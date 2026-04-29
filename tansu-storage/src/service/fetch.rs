@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use rama::{Context, Service};
 use tansu_sans_io::{
-    ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel,
+    ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel, NULL_TOPIC_ID,
     fetch_request::{FetchPartition, FetchTopic},
     fetch_response::{
         EpochEndOffset, FetchableTopicResponse, LeaderIdAndEpoch, PartitionData, SnapshotId,
@@ -24,10 +24,15 @@ use tansu_sans_io::{
     metadata_response::MetadataResponseTopic,
     record::deflated::{Batch, Frame},
 };
-use tokio::time::sleep;
-use tracing::{debug, error, instrument};
+use tokio::time::{sleep, timeout};
+use tracing::{debug, error, instrument, warn};
 
 use crate::{Error, Result, Storage, Topition};
+
+/// Small grace period added on top of `max_wait_ms` when wrapping storage
+/// calls in a [`tokio::time::timeout`]. The grace lets a near-deadline call
+/// finish if it is just about done, instead of forcing a cancel + retry.
+const FETCH_DEADLINE_GRACE: Duration = Duration::from_millis(250);
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`FetchRequest`] returning [`FetchResponse`].
 /// ```
@@ -129,7 +134,7 @@ impl FetchService {
     async fn fetch_partition<G>(
         &self,
         ctx: Context<G>,
-        max_wait_ms: Duration,
+        deadline: Instant,
         min_bytes: u32,
         max_bytes: &mut u32,
         isolation: IsolationLevel,
@@ -139,19 +144,12 @@ impl FetchService {
     where
         G: Storage,
     {
-        debug!(
-            ?max_wait_ms,
-            ?min_bytes,
-            ?max_bytes,
-            ?isolation,
-            ?fetch_partition
-        );
+        debug!(?min_bytes, ?max_bytes, ?isolation, ?fetch_partition);
 
         let partition_index = fetch_partition.partition;
         let tp = Topition::new(topic, partition_index);
 
         let mut batches = Vec::new();
-
         let mut offset = fetch_partition.fetch_offset;
 
         loop {
@@ -159,14 +157,37 @@ impl FetchService {
                 break;
             }
 
+            // Cooperative deadline check: don't start another storage call if
+            // we have already overrun the client's max_wait_ms. We still emit
+            // a (possibly empty) PartitionData below so the request always
+            // gets a response.
+            let now = Instant::now();
+            if now >= deadline {
+                debug!(?tp, ?offset, "fetch_partition deadline reached");
+                break;
+            }
+            let remaining = deadline.saturating_duration_since(now) + FETCH_DEADLINE_GRACE;
+
             debug!(offset);
 
-            let mut fetched = ctx
+            let fetch_call = ctx
                 .state()
-                .fetch(&tp, offset, min_bytes, *max_bytes, isolation)
-                .await
-                .inspect(|r| debug!(?tp, ?offset, ?r))
-                .inspect_err(|error| error!(?tp, ?error))?;
+                .fetch(&tp, offset, min_bytes, *max_bytes, isolation);
+
+            let mut fetched = match timeout(remaining, fetch_call).await {
+                Ok(Ok(r)) => {
+                    debug!(?tp, ?offset, ?r);
+                    r
+                }
+                Ok(Err(error)) => {
+                    error!(?tp, ?error);
+                    return Err(error);
+                }
+                Err(_elapsed) => {
+                    warn!(?tp, ?offset, "storage fetch timed out, returning partial");
+                    break;
+                }
+            };
 
             *max_bytes =
                 u32::try_from(fetched.byte_size()).map(|bytes| max_bytes.saturating_sub(bytes))?;
@@ -185,18 +206,35 @@ impl FetchService {
             }
         }
 
-        let offset_stage = ctx
-            .state()
-            .offset_stage(&tp)
-            .await
-            .inspect_err(|error| error!(?error, ?tp))?;
+        // Always return offset_stage information even when we ran out of time
+        // mid-fetch; clients use high_watermark/last_stable_offset to keep
+        // their own offsets in sync. Fall back to safe defaults if even this
+        // call exceeds the deadline so the response can still be sent.
+        let now = Instant::now();
+        let stage_remaining = deadline.saturating_duration_since(now) + FETCH_DEADLINE_GRACE;
+        let offset_stage_call = ctx.state().offset_stage(&tp);
+        let offset_stage = match timeout(stage_remaining, offset_stage_call).await {
+            Ok(Ok(stage)) => Some(stage),
+            Ok(Err(error)) => {
+                error!(?error, ?tp);
+                return Err(error);
+            }
+            Err(_elapsed) => {
+                warn!(?tp, "offset_stage timed out, returning empty");
+                None
+            }
+        };
+
+        let (high_watermark, last_stable, log_start) = offset_stage
+            .map(|s| (s.high_watermark(), s.last_stable(), s.log_start()))
+            .unwrap_or((offset, offset, -1));
 
         Ok(PartitionData::default()
             .partition_index(partition_index)
             .error_code(ErrorCode::None.into())
-            .high_watermark(offset_stage.high_watermark())
-            .last_stable_offset(Some(offset_stage.last_stable()))
-            .log_start_offset(Some(offset_stage.log_start()))
+            .high_watermark(high_watermark)
+            .last_stable_offset(Some(last_stable))
+            .log_start_offset(Some(log_start))
             .diverging_epoch(None)
             .current_leader(None)
             .snapshot_id(None)
@@ -211,9 +249,15 @@ impl FetchService {
     }
 
     fn unknown_topic_response(&self, fetch: &FetchTopic) -> Result<FetchableTopicResponse> {
+        // For v13+ requests the topic name field is gone — clients match
+        // responses to requests by topic_id. Echo back whatever id the client
+        // sent so it can pair this error with its request; only fall back to
+        // NULL_TOPIC_ID when the client itself didn't supply one.
+        let topic_id = fetch.topic_id.or(Some(NULL_TOPIC_ID));
+
         Ok(FetchableTopicResponse::default()
             .topic(fetch.topic.clone())
-            .topic_id(Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+            .topic_id(topic_id)
             .partitions(fetch.partitions.as_ref().map(|partitions| {
                 partitions
                     .iter()
@@ -243,19 +287,34 @@ impl FetchService {
     async fn fetch_topic<G>(
         &self,
         ctx: Context<G>,
-        max_wait_ms: Duration,
+        deadline: Instant,
         min_bytes: u32,
         max_bytes: &mut u32,
         isolation: IsolationLevel,
         fetch: &FetchTopic,
-        _is_first: bool,
     ) -> Result<FetchableTopicResponse>
     where
         G: Storage,
     {
-        debug!(?max_wait_ms, ?min_bytes, ?isolation, ?fetch);
+        debug!(?min_bytes, ?isolation, ?fetch);
 
-        let metadata = ctx.state().metadata(Some(&[fetch.into()])).await?;
+        // Bound the metadata lookup so the broker can never be wedged by a
+        // stalled metadata backend before it even reaches the partitions.
+        let metadata_remaining =
+            deadline.saturating_duration_since(Instant::now()) + FETCH_DEADLINE_GRACE;
+        let metadata = match timeout(
+            metadata_remaining,
+            ctx.state().metadata(Some(&[fetch.into()])),
+        )
+        .await
+        {
+            Ok(Ok(m)) => m,
+            Ok(Err(error)) => return Err(error),
+            Err(_elapsed) => {
+                warn!(?fetch, "metadata lookup timed out during fetch");
+                return self.unknown_topic_response(fetch);
+            }
+        };
 
         if let Some(MetadataResponseTopic {
             topic_id,
@@ -269,7 +328,7 @@ impl FetchService {
                 let partition = self
                     .fetch_partition(
                         ctx.clone(),
-                        max_wait_ms,
+                        deadline,
                         min_bytes,
                         max_bytes,
                         isolation,
@@ -305,63 +364,80 @@ impl FetchService {
         debug!(?max_wait, ?min_bytes, ?isolation, ?topics);
 
         if topics.is_empty() {
-            Ok(vec![])
-        } else {
-            let start = Instant::now();
-            let mut responses = vec![];
-            let mut iteration = 0;
-            let mut elapsed = Duration::from_millis(0);
-            let mut bytes = 0;
+            return Ok(vec![]);
+        }
 
-            while elapsed <= max_wait && bytes <= min_bytes {
-                debug!(?elapsed, ?max_wait, ?bytes, ?min_bytes);
+        let start = Instant::now();
+        let deadline = start + max_wait;
 
-                let enumerate = topics.iter().enumerate();
-                responses.clear();
+        // Do at least one fetch attempt, even when max_wait is zero. This is
+        // the long-poll loop: keep retrying until either we accumulate
+        // min_bytes of data or the deadline is reached. Crucially, we keep
+        // each attempt's responses (the previous loop cleared them, which
+        // could throw away good data when the inner storage call ran into
+        // the deadline mid-iteration).
+        let original_max_bytes = *max_bytes;
+        let mut responses: Vec<FetchableTopicResponse> = Vec::with_capacity(topics.len());
 
-                for (i, fetch) in enumerate {
-                    let fetch_response = self
-                        .fetch_topic(
-                            ctx.clone(),
-                            max_wait,
-                            min_bytes,
-                            max_bytes,
-                            isolation,
-                            fetch,
-                            i == 0,
-                        )
-                        .await?;
+        loop {
+            // Reset per-attempt budget so a partial read on iteration N
+            // doesn't leave iteration N+1 with no headroom.
+            let mut attempt_max_bytes = original_max_bytes;
+            let mut attempt: Vec<FetchableTopicResponse> = Vec::with_capacity(topics.len());
 
-                    responses.push(fetch_response);
-                }
-
-                bytes += u32::try_from(responses.byte_size())?;
-
-                let now = Instant::now();
-                elapsed = now.duration_since(start);
-                let remaining = max_wait.saturating_sub(elapsed);
-
-                debug!(
-                    ?iteration,
-                    ?max_wait,
-                    ?elapsed,
-                    ?remaining,
-                    ?bytes,
-                    ?min_bytes
-                );
-
-                sleep(if remaining.as_millis() >= 250 {
-                    remaining / 2
-                } else {
-                    remaining
-                })
-                .await;
-
-                iteration += 1;
+            for fetch in topics {
+                let response = self
+                    .fetch_topic(
+                        ctx.clone(),
+                        deadline,
+                        min_bytes,
+                        &mut attempt_max_bytes,
+                        isolation,
+                        fetch,
+                    )
+                    .await?;
+                attempt.push(response);
             }
 
-            Ok(responses)
+            let attempt_bytes = u32::try_from(attempt.byte_size()).unwrap_or(u32::MAX);
+
+            // Keep the better of the two: any non-empty attempt replaces the
+            // running best. If this attempt found nothing but a previous one
+            // did, hold onto the previous data.
+            if attempt_bytes > 0
+                || responses.is_empty()
+                || u32::try_from(responses.byte_size()).unwrap_or(0) == 0
+            {
+                responses = attempt;
+                *max_bytes = attempt_max_bytes;
+            }
+
+            if attempt_bytes >= min_bytes {
+                break;
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+
+            // Long-poll: wait a fraction of the remaining time before
+            // retrying. Cap the slice so a tiny remainder doesn't busy-loop.
+            let remaining = deadline.saturating_duration_since(now);
+            let sleep_for = if remaining.as_millis() >= 250 {
+                remaining / 2
+            } else {
+                remaining
+            };
+
+            if sleep_for.is_zero() {
+                break;
+            }
+
+            sleep(sleep_for).await;
         }
+
+        Ok(responses)
     }
 }
 
