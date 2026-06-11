@@ -11,7 +11,7 @@ env:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-8-cores
     steps:
       - uses: actions/checkout@v6
       - uses: extractions/setup-just@v3
@@ -33,7 +33,7 @@ jobs:
       - run: just fmt
 
   clippy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-8-cores
     steps:
       - uses: actions/checkout@v6
       - uses: extractions/setup-just@v3
@@ -87,7 +87,7 @@ jobs:
 
   test:
     needs: [check, fmt, clippy, build-storage, build-storage-lake]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-8-cores
     env:
       ADVERTISED_LISTENER_URL: tcp://localhost:9092
       AWS_ACCESS_KEY_ID: minioadmin
