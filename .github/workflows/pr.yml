@@ -102,6 +102,7 @@ jobs:
       ICEBERG_WAREHOUSE: tansu
       LAKEKEEPER_IMAGE: quay.io/lakekeeper/catalog:v0.8.5
       POSTGRES_IMAGE: postgres:17
+      TANSU_IMAGE: ghcr.io/popsink/tansu
       PROMETHEUS_LISTENER_URL: tcp://[::]:9100
       RUST_BACKTRACE: 1
       RUST_LOG: debug,tansu_sans_io=warn,tansu_model=warn
