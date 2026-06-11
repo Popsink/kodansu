@@ -227,7 +227,14 @@ mod start_after {
         // A single byte budget always yields at least one batch (Kafka semantics) but never the
         // whole partition.
         let batches = storage
-            .fetch(&topition, 0, 0, 1, IsolationLevel::ReadUncommitted, MAX_WAIT)
+            .fetch(
+                &topition,
+                0,
+                0,
+                1,
+                IsolationLevel::ReadUncommitted,
+                MAX_WAIT,
+            )
             .await?;
 
         assert_eq!(1, batches.len());
