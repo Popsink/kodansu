@@ -128,6 +128,23 @@ use crate::{Error, Result, Storage, Topition};
 /// # Ok(())
 /// # }
 /// ```
+/// Map an unexpected (non-`Api`) produce error to the Kafka error code returned
+/// to the client.
+///
+/// Transient storage failures (e.g. an S3 error under load) are mapped to
+/// [`ErrorCode::KafkaStorageError`], which clients treat as **retriable** —
+/// instead of [`ErrorCode::UnknownServerError`] (-1), which is fatal and makes
+/// clients drop the whole batch (#6). Anything else stays UNKNOWN, since it
+/// signals a genuine bug rather than something a retry would fix.
+fn storage_error_code(error: &Error) -> ErrorCode {
+    match error {
+        #[cfg(any(feature = "dynostore", feature = "slatedb"))]
+        Error::ObjectStore(_) => ErrorCode::KafkaStorageError,
+
+        _ => ErrorCode::UnknownServerError,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProduceService;
 
@@ -196,9 +213,15 @@ impl ProduceService {
                     }
 
                     Err(otherwise) => {
-                        warn!(?otherwise);
-                        let error = self.error(partition.index, ErrorCode::UnknownServerError);
-                        return error;
+                        // A transient storage failure (e.g. an S3 error under
+                        // load) was previously surfaced as UNKNOWN_SERVER_ERROR
+                        // (-1), which clients treat as fatal and drop the whole
+                        // batch (#6). Map storage errors to a *retriable* code
+                        // so clients retry instead, and log the underlying error
+                        // with its topic-partition so it isn't opaque.
+                        let error_code = storage_error_code(&otherwise);
+                        warn!(?otherwise, ?tp, ?error_code, "produce storage error");
+                        return self.error(partition.index, error_code);
                     }
                 }
             }
@@ -299,6 +322,28 @@ mod tests {
         },
     };
     use tracing::subscriber::DefaultGuard;
+
+    #[test]
+    fn object_store_errors_map_to_retriable_kafka_storage_error() {
+        use std::sync::Arc;
+
+        // A transient storage failure must surface as a retriable code so the
+        // client retries instead of dropping the batch (#6).
+        let object_store = Error::ObjectStore(Arc::new(object_store::Error::Generic {
+            store: "S3",
+            source: "503 SlowDown".into(),
+        }));
+        assert_eq!(
+            ErrorCode::KafkaStorageError,
+            storage_error_code(&object_store)
+        );
+
+        // Anything else stays UNKNOWN — a retry wouldn't fix it.
+        assert_eq!(
+            ErrorCode::UnknownServerError,
+            storage_error_code(&Error::NoSuchOffset(0))
+        );
+    }
 
     fn init_tracing() -> Result<DefaultGuard> {
         use std::{fs::File, sync::Arc, thread};
