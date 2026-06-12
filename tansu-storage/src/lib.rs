@@ -128,6 +128,8 @@ use object_store::memory::InMemory;
 
 #[cfg(feature = "dynostore")]
 use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
+#[cfg(feature = "dynostore")]
+use object_store::{BackoffConfig, RetryConfig};
 
 use opentelemetry::{
     InstrumentationScope, KeyValue, global,
@@ -2306,6 +2308,22 @@ impl Builder<i32, String, Url, Url> {
                 AmazonS3Builder::from_env()
                     .with_bucket_name(bucket_name)
                     .with_conditional_put(S3ConditionalPut::ETagMatch)
+                    // S3 enforces a per-prefix request-rate limit (~3,500
+                    // mutating req/prefix/sec). A hot topic-partition with many
+                    // tiny batch objects, plus the periodic `maintain` delete
+                    // flood, trips `503 SlowDown`; the object_store default of
+                    // 10 retries over 180s isn't enough and deletes/produces are
+                    // dropped (#5, #6). Give throttles a longer, gentler ceiling
+                    // so they ride out a SlowDown burst instead of failing.
+                    .with_retry(RetryConfig {
+                        backoff: BackoffConfig {
+                            init_backoff: Duration::from_millis(200),
+                            max_backoff: Duration::from_secs(30),
+                            base: 2.0,
+                        },
+                        max_retries: 32,
+                        retry_timeout: Duration::from_secs(300),
+                    })
                     .build()
                     .map(|object_store| {
                         DynoStore::new(self.cluster_id.as_str(), self.node_id, object_store)

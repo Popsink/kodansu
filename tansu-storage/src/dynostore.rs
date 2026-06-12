@@ -524,6 +524,39 @@ impl DynoStore {
         Ok(offsets)
     }
 
+    /// List the base offsets of `topition`'s batch files, sorted ascending.
+    ///
+    /// Unlike [`Self::list_batch_offsets`] this only retains the `i64` offsets
+    /// (not the full [`ObjectMeta`] of every object), so the transient
+    /// allocation stays small on hot partitions with many batch objects (#8).
+    async fn list_batch_offset_keys(&self, topition: &Topition) -> Result<Vec<i64>> {
+        let prefix = self.records_prefix(topition);
+
+        let mut offsets = Vec::new();
+        let mut list_stream = self.object_store.list(Some(&prefix));
+
+        while let Some(meta) = list_stream
+            .next()
+            .await
+            .transpose()
+            .inspect_err(|err| error!(?err, ?topition))?
+        {
+            let Some(name) = meta.location.parts().next_back() else {
+                continue;
+            };
+
+            let Ok(offset) = i64::from_str(&name.as_ref()[0..20]) else {
+                continue;
+            };
+
+            offsets.push(offset);
+        }
+
+        offsets.sort_unstable();
+
+        Ok(offsets)
+    }
+
     /// Set the log start offset (`watermark.low`) to `low`.
     async fn advance_low_watermark(&self, topition: &Topition, low: Option<i64>) -> Result<()> {
         self.watermark(topition)?
@@ -554,25 +587,59 @@ impl DynoStore {
     /// advance the log start offset (`watermark.low`) to the oldest surviving
     /// batch. Age is taken from the object's `last_modified` (the append time),
     /// streamed from the object store so no per-batch GET is required.
+    ///
+    /// The listing is consumed as a stream and expired locations are deleted in
+    /// bounded chunks (`EXPIRE_DELETE_CHUNK`) rather than materialising the whole
+    /// partition's object metadata in memory first — a hot partition can hold a
+    /// very large number of tiny batch objects, and collecting them all into a
+    /// map drives the per-tick memory spike seen on every broker pod (#8).
     async fn expire_partition(&self, topition: &Topition, threshold_ms: i64) -> Result<u64> {
-        let mut expired = vec![];
-        let mut surviving_low: Option<i64> = None;
+        /// Maximum number of expired locations buffered before a delete is
+        /// flushed. Matches the S3 `DeleteObjects` per-request key cap.
+        const EXPIRE_DELETE_CHUNK: usize = 1_000;
 
-        for (offset, meta) in self.list_batch_offsets(topition).await? {
+        let prefix = self.records_prefix(topition);
+        let mut list_stream = self.object_store.list(Some(&prefix));
+
+        let mut surviving_low: Option<i64> = None;
+        let mut chunk: Vec<Path> = Vec::new();
+        let mut deleted: u64 = 0;
+
+        while let Some(meta) = list_stream
+            .next()
+            .await
+            .transpose()
+            .inspect_err(|err| error!(?err, ?topition))?
+        {
+            let Some(name) = meta.location.parts().next_back() else {
+                continue;
+            };
+
+            let Ok(offset) = i64::from_str(&name.as_ref()[0..20]) else {
+                continue;
+            };
+
             if meta.last_modified.timestamp_millis() < threshold_ms {
-                expired.push(meta.location);
+                chunk.push(meta.location);
+
+                if chunk.len() >= EXPIRE_DELETE_CHUNK {
+                    deleted += chunk.len() as u64;
+                    self.delete_batches(std::mem::take(&mut chunk)).await?;
+                }
             } else if surviving_low.is_none_or(|low| offset < low) {
                 surviving_low = Some(offset);
             }
         }
 
-        if expired.is_empty() {
+        if !chunk.is_empty() {
+            deleted += chunk.len() as u64;
+            self.delete_batches(chunk).await?;
+        }
+
+        if deleted == 0 {
             return Ok(0);
         }
 
-        let deleted = expired.len() as u64;
-
-        self.delete_batches(expired).await?;
         self.advance_low_watermark(topition, surviving_low).await?;
 
         Ok(deleted)
@@ -656,7 +723,7 @@ impl DynoStore {
     /// within a batch). Emptied batch files are removed, partially compacted ones
     /// are rewritten in place (preserving base offset and record offsets).
     async fn compact_partition(&self, topition: &Topition) -> Result<u64> {
-        let offsets = self.list_batch_offsets(topition).await?;
+        let offsets = self.list_batch_offset_keys(topition).await?;
 
         if offsets.is_empty() {
             return Ok(0);
@@ -668,7 +735,7 @@ impl DynoStore {
         let mut compacted = 0;
 
         // newest to oldest: a key kept in a newer batch supersedes older ones
-        for offset in offsets.into_keys().rev() {
+        for offset in offsets.into_iter().rev() {
             let location = self.batch_location(topition, offset);
 
             let deflated = match self.object_store.get(&location).await {
