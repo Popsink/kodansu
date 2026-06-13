@@ -30,7 +30,10 @@ use std::{
     marker::PhantomData,
     net::{IpAddr, Ipv6Addr, SocketAddr},
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 use tansu_sans_io::{ErrorCode, RootMessageMeta};
@@ -40,11 +43,11 @@ use tokio::{
     net::TcpListener,
     signal::unix::{SignalKind, signal},
     task::JoinSet,
-    time::{self, Instant, sleep},
+    time::{self, Instant, MissedTickBehavior, sleep},
 };
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, Level, debug, error, span};
+use tracing::{Instrument, Level, debug, error, span, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -237,8 +240,42 @@ where
         .inspect(|listener| debug!(listener = ?listener.local_addr().ok()))
         .inspect_err(|err| error!(?err, %self.advertised_listener))?;
 
-        let mut interval =
-            time::interval(self.maintenance_interval.unwrap_or(Duration::from_mins(10)));
+        let maintenance_period = self.maintenance_interval.unwrap_or(Duration::from_mins(10));
+
+        // Desynchronise replicas: every broker pod runs `maintain` on the *same*
+        // bucket, and without this they fire on near-identical schedules from a
+        // shared startup, so N replicas scan+delete the same prefixes at once —
+        // N× the S3 load and N pods spiking memory together (#8). Offset the
+        // first tick by a deterministic, node-derived fraction of the period
+        // (golden-ratio spread) so the runs fan out across the interval.
+        let phase = (self.node_id.unsigned_abs() as f64 * 0.618_033_988_75).fract();
+        let mut interval = time::interval_at(
+            Instant::now() + maintenance_period.mul_f64(phase),
+            maintenance_period,
+        );
+
+        // Don't let a stalled/slow pass burst-fire catch-up ticks the moment it
+        // returns; the overlap guard below already skips while a run is in
+        // flight, and skipping missed ticks keeps maintenance from compounding.
+        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        // Guard against overlapping `maintain` runs: under S3 throttling a pass
+        // can take longer than the interval, and spawning a second concurrent
+        // run compounds the memory + S3 pressure (#8).
+        let maintenance_in_flight = Arc::new(AtomicBool::new(false));
+
+        // Reset the in-flight flag on drop rather than with a bare `store` at the
+        // end of the run: `maintain` can panic (e.g. a malformed object key), and
+        // a panic in the spawned task would otherwise leave the flag stuck `true`
+        // and disable maintenance for the whole pod until restart. Drop runs on
+        // the unwind path too, so the flag is always released (#8).
+        struct InFlightGuard(Arc<AtomicBool>);
+
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
 
         let mut set = JoinSet::new();
 
@@ -332,20 +369,32 @@ where
                 }
 
                 _ = interval.tick() => {
-                    let storage = self.storage.clone();
+                    // Skip this tick if the previous maintenance run is still in
+                    // flight, rather than spawning a second concurrent run (#8).
+                    if maintenance_in_flight
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_err()
+                    {
+                        warn!("skipping maintenance tick: previous run still in flight");
+                    } else {
+                        let storage = self.storage.clone();
+                        let guard = InFlightGuard(maintenance_in_flight.clone());
 
+                        let handle = set.spawn(async move {
+                            let span = span!(Level::DEBUG, "maintenance");
 
-                    let handle = set.spawn(async move {
-                        let span = span!(Level::DEBUG, "maintenance");
+                            async move {
+                                // Released when this block ends — including on a
+                                // panic unwind — so the flag never sticks (#8).
+                                let _guard = guard;
 
-                        async move {
-                            _ = storage.maintain(SystemTime::now()).await.inspect(|maintain|debug!(?maintain)).inspect_err(|err|debug!(?err)).ok();
+                                _ = storage.maintain(SystemTime::now()).await.inspect(|maintain|debug!(?maintain)).inspect_err(|err|debug!(?err)).ok();
+                            }.instrument(span).await
 
-                        }.instrument(span).await
+                        });
 
-                    });
-
-                    debug!(?handle);
+                        debug!(?handle);
+                    }
                 }
 
                 v = set.join_next(), if !set.is_empty() => {
