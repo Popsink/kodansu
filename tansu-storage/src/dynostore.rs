@@ -567,20 +567,88 @@ impl DynoStore {
             .await
     }
 
-    /// Delete the given batch object locations concurrently.
+    /// Delete the given batch object locations.
+    ///
+    /// S3 can throttle a multi-object `DeleteObjects` by returning **HTTP 200**
+    /// with a top-level `<Error><Code>SlowDown</Code></Error>` body instead of
+    /// the expected `<DeleteResult>`. The `object_store` S3 client only retries
+    /// on the HTTP status, so a 200-with-error body slips past its retry loop
+    /// and then fails XML deserialisation (`unknown variant `Code``), surfacing
+    /// as a non-retryable error even though *nothing was deleted* (#5).
+    ///
+    /// We therefore retry the whole bulk delete ourselves, with backoff, on a
+    /// detected throttle; once those retries are exhausted we fall back to
+    /// per-key deletes, whose `503 SlowDown` is status-coded and so is retried
+    /// by the store's own `RetryConfig`, side-stepping the bulk parse bug.
     async fn delete_batches(&self, locations: Vec<Path>) -> Result<()> {
+        /// Times to retry the whole bulk delete on a detected S3 throttle before
+        /// falling back to per-key deletes.
+        const MAX_BULK_THROTTLE_RETRIES: u32 = 5;
+
         if locations.is_empty() {
             return Ok(());
         }
 
-        let locations = futures::stream::iter(locations.into_iter().map(Ok)).boxed();
+        let mut attempt = 0u32;
+
+        loop {
+            match self.bulk_delete(locations.clone()).await {
+                Ok(()) => return Ok(()),
+
+                Err(err) if is_s3_throttle(&err) => {
+                    if attempt >= MAX_BULK_THROTTLE_RETRIES {
+                        warn!(
+                            %err,
+                            "bulk DeleteObjects still throttled after retries; falling back to per-key deletes"
+                        );
+                        return self.delete_each(locations).await;
+                    }
+
+                    let backoff = throttle_backoff(attempt);
+                    warn!(%err, attempt, ?backoff, "S3 throttled DeleteObjects; backing off then retrying");
+                    tokio::time::sleep(backoff).await;
+                    attempt += 1;
+                }
+
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+
+    /// Issue a single bulk `DeleteObjects` for `locations`.
+    async fn bulk_delete(&self, locations: Vec<Path>) -> Result<(), object_store::Error> {
+        let stream = futures::stream::iter(locations.into_iter().map(Ok)).boxed();
 
         self.object_store
-            .delete_stream(locations)
+            .delete_stream(stream)
             .try_collect::<Vec<Path>>()
             .await
             .map(|_| ())
-            .map_err(Into::into)
+    }
+
+    /// Delete each location individually, ignoring already-absent objects. Used
+    /// as a throttle fallback: a single-object DELETE returns a real `503`
+    /// status that the store's `RetryConfig` retries.
+    async fn delete_each(&self, locations: Vec<Path>) -> Result<()> {
+        /// Bounded concurrency for the per-key fallback. A purely sequential
+        /// pass would issue up to a full `DeleteObjects` batch (1000) of
+        /// round-trips back-to-back; a small fan-out makes progress without
+        /// re-creating the request burst that tripped the throttle.
+        const DELETE_EACH_CONCURRENCY: usize = 16;
+
+        let object_store = &self.object_store;
+
+        futures::stream::iter(locations)
+            .map(|location| async move {
+                match object_store.delete(&location).await {
+                    Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+                    Err(err) => Err(Error::from(err)),
+                }
+            })
+            .buffer_unordered(DELETE_EACH_CONCURRENCY)
+            .try_collect::<Vec<()>>()
+            .await
+            .map(|_| ())
     }
 
     /// Delete every batch of `topition` written before `now - retention_ms`, then
@@ -3105,6 +3173,39 @@ impl Storage for DynoStore {
     }
 }
 
+/// Backoff (with jitter) before retrying a throttled bulk delete: 0.5s, 1s, 2s,
+/// 4s, 8s … capped at 30s, plus up to 50% jitter to desynchronise replicas that
+/// were throttled at the same instant.
+fn throttle_backoff(attempt: u32) -> Duration {
+    let base_ms = 500u64.saturating_mul(1 << attempt.min(6)).min(30_000);
+    let jitter = rng().random_range(0..=base_ms / 2);
+    Duration::from_millis(base_ms + jitter)
+}
+
+/// True if `error` looks like an S3 request-rate throttle on a multi-object
+/// delete — either a surfaced `SlowDown`, or the `object_store` deserialisation
+/// failure that a `200`-with-`<Error>` throttle body produces (the response is
+/// `<Error><Code>SlowDown</Code></Error>` rather than `<DeleteResult>`, so the
+/// parser reports `unknown variant `Code``). See [`DynoStore::delete_batches`].
+fn is_s3_throttle(error: &object_store::Error) -> bool {
+    let mut current: Option<&dyn std::error::Error> = Some(error);
+
+    while let Some(err) = current {
+        let text = err.to_string();
+
+        if text.contains("SlowDown")
+            || text.contains("unknown variant `Code`")
+            || text.contains("invalid DeleteObjects response")
+        {
+            return true;
+        }
+
+        current = err.source();
+    }
+
+    false
+}
+
 fn object_store_error_name(error: &object_store::Error) -> &'static str {
     match error {
         object_store::Error::Precondition { .. } => "pre_condition",
@@ -3376,5 +3477,54 @@ where
                 additional.append(&mut attributes);
                 self.request_error.add(1, &additional[..]);
             })
+    }
+}
+
+#[cfg(test)]
+mod throttle_tests {
+    use super::{is_s3_throttle, throttle_backoff};
+
+    fn generic_s3(source: &'static str) -> object_store::Error {
+        object_store::Error::Generic {
+            store: "S3",
+            source: source.into(),
+        }
+    }
+
+    #[test]
+    fn slowdown_503_body_is_throttle() {
+        // A genuine 503 whose body is surfaced after retries are exhausted.
+        assert!(is_s3_throttle(&generic_s3(
+            "Status { status: 503, body: \"<Error><Code>SlowDown</Code></Error>\" }"
+        )));
+    }
+
+    #[test]
+    fn parse_error_from_200_throttle_body_is_throttle() {
+        // S3 returned 200 with <Error><Code>SlowDown</Code></Error>; object_store
+        // tried to parse it as <DeleteResult> and tripped on the <Code> element.
+        assert!(is_s3_throttle(&generic_s3(
+            "Got invalid DeleteObjects response: unknown variant `Code`, expected `Deleted` or `Error`"
+        )));
+    }
+
+    #[test]
+    fn unrelated_errors_are_not_throttle() {
+        assert!(!is_s3_throttle(&object_store::Error::NotFound {
+            path: "x".into(),
+            source: "missing".into(),
+        }));
+        assert!(!is_s3_throttle(&generic_s3("connection reset by peer")));
+    }
+
+    #[test]
+    fn backoff_grows_and_is_capped() {
+        // attempt 0: base 500ms + up to 50% jitter => [500, 750]ms
+        let first = throttle_backoff(0).as_millis();
+        assert!((500..=750).contains(&first), "{first}");
+
+        // large attempt: base capped at 30s + up to 50% jitter => [30s, 45s]
+        let capped = throttle_backoff(20).as_millis();
+        assert!((30_000..=45_000).contains(&capped), "{capped}");
     }
 }
