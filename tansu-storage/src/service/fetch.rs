@@ -423,7 +423,13 @@ where
             .throttle_time_ms(Some(0))
             .error_code(Some(ErrorCode::None.into()))
             .session_id(Some(0))
-            .node_endpoints(Some([].into()))
+            // NodeEndpoints is a tagged field (tag 0) only valid from Fetch v16
+            // (KIP-951). Emitting it (even as an empty list) on a response whose
+            // negotiated version is < 16 makes clients fail to decode with
+            // "Tag 0 is not valid for version <V>", killing e.g. Kafka Connect's
+            // KafkaBasedLog work thread (#7). It carries no information for us
+            // (no leader endpoints to advertise), so leave it unset.
+            .node_endpoints(None)
             .responses(responses))
         .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed().ok()))
     }
