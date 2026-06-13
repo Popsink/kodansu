@@ -597,14 +597,25 @@ impl DynoStore {
     /// as a throttle fallback: a single-object DELETE returns a real `503`
     /// status that the store's `RetryConfig` retries.
     async fn delete_each(&self, locations: Vec<Path>) -> Result<()> {
-        for location in locations {
-            match self.object_store.delete(&location).await {
-                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
-                Err(err) => return Err(err.into()),
-            }
-        }
+        /// Bounded concurrency for the per-key fallback. A purely sequential
+        /// pass would issue up to a full `DeleteObjects` batch (1000) of
+        /// round-trips back-to-back; a small fan-out makes progress without
+        /// re-creating the request burst that tripped the throttle.
+        const DELETE_EACH_CONCURRENCY: usize = 16;
 
-        Ok(())
+        let object_store = &self.object_store;
+
+        futures::stream::iter(locations)
+            .map(|location| async move {
+                match object_store.delete(&location).await {
+                    Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+                    Err(err) => Err(Error::from(err)),
+                }
+            })
+            .buffer_unordered(DELETE_EACH_CONCURRENCY)
+            .try_collect::<Vec<()>>()
+            .await
+            .map(|_| ())
     }
 
     /// Delete every batch of `topition` written before `now - retention_ms`, then
