@@ -264,6 +264,19 @@ where
         // run compounds the memory + S3 pressure (#8).
         let maintenance_in_flight = Arc::new(AtomicBool::new(false));
 
+        // Reset the in-flight flag on drop rather than with a bare `store` at the
+        // end of the run: `maintain` can panic (e.g. a malformed object key), and
+        // a panic in the spawned task would otherwise leave the flag stuck `true`
+        // and disable maintenance for the whole pod until restart. Drop runs on
+        // the unwind path too, so the flag is always released (#8).
+        struct InFlightGuard(Arc<AtomicBool>);
+
+        impl Drop for InFlightGuard {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+
         let mut set = JoinSet::new();
 
         let m = MultiProgress::new();
@@ -365,15 +378,17 @@ where
                         warn!("skipping maintenance tick: previous run still in flight");
                     } else {
                         let storage = self.storage.clone();
-                        let in_flight = maintenance_in_flight.clone();
+                        let guard = InFlightGuard(maintenance_in_flight.clone());
 
                         let handle = set.spawn(async move {
                             let span = span!(Level::DEBUG, "maintenance");
 
                             async move {
-                                _ = storage.maintain(SystemTime::now()).await.inspect(|maintain|debug!(?maintain)).inspect_err(|err|debug!(?err)).ok();
+                                // Released when this block ends — including on a
+                                // panic unwind — so the flag never sticks (#8).
+                                let _guard = guard;
 
-                                in_flight.store(false, Ordering::Release);
+                                _ = storage.maintain(SystemTime::now()).await.inspect(|maintain|debug!(?maintain)).inspect_err(|err|debug!(?err)).ok();
                             }.instrument(span).await
 
                         });
