@@ -9,7 +9,9 @@ on:
       - "v*"
 
 env:
-  IMAGE: ghcr.io/${{ github.repository }}
+  # `github.repository` is `Popsink/tansu`, but OCI/Docker refs must be
+  # lowercase, so the org casing is hardcoded here.
+  IMAGE: ghcr.io/popsink/tansu
 
 permissions:
   contents: read
