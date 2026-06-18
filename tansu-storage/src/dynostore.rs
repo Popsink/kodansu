@@ -108,6 +108,15 @@ pub struct DynoStore {
     /// GCS per-object update-rate cap (#13).
     next_offsets: Arc<Mutex<BTreeMap<Topition, i64>>>,
 
+    /// Per-producer optimistic-concurrency handle on `producers/{id}.json`,
+    /// holding that producer's idempotent sequence state. Sharding the sequence
+    /// CAS per producer (instead of CASing the single cluster-global `meta`
+    /// object on every idempotent batch) removes the cross-producer contention
+    /// that serialised every `acks=all`/Debezium producer on GCS (#13). The
+    /// linearizable CAS is kept, so the exact `OutOfOrderSequenceNumber` /
+    /// `DuplicateSequenceNumber` / `ProducerFenced` semantics are preserved.
+    producers: Arc<Mutex<BTreeMap<ProducerId, OptiCon<ProducerDetail>>>>,
+
     object_store: Arc<DynObjectStore>,
 }
 
@@ -270,6 +279,12 @@ struct ProducerDetail {
     sequences: BTreeMap<ProducerEpoch, BTreeMap<String, BTreeMap<i32, Sequence>>>,
 }
 
+impl OptiCon<ProducerDetail> {
+    fn new(cluster: &str, producer_id: ProducerId) -> Self {
+        Self::path(format!("clusters/{cluster}/producers/{producer_id}.json"))
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 struct TxnId {
     transaction: String,
@@ -369,6 +384,7 @@ impl DynoStore {
 
             watermarks: Arc::new(Mutex::new(BTreeMap::new())),
             next_offsets: Arc::new(Mutex::new(BTreeMap::new())),
+            producers: Arc::new(Mutex::new(BTreeMap::new())),
             meta: OptiCon::<Meta>::new(cluster),
             object_store: Arc::new(Cache::new(
                 Metron::new(object_store, cluster),
@@ -435,6 +451,42 @@ impl DynoStore {
                     .to_owned()
             })
             .map_err(Into::into)
+    }
+
+    /// Optimistic-concurrency handle on the per-producer `producers/{id}.json`
+    /// object holding `producer_id`'s idempotent sequence state.
+    fn producer(&self, producer_id: ProducerId) -> Result<OptiCon<ProducerDetail>> {
+        self.producers
+            .lock()
+            .map(|mut locked| {
+                locked
+                    .entry(producer_id)
+                    .or_insert_with(|| {
+                        OptiCon::<ProducerDetail>::new(self.cluster.as_str(), producer_id)
+                    })
+                    .to_owned()
+            })
+            .map_err(Into::into)
+    }
+
+    /// Seed (or epoch-bump) the per-producer sequence object so the produce hot
+    /// path can validate against it. Called from `init_producer` on the cold
+    /// registration path; an absent epoch entry is what distinguishes a
+    /// registered producer from `UnknownProducerId`.
+    async fn seed_producer(&self, response: &ProducerIdResponse) -> Result<()> {
+        if response.error != ErrorCode::None || response.id < 0 {
+            return Ok(());
+        }
+
+        let epoch = response.epoch;
+
+        self.producer(response.id)?
+            .with_mut(&self.object_store, |pd| {
+                _ = pd.sequences.entry(epoch).or_default();
+                Ok(())
+            })
+            .await
+            .map(|_| ())
     }
 
     /// The cached next offset (== high watermark) hint for `topition`, if known
@@ -1497,16 +1549,18 @@ impl Storage for DynoStore {
             Ok(offset)
         } else {
             if deflated.is_idempotent() {
-                self.meta
-                .with_mut(&self.object_store, |meta| {
-                    let Some(pd) = meta.producers.get_mut(&deflated.producer_id) else {
-                        debug!(producer_id = deflated.producer_id, ?meta.producers);
-                        return Err(Error::Api(ErrorCode::UnknownProducerId));
-                    };
-
+                // Validate (and advance) the idempotent sequence on the producer's
+                // own `producers/{id}.json` object rather than the cluster-global
+                // `meta` object, so distinct producers no longer contend on one
+                // hot object on GCS (#13). The CAS is still linearizable, so the
+                // exact OutOfOrder/Duplicate/Fenced semantics are unchanged.
+                self.producer(deflated.producer_id)?
+                .with_mut(&self.object_store, |pd| {
                     let Some(mut current) = pd.sequences.last_entry() else {
-                        debug!(last_entry = ?pd.sequences.last_entry());
-                        return Err(Error::Api(ErrorCode::UnknownServerError));
+                        // An empty/absent producer object means the id was never
+                        // registered (InitProducerId seeds it).
+                        debug!(producer_id = deflated.producer_id, ?pd);
+                        return Err(Error::Api(ErrorCode::UnknownProducerId));
                     };
 
                     if current.key() != &deflated.producer_epoch {
@@ -2750,7 +2804,10 @@ impl Storage for DynoStore {
                 })
                 .await?
             {
-                InitProducer::Completed(completed) => Ok(completed),
+                InitProducer::Completed(completed) => {
+                    self.seed_producer(&completed).await?;
+                    Ok(completed)
+                }
                 InitProducer::NeedToRollback {
                     producer_id: rollback_producer_id,
                     producer_epoch: rollback_producer_epoch,
@@ -2785,7 +2842,8 @@ impl Storage for DynoStore {
                 }
             }
         } else {
-            self.meta
+            let response = self
+                .meta
                 .with_mut(&self.object_store, |meta| {
                     debug!(?meta);
                     match (producer_id, producer_epoch) {
@@ -2819,6 +2877,11 @@ impl Storage for DynoStore {
                     }
                 })
                 .await
+                .inspect(|response| debug!(?response))?;
+
+            self.seed_producer(&response).await?;
+
+            Ok(response)
         }
     }
 

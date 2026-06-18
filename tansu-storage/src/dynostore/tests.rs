@@ -20,6 +20,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::{Error, Result};
 
+mod idempotent;
 mod latency;
 mod offset_assignment;
 
