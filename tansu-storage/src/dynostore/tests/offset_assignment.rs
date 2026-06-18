@@ -24,11 +24,13 @@
 //! - the high watermark is derived from the immutable objects, so a cold replica
 //!   reads it correctly without ever having written the partition.
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use object_store::memory::InMemory;
 use tansu_sans_io::{
-    IsolationLevel, create_topics_request::CreatableTopic, record::Record, record::deflated,
-    record::inflated,
+    IsolationLevel, ListOffset, create_topics_request::CreatableTopic, record::Record,
+    record::deflated, record::inflated,
 };
 
 use crate::{
@@ -219,11 +221,140 @@ async fn high_watermark_from_listing_on_cold_replica() -> Result<(), Error> {
     let latest = reader
         .list_offsets(
             IsolationLevel::ReadUncommitted,
-            &[(topition.clone(), tansu_sans_io::ListOffset::Latest)],
+            &[(topition.clone(), ListOffset::Latest)],
         )
         .await?;
     assert_eq!(1, latest.len());
     assert_eq!(Some(4), latest[0].1.offset);
+
+    Ok(())
+}
+
+/// Fetch every batch of `topition` from `offset`, returning `(base_offset,
+/// record_count)` for each — proving the create-only assignment yields records
+/// that are actually fetchable at the offsets it handed back.
+async fn fetch_offsets(storage: &DynoStore, topition: &Topition, offset: i64) -> Vec<(i64, usize)> {
+    storage
+        .fetch(
+            topition,
+            offset,
+            0,
+            10 * 1024 * 1024,
+            IsolationLevel::ReadUncommitted,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("fetch")
+        .iter()
+        .map(|deflated| {
+            let records = inflated::Batch::try_from(deflated)
+                .expect("inflate")
+                .records
+                .len();
+            (deflated.base_offset, records)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn produced_records_are_fetchable_at_assigned_offsets() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let store = DynoStore::new(CLUSTER, NODE, InMemory::new());
+
+    let topic = "roundtrip";
+    create_topic(&store, topic, 1).await?;
+    let topition = Topition::new(topic, 0);
+
+    // Mixed batch widths: offsets 0..=1, 2, 3..=5.
+    assert_eq!(0, store.produce(None, &topition, batch(2)?).await?);
+    assert_eq!(2, store.produce(None, &topition, batch(1)?).await?);
+    assert_eq!(3, store.produce(None, &topition, batch(3)?).await?);
+
+    // A full fetch returns the batches at exactly the assigned base offsets with
+    // their original record counts — no gaps, the filename offset is authority.
+    assert_eq!(
+        vec![(0, 2), (2, 1), (3, 3)],
+        fetch_offsets(&store, &topition, 0).await
+    );
+
+    // A mid-log fetch seeks to the requested offset.
+    assert_eq!(
+        vec![(2, 1), (3, 3)],
+        fetch_offsets(&store, &topition, 2).await
+    );
+
+    // Fetching at the high watermark returns nothing.
+    assert!(fetch_offsets(&store, &topition, 6).await.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn partitions_track_offsets_independently() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let store = DynoStore::new(CLUSTER, NODE, InMemory::new());
+
+    let topic = "multi-partition";
+    create_topic(&store, topic, 3).await?;
+
+    let p0 = Topition::new(topic, 0);
+    let p1 = Topition::new(topic, 1);
+
+    // Interleave produces across two partitions; each has its own offset space.
+    assert_eq!(0, store.produce(None, &p0, batch(2)?).await?);
+    assert_eq!(0, store.produce(None, &p1, batch(1)?).await?);
+    assert_eq!(2, store.produce(None, &p0, batch(1)?).await?);
+    assert_eq!(1, store.produce(None, &p1, batch(3)?).await?);
+
+    assert_eq!(3, store.offset_stage(&p0).await?.high_watermark);
+    assert_eq!(4, store.offset_stage(&p1).await?.high_watermark);
+
+    // An untouched partition is empty.
+    let p2 = Topition::new(topic, 2);
+    assert_eq!(0, store.offset_stage(&p2).await?.high_watermark);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn delete_records_all_uses_listing_high_watermark() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    use tansu_sans_io::delete_records_request::DeleteRecordsPartition;
+    use tansu_sans_io::delete_records_request::DeleteRecordsTopic;
+
+    let store = DynoStore::new(CLUSTER, NODE, InMemory::new());
+
+    let topic = "delete-all";
+    create_topic(&store, topic, 1).await?;
+    let topition = Topition::new(topic, 0);
+
+    assert_eq!(0, store.produce(None, &topition, batch(2)?).await?);
+    assert_eq!(2, store.produce(None, &topition, batch(3)?).await?);
+
+    // `offset: -1` means "the log end offset" — it must come from the immutable
+    // objects (high watermark 5), not the no-longer-advanced `watermark.high`.
+    let results = store
+        .delete_records(&[DeleteRecordsTopic::default()
+            .name(topic.into())
+            .partitions(Some(vec![
+                DeleteRecordsPartition::default()
+                    .partition_index(0)
+                    .offset(-1),
+            ]))])
+        .await?;
+
+    assert_eq!(1, results.len());
+    let partitions = results[0].partitions.as_deref().unwrap_or_default();
+    assert_eq!(1, partitions.len());
+    assert_eq!(5, partitions[0].low_watermark);
+
+    // Everything is gone; the next produce continues at the log end offset (5),
+    // not back at 0.
+    assert!(fetch_offsets(&store, &topition, 0).await.is_empty());
+    assert_eq!(5, store.produce(None, &topition, batch(1)?).await?);
 
     Ok(())
 }

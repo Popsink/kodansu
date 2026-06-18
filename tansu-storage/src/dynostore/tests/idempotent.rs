@@ -216,3 +216,39 @@ async fn unregistered_producer_is_rejected() -> Result<(), Error> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn stale_epoch_is_fenced() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let store = DynoStore::new(CLUSTER, NODE, InMemory::new());
+
+    let topic = "fenced";
+    create_topic(&store, topic).await?;
+    let topition = Topition::new(topic, 0);
+
+    // Registered at epoch 0.
+    let producer = init_idempotent(&store).await?;
+
+    // A batch claiming a different (here, higher) epoch than the one the
+    // producer object knows about is fenced — the sharded object preserves the
+    // exact ProducerFenced semantics of the old global-meta check.
+    assert_eq!(
+        ErrorCode::ProducerFenced,
+        api_error(
+            store
+                .produce(None, &topition, idempotent_batch(producer, 1, 0, 1)?)
+                .await
+        )
+    );
+
+    // The correct epoch still works.
+    assert_eq!(
+        0,
+        store
+            .produce(None, &topition, idempotent_batch(producer, 0, 0, 1)?)
+            .await?
+    );
+
+    Ok(())
+}
