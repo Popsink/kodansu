@@ -1938,17 +1938,25 @@ impl Storage for DynoStore {
             // offset == high watermark, derived from the immutable batch objects
             // (max base offset + that batch's record count). The previous
             // `last_modified` ordering was wrong under inter-replica clock skew
-            // and `max_base + 1` ignored multi-record batches; `refresh_high`
-            // is correct on both counts.
+            // and `max_base + 1` ignored multi-record batches; `high_watermark`
+            // is correct on both counts. The timestamp is still the tail batch's
+            // mtime (a positive value), preserving the contract the SQL backends
+            // also honour; `None` (→ -1 on the wire) only for an empty log.
             if *offset_request == ListOffset::Latest && !stable.contains_key(topition) {
                 let high = self.high_watermark(topition).await?;
+
+                let timestamp = self
+                    .list_batch_offsets(topition)
+                    .await?
+                    .last_key_value()
+                    .map(|(_, meta)| meta.last_modified.into());
 
                 responses.push((
                     topition.to_owned(),
                     ListOffsetResponse {
                         error_code: ErrorCode::None,
                         offset: Some(high),
-                        ..Default::default()
+                        timestamp,
                     },
                 ));
 
