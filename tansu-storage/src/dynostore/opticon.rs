@@ -23,9 +23,12 @@ use object_store::{
     Attributes, GetOptions, ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, TagSet,
     UpdateVersion, path::Path,
 };
-use opentelemetry::{KeyValue, metrics::Counter};
+use opentelemetry::{
+    KeyValue,
+    metrics::{Counter, Histogram},
+};
 use serde::{Serialize, de::DeserializeOwned};
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 use super::METER;
 
@@ -57,6 +60,22 @@ static ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .with_description("OptiCon requests")
         .build()
 });
+
+/// Number of optimistic-concurrency conflict retries a single `with_mut` call
+/// took before committing. On a backend that caps single-object update rate
+/// (GCS ~1 write/s/object, #13), a hot object shows up here as a rising
+/// distribution — the contention that was previously invisible (30s latency,
+/// zero log lines).
+static RETRIES: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    METER
+        .u64_histogram("tansu_opticon_with_mut_retries")
+        .with_description("OptiCon with_mut conflict retries per call")
+        .build()
+});
+
+/// A `with_mut` call that retries more than this many times on conflict is
+/// almost certainly contending on a hot object; surface it in the logs.
+const RETRY_WARN_THRESHOLD: u64 = 8;
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct OptiCon<D> {
@@ -247,6 +266,8 @@ where
             );
         };
 
+        let mut retries: u64 = 0;
+
         loop {
             REQUESTS.add(1, &[KeyValue::new("method", "with_mut_loop")]);
 
@@ -275,6 +296,8 @@ where
                     on_error(error)
                 }) {
                 Ok(put_result) => {
+                    RETRIES.record(retries, &[]);
+
                     return self
                         .data_version
                         .lock()
@@ -295,6 +318,16 @@ where
                     object_store::Error::Precondition { .. }
                     | object_store::Error::AlreadyExists { .. },
                 ) => {
+                    retries += 1;
+
+                    if retries >= RETRY_WARN_THRESHOLD {
+                        warn!(
+                            path = %self.path,
+                            retries,
+                            "OptiCon with_mut contending on a hot object (per-object update-rate cap?)"
+                        );
+                    }
+
                     self.get(object_store).await?;
                     continue;
                 }

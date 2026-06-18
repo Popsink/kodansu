@@ -2376,6 +2376,23 @@ impl Builder<i32, String, Url, Url> {
 
                 GoogleCloudStorageBuilder::from_env()
                     .with_bucket_name(bucket_name)
+                    // GCS caps updates to a single object at ~1 write/second; an
+                    // over-the-cap conditional update returns `429 rateLimitExceeded`.
+                    // The object_store default RetryConfig (10 retries over 180s) backs
+                    // off *silently*, which is exactly the "30s produce latency with zero
+                    // log lines" reported in #13. Bound the budget so a throttled object
+                    // fails fast instead of hanging tens of seconds. `PutMode::Create`
+                    // conflicts are NOT retried here — they surface as `AlreadyExists`
+                    // and are resolved by the dynostore offset-assignment loop.
+                    .with_retry(RetryConfig {
+                        backoff: BackoffConfig {
+                            init_backoff: Duration::from_millis(100),
+                            max_backoff: Duration::from_secs(3),
+                            base: 2.0,
+                        },
+                        max_retries: 5,
+                        retry_timeout: Duration::from_secs(15),
+                    })
                     .build()
                     .map(|object_store| {
                         PutRateLimiter::new(object_store, Duration::from_mins(5))
