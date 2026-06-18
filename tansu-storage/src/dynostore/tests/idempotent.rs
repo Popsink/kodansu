@@ -26,7 +26,9 @@ use tansu_sans_io::{
     record::inflated,
 };
 
-use crate::{Error, Result, Storage, Topition, dynostore::DynoStore, dynostore::tests::init_tracing};
+use crate::{
+    Error, Result, Storage, Topition, dynostore::DynoStore, dynostore::tests::init_tracing,
+};
 
 const CLUSTER: &str = "tansu";
 const NODE: i32 = 111;
@@ -102,21 +104,44 @@ async fn producers_validate_independently() -> Result<(), Error> {
 
     // p1 writes two records (seq 0,1), p2 one record (seq 0); they interleave on
     // the same partition but each tracks its own sequence.
-    assert_eq!(0, store.produce(None, &topition, idempotent_batch(p1, 0, 0, 2)?).await?);
-    assert_eq!(2, store.produce(None, &topition, idempotent_batch(p2, 0, 0, 1)?).await?);
-    assert_eq!(3, store.produce(None, &topition, idempotent_batch(p1, 0, 2, 1)?).await?);
+    assert_eq!(
+        0,
+        store
+            .produce(None, &topition, idempotent_batch(p1, 0, 0, 2)?)
+            .await?
+    );
+    assert_eq!(
+        2,
+        store
+            .produce(None, &topition, idempotent_batch(p2, 0, 0, 1)?)
+            .await?
+    );
+    assert_eq!(
+        3,
+        store
+            .produce(None, &topition, idempotent_batch(p1, 0, 2, 1)?)
+            .await?
+    );
 
     // Re-sending p2's first batch is a duplicate for p2 — unaffected by p1's
     // progress on the same partition.
     assert_eq!(
         ErrorCode::DuplicateSequenceNumber,
-        api_error(store.produce(None, &topition, idempotent_batch(p2, 0, 0, 1)?).await)
+        api_error(
+            store
+                .produce(None, &topition, idempotent_batch(p2, 0, 0, 1)?)
+                .await
+        )
     );
 
     // A gap for p1 is out-of-order; again independent of p2.
     assert_eq!(
         ErrorCode::OutOfOrderSequenceNumber,
-        api_error(store.produce(None, &topition, idempotent_batch(p1, 0, 9, 1)?).await)
+        api_error(
+            store
+                .produce(None, &topition, idempotent_batch(p1, 0, 9, 1)?)
+                .await
+        )
     );
 
     Ok(())
@@ -142,20 +167,28 @@ async fn idempotent_state_is_shared_across_replicas() -> Result<(), Error> {
     // the sharded object A wrote.
     assert_eq!(
         0,
-        replica_b.produce(None, &topition, idempotent_batch(producer, 0, 0, 2)?).await?
+        replica_b
+            .produce(None, &topition, idempotent_batch(producer, 0, 0, 2)?)
+            .await?
     );
 
     // Replaying seq 0 on A must be rejected as a duplicate — A sees B's advance
     // through the shared object, not a per-replica counter.
     assert_eq!(
         ErrorCode::DuplicateSequenceNumber,
-        api_error(replica_a.produce(None, &topition, idempotent_batch(producer, 0, 0, 2)?).await)
+        api_error(
+            replica_a
+                .produce(None, &topition, idempotent_batch(producer, 0, 0, 2)?)
+                .await
+        )
     );
 
     // The contiguous continuation (seq 2) from B succeeds at offset 2.
     assert_eq!(
         2,
-        replica_b.produce(None, &topition, idempotent_batch(producer, 0, 2, 1)?).await?
+        replica_b
+            .produce(None, &topition, idempotent_batch(producer, 0, 2, 1)?)
+            .await?
     );
 
     Ok(())
@@ -174,7 +207,11 @@ async fn unregistered_producer_is_rejected() -> Result<(), Error> {
     // Never registered via InitProducerId.
     assert_eq!(
         ErrorCode::UnknownProducerId,
-        api_error(store.produce(None, &topition, idempotent_batch(42, 0, 0, 1)?).await)
+        api_error(
+            store
+                .produce(None, &topition, idempotent_batch(42, 0, 0, 1)?)
+                .await
+        )
     );
 
     Ok(())

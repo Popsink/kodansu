@@ -660,7 +660,12 @@ impl DynoStore {
                 }
 
                 Err(object_store::Error::AlreadyExists { .. }) => {
-                    debug!(candidate, attempt, ?topition, "offset taken, resyncing tail");
+                    debug!(
+                        candidate,
+                        attempt,
+                        ?topition,
+                        "offset taken, resyncing tail"
+                    );
                     candidate = self.tail_next_offset(topition, Some(candidate)).await?;
                     self.set_high(topition, candidate)?;
                 }
@@ -1626,7 +1631,9 @@ impl Storage for DynoStore {
             // authority; the watermark stays a write-behind cache only. This is
             // the #13 fix: the produce hot path no longer hammers a single
             // object capped at ~1 write/s on GCS.
-            let payload = self.encode(deflated.clone()).inspect_err(|err| debug!(?err))?;
+            let payload = self
+                .encode(deflated.clone())
+                .inspect_err(|err| debug!(?err))?;
 
             let offset = self
                 .assign_and_create(topition, &deflated, payload)

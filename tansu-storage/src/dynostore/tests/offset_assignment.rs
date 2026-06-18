@@ -31,7 +31,9 @@ use tansu_sans_io::{
     record::inflated,
 };
 
-use crate::{Error, Result, Storage, Topition, dynostore::DynoStore, dynostore::tests::init_tracing};
+use crate::{
+    Error, Result, Storage, Topition, dynostore::DynoStore, dynostore::tests::init_tracing,
+};
 
 const CLUSTER: &str = "tansu";
 const NODE: i32 = 111;
@@ -148,7 +150,11 @@ async fn multi_writer_offsets_are_contiguous() -> Result<(), Error> {
         .iter()
         .map(|(offset, _)| *offset)
         .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(PRODUCES, distinct.len(), "duplicate offsets in {assigned:?}");
+    assert_eq!(
+        PRODUCES,
+        distinct.len(),
+        "duplicate offsets in {assigned:?}"
+    );
 
     // Offsets tile [0, expected_total) with no gaps/overlaps.
     assert_contiguous(assigned, expected_total);
