@@ -1,0 +1,223 @@
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Offset assignment is done by *creating* immutable, create-only batch objects
+//! whose names encode the base offset, rather than by updating a hot
+//! per-partition `watermark` object on every batch (#13). These tests exercise
+//! the correctness properties that move guards:
+//!
+//! - concurrent writers (tasks on one store, or two stores sharing one bucket —
+//!   i.e. two stateless replicas) assign **contiguous, non-overlapping** offsets
+//!   with no gaps and no losses;
+//! - a `Create` conflict resyncs to the real next offset;
+//! - the high watermark is derived from the immutable objects, so a cold replica
+//!   reads it correctly without ever having written the partition.
+
+use bytes::Bytes;
+use object_store::memory::InMemory;
+use tansu_sans_io::{
+    IsolationLevel, create_topics_request::CreatableTopic, record::Record, record::deflated,
+    record::inflated,
+};
+
+use crate::{Error, Result, Storage, Topition, dynostore::DynoStore, dynostore::tests::init_tracing};
+
+const CLUSTER: &str = "tansu";
+const NODE: i32 = 111;
+
+/// Build a non-idempotent deflated batch carrying `records` records (so it
+/// occupies `records` consecutive offsets, `last_offset_delta == records - 1`).
+fn batch(records: usize) -> Result<deflated::Batch> {
+    let mut builder = inflated::Batch::builder();
+
+    for i in 0..records {
+        builder = builder.record(Record::builder().value(Some(Bytes::copy_from_slice(
+            format!("record-{i}").as_bytes(),
+        ))));
+    }
+
+    // `build()` does not derive `last_offset_delta` from the record count — a
+    // real Kafka producer sets it on the wire — so set it explicitly here. It
+    // is what makes a batch occupy `records` consecutive offsets.
+    builder
+        .last_offset_delta(records as i32 - 1)
+        .build()
+        .and_then(deflated::Batch::try_from)
+        .map_err(Into::into)
+}
+
+async fn create_topic(storage: &DynoStore, name: &str, partitions: i32) -> Result<()> {
+    _ = storage
+        .create_topic(
+            CreatableTopic::default()
+                .name(name.into())
+                .num_partitions(partitions)
+                .replication_factor(1)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    Ok(())
+}
+
+/// Assert the (offset, record_count) pairs tile `[0, total)` exactly: sorted by
+/// base offset they must be contiguous with no gaps and no overlaps, and every
+/// base offset must be distinct.
+fn assert_contiguous(mut assigned: Vec<(i64, usize)>, expected_total: i64) {
+    assigned.sort_by_key(|(offset, _)| *offset);
+
+    let mut next = 0i64;
+    for (offset, count) in &assigned {
+        assert_eq!(
+            next, *offset,
+            "non-contiguous offset assignment: expected {next}, got {offset} in {assigned:?}"
+        );
+        next += *count as i64;
+    }
+
+    assert_eq!(
+        expected_total, next,
+        "total records covered {next} != expected {expected_total} in {assigned:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multi_writer_offsets_are_contiguous() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    // Two stores over ONE shared bucket == two stateless replicas (node 111).
+    let bucket = InMemory::new();
+    let replica_a = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    let replica_b = DynoStore::new(CLUSTER, NODE, bucket.clone());
+
+    let topic = "concurrent";
+    create_topic(&replica_a, topic, 1).await?;
+
+    let topition = Topition::new(topic, 0);
+
+    const PRODUCES: usize = 64;
+
+    let mut handles = Vec::new();
+    let mut expected_total = 0i64;
+
+    for i in 0..PRODUCES {
+        // Mix single- and multi-record batches so overlaps (which a base-only
+        // view would miss) are exercised.
+        let records = 1 + (i % 3);
+        expected_total += records as i64;
+
+        // Spread produces across both replicas so writers genuinely race the
+        // same partition tail on different stores.
+        let storage = if i % 2 == 0 {
+            replica_a.clone()
+        } else {
+            replica_b.clone()
+        };
+
+        let topition = topition.clone();
+        let deflated = batch(records)?;
+
+        handles.push(tokio::spawn(async move {
+            storage
+                .produce(None, &topition, deflated)
+                .await
+                .map(|offset| (offset, records))
+        }));
+    }
+
+    let mut assigned = Vec::with_capacity(PRODUCES);
+    for handle in handles {
+        assigned.push(handle.await.expect("task panicked")?);
+    }
+
+    // Every produce returned a distinct base offset.
+    let distinct = assigned
+        .iter()
+        .map(|(offset, _)| *offset)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(PRODUCES, distinct.len(), "duplicate offsets in {assigned:?}");
+
+    // Offsets tile [0, expected_total) with no gaps/overlaps.
+    assert_contiguous(assigned, expected_total);
+
+    // A fresh, cold replica reads the high watermark purely from the immutable
+    // batch objects (it never wrote this partition).
+    let replica_c = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    let stage = replica_c.offset_stage(&topition).await?;
+    assert_eq!(expected_total, stage.high_watermark);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn conflict_resyncs_to_next_offset() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let replica_a = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    let replica_b = DynoStore::new(CLUSTER, NODE, bucket.clone());
+
+    let topic = "resync";
+    create_topic(&replica_a, topic, 1).await?;
+    let topition = Topition::new(topic, 0);
+
+    // B writes offset 0; its in-memory hint advances to 1.
+    assert_eq!(0, replica_b.produce(None, &topition, batch(1)?).await?);
+
+    // A (cold) derives the tail from listing -> writes offset 1; real tail is 2.
+    assert_eq!(1, replica_a.produce(None, &topition, batch(1)?).await?);
+
+    // B still believes the next offset is 1 (stale hint). Its Create at 1 must
+    // conflict (A owns it), resync from the listing, and land on 2.
+    assert_eq!(2, replica_b.produce(None, &topition, batch(1)?).await?);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn high_watermark_from_listing_on_cold_replica() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let writer = DynoStore::new(CLUSTER, NODE, bucket.clone());
+
+    let topic = "cold-read";
+    create_topic(&writer, topic, 1).await?;
+    let topition = Topition::new(topic, 0);
+
+    // A multi-record batch (offsets 0..=2) then a single-record batch (3).
+    assert_eq!(0, writer.produce(None, &topition, batch(3)?).await?);
+    assert_eq!(3, writer.produce(None, &topition, batch(1)?).await?);
+
+    // A reader that never touched this partition still reports the correct high
+    // watermark (== log end offset == 4), proving it comes from the immutable
+    // objects and not a per-replica cache.
+    let reader = DynoStore::new(CLUSTER, NODE, bucket.clone());
+
+    let stage = reader.offset_stage(&topition).await?;
+    assert_eq!(4, stage.high_watermark);
+
+    let latest = reader
+        .list_offsets(
+            IsolationLevel::ReadUncommitted,
+            &[(topition.clone(), tansu_sans_io::ListOffset::Latest)],
+        )
+        .await?;
+    assert_eq!(1, latest.len());
+    assert_eq!(Some(4), latest[0].1.offset);
+
+    Ok(())
+}

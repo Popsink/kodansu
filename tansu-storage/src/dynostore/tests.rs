@@ -21,6 +21,7 @@ use tracing_subscriber::EnvFilter;
 use crate::{Error, Result};
 
 mod latency;
+mod offset_assignment;
 
 pub(crate) fn init_tracing() -> Result<DefaultGuard, Error> {
     _ = dotenv().ok();

@@ -97,6 +97,17 @@ pub struct DynoStore {
     watermarks: Arc<Mutex<BTreeMap<Topition, OptiCon<Watermark>>>>,
     meta: OptiCon<Meta>,
 
+    /// Per-partition cache of the next offset to assign (== the high watermark).
+    ///
+    /// This is a *hint*, not the authority: the authority is the set of
+    /// immutable, create-only batch objects whose names encode their base
+    /// offset. The hint lets the common produce path skip a tail listing, and
+    /// is reconciled against the listing on a `Create` conflict or a cold read
+    /// (see [`DynoStore::refresh_high`]). Keeping offset assignment off a single
+    /// mutable `watermark` object is what takes the produce hot path off the
+    /// GCS per-object update-rate cap (#13).
+    next_offsets: Arc<Mutex<BTreeMap<Topition, i64>>>,
+
     object_store: Arc<DynObjectStore>,
 }
 
@@ -357,6 +368,7 @@ impl DynoStore {
             lake: None,
 
             watermarks: Arc::new(Mutex::new(BTreeMap::new())),
+            next_offsets: Arc::new(Mutex::new(BTreeMap::new())),
             meta: OptiCon::<Meta>::new(cluster),
             object_store: Arc::new(Cache::new(
                 Metron::new(object_store, cluster),
@@ -423,6 +435,190 @@ impl DynoStore {
                     .to_owned()
             })
             .map_err(Into::into)
+    }
+
+    /// The cached next offset (== high watermark) hint for `topition`, if known
+    /// to this process. `None` means the partition has not been read or written
+    /// here yet and the tail must be listed.
+    fn cached_high(&self, topition: &Topition) -> Result<Option<i64>> {
+        self.next_offsets
+            .lock()
+            .map(|locked| locked.get(topition).copied())
+            .map_err(Into::into)
+    }
+
+    /// Advance the cached next-offset hint for `topition`. Monotonic: a slower
+    /// task can never lower a value a faster one already published, so the hint
+    /// only ever moves forward (offsets are never reused).
+    fn set_high(&self, topition: &Topition, high: i64) -> Result<()> {
+        self.next_offsets
+            .lock()
+            .map(|mut locked| {
+                let entry = locked.entry(topition.to_owned()).or_default();
+                *entry = (*entry).max(high);
+            })
+            .map_err(Into::into)
+    }
+
+    /// Read the base offset and record count of the partition's tail batch,
+    /// scanning only objects at or after `from` (a cached floor). Returns the
+    /// next offset past the tail (`base + last_offset_delta + 1`), or `from`
+    /// (defaulting to `0`) when no batch exists at/after the floor.
+    ///
+    /// The authority for the high watermark is the immutable batch objects, not
+    /// any mutable `watermark` object — so this is correct across replicas: a
+    /// batch another replica created is visible here as soon as it is listed
+    /// (GCS object listing is strongly consistent).
+    async fn tail_next_offset(&self, topition: &Topition, from: Option<i64>) -> Result<i64> {
+        let prefix = self.records_prefix(topition);
+
+        let mut max: Option<(i64, Path)> = None;
+
+        let mut list_stream = match from {
+            Some(floor) => {
+                // Batch names are zero-padded offsets, so this strict prefix of
+                // `{floor:0>20}.batch` yields base offsets >= floor (same trick
+                // as `fetch`), bounding the scan to the contended tail region.
+                let start_after = Path::from(format!(
+                    "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}",
+                    self.cluster, topition.topic, topition.partition, floor,
+                ));
+
+                self.object_store
+                    .list_with_offset(Some(&prefix), &start_after)
+            }
+            None => self.object_store.list(Some(&prefix)),
+        };
+
+        while let Some(meta) = list_stream
+            .next()
+            .await
+            .transpose()
+            .inspect_err(|err| error!(?err, ?topition))?
+        {
+            let Some(name) = meta.location.parts().next_back() else {
+                continue;
+            };
+
+            let Ok(offset) = i64::from_str(&name.as_ref()[0..20]) else {
+                continue;
+            };
+
+            if max.as_ref().is_none_or(|(m, _)| offset > *m) {
+                max = Some((offset, meta.location));
+            }
+        }
+
+        let Some((base, location)) = max else {
+            return Ok(from.unwrap_or(0));
+        };
+
+        let encoded = self
+            .object_store
+            .get(&location)
+            .await
+            .inspect_err(|err| error!(?err, ?topition, base))?
+            .bytes()
+            .await
+            .inspect_err(|err| error!(?err, ?topition, base))?;
+
+        let batch = self.decode(encoded)?;
+
+        Ok(base + batch.last_offset_delta as i64 + 1)
+    }
+
+    /// Reconcile the cached high-watermark hint for `topition` against the
+    /// partition's batch objects and return the authoritative next offset.
+    async fn refresh_high(&self, topition: &Topition) -> Result<i64> {
+        let floor = self.cached_high(topition)?;
+        let high = self.tail_next_offset(topition, floor).await?;
+        self.set_high(topition, high)?;
+        Ok(high)
+    }
+
+    /// The log end offset (high watermark) for `topition`.
+    ///
+    /// For ordinary topics the authority is the immutable batch objects
+    /// ([`Self::refresh_high`]). Lake-sink topics (`tansu.lake.sink`) write *no*
+    /// batch objects — their records go straight to the lake and the offset is
+    /// carried in the mutable `watermark` object — so we take the max of the two
+    /// sources. `watermark.high` is otherwise no longer advanced on the produce
+    /// hot path (#13), so for ordinary topics the listing always wins.
+    async fn high_watermark(&self, topition: &Topition) -> Result<i64> {
+        let from_objects = self.refresh_high(topition).await?;
+
+        let from_watermark = self
+            .watermark(topition)?
+            .with(&self.object_store, |watermark| {
+                Ok(watermark.high.unwrap_or(0))
+            })
+            .await?;
+
+        Ok(from_objects.max(from_watermark))
+    }
+
+    /// Assign the next offset to `deflated` and persist it as an immutable,
+    /// create-only batch object whose name encodes the base offset.
+    ///
+    /// The `PutMode::Create` *is* the offset-assignment authority: two writers
+    /// (tasks on one replica, or different replicas) racing the same offset both
+    /// attempt the create, exactly one wins and the loser gets `AlreadyExists`
+    /// (GCS guards this with `x-goog-if-generation-match: 0`), resyncs from the
+    /// partition tail and retries at the next free offset. This keeps the
+    /// produce hot path on *creating distinct new objects* (high create rate is
+    /// fine on GCS) instead of *updating one hot `watermark` object* (capped at
+    /// ~1/s), which is the #13 collapse. Contiguity holds because the resync
+    /// reads the real tail, never a speculative reservation — no gaps, no
+    /// overlaps.
+    async fn assign_and_create(
+        &self,
+        topition: &Topition,
+        deflated: &deflated::Batch,
+        payload: PutPayload,
+    ) -> Result<i64> {
+        /// Bounds the conflict-resync loop so a pathologically hot partition
+        /// fails fast instead of spinning; far above any real contention.
+        const MAX_ATTEMPTS: usize = 64;
+
+        let record_count = deflated.last_offset_delta as i64 + 1;
+
+        let mut candidate = match self.cached_high(topition)? {
+            Some(hint) => hint,
+            None => self.refresh_high(topition).await?,
+        };
+
+        for attempt in 0..MAX_ATTEMPTS {
+            match self
+                .object_store
+                .put_opts(
+                    &self.batch_location(topition, candidate),
+                    payload.clone(),
+                    PutOptions {
+                        mode: PutMode::Create,
+                        attributes: Attributes::new(),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(outcome) => {
+                    debug!(?outcome, candidate, ?topition);
+                    self.set_high(topition, candidate + record_count)?;
+                    return Ok(candidate);
+                }
+
+                Err(object_store::Error::AlreadyExists { .. }) => {
+                    debug!(candidate, attempt, ?topition, "offset taken, resyncing tail");
+                    candidate = self.tail_next_offset(topition, Some(candidate)).await?;
+                    self.set_high(topition, candidate)?;
+                }
+
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        error!(?topition, candidate, "offset assignment exhausted retries");
+        Err(Error::Api(ErrorCode::UnknownServerError))
     }
 
     /// Enforce the `delete` cleanup policy: for every topic configured with
@@ -717,12 +913,10 @@ impl DynoStore {
     /// set the log start offset to `before`. `before` of `-1` means the log end
     /// offset (delete everything). Returns the new log start offset.
     async fn delete_records_before(&self, topition: &Topition, before: i64) -> Result<i64> {
-        let high = self
-            .watermark(topition)?
-            .with(&self.object_store, |watermark| {
-                Ok(watermark.high.unwrap_or(0))
-            })
-            .await?;
+        // The log end offset comes from the immutable batch objects (the
+        // authority), not the write-behind `watermark` object, which is no
+        // longer advanced on the produce hot path (#13).
+        let high = self.high_watermark(topition).await?;
 
         let before = if before < 0 { high } else { before.min(high) };
 
@@ -1057,6 +1251,14 @@ impl Storage for DynoStore {
                             Ok(())
                         })
                         .await?;
+
+                    // Drop any stale next-offset hint (e.g. a topic of the same
+                    // name was previously deleted) so the fresh, empty partition
+                    // re-derives offset 0 from listing.
+                    _ = self
+                        .next_offsets
+                        .lock()
+                        .map(|mut locked| locked.remove(&topition))?;
                 }
 
                 Ok(id)
@@ -1361,33 +1563,22 @@ impl Storage for DynoStore {
                 }
             }
 
-            let watermark = self.watermarks.lock().map(|mut locked| {
-                locked
-                    .entry(topition.to_owned())
-                    .or_insert_with(|| OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
-                    .to_owned()
-            })?;
+            let attributes =
+                BatchAttribute::try_from(deflated.attributes).inspect_err(|err| debug!(?err))?;
 
-            let offset = watermark
-                .with_mut(&self.object_store, |watermark| {
-                    debug!(?watermark);
+            // Assign the offset by *creating* the immutable batch object (its
+            // name encodes the base offset), rather than by updating a hot
+            // per-partition `watermark` object on every batch. The create is the
+            // authority; the watermark stays a write-behind cache only. This is
+            // the #13 fix: the produce hot path no longer hammers a single
+            // object capped at ~1 write/s on GCS.
+            let payload = self.encode(deflated.clone()).inspect_err(|err| debug!(?err))?;
 
-                    let offset = watermark.high.unwrap_or_default();
-                    watermark.high = watermark.high.map_or_else(
-                        || Some(deflated.last_offset_delta as i64 + 1i64),
-                        |high| Some(high + deflated.last_offset_delta as i64 + 1i64),
-                    );
-
-                    debug!(?watermark);
-
-                    Ok(offset)
-                })
+            let offset = self
+                .assign_and_create(topition, &deflated, payload)
                 .await
                 .inspect(|offset| debug!(offset, transaction_id, ?topition))
                 .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
-
-            let attributes =
-                BatchAttribute::try_from(deflated.attributes).inspect_err(|err| debug!(?err))?;
 
             if !attributes.control
                 && let Some(ref lake) = self.lake
@@ -1450,28 +1641,6 @@ impl Storage for DynoStore {
                     .inspect(|outcome| debug!(?outcome, transaction_id, ?topition))
                     .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
             }
-
-            let location = Path::from(format!(
-                "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
-                self.cluster, topition.topic, topition.partition, offset,
-            ));
-
-            let payload = self.encode(deflated).inspect_err(|err| debug!(?err))?;
-
-            _ = self
-                .object_store
-                .put_opts(
-                    &location,
-                    payload,
-                    PutOptions {
-                        mode: PutMode::Create,
-                        attributes: Attributes::new(),
-                        ..Default::default()
-                    },
-                )
-                .await
-                .inspect(|outcome| debug!(?outcome, transaction_id, ?topition))
-                .inspect_err(|error| error!(?error, transaction_id, ?topition))?;
 
             Ok(offset)
         }
@@ -1626,6 +1795,15 @@ impl Storage for DynoStore {
 
         debug!(?stable);
 
+        // The high watermark is derived from the immutable batch objects (the
+        // authority), not from the mutable `watermark` object — so it is correct
+        // across replicas even though offset assignment no longer CASes the
+        // watermark on every produce (#13). The `watermark` object is consulted
+        // only for the log start offset (`low`), advanced on the cold
+        // maintain/expire path (and for lake-sink topics' high, folded into
+        // `high_watermark`).
+        let high_watermark = self.high_watermark(topition).await?;
+
         let watermark = self.watermarks.lock().map(|mut locked| {
             locked
                 .entry(topition.to_owned())
@@ -1636,7 +1814,6 @@ impl Storage for DynoStore {
         watermark
             .with(&self.object_store, |watermark| {
                 debug!(?watermark);
-                let high_watermark = watermark.high.unwrap_or(0);
                 let log_start = watermark.low.unwrap_or(0);
                 let last_stable = stable.get(topition).copied().unwrap_or(high_watermark);
 
@@ -1696,6 +1873,27 @@ impl Storage for DynoStore {
         let mut responses = vec![];
 
         for (topition, offset_request) in offsets {
+            // LATEST (outside an open read-committed transaction) is the log end
+            // offset == high watermark, derived from the immutable batch objects
+            // (max base offset + that batch's record count). The previous
+            // `last_modified` ordering was wrong under inter-replica clock skew
+            // and `max_base + 1` ignored multi-record batches; `refresh_high`
+            // is correct on both counts.
+            if *offset_request == ListOffset::Latest && !stable.contains_key(topition) {
+                let high = self.high_watermark(topition).await?;
+
+                responses.push((
+                    topition.to_owned(),
+                    ListOffsetResponse {
+                        error_code: ErrorCode::None,
+                        offset: Some(high),
+                        ..Default::default()
+                    },
+                ));
+
+                continue;
+            }
+
             let location = Path::from(format!(
                 "clusters/{}/topics/{}/partitions/{:0>10}/records",
                 self.cluster, topition.topic, topition.partition,
