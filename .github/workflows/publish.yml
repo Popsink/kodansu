@@ -26,10 +26,10 @@ jobs:
         include:
           - platform: linux/amd64
             platform_pair: linux-amd64
-            runner: ubuntu-latest
+            runner: ubuntu-latest-8-cores
           - platform: linux/arm64
             platform_pair: linux-arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-24.04-arm-8-cores
 
     runs-on: ${{ matrix.runner }}
     steps:
