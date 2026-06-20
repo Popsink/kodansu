@@ -1401,6 +1401,15 @@ pub trait Storage: Debug + Send + Sync + 'static {
         Err(Error::Api(ErrorCode::UnsupportedVersion))
     }
 
+    /// The object-store key where the batch for `(topition, offset)` must be
+    /// written (the offset-keyed Kotatsu layout). The coordinator owns this
+    /// layout and resolves the topic id, so a stateless front writing the bytes
+    /// never needs the topic UUID, cluster id, or key format — it just writes to
+    /// the returned path. Only coordinator backends support this.
+    async fn record_object_path(&self, _topition: &Topition, _offset: i64) -> Result<String> {
+        Err(Error::Api(ErrorCode::UnsupportedVersion))
+    }
+
     /// Confirm a reserved batch whose bytes are now durable in object storage,
     /// recording its offset→object marker and releasing the reservation.
     async fn confirm(&self, _topition: &Topition, _base: i64, _byte_size: u64) -> Result<()> {
@@ -1624,6 +1633,10 @@ where
 
     async fn reserve(&self, topition: &Topition, count: i64, deadline_ms: i64) -> Result<i64> {
         self.as_ref().reserve(topition, count, deadline_ms).await
+    }
+
+    async fn record_object_path(&self, topition: &Topition, offset: i64) -> Result<String> {
+        self.as_ref().record_object_path(topition, offset).await
     }
 
     async fn confirm(&self, topition: &Topition, base: i64, byte_size: u64) -> Result<()> {
@@ -1895,6 +1908,10 @@ where
 
     async fn reserve(&self, topition: &Topition, count: i64, deadline_ms: i64) -> Result<i64> {
         self.as_ref().reserve(topition, count, deadline_ms).await
+    }
+
+    async fn record_object_path(&self, topition: &Topition, offset: i64) -> Result<String> {
+        self.as_ref().record_object_path(topition, offset).await
     }
 
     async fn confirm(&self, topition: &Topition, base: i64, byte_size: u64) -> Result<()> {
@@ -3035,6 +3052,24 @@ impl Storage for StorageContainer {
             Self::Slate(engine) => engine.reserve(topition, count, deadline_ms),
             #[cfg(feature = "turso")]
             Self::Turso(engine) => engine.reserve(topition, count, deadline_ms),
+        }
+        .await
+    }
+
+    #[instrument(skip_all)]
+    async fn record_object_path(&self, topition: &Topition, offset: i64) -> Result<String> {
+        match self {
+            #[cfg(feature = "dynostore")]
+            Self::DynoStore(engine) => engine.record_object_path(topition, offset),
+            #[cfg(feature = "libsql")]
+            Self::Lite(engine) => engine.record_object_path(topition, offset),
+            Self::Null(engine) => engine.record_object_path(topition, offset),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(engine) => engine.record_object_path(topition, offset),
+            #[cfg(feature = "slatedb")]
+            Self::Slate(engine) => engine.record_object_path(topition, offset),
+            #[cfg(feature = "turso")]
+            Self::Turso(engine) => engine.record_object_path(topition, offset),
         }
         .await
     }

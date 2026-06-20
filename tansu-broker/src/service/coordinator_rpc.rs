@@ -77,7 +77,13 @@ where
             } => {
                 let tp = Topition::new(topic, partition);
                 match self.storage.reserve(&tp, count, deadline_ms).await {
-                    Ok(base) => Ok(Response::Reserved { base }),
+                    Ok(base) => {
+                        // resolve the S3 key here (coordinator-side), so the
+                        // front writes to an opaque path and never needs the
+                        // topic id, cluster id, or key layout.
+                        let object_path = self.storage.record_object_path(&tp, base).await?;
+                        Ok(Response::Reserved { base, object_path })
+                    }
                     Err(StorageError::Api(code)) => Ok(Response::Error { code: code.into() }),
                     Err(error) => Err(error.into()),
                 }
@@ -123,7 +129,7 @@ where
 mod tests {
     use super::*;
     use tansu_sans_io::{ErrorCode, create_topics_request::CreatableTopic};
-    use tansu_storage::{ArcDynStorage, Storage as _, StorageContainer};
+    use tansu_storage::{ArcDynStorage, StorageContainer};
     use url::Url;
 
     async fn hybrid_storage() -> ArcDynStorage {
@@ -165,7 +171,11 @@ mod tests {
                 },
             )
             .await?;
-        assert_eq!(reserved, Response::Reserved { base: 0 });
+        assert!(matches!(
+            reserved,
+            Response::Reserved { base: 0, ref object_path }
+                if object_path.ends_with("/records/00000000000000000000.batch")
+        ));
 
         let confirmed = handler
             .serve(

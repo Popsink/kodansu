@@ -79,8 +79,10 @@ pub enum Request {
 /// A coordinator RPC response.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub enum Response {
-    /// Offsets `[base, base + count)` are reserved for the caller.
-    Reserved { base: i64 },
+    /// Offsets `[base, base + count)` are reserved for the caller, which must
+    /// write the batch bytes to `object_path` (the coordinator owns the key
+    /// layout) before [`Request::Confirm`].
+    Reserved { base: i64, object_path: String },
     /// The reserved batch is recorded; its offsets are now confirmed.
     Confirmed,
     /// The request failed; carries the Kafka error-code value.
@@ -245,14 +247,15 @@ impl Client {
         postcard::from_bytes(&body).map_err(Into::into)
     }
 
-    /// Reserve `count` offsets for `topic`/`partition`; returns the base offset.
+    /// Reserve `count` offsets for `topic`/`partition`; returns the assigned base
+    /// offset and the object-store path to write the batch bytes to.
     pub async fn reserve(
         &self,
         topic: impl Into<String>,
         partition: i32,
         count: i64,
         deadline_ms: i64,
-    ) -> Result<i64, Error> {
+    ) -> Result<(i64, String), Error> {
         match self
             .call(Request::Reserve {
                 topic: topic.into(),
@@ -262,7 +265,7 @@ impl Client {
             })
             .await?
         {
-            Response::Reserved { base } => Ok(base),
+            Response::Reserved { base, object_path } => Ok((base, object_path)),
             Response::Error { code } => Err(Error::Coordinator(code)),
             Response::Confirmed => Err(Error::Message("unexpected Confirmed for reserve".into())),
         }
@@ -303,7 +306,10 @@ mod tests {
     async fn round_trips_reserve_through_the_postcard_codec() -> Result<(), Error> {
         // inner service: typed Request -> typed Response
         let inner = service_fn(async |_ctx: Context<()>, req: Request| match req {
-            Request::Reserve { count, .. } => Ok::<_, Error>(Response::Reserved { base: count }),
+            Request::Reserve { count, .. } => Ok::<_, Error>(Response::Reserved {
+                base: count,
+                object_path: "p".into(),
+            }),
             Request::Confirm { .. } => Ok(Response::Confirmed),
         });
 
@@ -320,7 +326,13 @@ mod tests {
 
         let out = svc.serve(Context::default(), wire).await?;
         let decoded: Response = decode_frame(&out)?;
-        assert_eq!(decoded, Response::Reserved { base: 7 });
+        assert_eq!(
+            decoded,
+            Response::Reserved {
+                base: 7,
+                object_path: "p".into()
+            }
+        );
         Ok(())
     }
 
@@ -338,9 +350,10 @@ mod tests {
         // TcpBytesService hands its inner service `Context<()>` (it swaps to its
         // own State::default()), so the handler is Service<(), Request>.
         let handler = service_fn(async |_ctx: Context<()>, req: Request| match req {
-            Request::Reserve { count, .. } => {
-                Ok::<_, Error>(Response::Reserved { base: count - 1 })
-            }
+            Request::Reserve { count, .. } => Ok::<_, Error>(Response::Reserved {
+                base: count - 1,
+                object_path: "p".into(),
+            }),
             Request::Confirm { .. } => Ok(Response::Confirmed),
         });
         let server = (
@@ -357,7 +370,8 @@ mod tests {
         });
 
         let client = Client::new(addr.to_string())?;
-        assert_eq!(client.reserve("t", 3, 10, 0).await?, 9);
+        let (base, object_path) = client.reserve("t", 3, 10, 0).await?;
+        assert_eq!((base, object_path.as_str()), (9, "p"));
         assert!(matches!(client.confirm("t", 3, 9, 64).await, Ok(())));
         Ok(())
     }

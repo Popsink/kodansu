@@ -129,6 +129,16 @@ impl Storage for Engine {
         self.commit_tx(tx).await.and(Ok(base))
     }
 
+    async fn record_object_path(&self, topition: &Topition, offset: i64) -> Result<String> {
+        let topics = self.get_topics().await?;
+        let Some(metadata) = topics.get(&topition.topic[..]) else {
+            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+        };
+        Ok(self
+            .batch_object_path(metadata.id, topition.partition, offset)
+            .to_string())
+    }
+
     /// Confirm a previously reserved batch whose bytes the writer has already
     /// put to the object store. Records the `b/` marker and drops the
     /// reservation, which lets the visible watermark advance over it.

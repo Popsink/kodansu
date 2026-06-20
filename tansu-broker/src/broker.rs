@@ -820,7 +820,9 @@ mod tests {
         ));
 
         let client = Client::new(addr.to_string())?;
-        assert_eq!(client.reserve("rpc", 0, 5, 0).await?, 0);
+        let (base, object_path) = client.reserve("rpc", 0, 5, 0).await?;
+        assert_eq!(base, 0);
+        assert!(object_path.ends_with("/records/00000000000000000000.batch"));
         client.confirm("rpc", 0, 0, 64).await?;
 
         token.cancel();
