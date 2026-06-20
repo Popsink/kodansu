@@ -2506,6 +2506,68 @@ impl Builder<i32, String, Url, Url> {
                 message: self.storage.to_string(),
             }),
 
+            // Hybrid: SlateDB holds the metadata plane (offsets, watermarks,
+            // consumer offsets, producer/txn state); record-batch bytes go to a
+            // separate object store. Reuses slate::Engine with an object_store set.
+            #[cfg(feature = "slatedb")]
+            "hybrid" => {
+                use object_store::{ObjectStore, aws::AmazonS3Builder, memory::InMemory};
+                use slatedb::Db;
+                use slatedb::object_store::{
+                    ObjectStore as SlateObjectStore,
+                    aws::{
+                        AmazonS3Builder as SlateS3Builder,
+                        S3ConditionalPut as SlateS3ConditionalPut,
+                    },
+                    memory::InMemory as SlateInMemory,
+                };
+
+                let host = self.storage.host_str().unwrap_or("tansu");
+                let db_path = format!("tansu-{}.slatedb", self.cluster_id);
+
+                let (meta_store, record_store): (Arc<dyn SlateObjectStore>, Arc<dyn ObjectStore>) =
+                    if host == "memory" {
+                        (Arc::new(SlateInMemory::new()), Arc::new(InMemory::new()))
+                    } else {
+                        let meta = SlateS3Builder::from_env()
+                            .with_bucket_name(host)
+                            .with_conditional_put(SlateS3ConditionalPut::ETagMatch)
+                            .build()
+                            .map(Arc::new)
+                            .map_err(|e| Error::Message(e.to_string()))?;
+                        let data = AmazonS3Builder::from_env()
+                            .with_bucket_name(host)
+                            .build()
+                            .map(Arc::new)
+                            .map_err(|e| Error::Message(e.to_string()))?;
+                        (meta, data)
+                    };
+
+                Db::open(db_path, meta_store)
+                    .await
+                    .map(Arc::new)
+                    .map(|db| {
+                        slate::Engine::builder()
+                            .cluster(self.cluster_id.clone())
+                            .node(self.node_id)
+                            .advertised_listener(self.advertised_listener.clone())
+                            .db(db)
+                            .schemas(self.schema_registry)
+                            .lake(self.lake_house)
+                            .object_store(Some(record_store))
+                            .build()
+                    })
+                    .map(|storage| Box::new(storage) as Box<dyn Storage>)
+                    .map(Arc::new)
+                    .map_err(Into::into)
+            }
+
+            #[cfg(not(feature = "slatedb"))]
+            "hybrid" => Err(Error::FeatureNotEnabled {
+                feature: "slatedb".into(),
+                message: self.storage.to_string(),
+            }),
+
             #[cfg(feature = "turso")]
             "turso" => limbo::Engine::builder()
                 .storage(self.storage.clone())

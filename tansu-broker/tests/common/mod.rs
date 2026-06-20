@@ -74,6 +74,7 @@ pub(crate) enum StorageType {
     Lite,
     Postgres,
     SlateDb,
+    Hybrid,
     Turso,
 }
 
@@ -213,6 +214,18 @@ where
             .advertised_listener(advertised_listener)
             .schema_registry(schemas)
             .storage(Url::parse("slatedb://memory")?)
+            .build()
+            .await
+            .map_err(Into::into),
+
+        // hybrid://memory: SlateDB (in-memory) for metadata + a separate
+        // in-memory object store for record bytes. No external S3 needed.
+        StorageType::Hybrid => StorageContainer::builder()
+            .cluster_id(cluster)
+            .node_id(node)
+            .advertised_listener(advertised_listener)
+            .schema_registry(schemas)
+            .storage(Url::parse("hybrid://memory")?)
             .build()
             .await
             .map_err(Into::into),

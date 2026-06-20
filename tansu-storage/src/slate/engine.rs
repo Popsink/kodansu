@@ -80,16 +80,20 @@
 use std::{cmp::Ordering, fmt, sync::Arc};
 
 use bytes::Bytes;
+use object_store::{
+    ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, path::Path as ObjectPath,
+};
 use serde::Deserialize;
 use slatedb::Db;
 use tansu_sans_io::{ErrorCode, de::BatchDecoder, record::deflated::Batch};
 use tansu_schema::{Registry, lake::House};
 use tracing::debug;
 use url::Url;
+use uuid::Uuid;
 
 use crate::{Error, Result, TopicId};
 
-use super::types::{TopicMetadata, Topics, Transactions};
+use super::types::{BatchKey, TopicMetadata, Topics, Transactions};
 
 /// SlateDB Storage Engine
 ///
@@ -103,6 +107,10 @@ pub struct Engine {
     pub(super) db: Arc<Db>,
     pub(super) schemas: Option<Registry>,
     pub(super) lake: Option<House>,
+    /// When set (the `hybrid://` scheme), record-batch bytes are written to this
+    /// object store and SlateDB keeps only the offset→object marker; otherwise
+    /// (`slatedb://`) batch bytes are stored inline in SlateDB.
+    pub(super) object_store: Option<Arc<dyn ObjectStore>>,
 }
 
 impl fmt::Debug for Engine {
@@ -125,6 +133,7 @@ pub struct Builder {
     db: Option<Arc<Db>>,
     schemas: Option<Registry>,
     lake: Option<House>,
+    object_store: Option<Arc<dyn ObjectStore>>,
 }
 
 impl fmt::Debug for Builder {
@@ -171,6 +180,14 @@ impl Builder {
         self
     }
 
+    /// Record-batch object store. `Some` selects the hybrid data/metadata split
+    /// (records → object store, offsets/index → SlateDB); `None` stores batch
+    /// bytes inline in SlateDB.
+    pub fn object_store(mut self, object_store: Option<Arc<dyn ObjectStore>>) -> Self {
+        self.object_store = object_store;
+        self
+    }
+
     /// Build the Engine, panicking if required fields are missing
     pub fn build(self) -> Engine {
         Engine {
@@ -182,6 +199,7 @@ impl Builder {
             db: self.db.expect("db is required"),
             schemas: self.schemas,
             lake: self.lake,
+            object_store: self.object_store,
         }
     }
 
@@ -194,6 +212,7 @@ impl Builder {
             db: self.db?,
             schemas: self.schemas,
             lake: self.lake,
+            object_store: self.object_store,
         })
     }
 }
@@ -229,6 +248,89 @@ impl Engine {
             db,
             schemas: None,
             lake: None,
+            object_store: None,
+        }
+    }
+
+    /// Deterministic object-store key for a record batch, mirroring the
+    /// DynoStore layout so the offset (carried by the SlateDB `b/` key) is
+    /// sufficient to locate the batch — no pointer needs to be stored.
+    pub(super) fn batch_object_path(
+        &self,
+        topic_id: Uuid,
+        partition: i32,
+        offset: i64,
+    ) -> ObjectPath {
+        ObjectPath::from(format!(
+            "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
+            self.cluster, topic_id, partition, offset,
+        ))
+    }
+
+    /// Write batch bytes to the object store as an immutable, create-only
+    /// object. Used on the hybrid produce path before the SlateDB commit.
+    pub(super) async fn put_record_object(
+        &self,
+        store: &Arc<dyn ObjectStore>,
+        topic_id: Uuid,
+        partition: i32,
+        offset: i64,
+        bytes: Bytes,
+    ) -> Result<()> {
+        let path = self.batch_object_path(topic_id, partition, offset);
+        store
+            .put_opts(
+                &path,
+                PutPayload::from(bytes),
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
+    /// Read batch bytes back from the object store on the hybrid fetch path.
+    pub(super) async fn get_record_object(
+        &self,
+        store: &Arc<dyn ObjectStore>,
+        topic_id: Uuid,
+        partition: i32,
+        offset: i64,
+    ) -> Result<Bytes> {
+        let path = self.batch_object_path(topic_id, partition, offset);
+        store
+            .get(&path)
+            .await
+            .map_err(Error::from)?
+            .bytes()
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Persist an encoded record batch at `(topic_id, partition, offset)`.
+    /// Hybrid: bytes → object store, size marker → SlateDB. Otherwise: bytes
+    /// inline in SlateDB. Used by both the produce path and the transaction
+    /// control/replay paths so the data/metadata split holds everywhere a batch
+    /// is written (control markers included).
+    pub(super) async fn store_batch_bytes(
+        &self,
+        tx: &slatedb::DbTransaction,
+        topic_id: Uuid,
+        partition: i32,
+        offset: i64,
+        encoded: Bytes,
+    ) -> Result<()> {
+        let batch_key = postcard::to_stdvec(&BatchKey::new(topic_id, partition, offset))?;
+        if let Some(ref store) = self.object_store {
+            self.put_record_object(store, topic_id, partition, offset, encoded.clone())
+                .await?;
+            tx.put(batch_key, (encoded.len() as u64).to_be_bytes().to_vec())
+                .map_err(Into::into)
+        } else {
+            tx.put(batch_key, &encoded[..]).map_err(Into::into)
         }
     }
 

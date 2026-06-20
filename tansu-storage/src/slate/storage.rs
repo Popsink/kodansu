@@ -629,10 +629,11 @@ impl Storage for Engine {
             Bytes::from(encoder)
         };
 
-        let batch_key =
-            postcard::to_stdvec(&BatchKey::new(metadata.id, topition.partition, offset))?;
-
-        tx.put(batch_key, &encoded[..])?;
+        // hybrid: batch bytes -> object store (create-only), size marker ->
+        // SlateDB; the PUT happens before tx.commit, so a crash in between
+        // leaves an orphan object (no offset consumed), never an offset gap.
+        self.store_batch_bytes(&tx, metadata.id, topition.partition, offset, encoded)
+            .await?;
 
         // Also save the updated watermark
         let watermark_key =
@@ -731,8 +732,6 @@ impl Storage for Engine {
                 break;
             }
 
-            let size = kv.value.len();
-
             let key: BatchKey = postcard::from_bytes(&kv.key)?;
 
             // Stop if we've reached the high watermark (respecting isolation level)
@@ -743,7 +742,22 @@ impl Storage for Engine {
             // TODO: Performance - Avoid full decode
             // We decode the entire batch just to check size limits or return it.
             // For scanning/filtering, we should only decode the header or use a lightweight check.
-            let mut batch = self.decode(kv.value)?;
+            let (mut batch, size) = if let Some(ref store) = self.object_store {
+                // hybrid: the value is the byte-size marker; the batch bytes
+                // live in the object store, keyed by offset.
+                let size = kv
+                    .value
+                    .get(..8)
+                    .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                    .map_or(0usize, |b| u64::from_be_bytes(b) as usize);
+                let bytes = self
+                    .get_record_object(store, metadata.id, topition.partition, key.offset)
+                    .await?;
+                (self.decode(bytes)?, size)
+            } else {
+                let size = kv.value.len();
+                (self.decode(kv.value)?, size)
+            };
             batch.base_offset = key.offset;
             batches.push(batch);
             total_bytes += size;
@@ -1648,12 +1662,8 @@ impl Storage for Engine {
                                 Bytes::from(encoder)
                             };
 
-                            let batch_key = postcard::to_stdvec(&BatchKey::new(
-                                metadata.id,
-                                *partition,
-                                offset,
-                            ))?;
-                            tx.put(batch_key, &encoded[..])?;
+                            self.store_batch_bytes(&tx, metadata.id, *partition, offset, encoded)
+                                .await?;
 
                             // Save updated watermark
                             let watermark_value = postcard::to_stdvec(&watermark)?;
@@ -2215,9 +2225,8 @@ impl Storage for Engine {
                     Bytes::from(encoder)
                 };
 
-                let batch_key =
-                    postcard::to_stdvec(&BatchKey::new(metadata.id, topition.partition, offset))?;
-                tx.put(batch_key, &encoded[..])?;
+                self.store_batch_bytes(&tx, metadata.id, topition.partition, offset, encoded)
+                    .await?;
 
                 // Save updated watermark
                 let watermark_value = postcard::to_stdvec(&watermark)?;
