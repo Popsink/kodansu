@@ -251,6 +251,7 @@ use url::Url;
 mod api;
 mod channel;
 mod consumer;
+pub mod coordinator;
 mod frame;
 mod stream;
 
@@ -285,6 +286,7 @@ pub enum Error {
     OneshotRecv(oneshot::error::RecvError),
     Poison,
     Parse(#[from] url::ParseError),
+    Postcard(#[from] postcard::Error),
     Protocol(#[from] tansu_sans_io::Error),
     UnableToSend(Box<Frame>),
     UnknownHost(Url),
