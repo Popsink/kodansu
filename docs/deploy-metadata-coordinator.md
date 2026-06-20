@@ -110,6 +110,20 @@ kafka-producer-perf-test.sh --topic perf \
   --producer-props bootstrap.servers=proxy:9092 acks=1 linger.ms=10 batch.size=1048576
 ```
 
+In-cluster, the same run is packaged as a Job (Apache Kafka image, against the
+proxy Service) — kept out of `apply -k` so it only runs on demand:
+
+```shell
+kubectl apply  -n tansu-preprod -f deploy/k8s/perf-job.yaml
+kubectl logs   -n tansu-preprod -f job/tansu-kafka-perf
+kubectl delete -n tansu-preprod -f deploy/k8s/perf-job.yaml   # before re-running
+```
+
+For an apples-to-apples baseline, run it twice: once against proxies with the
+coordinator front (the split), and once against proxies started without
+`--coordinator-url`/`--object-store-url` (plain forwarding to the origin). Same
+topic, same job — compare producer throughput and p99.
+
 ## What to measure
 
 - **Produce throughput / p99** at the proxy vs a plain forwarding proxy (omit

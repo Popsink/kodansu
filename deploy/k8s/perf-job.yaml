@@ -1,0 +1,79 @@
+# Standalone perf run with Apache Kafka's own tools against the proxy Service.
+# NOT part of `kubectl apply -k deploy/k8s` (it is a one-off job, not standing
+# topology). Run it on demand:
+#
+#   kubectl apply -n tansu-preprod -f deploy/k8s/perf-job.yaml
+#   kubectl logs  -n tansu-preprod -f job/tansu-kafka-perf
+#   kubectl delete -n tansu-preprod -f deploy/k8s/perf-job.yaml   # to re-run
+#
+# Tune NUM_RECORDS / RECORD_SIZE / THROUGHPUT / PARTITIONS below. The topic is
+# created with tansu.batch=true so the coordinator-front produce path engages.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: tansu-kafka-perf
+  labels:
+    app: tansu
+    role: perf
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: tansu
+        role: perf
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: perf
+          image: apache/kafka:3.9.0
+          env:
+            - name: BOOTSTRAP
+              value: tansu-proxy:9092
+            - name: TOPIC
+              value: perf
+            - name: PARTITIONS
+              value: "12"
+            - name: NUM_RECORDS
+              value: "5000000"
+            - name: RECORD_SIZE
+              value: "1024"
+            - name: THROUGHPUT # -1 = unbounded (saturate)
+              value: "-1"
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              BIN=/opt/kafka/bin
+
+              echo ">> create topic ${TOPIC} (tansu.batch=true)"
+              "$BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" \
+                --create --if-not-exists \
+                --topic "$TOPIC" --partitions "$PARTITIONS" \
+                --config tansu.batch=true
+
+              echo ">> producer perf: ${NUM_RECORDS} x ${RECORD_SIZE}B, throughput=${THROUGHPUT}"
+              "$BIN/kafka-producer-perf-test.sh" \
+                --topic "$TOPIC" \
+                --num-records "$NUM_RECORDS" \
+                --record-size "$RECORD_SIZE" \
+                --throughput "$THROUGHPUT" \
+                --producer-props \
+                  bootstrap.servers="$BOOTSTRAP" \
+                  acks=1 \
+                  linger.ms=10 \
+                  batch.size=1048576
+
+              echo ">> consumer perf (drain ${NUM_RECORDS})"
+              "$BIN/kafka-consumer-perf-test.sh" \
+                --bootstrap-server "$BOOTSTRAP" \
+                --topic "$TOPIC" \
+                --messages "$NUM_RECORDS" \
+                --timeout 120000
+          resources:
+            requests:
+              cpu: "2"
+              memory: 1Gi
+            limits:
+              memory: 2Gi
