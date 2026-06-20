@@ -1,0 +1,99 @@
+# The coordinator: a single tansu broker that owns the SlateDB writer. It serves
+# Kafka on 9092 (metadata/fetch/groups, and reads) and the reserve/confirm RPC
+# on 9093 for the proxy fronts. StatefulSet with one replica — there is exactly
+# one writer (no failover yet; Phase 2 adds Lease + fencing). Durability lives in
+# object storage, so the pod itself is disposable.
+apiVersion: v1
+kind: Service
+metadata:
+  name: tansu-coordinator
+  labels:
+    app: tansu
+    role: coordinator
+spec:
+  clusterIP: None # headless: stable per-pod DNS, single writer
+  selector:
+    app: tansu
+    role: coordinator
+  ports:
+    - name: kafka
+      port: 9092
+      targetPort: kafka
+    - name: rpc
+      port: 9093
+      targetPort: rpc
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: tansu-coordinator
+  labels:
+    app: tansu
+    role: coordinator
+spec:
+  serviceName: tansu-coordinator
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tansu
+      role: coordinator
+  template:
+    metadata:
+      labels:
+        app: tansu
+        role: coordinator
+    spec:
+      containers:
+        - name: tansu
+          image: ghcr.io/tansu-io/tansu
+          args: ["broker"]
+          ports:
+            - name: kafka
+              containerPort: 9092
+            - name: rpc
+              containerPort: 9093
+          env:
+            # BUCKET / region first: later vars expand $(BUCKET), which k8s only
+            # resolves against env entries defined earlier in this list.
+            - name: BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: tansu-object-store
+                  key: BUCKET
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: tansu-object-store
+                  key: AWS_DEFAULT_REGION
+            - name: LISTENER_URL
+              value: tcp://0.0.0.0:9092
+            # Advertised to clients that reach the coordinator directly; for the
+            # split topology clients go through the proxy, so this only matters
+            # for direct admin/consumer access.
+            - name: ADVERTISED_LISTENER_URL
+              value: tcp://tansu-coordinator-0.tansu-coordinator:9092
+            # hybrid:// = records to object storage, metadata in SlateDB, both in
+            # BUCKET.
+            - name: STORAGE_ENGINE
+              value: hybrid://$(BUCKET)
+            - name: RPC_LISTENER_URL
+              value: tcp://0.0.0.0:9093
+          envFrom:
+            - secretRef:
+                name: tansu-object-store-credentials
+          readinessProbe:
+            tcpSocket:
+              port: rpc
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: kafka
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+            limits:
+              memory: 2Gi

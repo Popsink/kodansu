@@ -1,0 +1,36 @@
+# Metadata-coordinator topology (#18) for preprod.
+#
+#   kubectl apply -k deploy/k8s
+#
+# Edit images, the bucket, and the AWS secret before applying. Stand the
+# coordinator up first (single SlateDB writer), then the proxies.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: tansu-preprod
+
+resources:
+  - namespace.yaml
+  - secret.example.yaml
+  - coordinator.yaml
+  - proxy.yaml
+
+# One place to pin the image for every workload.
+images:
+  - name: ghcr.io/tansu-io/tansu
+    newTag: latest
+
+# Bucket + region shared by coordinator and proxies. `hybrid://<bucket>` keeps
+# records and SlateDB metadata in the same bucket; the proxy writes record
+# bytes to `s3://<bucket>`.
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: tansu-object-store
+    literals:
+      - BUCKET=tansu
+      - AWS_DEFAULT_REGION=eu-west-2
+      # Uncomment for in-cluster MinIO (and set AWS_ALLOW_HTTP=true):
+      # - AWS_ENDPOINT=http://minio:9000
+      # - AWS_ALLOW_HTTP=true

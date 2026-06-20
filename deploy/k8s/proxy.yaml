@@ -1,0 +1,90 @@
+# Stateless proxy fronts. Each writes record batches straight to object storage
+# and calls the coordinator's RPC (9093) for offsets; everything else
+# (metadata/fetch/consumer groups) is forwarded to the coordinator's Kafka port
+# (9092). Scale `replicas` to scale the produce write path — the single
+# coordinator stays off the byte path.
+apiVersion: v1
+kind: Service
+metadata:
+  name: tansu-proxy
+  labels:
+    app: tansu
+    role: proxy
+spec:
+  # The client entrypoint. Producers/consumers and the perf test connect here.
+  type: ClusterIP
+  selector:
+    app: tansu
+    role: proxy
+  ports:
+    - name: kafka
+      port: 9092
+      targetPort: kafka
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tansu-proxy
+  labels:
+    app: tansu
+    role: proxy
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: tansu
+      role: proxy
+  template:
+    metadata:
+      labels:
+        app: tansu
+        role: proxy
+    spec:
+      containers:
+        - name: tansu
+          image: ghcr.io/tansu-io/tansu
+          args: ["proxy"]
+          ports:
+            - name: kafka
+              containerPort: 9092
+          env:
+            # BUCKET / region first: OBJECT_STORE_URL expands $(BUCKET), which
+            # k8s only resolves against env entries defined earlier in this list.
+            - name: BUCKET
+              valueFrom:
+                configMapKeyRef:
+                  name: tansu-object-store
+                  key: BUCKET
+            - name: AWS_DEFAULT_REGION
+              valueFrom:
+                configMapKeyRef:
+                  name: tansu-object-store
+                  key: AWS_DEFAULT_REGION
+            - name: LISTENER_URL
+              value: tcp://0.0.0.0:9092
+            # Clients reconnect through the proxy Service after metadata.
+            - name: ADVERTISED_LISTENER_URL
+              value: tcp://tansu-proxy:9092
+            # Non-produce traffic (metadata/fetch/groups) → coordinator Kafka port.
+            - name: ORIGIN_URL
+              value: tcp://tansu-coordinator:9092
+            # Produce reserve/confirm → coordinator RPC port.
+            - name: COORDINATOR_URL
+              value: tcp://tansu-coordinator:9093
+            # Record bytes → object store (same bucket as the coordinator).
+            - name: OBJECT_STORE_URL
+              value: s3://$(BUCKET)
+          envFrom:
+            - secretRef:
+                name: tansu-object-store-credentials
+          readinessProbe:
+            tcpSocket:
+              port: kafka
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: "1"
+              memory: 256Mi
+            limits:
+              memory: 512Mi
