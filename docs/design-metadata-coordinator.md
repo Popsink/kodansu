@@ -67,42 +67,54 @@ mutated, does not slow a relaunch.
 
 ## 4. Topology and fast failover
 
+> **Revised after the Phase-0 spike** (see #18). The original design assumed the
+> standby would be a SlateDB *reader* warm-tailing the WAL, so that promotion was
+> near-instant. The spike showed a `DbReader` in SlateDB 0.10.1 does **not** track
+> a live writer (its view freezes near its first-established snapshot). So the
+> standby cannot be assumed near-current, promotion is a **cold `Db::open`**, and
+> the failover budget is governed by **checkpoint cadence + WAL coalescing**, not
+> by a warm reader. This actually simplifies the design — no tail machinery.
+
 ```
    brokers (stateless) ──RPC──► coordinator ACTIVE ──writer──► SlateDB / S3
         (clients)                      │                            ▲
-                                       │                            │ tail WAL (reader)
-                                 coordinator STANDBY ────────────────┘
+                                       │                            │ Db::open on
+                                 coordinator STANDBY ────────────────┘ promotion
+                                 (idle, fence-ready)
 ```
 
-- **Active**: single SlateDB writer, serves RPCs, flushes to S3, checkpoints often.
-- **Standby**: opens SlateDB in **reader** mode, tails the WAL continuously; its
-  hot-mutable state lags by ~one WAL segment.
+- **Active**: single SlateDB writer, serves *all* RPCs (including fresh reads,
+  from its in-memory state), flushes to S3, **checkpoints frequently** (this is
+  the failover lever — see §6.0 and §8).
+- **Standby**: an idle pod ready to `Db::open`-as-writer on failover. It does
+  **not** tail; it holds no live view. Its only job is to take over fast and let
+  SlateDB fence the old writer. (A warm block/object cache helps the cold open a
+  little but is not required for correctness.)
 - **Two independent mechanisms**:
   - *Liveness / election* — a **Kubernetes Lease** (`coordination.k8s.io/Lease`,
     already in the API server, no new infra). The active renews it; the standby
     takes over on expiry.
-  - *Safety / anti-split-brain* — SlateDB's **manifest epoch fencing**. On
-    `db::open` the epoch is read and incremented; the old writer is fenced (its
-    CAS SST writes fail, so it self-terminates and rejoins as standby). Even if
-    the Lease is wrong, SlateDB guarantees a single writer.
-
-Confirmed against SlateDB docs: manifest CAS + incrementing epoch fences zombie
-writers; multiple readers on different nodes can read the same DB; checkpoints
-(RFC 0004) bound WAL replay; "partitioning can easily be built on top since
-fencing is supported".
+  - *Safety / anti-split-brain* — SlateDB's **manifest epoch fencing**, **verified
+    in the spike**: after the standby `Db::open`s, the old writer's next `write`
+    *and* `flush` both error. Even if the Lease is wrong, SlateDB guarantees a
+    single writer.
 
 **Failover sequence**
 
 1. Active dies (T0).
 2. Lease expires (TTL, e.g. 1–2 s); standby detects it.
-3. Standby `db::open` as writer ⇒ epoch++ ⇒ old writer fenced.
-4. Replay the last un-tailed WAL segment (ms; hot-mutable set is tiny).
+3. Standby `Db::open` as writer ⇒ epoch++ ⇒ old writer fenced.
+4. Replay the WAL since the last durable checkpoint (bounded — see below).
 5. Standby serves RPCs.
 
-Recovery budget ≈ Lease TTL + tail replay ≈ **1–3 s** (vs the current ~30 s
-collapse). During the window, produce *blocks and retries* — no data loss,
-because offsets advance only at commit. A full cold-open (both pods lost) is rare
-and bounded by checkpoints + the tiny hot set.
+**Recovery budget (measured on minio, extrapolated to GCS at ~20 ms/GET):**
+`Db::open` replays one object-store GET per WAL object since the last checkpoint.
+With **group commit** (§6.0) coalescing many commits per WAL object, plus frequent
+checkpoints, the replay stays small: `open_GCS(k) ≈ 0.2 s + 20 ms × k` where `k` is
+*WAL objects* since the checkpoint. Bounding `k` to a few dozen keeps failover
+within **~1–3 s** (vs the current ~30 s collapse). During the window, produce
+*blocks and retries* — no data loss, because offsets advance only at commit, and
+group commit only acks after the group is durable.
 
 ## 5. SlateDB key schema
 
@@ -184,6 +196,27 @@ single writer there are no locks/MVCC to design: the active coordinator processe
 commands serially (single-threaded command loop or a mutex), so offset assignment
 is an in-memory counter increment persisted atomically. This is *simpler* than
 the Postgres `SELECT ... FOR NO KEY UPDATE` path.
+
+### 6.0 Group commit (the write path) — added after Phase 0
+
+The spike (#18) showed the two naive options are both wrong:
+
+- `await_durable=true` (SlateDB default): every commit blocks on the next WAL
+  flush tick (~`flush_interval`, measured **~52 ms/commit**) and writes ~1 WAL
+  object per commit → slow produce *and* slow recovery (every commit-since-
+  checkpoint is one GET to replay).
+- `await_durable=false`: commit returns in ~0 ms and the flush coalesces many
+  commits per WAL object (**13× faster recovery** in the spike) — **but** it acks
+  before the data is durable, so a crash loses acked commits whose offsets were
+  already handed to producers. Unacceptable for the coordinator.
+
+**The coordinator therefore uses group commit:** accumulate the commits that
+arrive within a ~`flush_interval` window, persist them in one `WriteBatch`, do
+**one** durable flush, then ack the whole group. This captures the coalesced
+speed and small WAL-object count (fast recovery) *and* durable-on-ack safety.
+Produce latency ≈ the (tunable) flush window, amortized across the group rather
+than paid per commit. It also relaxes the checkpoint cadence by ~the group size
+(N commits → 1 WAL object), which is what keeps the §4 failover budget in range.
 
 ### 6.1 RPC contract (broker → coordinator)
 
@@ -285,17 +318,19 @@ The coordinator itself reuses tansu's existing `slatedb://` backend integration
 
 ## 8. Phasing
 
-- **Phase 0 — Spike (decision gate).** Measure on representative load:
-  (a) SlateDB reader tail lag under write pressure, (b) reader→writer promotion
-  time, (c) cold-open time vs WAL/checkpoint size. These three numbers validate
-  or recalibrate the 1–3 s failover budget. *This is the first task and gates the
-  rest.*
+- **Phase 0 — Spike (decision gate). ✅ DONE (#18).** Validated on minio: fencing
+  works (old writer fenced on 2nd open), `Db::open` recovery ≈ 0.2 s + 20 ms × k
+  WAL-objects extrapolated to GCS, group commit is the right write path, and the
+  `DbReader` does not usefully tail a live writer (so the standby is a cold open,
+  not a warm tail). No conceptual blocker; §4 and §6.0 revised accordingly.
 - **Phase 1 — Single coordinator, no standby.** Coordinator service + SlateDB
   keyspace (hot-mutable + batch index) + broker→coordinator RPC + `hybrid://`
-  backend. Idempotent produce, fetch, `offset_stage`, group offsets. Kills the
-  produce hot path; recovery = cold-open from S3 (accept brief restart downtime).
-- **Phase 2 — Warm standby + fast failover.** Reader standby + K8s Lease election
-  + SlateDB epoch fencing. Delivers "relance très vite".
+  backend + **group commit** write path. Idempotent produce, fetch, `offset_stage`,
+  group offsets. Kills the produce hot path; recovery = cold-open from S3 (accept
+  brief restart downtime).
+- **Phase 2 — Standby + fast failover.** Fence-ready standby pod + K8s Lease
+  election + SlateDB epoch fencing + a checkpoint-cadence policy that bounds the
+  cold-open replay. Delivers "relance très vite". (No warm-tailing reader — see §4.)
 - **Phase 3 — Transactions / EOS.** LSO, aborted-txn index, control markers, txn
   coordinator state.
 - **Phase 4 — Sharding by partition.** N coordinators, each owning a partition
@@ -308,8 +343,12 @@ The coordinator itself reuses tansu's existing `slatedb://` backend integration
   the (bounded) failover window. Sharding (Phase 4) shrinks the blast radius.
 - A new internal RPC surface (broker→coordinator) is added; brokers must handle
   failover/`FENCED` transparently.
-- Phase-0 numbers are load-bearing: if reader tail lag is high, failover degrades
-  toward cold-open and we lean harder on small-hot-set + frequent checkpoints.
+- Failover is a cold `Db::open` bounded by WAL-objects-since-checkpoint (Phase 0).
+  The knobs are checkpoint cadence + group-commit coalescing; an over-long
+  checkpoint interval pushes failover past the 1–3 s budget.
+- `DbReader` not tailing a live writer (Phase 0) is taken as given here; if a
+  future SlateDB version supports low-lag tailing, a warm standby could shave the
+  cold-open further, but the design must not depend on it.
 - Control-marker representation for EOS: reuse tansu's existing control-batch
   encoding vs synthesise markers in the coordinator — to be settled in Phase 3.
 - `delete_records` / retention advances `log_start_offset` in `'w'` and trims the
