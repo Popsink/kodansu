@@ -188,6 +188,76 @@ impl Engine {
 
         self.next_offset(metadata.id, topition.partition).await
     }
+
+    /// Resolve reservations whose `deadline_ms` has passed — a front that
+    /// reserved offsets then died before confirming. For each, write an empty
+    /// filler batch at the reserved base and drop the reservation, so the
+    /// contiguous high watermark can advance past the hole instead of stalling
+    /// forever. The coordinator is the only writer on this path, and it only
+    /// runs for abandoned reservations, so it is not a bottleneck. Consumers
+    /// skip the empty (`record_count == 0`) batch. Returns the number filled.
+    pub(super) async fn gap_fill_expired(&self, topition: &Topition, now_ms: i64) -> Result<u64> {
+        let topics = self.get_topics().await?;
+        let Some(metadata) = topics.get(&topition.topic[..]) else {
+            return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
+        };
+
+        let prefix =
+            postcard::to_stdvec(&ReservationKeyPrefix::new(metadata.id, topition.partition))?;
+        let mut scan = self.db.scan(prefix.clone()..).await?;
+        let mut expired: Vec<(i64, i64)> = Vec::new();
+        while let Some(kv) = scan.next().await? {
+            if !kv.key.starts_with(&prefix) {
+                break;
+            }
+            let key: ReservationKey = postcard::from_bytes(&kv.key)?;
+            let reservation: Reservation = postcard::from_bytes(&kv.value)?;
+            if reservation.deadline_ms <= now_ms {
+                expired.push((key.base, reservation.count));
+            }
+        }
+
+        for &(base, count) in &expired {
+            // Empty batch spanning the reserved range. crc is 0: the fetch path
+            // (BatchDecoder) does not verify it, and the batch carries no records.
+            let filler = Batch {
+                base_offset: base,
+                batch_length: 0,
+                partition_leader_epoch: 0,
+                magic: 2,
+                crc: 0,
+                attributes: 0,
+                last_offset_delta: (count - 1) as i32,
+                base_timestamp: 0,
+                max_timestamp: 0,
+                producer_id: -1,
+                producer_epoch: -1,
+                base_sequence: -1,
+                record_count: 0,
+                record_data: Bytes::new(),
+            };
+            let encoded = {
+                let mut encoder = RecordBatchEncoder::new(BytesMut::new());
+                filler.serialize(&mut encoder)?;
+                Bytes::from(encoder)
+            };
+
+            let tx = self
+                .db
+                .begin(slatedb::IsolationLevel::SerializableSnapshot)
+                .await?;
+            self.store_batch_bytes(&tx, metadata.id, topition.partition, base, encoded)
+                .await?;
+            tx.delete(postcard::to_stdvec(&ReservationKey::new(
+                metadata.id,
+                topition.partition,
+                base,
+            ))?)?;
+            self.commit_tx(tx).await?;
+        }
+
+        Ok(expired.len() as u64)
+    }
 }
 
 /// Decode a big-endian `i64` offset from a stored cursor value (0 if malformed).

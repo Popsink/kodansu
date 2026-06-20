@@ -873,3 +873,30 @@ async fn out_of_order_confirm_holds_watermark_at_lowest_pending() {
     engine.confirm(&tp, b0, 64).await.unwrap();
     assert_eq!(engine.reserved_high_watermark(&tp).await.unwrap(), 10);
 }
+
+#[tokio::test]
+async fn gap_fill_unblocks_a_stalled_watermark() {
+    let engine = create_test_engine().await;
+    create_partition_topic(&engine, "gap").await;
+    let tp = Topition::new("gap", 0);
+
+    // two reservations with a deadline of 100ms; only the later one confirms, so
+    // the visible watermark stalls at the abandoned base 0.
+    let b0 = engine.reserve(&tp, 5, 100).await.unwrap();
+    let b1 = engine.reserve(&tp, 5, 100).await.unwrap();
+    engine.confirm(&tp, b1, 64).await.unwrap();
+    assert_eq!((b0, b1), (0, 5));
+    assert_eq!(engine.reserved_high_watermark(&tp).await.unwrap(), 0);
+
+    // before the deadline: nothing is filled, the stall remains.
+    assert_eq!(engine.gap_fill_expired(&tp, 50).await.unwrap(), 0);
+    assert_eq!(engine.reserved_high_watermark(&tp).await.unwrap(), 0);
+
+    // at/after the deadline: base 0 is filled and its reservation dropped, so
+    // the watermark advances all the way to the cursor.
+    assert_eq!(engine.gap_fill_expired(&tp, 100).await.unwrap(), 1);
+    assert_eq!(engine.reserved_high_watermark(&tp).await.unwrap(), 10);
+
+    // idempotent: a second sweep finds nothing left to fill.
+    assert_eq!(engine.gap_fill_expired(&tp, 1_000).await.unwrap(), 0);
+}
