@@ -900,3 +900,66 @@ async fn gap_fill_unblocks_a_stalled_watermark() {
     // idempotent: a second sweep finds nothing left to fill.
     assert_eq!(engine.gap_fill_expired(&tp, 1_000).await.unwrap(), 0);
 }
+
+// A hybrid engine: SlateDB metadata + a separate in-memory record object store
+// (the coordinator configuration). reserve/confirm batches are consumer-visible.
+async fn create_hybrid_engine() -> Engine {
+    let meta = Arc::new(InMemory::new());
+    let db = Db::open("hybrid-test.slatedb", meta)
+        .await
+        .expect("open slatedb");
+
+    Engine::builder()
+        .cluster("hybrid-test")
+        .node(111)
+        .advertised_listener(Url::parse("tcp://localhost:9092").unwrap())
+        .db(Arc::new(db))
+        .schemas(None)
+        .lake(None)
+        .object_store(Some(Arc::new(object_store::memory::InMemory::new())))
+        .build()
+}
+
+#[tokio::test]
+async fn offset_stage_reflects_reserve_confirm_high_watermark() {
+    let engine = create_hybrid_engine().await;
+    create_partition_topic(&engine, "vis").await;
+    let tp = Topition::new("vis", 0);
+
+    // reserved-but-unconfirmed: the consumer-visible high watermark is held.
+    let base = engine.reserve(&tp, 5, 0).await.unwrap();
+    assert_eq!(engine.offset_stage(&tp).await.unwrap().high_watermark, 0);
+
+    // confirm advances the visible watermark (confirm moves the cursor, not
+    // Watermark.high — offset_stage must read the reserved watermark in hybrid).
+    engine.confirm(&tp, base, 128).await.unwrap();
+    assert_eq!(engine.offset_stage(&tp).await.unwrap().high_watermark, 5);
+}
+
+#[tokio::test]
+async fn gap_filled_batch_is_visible_and_fetchable() {
+    let engine = create_hybrid_engine().await;
+    create_partition_topic(&engine, "gapvis").await;
+    let tp = Topition::new("gapvis", 0);
+
+    // a reservation abandoned past its deadline: gap-fill writes the filler
+    // bytes itself, so the batch is both visible and fetchable end to end.
+    let _ = engine.reserve(&tp, 3, 100).await.unwrap();
+    assert_eq!(engine.offset_stage(&tp).await.unwrap().high_watermark, 0);
+
+    assert_eq!(engine.gap_fill_expired(&tp, 100).await.unwrap(), 1);
+    assert_eq!(engine.offset_stage(&tp).await.unwrap().high_watermark, 3);
+
+    let batches = engine
+        .fetch(
+            &tp,
+            0,
+            0,
+            1024 * 1024,
+            crate::IsolationLevel::ReadUncommitted,
+            std::time::Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert!(batches.iter().any(|b| b.base_offset == 0));
+}

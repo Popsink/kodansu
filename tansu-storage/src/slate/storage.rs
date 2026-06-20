@@ -207,24 +207,19 @@ impl Storage for Engine {
         }
 
         for &(base, count) in &expired {
-            // Empty batch spanning the reserved range. crc is 0: the fetch path
-            // (BatchDecoder) does not verify it, and the batch carries no records.
-            let filler = Batch {
-                base_offset: base,
-                batch_length: 0,
-                partition_leader_epoch: 0,
-                magic: 2,
-                crc: 0,
-                attributes: 0,
-                last_offset_delta: (count - 1) as i32,
-                base_timestamp: 0,
-                max_timestamp: 0,
-                producer_id: -1,
-                producer_epoch: -1,
-                base_sequence: -1,
-                record_count: 0,
-                record_data: Bytes::new(),
-            };
+            // Empty batch spanning the reserved range [base, base + count): a
+            // record-less batch with last_offset_delta = count - 1, built via the
+            // inflated→deflated path so batch_length and crc are valid (a
+            // hand-rolled batch with batch_length 0 fails to decode on fetch).
+            // Consumers skip it (no records).
+            let filler = InflatedBatch::builder()
+                .base_offset(base)
+                .last_offset_delta((count - 1) as i32)
+                .producer_id(-1)
+                .producer_epoch(-1)
+                .base_sequence(-1)
+                .build()
+                .and_then(Batch::try_from)?;
             let encoded = {
                 let mut encoder = RecordBatchEncoder::new(BytesMut::new());
                 filler.serialize(&mut encoder)?;
@@ -978,7 +973,17 @@ impl Storage for Engine {
                 })
             })?;
 
-        let high_watermark = watermark.high.unwrap_or(0);
+        // In hybrid (coordinator) mode the visible high watermark is the
+        // contiguous confirmed prefix from reserve/confirm — `confirm` advances
+        // the cursor/reservations, not `Watermark.high`. For a partition written
+        // via the direct produce path this falls back to `Watermark.high`, so
+        // plain-produce hybrid is unchanged. Pure SlateDB (no object store) keeps
+        // reading `Watermark.high`.
+        let high_watermark = if self.object_store.is_some() {
+            self.reserved_high_watermark(topition).await?
+        } else {
+            watermark.high.unwrap_or(0)
+        };
 
         // Calculate last_stable by finding the minimum offset of any in-progress transaction
         let transactions = self.get_transactions().await?;
