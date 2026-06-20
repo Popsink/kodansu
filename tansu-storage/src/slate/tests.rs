@@ -819,3 +819,57 @@ async fn test_builder_pattern() {
     assert_eq!("builder-cluster", engine.cluster_id().await.unwrap());
     assert_eq!(42, engine.node().await.unwrap());
 }
+
+// ========== Reserve / confirm (Milestone 2 data-plane split) ==========
+
+async fn create_partition_topic(engine: &Engine, name: &str) {
+    let topic = CreatableTopic::default()
+        .name(name.into())
+        .num_partitions(1)
+        .replication_factor(1);
+    let _ = engine
+        .create_topic(topic, false)
+        .await
+        .expect("create topic");
+}
+
+#[tokio::test]
+async fn reserve_then_confirm_advances_visible_watermark() {
+    let engine = create_test_engine().await;
+    create_partition_topic(&engine, "rc").await;
+    let tp = Topition::new("rc", 0);
+
+    assert_eq!(engine.reserved_high_watermark(&tp).await.unwrap(), 0);
+
+    // reserve 5 offsets: the cursor moves to 5, but the visible watermark is
+    // held at the pending base (0) until the batch is confirmed.
+    let base = engine.reserve(&tp, 5, 0).await.unwrap();
+    assert_eq!(base, 0);
+    assert_eq!(engine.reserved_high_watermark(&tp).await.unwrap(), 0);
+
+    // confirm: nothing in flight, so the watermark catches up to the cursor.
+    engine.confirm(&tp, base, 128).await.unwrap();
+    assert_eq!(engine.reserved_high_watermark(&tp).await.unwrap(), 5);
+}
+
+#[tokio::test]
+async fn out_of_order_confirm_holds_watermark_at_lowest_pending() {
+    let engine = create_test_engine().await;
+    create_partition_topic(&engine, "ooo").await;
+    let tp = Topition::new("ooo", 0);
+
+    let b0 = engine.reserve(&tp, 5, 0).await.unwrap();
+    let b1 = engine.reserve(&tp, 5, 0).await.unwrap();
+    assert_eq!((b0, b1), (0, 5));
+    assert_eq!(engine.reserved_high_watermark(&tp).await.unwrap(), 0);
+
+    // confirming the *later* batch must NOT advance the watermark: offset 0 is
+    // still pending, so the contiguous visible prefix ends at 0 (the stall the
+    // gap-fill mechanism will resolve).
+    engine.confirm(&tp, b1, 64).await.unwrap();
+    assert_eq!(engine.reserved_high_watermark(&tp).await.unwrap(), 0);
+
+    // confirming the lowest pending base unblocks everything up to the cursor.
+    engine.confirm(&tp, b0, 64).await.unwrap();
+    assert_eq!(engine.reserved_high_watermark(&tp).await.unwrap(), 10);
+}
