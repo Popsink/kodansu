@@ -18,7 +18,7 @@ use crate::{
     CancelKind, Error, Result,
     coordinator::group::{Coordinator, administrator::Controller},
     otel,
-    service::services,
+    service::{coordinator_rpc, services},
 };
 use console::Term;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
@@ -61,6 +61,13 @@ pub struct Broker<G, S> {
     storage: S,
     groups: G,
 
+    /// Coordinator RPC listener (Milestone 2, #18). When set, the broker also
+    /// serves the broker→coordinator reserve/confirm RPC on this address, so a
+    /// coordinator pod accepts offset assignments from stateless fronts. `None`
+    /// on a plain broker. Opt-in via [`Broker::rpc_listener`] — kept off the
+    /// typestate builder so it threads through no setter.
+    rpc_listener: Option<Url>,
+
     sasl_config: Option<Arc<SASLConfig>>,
     tls_server_config: Option<Arc<ServerConfig>>,
     silent: bool,
@@ -92,6 +99,8 @@ where
             advertised_listener,
             storage,
             groups,
+
+            rpc_listener: None,
 
             sasl_config: None,
             tls_server_config: None,
@@ -197,8 +206,33 @@ where
         Ok(ErrorCode::None)
     }
 
+    /// Also serve the coordinator reserve/confirm RPC on `listener` (#18). Set
+    /// on coordinator pods; leave unset on plain brokers. Opt-in here rather
+    /// than on the typestate builder so it threads through no setter.
+    pub fn rpc_listener(mut self, listener: Url) -> Self {
+        self.rpc_listener = Some(listener);
+        self
+    }
+
     pub async fn serve(&mut self, started: Instant) -> Result<()> {
         self.register().await?;
+
+        // When configured as a coordinator, accept reserve/confirm RPC on a
+        // second listener alongside the Kafka one, cancelled with the broker.
+        if let Some(rpc_listener) = self.rpc_listener.clone() {
+            let cluster_id = self.cluster_id.clone();
+            let storage = self.storage.clone();
+            let token = self.cancellation.clone();
+            let bound = TcpListener::bind(socket_addr(&rpc_listener, 9093)).await?;
+            debug!(rpc_listener = ?bound.local_addr().ok());
+
+            _ = tokio::spawn(async move {
+                serve_coordinator_rpc(bound, cluster_id, storage, token)
+                    .await
+                    .inspect_err(|err| error!(?err, "coordinator rpc listener stopped"))
+            });
+        }
+
         self.listen(started).await
     }
 
@@ -680,6 +714,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             advertised_listener: self.advertised_listener,
             storage,
             groups,
+            rpc_listener: None,
             sasl_config,
             tls_server_config: self.tls_server_config.map(Arc::new),
 
@@ -687,5 +722,109 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             maintenance_interval: self.maintenance_interval,
             cancellation: self.cancellation,
         })
+    }
+}
+
+/// Resolve a listener [`Url`] to a [`SocketAddr`], defaulting the port.
+fn socket_addr(url: &Url, default_port: u16) -> SocketAddr {
+    let port = url.port().unwrap_or(default_port);
+    match url.host() {
+        None => SocketAddr::from((IpAddr::V6(Ipv6Addr::UNSPECIFIED), port)),
+        Some(url::Host::Domain(domain)) => SocketAddr::from_str(&format!("{domain}:{port}"))
+            .unwrap_or(SocketAddr::from((IpAddr::V6(Ipv6Addr::UNSPECIFIED), port))),
+        Some(url::Host::Ipv4(ipv4)) => SocketAddr::from((IpAddr::V4(ipv4), port)),
+        Some(url::Host::Ipv6(ipv6)) => SocketAddr::from((IpAddr::V6(ipv6), port)),
+    }
+}
+
+/// Accept loop for the coordinator RPC listener: each connection is served by
+/// the [`coordinator_rpc`] stack (length-prefix bytes → postcard body →
+/// reserve/confirm against storage). Runs until `token` is cancelled. A free
+/// function (not a [`Broker`] method) so it depends only on the storage type,
+/// not the group-coordinator type.
+async fn serve_coordinator_rpc<S>(
+    listener: TcpListener,
+    cluster_id: String,
+    storage: S,
+    token: CancellationToken,
+) -> Result<()>
+where
+    S: Storage + Clone + 'static,
+{
+    let mut set = JoinSet::new();
+
+    loop {
+        tokio::select! {
+            () = token.cancelled() => {
+                set.abort_all();
+                return Ok(());
+            }
+
+            accepted = listener.accept() => {
+                let Ok((stream, addr)) = accepted else { continue };
+                debug!(?addr, "coordinator rpc connection");
+
+                stream.set_nodelay(true)?;
+                let service = coordinator_rpc::services(cluster_id.as_str(), storage.clone());
+
+                _ = set.spawn(async move {
+                    if let Err(error) = service.serve(Context::default(), stream).await {
+                        debug!(?error, "coordinator rpc connection closed");
+                    }
+                });
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tansu_sans_io::create_topics_request::CreatableTopic;
+    use tansu_service::coordinator::Client;
+    use tansu_storage::StorageContainer;
+
+    // The broker's coordinator RPC listener serves reserve/confirm over a real
+    // TCP socket against hybrid storage, end to end.
+    #[tokio::test]
+    async fn coordinator_rpc_listener_serves_reserve_confirm() -> Result<()> {
+        let storage = StorageContainer::builder()
+            .cluster_id("rpc-listener")
+            .node_id(111)
+            .advertised_listener(Url::parse("tcp://localhost:9092").unwrap())
+            .schema_registry(None)
+            .storage(Url::parse("hybrid://memory").unwrap())
+            .build()
+            .await?;
+
+        let _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name("rpc".into())
+                    .num_partitions(1)
+                    .replication_factor(1),
+                false,
+            )
+            .await?;
+
+        // bind an ephemeral port and hand the listener to the accept loop.
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+
+        let token = CancellationToken::new();
+        let serving = tokio::spawn(serve_coordinator_rpc(
+            listener,
+            "rpc-listener".into(),
+            storage,
+            token.clone(),
+        ));
+
+        let client = Client::new(addr.to_string())?;
+        assert_eq!(client.reserve("rpc", 0, 5, 0).await?, 0);
+        client.confirm("rpc", 0, 0, 64).await?;
+
+        token.cancel();
+        let _ = serving.await;
+        Ok(())
     }
 }
