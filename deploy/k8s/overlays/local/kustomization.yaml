@@ -1,0 +1,27 @@
+# Local / in-cluster MinIO overlay: static-credentials Secret, memory-friendly
+# bucket. `kubectl apply -k deploy/k8s/overlays/local`.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: tansu-preprod
+
+resources:
+  - namespace.yaml
+  - secret.example.yaml
+  - ../../base
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: tansu-object-store
+    literals:
+      - BUCKET=tansu
+      - AWS_DEFAULT_REGION=eu-west-2
+      # Uncomment for in-cluster MinIO:
+      # - AWS_ENDPOINT=http://minio:9000
+      # - AWS_ALLOW_HTTP=true
+
+images:
+  - name: ghcr.io/tansu-io/tansu
+    newTag: latest

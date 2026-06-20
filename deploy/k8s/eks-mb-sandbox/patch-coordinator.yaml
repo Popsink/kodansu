@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: tansu-coordinator
+spec:
+  template:
+    spec:
+      serviceAccountName: tansu-m2
+      containers:
+        - name: tansu
+          envFrom: [] # Pod Identity, not a static-credentials Secret
+          env:
+            # dedicated cluster id -> writes under clusters/m2coord/, disjoint
+            # from the live `tansu` cluster (tansu-external + Kotatsu).
+            - name: CLUSTER_ID
+              value: m2coord
+            - name: AWS_ENDPOINT_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: tansu-object-store
+                  key: AWS_ENDPOINT_URL

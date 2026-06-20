@@ -1,0 +1,53 @@
+# Overlay for the EKS preprod sandbox (context
+# eks-mb-sandbox-tsop.zonkey-royal.ts.net).
+#
+#   kubectl --context eks-mb-sandbox-tsop.zonkey-royal.ts.net apply -k deploy/k8s/eks-mb-sandbox
+#
+# Coexists with the live tansu-external / kotatsu (ArgoCD-managed): a NEW
+# namespace (untracked by ArgoCD, so not pruned), the SAME S3 bucket but a
+# DEDICATED cluster id `m2coord` (its own clusters/m2coord/ prefix — invisible
+# to Kotatsu's `tansu` cluster and disjoint from tansu-external's data).
+#
+# PREREQUISITES (cannot be done from kubectl):
+#  1. Image: build integration/metadata-coordinator and push it; set the tag in
+#     `images:` below.
+#  2. EKS Pod Identity association binding (namespace=tansu-m2, sa=tansu-m2) to
+#     an IAM role with read/write on s3://eks-mb-sandbox-tansu-917630917049.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: tansu-m2
+
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - ../base
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+# Real bucket/region for this cluster; no static credentials (Pod Identity).
+configMapGenerator:
+  - name: tansu-object-store
+    literals:
+      - BUCKET=eks-mb-sandbox-tansu-917630917049
+      - AWS_DEFAULT_REGION=eu-west-3
+      - AWS_ENDPOINT_URL=https://s3.eu-west-3.amazonaws.com
+
+images:
+  - name: ghcr.io/tansu-io/tansu
+    newName: ghcr.io/popsink/tansu
+    newTag: REPLACE_WITH_PUSHED_TAG # e.g. m2-coordinator
+
+patches:
+  # Bind both workloads to the Pod Identity service account, set the dedicated
+  # cluster id, the real S3 endpoint, and drop the static-credentials Secret
+  # (Pod Identity provides credentials).
+  - path: patch-coordinator.yaml
+    target:
+      kind: StatefulSet
+      name: tansu-coordinator
+  - path: patch-proxy.yaml
+    target:
+      kind: Deployment
+      name: tansu-proxy

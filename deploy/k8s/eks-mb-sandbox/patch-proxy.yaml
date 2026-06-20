@@ -1,0 +1,17 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tansu-proxy
+spec:
+  template:
+    spec:
+      serviceAccountName: tansu-m2
+      containers:
+        - name: tansu
+          envFrom: [] # Pod Identity, not a static-credentials Secret
+          env:
+            - name: AWS_ENDPOINT_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: tansu-object-store
+                  key: AWS_ENDPOINT_URL

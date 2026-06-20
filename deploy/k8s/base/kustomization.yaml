@@ -1,0 +1,10 @@
+# Base workloads for the metadata-coordinator topology (#18): the coordinator
+# StatefulSet + the proxy Deployment and their Services. Environment specifics
+# (namespace, bucket/region, credentials, image) come from an overlay:
+#   - overlays/local        : in-cluster MinIO, static-credentials Secret
+#   - eks-mb-sandbox        : EKS preprod, real S3 bucket, Pod Identity
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - coordinator.yaml
+  - proxy.yaml
