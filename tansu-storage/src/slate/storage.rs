@@ -67,23 +67,10 @@ use super::types::{
     TxnCommitOffset, TxnDetail, TxnProduceOffset, Watermark, WatermarkKey,
 };
 
-/// Reserve / confirm: the coordinator side of the Milestone-2 data-plane split
-/// (#18). A stateless front reserves an offset, writes the batch bytes to the
-/// object store itself, then confirms — so record bytes never transit the
-/// coordinator. Offsets are assigned at `reserve` (offset is in the S3 key, per
-/// the Kotatsu layout), and the consumer-visible high watermark only advances
-/// over the contiguous confirmed prefix.
-///
-/// These are additive inherent methods, independent of the Kafka [`Storage`]
-/// produce/fetch path; they are exercised directly in unit tests and will be
-/// driven over an RPC by the proxy in a later slice.
-// allow(dead_code): no production caller yet — wired to the proxy over RPC in
-// Milestone 2b/2c (#18); covered by the slate reserve/confirm unit tests.
-#[allow(dead_code)]
 impl Engine {
-    /// Read the assignment cursor for a partition, falling back to the visible
-    /// watermark (so a partition previously written via the direct produce path
-    /// continues from the right offset).
+    /// Read the per-partition assignment cursor for the reserve/confirm path,
+    /// falling back to the visible watermark (so a partition previously written
+    /// via the direct produce path continues from the right offset).
     async fn next_offset(&self, topic: Uuid, partition: i32) -> Result<i64> {
         let key = postcard::to_stdvec(&NextOffsetKey::new(topic, partition))?;
         if let Some(encoded) = self.db.get(&key).await.map_err(Error::from)? {
@@ -101,16 +88,23 @@ impl Engine {
             })?;
         Ok(watermark.high.unwrap_or(0))
     }
+}
 
+/// Decode a big-endian `i64` offset from a stored cursor value (0 if malformed).
+fn decode_offset(encoded: &[u8]) -> i64 {
+    encoded
+        .get(..8)
+        .and_then(|raw| <[u8; 8]>::try_from(raw).ok())
+        .map_or(0, i64::from_be_bytes)
+}
+
+#[async_trait]
+impl Storage for Engine {
     /// Assign `count` offsets to a stateless writer and record a pending
     /// reservation with a gap-fill `deadline_ms`. Advances the assignment cursor
-    /// but not the visible watermark.
-    pub(super) async fn reserve(
-        &self,
-        topition: &Topition,
-        count: i64,
-        deadline_ms: i64,
-    ) -> Result<i64> {
+    /// but not the visible watermark (the offset is in the S3 key, Kotatsu
+    /// layout, so it must be assigned before the writer uploads).
+    async fn reserve(&self, topition: &Topition, count: i64, deadline_ms: i64) -> Result<i64> {
         let topics = self.get_topics().await?;
         let Some(metadata) = topics.get(&topition.topic[..]) else {
             return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
@@ -138,12 +132,7 @@ impl Engine {
     /// Confirm a previously reserved batch whose bytes the writer has already
     /// put to the object store. Records the `b/` marker and drops the
     /// reservation, which lets the visible watermark advance over it.
-    pub(super) async fn confirm(
-        &self,
-        topition: &Topition,
-        base: i64,
-        byte_size: u64,
-    ) -> Result<()> {
+    async fn confirm(&self, topition: &Topition, base: i64, byte_size: u64) -> Result<()> {
         let topics = self.get_topics().await?;
         let Some(metadata) = topics.get(&topition.topic[..]) else {
             return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
@@ -170,7 +159,7 @@ impl Engine {
     /// The consumer-visible high watermark: the lowest pending reservation base
     /// (everything below it is confirmed), or the assignment cursor when there
     /// are none in flight.
-    pub(super) async fn reserved_high_watermark(&self, topition: &Topition) -> Result<i64> {
+    async fn reserved_high_watermark(&self, topition: &Topition) -> Result<i64> {
         let topics = self.get_topics().await?;
         let Some(metadata) = topics.get(&topition.topic[..]) else {
             return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
@@ -196,7 +185,7 @@ impl Engine {
     /// forever. The coordinator is the only writer on this path, and it only
     /// runs for abandoned reservations, so it is not a bottleneck. Consumers
     /// skip the empty (`record_count == 0`) batch. Returns the number filled.
-    pub(super) async fn gap_fill_expired(&self, topition: &Topition, now_ms: i64) -> Result<u64> {
+    async fn gap_fill_expired(&self, topition: &Topition, now_ms: i64) -> Result<u64> {
         let topics = self.get_topics().await?;
         let Some(metadata) = topics.get(&topition.topic[..]) else {
             return Err(Error::Api(ErrorCode::UnknownTopicOrPartition));
@@ -258,19 +247,7 @@ impl Engine {
 
         Ok(expired.len() as u64)
     }
-}
 
-/// Decode a big-endian `i64` offset from a stored cursor value (0 if malformed).
-#[allow(dead_code)] // see reserve/confirm impl above (Milestone 2b/2c, #18)
-fn decode_offset(encoded: &[u8]) -> i64 {
-    encoded
-        .get(..8)
-        .and_then(|raw| <[u8; 8]>::try_from(raw).ok())
-        .map_or(0, i64::from_be_bytes)
-}
-
-#[async_trait]
-impl Storage for Engine {
     /// Register a broker in the cluster.
     ///
     /// NOTE: This should be a null operation for SlateDB. All brokers are the same

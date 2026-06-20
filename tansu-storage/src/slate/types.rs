@@ -261,9 +261,6 @@ impl BatchKeyPrefix {
 /// watermark, which is the consumer-*visible* high watermark; with the
 /// reserve/confirm data-plane split the cursor runs ahead of the visible
 /// watermark while reservations are in flight.
-// allow(dead_code): reserve/confirm primitives land ahead of their RPC caller
-// (Milestone 2b/2c, #18); covered by the slate reserve/confirm unit tests.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub(super) struct NextOffsetKey {
     pub prefix: char,
@@ -272,7 +269,6 @@ pub(super) struct NextOffsetKey {
     pub partition: Partition,
 }
 
-#[allow(dead_code)]
 impl NextOffsetKey {
     pub(super) fn new(topic: Uuid, partition: Partition) -> Self {
         Self {
@@ -289,7 +285,6 @@ impl NextOffsetKey {
 /// base offset, so a prefix scan's first key is the lowest pending base — which
 /// is exactly the consumer-visible high watermark (everything below it is
 /// confirmed).
-#[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub(super) struct ReservationKey {
     pub prefix: char,
@@ -300,7 +295,6 @@ pub(super) struct ReservationKey {
     pub base: Offset,
 }
 
-#[allow(dead_code)]
 impl ReservationKey {
     pub(super) fn new(topic: Uuid, partition: Partition, base: Offset) -> Self {
         Self {
@@ -313,7 +307,6 @@ impl ReservationKey {
 }
 
 /// Prefix for scanning all pending reservations of a partition: `r/{topic}/{partition}`.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub(super) struct ReservationKeyPrefix {
     pub prefix: char,
@@ -322,7 +315,6 @@ pub(super) struct ReservationKeyPrefix {
     pub partition: Partition,
 }
 
-#[allow(dead_code)]
 impl ReservationKeyPrefix {
     pub(super) fn new(topic: Uuid, partition: Partition) -> Self {
         Self {
@@ -334,7 +326,6 @@ impl ReservationKeyPrefix {
 }
 
 /// Value of a pending reservation: the offset count and the gap-fill deadline.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub(super) struct Reservation {
     pub count: Offset,

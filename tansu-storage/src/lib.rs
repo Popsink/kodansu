@@ -1391,6 +1391,37 @@ pub trait Storage: Debug + Send + Sync + 'static {
         offsets: &[(Topition, ListOffset)],
     ) -> Result<Vec<(Topition, ListOffsetResponse)>>;
 
+    /// Reserve `count` offsets for a stateless writer that will upload the batch
+    /// bytes to object storage itself (the Milestone-2 data-plane split): returns
+    /// the assigned base offset and records a pending reservation that holds the
+    /// visible high watermark until [`Storage::confirm`]. `deadline_ms` is the
+    /// wall-clock after which [`Storage::gap_fill_expired`] may resolve an
+    /// abandoned reservation. Only coordinator backends support this.
+    async fn reserve(&self, _topition: &Topition, _count: i64, _deadline_ms: i64) -> Result<i64> {
+        Err(Error::Api(ErrorCode::UnsupportedVersion))
+    }
+
+    /// Confirm a reserved batch whose bytes are now durable in object storage,
+    /// recording its offset→object marker and releasing the reservation.
+    async fn confirm(&self, _topition: &Topition, _base: i64, _byte_size: u64) -> Result<()> {
+        Err(Error::Api(ErrorCode::UnsupportedVersion))
+    }
+
+    /// Resolve reservations whose deadline has passed (a writer that died before
+    /// confirming) so the high watermark can advance past the hole. Returns how
+    /// many were resolved.
+    async fn gap_fill_expired(&self, _topition: &Topition, _now_ms: i64) -> Result<u64> {
+        Err(Error::Api(ErrorCode::UnsupportedVersion))
+    }
+
+    /// The consumer-visible high watermark. With the reserve/confirm split this
+    /// is the contiguous confirmed prefix (it lags `next_offset` while
+    /// reservations are in flight); without reservations it is just the high
+    /// watermark.
+    async fn reserved_high_watermark(&self, topition: &Topition) -> Result<i64> {
+        Ok(self.offset_stage(topition).await?.high_watermark)
+    }
+
     /// Commit offsets for one or more topic partitions in a consumer group.
     async fn offset_commit(
         &self,
@@ -2956,6 +2987,78 @@ impl Storage for StorageContainer {
         .inspect_err(|_| {
             STORAGE_CONTAINER_ERRORS.add(1, &attributes);
         })
+    }
+
+    #[instrument(skip_all)]
+    async fn reserve(&self, topition: &Topition, count: i64, deadline_ms: i64) -> Result<i64> {
+        match self {
+            #[cfg(feature = "dynostore")]
+            Self::DynoStore(engine) => engine.reserve(topition, count, deadline_ms),
+            #[cfg(feature = "libsql")]
+            Self::Lite(engine) => engine.reserve(topition, count, deadline_ms),
+            Self::Null(engine) => engine.reserve(topition, count, deadline_ms),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(engine) => engine.reserve(topition, count, deadline_ms),
+            #[cfg(feature = "slatedb")]
+            Self::Slate(engine) => engine.reserve(topition, count, deadline_ms),
+            #[cfg(feature = "turso")]
+            Self::Turso(engine) => engine.reserve(topition, count, deadline_ms),
+        }
+        .await
+    }
+
+    #[instrument(skip_all)]
+    async fn confirm(&self, topition: &Topition, base: i64, byte_size: u64) -> Result<()> {
+        match self {
+            #[cfg(feature = "dynostore")]
+            Self::DynoStore(engine) => engine.confirm(topition, base, byte_size),
+            #[cfg(feature = "libsql")]
+            Self::Lite(engine) => engine.confirm(topition, base, byte_size),
+            Self::Null(engine) => engine.confirm(topition, base, byte_size),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(engine) => engine.confirm(topition, base, byte_size),
+            #[cfg(feature = "slatedb")]
+            Self::Slate(engine) => engine.confirm(topition, base, byte_size),
+            #[cfg(feature = "turso")]
+            Self::Turso(engine) => engine.confirm(topition, base, byte_size),
+        }
+        .await
+    }
+
+    #[instrument(skip_all)]
+    async fn gap_fill_expired(&self, topition: &Topition, now_ms: i64) -> Result<u64> {
+        match self {
+            #[cfg(feature = "dynostore")]
+            Self::DynoStore(engine) => engine.gap_fill_expired(topition, now_ms),
+            #[cfg(feature = "libsql")]
+            Self::Lite(engine) => engine.gap_fill_expired(topition, now_ms),
+            Self::Null(engine) => engine.gap_fill_expired(topition, now_ms),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(engine) => engine.gap_fill_expired(topition, now_ms),
+            #[cfg(feature = "slatedb")]
+            Self::Slate(engine) => engine.gap_fill_expired(topition, now_ms),
+            #[cfg(feature = "turso")]
+            Self::Turso(engine) => engine.gap_fill_expired(topition, now_ms),
+        }
+        .await
+    }
+
+    #[instrument(skip_all)]
+    async fn reserved_high_watermark(&self, topition: &Topition) -> Result<i64> {
+        match self {
+            #[cfg(feature = "dynostore")]
+            Self::DynoStore(engine) => engine.reserved_high_watermark(topition),
+            #[cfg(feature = "libsql")]
+            Self::Lite(engine) => engine.reserved_high_watermark(topition),
+            Self::Null(engine) => engine.reserved_high_watermark(topition),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(engine) => engine.reserved_high_watermark(topition),
+            #[cfg(feature = "slatedb")]
+            Self::Slate(engine) => engine.reserved_high_watermark(topition),
+            #[cfg(feature = "turso")]
+            Self::Turso(engine) => engine.reserved_high_watermark(topition),
+        }
+        .await
     }
 
     #[instrument(skip_all)]
