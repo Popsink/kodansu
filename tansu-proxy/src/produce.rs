@@ -114,7 +114,18 @@ pub(crate) struct BatchProduceService<S> {
     requests: Arc<Mutex<Vec<BatchRequest>>>,
     responses: Arc<Mutex<BTreeMap<Uuid, BatchResponse>>>,
     resource_config: ResourceConfig,
+    /// When both are set (a coordinator front), produce writes batch bytes to
+    /// the object store via the coordinator (reserve/write/confirm) instead of
+    /// forwarding the Kafka ProduceRequest to the origin. `None` keeps the plain
+    /// forwarding proxy.
+    coordinator: Option<Arc<Client>>,
+    object_store: Option<Arc<dyn ObjectStore>>,
 }
+
+/// Grace added to the wall clock for a reservation's gap-fill deadline: if this
+/// front dies between reserve and confirm, the coordinator may fill the gap
+/// after this long.
+const RESERVATION_GRACE: Duration = Duration::from_secs(30);
 
 static SEND_PENDING_BATCH_COUNTER: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
@@ -234,12 +245,24 @@ where
         let produce_response = {
             let start = SystemTime::now();
 
-            self.service
-                .serve(ctx, produce_request)
-                .await
+            let response = match (self.coordinator.as_ref(), self.object_store.as_ref()) {
+                // coordinator front: write batches to object storage directly,
+                // never forwarding record bytes to the origin.
+                (Some(coordinator), Some(object_store)) => {
+                    self.store_to_object_store(coordinator, object_store, produce_request)
+                        .await
+                }
+                // plain proxy: forward the coalesced produce to the origin.
+                _ => self
+                    .service
+                    .serve(ctx, produce_request)
+                    .await
+                    .map_err(Into::into),
+            };
+
+            response
                 .inspect(|response| debug!(?response))
                 .inspect_err(|err| debug!(?err))
-                .map_err(Into::into)
                 .inspect(|_| {
                     SEND_PENDING_PRODUCE_DURATION.record(
                         start
@@ -427,24 +450,123 @@ where
 }
 
 impl<S> BatchProduceService<S> {
-    fn new(resource_config: ResourceConfig, service: S) -> Self {
+    fn new(
+        resource_config: ResourceConfig,
+        service: S,
+        coordinator: Option<Arc<Client>>,
+        object_store: Option<Arc<dyn ObjectStore>>,
+    ) -> Self {
         Self {
             service,
             requests: Arc::new(Mutex::new(Vec::new())),
             responses: Arc::new(Mutex::new(BTreeMap::new())),
             resource_config,
+            coordinator,
+            object_store,
         }
+    }
+
+    /// Write every batch in the coalesced request to object storage via the
+    /// coordinator (reserve → PUT → confirm) and synthesise the ProduceResponse
+    /// the origin would have returned: one PartitionProduceResponse per
+    /// (topic, partition) whose base_offset is the first batch's reserved offset
+    /// (subsequent batches reserve contiguous offsets). Fed to the same
+    /// `Owner::split` distribution as the origin path.
+    async fn store_to_object_store(
+        &self,
+        coordinator: &Client,
+        object_store: &Arc<dyn ObjectStore>,
+        request: ProduceRequest,
+    ) -> Result<ProduceResponse, Error> {
+        let deadline_ms = i64::try_from(
+            (SystemTime::now() + RESERVATION_GRACE)
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| d.as_millis()),
+        )
+        .unwrap_or(i64::MAX);
+
+        let mut topics = vec![];
+        for topic in request.topic_data.unwrap_or_default() {
+            let mut partitions = vec![];
+            for partition in topic.partition_data.unwrap_or_default() {
+                let mut base_offset = -1;
+                for (index, batch) in partition
+                    .records
+                    .into_iter()
+                    .flat_map(|frame| frame.batches)
+                    .enumerate()
+                {
+                    let base = store_batch(
+                        coordinator,
+                        object_store,
+                        &topic.name,
+                        partition.index,
+                        &batch,
+                        deadline_ms,
+                    )
+                    .await?;
+                    if index == 0 {
+                        base_offset = base;
+                    }
+                }
+
+                partitions.push(
+                    PartitionProduceResponse::default()
+                        .index(partition.index)
+                        .error_code(i16::from(tansu_sans_io::ErrorCode::None))
+                        .base_offset(base_offset)
+                        .log_append_time_ms(Some(-1))
+                        .log_start_offset(Some(0)),
+                );
+            }
+
+            topics.push(
+                TopicProduceResponse::default()
+                    .name(topic.name)
+                    .partition_responses(Some(partitions)),
+            );
+        }
+
+        Ok(ProduceResponse::default()
+            .responses(Some(topics))
+            .throttle_time_ms(Some(0)))
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct BatchProduceLayer {
     resource_config: ResourceConfig,
+    coordinator: Option<Arc<Client>>,
+    object_store: Option<Arc<dyn ObjectStore>>,
+}
+
+impl Debug for BatchProduceLayer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct(stringify!(BatchProduceLayer))
+            .field("coordinator", &self.coordinator.is_some())
+            .finish()
+    }
 }
 
 impl BatchProduceLayer {
     pub(crate) fn new(resource_config: ResourceConfig) -> Self {
-        Self { resource_config }
+        Self {
+            resource_config,
+            coordinator: None,
+            object_store: None,
+        }
+    }
+
+    /// Make this a coordinator front: produce writes batches to `object_store`
+    /// via the coordinator instead of forwarding to the origin.
+    pub(crate) fn coordinator(
+        mut self,
+        coordinator: Arc<Client>,
+        object_store: Arc<dyn ObjectStore>,
+    ) -> Self {
+        self.coordinator = Some(coordinator);
+        self.object_store = Some(object_store);
+        self
     }
 }
 
@@ -455,7 +577,12 @@ where
     type Service = BatchProduceService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        Self::Service::new(self.resource_config.clone(), inner)
+        Self::Service::new(
+            self.resource_config.clone(),
+            inner,
+            self.coordinator.clone(),
+            self.object_store.clone(),
+        )
     }
 }
 
@@ -1463,6 +1590,68 @@ mod tests {
         assert_eq!(base, 7);
 
         // the encoded batch landed at the coordinator-provided path.
+        assert!(
+            object_store
+                .head(&ObjectPath::from(OBJECT_PATH))
+                .await
+                .is_ok()
+        );
+        Ok(())
+    }
+
+    // store_to_object_store turns a coalesced ProduceRequest into a synthesised
+    // ProduceResponse carrying the coordinator's base offset, with the batch
+    // written to the returned object path.
+    #[tokio::test]
+    async fn store_to_object_store_synthesises_response() -> Result<(), Error> {
+        use object_store::memory::InMemory;
+        use rama::{Context, Layer as _, service::service_fn};
+        use tansu_service::{
+            TcpBytesLayer, TcpContext, TcpContextLayer,
+            coordinator::{PostcardFrameLayer, Request, Response},
+        };
+
+        const OBJECT_PATH: &str =
+            "clusters/c/topics/t/partitions/0000000000/records/00000000000000000007.batch";
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let handler = service_fn(async |_ctx: Context<()>, req: Request| match req {
+            Request::Reserve { .. } => Ok::<_, tansu_service::Error>(Response::Reserved {
+                base: 7,
+                object_path: OBJECT_PATH.into(),
+            }),
+            Request::Confirm { .. } => Ok(Response::Confirmed),
+        });
+        let server = (
+            TcpContextLayer::new(TcpContext::default()),
+            TcpBytesLayer::<()>::default(),
+            PostcardFrameLayer::<Request, Response>::default(),
+        )
+            .into_layer(handler);
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = server.serve(Context::default(), stream).await;
+            }
+        });
+
+        let coordinator = Client::new(addr.to_string())?;
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        let bp = BatchProduceLayer::new(ResourceConfig::default())
+            .into_layer(MockProduceService::default());
+        let request = produce_request("t", b"hello")?;
+
+        let response = bp
+            .store_to_object_store(&coordinator, &object_store, request)
+            .await?;
+
+        let topics = response.responses.unwrap_or_default();
+        let partition = &topics[0].partition_responses.as_ref().unwrap()[0];
+        assert_eq!(topics[0].name, "t");
+        assert_eq!(partition.index, 0);
+        assert_eq!(partition.base_offset, 7);
+        assert_eq!(partition.error_code, 0);
         assert!(
             object_store
                 .head(&ObjectPath::from(OBJECT_PATH))

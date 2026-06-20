@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use object_store::{ObjectStore, aws::AmazonS3Builder, memory::InMemory};
 use opentelemetry::{InstrumentationScope, global, metrics::Meter};
 use opentelemetry_otlp::ExporterBuildError;
 use opentelemetry_sdk::error::OTelSdkError;
@@ -36,7 +37,7 @@ use tansu_sans_io::{
 };
 use tansu_service::{
     BytesFrameLayer, FrameApiKeyMatcher, FrameBytesLayer, FrameRequestLayer, TcpBytesLayer,
-    TcpContextLayer, TcpListenerLayer, host_port,
+    TcpContextLayer, TcpListenerLayer, coordinator, host_port,
 };
 use tokio::{
     net::TcpListener,
@@ -54,6 +55,20 @@ use crate::{
 
 mod produce;
 mod topic;
+
+/// Build the record-batch object store from a URL: `memory` for an in-memory
+/// store (testing), otherwise the host is an S3 bucket name (credentials from
+/// the environment), mirroring the broker's storage configuration.
+fn object_store(url: &Url) -> Result<Arc<dyn ObjectStore>, Error> {
+    match url.host_str().unwrap_or("tansu") {
+        "memory" => Ok(Arc::new(InMemory::new())),
+        bucket => AmazonS3Builder::from_env()
+            .with_bucket_name(bucket)
+            .build()
+            .map(|store| Arc::new(store) as Arc<dyn ObjectStore>)
+            .map_err(|e| Error::Message(e.to_string())),
+    }
+}
 
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
@@ -133,6 +148,14 @@ pub struct Proxy {
     listener: Url,
     advertised_listener: Url,
     origin: Url,
+    /// Coordinator RPC address. When set (with `object_store`), produce becomes a
+    /// stateless-front path: batches are written to the object store via the
+    /// coordinator (reserve/write/confirm) instead of being forwarded to the
+    /// origin. `None` keeps the plain forwarding proxy.
+    coordinator: Option<Url>,
+    /// Object store for record batches (`memory` or an `s3://bucket` URL, S3
+    /// credentials from the environment). Required alongside `coordinator`.
+    object_store: Option<Url>,
 }
 
 impl Proxy {
@@ -141,7 +164,18 @@ impl Proxy {
             listener,
             advertised_listener,
             origin,
+            coordinator: None,
+            object_store: None,
         }
+    }
+
+    /// Configure this proxy as a coordinator front: produce writes batches to
+    /// `object_store` via the coordinator at `coordinator` rather than
+    /// forwarding to the origin.
+    pub fn coordinator(mut self, coordinator: Url, object_store: Url) -> Self {
+        self.coordinator = Some(coordinator);
+        self.object_store = Some(object_store);
+        self
     }
 
     pub async fn listen(&self) -> Result<(), Error> {
@@ -286,6 +320,18 @@ impl Proxy {
                 .into_layer(request_origin.clone()),
         );
 
+        // A coordinator front writes batches to object storage via the
+        // coordinator; a plain proxy forwards produce to the origin.
+        let batch_produce = match (self.coordinator.as_ref(), self.object_store.as_ref()) {
+            (Some(coordinator), Some(object_store_url)) => {
+                let client =
+                    coordinator::Client::new(host_port(coordinator.clone()).await?.to_string())?;
+                BatchProduceLayer::new(configuration.clone())
+                    .coordinator(Arc::new(client), object_store(object_store_url)?)
+            }
+            _ => BatchProduceLayer::new(configuration.clone()),
+        };
+
         let produce = HijackLayer::new(
             FrameApiKeyMatcher(ProduceRequest::KEY),
             (
@@ -299,8 +345,7 @@ impl Proxy {
                             "tansu.batch",
                             "true",
                         ),
-                        BatchProduceLayer::new(configuration.clone())
-                            .into_layer(request_origin.clone()),
+                        batch_produce.into_layer(request_origin.clone()),
                     )
                     .into_layer(request_origin.clone()),
                 ),
