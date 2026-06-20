@@ -23,8 +23,11 @@ use std::{
     vec::IntoIter,
 };
 
+use bytes::{Bytes, BytesMut};
+use object_store::{ObjectStore, ObjectStoreExt as _, PutPayload, path::Path as ObjectPath};
 use opentelemetry::metrics::{Counter, Histogram};
 use rama::{Layer, Service};
+use serde::Serialize as _;
 use tansu_sans_io::{
     ProduceRequest, ProduceResponse,
     produce_request::{PartitionProduceData, TopicProduceData},
@@ -34,12 +37,53 @@ use tansu_sans_io::{
         deflated::{self, Frame},
         inflated,
     },
+    ser::RecordBatchEncoder,
 };
+use tansu_service::coordinator::Client;
 use tokio::time::sleep;
 use tracing::debug;
 use uuid::Uuid;
 
 use crate::{Error, METER, topic::ResourceConfig};
+
+/// Write one record batch to object storage via the coordinator, the core of
+/// the stateless-front produce path (#18): reserve an offset, PUT the encoded
+/// batch to the object path the coordinator returns (it owns the Kotatsu key
+/// layout), then confirm. Returns the assigned base offset for the Kafka
+/// ProduceResponse. Record bytes never transit the coordinator.
+async fn store_batch(
+    coordinator: &Client,
+    object_store: &Arc<dyn ObjectStore>,
+    topic: &str,
+    partition: i32,
+    batch: &deflated::Batch,
+    deadline_ms: i64,
+) -> Result<i64, Error> {
+    // a batch spans last_offset_delta + 1 offsets (matches the broker's
+    // watermark accounting), so that is the reservation count.
+    let count = i64::from(batch.last_offset_delta) + 1;
+
+    let (base, object_path) = coordinator
+        .reserve(topic, partition, count, deadline_ms)
+        .await?;
+
+    let encoded = {
+        let mut encoder = RecordBatchEncoder::new(BytesMut::new());
+        batch.serialize(&mut encoder)?;
+        Bytes::from(encoder)
+    };
+    let byte_size = encoded.len() as u64;
+
+    object_store
+        .put(&ObjectPath::from(object_path), PutPayload::from(encoded))
+        .await?;
+
+    coordinator
+        .confirm(topic, partition, base, byte_size)
+        .await?;
+
+    Ok(base)
+}
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct Topition {
@@ -1363,6 +1407,68 @@ mod tests {
             response_b
         );
 
+        Ok(())
+    }
+
+    // store_batch against a mock coordinator over real TCP: it should reserve,
+    // PUT the encoded batch to the path the coordinator returns, then confirm.
+    #[tokio::test]
+    async fn store_batch_reserves_writes_and_confirms() -> Result<(), Error> {
+        use object_store::memory::InMemory;
+        use rama::{Context, Layer as _, service::service_fn};
+        use tansu_service::{
+            TcpBytesLayer, TcpContext, TcpContextLayer,
+            coordinator::{PostcardFrameLayer, Request, Response},
+        };
+
+        const OBJECT_PATH: &str =
+            "clusters/c/topics/t/partitions/0000000000/records/00000000000000000007.batch";
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+
+        let handler = service_fn(async |_ctx: Context<()>, req: Request| match req {
+            Request::Reserve { .. } => Ok::<_, tansu_service::Error>(Response::Reserved {
+                base: 7,
+                object_path: OBJECT_PATH.into(),
+            }),
+            Request::Confirm { .. } => Ok(Response::Confirmed),
+        });
+        let server = (
+            TcpContextLayer::new(TcpContext::default()),
+            TcpBytesLayer::<()>::default(),
+            PostcardFrameLayer::<Request, Response>::default(),
+        )
+            .into_layer(handler);
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = server.serve(Context::default(), stream).await;
+            }
+        });
+
+        let coordinator = Client::new(addr.to_string())?;
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+
+        // a valid empty batch spanning 3 offsets.
+        let batch = inflated::Batch::builder()
+            .base_offset(0)
+            .last_offset_delta(2)
+            .producer_id(-1)
+            .producer_epoch(-1)
+            .base_sequence(-1)
+            .build()
+            .and_then(deflated::Batch::try_from)?;
+
+        let base = store_batch(&coordinator, &object_store, "t", 0, &batch, 0).await?;
+        assert_eq!(base, 7);
+
+        // the encoded batch landed at the coordinator-provided path.
+        assert!(
+            object_store
+                .head(&ObjectPath::from(OBJECT_PATH))
+                .await
+                .is_ok()
+        );
         Ok(())
     }
 }

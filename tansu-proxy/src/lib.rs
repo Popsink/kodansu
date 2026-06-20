@@ -62,6 +62,7 @@ pub enum Error {
     FrameTooBig(usize),
     Io(Arc<io::Error>),
     Join(Arc<JoinError>),
+    ObjectStore(Arc<object_store::Error>),
     Otel(#[from] tansu_otel::Error),
     OtelSdk(Arc<OTelSdkError>),
     ParseFilter(Arc<ParseError>),
@@ -109,6 +110,12 @@ impl From<ParseError> for Error {
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {
         Self::Io(Arc::new(value))
+    }
+}
+
+impl From<object_store::Error> for Error {
+    fn from(value: object_store::Error) -> Self {
+        Self::ObjectStore(Arc::new(value))
     }
 }
 
