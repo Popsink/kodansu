@@ -514,3 +514,54 @@ mod slatedb {
         .await
     }
 }
+
+#[cfg(feature = "slatedb")]
+mod hybrid {
+    use std::sync::Arc;
+
+    use super::*;
+
+    async fn storage_container(
+        cluster: impl Into<String>,
+        node: i32,
+    ) -> Result<Arc<Box<dyn Storage>>> {
+        common::storage_container(
+            StorageType::Hybrid,
+            cluster,
+            node,
+            Url::parse("tcp://127.0.0.1/")?,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn empty_topic() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::simple_non_txn(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn simple_non_txn() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let cluster_id = Uuid::now_v7();
+        let broker_id = rng().random_range(0..i32::MAX);
+
+        super::simple_non_txn(
+            cluster_id,
+            broker_id,
+            storage_container(cluster_id, broker_id).await?,
+        )
+        .await
+    }
+}
