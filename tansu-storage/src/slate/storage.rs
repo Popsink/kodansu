@@ -665,7 +665,7 @@ impl Storage for Engine {
             }
         }
 
-        tx.commit().await.map_err(Error::from).and(Ok(offset))
+        self.commit_tx(tx).await.and(Ok(offset))
     }
 
     async fn fetch(

@@ -77,17 +77,23 @@
 //!
 //! 4. **Large Partition Scans**: Very large partitions may benefit from skip-list indexing.
 
-use std::{cmp::Ordering, fmt, sync::Arc};
+use std::{
+    cmp::Ordering,
+    fmt,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use bytes::Bytes;
 use object_store::{
     ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, path::Path as ObjectPath,
 };
 use serde::Deserialize;
-use slatedb::Db;
+use slatedb::{Db, DbTransaction, config::WriteOptions};
 use tansu_sans_io::{ErrorCode, de::BatchDecoder, record::deflated::Batch};
 use tansu_schema::{Registry, lake::House};
-use tracing::debug;
+use tokio::sync::{Notify, oneshot};
+use tracing::{debug, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -111,6 +117,10 @@ pub struct Engine {
     /// object store and SlateDB keeps only the offset→object marker; otherwise
     /// (`slatedb://`) batch bytes are stored inline in SlateDB.
     pub(super) object_store: Option<Arc<dyn ObjectStore>>,
+    /// Group-commit coordinator. `Some` when built via the async [`Builder`]
+    /// (a flush task is spawned); `None` for [`Engine::new`], in which case
+    /// commits flush durably one at a time.
+    pub(super) committer: Option<Arc<GroupCommitter>>,
 }
 
 impl fmt::Debug for Engine {
@@ -119,6 +129,91 @@ impl fmt::Debug for Engine {
             .field("cluster", &self.cluster)
             .field("node", &self.node)
             .finish()
+    }
+}
+
+/// How often the group committer flushes as a fallback when idle; under load it
+/// flushes as soon as the previous flush returns, so this is just a floor.
+const GROUP_COMMIT_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Group-commit coordinator. Transactions commit non-durably (fast), then wait
+/// on a shared flush barrier; a single background `db.flush()` makes a whole
+/// group durable at once before any member is acked. This amortises the
+/// per-commit durable flush measured in Phase 0 (#18) while preserving
+/// durable-on-ack: a member is only resolved after the flush that includes it.
+pub(super) struct GroupCommitter {
+    db: Arc<Db>,
+    waiters: Mutex<Vec<oneshot::Sender<Result<()>>>>,
+    notify: Notify,
+    flush_interval: Duration,
+}
+
+impl GroupCommitter {
+    fn spawn(db: Arc<Db>, flush_interval: Duration) -> Arc<Self> {
+        let committer = Arc::new(Self {
+            db,
+            waiters: Mutex::new(Vec::new()),
+            notify: Notify::new(),
+            flush_interval,
+        });
+
+        let runner = Arc::clone(&committer);
+        _ = tokio::spawn(async move { runner.run().await });
+
+        committer
+    }
+
+    async fn run(&self) {
+        loop {
+            tokio::select! {
+                _ = self.notify.notified() => {}
+                _ = tokio::time::sleep(self.flush_interval) => {}
+            }
+
+            let waiters: Vec<oneshot::Sender<Result<()>>> = {
+                let mut guard = self.waiters.lock().expect("group committer poisoned");
+                std::mem::take(&mut *guard)
+            };
+
+            if waiters.is_empty() {
+                continue;
+            }
+
+            // A single flush makes every group member durable. Each member
+            // committed to the WAL buffer before registering its waiter, so all
+            // are captured by this flush.
+            let outcome = self.db.flush().await;
+            for waiter in waiters {
+                let result = match &outcome {
+                    Ok(()) => Ok(()),
+                    Err(err) => Err(Error::Message(err.to_string())),
+                };
+                _ = waiter.send(result);
+            }
+        }
+    }
+
+    /// Commit `tx` non-durably, then block until the next group flush makes it
+    /// durable. The transaction's writes land in the WAL buffer synchronously on
+    /// commit, so the flush that resolves this waiter includes them.
+    async fn commit(&self, tx: DbTransaction) -> Result<()> {
+        tx.commit_with_options(&WriteOptions {
+            await_durable: false,
+        })
+        .await
+        .map_err(Error::from)?;
+
+        let (done, wait) = oneshot::channel();
+        self.waiters
+            .lock()
+            .expect("group committer poisoned")
+            .push(done);
+        self.notify.notify_one();
+
+        wait.await.unwrap_or_else(|_| {
+            warn!("group committer stopped before flush");
+            Err(Error::Message("group committer stopped".into()))
+        })
     }
 }
 
@@ -188,22 +283,33 @@ impl Builder {
         self
     }
 
-    /// Build the Engine, panicking if required fields are missing
+    /// Build the Engine, panicking if required fields are missing.
+    ///
+    /// Spawns the group-commit flush task, so this must be called from within a
+    /// Tokio runtime.
     pub fn build(self) -> Engine {
+        let db = self.db.expect("db is required");
+        let committer = Some(GroupCommitter::spawn(
+            Arc::clone(&db),
+            GROUP_COMMIT_FLUSH_INTERVAL,
+        ));
+
         Engine {
             cluster: self.cluster.expect("cluster is required"),
             node: self.node.expect("node is required"),
             advertised_listener: self
                 .advertised_listener
                 .expect("advertised_listener is required"),
-            db: self.db.expect("db is required"),
+            db,
             schemas: self.schemas,
             lake: self.lake,
             object_store: self.object_store,
+            committer,
         }
     }
 
-    /// Try to build the Engine, returning None if required fields are missing
+    /// Try to build the Engine, returning None if required fields are missing.
+    /// No group committer is spawned (commits flush durably one at a time).
     pub fn try_build(self) -> Option<Engine> {
         Some(Engine {
             cluster: self.cluster?,
@@ -213,6 +319,7 @@ impl Builder {
             schemas: self.schemas,
             lake: self.lake,
             object_store: self.object_store,
+            committer: None,
         })
     }
 }
@@ -249,6 +356,16 @@ impl Engine {
             schemas: None,
             lake: None,
             object_store: None,
+            committer: None,
+        }
+    }
+
+    /// Commit a transaction, group-committing through the shared flush barrier
+    /// when a [`GroupCommitter`] is present, otherwise flushing durably inline.
+    pub(super) async fn commit_tx(&self, tx: DbTransaction) -> Result<()> {
+        match &self.committer {
+            Some(committer) => committer.commit(tx).await,
+            None => tx.commit().await.map_err(Into::into),
         }
     }
 
@@ -317,7 +434,7 @@ impl Engine {
     /// is written (control markers included).
     pub(super) async fn store_batch_bytes(
         &self,
-        tx: &slatedb::DbTransaction,
+        tx: &DbTransaction,
         topic_id: Uuid,
         partition: i32,
         offset: i64,
@@ -327,7 +444,7 @@ impl Engine {
         if let Some(ref store) = self.object_store {
             self.put_record_object(store, topic_id, partition, offset, encoded.clone())
                 .await?;
-            tx.put(batch_key, (encoded.len() as u64).to_be_bytes().to_vec())
+            tx.put(batch_key, (encoded.len() as u64).to_be_bytes())
                 .map_err(Into::into)
         } else {
             tx.put(batch_key, &encoded[..]).map_err(Into::into)
@@ -344,11 +461,7 @@ impl Engine {
         Batch::deserialize(decoder).map_err(Into::into)
     }
 
-    pub(super) async fn load_metadata<T>(
-        &self,
-        tx: &slatedb::DbTransaction,
-        key: &[u8],
-    ) -> Result<T>
+    pub(super) async fn load_metadata<T>(&self, tx: &DbTransaction, key: &[u8]) -> Result<T>
     where
         T: serde::de::DeserializeOwned + Default,
     {
@@ -362,12 +475,7 @@ impl Engine {
             })
     }
 
-    pub(super) fn save_metadata<T>(
-        &self,
-        tx: &slatedb::DbTransaction,
-        key: &[u8],
-        value: &T,
-    ) -> Result<()>
+    pub(super) fn save_metadata<T>(&self, tx: &DbTransaction, key: &[u8], value: &T) -> Result<()>
     where
         T: serde::Serialize,
     {
