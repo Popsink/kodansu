@@ -278,6 +278,8 @@ pub use stream::{
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
     Auth(#[from] tansu_auth::Error),
+    /// A coordinator RPC returned an API error code (Milestone 2 reserve/confirm).
+    Coordinator(i16),
     DuplicateRoute(i16),
     FrameTooBig(usize),
     Io(Arc<io::Error>),

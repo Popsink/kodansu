@@ -26,12 +26,33 @@
 
 use std::{fmt, marker::PhantomData};
 
-use bytes::Bytes;
+use bytes::{BufMut as _, Bytes, BytesMut};
 use rama::{Context, Layer, Service};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
 use crate::Error;
+
+/// Encode `value` as a length-delimited postcard frame: a 4-byte big-endian
+/// body length followed by the postcard body. This is the wire format the
+/// broker's [`crate::TcpBytesService`] expects (it reads the 4-byte prefix to
+/// size the frame and writes a service response verbatim), so client and server
+/// share it. Mirrors the Kafka `fix_length` prefix.
+pub fn encode_frame<T: Serialize>(value: &T) -> Result<Bytes, Error> {
+    let body = postcard::to_stdvec(value)?;
+    let mut framed = BytesMut::with_capacity(4 + body.len());
+    framed.put_i32(body.len() as i32);
+    framed.extend_from_slice(&body);
+    Ok(framed.freeze())
+}
+
+/// Decode a value from a length-delimited postcard frame (`[4-byte len][body]`),
+/// the inverse of [`encode_frame`]. The 4-byte prefix is skipped; the body is
+/// postcard-decoded.
+pub fn decode_frame<T: for<'de> Deserialize<'de>>(framed: &[u8]) -> Result<T, Error> {
+    let body = framed.get(4..).ok_or(Error::FrameTooBig(framed.len()))?;
+    postcard::from_bytes(body).map_err(Into::into)
+}
 
 /// A coordinator RPC request. Topic is carried by name (the proxy speaks Kafka
 /// names; the coordinator resolves to its topic id).
@@ -142,11 +163,134 @@ where
 
     #[instrument(skip(self, ctx, req))]
     async fn serve(&self, ctx: Context<State>, req: Bytes) -> Result<Self::Response, Self::Error> {
-        let request: Req = postcard::from_bytes(&req).map_err(Error::from)?;
+        // `req` arrives from TcpBytesService as `[4-byte len][body]`; the
+        // response must carry the same prefix (TcpBytesService writes it
+        // verbatim). encode_frame/decode_frame own that framing.
+        let request: Req = decode_frame(&req).map_err(Error::from)?;
         let response = self.inner.serve(ctx, request).await?;
-        let encoded = postcard::to_stdvec(&response).map_err(Error::from)?;
-        debug!(response_bytes = encoded.len());
-        Ok(Bytes::from(encoded))
+        let framed = encode_frame(&response).map_err(Error::from)?;
+        debug!(response_bytes = framed.len());
+        Ok(framed)
+    }
+}
+
+/// deadpool manager for pooled TCP connections to the coordinator's RPC port.
+#[derive(Clone, Debug)]
+struct ConnectionManager {
+    addr: String,
+}
+
+impl deadpool::managed::Manager for ConnectionManager {
+    type Type = tokio::net::TcpStream;
+    type Error = Error;
+
+    async fn create(&self) -> Result<Self::Type, Self::Error> {
+        let stream = tokio::net::TcpStream::connect(&self.addr).await?;
+        stream.set_nodelay(true)?;
+        Ok(stream)
+    }
+
+    async fn recycle(
+        &self,
+        _conn: &mut Self::Type,
+        _metrics: &deadpool::managed::Metrics,
+    ) -> deadpool::managed::RecycleResult<Self::Error> {
+        Ok(())
+    }
+}
+
+/// Pooled client for the broker→coordinator RPC.
+///
+/// reserve/confirm are on the produce hot path (one call per coalesced batch),
+/// so connections are pooled rather than dialed per call. A backend API-error
+/// rejection ([`Response::Error`]) surfaces as [`Error::Coordinator`]; the proxy
+/// maps it to the right Kafka error for the client.
+#[derive(Clone)]
+pub struct Client {
+    pool: deadpool::managed::Pool<ConnectionManager>,
+}
+
+impl fmt::Debug for Client {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct(stringify!(Client)).finish()
+    }
+}
+
+impl Client {
+    /// Connect to the coordinator RPC endpoint (`host:port`).
+    pub fn new(addr: impl Into<String>) -> Result<Self, Error> {
+        let pool = deadpool::managed::Pool::builder(ConnectionManager { addr: addr.into() })
+            .build()
+            .map_err(|e| Error::Message(e.to_string()))?;
+        Ok(Self { pool })
+    }
+
+    async fn call(&self, request: Request) -> Result<Response, Error> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let mut conn = self
+            .pool
+            .get()
+            .await
+            .map_err(|e| Error::Message(e.to_string()))?;
+
+        let framed = encode_frame(&request)?;
+        conn.write_all(&framed).await?;
+        conn.flush().await?;
+
+        let mut len = [0u8; 4];
+        conn.read_exact(&mut len).await?;
+        let mut body = vec![0u8; i32::from_be_bytes(len) as usize];
+        conn.read_exact(&mut body).await?;
+        postcard::from_bytes(&body).map_err(Into::into)
+    }
+
+    /// Reserve `count` offsets for `topic`/`partition`; returns the base offset.
+    pub async fn reserve(
+        &self,
+        topic: impl Into<String>,
+        partition: i32,
+        count: i64,
+        deadline_ms: i64,
+    ) -> Result<i64, Error> {
+        match self
+            .call(Request::Reserve {
+                topic: topic.into(),
+                partition,
+                count,
+                deadline_ms,
+            })
+            .await?
+        {
+            Response::Reserved { base } => Ok(base),
+            Response::Error { code } => Err(Error::Coordinator(code)),
+            Response::Confirmed => Err(Error::Message("unexpected Confirmed for reserve".into())),
+        }
+    }
+
+    /// Confirm a reserved batch now durable in object storage.
+    pub async fn confirm(
+        &self,
+        topic: impl Into<String>,
+        partition: i32,
+        base: i64,
+        byte_size: u64,
+    ) -> Result<(), Error> {
+        match self
+            .call(Request::Confirm {
+                topic: topic.into(),
+                partition,
+                base,
+                byte_size,
+            })
+            .await?
+        {
+            Response::Confirmed => Ok(()),
+            Response::Error { code } => Err(Error::Coordinator(code)),
+            Response::Reserved { .. } => {
+                Err(Error::Message("unexpected Reserved for confirm".into()))
+            }
+        }
     }
 }
 
@@ -165,16 +309,56 @@ mod tests {
 
         let svc = PostcardFrameLayer::<Request, Response>::new().into_layer(inner);
 
-        let wire = Bytes::from(postcard::to_stdvec(&Request::Reserve {
+        // the service consumes/produces length-prefixed frames (what
+        // TcpBytesService hands it / writes verbatim).
+        let wire = encode_frame(&Request::Reserve {
             topic: "t".into(),
             partition: 0,
             count: 7,
             deadline_ms: 0,
-        })?);
+        })?;
 
         let out = svc.serve(Context::default(), wire).await?;
-        let decoded: Response = postcard::from_bytes(&out)?;
+        let decoded: Response = decode_frame(&out)?;
         assert_eq!(decoded, Response::Reserved { base: 7 });
+        Ok(())
+    }
+
+    // End-to-end over a real TCP socket: the full server stack
+    // (TcpBytes → PostcardFrame → handler) served on a loopback listener, hit by
+    // the pooled Client. Proves the wire framing agrees in both directions.
+    #[tokio::test]
+    async fn client_server_round_trip_over_tcp() -> Result<(), Error> {
+        use crate::{TcpBytesLayer, TcpContext, TcpContextLayer};
+        use rama::Context;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+
+        // TcpBytesService hands its inner service `Context<()>` (it swaps to its
+        // own State::default()), so the handler is Service<(), Request>.
+        let handler = service_fn(async |_ctx: Context<()>, req: Request| match req {
+            Request::Reserve { count, .. } => {
+                Ok::<_, Error>(Response::Reserved { base: count - 1 })
+            }
+            Request::Confirm { .. } => Ok(Response::Confirmed),
+        });
+        let server = (
+            TcpContextLayer::new(TcpContext::default()),
+            TcpBytesLayer::<()>::default(),
+            PostcardFrameLayer::<Request, Response>::default(),
+        )
+            .into_layer(handler);
+
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let _ = server.serve(Context::default(), stream).await;
+            }
+        });
+
+        let client = Client::new(addr.to_string())?;
+        assert_eq!(client.reserve("t", 3, 10, 0).await?, 9);
+        assert!(matches!(client.confirm("t", 3, 9, 64).await, Ok(())));
         Ok(())
     }
 }
