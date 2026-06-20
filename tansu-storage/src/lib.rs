@@ -1622,6 +1622,22 @@ where
         self.as_ref().offset_stage(topition).await
     }
 
+    async fn reserve(&self, topition: &Topition, count: i64, deadline_ms: i64) -> Result<i64> {
+        self.as_ref().reserve(topition, count, deadline_ms).await
+    }
+
+    async fn confirm(&self, topition: &Topition, base: i64, byte_size: u64) -> Result<()> {
+        self.as_ref().confirm(topition, base, byte_size).await
+    }
+
+    async fn gap_fill_expired(&self, topition: &Topition, now_ms: i64) -> Result<u64> {
+        self.as_ref().gap_fill_expired(topition, now_ms).await
+    }
+
+    async fn reserved_high_watermark(&self, topition: &Topition) -> Result<i64> {
+        self.as_ref().reserved_high_watermark(topition).await
+    }
+
     async fn list_offsets(
         &self,
         isolation_level: IsolationLevel,
@@ -1875,6 +1891,22 @@ where
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
         self.as_ref().offset_stage(topition).await
+    }
+
+    async fn reserve(&self, topition: &Topition, count: i64, deadline_ms: i64) -> Result<i64> {
+        self.as_ref().reserve(topition, count, deadline_ms).await
+    }
+
+    async fn confirm(&self, topition: &Topition, base: i64, byte_size: u64) -> Result<()> {
+        self.as_ref().confirm(topition, base, byte_size).await
+    }
+
+    async fn gap_fill_expired(&self, topition: &Topition, now_ms: i64) -> Result<u64> {
+        self.as_ref().gap_fill_expired(topition, now_ms).await
+    }
+
+    async fn reserved_high_watermark(&self, topition: &Topition) -> Result<i64> {
+        self.as_ref().reserved_high_watermark(topition).await
     }
 
     async fn list_offsets(

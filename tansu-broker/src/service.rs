@@ -27,6 +27,7 @@ use crate::{Error, Result, coordinator::group::Coordinator};
 
 pub mod auth;
 pub mod coordinator;
+pub mod coordinator_rpc;
 pub mod storage;
 
 type TcpRouteFrame =
