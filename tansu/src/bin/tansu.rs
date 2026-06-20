@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// The proxy's `listen()` composes a deep rama Layer/Service stack (Kafka frame
+// routing + produce/metadata/find-coordinator hijacks + the coordinator front);
+// monomorphising that future's layout in this binary overflows the default
+// trait-solver query depth (128). Raise it for headroom.
+#![recursion_limit = "512"]
+
 use dotenv::dotenv;
 use tansu_broker::{TracingFormat, otel};
 use tansu_cli::{Cli, Result};
