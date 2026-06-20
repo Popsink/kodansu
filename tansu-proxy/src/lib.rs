@@ -372,6 +372,8 @@ impl Proxy {
         advertised_listener_url: Url,
         origin_url: Url,
         otlp_endpoint_url: Option<Url>,
+        coordinator_url: Option<Url>,
+        object_store_url: Option<Url>,
     ) -> Result<ErrorCode, Error> {
         let mut set = JoinSet::new();
 
@@ -380,7 +382,12 @@ impl Proxy {
         })?;
 
         {
-            let proxy = Proxy::new(listener_url, advertised_listener_url, origin_url);
+            let mut proxy = Proxy::new(listener_url, advertised_listener_url, origin_url);
+            if let (Some(coordinator_url), Some(object_store_url)) =
+                (coordinator_url, object_store_url)
+            {
+                proxy = proxy.coordinator(coordinator_url, object_store_url);
+            }
             _ = set.spawn(async move { proxy.listen().await });
         }
 

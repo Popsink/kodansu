@@ -36,6 +36,17 @@ pub(super) struct Arg {
     #[arg(long, env = "ORIGIN_URL", default_value = DEFAULT_BROKER)]
     pub(super) origin_url: EnvVarExp<Url>,
 
+    /// Coordinator RPC address. When set (with --object-store-url), the proxy
+    /// becomes a stateless front: produce writes batches to the object store via
+    /// the coordinator instead of forwarding to the origin.
+    #[arg(long, env = "COORDINATOR_URL")]
+    pub(super) coordinator_url: Option<EnvVarExp<Url>>,
+
+    /// Object store for record batches (`memory` or `s3://bucket`, credentials
+    /// from the environment). Required alongside --coordinator-url.
+    #[arg(long, env = "OBJECT_STORE_URL")]
+    pub(super) object_store_url: Option<EnvVarExp<Url>>,
+
     /// OTEL Exporter OTLP endpoint
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
     pub(super) otlp_endpoint_url: Option<EnvVarExp<Url>>,

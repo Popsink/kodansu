@@ -78,6 +78,11 @@ pub(super) struct Arg {
     #[arg(long, env = "STORAGE_ENGINE", default_value = "memory://tansu/")]
     storage_engine: EnvVarExp<Url>,
 
+    /// When set, this broker also serves the coordinator reserve/confirm RPC on
+    /// this address (for stateless proxy fronts). Set on coordinator pods only.
+    #[arg(long, env = "RPC_LISTENER_URL")]
+    rpc_listener_url: Option<EnvVarExp<Url>>,
+
     /// Schema registry examples are: file://./etc/schema or s3://tansu/, containing: topic.json, topic.proto or topic.avsc
     #[arg(long, env = "SCHEMA_REGISTRY")]
     schema_registry: Option<EnvVarExp<Url>>,
@@ -202,6 +207,9 @@ impl Arg {
         let storage_engine = self.storage_engine.into_inner();
         let advertised_listener = self.advertised_listener_url.into_inner();
         let listener = self.listener_url.into_inner();
+        let rpc_listener = self
+            .rpc_listener_url
+            .map(|rpc_listener_url| rpc_listener_url.into_inner());
 
         let schema_registry_url = self
             .schema_registry
@@ -319,7 +327,14 @@ impl Arg {
             }
         }
 
-        broker.build().await.map_err(Into::into)
+        broker
+            .build()
+            .await
+            .map(|broker| match rpc_listener {
+                Some(rpc_listener) => broker.rpc_listener(rpc_listener),
+                None => broker,
+            })
+            .map_err(Into::into)
     }
 }
 

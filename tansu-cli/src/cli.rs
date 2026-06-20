@@ -141,6 +141,10 @@ impl Cli {
                 arg.origin_url.into_inner(),
                 arg.otlp_endpoint_url
                     .map(|otlp_endpoint_url| otlp_endpoint_url.into_inner()),
+                arg.coordinator_url
+                    .map(|coordinator_url| coordinator_url.into_inner()),
+                arg.object_store_url
+                    .map(|object_store_url| object_store_url.into_inner()),
             )
             .await
             .map_err(Into::into),
