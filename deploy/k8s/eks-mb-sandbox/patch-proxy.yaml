@@ -5,7 +5,7 @@ metadata:
 spec:
   template:
     spec:
-      serviceAccountName: tansu-m2
+      serviceAccountName: tansu-external
       containers:
         - name: tansu
           envFrom: [] # Pod Identity, not a static-credentials Secret
