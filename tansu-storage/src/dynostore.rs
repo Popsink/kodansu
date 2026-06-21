@@ -2004,28 +2004,55 @@ impl Storage for DynoStore {
                         _ = candidate.replace(meta);
                     }
                 } else {
+                    // Selection orders on the immutable base offset encoded in
+                    // the object key, never on `last_modified`. Compaction
+                    // rewrites surviving batches in place with
+                    // `PutMode::Overwrite` (`compact_partition`), which bumps
+                    // `last_modified`; ordering on it inverted the mtime↔offset
+                    // relation and made EARLIEST/TIMESTAMP return an offset past
+                    // retained data, so consumers silently skipped it (see #26).
+                    // LATEST was already moved off mtime onto `high_watermark`.
+                    let Some(meta_offset) = meta
+                        .location
+                        .parts()
+                        .next_back()
+                        .and_then(|offset| i64::from_str(&offset.as_ref()[0..20]).ok())
+                    else {
+                        continue;
+                    };
+
+                    let found_offset = candidate.as_ref().and_then(|found| {
+                        found
+                            .location
+                            .parts()
+                            .next_back()
+                            .and_then(|offset| i64::from_str(&offset.as_ref()[0..20]).ok())
+                    });
+
                     match offset_request {
+                        // EARLIEST: the smallest base offset present == the log
+                        // start (matches the SQL backends' `min(offset_id)`).
                         ListOffset::Earliest
-                            if candidate
-                                .as_ref()
-                                .is_none_or(|found| found.last_modified > meta.last_modified) =>
+                            if found_offset.is_none_or(|found| meta_offset < found) =>
                         {
                             _ = candidate.replace(meta);
                         }
 
                         ListOffset::Latest
-                            if candidate
-                                .as_ref()
-                                .is_none_or(|found| meta.last_modified > found.last_modified) =>
+                            if found_offset.is_none_or(|found| meta_offset > found) =>
                         {
                             _ = candidate.replace(meta);
                         }
 
+                        // TIMESTAMP: earliest offset whose batch is not older than
+                        // the target. The `last_modified` predicate is the batch's
+                        // write time (best effort — a fully correct answer needs
+                        // per-record timestamps), but the candidate is chosen by
+                        // smallest base offset so the result stays monotonic in
+                        // offset rather than in mtime.
                         ListOffset::Timestamp(system_time)
                             if SystemTime::from(meta.last_modified) > *system_time
-                                && candidate.as_ref().is_none_or(|found| {
-                                    found.last_modified > meta.last_modified
-                                }) =>
+                                && found_offset.is_none_or(|found| meta_offset < found) =>
                         {
                             _ = candidate.replace(meta);
                         }
