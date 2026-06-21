@@ -34,7 +34,7 @@ configMapGenerator:
 images:
   - name: ghcr.io/tansu-io/tansu
     newName: ghcr.io/popsink/tansu
-    newTag: 0.8.0-alpha.1
+    newTag: 0.8.0-alpha.2
 
 patches:
   - path: patch-coordinator.yaml
