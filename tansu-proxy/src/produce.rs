@@ -516,7 +516,14 @@ impl<S> BatchProduceService<S> {
                         .error_code(i16::from(tansu_sans_io::ErrorCode::None))
                         .base_offset(base_offset)
                         .log_append_time_ms(Some(-1))
-                        .log_start_offset(Some(0)),
+                        .log_start_offset(Some(0))
+                        // record_errors must serialise as a non-null (empty)
+                        // array, or Kafka clients fail to parse the response
+                        // ("non-nullable field recordErrors was serialized as
+                        // null"). Match the broker's success response exactly.
+                        .record_errors(Some([].into()))
+                        .error_message(None)
+                        .current_leader(None),
                 );
             }
 
@@ -1652,6 +1659,9 @@ mod tests {
         assert_eq!(partition.index, 0);
         assert_eq!(partition.base_offset, 7);
         assert_eq!(partition.error_code, 0);
+        // record_errors must be a non-null (empty) array — a null serialises as
+        // a protocol error that Kafka clients reject.
+        assert_eq!(partition.record_errors.as_deref(), Some(&[][..]));
         assert!(
             object_store
                 .head(&ObjectPath::from(OBJECT_PATH))
