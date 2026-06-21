@@ -218,10 +218,18 @@ impl fmt::Debug for Client {
     }
 }
 
+/// Max pooled connections to the coordinator. Each connection carries one
+/// in-flight reserve/confirm; concurrency here is what lets the coordinator's
+/// group committer batch many commits into one flush (the produce hot path).
+/// deadpool defaults to num_cpus, which throttles a small proxy pod, so set it
+/// explicitly.
+const POOL_MAX_SIZE: usize = 64;
+
 impl Client {
     /// Connect to the coordinator RPC endpoint (`host:port`).
     pub fn new(addr: impl Into<String>) -> Result<Self, Error> {
         let pool = deadpool::managed::Pool::builder(ConnectionManager { addr: addr.into() })
+            .max_size(POOL_MAX_SIZE)
             .build()
             .map_err(|e| Error::Message(e.to_string()))?;
         Ok(Self { pool })

@@ -485,34 +485,68 @@ impl<S> BatchProduceService<S> {
         )
         .unwrap_or(i64::MAX);
 
-        let mut topics = vec![];
+        // Store every batch concurrently. Serialising reserve→PUT→confirm (one
+        // commit in flight at a time) defeats the coordinator's group committer,
+        // which is what makes the inline path fast — so fan out all batches and
+        // keep many reservations in flight, letting the committer batch them.
+        let mut set = tokio::task::JoinSet::new();
+        // Preserve topic/partition order for the response; offsets come back via
+        // the JoinSet keyed by (topic, partition).
+        let mut layout: Vec<(String, Vec<i32>)> = vec![];
+
         for topic in request.topic_data.unwrap_or_default() {
-            let mut partitions = vec![];
+            let mut partition_indexes = vec![];
             for partition in topic.partition_data.unwrap_or_default() {
-                let mut base_offset = -1;
-                for (index, batch) in partition
+                partition_indexes.push(partition.index);
+                for batch in partition
                     .records
                     .into_iter()
                     .flat_map(|frame| frame.batches)
-                    .enumerate()
                 {
-                    let base = store_batch(
-                        coordinator,
-                        object_store,
-                        &topic.name,
-                        partition.index,
-                        &batch,
-                        deadline_ms,
-                    )
-                    .await?;
-                    if index == 0 {
-                        base_offset = base;
-                    }
+                    let coordinator = coordinator.clone();
+                    let object_store = object_store.clone();
+                    let topic_name = topic.name.clone();
+                    let partition = partition.index;
+                    _ = set.spawn(async move {
+                        store_batch(
+                            &coordinator,
+                            &object_store,
+                            &topic_name,
+                            partition,
+                            &batch,
+                            deadline_ms,
+                        )
+                        .await
+                        .map(|base| (topic_name, partition, base))
+                    });
                 }
+            }
+            layout.push((topic.name, partition_indexes));
+        }
 
+        // Consumer-visible base_offset per (topic, partition) = the lowest
+        // reserved base among that partition's batches in this flush.
+        let mut bases: BTreeMap<(String, i32), i64> = BTreeMap::new();
+        while let Some(joined) = set.join_next().await {
+            let (topic_name, partition, base) =
+                joined.map_err(|err| Error::Message(err.to_string()))??;
+            bases
+                .entry((topic_name, partition))
+                .and_modify(|lowest| *lowest = (*lowest).min(base))
+                .or_insert(base);
+        }
+
+        let mut topics = vec![];
+        for (topic_name, partition_indexes) in layout {
+            let mut partitions = vec![];
+            for partition in partition_indexes {
+                let base_offset = bases
+                    .get(&(topic_name.clone(), partition))
+                    .copied()
+                    .unwrap_or(-1);
                 partitions.push(
                     PartitionProduceResponse::default()
-                        .index(partition.index)
+                        .index(partition)
                         .error_code(i16::from(tansu_sans_io::ErrorCode::None))
                         .base_offset(base_offset)
                         .log_append_time_ms(Some(-1))
@@ -529,7 +563,7 @@ impl<S> BatchProduceService<S> {
 
             topics.push(
                 TopicProduceResponse::default()
-                    .name(topic.name)
+                    .name(topic_name)
                     .partition_responses(Some(partitions)),
             );
         }
