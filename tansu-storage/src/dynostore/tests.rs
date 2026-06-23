@@ -22,6 +22,7 @@ use crate::{Error, Result};
 
 mod idempotent;
 mod latency;
+mod metadata_visibility;
 mod offset_assignment;
 
 pub(crate) fn init_tracing() -> Result<DefaultGuard, Error> {
