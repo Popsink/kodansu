@@ -19,7 +19,7 @@ use std::{sync::Arc, time::Duration};
 use crate::common::{Error, init_tracing};
 use bytes::Bytes;
 use tansu_sans_io::{
-    IsolationLevel,
+    IsolationLevel, ListOffset,
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
     record::{Record, deflated, inflated},
 };
@@ -254,6 +254,91 @@ async fn without_compact_policy_nothing_is_removed() -> Result<(), Error> {
     storage.maintain(std::time::SystemTime::now()).await?;
 
     assert_eq!(3, fetched_records(&storage, &topition).await?.len());
+
+    Ok(())
+}
+
+/// Compaction must not corrupt `ListOffsets(EARLIEST)`.
+///
+/// Selection used to order candidate objects by their `last_modified`. Compaction
+/// rewrites surviving batches in place with `PutMode::Overwrite`, which bumps
+/// `last_modified`; the rewritten *oldest* batch then looked *newest* by mtime, so
+/// EARLIEST returned a later batch's base offset and a consumer skipped the records
+/// still held at the true log start (see #26).
+///
+/// Here a multi-record batch at offset 0 survives compaction (rewritten in place),
+/// while the newer single-record batch at offset 2 is not rewritten — inverting the
+/// mtime order. EARLIEST must still report 0, the smallest surviving base offset.
+#[tokio::test]
+async fn earliest_after_compaction_is_the_log_start_not_the_newest_mtime() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = memory_storage().await?;
+
+    create_topic(&storage, "kv", cleanup_compact()).await?;
+
+    let topition = Topition::new("kv", 0);
+
+    // batch at offsets 0..=1: k1@0, k2@1
+    let head = inflated::Batch::builder()
+        .last_offset_delta(1)
+        .record(
+            Record::builder()
+                .offset_delta(0)
+                .key(Some(Bytes::from_static(b"k1")))
+                .value(Some(Bytes::from_static(b"v1"))),
+        )
+        .record(
+            Record::builder()
+                .offset_delta(1)
+                .key(Some(Bytes::from_static(b"k2")))
+                .value(Some(Bytes::from_static(b"v2"))),
+        )
+        .build()
+        .and_then(deflated::Batch::try_from)?;
+
+    _ = storage.produce(None, &topition, head).await?;
+
+    // newer single-record batch at offset 2 supersedes k2@1
+    _ = storage
+        .produce(None, &topition, keyed_batch(b"k2", b"v3")?)
+        .await?;
+
+    storage.maintain(std::time::SystemTime::now()).await?;
+
+    // k2@1 is dropped; the head batch is rewritten in place (base offset 0 kept),
+    // so k1@0 is still fetchable while k2 now lives at offset 2.
+    let records = fetched_records(&storage, &topition).await?;
+    assert_eq!(
+        vec![
+            (
+                Some(Bytes::from_static(b"k1")),
+                Some(Bytes::from_static(b"v1")),
+                0,
+            ),
+            (
+                Some(Bytes::from_static(b"k2")),
+                Some(Bytes::from_static(b"v3")),
+                2,
+            ),
+        ],
+        records
+    );
+
+    let responses = storage
+        .list_offsets(
+            IsolationLevel::ReadUncommitted,
+            &[
+                (topition.clone(), ListOffset::Earliest),
+                (topition.clone(), ListOffset::Latest),
+            ],
+        )
+        .await?;
+
+    // EARLIEST is the log start (0), not the newest-mtime batch's offset (2).
+    assert_eq!(Some(0), responses[0].1.offset);
+    // LATEST (high watermark) is unchanged by compaction.
+    assert_eq!(Some(3), responses[1].1.offset);
 
     Ok(())
 }
