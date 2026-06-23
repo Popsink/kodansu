@@ -13,8 +13,10 @@
 // limitations under the License.
 
 use rama::{Context, Service};
-use tansu_sans_io::{ApiKey, MetadataRequest, MetadataResponse};
-use tracing::{error, instrument};
+use tansu_sans_io::{
+    ApiKey, ErrorCode, MetadataRequest, MetadataResponse, create_topics_request::CreatableTopic,
+};
+use tracing::{error, instrument, warn};
 
 use crate::{Error, Result, Storage, TopicId};
 
@@ -81,15 +83,60 @@ where
         ctx: Context<G>,
         req: MetadataRequest,
     ) -> Result<Self::Response, Self::Error> {
+        let allow_auto_topic_creation = req.allow_auto_topic_creation.unwrap_or(false);
+
         let topics = req
             .topics
             .map(|topics| topics.iter().map(TopicId::from).collect::<Vec<_>>());
 
-        let response = ctx
+        let mut response = ctx
             .state()
             .metadata(topics.as_deref())
             .await
             .inspect_err(|err| error!(?err))?;
+
+        // Auto-create any explicitly-named topic that came back unknown, when
+        // both the broker policy and the request opt in (Kafka
+        // `auto.create.topics.enable` AND `allowAutoTopicCreation`). Creation is
+        // idempotent: a topic another replica raced us to create surfaces as
+        // `TopicAlreadyExists` and is treated as success. Only named topics are
+        // eligible — an unknown topic-id cannot be created.
+        let auto_create = ctx.state().auto_create_topic_config();
+
+        if auto_create.enable && allow_auto_topic_creation {
+            let unknown = i16::from(ErrorCode::UnknownTopicOrPartition);
+
+            let to_create = response
+                .topics()
+                .iter()
+                .filter(|topic| topic.error_code == unknown)
+                .filter_map(|topic| topic.name.clone())
+                .collect::<Vec<_>>();
+
+            if !to_create.is_empty() {
+                for name in to_create {
+                    let creatable = CreatableTopic::default()
+                        .name(name.clone())
+                        .num_partitions(auto_create.num_partitions)
+                        .replication_factor(auto_create.replication_factor)
+                        .assignments(Some([].into()))
+                        .configs(Some([].into()));
+
+                    match ctx.state().create_topic(creatable, false).await {
+                        Ok(_) | Err(Error::Api(ErrorCode::TopicAlreadyExists)) => {}
+                        Err(err) => warn!(?err, %name, "auto-create topic failed"),
+                    }
+                }
+
+                // Re-read so the response reflects the freshly created topics.
+                response = ctx
+                    .state()
+                    .metadata(topics.as_deref())
+                    .await
+                    .inspect_err(|err| error!(?err))?;
+            }
+        }
+
         let brokers = Some(response.brokers().to_owned());
         let cluster_id = response.cluster().map(|s| s.into());
         let controller_id = response.controller();
