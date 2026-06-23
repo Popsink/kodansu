@@ -79,10 +79,10 @@ mod opticon;
 mod tests;
 
 use crate::{
-    BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
-    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    AutoTopicCreate, BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
+    Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
 };
 
 const APPLICATION_JSON: &str = "application/json";
@@ -106,6 +106,11 @@ pub struct DynoStore {
     /// so the conditional GET cannot be short-circuited to a stale
     /// `NotModified` (the cross-replica create-then-produce race, #28).
     topic_metas: Arc<Mutex<BTreeMap<Topic, OptiCon<TopicMetadata>>>>,
+
+    /// Broker auto-topic-creation policy (Kafka `auto.create.topics.enable` /
+    /// `num.partitions` / `default.replication.factor`), consulted by the
+    /// Metadata handler.
+    auto_create: AutoTopicCreate,
 
     /// Per-partition cache of the next offset to assign (== the high watermark).
     ///
@@ -409,6 +414,7 @@ impl DynoStore {
             next_offsets: Arc::new(Mutex::new(BTreeMap::new())),
             producers: Arc::new(Mutex::new(BTreeMap::new())),
             topic_metas: Arc::new(Mutex::new(BTreeMap::new())),
+            auto_create: AutoTopicCreate::default(),
             meta: OptiCon::<Meta>::new(cluster),
             object_store: Arc::new(Cache::new(
                 Metron::new(object_store, cluster),
@@ -430,6 +436,13 @@ impl DynoStore {
 
     pub fn lake(self, lake: Option<House>) -> Self {
         Self { lake, ..self }
+    }
+
+    pub fn auto_create(self, auto_create: AutoTopicCreate) -> Self {
+        Self {
+            auto_create,
+            ..self
+        }
     }
 
     /// Optimistic-concurrency handle on a topic's `topic-metadata/{name}.json`.
@@ -1357,6 +1370,10 @@ impl Storage for DynoStore {
         // Idempotent, concurrency-safe backfill of any legacy monolithic topic
         // metadata into per-topic objects on first boot of this version.
         self.migrate_legacy_topic_metadata().await
+    }
+
+    fn auto_create_topic_config(&self) -> AutoTopicCreate {
+        self.auto_create
     }
 
     async fn incremental_alter_resource(

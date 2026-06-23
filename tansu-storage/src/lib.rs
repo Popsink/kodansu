@@ -849,6 +849,27 @@ impl OffsetStage {
     }
 }
 
+/// Broker policy for auto-creating a topic referenced by a Metadata request
+/// (Kafka `auto.create.topics.enable` / `num.partitions` /
+/// `default.replication.factor`). A topic is auto-created only when both this
+/// `enable` flag and the request's `allow_auto_topic_creation` are set.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AutoTopicCreate {
+    pub enable: bool,
+    pub num_partitions: i32,
+    pub replication_factor: i16,
+}
+
+impl Default for AutoTopicCreate {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            num_partitions: 1,
+            replication_factor: 1,
+        }
+    }
+}
+
 /// Group Member
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct GroupMember {
@@ -1413,6 +1434,13 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// Query broker and topic metadata.
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse>;
 
+    /// The broker's auto-topic-creation policy. Defaults to enabled with a
+    /// single partition and replication factor of one; backends carrying a
+    /// configured value override this.
+    fn auto_create_topic_config(&self) -> AutoTopicCreate {
+        AutoTopicCreate::default()
+    }
+
     async fn upsert_user_scram_credential(
         &self,
         user: &str,
@@ -1627,6 +1655,10 @@ where
 
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
         self.as_ref().metadata(topics).await
+    }
+
+    fn auto_create_topic_config(&self) -> AutoTopicCreate {
+        self.as_ref().auto_create_topic_config()
     }
 
     async fn upsert_user_scram_credential(
@@ -1882,6 +1914,10 @@ where
 
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
         self.as_ref().metadata(topics).await
+    }
+
+    fn auto_create_topic_config(&self) -> AutoTopicCreate {
+        self.as_ref().auto_create_topic_config()
     }
 
     async fn upsert_user_scram_credential(
@@ -2257,6 +2293,37 @@ impl<N, C, A, S> Builder<N, C, A, S> {
     }
 }
 
+/// Parse the auto-topic-creation policy from the storage URL query string
+/// (`?auto_create_topics=false&num_partitions=3&default_replication_factor=2`),
+/// falling back to [`AutoTopicCreate::default`] for any absent or unparseable key.
+#[cfg(feature = "dynostore")]
+fn auto_topic_create(storage: &Url) -> AutoTopicCreate {
+    let mut config = AutoTopicCreate::default();
+
+    for (key, value) in storage.query_pairs() {
+        match key.as_ref() {
+            "auto_create_topics" => {
+                if let Ok(enable) = value.parse() {
+                    config.enable = enable;
+                }
+            }
+            "num_partitions" => {
+                if let Ok(num_partitions) = value.parse() {
+                    config.num_partitions = num_partitions;
+                }
+            }
+            "default_replication_factor" => {
+                if let Ok(replication_factor) = value.parse() {
+                    config.replication_factor = replication_factor;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    config
+}
+
 impl Builder<i32, String, Url, Url> {
     pub async fn build(self) -> Result<Arc<Box<dyn Storage>>> {
         let storage = match self.storage.scheme() {
@@ -2333,6 +2400,7 @@ impl Builder<i32, String, Url, Url> {
                             .advertised_listener(self.advertised_listener.clone())
                             .schemas(self.schema_registry)
                             .lake(self.lake_house.clone())
+                            .auto_create(auto_topic_create(&self.storage))
                     })
                     .map(|storage| {
                         ProduceRequestBatcher::new(storage)
@@ -2407,6 +2475,7 @@ impl Builder<i32, String, Url, Url> {
                             .advertised_listener(self.advertised_listener.clone())
                             .schemas(self.schema_registry)
                             .lake(self.lake_house.clone())
+                            .auto_create(auto_topic_create(&self.storage))
                     })
                     .map(|storage| {
                         ProduceRequestBatcher::new(storage)
@@ -2423,7 +2492,8 @@ impl Builder<i32, String, Url, Url> {
                 DynoStore::new(self.cluster_id.as_str(), self.node_id, InMemory::new())
                     .advertised_listener(self.advertised_listener.clone())
                     .schemas(self.schema_registry)
-                    .lake(self.lake_house.clone()),
+                    .lake(self.lake_house.clone())
+                    .auto_create(auto_topic_create(&self.storage)),
             )
             .map(|storage| Box::new(storage) as Box<dyn Storage>)
             .map(Arc::new),
@@ -3094,6 +3164,27 @@ impl Storage for StorageContainer {
         .inspect_err(|_| {
             STORAGE_CONTAINER_ERRORS.add(1, &attributes);
         })
+    }
+
+    fn auto_create_topic_config(&self) -> AutoTopicCreate {
+        match self {
+            #[cfg(feature = "dynostore")]
+            Self::DynoStore(engine) => engine.auto_create_topic_config(),
+
+            #[cfg(feature = "libsql")]
+            Self::Lite(engine) => engine.auto_create_topic_config(),
+
+            Self::Null(engine) => engine.auto_create_topic_config(),
+
+            #[cfg(feature = "postgres")]
+            Self::Postgres(engine) => engine.auto_create_topic_config(),
+
+            #[cfg(feature = "slatedb")]
+            Self::Slate(engine) => engine.auto_create_topic_config(),
+
+            #[cfg(feature = "turso")]
+            Self::Turso(engine) => engine.auto_create_topic_config(),
+        }
     }
 
     #[instrument(skip_all)]
