@@ -26,11 +26,11 @@ use std::{
 };
 
 use crate::{
-    BrokerRegistrationRequest, ChannelRequestLayer, Error, GroupDetail, ListOffsetResponse, METER,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    RequestChannelService, RequestStorageService, Result, ScramCredential, Storage, TopicId,
-    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
-    UpdateError, Version, bounded_channel,
+    AutoTopicCreate, BrokerRegistrationRequest, ChannelRequestLayer, Error, GroupDetail,
+    ListOffsetResponse, METER, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
+    OffsetStage, ProducerIdResponse, RequestChannelService, RequestStorageService, Result,
+    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, TxnState, UpdateError, Version, bounded_channel,
     proxy::SemaphoreProxy,
     sql::{Cache, default_hash, idempotent_sequence_check, remove_comments},
 };
@@ -1786,6 +1786,10 @@ impl Storage for Engine {
                 &[KeyValue::new("operation", "metadata")],
             )
         })
+    }
+
+    fn auto_create_topic_config(&self) -> AutoTopicCreate {
+        self.inner.auto_create_topic_config()
     }
 
     #[instrument(skip_all)]

@@ -39,10 +39,10 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    BrokerRegistrationRequest, GroupDetail, ListOffsetResponse, MetadataResponse, NamedGroupDetail,
-    OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage,
-    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    UpdateError, Version,
+    AutoTopicCreate, BrokerRegistrationRequest, GroupDetail, ListOffsetResponse, MetadataResponse,
+    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
+    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, UpdateError, Version,
 };
 
 #[derive(Clone, Debug)]
@@ -219,6 +219,10 @@ where
         self.introduce_latency().await?;
 
         self.storage.metadata(topics).await
+    }
+
+    fn auto_create_topic_config(&self) -> AutoTopicCreate {
+        self.storage.auto_create_topic_config()
     }
 
     async fn upsert_user_scram_credential(
