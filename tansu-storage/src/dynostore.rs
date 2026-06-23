@@ -68,7 +68,7 @@ use tansu_schema::{
     lake::{House, LakeHouse as _},
 };
 use tokio::time::Duration;
-use tracing::{debug, error, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -96,6 +96,16 @@ pub struct DynoStore {
     lake: Option<House>,
     watermarks: Arc<Mutex<BTreeMap<Topition, OptiCon<Watermark>>>>,
     meta: OptiCon<Meta>,
+
+    /// Per-topic optimistic-concurrency handle on
+    /// `topic-metadata/{name}.json`, the authoritative record of a topic's id
+    /// and config. Decomposing topic metadata out of the cluster-global
+    /// `meta.json` removes the create-time CAS contention on that monolith and,
+    /// crucially, makes a freshly created topic immediately visible to every
+    /// replica: a replica that has never read the topic holds no cached etag,
+    /// so the conditional GET cannot be short-circuited to a stale
+    /// `NotModified` (the cross-replica create-then-produce race, #28).
+    topic_metas: Arc<Mutex<BTreeMap<Topic, OptiCon<TopicMetadata>>>>,
 
     /// Per-partition cache of the next offset to assign (== the high watermark).
     ///
@@ -131,7 +141,6 @@ type Topic = String;
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 struct Meta {
     producers: BTreeMap<ProducerId, ProducerDetail>,
-    topics: BTreeMap<Topic, TopicMetadata>,
     transactions: BTreeMap<String, Txn>,
 }
 
@@ -226,52 +235,6 @@ impl Meta {
 
         Ok(overlapping)
     }
-
-    fn alter_topic(&mut self, topic: &str, changes: &[AlterableConfig]) -> Result<()> {
-        if let Some(metadata) = self.topics.get_mut(topic) {
-            let mut configuration = metadata
-                .topic
-                .configs
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .fold(BTreeMap::new(), |mut acc, item| {
-                    _ = acc.insert(item.name.as_str(), item.value.as_deref());
-                    acc
-                });
-
-            for change in changes {
-                match OpType::try_from(change.config_operation)? {
-                    OpType::Set => {
-                        _ = configuration.insert(change.name.as_str(), change.value.as_deref());
-                    }
-                    OpType::Delete => {
-                        _ = configuration.remove(change.name.as_str());
-                    }
-                    OpType::Append => todo!(),
-                    OpType::Subtract => todo!(),
-                }
-            }
-
-            _ = metadata
-                .topic
-                .configs
-                .replace(
-                    configuration
-                        .into_iter()
-                        .fold(Vec::new(), |mut acc, (key, value)| {
-                            acc.push(
-                                CreatableTopicConfig::default()
-                                    .name(key.to_owned())
-                                    .value(value.map(|value| value.to_owned())),
-                            );
-                            acc
-                        }),
-                );
-        }
-
-        Ok(())
-    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -348,6 +311,66 @@ struct TopicMetadata {
     topic: CreatableTopic,
 }
 
+impl TopicMetadata {
+    /// Apply an incremental config change in place (used under the per-topic
+    /// `OptiCon::with_mut` CAS). Mirrors Kafka `IncrementalAlterConfigs`
+    /// Set/Delete semantics on `topic.configs`.
+    fn alter_configs(&mut self, changes: &[AlterableConfig]) -> Result<()> {
+        let mut configuration = self
+            .topic
+            .configs
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .fold(BTreeMap::new(), |mut acc, item| {
+                _ = acc.insert(item.name.as_str(), item.value.as_deref());
+                acc
+            });
+
+        for change in changes {
+            match OpType::try_from(change.config_operation)? {
+                OpType::Set => {
+                    _ = configuration.insert(change.name.as_str(), change.value.as_deref());
+                }
+                OpType::Delete => {
+                    _ = configuration.remove(change.name.as_str());
+                }
+                OpType::Append => todo!(),
+                OpType::Subtract => todo!(),
+            }
+        }
+
+        _ = self.topic.configs.replace(configuration.into_iter().fold(
+            Vec::new(),
+            |mut acc, (key, value)| {
+                acc.push(
+                    CreatableTopicConfig::default()
+                        .name(key.to_owned())
+                        .value(value.map(|value| value.to_owned())),
+                );
+                acc
+            },
+        ));
+
+        Ok(())
+    }
+}
+
+impl OptiCon<TopicMetadata> {
+    fn new(cluster: &str, name: &str) -> Self {
+        Self::path(format!("clusters/{cluster}/topic-metadata/{name}.json"))
+    }
+}
+
+/// Pointer object at `topic-ids/{uuid}.json` mapping a topic's id back to its
+/// name, so a metadata lookup by topic-id can resolve to the per-topic
+/// `topic-metadata/{name}.json` object. Written create-only alongside the
+/// topic in [`DynoStore::create_topic`].
+#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+struct TopicIdRef {
+    name: Topic,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 struct Watermark {
     low: Option<i64>,
@@ -385,6 +408,7 @@ impl DynoStore {
             watermarks: Arc::new(Mutex::new(BTreeMap::new())),
             next_offsets: Arc::new(Mutex::new(BTreeMap::new())),
             producers: Arc::new(Mutex::new(BTreeMap::new())),
+            topic_metas: Arc::new(Mutex::new(BTreeMap::new())),
             meta: OptiCon::<Meta>::new(cluster),
             object_store: Arc::new(Cache::new(
                 Metron::new(object_store, cluster),
@@ -408,23 +432,149 @@ impl DynoStore {
         Self { lake, ..self }
     }
 
+    /// Optimistic-concurrency handle on a topic's `topic-metadata/{name}.json`.
+    fn topic_meta(&self, name: &str) -> Result<OptiCon<TopicMetadata>> {
+        self.topic_metas
+            .lock()
+            .map(|mut locked| {
+                locked
+                    .entry(name.to_owned())
+                    .or_insert_with(|| OptiCon::<TopicMetadata>::new(self.cluster.as_str(), name))
+                    .to_owned()
+            })
+            .map_err(Into::into)
+    }
+
+    fn topic_id_path(&self, id: &Uuid) -> Path {
+        Path::from(format!("clusters/{}/topic-ids/{}.json", self.cluster, id))
+    }
+
+    /// Resolve a topic-id to its name via the `topic-ids/{uuid}.json` pointer.
+    async fn topic_name_by_id(&self, id: &Uuid) -> Result<Option<Topic>> {
+        match self.object_store.get(&self.topic_id_path(id)).await {
+            Ok(get_result) => get_result
+                .bytes()
+                .await
+                .map_err(Into::into)
+                .and_then(|encoded| {
+                    serde_json::from_slice::<TopicIdRef>(&encoded).map_err(Into::into)
+                })
+                .map(|id_ref| Some(id_ref.name)),
+
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(otherwise) => Err(otherwise.into()),
+        }
+    }
+
+    /// Every topic's metadata, by listing the `topic-metadata/` prefix and
+    /// reading each object. Used by the list-all Metadata path and the cleanup
+    /// policies; not on the produce/fetch hot path. The prefix holds only the
+    /// per-topic metadata objects (topic *data* lives under `topics/`), so the
+    /// listing does not scan record objects.
+    async fn all_topics(&self) -> Result<Vec<TopicMetadata>> {
+        let prefix = Path::from(format!("clusters/{}/topic-metadata/", self.cluster));
+
+        let mut list_stream = self.object_store.list(Some(&prefix));
+        let mut topics = Vec::new();
+
+        while let Some(meta) = list_stream
+            .next()
+            .await
+            .transpose()
+            .inspect_err(|err| error!(?err))?
+        {
+            let encoded = self.object_store.get(&meta.location).await?.bytes().await?;
+            topics.push(serde_json::from_slice::<TopicMetadata>(&encoded)?);
+        }
+
+        Ok(topics)
+    }
+
+    /// One-shot, idempotent backfill from the legacy monolithic `meta.json`
+    /// (which embedded a `topics` map) to per-topic `topic-metadata/{name}.json`
+    /// objects plus their `topic-ids/{uuid}.json` pointers.
+    ///
+    /// Safe to run on every boot and from every replica concurrently: each
+    /// object is written create-only, so an already migrated (or freshly
+    /// created) topic is skipped. A cluster with no legacy `meta.json`, or whose
+    /// topics are already decomposed, is a no-op. The legacy `topics` bytes are
+    /// left in `meta.json` untouched — they are dead data the current `Meta`
+    /// deserialiser ignores.
+    async fn migrate_legacy_topic_metadata(&self) -> Result<()> {
+        #[derive(Deserialize)]
+        struct LegacyMeta {
+            #[serde(default)]
+            topics: BTreeMap<Topic, TopicMetadata>,
+        }
+
+        let path = Path::from(format!("clusters/{}/meta.json", self.cluster));
+
+        let encoded = match self.object_store.get(&path).await {
+            Ok(get_result) => get_result.bytes().await?,
+            Err(object_store::Error::NotFound { .. }) => return Ok(()),
+            Err(otherwise) => return Err(otherwise.into()),
+        };
+
+        let legacy = serde_json::from_slice::<LegacyMeta>(&encoded)?;
+        if legacy.topics.is_empty() {
+            return Ok(());
+        }
+
+        let mut migrated = 0u64;
+
+        for (name, metadata) in legacy.topics {
+            let id = metadata.id;
+
+            // Both writes are create-only and tolerant of an already-present
+            // object, so a partially completed prior run converges.
+            if self
+                .topic_meta(name.as_str())?
+                .create(&self.object_store, metadata)
+                .await?
+            {
+                migrated += 1;
+            }
+
+            match self
+                .object_store
+                .put_opts(
+                    &self.topic_id_path(&id),
+                    serde_json::to_vec(&TopicIdRef { name })
+                        .map(Bytes::from)
+                        .map(PutPayload::from)?,
+                    PutOptions {
+                        mode: PutMode::Create,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => {}
+                Err(otherwise) => return Err(otherwise.into()),
+            }
+        }
+
+        if migrated > 0 {
+            info!(
+                cluster = %self.cluster,
+                migrated,
+                "backfilled legacy topic metadata into per-topic objects"
+            );
+        }
+
+        Ok(())
+    }
+
     async fn topic_metadata(&self, topic: &TopicId) -> Result<Option<TopicMetadata>> {
         debug!(?topic);
 
-        self.meta
-            .with(&self.object_store, |meta| match topic {
-                TopicId::Name(name) => Ok(meta.topics.get(name).cloned()),
-                TopicId::Id(id) => {
-                    for (_, metadata) in meta.topics.iter() {
-                        if &metadata.id == id {
-                            return Ok(Some(metadata.clone()));
-                        }
-                    }
-
-                    Ok(None)
-                }
-            })
-            .await
+        match topic {
+            TopicId::Name(name) => self.topic_meta(name)?.get_opt(&self.object_store).await,
+            TopicId::Id(id) => match self.topic_name_by_id(id).await? {
+                Some(name) => self.topic_meta(&name)?.get_opt(&self.object_store).await,
+                None => Ok(None),
+            },
+        }
     }
 
     fn records_prefix(&self, topition: &Topition) -> Path {
@@ -694,42 +844,38 @@ impl DynoStore {
         .unwrap_or(i64::MAX);
 
         let topics = self
-            .meta
-            .with(&self.object_store, |meta| {
-                Ok(meta
-                    .topics
-                    .values()
-                    .filter_map(|metadata| {
-                        let configs = metadata.topic.configs.as_deref().unwrap_or_default();
+            .all_topics()
+            .await?
+            .into_iter()
+            .filter_map(|metadata| {
+                let configs = metadata.topic.configs.as_deref().unwrap_or_default();
 
-                        let delete = configs.iter().any(|config| {
-                            config.name == "cleanup.policy"
-                                && config
-                                    .value
-                                    .as_deref()
-                                    .is_some_and(|value| value.contains("delete"))
-                        });
+                let delete = configs.iter().any(|config| {
+                    config.name == "cleanup.policy"
+                        && config
+                            .value
+                            .as_deref()
+                            .is_some_and(|value| value.contains("delete"))
+                });
 
-                        if !delete {
-                            return None;
-                        }
+                if !delete {
+                    return None;
+                }
 
-                        let retention_ms = configs
-                            .iter()
-                            .find(|config| config.name == "retention.ms")
-                            .and_then(|config| config.value.as_deref())
-                            .and_then(|value| i64::from_str(value).ok())
-                            .unwrap_or(DEFAULT_RETENTION.as_millis() as i64);
+                let retention_ms = configs
+                    .iter()
+                    .find(|config| config.name == "retention.ms")
+                    .and_then(|config| config.value.as_deref())
+                    .and_then(|value| i64::from_str(value).ok())
+                    .unwrap_or(DEFAULT_RETENTION.as_millis() as i64);
 
-                        Some((
-                            metadata.topic.name.clone(),
-                            metadata.topic.num_partitions,
-                            retention_ms,
-                        ))
-                    })
-                    .collect::<Vec<_>>())
+                Some((
+                    metadata.topic.name.clone(),
+                    metadata.topic.num_partitions,
+                    retention_ms,
+                ))
             })
-            .await?;
+            .collect::<Vec<_>>();
 
         let mut deleted = 0;
 
@@ -998,28 +1144,23 @@ impl DynoStore {
     #[instrument(skip(self), ret)]
     async fn policy_compact(&self) -> Result<u64> {
         let topics = self
-            .meta
-            .with(&self.object_store, |meta| {
-                Ok(meta
-                    .topics
-                    .values()
-                    .filter_map(|metadata| {
-                        let configs = metadata.topic.configs.as_deref().unwrap_or_default();
+            .all_topics()
+            .await?
+            .into_iter()
+            .filter_map(|metadata| {
+                let configs = metadata.topic.configs.as_deref().unwrap_or_default();
 
-                        let compact = configs.iter().any(|config| {
-                            config.name == "cleanup.policy"
-                                && config
-                                    .value
-                                    .as_deref()
-                                    .is_some_and(|value| value.contains("compact"))
-                        });
+                let compact = configs.iter().any(|config| {
+                    config.name == "cleanup.policy"
+                        && config
+                            .value
+                            .as_deref()
+                            .is_some_and(|value| value.contains("compact"))
+                });
 
-                        compact
-                            .then(|| (metadata.topic.name.clone(), metadata.topic.num_partitions))
-                    })
-                    .collect::<Vec<_>>())
+                compact.then(|| (metadata.topic.name.clone(), metadata.topic.num_partitions))
             })
-            .await?;
+            .collect::<Vec<_>>();
 
         let mut compacted = 0;
 
@@ -1213,7 +1354,9 @@ impl DynoStore {
 #[async_trait]
 impl Storage for DynoStore {
     async fn register_broker(&self, _broker_registration: BrokerRegistrationRequest) -> Result<()> {
-        Ok(())
+        // Idempotent, concurrency-safe backfill of any legacy monolithic topic
+        // metadata into per-topic objects on first boot of this version.
+        self.migrate_legacy_topic_metadata().await
     }
 
     async fn incremental_alter_resource(
@@ -1243,22 +1386,27 @@ impl Storage for DynoStore {
                 .error_message(Some("".into()))
                 .resource_type(resource.resource_type)
                 .resource_name(resource.resource_name)),
-            ConfigResource::Topic => self
-                .meta
-                .with_mut(&self.object_store, |meta| {
-                    meta.alter_topic(
-                        resource.resource_name.as_str(),
-                        resource.configs.as_deref().unwrap_or_default(),
-                    )
-                })
-                .await
-                .map(|()| {
-                    AlterConfigsResourceResponse::default()
-                        .error_code(ErrorCode::None.into())
-                        .error_message(Some("".into()))
-                        .resource_type(resource.resource_type)
-                        .resource_name(resource.resource_name)
-                }),
+            ConfigResource::Topic => {
+                let handle = self.topic_meta(resource.resource_name.as_str())?;
+
+                // Only mutate an existing topic: `with_mut` would otherwise
+                // create one from `Default` (Kafka alter on an unknown topic is
+                // a no-op here, matching the previous behaviour).
+                if handle.get_opt(&self.object_store).await?.is_some() {
+                    handle
+                        .with_mut(&self.object_store, |topic_metadata| {
+                            topic_metadata
+                                .alter_configs(resource.configs.as_deref().unwrap_or_default())
+                        })
+                        .await?;
+                }
+
+                Ok(AlterConfigsResourceResponse::default()
+                    .error_code(ErrorCode::None.into())
+                    .error_message(Some("".into()))
+                    .resource_type(resource.resource_type)
+                    .resource_name(resource.resource_name))
+            }
             ConfigResource::Unknown => Ok(AlterConfigsResourceResponse::default()
                 .error_code(ErrorCode::None.into())
                 .error_message(Some("".into()))
@@ -1269,60 +1417,75 @@ impl Storage for DynoStore {
 
     #[instrument(skip_all, fields(topic = %topic.name))]
     async fn create_topic(&self, topic: CreatableTopic, _validate_only: bool) -> Result<Uuid> {
-        match self
-            .meta
-            .with_mut(&self.object_store, |meta| {
-                if meta.topics.contains_key(topic.name.as_str()) {
-                    return Err(Error::Api(ErrorCode::TopicAlreadyExists));
-                }
+        let id = Uuid::now_v7();
+        debug!(%id);
 
-                let id = Uuid::now_v7();
-                debug!(%id);
-
-                let td = TopicMetadata {
+        // Create-only PUT of the per-topic object. A losing creator (another
+        // replica racing the same name) gets `false` here and returns
+        // `TopicAlreadyExists` without overwriting the winner's object.
+        let created = self
+            .topic_meta(topic.name.as_str())?
+            .create(
+                &self.object_store,
+                TopicMetadata {
                     id,
                     topic: topic.clone(),
-                };
+                },
+            )
+            .await?;
 
-                assert_eq!(None, meta.topics.insert(topic.name.clone(), td));
-                Ok(id)
-            })
-            .await
-        {
-            Ok(id) => {
-                for partition in 0..topic.num_partitions {
-                    let topition = Topition::new(topic.name.as_str(), partition);
-
-                    let watermark = self.watermarks.lock().map(|mut locked| {
-                        locked
-                            .entry(topition.to_owned())
-                            .or_insert(OptiCon::<Watermark>::new(self.cluster.as_str(), &topition))
-                            .to_owned()
-                    })?;
-
-                    watermark
-                        .with_mut(&self.object_store, |watermark| {
-                            _ = watermark.high.take();
-                            _ = watermark.low.take();
-
-                            Ok(())
-                        })
-                        .await?;
-
-                    // Drop any stale next-offset hint (e.g. a topic of the same
-                    // name was previously deleted) so the fresh, empty partition
-                    // re-derives offset 0 from listing.
-                    _ = self
-                        .next_offsets
-                        .lock()
-                        .map(|mut locked| locked.remove(&topition))?;
-                }
-
-                Ok(id)
-            }
-
-            error @ Err(_) => error,
+        if !created {
+            return Err(Error::Api(ErrorCode::TopicAlreadyExists));
         }
+
+        // id -> name pointer so a lookup by topic-id can resolve to the named
+        // object. Written after the topic object so only the winning creator
+        // (whose id is the topic's id) ever writes it.
+        _ = self
+            .object_store
+            .put_opts(
+                &self.topic_id_path(&id),
+                serde_json::to_vec(&TopicIdRef {
+                    name: topic.name.clone(),
+                })
+                .map(Bytes::from)
+                .map(PutPayload::from)?,
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        for partition in 0..topic.num_partitions {
+            let topition = Topition::new(topic.name.as_str(), partition);
+
+            let watermark = self.watermarks.lock().map(|mut locked| {
+                locked
+                    .entry(topition.to_owned())
+                    .or_insert(OptiCon::<Watermark>::new(self.cluster.as_str(), &topition))
+                    .to_owned()
+            })?;
+
+            watermark
+                .with_mut(&self.object_store, |watermark| {
+                    _ = watermark.high.take();
+                    _ = watermark.low.take();
+
+                    Ok(())
+                })
+                .await?;
+
+            // Drop any stale next-offset hint (e.g. a topic of the same
+            // name was previously deleted) so the fresh, empty partition
+            // re-derives offset 0 from listing.
+            _ = self
+                .next_offsets
+                .lock()
+                .map(|mut locked| locked.remove(&topition))?;
+        }
+
+        Ok(id)
     }
 
     async fn delete_records(
@@ -1375,12 +1538,19 @@ impl Storage for DynoStore {
 
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
         if let Some(metadata) = self.topic_metadata(topic).await? {
-            self.meta
-                .with_mut(&self.object_store, |meta| {
-                    _ = meta.topics.remove(metadata.topic.name.as_str());
-                    Ok(())
-                })
+            // Remove the per-topic metadata object and its id -> name pointer.
+            self.topic_meta(metadata.topic.name.as_str())?
+                .remove(&self.object_store)
                 .await?;
+
+            match self
+                .object_store
+                .delete(&self.topic_id_path(&metadata.id))
+                .await
+            {
+                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                Err(otherwise) => return Err(otherwise.into()),
+            }
 
             let prefix = Path::from(format!(
                 "clusters/{}/topics/{}/",
@@ -1726,13 +1896,16 @@ impl Storage for DynoStore {
                 .unwrap_or_default()
         };
 
-        let high_watermark = self.offset_stage(topition).await.map(|offset_stage| {
-            if isolation_level == IsolationLevel::ReadCommitted {
-                offset_stage.last_stable
-            } else {
-                offset_stage.high_watermark
-            }
-        })?;
+        // Read-committed needs the last-stable offset, which `offset_stage`
+        // derives from the cluster `meta.json` transactions. Read-uncommitted
+        // (the common case) only needs the high watermark, derived purely from
+        // the immutable batch objects — so go straight to `high_watermark` and
+        // keep the hot fetch path off the meta object entirely.
+        let high_watermark = if isolation_level == IsolationLevel::ReadCommitted {
+            self.offset_stage(topition).await?.last_stable
+        } else {
+            self.high_watermark(topition).await?
+        };
 
         debug!(high_watermark);
 
@@ -2354,73 +2527,70 @@ impl Storage for DynoStore {
             }
 
             _ => {
-                self.meta
-                    .with(&self.object_store, |meta| {
-                        let mut responses = vec![];
+                let mut responses = vec![];
 
-                        for (name, topic_metadata) in meta.topics.iter() {
-                            debug!(?name, ?topic_metadata);
+                for topic_metadata in self.all_topics().await? {
+                    debug!(?topic_metadata);
 
-                            let name = Some(name.to_owned());
-                            let error_code = ErrorCode::None.into();
-                            let topic_id = Some(topic_metadata.id.into_bytes());
-                            let is_internal = Some(false);
-                            let partitions = topic_metadata.topic.num_partitions;
-                            let replication_factor = topic_metadata.topic.replication_factor;
+                    let name = Some(topic_metadata.topic.name.clone());
+                    let error_code = ErrorCode::None.into();
+                    let topic_id = Some(topic_metadata.id.into_bytes());
+                    let is_internal = Some(false);
+                    let partitions = topic_metadata.topic.num_partitions;
+                    let replication_factor = topic_metadata.topic.replication_factor;
 
-                            debug!(
-                                ?error_code,
-                                ?topic_id,
-                                ?name,
-                                ?is_internal,
-                                ?partitions,
-                                ?replication_factor
-                            );
+                    debug!(
+                        ?error_code,
+                        ?topic_id,
+                        ?name,
+                        ?is_internal,
+                        ?partitions,
+                        ?replication_factor
+                    );
 
-                            let mut rng = rng();
-                            let mut broker_ids: Vec<_> =
-                                brokers.iter().map(|broker| broker.node_id).collect();
-                            broker_ids.shuffle(&mut rng);
+                    let mut rng = rng();
+                    let mut broker_ids: Vec<_> =
+                        brokers.iter().map(|broker| broker.node_id).collect();
+                    broker_ids.shuffle(&mut rng);
 
-                            let mut brokers = broker_ids.into_iter().cycle();
+                    let mut brokers = broker_ids.into_iter().cycle();
 
-                            let partitions = Some(
-                                (0..partitions)
-                                    .map(|partition_index| {
-                                        let leader_id = brokers.next().expect("cycling");
+                    let partitions = Some(
+                        (0..partitions)
+                            .map(|partition_index| {
+                                let leader_id = brokers.next().expect("cycling");
 
-                                        let replica_nodes = Some(
-                                            (0..replication_factor)
-                                                .map(|_replica| brokers.next().expect("cycling"))
-                                                .collect(),
-                                        );
-                                        let isr_nodes = replica_nodes.clone();
+                                let replica_nodes = Some(
+                                    (0..replication_factor)
+                                        .map(|_replica| brokers.next().expect("cycling"))
+                                        .collect(),
+                                );
+                                let isr_nodes = replica_nodes.clone();
 
-                                        MetadataResponsePartition::default()
-                                            .error_code(error_code)
-                                            .partition_index(partition_index)
-                                            .leader_id(leader_id)
-                                            .leader_epoch(Some(0))
-                                            .replica_nodes(replica_nodes)
-                                            .isr_nodes(isr_nodes)
-                                            .offline_replicas(Some([].into()))
-                                    })
-                                    .collect(),
-                            );
-
-                            responses.push(
-                                MetadataResponseTopic::default()
+                                MetadataResponsePartition::default()
                                     .error_code(error_code)
-                                    .name(name)
-                                    .topic_id(topic_id)
-                                    .is_internal(is_internal)
-                                    .partitions(partitions)
-                                    .topic_authorized_operations(Some(-2147483648)),
-                            );
-                        }
-                        Ok(responses)
-                    })
-                    .await?
+                                    .partition_index(partition_index)
+                                    .leader_id(leader_id)
+                                    .leader_epoch(Some(0))
+                                    .replica_nodes(replica_nodes)
+                                    .isr_nodes(isr_nodes)
+                                    .offline_replicas(Some([].into()))
+                            })
+                            .collect(),
+                    );
+
+                    responses.push(
+                        MetadataResponseTopic::default()
+                            .error_code(error_code)
+                            .name(name)
+                            .topic_id(topic_id)
+                            .is_internal(is_internal)
+                            .partitions(partitions)
+                            .topic_authorized_operations(Some(-2147483648)),
+                    );
+                }
+
+                responses
             }
         };
 
