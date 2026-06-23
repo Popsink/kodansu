@@ -151,13 +151,12 @@ where
         }
     }
 
+    /// Refresh the cached value+version with a conditional GET (`if_none_match`
+    /// against the cached etag). `NotModified` keeps the cache as-is, `NotFound`
+    /// clears it. Shared by [`Self::with`] and [`Self::get_opt`].
     #[instrument(skip_all, fields(path = %self.path))]
-    pub(super) async fn with<E, F>(&self, object_store: &impl ObjectStore, f: F) -> Result<E>
-    where
-        F: Fn(&D) -> Result<E>,
-    {
-        const METHOD: &str = "with";
-        REQUESTS.add(1, &[KeyValue::new("method", METHOD)]);
+    async fn refresh(&self, object_store: &impl ObjectStore) -> Result<()> {
+        const METHOD: &str = "refresh";
 
         let on_error = |error: &object_store::Error| {
             ERRORS.add(
@@ -230,21 +229,47 @@ where
 
             Err(otherwise) => Err(otherwise.into()),
         }
-        .and(
-            self.data_version
-                .lock()
-                .map_err(Into::into)
-                .and_then(|lock| {
-                    if let Some(dv @ DataVersion { data, .. }) = lock.as_ref() {
-                        debug!(?dv);
-                        f(data)
-                    } else {
-                        let data = D::default();
-                        debug!(?data);
-                        f(&data)
-                    }
-                }),
-        )
+    }
+
+    #[instrument(skip_all, fields(path = %self.path))]
+    pub(super) async fn with<E, F>(&self, object_store: &impl ObjectStore, f: F) -> Result<E>
+    where
+        F: Fn(&D) -> Result<E>,
+    {
+        REQUESTS.add(1, &[KeyValue::new("method", "with")]);
+
+        self.refresh(object_store)
+            .await
+            .and(
+                self.data_version
+                    .lock()
+                    .map_err(Into::into)
+                    .and_then(|lock| {
+                        if let Some(dv @ DataVersion { data, .. }) = lock.as_ref() {
+                            debug!(?dv);
+                            f(data)
+                        } else {
+                            let data = D::default();
+                            debug!(?data);
+                            f(&data)
+                        }
+                    }),
+            )
+    }
+
+    /// Read the current value, returning `None` when the backing object does
+    /// not exist. Unlike [`Self::with`], absence is reported as `None` rather
+    /// than the `Default` value, so callers can distinguish an absent key from
+    /// one holding default fields (topic existence checks rely on this).
+    #[instrument(skip_all, fields(path = %self.path))]
+    pub(super) async fn get_opt(&self, object_store: &impl ObjectStore) -> Result<Option<D>> {
+        REQUESTS.add(1, &[KeyValue::new("method", "get_opt")]);
+
+        self.refresh(object_store).await?;
+        self.data_version
+            .lock()
+            .map_err(Into::into)
+            .map(|guard| guard.as_ref().map(|dv| dv.data.clone()))
     }
 
     #[instrument(skip_all, fields(path = %self.path))]
@@ -334,6 +359,69 @@ where
 
                 Err(err) => return Err(err.into()),
             }
+        }
+    }
+
+    /// Create the backing object iff it does not already exist
+    /// (`PutMode::Create`). Returns `Ok(true)` when this call created it,
+    /// `Ok(false)` when it already existed. On success the cached version is
+    /// seeded so a following read is served warm; on conflict the cache is
+    /// refreshed from the winner's object.
+    #[instrument(skip_all, fields(path = %self.path))]
+    pub(super) async fn create(&self, object_store: &impl ObjectStore, data: D) -> Result<bool> {
+        REQUESTS.add(1, &[KeyValue::new("method", "create")]);
+
+        let payload = serde_json::to_vec(&data)
+            .map(Bytes::from)
+            .map(PutPayload::from)?;
+
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            tags: self.tags.clone(),
+            attributes: self.attributes.clone(),
+            ..Default::default()
+        };
+
+        match object_store.put_opts(&self.path, payload, opts).await {
+            Ok(put_result) => self
+                .data_version
+                .lock()
+                .map_err(Into::into)
+                .map(|mut guard| {
+                    _ = guard.replace(DataVersion {
+                        data,
+                        version: Some(UpdateVersion {
+                            e_tag: put_result.e_tag,
+                            version: put_result.version,
+                        }),
+                    });
+                })
+                .and(Ok(true)),
+
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                self.refresh(object_store).await.and(Ok(false))
+            }
+
+            Err(otherwise) => Err(otherwise.into()),
+        }
+    }
+
+    /// Delete the backing object (idempotent on `NotFound`) and clear the cache.
+    #[instrument(skip_all, fields(path = %self.path))]
+    pub(super) async fn remove(&self, object_store: &impl ObjectStore) -> Result<()> {
+        REQUESTS.add(1, &[KeyValue::new("method", "remove")]);
+
+        match object_store.delete(&self.path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => self
+                .data_version
+                .lock()
+                .map_err(Into::into)
+                .map(|mut guard| {
+                    _ = guard.take();
+                })
+                .and(Ok(())),
+
+            Err(otherwise) => Err(otherwise.into()),
         }
     }
 }
