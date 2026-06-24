@@ -635,11 +635,29 @@ impl DynoStore {
             }
         }
 
-        // GET only the new/changed objects (no lock held).
-        for (name, location, etag) in stale {
-            let encoded = self.object_store.get(&location).await?.bytes().await?;
-            let metadata = serde_json::from_slice::<TopicMetadata>(&encoded)?;
-            _ = entries.insert(name, (etag, metadata));
+        // GET only the new/changed objects (no lock held), with a bounded
+        // fan-out. The cold build — every topic stale on the first refresh —
+        // is otherwise O(topics) *sequential* round-trips: ~6s for 5k objects
+        // on local minio and tens of seconds against real S3, which (now that
+        // the warm-up runs this before the listener opens) would stretch boot
+        // unacceptably at 15k topics. A small concurrency keeps it to a few
+        // seconds without re-creating a request burst.
+        const FETCH_EACH_CONCURRENCY: usize = 32;
+
+        let object_store = &self.object_store;
+
+        let fetched = futures::stream::iter(stale)
+            .map(|(name, location, etag)| async move {
+                let encoded = object_store.get(&location).await?.bytes().await?;
+                let metadata = serde_json::from_slice::<TopicMetadata>(&encoded)?;
+                Ok::<_, Error>((name, (etag, metadata)))
+            })
+            .buffer_unordered(FETCH_EACH_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        for (name, value) in fetched {
+            _ = entries.insert(name, value);
         }
 
         let snapshot = Arc::new(
@@ -664,6 +682,32 @@ impl DynoStore {
     fn invalidate_topic_index(&self) {
         if let Ok(mut index) = self.topic_index.lock() {
             index.refreshed_at = None;
+        }
+    }
+
+    /// Best-effort warm-up of the topic index at boot, run from
+    /// [`Storage::register_broker`] which completes *before* the broker binds
+    /// its listener. Without it, the first list-all metadata request pays the
+    /// full cold build — LIST the `topic-metadata/` prefix and GET every object
+    /// — which at 15k topics is several seconds and can exceed a Kafka client's
+    /// first metadata timeout. Paying it here keeps the port closed (so the pod
+    /// is not yet ready for traffic) until the index is hot.
+    ///
+    /// Best-effort by design: a transient object-store error at boot must not
+    /// stop the broker starting. On failure the index stays empty and the lazy
+    /// [`Self::topics_index`] path rebuilds it on the first request.
+    async fn warm_topic_index(&self) {
+        let started = SystemTime::now();
+        match self.refresh_topic_index().await {
+            Ok(snapshot) => info!(
+                topics = snapshot.len(),
+                elapsed_ms = started.elapsed().ok().map(|elapsed| elapsed.as_millis()),
+                "topic index warmed"
+            ),
+            Err(err) => warn!(
+                ?err,
+                "topic index warm-up failed; building lazily on first request"
+            ),
         }
     }
 
@@ -1579,7 +1623,14 @@ impl Storage for DynoStore {
     async fn register_broker(&self, _broker_registration: BrokerRegistrationRequest) -> Result<()> {
         // Idempotent, concurrency-safe backfill of any legacy monolithic topic
         // metadata into per-topic objects on first boot of this version.
-        self.migrate_legacy_topic_metadata().await
+        self.migrate_legacy_topic_metadata().await?;
+
+        // Warm the in-memory topic index now, while the listener is still
+        // closed, so the first client's list-all metadata request hits a hot
+        // cache instead of paying the cold build (LIST + GET-per-topic).
+        self.warm_topic_index().await;
+
+        Ok(())
     }
 
     fn auto_create_topic_config(&self) -> AutoTopicCreate {
