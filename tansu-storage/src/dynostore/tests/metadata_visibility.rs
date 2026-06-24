@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use object_store::{ObjectStore as _, PutPayload, memory::InMemory, path::Path};
+use object_store::{
+    ObjectStore as _, ObjectStoreExt as _, PutPayload, memory::InMemory, path::Path,
+};
 use std::collections::BTreeMap;
 use tansu_sans_io::create_topics_request::CreatableTopic;
 use uuid::Uuid;
@@ -171,19 +173,28 @@ async fn legacy_meta_json_is_backfilled_into_per_topic_objects() -> Result<(), E
 
     let replica = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
-    // Not yet decomposed: the per-topic object does not exist.
+    let sidecar = Path::from(format!("clusters/{CLUSTER}/topic-metadata/legacy.json"));
+
+    // Before backfill: no per-topic object yet, though the topic is already
+    // visible via the authoritative meta.json.
+    assert!(matches!(
+        bucket.get(&sidecar).await,
+        Err(object_store::Error::NotFound { .. })
+    ));
     assert!(
         replica
             .topic_metadata(&TopicId::Name("legacy".into()))
             .await?
-            .is_none()
+            .is_some()
     );
 
     // Run the backfill (idempotent — run twice).
     replica.migrate_legacy_topic_metadata().await?;
     replica.migrate_legacy_topic_metadata().await?;
 
-    // Now visible by name and by id, with the original id preserved.
+    // The per-topic object now exists; the topic resolves by name and id with
+    // the original id preserved.
+    assert!(bucket.get(&sidecar).await.is_ok());
     let by_name = replica
         .topic_metadata(&TopicId::Name("legacy".into()))
         .await?;
@@ -198,6 +209,37 @@ async fn legacy_meta_json_is_backfilled_into_per_topic_objects() -> Result<(), E
             .topic_metadata(&TopicId::Id(id))
             .await?
             .map(|metadata| metadata.id)
+    );
+
+    Ok(())
+}
+
+/// `create_topic` must mirror the topic into the authoritative `meta.json`
+/// topics map, not only the per-topic object. Beta.4 dropped the `topics` field
+/// from the serialised `Meta`, so the next producer/txn write to `meta.json`
+/// erased every topic — invisible to a rollback target reading `meta.json`.
+/// This guards that the mirror is written (and survives a meta.json round-trip).
+#[tokio::test]
+async fn create_topic_mirrors_into_meta_json() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let replica = DynoStore::new(CLUSTER, NODE, bucket.clone());
+
+    _ = create_topic(&replica, "mirrored", 1).await?;
+
+    let raw = bucket
+        .get(&Path::from(format!("clusters/{CLUSTER}/meta.json")))
+        .await?
+        .bytes()
+        .await?;
+    let meta: serde_json::Value = serde_json::from_slice(&raw)?;
+
+    assert!(
+        meta.get("topics")
+            .and_then(|topics| topics.get("mirrored"))
+            .is_some(),
+        "create_topic must mirror into meta.json.topics (rollback safety); got {meta}"
     );
 
     Ok(())
@@ -247,17 +289,15 @@ async fn migration_is_one_shot() -> Result<(), Error> {
         )
         .await?;
 
+    let sidecar = |name: &str| Path::from(format!("clusters/{CLUSTER}/topic-metadata/{name}.json"));
+
     let replica = DynoStore::new(CLUSTER, NODE, bucket.clone());
     replica.migrate_legacy_topic_metadata().await?;
-    assert!(
-        replica
-            .topic_metadata(&TopicId::Name("a".into()))
-            .await?
-            .is_some()
-    );
+    // First run created a's per-topic object.
+    assert!(bucket.get(&sidecar("a")).await.is_ok());
 
-    // The legacy object later grows a second topic. A fresh replica's migration
-    // must take the marker fast-path and NOT backfill it.
+    // The meta.json later grows a second topic. A fresh replica's migration must
+    // take the marker fast-path and NOT re-scan: b gets no per-topic object.
     _ = bucket
         .put_opts(
             &meta,
@@ -271,10 +311,10 @@ async fn migration_is_one_shot() -> Result<(), Error> {
     let replica = DynoStore::new(CLUSTER, NODE, bucket.clone());
     replica.migrate_legacy_topic_metadata().await?;
     assert!(
-        replica
-            .topic_metadata(&TopicId::Name("b".into()))
-            .await?
-            .is_none(),
+        matches!(
+            bucket.get(&sidecar("b")).await,
+            Err(object_store::Error::NotFound { .. })
+        ),
         "marker should make migration one-shot; b must not be backfilled"
     );
 
