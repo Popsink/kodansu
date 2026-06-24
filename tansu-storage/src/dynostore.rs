@@ -914,11 +914,29 @@ impl DynoStore {
         Ok(base + batch.last_offset_delta as i64 + 1)
     }
 
+    /// The persisted `watermark.high`: a durable lower bound on the tail offset,
+    /// used as a listing floor so a cold reader scans only forward (S3
+    /// `start-after`) rather than the whole partition.
+    async fn persisted_high(&self, topition: &Topition) -> Result<i64> {
+        self.watermark(topition)?
+            .with(&self.object_store, |watermark| {
+                Ok(watermark.high.unwrap_or(0))
+            })
+            .await
+    }
+
     /// Reconcile the cached high-watermark hint for `topition` against the
     /// partition's batch objects and return the authoritative next offset.
     async fn refresh_high(&self, topition: &Topition) -> Result<i64> {
-        let floor = self.cached_high(topition)?;
-        let high = self.tail_next_offset(topition, floor).await?;
+        // Cold (no in-memory hint): floor at the persisted watermark so we scan
+        // only the tail, not the whole partition. Still correct for offset
+        // assignment — listing from a floor at/below the true tail still finds
+        // the true tail.
+        let floor = match self.cached_high(topition)? {
+            Some(hint) => hint,
+            None => self.persisted_high(topition).await?,
+        };
+        let high = self.tail_next_offset(topition, Some(floor)).await?;
         self.set_high(topition, high)?;
         Ok(high)
     }
@@ -937,12 +955,7 @@ impl DynoStore {
     /// (`tansu.lake.sink`) write no batch objects and carry the offset in
     /// `watermark.high`, which the `max` below preserves.
     async fn high_watermark(&self, topition: &Topition) -> Result<i64> {
-        let from_watermark = self
-            .watermark(topition)?
-            .with(&self.object_store, |watermark| {
-                Ok(watermark.high.unwrap_or(0))
-            })
-            .await?;
+        let from_watermark = self.persisted_high(topition).await?;
 
         let cached = self.cached_high(topition)?;
         let was_cold = cached.is_none();

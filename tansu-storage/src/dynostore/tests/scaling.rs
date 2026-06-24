@@ -30,7 +30,9 @@ use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory, path::Path,
 };
+use std::time::Duration;
 use tansu_sans_io::{
+    IsolationLevel,
     create_topics_request::CreatableTopic,
     record::{Record, deflated, inflated},
 };
@@ -347,5 +349,98 @@ async fn cold_high_watermark_uses_persisted_floor() -> Result<(), Error> {
         "persisted floor must skip every batch object on a cold read"
     );
 
+    Ok(())
+}
+
+/// Steady-state (warm) produce assigns offsets from the in-memory hint and just
+/// creates the batch object — no listing of the growing partition.
+#[tokio::test]
+async fn warm_produce_does_not_list() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+    let (storage, counters) = store();
+
+    create(&storage, "hot", 1).await?;
+    let topition = Topition::new("hot", 0);
+
+    // First produce warms the offset hint.
+    _ = storage.produce(None, &topition, batch(b"warmup")?).await?;
+
+    counters.reset();
+    const PRODUCES: usize = 50;
+    for n in 0..PRODUCES {
+        _ = storage
+            .produce(None, &topition, batch(format!("m-{n}").as_bytes())?)
+            .await?;
+    }
+    let produced = counters.report("50 warm produces");
+
+    assert_eq!(
+        0, produced.2,
+        "warm produce must not full-list the partition"
+    );
+    assert_eq!(0, produced.3, "warm produce needs no tail scan");
+    assert_eq!(
+        PRODUCES as u64, produced.0,
+        "one batch object create per produce"
+    );
+    Ok(())
+}
+
+/// A consumer fetch scans only from its offset forward (bounded `list_with_offset`,
+/// never a full `list`) and reads only the batches in range — so fetch cost
+/// tracks the bytes consumed, not the partition size.
+#[tokio::test]
+async fn consume_scans_only_from_offset() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+    let (storage, counters) = store();
+
+    create(&storage, "hot", 1).await?;
+    let topition = Topition::new("hot", 0);
+    const BATCHES: usize = 64;
+    for n in 0..BATCHES {
+        _ = storage
+            .produce(None, &topition, batch(format!("m-{n}").as_bytes())?)
+            .await?;
+    }
+
+    // Consume the whole log from the start.
+    counters.reset();
+    let fetched = storage
+        .fetch(
+            &topition,
+            0,
+            1,
+            8 * 1024 * 1024,
+            IsolationLevel::ReadUncommitted,
+            Duration::from_secs(5),
+        )
+        .await?;
+    let consume = counters.report("fetch from offset 0");
+
+    assert!(!fetched.is_empty(), "fetch returned batches");
+    assert_eq!(0, consume.2, "fetch must not full-list the partition");
+    assert!(
+        consume.3 >= 1,
+        "fetch scans the partition via bounded list_with_offset"
+    );
+
+    // Fetch from near the tail reads far fewer objects than from the start.
+    counters.reset();
+    _ = storage
+        .fetch(
+            &topition,
+            (BATCHES - 2) as i64,
+            1,
+            8 * 1024 * 1024,
+            IsolationLevel::ReadUncommitted,
+            Duration::from_secs(5),
+        )
+        .await?;
+    let tail = counters.report("fetch near tail");
+    assert_eq!(0, tail.2, "fetch must not full-list the partition");
+    assert!(
+        tail.4 < consume.4,
+        "fetching near the tail lists fewer objects than from the start"
+    );
     Ok(())
 }
