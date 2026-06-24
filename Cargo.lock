@@ -3781,7 +3781,7 @@ dependencies = [
 
 [[package]]
 name = "fuzz"
-version = "0.7.0-beta.3"
+version = "0.7.0-beta.4"
 dependencies = [
  "bytes",
  "libfuzzer-sys",
@@ -8288,7 +8288,7 @@ checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 
 [[package]]
 name = "tansu"
-version = "0.7.0-beta.3"
+version = "0.7.0-beta.4"
 dependencies = [
  "dotenv",
  "tansu-broker",
@@ -8307,7 +8307,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-auth"
-version = "0.7.0-beta.3"
+version = "0.7.0-beta.4"
 dependencies = [
  "bytes",
  "rama",
@@ -8321,7 +8321,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-broker"
-version = "0.7.0-beta.3"
+version = "0.7.0-beta.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8373,7 +8373,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-cat"
-version = "0.7.0-beta.3"
+version = "0.7.0-beta.4"
 dependencies = [
  "bytes",
  "futures",
@@ -8393,7 +8393,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-cli"
-version = "0.7.0-beta.3"
+version = "0.7.0-beta.4"
 dependencies = [
  "bytes",
  "clap",
@@ -8428,7 +8428,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-client"
-version = "0.7.0-beta.3"
+version = "0.7.0-beta.4"
 dependencies = [
  "anyhow",
  "backoff",
@@ -8452,7 +8452,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-generator"
-version = "0.7.0-beta.3"
+version = "0.7.0-beta.4"
 dependencies = [
  "futures",
  "futures-core",
@@ -8479,7 +8479,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-model"
-version = "0.7.0-beta.3"
+version = "0.7.0-beta.4"
 dependencies = [
  "convert_case 0.11.0",
  "lazy_static",
@@ -8494,7 +8494,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-otel"
-version = "0.7.0-beta.3"
+version = "0.7.0-beta.4"
 dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
@@ -8507,7 +8507,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-perf"
-version = "0.7.0-beta.3"
+version = "0.7.0-beta.4"
 dependencies = [
  "bytes",
  "futures",
@@ -8536,7 +8536,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-proxy"
-version = "0.7.0-beta.3"
+version = "0.7.0-beta.4"
 dependencies = [
  "async-trait",
  "bytes",
@@ -8561,7 +8561,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-sans-io"
-version = "0.7.0-beta.3"
+version = "0.7.0-beta.4"
 dependencies = [
  "bytes",
  "clap",
@@ -8590,7 +8590,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-schema"
-version = "0.7.0-beta.3"
+version = "0.7.0-beta.4"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -8637,7 +8637,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-service"
-version = "0.7.0-beta.3"
+version = "0.7.0-beta.4"
 dependencies = [
  "async-trait",
  "bytes",
@@ -8662,7 +8662,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-storage"
-version = "0.7.0-beta.3"
+version = "0.7.0-beta.4"
 dependencies = [
  "assert_matches",
  "async-trait",
@@ -8716,7 +8716,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-topic"
-version = "0.7.0-beta.3"
+version = "0.7.0-beta.4"
 dependencies = [
  "futures",
  "futures-core",
