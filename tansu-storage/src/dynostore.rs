@@ -107,6 +107,23 @@ pub struct DynoStore {
     /// `NotModified` (the cross-replica create-then-produce race, #28).
     topic_metas: Arc<Mutex<BTreeMap<Topic, OptiCon<TopicMetadata>>>>,
 
+    /// In-memory, etag-delta-refreshed index of all topics, serving the list-all
+    /// metadata path and the cleanup policies from memory. Without it, list-all
+    /// swept every per-topic object (a GET each) on every request — the #29
+    /// regression that OOM-crash-looped prod under metadata load. A refresh
+    /// LISTs the `topic-metadata/` prefix once and GETs only the objects whose
+    /// etag changed, so it scales to tens of thousands of topics.
+    topic_index: Arc<Mutex<TopicIndex>>,
+
+    /// Single-flight guard: only one task refreshes [`Self::topic_index`] at a
+    /// time; concurrent list-all callers await it rather than each re-listing.
+    topic_index_refresh: Arc<tokio::sync::Mutex<()>>,
+
+    /// Cache of the `topic-ids/{uuid}.json` pointer (topic-id -> name), immutable
+    /// for a topic's lifetime, so a by-id lookup avoids an uncached object GET;
+    /// invalidated on delete.
+    topic_ids: Arc<Mutex<BTreeMap<Uuid, Topic>>>,
+
     /// Broker auto-topic-creation policy (Kafka `auto.create.topics.enable` /
     /// `num.partitions` / `default.replication.factor`), consulted by the
     /// Metadata handler.
@@ -376,6 +393,17 @@ struct TopicIdRef {
     name: Topic,
 }
 
+/// In-memory topic index (see [`DynoStore::topic_index`]). `entries` maps a
+/// topic name to its last-seen object etag and decoded metadata, used to skip
+/// re-GETting unchanged objects on refresh; `snapshot` is the shared, ready-to-
+/// serve list reused by every list-all caller between refreshes.
+#[derive(Debug, Default)]
+struct TopicIndex {
+    entries: BTreeMap<Topic, (Option<String>, TopicMetadata)>,
+    snapshot: Arc<Vec<TopicMetadata>>,
+    refreshed_at: Option<SystemTime>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 struct Watermark {
     low: Option<i64>,
@@ -414,6 +442,9 @@ impl DynoStore {
             next_offsets: Arc::new(Mutex::new(BTreeMap::new())),
             producers: Arc::new(Mutex::new(BTreeMap::new())),
             topic_metas: Arc::new(Mutex::new(BTreeMap::new())),
+            topic_index: Arc::new(Mutex::new(TopicIndex::default())),
+            topic_index_refresh: Arc::new(tokio::sync::Mutex::new(())),
+            topic_ids: Arc::new(Mutex::new(BTreeMap::new())),
             auto_create: AutoTopicCreate::default(),
             meta: OptiCon::<Meta>::new(cluster),
             object_store: Arc::new(Cache::new(
@@ -500,20 +531,34 @@ impl DynoStore {
         }
     }
 
-    /// Resolve a topic-id to its name via the `topic-ids/{uuid}.json` pointer.
+    /// Resolve a topic-id to its name: in-memory cache first, then the
+    /// `topic-ids/{uuid}.json` pointer (result cached). The mapping is immutable
+    /// for a topic's lifetime, so the cache is safe until delete.
     async fn topic_name_by_id(&self, id: &Uuid) -> Result<Option<Topic>> {
-        match self.object_store.get(&self.topic_id_path(id)).await {
-            Ok(get_result) => get_result
-                .bytes()
-                .await
-                .map_err(Into::into)
-                .and_then(|encoded| {
-                    serde_json::from_slice::<TopicIdRef>(&encoded).map_err(Into::into)
-                })
-                .map(|id_ref| Some(id_ref.name)),
+        if let Ok(cache) = self.topic_ids.lock()
+            && let Some(name) = cache.get(id)
+        {
+            return Ok(Some(name.clone()));
+        }
 
+        match self.object_store.get(&self.topic_id_path(id)).await {
+            Ok(get_result) => {
+                let encoded = get_result.bytes().await?;
+                let name = serde_json::from_slice::<TopicIdRef>(&encoded)?.name;
+                if let Ok(mut cache) = self.topic_ids.lock() {
+                    _ = cache.insert(*id, name.clone());
+                }
+                Ok(Some(name))
+            }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(otherwise) => Err(otherwise.into()),
+        }
+    }
+
+    /// Drop a cached topic-id -> name mapping (on delete).
+    fn invalidate_topic_id(&self, id: &Uuid) {
+        if let Ok(mut cache) = self.topic_ids.lock() {
+            _ = cache.remove(id);
         }
     }
 
@@ -522,23 +567,148 @@ impl DynoStore {
     /// policies; not on the produce/fetch hot path. The prefix holds only the
     /// per-topic metadata objects (topic *data* lives under `topics/`), so the
     /// listing does not scan record objects.
-    async fn all_topics(&self) -> Result<Vec<TopicMetadata>> {
-        let prefix = Path::from(format!("clusters/{}/topic-metadata/", self.cluster));
+    /// How long a [`TopicIndex`] snapshot is served before a refresh. Bounds the
+    /// cross-replica staleness of the list-all metadata view (a topic created on
+    /// another replica appears within this window); the by-name path is always
+    /// fresh via the per-topic object.
+    const TOPIC_INDEX_TTL: Duration = Duration::from_secs(5);
 
-        let mut list_stream = self.object_store.list(Some(&prefix));
-        let mut topics = Vec::new();
-
-        while let Some(meta) = list_stream
-            .next()
-            .await
-            .transpose()
-            .inspect_err(|err| error!(?err))?
-        {
-            let encoded = self.object_store.get(&meta.location).await?.bytes().await?;
-            topics.push(serde_json::from_slice::<TopicMetadata>(&encoded)?);
+    /// All topics, served from the in-memory [`TopicIndex`]. Returns the shared
+    /// snapshot if fresh; otherwise refreshes it (single-flight) by LISTing the
+    /// `topic-metadata/` prefix and GETting only the objects whose etag changed.
+    /// Used by the list-all metadata path and the cleanup policies — never on
+    /// the produce/fetch hot path.
+    async fn topics_index(&self) -> Result<Arc<Vec<TopicMetadata>>> {
+        if let Some(snapshot) = self.fresh_topic_index()? {
+            return Ok(snapshot);
         }
 
-        Ok(topics)
+        // Stale or empty: one task refreshes, the rest await and reuse it.
+        let _guard = self.topic_index_refresh.lock().await;
+        if let Some(snapshot) = self.fresh_topic_index()? {
+            return Ok(snapshot);
+        }
+        self.refresh_topic_index().await
+    }
+
+    /// The cached snapshot iff it was refreshed within [`Self::TOPIC_INDEX_TTL`].
+    fn fresh_topic_index(&self) -> Result<Option<Arc<Vec<TopicMetadata>>>> {
+        let index = self.topic_index.lock()?;
+        let fresh = index.refreshed_at.is_some_and(|at| {
+            SystemTime::now()
+                .duration_since(at)
+                .is_ok_and(|elapsed| elapsed < Self::TOPIC_INDEX_TTL)
+        });
+        Ok(fresh.then(|| index.snapshot.clone()))
+    }
+
+    /// Rebuild the index: LIST the prefix once, reuse cached entries whose etag
+    /// is unchanged, GET only the new/changed objects, and drop deleted ones.
+    async fn refresh_topic_index(&self) -> Result<Arc<Vec<TopicMetadata>>> {
+        let prefix = Path::from(format!("clusters/{}/topic-metadata/", self.cluster));
+        let listed = self.object_store.list_with_delimiter(Some(&prefix)).await?;
+
+        let mut entries: BTreeMap<Topic, (Option<String>, TopicMetadata)> = BTreeMap::new();
+        let mut stale = Vec::new();
+
+        {
+            let index = self.topic_index.lock()?;
+            for object in &listed.objects {
+                let Some(name) = object
+                    .location
+                    .filename()
+                    .and_then(|file| file.strip_suffix(".json"))
+                else {
+                    continue;
+                };
+
+                match index.entries.get(name) {
+                    Some(cached @ (etag, _)) if etag.is_some() && *etag == object.e_tag => {
+                        _ = entries.insert(name.to_owned(), cached.clone());
+                    }
+                    _ => stale.push((
+                        name.to_owned(),
+                        object.location.clone(),
+                        object.e_tag.clone(),
+                    )),
+                }
+            }
+        }
+
+        // GET only the new/changed objects (no lock held), with a bounded
+        // fan-out. The cold build — every topic stale on the first refresh —
+        // is otherwise O(topics) *sequential* round-trips: ~6s for 5k objects
+        // on local minio and tens of seconds against real S3, which (now that
+        // the warm-up runs this before the listener opens) would stretch boot
+        // unacceptably at 15k topics. A small concurrency keeps it to a few
+        // seconds without re-creating a request burst.
+        const FETCH_EACH_CONCURRENCY: usize = 32;
+
+        let object_store = &self.object_store;
+
+        let fetched = futures::stream::iter(stale)
+            .map(|(name, location, etag)| async move {
+                let encoded = object_store.get(&location).await?.bytes().await?;
+                let metadata = serde_json::from_slice::<TopicMetadata>(&encoded)?;
+                Ok::<_, Error>((name, (etag, metadata)))
+            })
+            .buffer_unordered(FETCH_EACH_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        for (name, value) in fetched {
+            _ = entries.insert(name, value);
+        }
+
+        let snapshot = Arc::new(
+            entries
+                .values()
+                .map(|(_, metadata)| metadata.clone())
+                .collect::<Vec<_>>(),
+        );
+
+        {
+            let mut index = self.topic_index.lock()?;
+            index.entries = entries;
+            index.snapshot = snapshot.clone();
+            index.refreshed_at = Some(SystemTime::now());
+        }
+
+        Ok(snapshot)
+    }
+
+    /// Force the next [`Self::topics_index`] to refresh (after a local create or
+    /// delete), so the change is reflected without waiting out the TTL.
+    fn invalidate_topic_index(&self) {
+        if let Ok(mut index) = self.topic_index.lock() {
+            index.refreshed_at = None;
+        }
+    }
+
+    /// Best-effort warm-up of the topic index at boot, run from
+    /// [`Storage::register_broker`] which completes *before* the broker binds
+    /// its listener. Without it, the first list-all metadata request pays the
+    /// full cold build — LIST the `topic-metadata/` prefix and GET every object
+    /// — which at 15k topics is several seconds and can exceed a Kafka client's
+    /// first metadata timeout. Paying it here keeps the port closed (so the pod
+    /// is not yet ready for traffic) until the index is hot.
+    ///
+    /// Best-effort by design: a transient object-store error at boot must not
+    /// stop the broker starting. On failure the index stays empty and the lazy
+    /// [`Self::topics_index`] path rebuilds it on the first request.
+    async fn warm_topic_index(&self) {
+        let started = SystemTime::now();
+        match self.refresh_topic_index().await {
+            Ok(snapshot) => info!(
+                topics = snapshot.len(),
+                elapsed_ms = started.elapsed().ok().map(|elapsed| elapsed.as_millis()),
+                "topic index warmed"
+            ),
+            Err(err) => warn!(
+                ?err,
+                "topic index warm-up failed; building lazily on first request"
+            ),
+        }
     }
 
     /// One-shot, idempotent backfill from the legacy monolithic `meta.json`
@@ -788,34 +958,72 @@ impl DynoStore {
         Ok(base + batch.last_offset_delta as i64 + 1)
     }
 
+    /// The persisted `watermark.high`: a durable lower bound on the tail offset,
+    /// used as a listing floor so a cold reader scans only forward (S3
+    /// `start-after`) rather than the whole partition.
+    async fn persisted_high(&self, topition: &Topition) -> Result<i64> {
+        self.watermark(topition)?
+            .with(&self.object_store, |watermark| {
+                Ok(watermark.high.unwrap_or(0))
+            })
+            .await
+    }
+
     /// Reconcile the cached high-watermark hint for `topition` against the
     /// partition's batch objects and return the authoritative next offset.
     async fn refresh_high(&self, topition: &Topition) -> Result<i64> {
-        let floor = self.cached_high(topition)?;
-        let high = self.tail_next_offset(topition, floor).await?;
+        // Cold (no in-memory hint): floor at the persisted watermark so we scan
+        // only the tail, not the whole partition. Still correct for offset
+        // assignment — listing from a floor at/below the true tail still finds
+        // the true tail.
+        let floor = match self.cached_high(topition)? {
+            Some(hint) => hint,
+            None => self.persisted_high(topition).await?,
+        };
+        let high = self.tail_next_offset(topition, Some(floor)).await?;
         self.set_high(topition, high)?;
         Ok(high)
     }
 
     /// The log end offset (high watermark) for `topition`.
     ///
-    /// For ordinary topics the authority is the immutable batch objects
-    /// ([`Self::refresh_high`]). Lake-sink topics (`tansu.lake.sink`) write *no*
-    /// batch objects — their records go straight to the lake and the offset is
-    /// carried in the mutable `watermark` object — so we take the max of the two
-    /// sources. `watermark.high` is otherwise no longer advanced on the produce
-    /// hot path (#13), so for ordinary topics the listing always wins.
+    /// The authority is the immutable batch objects. The tail listing is floored
+    /// at the best known lower bound — the in-memory hint, or the persisted
+    /// `watermark.high` — so a *cold* reader (empty hint after a restart or on
+    /// another replica) lists only the batches *after* that floor via S3
+    /// `start-after`, instead of scanning the whole partition (the cold-LIST
+    /// storm at scale). On a cold read the computed high is persisted back to
+    /// `watermark.high`, keeping the floor current for the next cold reader; this
+    /// runs once per process per partition, not on the produce hot path, so it
+    /// does not reintroduce the #13 hot-object write. Lake-sink topics
+    /// (`tansu.lake.sink`) write no batch objects and carry the offset in
+    /// `watermark.high`, which the `max` below preserves.
     async fn high_watermark(&self, topition: &Topition) -> Result<i64> {
-        let from_objects = self.refresh_high(topition).await?;
+        let from_watermark = self.persisted_high(topition).await?;
 
-        let from_watermark = self
-            .watermark(topition)?
-            .with(&self.object_store, |watermark| {
-                Ok(watermark.high.unwrap_or(0))
-            })
-            .await?;
+        let cached = self.cached_high(topition)?;
+        let was_cold = cached.is_none();
+        let floor = cached.unwrap_or(0).max(from_watermark);
 
-        Ok(from_objects.max(from_watermark))
+        let from_objects = self.tail_next_offset(topition, Some(floor)).await?;
+        self.set_high(topition, from_objects)?;
+
+        let high = from_objects.max(from_watermark);
+
+        // Cold read: refresh the persisted floor so the next cold reader scans
+        // only forward from here. Skipped for lake-sink topics (no batch objects
+        // → `high == from_watermark`) so we never clobber their authoritative
+        // watermark.
+        if was_cold && high > from_watermark {
+            self.watermark(topition)?
+                .with_mut(&self.object_store, |watermark| {
+                    watermark.high = Some(watermark.high.unwrap_or(0).max(high));
+                    Ok(())
+                })
+                .await?;
+        }
+
+        Ok(high)
     }
 
     /// Assign the next offset to `deflated` and persist it as an immutable,
@@ -903,9 +1111,9 @@ impl DynoStore {
         .unwrap_or(i64::MAX);
 
         let topics = self
-            .all_topics()
+            .topics_index()
             .await?
-            .into_iter()
+            .iter()
             .filter_map(|metadata| {
                 let configs = metadata.topic.configs.as_deref().unwrap_or_default();
 
@@ -1203,9 +1411,9 @@ impl DynoStore {
     #[instrument(skip(self), ret)]
     async fn policy_compact(&self) -> Result<u64> {
         let topics = self
-            .all_topics()
+            .topics_index()
             .await?
-            .into_iter()
+            .iter()
             .filter_map(|metadata| {
                 let configs = metadata.topic.configs.as_deref().unwrap_or_default();
 
@@ -1415,7 +1623,14 @@ impl Storage for DynoStore {
     async fn register_broker(&self, _broker_registration: BrokerRegistrationRequest) -> Result<()> {
         // Idempotent, concurrency-safe backfill of any legacy monolithic topic
         // metadata into per-topic objects on first boot of this version.
-        self.migrate_legacy_topic_metadata().await
+        self.migrate_legacy_topic_metadata().await?;
+
+        // Warm the in-memory topic index now, while the listener is still
+        // closed, so the first client's list-all metadata request hits a hot
+        // cache instead of paying the cold build (LIST + GET-per-topic).
+        self.warm_topic_index().await;
+
+        Ok(())
     }
 
     fn auto_create_topic_config(&self) -> AutoTopicCreate {
@@ -1548,6 +1763,9 @@ impl Storage for DynoStore {
                 .map(|mut locked| locked.remove(&topition))?;
         }
 
+        // Reflect the new topic in this replica's list-all view at once.
+        self.invalidate_topic_index();
+
         Ok(id)
     }
 
@@ -1605,6 +1823,9 @@ impl Storage for DynoStore {
             self.topic_meta(metadata.topic.name.as_str())?
                 .remove(&self.object_store)
                 .await?;
+
+            self.invalidate_topic_id(&metadata.id);
+            self.invalidate_topic_index();
 
             match self
                 .object_store
@@ -2592,7 +2813,7 @@ impl Storage for DynoStore {
             _ => {
                 let mut responses = vec![];
 
-                for topic_metadata in self.all_topics().await? {
+                for topic_metadata in self.topics_index().await?.iter() {
                     debug!(?topic_metadata);
 
                     let name = Some(topic_metadata.topic.name.clone());
@@ -3939,6 +4160,18 @@ where
         debug!(?prefix);
 
         self.object_store.list(prefix)
+    }
+
+    // Forward `list_with_offset` (S3 `start-after`) so a tail-offset scan reads
+    // only the partition tail rather than the default full-`list` downgrade.
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        debug!(?prefix, ?offset);
+
+        self.object_store.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(

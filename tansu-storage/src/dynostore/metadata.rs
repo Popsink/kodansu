@@ -364,6 +364,20 @@ where
         self.object_store.list(prefix)
     }
 
+    // Forward `list_with_offset` to the inner store instead of letting the
+    // default downgrade it to a full `list`: tail-offset scans
+    // (`DynoStore::tail_next_offset`) rely on S3 `start-after` to read only the
+    // partition tail, not the whole records prefix.
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        debug!(?prefix, ?offset);
+        REQUESTS.add(1, &[KeyValue::new("method", "list_with_offset")]);
+        self.object_store.list_with_offset(prefix, offset)
+    }
+
     #[instrument(skip_all, fields(prefix))]
     async fn list_with_delimiter(
         &self,
