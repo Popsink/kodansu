@@ -462,6 +462,44 @@ impl DynoStore {
         Path::from(format!("clusters/{}/topic-ids/{}.json", self.cluster, id))
     }
 
+    fn topic_metadata_path(&self, name: &str) -> Path {
+        Path::from(format!(
+            "clusters/{}/topic-metadata/{}.json",
+            self.cluster, name
+        ))
+    }
+
+    /// Marker object recording that the one-shot legacy-metadata backfill has
+    /// run. Kept outside the `topic-metadata/` prefix so it is never returned by
+    /// [`Self::all_topics`]'s listing.
+    fn topic_metadata_migration_marker(&self) -> Path {
+        Path::from(format!(
+            "clusters/{}/.migrations/topic-metadata",
+            self.cluster
+        ))
+    }
+
+    /// Create-only PUT: `Ok(true)` if this call created the object, `Ok(false)`
+    /// if it already existed.
+    async fn put_create(&self, path: &Path, payload: PutPayload) -> Result<bool> {
+        match self
+            .object_store
+            .put_opts(
+                path,
+                payload,
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(object_store::Error::AlreadyExists { .. }) => Ok(false),
+            Err(otherwise) => Err(otherwise.into()),
+        }
+    }
+
     /// Resolve a topic-id to its name via the `topic-ids/{uuid}.json` pointer.
     async fn topic_name_by_id(&self, id: &Uuid) -> Result<Option<Topic>> {
         match self.object_store.get(&self.topic_id_path(id)).await {
@@ -514,6 +552,18 @@ impl DynoStore {
     /// left in `meta.json` untouched — they are dead data the current `Meta`
     /// deserialiser ignores.
     async fn migrate_legacy_topic_metadata(&self) -> Result<()> {
+        let marker = self.topic_metadata_migration_marker();
+
+        // Fast path: a prior boot already backfilled. Without this, every
+        // restart re-loads `meta.json` and re-attempts a create per topic — a
+        // ~O(topics) startup cost (and memory spike) that, on a large cluster,
+        // is what tipped the broker over its memory limit and crash-looped it.
+        match self.object_store.head(&marker).await {
+            Ok(_) => return Ok(()),
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(otherwise) => return Err(otherwise.into()),
+        }
+
         #[derive(Deserialize)]
         struct LegacyMeta {
             #[serde(default)]
@@ -522,49 +572,40 @@ impl DynoStore {
 
         let path = Path::from(format!("clusters/{}/meta.json", self.cluster));
 
-        let encoded = match self.object_store.get(&path).await {
-            Ok(get_result) => get_result.bytes().await?,
-            Err(object_store::Error::NotFound { .. }) => return Ok(()),
+        let legacy = match self.object_store.get(&path).await {
+            Ok(get_result) => {
+                let encoded = get_result.bytes().await?;
+                serde_json::from_slice::<LegacyMeta>(&encoded)?
+            }
+            Err(object_store::Error::NotFound { .. }) => LegacyMeta {
+                topics: BTreeMap::new(),
+            },
             Err(otherwise) => return Err(otherwise.into()),
         };
 
-        let legacy = serde_json::from_slice::<LegacyMeta>(&encoded)?;
-        if legacy.topics.is_empty() {
-            return Ok(());
-        }
-
         let mut migrated = 0u64;
 
+        // Write per-topic objects directly (create-only), NOT through the cached
+        // `topic_meta` handle: the per-topic `OptiCon` cache would otherwise
+        // retain every migrated topic, making migration memory scale with topic
+        // count. Consume by value so the legacy map shrinks as we go.
         for (name, metadata) in legacy.topics {
             let id = metadata.id;
 
-            // Both writes are create-only and tolerant of an already-present
-            // object, so a partially completed prior run converges.
+            let payload = serde_json::to_vec(&metadata)
+                .map(Bytes::from)
+                .map(PutPayload::from)?;
             if self
-                .topic_meta(name.as_str())?
-                .create(&self.object_store, metadata)
+                .put_create(&self.topic_metadata_path(&name), payload)
                 .await?
             {
                 migrated += 1;
             }
 
-            match self
-                .object_store
-                .put_opts(
-                    &self.topic_id_path(&id),
-                    serde_json::to_vec(&TopicIdRef { name })
-                        .map(Bytes::from)
-                        .map(PutPayload::from)?,
-                    PutOptions {
-                        mode: PutMode::Create,
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(_) | Err(object_store::Error::AlreadyExists { .. }) => {}
-                Err(otherwise) => return Err(otherwise.into()),
-            }
+            let pointer = serde_json::to_vec(&TopicIdRef { name })
+                .map(Bytes::from)
+                .map(PutPayload::from)?;
+            _ = self.put_create(&self.topic_id_path(&id), pointer).await?;
         }
 
         if migrated > 0 {
@@ -574,6 +615,11 @@ impl DynoStore {
                 "backfilled legacy topic metadata into per-topic objects"
             );
         }
+
+        // Record completion so every subsequent boot takes the fast path above.
+        _ = self
+            .put_create(&marker, PutPayload::from(Bytes::new()))
+            .await?;
 
         Ok(())
     }

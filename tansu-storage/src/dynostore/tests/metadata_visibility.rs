@@ -202,3 +202,81 @@ async fn legacy_meta_json_is_backfilled_into_per_topic_objects() -> Result<(), E
 
     Ok(())
 }
+
+/// The backfill is one-shot: once its marker is written, a later boot does not
+/// re-scan `meta.json`. (Re-scanning every boot — re-loading the whole legacy
+/// object and re-attempting a create per topic — is the O(topics) startup
+/// cost/memory spike that crash-looped a large production cluster at its memory
+/// limit.) A topic appended to the legacy object after the first run is not
+/// picked up, proving the scan does not run again.
+#[tokio::test]
+async fn migration_is_one_shot() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    #[derive(serde::Serialize)]
+    struct LegacyMetaWrite {
+        topics: BTreeMap<String, TopicMetadata>,
+    }
+
+    fn legacy_topic(name: &str) -> (String, TopicMetadata) {
+        (
+            name.to_string(),
+            TopicMetadata {
+                id: Uuid::now_v7(),
+                topic: CreatableTopic::default()
+                    .name(name.into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+            },
+        )
+    }
+
+    let bucket = InMemory::new();
+    let meta = Path::from(format!("clusters/{CLUSTER}/meta.json"));
+
+    // Legacy state with a single topic, then migrate.
+    _ = bucket
+        .put_opts(
+            &meta,
+            PutPayload::from(serde_json::to_vec(&LegacyMetaWrite {
+                topics: BTreeMap::from([legacy_topic("a")]),
+            })?),
+            Default::default(),
+        )
+        .await?;
+
+    let replica = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    replica.migrate_legacy_topic_metadata().await?;
+    assert!(
+        replica
+            .topic_metadata(&TopicId::Name("a".into()))
+            .await?
+            .is_some()
+    );
+
+    // The legacy object later grows a second topic. A fresh replica's migration
+    // must take the marker fast-path and NOT backfill it.
+    _ = bucket
+        .put_opts(
+            &meta,
+            PutPayload::from(serde_json::to_vec(&LegacyMetaWrite {
+                topics: BTreeMap::from([legacy_topic("a"), legacy_topic("b")]),
+            })?),
+            Default::default(),
+        )
+        .await?;
+
+    let replica = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    replica.migrate_legacy_topic_metadata().await?;
+    assert!(
+        replica
+            .topic_metadata(&TopicId::Name("b".into()))
+            .await?
+            .is_none(),
+        "marker should make migration one-shot; b must not be backfilled"
+    );
+
+    Ok(())
+}
