@@ -203,6 +203,45 @@ async fn legacy_meta_json_is_backfilled_into_per_topic_objects() -> Result<(), E
     Ok(())
 }
 
+/// The list-all metadata path is served from the in-memory topic index (not a
+/// per-request sweep of every per-topic object — the #29 OOM at scale). A local
+/// create/delete invalidates the index, so list-all reflects the change at once.
+#[tokio::test]
+async fn list_all_reflects_create_and_delete_via_index() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let replica = DynoStore::new(CLUSTER, NODE, bucket.clone());
+
+    let names = |response: &crate::MetadataResponse| {
+        response
+            .topics()
+            .iter()
+            .filter_map(|topic| topic.name.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+
+    _ = create_topic(&replica, "alpha", 1).await?;
+    _ = create_topic(&replica, "beta", 1).await?;
+
+    let listed = names(&replica.metadata(None).await?);
+    assert!(
+        listed.contains("alpha") && listed.contains("beta"),
+        "{listed:?}"
+    );
+
+    _ = replica.delete_topic(&TopicId::Name("alpha".into())).await?;
+
+    let listed = names(&replica.metadata(None).await?);
+    assert!(
+        !listed.contains("alpha"),
+        "alpha should be gone: {listed:?}"
+    );
+    assert!(listed.contains("beta"), "beta should remain: {listed:?}");
+
+    Ok(())
+}
+
 /// The backfill is one-shot: once its marker is written, a later boot does not
 /// re-scan `meta.json`. (Re-scanning every boot — re-loading the whole legacy
 /// object and re-attempting a create per topic — is the O(topics) startup
