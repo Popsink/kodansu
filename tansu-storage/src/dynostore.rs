@@ -925,15 +925,18 @@ impl DynoStore {
 
     /// The log end offset (high watermark) for `topition`.
     ///
-    /// For ordinary topics the authority is the immutable batch objects
-    /// ([`Self::refresh_high`]). Lake-sink topics (`tansu.lake.sink`) write *no*
-    /// batch objects — their records go straight to the lake and the offset is
-    /// carried in the mutable `watermark` object — so we take the max of the two
-    /// sources. `watermark.high` is otherwise no longer advanced on the produce
-    /// hot path (#13), so for ordinary topics the listing always wins.
+    /// The authority is the immutable batch objects. The tail listing is floored
+    /// at the best known lower bound — the in-memory hint, or the persisted
+    /// `watermark.high` — so a *cold* reader (empty hint after a restart or on
+    /// another replica) lists only the batches *after* that floor via S3
+    /// `start-after`, instead of scanning the whole partition (the cold-LIST
+    /// storm at scale). On a cold read the computed high is persisted back to
+    /// `watermark.high`, keeping the floor current for the next cold reader; this
+    /// runs once per process per partition, not on the produce hot path, so it
+    /// does not reintroduce the #13 hot-object write. Lake-sink topics
+    /// (`tansu.lake.sink`) write no batch objects and carry the offset in
+    /// `watermark.high`, which the `max` below preserves.
     async fn high_watermark(&self, topition: &Topition) -> Result<i64> {
-        let from_objects = self.refresh_high(topition).await?;
-
         let from_watermark = self
             .watermark(topition)?
             .with(&self.object_store, |watermark| {
@@ -941,7 +944,29 @@ impl DynoStore {
             })
             .await?;
 
-        Ok(from_objects.max(from_watermark))
+        let cached = self.cached_high(topition)?;
+        let was_cold = cached.is_none();
+        let floor = cached.unwrap_or(0).max(from_watermark);
+
+        let from_objects = self.tail_next_offset(topition, Some(floor)).await?;
+        self.set_high(topition, from_objects)?;
+
+        let high = from_objects.max(from_watermark);
+
+        // Cold read: refresh the persisted floor so the next cold reader scans
+        // only forward from here. Skipped for lake-sink topics (no batch objects
+        // → `high == from_watermark`) so we never clobber their authoritative
+        // watermark.
+        if was_cold && high > from_watermark {
+            self.watermark(topition)?
+                .with_mut(&self.object_store, |watermark| {
+                    watermark.high = Some(watermark.high.unwrap_or(0).max(high));
+                    Ok(())
+                })
+                .await?;
+        }
+
+        Ok(high)
     }
 
     /// Assign the next offset to `deflated` and persist it as an immutable,
@@ -4071,6 +4096,18 @@ where
         debug!(?prefix);
 
         self.object_store.list(prefix)
+    }
+
+    // Forward `list_with_offset` (S3 `start-after`) so a tail-offset scan reads
+    // only the partition tail rather than the default full-`list` downgrade.
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        debug!(?prefix, ?offset);
+
+        self.object_store.list_with_offset(prefix, offset)
     }
 
     async fn list_with_delimiter(
