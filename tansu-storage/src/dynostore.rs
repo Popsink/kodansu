@@ -2058,7 +2058,17 @@ impl Storage for DynoStore {
                 })
                 .await
                 .inspect(|outcome| debug!(transaction_id, ?topition, ?outcome))
-                .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
+                // `DuplicateSequenceNumber` / `OutOfOrderSequenceNumber` are the
+                // expected idempotent-producer outcomes for a retried batch, not
+                // broker failures — log them at debug like the CAS itself, and
+                // reserve error! for genuinely unexpected Api errors (#37).
+                .inspect_err(|err| {
+                    if err.is_expected_idempotent_outcome() {
+                        debug!(?err, transaction_id, ?topition);
+                    } else {
+                        error!(?err, transaction_id, ?topition);
+                    }
+                })?;
             }
 
             if let Some(ref registry) = self.schemas {

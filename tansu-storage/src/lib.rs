@@ -363,6 +363,20 @@ pub enum Error {
     OneshotRecv,
 }
 
+impl Error {
+    /// Expected idempotent-producer protocol outcomes handled by a well-behaved
+    /// client on its own (e.g. a retried-after-disconnect batch that tansu had
+    /// already persisted). These are the normal Kafka idempotent-producer
+    /// contract, not broker failures, so they must not be logged at error/warn
+    /// (#37).
+    pub(crate) fn is_expected_idempotent_outcome(&self) -> bool {
+        matches!(
+            self,
+            Error::Api(ErrorCode::DuplicateSequenceNumber | ErrorCode::OutOfOrderSequenceNumber)
+        )
+    }
+}
+
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "{self:?}")

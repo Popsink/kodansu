@@ -200,6 +200,11 @@ impl ProduceService {
                     .produce(transaction_id, &tp, batch)
                     .await
                     .inspect_err(|err| match err {
+                        // Expected idempotent-producer outcomes (a retried batch
+                        // already persisted) — routine, not a failure (#37).
+                        err if err.is_expected_idempotent_outcome() => {
+                            debug!(?err)
+                        }
                         storage_api @ Error::Api(_) => {
                             warn!(?storage_api)
                         }
@@ -343,6 +348,20 @@ mod tests {
             ErrorCode::UnknownServerError,
             storage_error_code(&Error::NoSuchOffset(0))
         );
+    }
+
+    #[test]
+    fn expected_idempotent_outcomes_are_not_failures() {
+        // Retried-after-disconnect batches surface as these two codes; a
+        // well-behaved idempotent producer handles them, so they must not be
+        // logged at error/warn (#37).
+        assert!(Error::Api(ErrorCode::DuplicateSequenceNumber).is_expected_idempotent_outcome());
+        assert!(Error::Api(ErrorCode::OutOfOrderSequenceNumber).is_expected_idempotent_outcome());
+
+        // Any other Api error, and non-Api errors, remain genuine failures.
+        assert!(!Error::Api(ErrorCode::ProducerFenced).is_expected_idempotent_outcome());
+        assert!(!Error::Api(ErrorCode::UnknownServerError).is_expected_idempotent_outcome());
+        assert!(!Error::NoSuchOffset(0).is_expected_idempotent_outcome());
     }
 
     fn init_tracing() -> Result<DefaultGuard> {
