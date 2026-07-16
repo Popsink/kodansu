@@ -93,7 +93,14 @@ async fn req() -> Result<(), Error> {
         )
         .await?;
 
-    assert!(response.results.unwrap_or_default()[0].configs.is_none());
+    // The topic carries the injected broker defaults (cleanup.policy/retention.ms),
+    // but the not-yet-altered key must be absent.
+    let results = response.results.unwrap_or_default();
+    let configs = results[0].configs.as_deref().unwrap_or_default();
+    assert!(
+        !configs.iter().any(|config| config.name == config_name),
+        "unset config `{config_name}` must be absent before it is altered"
+    );
 
     let alter_configs = {
         let storage = storage.clone();
@@ -140,8 +147,12 @@ async fn req() -> Result<(), Error> {
     assert_eq!(resource_name, results[0].resource_name.as_str());
 
     let configs = results[0].configs.as_deref().unwrap_or(&[]);
-    assert_eq!(1, configs.len());
-    assert_eq!(Some(config_value), configs[0].value.as_deref());
+    let altered = configs.iter().find(|config| config.name == config_name);
+    assert_eq!(
+        Some(config_value),
+        altered.and_then(|config| config.value.as_deref()),
+        "altered config `{config_name}` must read back its new value"
+    );
 
     Ok(())
 }
