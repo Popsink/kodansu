@@ -37,7 +37,7 @@ async fn create() -> Result<(), Error> {
         .build()
         .await?;
 
-    let service = MapStateLayer::new(|_| storage).into_layer(CreateTopicsService);
+    let service = MapStateLayer::new(|_| storage).into_layer(CreateTopicsService::default());
 
     let name = "pqr";
     let num_partitions = 5;
@@ -89,7 +89,7 @@ async fn create_with_default() -> Result<(), Error> {
 
     let service = {
         let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService::default())
     };
 
     let name = "pqr";
@@ -187,7 +187,7 @@ async fn duplicate() -> Result<(), Error> {
         .build()
         .await?;
 
-    let service = MapStateLayer::new(|_| storage).into_layer(CreateTopicsService);
+    let service = MapStateLayer::new(|_| storage).into_layer(CreateTopicsService::default());
 
     let name = "pqr";
     let num_partitions = 5;

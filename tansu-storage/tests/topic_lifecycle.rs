@@ -45,7 +45,7 @@ async fn topic_lifecycle() -> Result<(), Error> {
 
     let create_topic = {
         let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService::default())
     };
 
     let delete_topic = {
