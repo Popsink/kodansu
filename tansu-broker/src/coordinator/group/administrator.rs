@@ -25,6 +25,7 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use opentelemetry::{KeyValue, metrics::Counter};
+use rand::{prelude::*, rng};
 use tansu_sans_io::{
     Body, ErrorCode,
     consumer::{MemberAssignment, MemberMetadata},
@@ -57,6 +58,23 @@ use crate::{Error, METER, Result};
 use super::{Coordinator, OffsetCommit};
 
 const PAUSE_MS: u128 = 3_000;
+
+/// After this many consecutive object-store CAS conflicts on a single group's
+/// state object, log a warning: sustained conflicts mean several members of the
+/// same group are landing on different replicas behind a shared endpoint (the
+/// scenario mitigated client-side in #43).
+const CAS_CONFLICT_WARN: u32 = 16;
+
+/// Backoff before retrying a group-state write that lost the object-store CAS
+/// race (another replica updated the same `{group}.json` first). Without it the
+/// retry loop spins as fast as the store answers, hammering the shared object
+/// and keeping racing replicas in lock-step. Exponential (5ms·2^n) capped at
+/// 500ms, plus up to 50% jitter to desynchronise replicas. See #44.
+fn cas_conflict_backoff(attempt: u32) -> Duration {
+    let base_ms = 5u64.saturating_mul(1u64 << attempt.min(7)).min(500);
+    let jitter = rng().random_range(0..=base_ms / 2);
+    Duration::from_millis(base_ms + jitter)
+}
 
 static COORDINATOR_REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
@@ -822,6 +840,7 @@ where
         let started_at = SystemTime::now();
 
         let mut iteration = 0;
+        let mut cas_conflicts = 0u32;
 
         loop {
             COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_loop")]);
@@ -945,6 +964,16 @@ where
                         )
                     });
 
+                    cas_conflicts += 1;
+                    if cas_conflicts == CAS_CONFLICT_WARN {
+                        warn!(
+                            group_id,
+                            cas_conflicts,
+                            "join: repeated group-state CAS conflicts (concurrent members across replicas?)"
+                        );
+                    }
+                    sleep(cas_conflict_backoff(cas_conflicts)).await;
+
                     iteration += 1;
                     continue;
                 }
@@ -999,6 +1028,7 @@ where
 
         let started_at = SystemTime::now();
         let mut iteration = 0;
+        let mut cas_conflicts = 0u32;
 
         if let Some(assignments) = assignments
             && !assignments.is_empty()
@@ -1138,6 +1168,16 @@ where
                             ),
                         )
                     })?;
+
+                    cas_conflicts += 1;
+                    if cas_conflicts == CAS_CONFLICT_WARN {
+                        warn!(
+                            group_id,
+                            cas_conflicts,
+                            "sync: repeated group-state CAS conflicts (concurrent members across replicas?)"
+                        );
+                    }
+                    sleep(cas_conflict_backoff(cas_conflicts)).await;
 
                     iteration += 1;
                     continue;
@@ -3135,6 +3175,24 @@ mod tests {
                 )
                 .finish(),
         ))
+    }
+
+    #[test]
+    fn cas_conflict_backoff_is_bounded() {
+        for attempt in 0..32 {
+            let backoff = cas_conflict_backoff(attempt);
+            // Every retry pauses at least the 5ms base, and the exponential is
+            // capped at 500ms with at most 50% jitter, so it never exceeds
+            // 750ms regardless of how many conflicts have accrued.
+            assert!(
+                backoff >= Duration::from_millis(5),
+                "attempt {attempt}: {backoff:?}"
+            );
+            assert!(
+                backoff <= Duration::from_millis(750),
+                "attempt {attempt}: {backoff:?}"
+            );
+        }
     }
 
     #[ignore]
