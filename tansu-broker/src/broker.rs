@@ -38,7 +38,9 @@ use std::{
 };
 use tansu_sans_io::{ErrorCode, RootMessageMeta};
 use tansu_schema::{Registry, lake::House};
-use tansu_storage::{ArcDynStorage, BrokerRegistrationRequest, Storage, StorageContainer};
+use tansu_storage::{
+    ArcDynStorage, BrokerRegistrationRequest, Storage, StorageContainer, TopicDefaults,
+};
 use tokio::{
     net::TcpListener,
     signal::unix::{SignalKind, signal},
@@ -65,6 +67,7 @@ pub struct Broker<G, S> {
     tls_server_config: Option<Arc<ServerConfig>>,
     silent: bool,
     maintenance_interval: Option<Duration>,
+    topic_defaults: TopicDefaults,
 
     cancellation: CancellationToken,
 }
@@ -99,6 +102,7 @@ where
             silent: false,
 
             maintenance_interval: None,
+            topic_defaults: TopicDefaults::default(),
 
             cancellation: CancellationToken::new(),
         }
@@ -338,7 +342,8 @@ where
                         self.cluster_id.as_str(),
                         self.groups.clone(),
                         self.storage.clone(),
-                        self.sasl_config.clone()
+                        self.sasl_config.clone(),
+                        self.topic_defaults.clone(),
                     )?;
 
                     let handle = set.spawn(async move {
@@ -433,6 +438,7 @@ pub struct Builder<N, C, I, A, S, L> {
     tls_server_config: Option<ServerConfig>,
     silent: bool,
     maintenance_interval: Option<Duration>,
+    topic_defaults: TopicDefaults,
 
     cancellation: CancellationToken,
 }
@@ -464,6 +470,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             tls_server_config: self.tls_server_config,
             silent: self.silent,
             maintenance_interval: self.maintenance_interval,
+            topic_defaults: self.topic_defaults,
 
             cancellation: self.cancellation,
         }
@@ -484,6 +491,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             tls_server_config: self.tls_server_config,
             silent: self.silent,
             maintenance_interval: self.maintenance_interval,
+            topic_defaults: self.topic_defaults,
 
             cancellation: self.cancellation,
         }
@@ -504,6 +512,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             tls_server_config: self.tls_server_config,
             silent: self.silent,
             maintenance_interval: self.maintenance_interval,
+            topic_defaults: self.topic_defaults,
 
             cancellation: self.cancellation,
         }
@@ -527,6 +536,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             tls_server_config: self.tls_server_config,
             silent: self.silent,
             maintenance_interval: self.maintenance_interval,
+            topic_defaults: self.topic_defaults,
 
             cancellation: self.cancellation,
         }
@@ -574,6 +584,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             tls_server_config: self.tls_server_config,
             silent: self.silent,
             maintenance_interval,
+            topic_defaults: self.topic_defaults,
 
             cancellation: self.cancellation,
         }
@@ -596,6 +607,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             tls_server_config: self.tls_server_config,
             silent: self.silent,
             maintenance_interval: self.maintenance_interval,
+            topic_defaults: self.topic_defaults,
 
             cancellation: self.cancellation,
         }
@@ -638,6 +650,13 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
     }
     pub fn silent(self, silent: bool) -> Self {
         Self { silent, ..self }
+    }
+
+    pub fn topic_defaults(self, topic_defaults: TopicDefaults) -> Self {
+        Self {
+            topic_defaults,
+            ..self
+        }
     }
 }
 
@@ -685,6 +704,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
 
             silent: self.silent,
             maintenance_interval: self.maintenance_interval,
+            topic_defaults: self.topic_defaults,
             cancellation: self.cancellation,
         })
     }

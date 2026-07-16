@@ -221,7 +221,7 @@ async fn empty_topic_5_000ms_max_wait() -> Result<(), Error> {
 
     let create_topic = {
         let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService::default())
     };
 
     let name = "pqr";
@@ -308,7 +308,7 @@ async fn empty_topic_50ms_max_wait() -> Result<(), Error> {
 
     let create_topic = {
         let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService::default())
     };
 
     let name = "pqr";
@@ -395,7 +395,7 @@ async fn fetch_1_min_bytes_5_000ms_max_wait() -> Result<(), Error> {
 
     let create_topic = {
         let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService::default())
     };
 
     let produce = {
@@ -653,7 +653,7 @@ async fn fetch_1_min_bytes_max_wait_of_1x_latency() -> Result<(), Error> {
 
     let create_topic = {
         let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService::default())
     };
 
     let produce = {
@@ -809,7 +809,7 @@ async fn fetch_1_min_bytes_max_wait_of_2x_latency() -> Result<(), Error> {
 
     let create_topic = {
         let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService::default())
     };
 
     let produce = {
@@ -982,7 +982,7 @@ async fn fetch_max_bytes_for_1_message_5_000ms_max_wait() -> Result<(), Error> {
 
     let create_topic = {
         let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService::default())
     };
 
     let produce = {
@@ -1139,7 +1139,7 @@ async fn fetch_max_bytes_for_1_message_50ms_max_wait() -> Result<(), Error> {
 
     let create_topic = {
         let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService::default())
     };
 
     let produce = {
@@ -1297,7 +1297,7 @@ async fn fetch_max_bytes_for_2_messages_5_000ms_max_wait() -> Result<(), Error> 
 
     let create_topic = {
         let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService::default())
     };
 
     let produce = {
@@ -1469,7 +1469,7 @@ async fn fetch_max_bytes_for_2_messages_50ms_max_wait() -> Result<(), Error> {
 
     let create_topic = {
         let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService::default())
     };
 
     let produce = {

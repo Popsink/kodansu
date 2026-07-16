@@ -32,7 +32,9 @@ use rustls::{
 use tansu_broker::{NODE_ID, broker::Broker, coordinator::group::administrator::Controller};
 use tansu_sans_io::ErrorCode;
 use tansu_schema::Registry;
-use tansu_storage::{ArcDynStorage, StorageContainer};
+use tansu_storage::{
+    ArcDynStorage, DEFAULT_CLEANUP_POLICY, DEFAULT_RETENTION_MS, StorageContainer, TopicDefaults,
+};
 use tokio::time::Instant;
 use tracing::debug;
 use url::Url;
@@ -101,6 +103,14 @@ pub(super) struct Arg {
     /// Transport Layer Security Key
     #[arg(group = "tls", long)]
     key: Option<PathBuf>,
+
+    /// Default `cleanup.policy` applied to topics created without one (Kafka default: delete). Set empty to opt out (infinite retention).
+    #[arg(long, env = "DEFAULT_CLEANUP_POLICY", default_value = DEFAULT_CLEANUP_POLICY)]
+    default_cleanup_policy: String,
+
+    /// Default `retention.ms` applied to delete-policy topics created without one (Kafka default: 7 days)
+    #[arg(long, env = "DEFAULT_RETENTION", value_parser = humantime::parse_duration, default_value = "7days")]
+    default_retention: Duration,
 
     /// Silent
     #[arg(long)]
@@ -266,6 +276,13 @@ impl Arg {
             .cert
             .and_then(|certs| self.key.and_then(|key| server_config(&certs, &key).ok()));
 
+        let topic_defaults = TopicDefaults {
+            cleanup_policy: Some(self.default_cleanup_policy.clone())
+                .filter(|policy| !policy.is_empty()),
+            retention_ms: i64::try_from(self.default_retention.as_millis())
+                .unwrap_or(DEFAULT_RETENTION_MS),
+        };
+
         let broker = Broker::<Controller<StorageContainer>, StorageContainer>::builder()
             .node_id(NODE_ID)
             .cluster_id(cluster_id)
@@ -277,6 +294,7 @@ impl Arg {
             .listener(listener.clone())
             .authentication(self.authentication)
             .tls_server_config(tls_server_config)
+            .topic_defaults(topic_defaults)
             .silent(self.silent);
 
         #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]

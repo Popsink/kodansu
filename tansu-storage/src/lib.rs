@@ -217,14 +217,15 @@ pub use latency::LatencyIntroducingStorage;
 
 pub use service::{
     AlterUserScramCredentialsService, ChannelRequestLayer, ChannelRequestService,
-    ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService, DeleteGroupsService,
-    DeleteRecordsService, DeleteTopicsService, DescribeAclsService, DescribeClusterService,
-    DescribeConfigsService, DescribeGroupsService, DescribeTopicPartitionsService,
-    DescribeUserScramCredentialsService, FetchService, FindCoordinatorService,
-    GetTelemetrySubscriptionsService, IncrementalAlterConfigsService, InitProducerIdService,
-    ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService, MetadataService,
-    ProduceService, Request, RequestChannelService, RequestLayer, RequestReceiver, RequestSender,
-    RequestService, RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService,
+    ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService, DEFAULT_CLEANUP_POLICY,
+    DEFAULT_RETENTION_MS, DeleteGroupsService, DeleteRecordsService, DeleteTopicsService,
+    DescribeAclsService, DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
+    DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
+    FindCoordinatorService, GetTelemetrySubscriptionsService, IncrementalAlterConfigsService,
+    InitProducerIdService, ListGroupsService, ListOffsetsService,
+    ListPartitionReassignmentsService, MetadataService, ProduceService, Request,
+    RequestChannelService, RequestLayer, RequestReceiver, RequestSender, RequestService,
+    RequestStorageService, Response, TopicDefaults, TxnAddOffsetsService, TxnAddPartitionService,
     TxnOffsetCommitService, bounded_channel,
 };
 
