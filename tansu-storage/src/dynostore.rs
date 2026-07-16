@@ -1100,6 +1100,87 @@ impl DynoStore {
     /// older than `retention.ms` (defaulting to 7 days, matching the SQL
     /// backends). Returns the number of batches removed.
     #[instrument(skip(self), ret)]
+    /// Expire consumer groups whose state object under
+    /// `clusters/{cluster}/groups/consumers/` has not been modified within
+    /// [`GROUP_RETENTION`]. A live group rewrites its state object on every
+    /// join, heartbeat and offset commit, so an object left untouched for the
+    /// whole window has had no member activity for that long and is treated as
+    /// dead. Age is read from the `last_modified` of the delimiter listing, so
+    /// candidate selection needs no per-group GET.
+    ///
+    /// Deletions are capped at [`GROUP_EXPIRE_CHUNK`] per tick so a large
+    /// accumulated backlog (e.g. groups leaked by a one-group-per-subscription
+    /// client model) drains gradually rather than issuing tens of thousands of
+    /// deletes at once — the concentrated object-store pressure that degraded
+    /// the broker in #8. See #45.
+    async fn expire_groups(&self, now: SystemTime) -> Result<u64> {
+        /// Kafka's default `offsets.retention.minutes` is 7 days; match it.
+        const GROUP_RETENTION: Duration = Duration::from_hours(7 * 24);
+        /// Maximum number of groups expired per maintenance tick.
+        const GROUP_EXPIRE_CHUNK: usize = 1_000;
+
+        let now_ms = i64::try_from(
+            now.duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
+        let threshold_ms = now_ms.saturating_sub(GROUP_RETENTION.as_millis() as i64);
+
+        let prefix = Path::from(format!("clusters/{}/groups/consumers/", self.cluster));
+
+        let listed = self
+            .object_store
+            .list_with_delimiter(Some(&prefix))
+            .await
+            .inspect_err(|err| error!(?err, cluster = self.cluster))?;
+
+        // The `{group}.json` files directly under the prefix are the group
+        // state objects; the `{group}/` common prefixes hold the per-partition
+        // committed offsets and are removed alongside them by `delete_groups`.
+        let mut stale: Vec<String> = Vec::new();
+        for meta in listed.objects {
+            if meta.last_modified.timestamp_millis() >= threshold_ms {
+                continue;
+            }
+
+            let Some(name) = meta.location.parts().next_back() else {
+                continue;
+            };
+
+            if let Some(group_id) = name.as_ref().strip_suffix(".json") {
+                stale.push(group_id.to_owned());
+
+                if stale.len() >= GROUP_EXPIRE_CHUNK {
+                    break;
+                }
+            }
+        }
+
+        if stale.is_empty() {
+            return Ok(0);
+        }
+
+        let capped = stale.len() >= GROUP_EXPIRE_CHUNK;
+        let expired = stale.len() as u64;
+
+        // `delete_groups` removes each state object and every committed-offset
+        // object under the group prefix, logging the per-group outcome.
+        _ = self.delete_groups(Some(&stale)).await?;
+
+        if capped {
+            info!(
+                expired,
+                cluster = self.cluster,
+                "expire_groups hit the per-tick cap; more stale groups remain for the next tick"
+            );
+        } else {
+            debug!(expired, cluster = self.cluster, "expire_groups");
+        }
+
+        Ok(expired)
+    }
+
     async fn policy_delete(&self, now: SystemTime) -> Result<u64> {
         const DEFAULT_RETENTION: Duration = Duration::from_hours(7 * 24);
 
@@ -3880,7 +3961,8 @@ impl Storage for DynoStore {
     async fn maintain(&self, now: SystemTime) -> Result<()> {
         let deleted = self.policy_delete(now).await?;
         let compacted = self.policy_compact().await?;
-        debug!(deleted, compacted);
+        let expired_groups = self.expire_groups(now).await?;
+        debug!(deleted, compacted, expired_groups);
 
         if let Some(ref lake) = self.lake {
             return lake

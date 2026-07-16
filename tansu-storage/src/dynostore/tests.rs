@@ -20,6 +20,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::{Error, Result};
 
+mod group_expiry;
 mod idempotent;
 mod latency;
 mod metadata_visibility;
