@@ -138,7 +138,7 @@ pub struct DynoStore {
     /// (see [`DynoStore::refresh_high`]). Keeping offset assignment off a single
     /// mutable `watermark` object is what takes the produce hot path off the
     /// GCS per-object update-rate cap (#13).
-    next_offsets: Arc<Mutex<BTreeMap<Topition, i64>>>,
+    next_offsets: Arc<Mutex<BTreeMap<Topition, OffsetHint>>>,
 
     /// Per-producer optimistic-concurrency handle on `producers/{id}.json`,
     /// holding that producer's idempotent sequence state. Sharding the sequence
@@ -159,6 +159,21 @@ type ProducerEpoch = i16;
 type ProducerId = i64;
 type Sequence = i32;
 type Topic = String;
+
+/// Per-partition next-offset hint (see [`DynoStore::next_offsets`]).
+///
+/// `next` is the cached next offset to assign (== the high watermark) and is the
+/// authority for offset *assignment* only as a starting candidate — the true
+/// authority is the immutable batch objects. `listed_at` records when `next` was
+/// last reconciled against an authoritative tail *listing* (not merely advanced
+/// by a local produce): the high-watermark read path serves from `next` without
+/// listing while `listed_at` is within [`DynoStore::HIGH_WATERMARK_HINT_TTL`],
+/// so a batch produced on *another* replica becomes visible within that bound.
+#[derive(Clone, Copy, Debug, Default)]
+struct OffsetHint {
+    next: i64,
+    listed_at: Option<SystemTime>,
+}
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 struct Meta {
@@ -573,6 +588,16 @@ impl DynoStore {
     /// fresh via the per-topic object.
     const TOPIC_INDEX_TTL: Duration = Duration::from_secs(5);
 
+    /// How long a per-partition high-watermark hint is served from memory before
+    /// the read path re-lists the tail (see [`OffsetHint`] / [`Self::cached_high_fresh`]).
+    /// Bounds the cross-replica staleness of the read-uncommitted high watermark:
+    /// a batch produced on another replica becomes visible within this window,
+    /// while a caught-up consumer long-polling an idle partition issues no
+    /// `ListObjectsV2` per poll in steady state (#40). Read-committed is
+    /// unaffected in semantics — a stale (lower) high watermark can only *delay*
+    /// visibility, never expose unstable offsets.
+    const HIGH_WATERMARK_HINT_TTL: Duration = Duration::from_secs(5);
+
     /// All topics, served from the in-memory [`TopicIndex`]. Returns the shared
     /// snapshot if fresh; otherwise refreshes it (single-flight) by LISTing the
     /// `topic-metadata/` prefix and GETting only the objects whose etag changed.
@@ -870,23 +895,65 @@ impl DynoStore {
 
     /// The cached next offset (== high watermark) hint for `topition`, if known
     /// to this process. `None` means the partition has not been read or written
-    /// here yet and the tail must be listed.
+    /// here yet and the tail must be listed. Ignores listing freshness — used for
+    /// offset assignment (produce) and as a listing floor, where any known lower
+    /// bound is safe (a `Create` conflict / tail listing reconciles it).
     fn cached_high(&self, topition: &Topition) -> Result<Option<i64>> {
         self.next_offsets
             .lock()
-            .map(|locked| locked.get(topition).copied())
+            .map(|locked| locked.get(topition).map(|hint| hint.next))
             .map_err(Into::into)
     }
 
-    /// Advance the cached next-offset hint for `topition`. Monotonic: a slower
-    /// task can never lower a value a faster one already published, so the hint
-    /// only ever moves forward (offsets are never reused).
+    /// The cached next-offset hint for `topition` iff it was last reconciled
+    /// against an authoritative tail listing within
+    /// [`Self::HIGH_WATERMARK_HINT_TTL`]. `None` (cold, or stale beyond the TTL)
+    /// means the high-watermark read path must LIST to pick up batches produced
+    /// on another replica. Serving from a fresh hint is what takes the consumer
+    /// Fetch hot path off the per-poll `ListObjectsV2` request (#40).
+    fn cached_high_fresh(&self, topition: &Topition) -> Result<Option<i64>> {
+        self.next_offsets
+            .lock()
+            .map(|locked| {
+                locked.get(topition).and_then(|hint| {
+                    let fresh = hint.listed_at.is_some_and(|at| {
+                        SystemTime::now()
+                            .duration_since(at)
+                            .is_ok_and(|elapsed| elapsed < Self::HIGH_WATERMARK_HINT_TTL)
+                    });
+                    fresh.then_some(hint.next)
+                })
+            })
+            .map_err(Into::into)
+    }
+
+    /// Advance the cached next-offset hint for `topition` after a local produce.
+    /// Monotonic: a slower task can never lower a value a faster one already
+    /// published, so the hint only ever moves forward (offsets are never reused).
+    /// Does **not** touch `listed_at`: a local produce reflects only this
+    /// replica's writes, so the TTL clock that forces cross-replica reconciliation
+    /// keeps running.
     fn set_high(&self, topition: &Topition, high: i64) -> Result<()> {
         self.next_offsets
             .lock()
             .map(|mut locked| {
                 let entry = locked.entry(topition.to_owned()).or_default();
-                *entry = (*entry).max(high);
+                entry.next = entry.next.max(high);
+            })
+            .map_err(Into::into)
+    }
+
+    /// Advance the hint after an authoritative tail *listing* and mark it fresh.
+    /// The listing observed every batch at/after its floor — including other
+    /// replicas' writes in that range — so it resets the [`Self::cached_high_fresh`]
+    /// TTL clock.
+    fn mark_listed(&self, topition: &Topition, high: i64) -> Result<()> {
+        self.next_offsets
+            .lock()
+            .map(|mut locked| {
+                let entry = locked.entry(topition.to_owned()).or_default();
+                entry.next = entry.next.max(high);
+                entry.listed_at = Some(SystemTime::now());
             })
             .map_err(Into::into)
     }
@@ -981,7 +1048,7 @@ impl DynoStore {
             None => self.persisted_high(topition).await?,
         };
         let high = self.tail_next_offset(topition, Some(floor)).await?;
-        self.set_high(topition, high)?;
+        self.mark_listed(topition, high)?;
         Ok(high)
     }
 
@@ -1001,12 +1068,23 @@ impl DynoStore {
     async fn high_watermark(&self, topition: &Topition) -> Result<i64> {
         let from_watermark = self.persisted_high(topition).await?;
 
+        // Warm fast path: serve from the in-memory hint without a tail LIST while
+        // it is fresh (reconciled against a listing within the TTL). This is what
+        // takes the consumer Fetch hot path off ~1 `ListObjectsV2` per poll per
+        // partition (#40); `from_watermark` still folds in lake-sink topics'
+        // authoritative high (they write no batch objects). Bounded staleness:
+        // another replica's just-produced batch is picked up on the next
+        // TTL-triggered listing below.
+        if let Some(hint) = self.cached_high_fresh(topition)? {
+            return Ok(hint.max(from_watermark));
+        }
+
         let cached = self.cached_high(topition)?;
         let was_cold = cached.is_none();
         let floor = cached.unwrap_or(0).max(from_watermark);
 
         let from_objects = self.tail_next_offset(topition, Some(floor)).await?;
-        self.set_high(topition, from_objects)?;
+        self.mark_listed(topition, from_objects)?;
 
         let high = from_objects.max(from_watermark);
 
@@ -1084,7 +1162,7 @@ impl DynoStore {
                         "offset taken, resyncing tail"
                     );
                     candidate = self.tail_next_offset(topition, Some(candidate)).await?;
-                    self.set_high(topition, candidate)?;
+                    self.mark_listed(topition, candidate)?;
                 }
 
                 Err(err) => return Err(err.into()),

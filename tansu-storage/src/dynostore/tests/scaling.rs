@@ -444,3 +444,105 @@ async fn consume_scans_only_from_offset() -> Result<(), Error> {
     );
     Ok(())
 }
+
+/// A caught-up consumer long-polling an idle partition issues ZERO LISTs per
+/// poll in steady state (#40): `high_watermark` is served from the warm hint
+/// within its TTL (no tail `list_with_offset`), and the fetch seek is skipped
+/// because `offset == high_watermark`. Only the first (cold) read lists.
+#[tokio::test]
+async fn caught_up_consumer_does_not_list_per_poll() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+    let (storage, counters) = store();
+
+    create(&storage, "hot", 1).await?;
+    let topition = Topition::new("hot", 0);
+    const BATCHES: usize = 8;
+    for n in 0..BATCHES {
+        _ = storage
+            .produce(None, &topition, batch(format!("m-{n}").as_bytes())?)
+            .await?;
+    }
+
+    // Cold read once to reconcile the hint against a tail listing.
+    assert_eq!(BATCHES as i64, storage.high_watermark(&topition).await?);
+
+    // Steady state: 50 polls at the tail (offset == high watermark). No LISTs.
+    counters.reset();
+    const POLLS: usize = 50;
+    for _ in 0..POLLS {
+        let fetched = storage
+            .fetch(
+                &topition,
+                BATCHES as i64,
+                1,
+                8 * 1024 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_secs(0),
+            )
+            .await?;
+        assert!(fetched.is_empty(), "caught-up poll returns no batches");
+    }
+    let polled = counters.report("50 caught-up polls");
+
+    assert_eq!(0, polled.2, "caught-up poll must not full-list");
+    assert_eq!(
+        0, polled.3,
+        "caught-up poll must not list the tail (served from the warm hint)"
+    );
+    assert_eq!(0, polled.4, "caught-up poll lists no objects at all");
+
+    Ok(())
+}
+
+/// A fresh reader (a consumer connecting to a replica that did not produce the
+/// data) collapses repeated `high_watermark` reads to a single tail listing
+/// within the TTL (#40): the first read lists the tail cold, the rest are served
+/// from the now-warm hint. This is the path every read-uncommitted fetch,
+/// `offset_stage`, and `list_offsets` LATEST funnels through.
+#[tokio::test]
+async fn repeated_high_watermark_on_fresh_reader_lists_once() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+
+    // Producer replica writes the batches (separate process / hint).
+    let writer = DynoStore::new(
+        CLUSTER,
+        NODE,
+        Counting {
+            inner: bucket.clone(),
+            counters: Arc::new(Counters::default()),
+        },
+    );
+    create(&writer, "hot", 1).await?;
+    let topition = Topition::new("hot", 0);
+    for n in 0..4 {
+        _ = writer
+            .produce(None, &topition, batch(format!("m-{n}").as_bytes())?)
+            .await?;
+    }
+
+    // Fresh reader replica (empty hint) on the same bucket.
+    let reader_counters = Arc::new(Counters::default());
+    let reader = DynoStore::new(
+        CLUSTER,
+        NODE,
+        Counting {
+            inner: bucket.clone(),
+            counters: reader_counters.clone(),
+        },
+    );
+
+    for _ in 0..20 {
+        assert_eq!(4, reader.high_watermark(&topition).await?);
+    }
+    let reads = reader_counters.report("20 high_watermark reads (fresh reader)");
+
+    assert_eq!(0, reads.2, "high_watermark must not full-list");
+    assert_eq!(
+        1, reads.3,
+        "first read lists the tail cold, the rest are served from the warm hint"
+    );
+
+    Ok(())
+}
