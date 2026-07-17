@@ -149,7 +149,39 @@ pub struct DynoStore {
     /// `DuplicateSequenceNumber` / `ProducerFenced` semantics are preserved.
     producers: Arc<Mutex<BTreeMap<ProducerId, OptiCon<ProducerDetail>>>>,
 
+    /// Per-producer debounce state for the lazy `producers/{id}.json` checkpoint
+    /// (#48). The in-memory sequence is advanced on every idempotent batch; the
+    /// durable object is written at most once per
+    /// [`Self::PRODUCER_CHECKPOINT_BATCHES`] batches or
+    /// [`Self::PRODUCER_CHECKPOINT_INTERVAL`], whichever comes first (plus the
+    /// immediate seed/epoch-bump write via [`Self::seed_producer`]). On an
+    /// unclean crash the persisted sequence may lag the acked one by at most one
+    /// such window (graceful-shutdown flush is intentionally not wired — a stale
+    /// checkpoint can only re-accept a bounded tail on replay, never lose data,
+    /// since the object never moves backwards).
+    producer_checkpoints: Arc<Mutex<BTreeMap<ProducerId, ProducerCheckpoint>>>,
+
+    /// Per-partition `last_modified` (ms) of the *oldest* surviving batch object,
+    /// as observed at the last `delete`-policy scan (#49). Lets the maintenance
+    /// loop skip the full `records/` LIST of a partition whose oldest data is
+    /// still newer than the retention threshold — the dominant wasted Tier1 cost
+    /// once `delete` is the default policy. Absent means "unknown, must scan";
+    /// the value is a *lower bound* on the true oldest timestamp (produce only
+    /// adds newer objects, expiry/compaction only makes the oldest newer), so a
+    /// stale hint can at worst force an unnecessary scan, never skip a partition
+    /// that has expirable data. In-memory only: rebuilt from the first scan
+    /// after a restart, and independent per maintain node.
+    oldest_retained: Arc<Mutex<BTreeMap<Topition, i64>>>,
+
     object_store: Arc<DynObjectStore>,
+}
+
+/// Debounce accounting for one producer's lazy `producers/{id}.json` checkpoint
+/// (see [`DynoStore::producer_checkpoints`], #48).
+#[derive(Clone, Copy, Debug)]
+struct ProducerCheckpoint {
+    batches_since_flush: u64,
+    last_flush: SystemTime,
 }
 
 type Group = String;
@@ -277,6 +309,26 @@ impl Meta {
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 struct ProducerDetail {
     sequences: BTreeMap<ProducerEpoch, BTreeMap<String, BTreeMap<i32, Sequence>>>,
+}
+
+impl ProducerDetail {
+    /// Fold `other` into `self` by taking the element-wise maximum sequence per
+    /// (epoch, topic, partition). Idempotent sequences are monotonic, so a
+    /// max-merge reconciles a lagging or concurrently-written checkpoint without
+    /// ever lowering an already-acked sequence. Used as the `reconcile` closure
+    /// of [`OptiCon::checkpoint`] on the lazy `producers/{id}.json` flush (#48).
+    fn reconcile(&mut self, other: &ProducerDetail) {
+        for (epoch, topics) in &other.sequences {
+            let dst_topics = self.sequences.entry(*epoch).or_default();
+            for (topic, partitions) in topics {
+                let dst_partitions = dst_topics.entry(topic.clone()).or_default();
+                for (partition, sequence) in partitions {
+                    let dst = dst_partitions.entry(*partition).or_default();
+                    *dst = (*dst).max(*sequence);
+                }
+            }
+        }
+    }
 }
 
 impl OptiCon<ProducerDetail> {
@@ -456,6 +508,8 @@ impl DynoStore {
             watermarks: Arc::new(Mutex::new(BTreeMap::new())),
             next_offsets: Arc::new(Mutex::new(BTreeMap::new())),
             producers: Arc::new(Mutex::new(BTreeMap::new())),
+            producer_checkpoints: Arc::new(Mutex::new(BTreeMap::new())),
+            oldest_retained: Arc::new(Mutex::new(BTreeMap::new())),
             topic_metas: Arc::new(Mutex::new(BTreeMap::new())),
             topic_index: Arc::new(Mutex::new(TopicIndex::default())),
             topic_index_refresh: Arc::new(tokio::sync::Mutex::new(())),
@@ -597,6 +651,16 @@ impl DynoStore {
     /// unaffected in semantics — a stale (lower) high watermark can only *delay*
     /// visibility, never expose unstable offsets.
     const HIGH_WATERMARK_HINT_TTL: Duration = Duration::from_secs(5);
+
+    /// Debounce window for persisting a producer's `producers/{id}.json` (#48):
+    /// the durable object is checkpointed after at most this many idempotent
+    /// batches have advanced its in-memory sequence.
+    const PRODUCER_CHECKPOINT_BATCHES: u64 = 64;
+
+    /// Time-based companion to [`Self::PRODUCER_CHECKPOINT_BATCHES`]: a producer
+    /// that keeps advancing below the batch threshold is still checkpointed at
+    /// least this often, bounding the unclean-crash replay window.
+    const PRODUCER_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(250);
 
     /// All topics, served from the in-memory [`TopicIndex`]. Returns the shared
     /// snapshot if fresh; otherwise refreshes it (single-flight) by LISTing the
@@ -891,6 +955,118 @@ impl DynoStore {
             })
             .await
             .map(|_| ())
+    }
+
+    /// Validate and advance a producer's idempotent sequence for `topition`.
+    ///
+    /// The sequence check/advance happens in memory only (the fast-path
+    /// authority); the durable `producers/{id}.json` object is persisted lazily
+    /// via [`OptiCon::checkpoint`] once the per-producer debounce window
+    /// ([`Self::PRODUCER_CHECKPOINT_BATCHES`] / [`Self::PRODUCER_CHECKPOINT_INTERVAL`])
+    /// elapses, so an all-idempotent workload issues ~1 PUT per batch instead of
+    /// two (#48). The `OutOfOrderSequenceNumber` / `DuplicateSequenceNumber` /
+    /// `ProducerFenced` / `UnknownProducerId` outcomes are unchanged from the
+    /// former per-batch `with_mut` (the seed/epoch-bump write stays immediate).
+    async fn advance_idempotent_sequence(
+        &self,
+        producer_id: ProducerId,
+        producer_epoch: ProducerEpoch,
+        topition: &Topition,
+        base_sequence: Sequence,
+        last_offset_delta: i32,
+    ) -> Result<()> {
+        let producer = self.producer(producer_id)?;
+
+        producer
+            .mutate_cached(&self.object_store, |pd| {
+                let Some(mut current) = pd.sequences.last_entry() else {
+                    // An empty/absent producer object means the id was never
+                    // registered (InitProducerId seeds it).
+                    debug!(producer_id, ?pd);
+                    return Err(Error::Api(ErrorCode::UnknownProducerId));
+                };
+
+                if current.key() != &producer_epoch {
+                    debug!(current = ?current.key(), producer_epoch);
+                    return Err(Error::Api(ErrorCode::ProducerFenced));
+                }
+
+                let sequences = current.get_mut();
+                debug!(?sequences);
+
+                match sequences
+                    .entry(topition.topic.clone())
+                    .or_default()
+                    .entry(topition.partition)
+                    .or_default()
+                {
+                    sequence if *sequence < base_sequence => {
+                        debug!(?sequence, base_sequence);
+                        Err(Error::Api(ErrorCode::OutOfOrderSequenceNumber))
+                    }
+
+                    sequence if *sequence > base_sequence => {
+                        debug!(?sequence, base_sequence);
+                        Err(Error::Api(ErrorCode::DuplicateSequenceNumber))
+                    }
+
+                    sequence => {
+                        debug!(?sequence, delta = last_offset_delta + 1);
+                        *sequence += last_offset_delta + 1;
+                        Ok(())
+                    }
+                }
+            })
+            .await?;
+
+        // The advance succeeded; persist it only when the debounce window is due.
+        if self.producer_checkpoint_due(producer_id)? {
+            producer
+                .checkpoint(&self.object_store, ProducerDetail::reconcile)
+                .await?;
+            self.producer_checkpoint_reset(producer_id)?;
+        }
+
+        Ok(())
+    }
+
+    /// Record one more advance for `producer_id` and report whether its durable
+    /// checkpoint is now due (batch-count or interval threshold reached). Seeds
+    /// the entry on first use.
+    fn producer_checkpoint_due(&self, producer_id: ProducerId) -> Result<bool> {
+        let now = SystemTime::now();
+
+        self.producer_checkpoints
+            .lock()
+            .map_err(Into::into)
+            .map(|mut locked| {
+                let entry = locked.entry(producer_id).or_insert(ProducerCheckpoint {
+                    batches_since_flush: 0,
+                    last_flush: now,
+                });
+                entry.batches_since_flush += 1;
+
+                entry.batches_since_flush >= Self::PRODUCER_CHECKPOINT_BATCHES
+                    || now
+                        .duration_since(entry.last_flush)
+                        .is_ok_and(|elapsed| elapsed >= Self::PRODUCER_CHECKPOINT_INTERVAL)
+            })
+    }
+
+    /// Reset `producer_id`'s debounce accounting after a successful checkpoint.
+    fn producer_checkpoint_reset(&self, producer_id: ProducerId) -> Result<()> {
+        self.producer_checkpoints
+            .lock()
+            .map_err(Into::into)
+            .map(|mut locked| {
+                _ = locked.insert(
+                    producer_id,
+                    ProducerCheckpoint {
+                        batches_since_flush: 0,
+                        last_flush: SystemTime::now(),
+                    },
+                );
+            })
     }
 
     /// The cached next offset (== high watermark) hint for `topition`, if known
@@ -1311,6 +1487,12 @@ impl DynoStore {
             for partition in 0..num_partitions {
                 let topition = Topition::new(topic.clone(), partition);
 
+                // Skip the full `records/` LIST when the oldest-retained hint
+                // proves nothing can be past the retention threshold yet (#49).
+                if !self.partition_maybe_expirable(&topition, threshold_ms)? {
+                    continue;
+                }
+
                 deleted += self
                     .expire_partition(&topition, threshold_ms)
                     .await
@@ -1319,6 +1501,43 @@ impl DynoStore {
         }
 
         Ok(deleted)
+    }
+
+    /// Whether `topition` might hold data older than `threshold_ms`, cheaply,
+    /// from the in-memory oldest-retained hint (#49). Returns `true` (must scan)
+    /// when the hint is absent, and `false` (safe to skip the full LIST) only
+    /// when a known oldest-surviving timestamp is at or after the threshold.
+    ///
+    /// The hint is a lower bound on the true oldest timestamp, so `false` is
+    /// always sound: it can never hide expirable data, only skip a partition
+    /// that has none.
+    fn partition_maybe_expirable(&self, topition: &Topition, threshold_ms: i64) -> Result<bool> {
+        self.oldest_retained
+            .lock()
+            .map_err(Into::into)
+            .map(|locked| {
+                locked
+                    .get(topition)
+                    .is_none_or(|oldest| *oldest < threshold_ms)
+            })
+    }
+
+    /// Update the oldest-retained hint for `topition` after a scan: `Some(ms)`
+    /// records the oldest surviving batch's `last_modified`; `None` (no surviving
+    /// object) drops the entry so the next tick scans again rather than skipping
+    /// a partition that may since have been produced to.
+    fn record_oldest_retained(&self, topition: &Topition, oldest_ms: Option<i64>) -> Result<()> {
+        self.oldest_retained
+            .lock()
+            .map_err(Into::into)
+            .map(|mut locked| match oldest_ms {
+                Some(ms) => {
+                    _ = locked.insert(topition.to_owned(), ms);
+                }
+                None => {
+                    _ = locked.remove(topition);
+                }
+            })
     }
 
     /// List the batch files of `topition` as a map of base offset to its object
@@ -1495,6 +1714,7 @@ impl DynoStore {
         let mut list_stream = self.object_store.list(Some(&prefix));
 
         let mut surviving_low: Option<i64> = None;
+        let mut surviving_oldest_ms: Option<i64> = None;
         let mut chunk: Vec<Path> = Vec::new();
         let mut deleted: u64 = 0;
 
@@ -1512,15 +1732,21 @@ impl DynoStore {
                 continue;
             };
 
-            if meta.last_modified.timestamp_millis() < threshold_ms {
+            let last_modified_ms = meta.last_modified.timestamp_millis();
+
+            if last_modified_ms < threshold_ms {
                 chunk.push(meta.location);
 
                 if chunk.len() >= EXPIRE_DELETE_CHUNK {
                     deleted += chunk.len() as u64;
                     self.delete_batches(std::mem::take(&mut chunk)).await?;
                 }
-            } else if surviving_low.is_none_or(|low| offset < low) {
-                surviving_low = Some(offset);
+            } else {
+                if surviving_low.is_none_or(|low| offset < low) {
+                    surviving_low = Some(offset);
+                }
+                surviving_oldest_ms =
+                    Some(surviving_oldest_ms.map_or(last_modified_ms, |m| m.min(last_modified_ms)));
             }
         }
 
@@ -1528,6 +1754,11 @@ impl DynoStore {
             deleted += chunk.len() as u64;
             self.delete_batches(chunk).await?;
         }
+
+        // Refresh the skip hint from what this scan observed — even when nothing
+        // was deleted, so a partition well within retention is skipped next tick
+        // (#49). `None` (no survivor) drops the entry.
+        self.record_oldest_retained(topition, surviving_oldest_ms)?;
 
         if deleted == 0 {
             return Ok(0);
@@ -2170,51 +2401,17 @@ impl Storage for DynoStore {
                 // Validate (and advance) the idempotent sequence on the producer's
                 // own `producers/{id}.json` object rather than the cluster-global
                 // `meta` object, so distinct producers no longer contend on one
-                // hot object on GCS (#13). The CAS is still linearizable, so the
+                // hot object on GCS (#13). The advance is applied in memory (the
+                // fast-path authority) and the object is checkpointed lazily, so
+                // an idempotent batch no longer costs a second S3 PUT (#48); the
                 // exact OutOfOrder/Duplicate/Fenced semantics are unchanged.
-                self.producer(deflated.producer_id)?
-                .with_mut(&self.object_store, |pd| {
-                    let Some(mut current) = pd.sequences.last_entry() else {
-                        // An empty/absent producer object means the id was never
-                        // registered (InitProducerId seeds it).
-                        debug!(producer_id = deflated.producer_id, ?pd);
-                        return Err(Error::Api(ErrorCode::UnknownProducerId));
-                    };
-
-                    if current.key() != &deflated.producer_epoch {
-                        debug!(current = ?current.key(), producer_epoch = deflated.producer_epoch);
-                        return Err(Error::Api(ErrorCode::ProducerFenced));
-                    }
-
-                    let sequences = current.get_mut();
-                    debug!(?sequences);
-
-                    match sequences
-                        .entry(topition.topic.clone())
-                        .or_default()
-                        .entry(topition.partition)
-                        .or_default()
-                    {
-                        sequence if *sequence < deflated.base_sequence => {
-                            debug!(?sequence, base_sequence = deflated.base_sequence);
-
-                            Err(Error::Api(ErrorCode::OutOfOrderSequenceNumber))
-                        }
-
-                        sequence if *sequence > deflated.base_sequence => {
-                            debug!(?sequence, base_sequence = deflated.base_sequence);
-
-                            Err(Error::Api(ErrorCode::DuplicateSequenceNumber))
-                        }
-
-                        sequence => {
-                            debug!(?sequence, delta = deflated.last_offset_delta + 1);
-
-                            *sequence += deflated.last_offset_delta + 1;
-                            Ok(())
-                        }
-                    }
-                })
+                self.advance_idempotent_sequence(
+                    deflated.producer_id,
+                    deflated.producer_epoch,
+                    topition,
+                    deflated.base_sequence,
+                    deflated.last_offset_delta,
+                )
                 .await
                 .inspect(|outcome| debug!(transaction_id, ?topition, ?outcome))
                 // `DuplicateSequenceNumber` / `OutOfOrderSequenceNumber` are the
