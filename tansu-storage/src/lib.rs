@@ -2388,7 +2388,16 @@ impl Builder<i32, String, Url, Url> {
                     }
                 });
 
-                debug!(?minimum_size, ?maximum_delay);
+                // Server-side produce coalescing (#50): flush a run of batches as
+                // one object per linger window, in DynoStore. Independent of the
+                // `batch_*` ProduceRequestBatcher above (which merges per producer);
+                // enable one or the other, not both.
+                let produce_coalesce = self
+                    .storage
+                    .query_pairs()
+                    .any(|(k, v)| k == "produce_coalesce" && v.as_ref().parse().unwrap_or(false));
+
+                debug!(?minimum_size, ?maximum_delay, produce_coalesce);
 
                 AmazonS3Builder::from_env()
                     .with_bucket_name(bucket_name)
@@ -2416,6 +2425,7 @@ impl Builder<i32, String, Url, Url> {
                             .schemas(self.schema_registry)
                             .lake(self.lake_house.clone())
                             .auto_create(auto_topic_create(&self.storage))
+                            .produce_coalesce(produce_coalesce)
                     })
                     .map(|storage| {
                         ProduceRequestBatcher::new(storage)
@@ -2460,6 +2470,13 @@ impl Builder<i32, String, Url, Url> {
                     }
                 });
 
+                // See the s3 arm: DynoStore-level produce coalescing (#50),
+                // independent of the batch_* ProduceRequestBatcher.
+                let produce_coalesce = self
+                    .storage
+                    .query_pairs()
+                    .any(|(k, v)| k == "produce_coalesce" && v.as_ref().parse().unwrap_or(false));
+
                 GoogleCloudStorageBuilder::from_env()
                     .with_bucket_name(bucket_name)
                     // GCS caps updates to a single object at ~1 write/second; an
@@ -2491,6 +2508,7 @@ impl Builder<i32, String, Url, Url> {
                             .schemas(self.schema_registry)
                             .lake(self.lake_house.clone())
                             .auto_create(auto_topic_create(&self.storage))
+                            .produce_coalesce(produce_coalesce)
                     })
                     .map(|storage| {
                         ProduceRequestBatcher::new(storage)
@@ -2508,7 +2526,10 @@ impl Builder<i32, String, Url, Url> {
                     .advertised_listener(self.advertised_listener.clone())
                     .schemas(self.schema_registry)
                     .lake(self.lake_house.clone())
-                    .auto_create(auto_topic_create(&self.storage)),
+                    .auto_create(auto_topic_create(&self.storage))
+                    .produce_coalesce(self.storage.query_pairs().any(|(k, v)| {
+                        k == "produce_coalesce" && v.as_ref().parse().unwrap_or(false)
+                    })),
             )
             .map(|storage| Box::new(storage) as Box<dyn Storage>)
             .map(Arc::new),

@@ -67,6 +67,7 @@ use tansu_schema::{
     Registry,
     lake::{House, LakeHouse as _},
 };
+use tokio::sync::oneshot;
 use tokio::time::Duration;
 use tracing::{debug, error, info, instrument, warn};
 use url::Url;
@@ -173,7 +174,37 @@ pub struct DynoStore {
     /// after a restart, and independent per maintain node.
     oldest_retained: Arc<Mutex<BTreeMap<Topition, i64>>>,
 
+    /// When set, the produce path buffers batches per partition and flushes them
+    /// as one coalesced `records/` object per linger window (#50), cutting the
+    /// PUT (and matching fetch GET) count on small-batch workloads. Off by
+    /// default — each batch is its own object, exactly as before. Transactional,
+    /// lake-sink and compacted topics always bypass the buffer.
+    produce_coalesce: bool,
+
+    /// Per-partition coalescing buffer (#50), used only when
+    /// [`Self::produce_coalesce`] is set. Holds batches awaiting a flush plus the
+    /// one-shot ack channels their produce calls are parked on; the map is
+    /// drained (never held across an await) on a threshold or linger-timer flush.
+    coalesce: Arc<Mutex<BTreeMap<Topition, CoalesceBuffer>>>,
+
     object_store: Arc<DynObjectStore>,
+}
+
+/// A batch parked in the coalescing buffer (#50) with the one-shot the producing
+/// `produce` call awaits its assigned base offset on.
+#[derive(Debug)]
+struct Pending {
+    batch: deflated::Batch,
+    ack: oneshot::Sender<Result<i64>>,
+}
+
+/// Per-partition accumulator for coalesced produce (#50): batches awaiting a
+/// flush plus the running offset span and byte size used for the flush triggers.
+#[derive(Debug, Default)]
+struct CoalesceBuffer {
+    pending: Vec<Pending>,
+    records: i64,
+    bytes: usize,
 }
 
 /// Debounce accounting for one producer's lazy `producers/{id}.json` checkpoint
@@ -510,6 +541,8 @@ impl DynoStore {
             producers: Arc::new(Mutex::new(BTreeMap::new())),
             producer_checkpoints: Arc::new(Mutex::new(BTreeMap::new())),
             oldest_retained: Arc::new(Mutex::new(BTreeMap::new())),
+            produce_coalesce: false,
+            coalesce: Arc::new(Mutex::new(BTreeMap::new())),
             topic_metas: Arc::new(Mutex::new(BTreeMap::new())),
             topic_index: Arc::new(Mutex::new(TopicIndex::default())),
             topic_index_refresh: Arc::new(tokio::sync::Mutex::new(())),
@@ -541,6 +574,15 @@ impl DynoStore {
     pub fn auto_create(self, auto_create: AutoTopicCreate) -> Self {
         Self {
             auto_create,
+            ..self
+        }
+    }
+
+    /// Enable server-side produce coalescing (#50): buffer batches per partition
+    /// and flush them as one `records/` object per linger window. Off by default.
+    pub fn produce_coalesce(self, produce_coalesce: bool) -> Self {
+        Self {
+            produce_coalesce,
             ..self
         }
     }
@@ -661,6 +703,15 @@ impl DynoStore {
     /// that keeps advancing below the batch threshold is still checkpointed at
     /// least this often, bounding the unclean-crash replay window.
     const PRODUCER_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(250);
+
+    /// Coalescing flush triggers (#50), whichever is reached first: linger time,
+    /// batch count, byte size, or offset span. The span cap also bounds how far
+    /// back [`Self::fetch`] must probe to find the object containing a mid-frame
+    /// offset.
+    const COALESCE_LINGER: Duration = Duration::from_millis(50);
+    const COALESCE_BATCHES: usize = 64;
+    const COALESCE_BYTES: usize = 1 << 20;
+    const COALESCE_MAX_RECORDS: i64 = 100_000;
 
     /// All topics, served from the in-memory [`TopicIndex`]. Returns the shared
     /// snapshot if fresh; otherwise refreshes it (single-flight) by LISTing the
@@ -1196,9 +1247,17 @@ impl DynoStore {
             .await
             .inspect_err(|err| error!(?err, ?topition, base))?;
 
-        let batch = self.decode(encoded)?;
+        // A coalesced object holds several contiguous batches (#50); the next
+        // offset past the tail is the object's base plus the sum of every
+        // sub-batch's offset span. A single-batch object reduces to the previous
+        // `base + last_offset_delta + 1`.
+        let span: i64 = self
+            .decode_frame(encoded)?
+            .iter()
+            .map(|batch| batch.last_offset_delta as i64 + 1)
+            .sum();
 
-        Ok(base + batch.last_offset_delta as i64 + 1)
+        Ok(base + span)
     }
 
     /// The persisted `watermark.high`: a durable lower bound on the tail offset,
@@ -1296,14 +1355,12 @@ impl DynoStore {
     async fn assign_and_create(
         &self,
         topition: &Topition,
-        deflated: &deflated::Batch,
+        record_count: i64,
         payload: PutPayload,
     ) -> Result<i64> {
         /// Bounds the conflict-resync loop so a pathologically hot partition
         /// fails fast instead of spinning; far above any real contention.
         const MAX_ATTEMPTS: usize = 64;
-
-        let record_count = deflated.last_offset_delta as i64 + 1;
 
         let mut candidate = match self.cached_high(topition)? {
             Some(hint) => hint,
@@ -1347,6 +1404,195 @@ impl DynoStore {
 
         error!(?topition, candidate, "offset assignment exhausted retries");
         Err(Error::Api(ErrorCode::UnknownServerError))
+    }
+
+    /// Buffer `deflated` for a coalesced flush and await its assigned base offset
+    /// (#50). The idempotent sequence and schema were already validated by
+    /// `produce`, so only eligible (non-txn, non-control, non-compacted) batches
+    /// reach here. The produce call parks on the returned one-shot until the
+    /// batch's run is durably written, so an unflushed batch is never acked
+    /// (crash-safe: the client retries).
+    async fn enqueue_coalesced(
+        &self,
+        topition: &Topition,
+        deflated: deflated::Batch,
+    ) -> Result<i64> {
+        let (ack, offset) = oneshot::channel();
+        let span = deflated.last_offset_delta as i64 + 1;
+        let size = size_of::<i64>() + size_of::<i32>() + deflated.batch_length.max(0) as usize;
+
+        enum Action {
+            Flush(CoalesceBuffer),
+            StartTimer,
+            Wait,
+        }
+
+        let action = {
+            let mut buffers = self.coalesce.lock().map_err(Into::<Error>::into)?;
+            let buffer = buffers.entry(topition.to_owned()).or_default();
+
+            let first = buffer.pending.is_empty();
+            buffer.pending.push(Pending {
+                batch: deflated,
+                ack,
+            });
+            buffer.records += span;
+            buffer.bytes += size;
+
+            if buffer.pending.len() >= Self::COALESCE_BATCHES
+                || buffer.bytes >= Self::COALESCE_BYTES
+                || buffer.records >= Self::COALESCE_MAX_RECORDS
+            {
+                Action::Flush(std::mem::take(buffer))
+            } else if first {
+                Action::StartTimer
+            } else {
+                Action::Wait
+            }
+        };
+
+        match action {
+            Action::Flush(buffer) => self.flush_coalesced(topition, buffer).await,
+
+            Action::StartTimer => {
+                let store = self.clone();
+                let topition = topition.to_owned();
+
+                _ = tokio::spawn(async move {
+                    tokio::time::sleep(Self::COALESCE_LINGER).await;
+
+                    let buffer = store
+                        .coalesce
+                        .lock()
+                        .ok()
+                        .and_then(|mut buffers| buffers.remove(&topition));
+
+                    if let Some(buffer) = buffer.filter(|buffer| !buffer.pending.is_empty()) {
+                        store.flush_coalesced(&topition, buffer).await;
+                    }
+                });
+            }
+
+            Action::Wait => {}
+        }
+
+        offset
+            .await
+            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+    }
+
+    /// Flush a drained coalescing buffer as one `records/` object and resolve
+    /// each parked produce with its assigned base offset (#50). One
+    /// `assign_and_create` covers the whole run, so offset assignment stays the
+    /// create-only, single-writer authority it is for a lone batch; on failure
+    /// every parked producer gets the error and retries.
+    async fn flush_coalesced(&self, topition: &Topition, buffer: CoalesceBuffer) {
+        if buffer.pending.is_empty() {
+            return;
+        }
+
+        let batches: Vec<deflated::Batch> = buffer
+            .pending
+            .iter()
+            .map(|pending| pending.batch.clone())
+            .collect();
+        let total: i64 = batches
+            .iter()
+            .map(|batch| batch.last_offset_delta as i64 + 1)
+            .sum();
+
+        let base = match async {
+            let payload = self.encode_frame(&batches)?;
+            self.assign_and_create(topition, total, payload).await
+        }
+        .await
+        {
+            Ok(base) => base,
+            Err(error) => {
+                error!(?error, ?topition, "coalesced flush failed");
+                for pending in buffer.pending {
+                    _ = pending.ack.send(Err(error.clone()));
+                }
+                return;
+            }
+        };
+
+        // Mirror the immediate path's lake sink, per sub-batch, with offsets
+        // running from the frame base. Only fetched when a lake is configured.
+        let config = if self.lake.is_some() {
+            self.describe_config(topition.topic(), ConfigResource::Topic, None)
+                .await
+                .inspect_err(|err| debug!(?err))
+                .ok()
+        } else {
+            None
+        };
+
+        let mut running = base;
+        for pending in buffer.pending {
+            let offset = running;
+            running += pending.batch.last_offset_delta as i64 + 1;
+
+            if let (Some(lake), Some(config)) = (self.lake.as_ref(), config.as_ref())
+                && let Ok(inflated) = inflated::Batch::try_from(&pending.batch)
+            {
+                _ = lake
+                    .store(
+                        topition.topic(),
+                        topition.partition(),
+                        offset,
+                        &inflated,
+                        config.clone(),
+                    )
+                    .await
+                    .inspect_err(|err| debug!(?err));
+            }
+
+            _ = pending.ack.send(Ok(offset));
+        }
+    }
+
+    /// The base offset of the object that *contains* `offset` — the greatest
+    /// base `<= offset` — or `None` when no such object exists (offset is at or
+    /// before the log start). Used only under coalescing (#50): a consumer that
+    /// resumes at a sub-batch boundary inside a coalesced object must be served
+    /// the whole containing object, not have it skipped by the `base >= offset`
+    /// seek. Bounded by [`Self::COALESCE_MAX_RECORDS`] — the per-object span cap
+    /// — so the probe reads only the tail region, never the whole partition.
+    async fn coalesce_fetch_floor(&self, topition: &Topition, offset: i64) -> Result<Option<i64>> {
+        let prefix = self.records_prefix(topition);
+        let floor = offset.saturating_sub(Self::COALESCE_MAX_RECORDS).max(0);
+        let start_after = Path::from(format!(
+            "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}",
+            self.cluster, topition.topic, topition.partition, floor,
+        ));
+
+        let mut list_stream = self
+            .object_store
+            .list_with_offset(Some(&prefix), &start_after);
+        let mut container = None;
+
+        while let Some(meta) = list_stream
+            .next()
+            .await
+            .transpose()
+            .inspect_err(|err| error!(?err, ?topition))?
+        {
+            let Some(name) = meta.location.parts().next_back() else {
+                continue;
+            };
+            let Ok(base) = i64::from_str(&name.as_ref()[0..20]) else {
+                continue;
+            };
+
+            if base <= offset {
+                container = Some(base);
+            } else {
+                break;
+            }
+        }
+
+        Ok(container)
     }
 
     /// Enforce the `delete` cleanup policy: for every topic configured with
@@ -1913,6 +2159,52 @@ impl DynoStore {
             .map_err(Into::into)
     }
 
+    /// Decode a stored `records/` object into its constituent batches.
+    ///
+    /// An object written by the coalescing produce path (#50) holds several
+    /// Kafka record batches concatenated; a legacy or non-coalesced object holds
+    /// exactly one. The wire layout is identical either way — each batch is
+    /// `base_offset (i64) + batch_length (i32) + batch_length bytes` — so this
+    /// handles both, and a single-batch object decodes to a one-element vec that
+    /// is byte-for-byte what [`Self::decode`] would return. Trailing bytes that
+    /// do not form a whole batch are ignored (mirroring `Batch::try_from`).
+    fn decode_frame(&self, encoded: Bytes) -> Result<Vec<deflated::Batch>> {
+        // base_offset (i64) + batch_length (i32) precede the `batch_length` body.
+        const PREFIX: usize = size_of::<i64>() + size_of::<i32>();
+
+        let mut batches = Vec::new();
+        let mut remaining = encoded;
+
+        while remaining.len() >= PREFIX {
+            let mut length = [0u8; size_of::<i32>()];
+            length.copy_from_slice(&remaining[size_of::<i64>()..PREFIX]);
+            let batch_length = usize::try_from(i32::from_be_bytes(length))?;
+
+            let total = PREFIX + batch_length;
+            if total > remaining.len() {
+                break;
+            }
+
+            batches.push(self.decode(remaining.slice(0..total))?);
+            remaining = remaining.slice(total..);
+        }
+
+        Ok(batches)
+    }
+
+    /// Serialize a run of contiguous batches into one `records/` object payload
+    /// (the coalescing produce write, #50). The batches are concatenated in wire
+    /// order; a single-batch slice is byte-identical to [`Self::encode`], so a
+    /// coalesced object and a legacy object are read back the same way by
+    /// [`Self::decode_frame`].
+    fn encode_frame(&self, batches: &[deflated::Batch]) -> Result<PutPayload> {
+        let mut buf = Vec::new();
+        for batch in batches {
+            buf.extend_from_slice(&Bytes::from(batch.clone()));
+        }
+        Ok(PutPayload::from(Bytes::from(buf)))
+    }
+
     async fn get<V>(&self, location: &Path) -> Result<(V, Version)>
     where
         V: DeserializeOwned,
@@ -2445,6 +2737,32 @@ impl Storage for DynoStore {
             let attributes =
                 BatchAttribute::try_from(deflated.attributes).inspect_err(|err| debug!(?err))?;
 
+            // Server-side coalescing (#50): buffer the batch and flush a run as
+            // one object per linger window. Transactional, control and compacted
+            // batches bypass it (offset/txn-marker/compaction semantics must stay
+            // one batch per object); the idempotent sequence and schema were
+            // already validated above, so a duplicate is rejected before it is
+            // ever buffered.
+            if self.produce_coalesce
+                && transaction_id.is_none()
+                && !attributes.transaction
+                && !attributes.control
+                && !config
+                    .configs
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|config| {
+                        config.name == "cleanup.policy"
+                            && config
+                                .value
+                                .as_deref()
+                                .is_some_and(|value| value.contains("compact"))
+                    })
+            {
+                return self.enqueue_coalesced(topition, deflated).await;
+            }
+
             // Assign the offset by *creating* the immutable batch object (its
             // name encodes the base offset), rather than by updating a hot
             // per-partition `watermark` object on every batch. The create is the
@@ -2456,7 +2774,7 @@ impl Storage for DynoStore {
                 .inspect_err(|err| debug!(?err))?;
 
             let offset = self
-                .assign_and_create(topition, &deflated, payload)
+                .assign_and_create(topition, deflated.last_offset_delta as i64 + 1, payload)
                 .await
                 .inspect(|offset| debug!(offset, transaction_id, ?topition))
                 .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
@@ -2574,9 +2892,22 @@ impl Storage for DynoStore {
             // of `{offset:0>20}.batch`, so listing returns exactly `base_offset >= offset`
             // (matching the previous `split_off(&offset)` semantics) while also handling
             // `offset == 0` without underflow.
+            //
+            // Under coalescing (#50) `offset` may fall *inside* a multi-batch object; start
+            // from the object that contains it (greatest base <= offset) so the seek does
+            // not skip it. When coalescing is off, or the offset is aligned to an object
+            // base, this is exactly `offset` — the fast path is unchanged.
+            let start_offset = if self.produce_coalesce {
+                self.coalesce_fetch_floor(topition, offset)
+                    .await?
+                    .unwrap_or(offset)
+            } else {
+                offset
+            };
+
             let start_after = Path::from(format!(
                 "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}",
-                self.cluster, topition.topic, topition.partition, offset,
+                self.cluster, topition.topic, topition.partition, start_offset,
             ));
 
             let mut list_stream = self
@@ -2612,7 +2943,13 @@ impl Storage for DynoStore {
 
                 let size = meta.size;
 
-                let mut batch = self
+                // A coalesced object (#50) holds several contiguous batches; a
+                // legacy object holds one. Expand them, assigning each sub-batch
+                // its absolute base offset by running from the object's base (the
+                // authority in the filename) over each sub-batch's offset span.
+                // For a single-batch object this pushes exactly one batch with
+                // `base_offset` set from the filename, as before.
+                let frame = self
                     .object_store
                     .get(&meta.location)
                     .await
@@ -2622,9 +2959,15 @@ impl Storage for DynoStore {
                     .await
                     .inspect_err(|error| error!(?error, location = %meta.location))
                     .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
-                    .and_then(|encoded| self.decode(encoded))?;
-                batch.base_offset = base_offset;
-                batches.push(batch);
+                    .and_then(|encoded| self.decode_frame(encoded))?;
+
+                let mut running = base_offset;
+                for mut batch in frame {
+                    let span = batch.last_offset_delta as i64 + 1;
+                    batch.base_offset = running;
+                    running += span;
+                    batches.push(batch);
+                }
 
                 if size > bytes {
                     break;
