@@ -13,11 +13,21 @@
 // limitations under the License.
 
 //! Idempotent producer sequence state is held per producer in
-//! `producers/{id}.json` and validated with a linearizable CAS, instead of
-//! CASing the single cluster-global `meta` object on every `acks=all` batch
-//! (#13). These tests check that the sharding keeps producers independent and
-//! that the exact Kafka error codes survive — including across two stateless
-//! replicas sharing one bucket.
+//! `producers/{id}.json`, sharded off the cluster-global `meta` object so
+//! `acks=all` producers no longer contend on one hot object (#13).
+//!
+//! The per-batch advance is applied in memory (the fast-path authority) and the
+//! object is checkpointed lazily, at most once per debounce window, to halve the
+//! steady-state S3 PUT cost of an idempotent workload (#48). The tradeoff is
+//! that idempotency is now **per-replica between checkpoints**: within a replica
+//! the exact `OutOfOrderSequenceNumber` / `DuplicateSequenceNumber` /
+//! `ProducerFenced` semantics hold on every batch, but a producer that migrates
+//! to another replica mid-window may not have its most recent advances deduped
+//! there until the source replica's next checkpoint. Producers are expected to
+//! stick to one replica; cross-replica dedup is eventually consistent, bounded
+//! by the checkpoint window. These tests pin both halves of that contract.
+
+use std::time::Duration;
 
 use bytes::Bytes;
 use object_store::memory::InMemory;
@@ -148,7 +158,7 @@ async fn producers_validate_independently() -> Result<(), Error> {
 }
 
 #[tokio::test]
-async fn idempotent_state_is_shared_across_replicas() -> Result<(), Error> {
+async fn idempotent_advance_is_local_until_checkpoint() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
     // Two stores over ONE bucket == two stateless replicas.
@@ -156,15 +166,15 @@ async fn idempotent_state_is_shared_across_replicas() -> Result<(), Error> {
     let replica_a = DynoStore::new(CLUSTER, NODE, bucket.clone());
     let replica_b = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
-    let topic = "cross-replica";
+    let topic = "cross-replica-local";
     create_topic(&replica_a, topic).await?;
     let topition = Topition::new(topic, 0);
 
     // Registered on A (seeds producers/{id}.json in the shared bucket).
     let producer = init_idempotent(&replica_a).await?;
 
-    // First batch produced on B: B has no in-memory producer state, so it reads
-    // the sharded object A wrote.
+    // First batch on B advances B's in-memory sequence but is not yet
+    // checkpointed to the shared object (below the debounce window, #48).
     assert_eq!(
         0,
         replica_b
@@ -172,23 +182,65 @@ async fn idempotent_state_is_shared_across_replicas() -> Result<(), Error> {
             .await?
     );
 
-    // Replaying seq 0 on A must be rejected as a duplicate — A sees B's advance
-    // through the shared object, not a per-replica counter.
+    // A replays seq 0 before B's checkpoint. Because the advance is still local
+    // to B, A does NOT see it and re-accepts the batch (at the next offset)
+    // rather than rejecting it as a duplicate: idempotency is per-replica
+    // between checkpoints, the accepted #48 tradeoff.
+    assert_eq!(
+        2,
+        replica_a
+            .produce(None, &topition, idempotent_batch(producer, 0, 0, 2)?)
+            .await?
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn idempotent_advance_visible_across_replicas_after_checkpoint() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    // Stores over ONE bucket == stateless replicas.
+    let bucket = InMemory::new();
+    let replica_a = DynoStore::new(CLUSTER, NODE, bucket.clone());
+
+    let topic = "cross-replica-checkpoint";
+    create_topic(&replica_a, topic).await?;
+    let topition = Topition::new(topic, 0);
+
+    let producer = init_idempotent(&replica_a).await?;
+
+    // A produces seq 0 (in-memory only), then — after the debounce interval has
+    // elapsed — a contiguous seq 2, which triggers A's lazy checkpoint and
+    // persists the advance (through seq 3) to the shared object.
+    assert_eq!(
+        0,
+        replica_a
+            .produce(None, &topition, idempotent_batch(producer, 0, 0, 2)?)
+            .await?
+    );
+    tokio::time::sleep(DynoStore::PRODUCER_CHECKPOINT_INTERVAL + Duration::from_millis(50)).await;
+    assert_eq!(
+        2,
+        replica_a
+            .produce(None, &topition, idempotent_batch(producer, 0, 2, 1)?)
+            .await?
+    );
+
+    // A replica that is *cold* for this producer (the migration target) reads the
+    // checkpointed object and correctly rejects a replay of the already-acked
+    // sequence: cross-replica dedup is restored once the source replica
+    // checkpoints. (A replica already holding the producer in memory validates
+    // against its own authority and would not re-read — hence the eventual, not
+    // immediate, cross-replica contract.)
+    let replica_cold = DynoStore::new(CLUSTER, NODE, bucket.clone());
     assert_eq!(
         ErrorCode::DuplicateSequenceNumber,
         api_error(
-            replica_a
+            replica_cold
                 .produce(None, &topition, idempotent_batch(producer, 0, 0, 2)?)
                 .await
         )
-    );
-
-    // The contiguous continuation (seq 2) from B succeeds at offset 2.
-    assert_eq!(
-        2,
-        replica_b
-            .produce(None, &topition, idempotent_batch(producer, 0, 2, 1)?)
-            .await?
     );
 
     Ok(())

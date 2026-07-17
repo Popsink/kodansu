@@ -25,6 +25,7 @@ mod idempotent;
 mod latency;
 mod metadata_visibility;
 mod offset_assignment;
+mod retention;
 mod scaling;
 
 pub(crate) fn init_tracing() -> Result<DefaultGuard, Error> {
