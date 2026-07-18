@@ -29,7 +29,8 @@ use tansu_sans_io::{
 };
 
 use crate::{
-    Error, Result, Storage, Topition, dynostore::DynoStore, dynostore::tests::init_tracing,
+    Error, Result, Storage, Topition, dynostore::CoalesceTuning, dynostore::DynoStore,
+    dynostore::tests::init_tracing,
 };
 
 const CLUSTER: &str = "tansu";
@@ -181,6 +182,44 @@ async fn flag_off_writes_one_object_per_batch() -> Result<(), Error> {
     assert_eq!(4, store.produce(None, &tp, batch(2)?).await?);
 
     assert_eq!(3, object_count(&bucket, topic).await);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn tuned_batch_count_flushes_before_the_linger_elapses() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    // Linger set an hour out: the ONLY way these produces can be acked within the
+    // test is the tuned batch-count trigger firing on the third enqueue. If the
+    // `coalesce_batches` override were ignored (default 64), the join! below would
+    // park on the linger and never complete — so a passing test proves the
+    // storage-URL threshold is actually applied (#54).
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .produce_coalesce(true)
+        .coalesce_tuning(CoalesceTuning {
+            coalesce_linger: Some(Duration::from_secs(3600)),
+            coalesce_batches: Some(3),
+            ..Default::default()
+        });
+
+    let topic = "tuned-count";
+    create_topic(&store, topic).await?;
+    let tp = Topition::new(topic, 0);
+
+    let (a, b, c) = tokio::join!(
+        store.produce(None, &tp, batch(2)?),
+        store.produce(None, &tp, batch(2)?),
+        store.produce(None, &tp, batch(2)?),
+    );
+
+    let mut offsets = vec![a?, b?, c?];
+    offsets.sort_unstable();
+    assert_eq!(vec![0, 2, 4], offsets);
+
+    // The three batches flushed as one object on the count trigger.
+    assert_eq!(1, object_count(&bucket, topic).await);
 
     Ok(())
 }

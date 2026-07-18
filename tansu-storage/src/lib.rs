@@ -118,7 +118,7 @@ use console::Emoji;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use deadpool::managed::PoolError;
 #[cfg(feature = "dynostore")]
-use dynostore::DynoStore;
+use dynostore::{CoalesceTuning, DynoStore};
 
 use glob::{GlobError, PatternError};
 
@@ -2159,8 +2159,12 @@ pub enum StorageContainer {
     #[cfg(feature = "postgres")]
     Postgres(Postgres),
 
+    // Boxed: `DynoStore` is by far the largest variant (its per-partition /
+    // per-producer caches, offset hints and coalescing config), and inlining it
+    // trips `clippy::large_enum_variant`. Method calls on the `Box` auto-deref,
+    // so the delegating `Storage` impl arms are unaffected.
     #[cfg(feature = "dynostore")]
-    DynoStore(DynoStore),
+    DynoStore(Box<DynoStore>),
 
     #[cfg(feature = "libsql")]
     Lite(lite::Engine),
@@ -2339,6 +2343,66 @@ fn auto_topic_create(storage: &Url) -> AutoTopicCreate {
     config
 }
 
+/// Parse the coalescing (#50) / producer-checkpoint (#48) flush-threshold
+/// overrides from the storage URL query string (#54):
+/// `?coalesce_linger=250ms&coalesce_batches=128&coalesce_bytes=4M&producer_checkpoint_interval=5s&producer_checkpoint_batches=256`.
+///
+/// Durations and sizes use the same `human-units` grammar as `batch_max_delay`
+/// / `batch_min_size`. Any absent or unparseable key is left as `None`, keeping
+/// that trigger at its [`DynoStore`] compile-time default — so omitting every
+/// key reproduces today's behaviour.
+#[cfg(feature = "dynostore")]
+fn coalesce_tuning(storage: &Url) -> CoalesceTuning {
+    let mut tuning = CoalesceTuning::default();
+
+    for (key, value) in storage.query_pairs() {
+        let value = value.as_ref();
+        match key.as_ref() {
+            "coalesce_linger" => {
+                tuning.coalesce_linger = human_units::Duration::from_str(value)
+                    .map(|duration| duration.0)
+                    .inspect_err(
+                        |err| warn!(storage = %storage, key = "coalesce_linger", value, ?err),
+                    )
+                    .ok();
+            }
+            "coalesce_batches" => {
+                tuning.coalesce_batches = value
+                    .parse()
+                    .inspect_err(
+                        |err| warn!(storage = %storage, key = "coalesce_batches", value, ?err),
+                    )
+                    .ok();
+            }
+            "coalesce_bytes" => {
+                tuning.coalesce_bytes = human_units::Size::from_str(value)
+                    .map(|size| size.0)
+                    .inspect_err(
+                        |err| warn!(storage = %storage, key = "coalesce_bytes", value, ?err),
+                    )
+                    .ok()
+                    .and_then(|size| usize::try_from(size).ok());
+            }
+            "producer_checkpoint_interval" => {
+                tuning.producer_checkpoint_interval = human_units::Duration::from_str(value)
+                    .map(|duration| duration.0)
+                    .inspect_err(|err| warn!(storage = %storage, key = "producer_checkpoint_interval", value, ?err))
+                    .ok();
+            }
+            "producer_checkpoint_batches" => {
+                tuning.producer_checkpoint_batches = value
+                    .parse()
+                    .inspect_err(|err| warn!(storage = %storage, key = "producer_checkpoint_batches", value, ?err))
+                    .ok();
+            }
+            _ => {}
+        }
+    }
+
+    debug!(?tuning);
+    tuning
+}
+
 impl Builder<i32, String, Url, Url> {
     pub async fn build(self) -> Result<Arc<Box<dyn Storage>>> {
         let storage = match self.storage.scheme() {
@@ -2426,6 +2490,7 @@ impl Builder<i32, String, Url, Url> {
                             .lake(self.lake_house.clone())
                             .auto_create(auto_topic_create(&self.storage))
                             .produce_coalesce(produce_coalesce)
+                            .coalesce_tuning(coalesce_tuning(&self.storage))
                     })
                     .map(|storage| {
                         ProduceRequestBatcher::new(storage)
@@ -2509,6 +2574,7 @@ impl Builder<i32, String, Url, Url> {
                             .lake(self.lake_house.clone())
                             .auto_create(auto_topic_create(&self.storage))
                             .produce_coalesce(produce_coalesce)
+                            .coalesce_tuning(coalesce_tuning(&self.storage))
                     })
                     .map(|storage| {
                         ProduceRequestBatcher::new(storage)
@@ -2529,7 +2595,8 @@ impl Builder<i32, String, Url, Url> {
                     .auto_create(auto_topic_create(&self.storage))
                     .produce_coalesce(self.storage.query_pairs().any(|(k, v)| {
                         k == "produce_coalesce" && v.as_ref().parse().unwrap_or(false)
-                    })),
+                    }))
+                    .coalesce_tuning(coalesce_tuning(&self.storage)),
             )
             .map(|storage| Box::new(storage) as Box<dyn Storage>)
             .map(Arc::new),
@@ -3924,6 +3991,47 @@ mod tests {
         let topition = Topition::from_str("test-topic-0000000-eFC79C8-2147483647")?;
         assert_eq!("test-topic-0000000-eFC79C8", topition.topic());
         assert_eq!(i32::MAX, topition.partition());
+        Ok(())
+    }
+
+    #[cfg(feature = "dynostore")]
+    #[test]
+    fn coalesce_tuning_absent_keys_keep_defaults() -> Result<()> {
+        let tuning = coalesce_tuning(&Url::parse("s3://tansu/?produce_coalesce=true")?);
+        assert_eq!(None, tuning.coalesce_linger);
+        assert_eq!(None, tuning.coalesce_batches);
+        assert_eq!(None, tuning.coalesce_bytes);
+        assert_eq!(None, tuning.producer_checkpoint_interval);
+        assert_eq!(None, tuning.producer_checkpoint_batches);
+        Ok(())
+    }
+
+    #[cfg(feature = "dynostore")]
+    #[test]
+    fn coalesce_tuning_parses_all_keys() -> Result<()> {
+        let tuning = coalesce_tuning(&Url::parse(
+            "s3://tansu/?coalesce_linger=300ms&coalesce_batches=128&coalesce_bytes=4M\
+             &producer_checkpoint_interval=5s&producer_checkpoint_batches=256",
+        )?);
+        assert_eq!(Some(Duration::from_millis(300)), tuning.coalesce_linger);
+        assert_eq!(Some(128), tuning.coalesce_batches);
+        assert_eq!(Some(4 << 20), tuning.coalesce_bytes);
+        assert_eq!(
+            Some(Duration::from_secs(5)),
+            tuning.producer_checkpoint_interval
+        );
+        assert_eq!(Some(256), tuning.producer_checkpoint_batches);
+        Ok(())
+    }
+
+    #[cfg(feature = "dynostore")]
+    #[test]
+    fn coalesce_tuning_unparseable_value_is_ignored() -> Result<()> {
+        let tuning = coalesce_tuning(&Url::parse(
+            "s3://tansu/?coalesce_linger=not-a-duration&coalesce_batches=lots",
+        )?);
+        assert_eq!(None, tuning.coalesce_linger);
+        assert_eq!(None, tuning.coalesce_batches);
         Ok(())
     }
 }

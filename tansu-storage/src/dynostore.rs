@@ -187,6 +187,19 @@ pub struct DynoStore {
     /// drained (never held across an await) on a threshold or linger-timer flush.
     coalesce: Arc<Mutex<BTreeMap<Topition, CoalesceBuffer>>>,
 
+    /// Runtime coalescing (#50) / producer-checkpoint (#48) flush thresholds
+    /// (#54). Each is seeded from its compile-time default
+    /// ([`Self::COALESCE_LINGER`], [`Self::COALESCE_BATCHES`],
+    /// [`Self::COALESCE_BYTES`], [`Self::PRODUCER_CHECKPOINT_INTERVAL`],
+    /// [`Self::PRODUCER_CHECKPOINT_BATCHES`]) and overridable per deployment via
+    /// [`Self::coalesce_tuning`], so a high-topic-fan-out workload can widen the
+    /// linger / checkpoint windows from the storage URL without recompiling.
+    coalesce_linger: Duration,
+    coalesce_batches: usize,
+    coalesce_bytes: usize,
+    producer_checkpoint_interval: Duration,
+    producer_checkpoint_batches: u64,
+
     object_store: Arc<DynObjectStore>,
 }
 
@@ -213,6 +226,21 @@ struct CoalesceBuffer {
 struct ProducerCheckpoint {
     batches_since_flush: u64,
     last_flush: SystemTime,
+}
+
+/// Per-deployment overrides for the produce-coalescing (#50) and
+/// producer-checkpoint (#48) flush thresholds (#54), applied via
+/// [`DynoStore::coalesce_tuning`]. A `None` field keeps that trigger's
+/// compile-time default, so omitting every key reproduces the shipped
+/// behaviour. Populated from the storage URL query string; see the storage
+/// tuning docs for the fan-out tradeoff these expose.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CoalesceTuning {
+    pub coalesce_linger: Option<Duration>,
+    pub coalesce_batches: Option<usize>,
+    pub coalesce_bytes: Option<usize>,
+    pub producer_checkpoint_interval: Option<Duration>,
+    pub producer_checkpoint_batches: Option<u64>,
 }
 
 type Group = String;
@@ -543,6 +571,11 @@ impl DynoStore {
             oldest_retained: Arc::new(Mutex::new(BTreeMap::new())),
             produce_coalesce: false,
             coalesce: Arc::new(Mutex::new(BTreeMap::new())),
+            coalesce_linger: Self::COALESCE_LINGER,
+            coalesce_batches: Self::COALESCE_BATCHES,
+            coalesce_bytes: Self::COALESCE_BYTES,
+            producer_checkpoint_interval: Self::PRODUCER_CHECKPOINT_INTERVAL,
+            producer_checkpoint_batches: Self::PRODUCER_CHECKPOINT_BATCHES,
             topic_metas: Arc::new(Mutex::new(BTreeMap::new())),
             topic_index: Arc::new(Mutex::new(TopicIndex::default())),
             topic_index_refresh: Arc::new(tokio::sync::Mutex::new(())),
@@ -583,6 +616,25 @@ impl DynoStore {
     pub fn produce_coalesce(self, produce_coalesce: bool) -> Self {
         Self {
             produce_coalesce,
+            ..self
+        }
+    }
+
+    /// Override the coalescing (#50) / producer-checkpoint (#48) flush
+    /// thresholds (#54). Each `None` in `tuning` leaves that trigger at its
+    /// current value (the compile-time default), so an all-default `tuning` is a
+    /// no-op and reproduces the shipped behaviour.
+    pub fn coalesce_tuning(self, tuning: CoalesceTuning) -> Self {
+        Self {
+            coalesce_linger: tuning.coalesce_linger.unwrap_or(self.coalesce_linger),
+            coalesce_batches: tuning.coalesce_batches.unwrap_or(self.coalesce_batches),
+            coalesce_bytes: tuning.coalesce_bytes.unwrap_or(self.coalesce_bytes),
+            producer_checkpoint_interval: tuning
+                .producer_checkpoint_interval
+                .unwrap_or(self.producer_checkpoint_interval),
+            producer_checkpoint_batches: tuning
+                .producer_checkpoint_batches
+                .unwrap_or(self.producer_checkpoint_batches),
             ..self
         }
     }
@@ -694,20 +746,25 @@ impl DynoStore {
     /// visibility, never expose unstable offsets.
     const HIGH_WATERMARK_HINT_TTL: Duration = Duration::from_secs(5);
 
-    /// Debounce window for persisting a producer's `producers/{id}.json` (#48):
-    /// the durable object is checkpointed after at most this many idempotent
-    /// batches have advanced its in-memory sequence.
+    /// Default debounce window for persisting a producer's `producers/{id}.json`
+    /// (#48): the durable object is checkpointed after at most this many
+    /// idempotent batches have advanced its in-memory sequence. Overridable per
+    /// deployment via `producer_checkpoint_batches` (#54).
     const PRODUCER_CHECKPOINT_BATCHES: u64 = 64;
 
     /// Time-based companion to [`Self::PRODUCER_CHECKPOINT_BATCHES`]: a producer
     /// that keeps advancing below the batch threshold is still checkpointed at
-    /// least this often, bounding the unclean-crash replay window.
+    /// least this often, bounding the unclean-crash replay window. Overridable
+    /// via `producer_checkpoint_interval` (#54).
     const PRODUCER_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(250);
 
-    /// Coalescing flush triggers (#50), whichever is reached first: linger time,
-    /// batch count, byte size, or offset span. The span cap also bounds how far
-    /// back [`Self::fetch`] must probe to find the object containing a mid-frame
-    /// offset.
+    /// Default coalescing flush triggers (#50), whichever is reached first:
+    /// linger time, batch count, byte size, or offset span. `COALESCE_LINGER`,
+    /// `COALESCE_BATCHES` and `COALESCE_BYTES` are overridable per deployment via
+    /// `coalesce_linger` / `coalesce_batches` / `coalesce_bytes` (#54). The span
+    /// cap ([`Self::COALESCE_MAX_RECORDS`]) stays a fixed safety bound: it also
+    /// bounds how far back [`Self::fetch`] must probe to find the object
+    /// containing a mid-frame offset.
     const COALESCE_LINGER: Duration = Duration::from_millis(50);
     const COALESCE_BATCHES: usize = 64;
     const COALESCE_BYTES: usize = 1 << 20;
@@ -1097,10 +1154,10 @@ impl DynoStore {
                 });
                 entry.batches_since_flush += 1;
 
-                entry.batches_since_flush >= Self::PRODUCER_CHECKPOINT_BATCHES
+                entry.batches_since_flush >= self.producer_checkpoint_batches
                     || now
                         .duration_since(entry.last_flush)
-                        .is_ok_and(|elapsed| elapsed >= Self::PRODUCER_CHECKPOINT_INTERVAL)
+                        .is_ok_and(|elapsed| elapsed >= self.producer_checkpoint_interval)
             })
     }
 
@@ -1439,8 +1496,8 @@ impl DynoStore {
             buffer.records += span;
             buffer.bytes += size;
 
-            if buffer.pending.len() >= Self::COALESCE_BATCHES
-                || buffer.bytes >= Self::COALESCE_BYTES
+            if buffer.pending.len() >= self.coalesce_batches
+                || buffer.bytes >= self.coalesce_bytes
                 || buffer.records >= Self::COALESCE_MAX_RECORDS
             {
                 Action::Flush(std::mem::take(buffer))
@@ -1457,9 +1514,10 @@ impl DynoStore {
             Action::StartTimer => {
                 let store = self.clone();
                 let topition = topition.to_owned();
+                let linger = self.coalesce_linger;
 
                 _ = tokio::spawn(async move {
-                    tokio::time::sleep(Self::COALESCE_LINGER).await;
+                    tokio::time::sleep(linger).await;
 
                     let buffer = store
                         .coalesce
