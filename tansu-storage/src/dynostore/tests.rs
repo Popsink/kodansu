@@ -28,6 +28,7 @@ mod metadata_visibility;
 mod offset_assignment;
 mod retention;
 mod scaling;
+mod segment;
 
 pub(crate) fn init_tracing() -> Result<DefaultGuard, Error> {
     _ = dotenv().ok();

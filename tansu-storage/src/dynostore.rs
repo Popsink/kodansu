@@ -243,6 +243,69 @@ pub struct CoalesceTuning {
     pub producer_checkpoint_batches: Option<u64>,
 }
 
+/// Magic trailer word marking a prefix-coalesced multi-topic segment object
+/// (#64), distinguishing a `.seg` from a legacy single-topic coalesced object
+/// (#50), which carries no trailer. ASCII `TSEG`.
+const SEGMENT_MAGIC: u32 = 0x5453_4547;
+
+/// On-disk version of the segment frame + footer format (#64). Version `0` is
+/// the implicit legacy single-topic layout (a bare batch concatenation with no
+/// trailer, produced by #50); `1` is the first self-describing multi-topic
+/// segment. Versioned so future footer fields stay forward-compatible.
+const SEGMENT_FORMAT_VERSION: u16 = 1;
+
+/// Fixed-size trailer at the very end of every multi-topic segment (#64):
+/// `footer_len (u64) + entry_count (u32) + version (u16) + magic (u32)`. A
+/// reader recovers the index with one ranged GET of the last
+/// [`SEGMENT_TRAILER_LEN`] bytes, then a second ranged GET of the `footer_len`
+/// bytes immediately preceding it — never downloading the record body.
+const SEGMENT_TRAILER_LEN: usize =
+    size_of::<u64>() + size_of::<u32>() + size_of::<u16>() + size_of::<u32>();
+
+/// One `(topic, partition)` sub-stream's self-describing entry in a segment
+/// footer (#64): where its batches live in the shared object and what offset
+/// span they cover. This is what the fetch path (#60) and cold-start offset
+/// recovery (#58) read, instead of deriving offsets from the object filename
+/// (the legacy `{offset}.batch` authority).
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SubstreamEntry {
+    topic: String,
+    partition: i32,
+    /// Absolute base offset of this sub-stream's first record in the segment.
+    base_offset: i64,
+    /// Offsets this sub-stream occupies
+    /// (`last_offset == base_offset + record_count - 1`).
+    record_count: i64,
+    /// Byte offset of this sub-stream's contiguous region within the segment.
+    byte_start: u64,
+    /// Byte length of that region (its batches, wire-encoded and concatenated).
+    byte_len: u64,
+    /// Greatest record timestamp in the sub-stream, read by per-prefix
+    /// whole-segment retention (#61) to decide expiry without a body read.
+    max_timestamp: i64,
+}
+
+/// The self-describing footer index of a prefix-coalesced segment (#64): one
+/// [`SubstreamEntry`] per `(topic, partition)` multiplexed into the shared
+/// object. Serialized at the segment tail ahead of the [`SEGMENT_TRAILER_LEN`]
+/// trailer and treated as the published external-reader contract (kotatsu#80).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SegmentFooter {
+    entries: Vec<SubstreamEntry>,
+}
+
+impl SegmentFooter {
+    /// The entry for a `(topic, partition)` sub-stream, if it is present in this
+    /// segment. `None` means the segment holds no records for that topition.
+    // Wired into the read path by #60; unused until then.
+    #[allow(dead_code)]
+    fn get(&self, topic: &str, partition: i32) -> Option<&SubstreamEntry> {
+        self.entries
+            .iter()
+            .find(|entry| entry.topic == topic && entry.partition == partition)
+    }
+}
+
 type Group = String;
 type Offset = i64;
 type Partition = i32;
@@ -2261,6 +2324,166 @@ impl DynoStore {
             buf.extend_from_slice(&Bytes::from(batch.clone()));
         }
         Ok(PutPayload::from(Bytes::from(buf)))
+    }
+
+    /// Serialize many `(topic, partition)` sub-streams into one shared,
+    /// prefix-coalesced segment object (#64) — the write produced by #57. Each
+    /// sub-stream's batches are concatenated contiguously (byte-compatible with
+    /// [`Self::encode_frame`], so a region decodes with [`Self::decode_frame`]);
+    /// the regions are laid end to end; then a self-describing [`SegmentFooter`]
+    /// and a fixed [`SEGMENT_TRAILER_LEN`] trailer are appended. A reader
+    /// locates any sub-stream by footer lookup + a ranged GET of its byte span
+    /// (#60) rather than deriving offsets from the filename. Each element is
+    /// `(topition, base_offset, batches)`, where `base_offset` is the absolute
+    /// offset already assigned to the sub-stream's first record (#58). Empty
+    /// sub-streams are skipped. Returns the payload and the footer, which the
+    /// writer keeps as the segment's in-memory index.
+    // Wired into the prefix flush path by #57; unused until then.
+    #[allow(dead_code)]
+    fn encode_segment(
+        &self,
+        substreams: &[(Topition, i64, Vec<deflated::Batch>)],
+    ) -> Result<(PutPayload, SegmentFooter)> {
+        let mut body = Vec::new();
+        let mut entries = Vec::with_capacity(substreams.len());
+
+        for (topition, base_offset, batches) in substreams {
+            if batches.is_empty() {
+                continue;
+            }
+
+            let byte_start = body.len() as u64;
+            let mut record_count = 0i64;
+            let mut max_timestamp = i64::MIN;
+
+            for batch in batches {
+                body.extend_from_slice(&Bytes::from(batch.clone()));
+                record_count += batch.last_offset_delta as i64 + 1;
+                max_timestamp = max_timestamp.max(batch.max_timestamp);
+            }
+
+            entries.push(SubstreamEntry {
+                topic: topition.topic().to_owned(),
+                partition: topition.partition(),
+                base_offset: *base_offset,
+                record_count,
+                byte_start,
+                byte_len: body.len() as u64 - byte_start,
+                max_timestamp,
+            });
+        }
+
+        let footer = SegmentFooter { entries };
+        let footer_bytes = Self::encode_footer(&footer);
+
+        body.extend_from_slice(&footer_bytes);
+        body.extend_from_slice(&(footer_bytes.len() as u64).to_be_bytes());
+        body.extend_from_slice(&(footer.entries.len() as u32).to_be_bytes());
+        body.extend_from_slice(&SEGMENT_FORMAT_VERSION.to_be_bytes());
+        body.extend_from_slice(&SEGMENT_MAGIC.to_be_bytes());
+
+        Ok((PutPayload::from(Bytes::from(body)), footer))
+    }
+
+    /// Serialize a [`SegmentFooter`] index (#64). Each entry:
+    /// `topic_len (u16) + topic (utf8) + partition (i32) + base_offset (i64) +
+    /// record_count (i64) + byte_start (u64) + byte_len (u64) +
+    /// max_timestamp (i64)`, all big-endian. Paired with [`Self::decode_footer`].
+    // Reached via `encode_segment` once #57 wires it; unused until then.
+    #[allow(dead_code)]
+    fn encode_footer(footer: &SegmentFooter) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for entry in &footer.entries {
+            let topic = entry.topic.as_bytes();
+            buf.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            buf.extend_from_slice(topic);
+            buf.extend_from_slice(&entry.partition.to_be_bytes());
+            buf.extend_from_slice(&entry.base_offset.to_be_bytes());
+            buf.extend_from_slice(&entry.record_count.to_be_bytes());
+            buf.extend_from_slice(&entry.byte_start.to_be_bytes());
+            buf.extend_from_slice(&entry.byte_len.to_be_bytes());
+            buf.extend_from_slice(&entry.max_timestamp.to_be_bytes());
+        }
+        buf
+    }
+
+    /// Parse a [`SegmentFooter`] from `footer_bytes`, the `footer_len` bytes that
+    /// precede the trailer (#64). Inverse of [`Self::encode_footer`]; a
+    /// truncated or malformed footer is a corrupt segment, not a legacy object.
+    // Reached via `decode_segment_footer`, wired into the read path by #60.
+    #[allow(dead_code)]
+    fn decode_footer(footer_bytes: &[u8], entry_count: usize) -> Result<SegmentFooter> {
+        let mut entries = Vec::with_capacity(entry_count);
+        let mut cursor = footer_bytes;
+
+        fn take<'a>(cursor: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
+            if cursor.len() < n {
+                return Err(Error::Message(String::from("truncated segment footer")));
+            }
+            let (head, tail) = cursor.split_at(n);
+            *cursor = tail;
+            Ok(head)
+        }
+
+        for _ in 0..entry_count {
+            let topic_len = u16::from_be_bytes(take(&mut cursor, 2)?.try_into()?) as usize;
+            let topic = String::from_utf8(take(&mut cursor, topic_len)?.to_vec())
+                .map_err(|e| Error::Message(e.to_string()))?;
+            let partition = i32::from_be_bytes(take(&mut cursor, 4)?.try_into()?);
+            let base_offset = i64::from_be_bytes(take(&mut cursor, 8)?.try_into()?);
+            let record_count = i64::from_be_bytes(take(&mut cursor, 8)?.try_into()?);
+            let byte_start = u64::from_be_bytes(take(&mut cursor, 8)?.try_into()?);
+            let byte_len = u64::from_be_bytes(take(&mut cursor, 8)?.try_into()?);
+            let max_timestamp = i64::from_be_bytes(take(&mut cursor, 8)?.try_into()?);
+
+            entries.push(SubstreamEntry {
+                topic,
+                partition,
+                base_offset,
+                record_count,
+                byte_start,
+                byte_len,
+                max_timestamp,
+            });
+        }
+
+        Ok(SegmentFooter { entries })
+    }
+
+    /// Recover the [`SegmentFooter`] of a segment given its tail bytes (#64):
+    /// `tail` must include at least the footer and the [`SEGMENT_TRAILER_LEN`]
+    /// trailer (in practice the last N bytes fetched by a ranged GET, or the
+    /// whole object). Returns `Ok(None)` when the trailer magic is absent — the
+    /// object is a legacy single-topic coalesced object (#50, the v0 case) and
+    /// must be read as a bare batch concatenation via [`Self::decode_frame`].
+    // Wired into the fetch / recovery path by #60 / #58; unused until then.
+    #[allow(dead_code)]
+    fn decode_segment_footer(&self, tail: &[u8]) -> Result<Option<SegmentFooter>> {
+        if tail.len() < SEGMENT_TRAILER_LEN {
+            return Ok(None);
+        }
+
+        let trailer = &tail[tail.len() - SEGMENT_TRAILER_LEN..];
+        let magic = u32::from_be_bytes(trailer[14..18].try_into()?);
+        if magic != SEGMENT_MAGIC {
+            return Ok(None);
+        }
+
+        let footer_len = u64::from_be_bytes(trailer[0..8].try_into()?) as usize;
+        let entry_count = u32::from_be_bytes(trailer[8..12].try_into()?) as usize;
+        let version = u16::from_be_bytes(trailer[12..14].try_into()?);
+        if version != SEGMENT_FORMAT_VERSION {
+            return Err(Error::Message(format!(
+                "unsupported segment format version {version}"
+            )));
+        }
+
+        let footer_end = tail.len() - SEGMENT_TRAILER_LEN;
+        let footer_start = footer_end
+            .checked_sub(footer_len)
+            .ok_or_else(|| Error::Message(String::from("segment footer length exceeds tail")))?;
+
+        Self::decode_footer(&tail[footer_start..footer_end], entry_count).map(Some)
     }
 
     async fn get<V>(&self, location: &Path) -> Result<(V, Version)>
