@@ -30,8 +30,8 @@ use futures::{
 };
 use metadata::Cache;
 use object_store::{
-    Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
-    ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode,
+    Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetRange,
+    GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, UpdateVersion, path::Path,
 };
 use opentelemetry::{
@@ -342,8 +342,6 @@ struct SegmentFooter {
 impl SegmentFooter {
     /// The entry for a `(topic, partition)` sub-stream, if it is present in this
     /// segment. `None` means the segment holds no records for that topition.
-    // Wired into the read path by #60; unused until then.
-    #[allow(dead_code)]
     fn get(&self, topic: &str, partition: i32) -> Option<&SubstreamEntry> {
         self.entries
             .iter()
@@ -1882,6 +1880,90 @@ impl DynoStore {
         Err(Error::Api(ErrorCode::UnknownServerError))
     }
 
+    /// Read a segment's self-describing footer (#58/#64) with at most two ranged
+    /// GETs of the object tail — never the record body: one `Suffix` GET of the
+    /// fixed trailer to learn the footer length, then one `Suffix` GET of the
+    /// footer + trailer. Returns `None` if the object carries no trailer (a
+    /// legacy #50 object). This is the read primitive the fetch path (#60) also
+    /// builds on.
+    async fn read_segment_footer(&self, location: &Path) -> Result<Option<SegmentFooter>> {
+        let trailer = self
+            .object_store
+            .get_opts(
+                location,
+                GetOptions {
+                    range: Some(GetRange::Suffix(SEGMENT_TRAILER_LEN as u64)),
+                    ..Default::default()
+                },
+            )
+            .await?
+            .bytes()
+            .await?;
+
+        if trailer.len() < SEGMENT_TRAILER_LEN {
+            return Ok(None);
+        }
+
+        let magic = u32::from_be_bytes(trailer[14..18].try_into()?);
+        if magic != SEGMENT_MAGIC {
+            return Ok(None);
+        }
+
+        let footer_len = u64::from_be_bytes(trailer[0..8].try_into()?) as usize;
+
+        let tail = self
+            .object_store
+            .get_opts(
+                location,
+                GetOptions {
+                    range: Some(GetRange::Suffix((SEGMENT_TRAILER_LEN + footer_len) as u64)),
+                    ..Default::default()
+                },
+            )
+            .await?
+            .bytes()
+            .await?;
+
+        self.decode_segment_footer(&tail)
+    }
+
+    /// Recover a prefix-coalesced sub-stream's next offset from the segment
+    /// footers (#58) when the in-memory counter is cold (a fresh process or a
+    /// #59 failover). Reads segment footers newest-first and returns the first
+    /// (highest) `base + record_count` for the topition; an active sub-stream is
+    /// in the newest segment, so this is one footer read on the common path. `0`
+    /// when the topition has never been written under the prefix.
+    ///
+    /// The segment is self-describing, so no external index or durable
+    /// per-partition watermark write is needed — which is what keeps the produce
+    /// path off the hot single-object update the whole design avoids (#13).
+    async fn recover_substream_next_offset(&self, topition: &Topition) -> Result<i64> {
+        let prefix = self.prefix_of(topition);
+        let listing = self.segment_prefix(&prefix);
+
+        let mut names: Vec<Path> = self
+            .object_store
+            .list(Some(&listing))
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .inspect_err(|err| error!(?err, prefix))?;
+
+        // Zero-padded sequence names sort lexicographically by sequence; scan
+        // newest-first and stop at the first segment that holds this sub-stream.
+        names.sort_unstable();
+
+        for location in names.into_iter().rev() {
+            if let Some(footer) = self.read_segment_footer(&location).await?
+                && let Some(entry) = footer.get(topition.topic(), topition.partition())
+            {
+                return Ok(entry.base_offset + entry.record_count);
+            }
+        }
+
+        Ok(0)
+    }
+
     /// Buffer `deflated` for a prefix-coalesced flush and await its assigned
     /// offset (#57). Like [`Self::enqueue_coalesced`] but keyed by the topition's
     /// connector prefix, so one buffer accumulates batches across every topic
@@ -1997,8 +2079,16 @@ impl DynoStore {
         for (topition, indices) in &grouped {
             let base = match self.cached_high(topition) {
                 Ok(Some(hint)) => hint,
-                Ok(None) => match self.refresh_high(topition).await {
-                    Ok(high) => high,
+                // Cold counter (fresh process / #59 failover): recover the next
+                // offset from the segment footers (#58), not from the legacy
+                // `records/` listing (a prefix-coalesced sub-stream has none).
+                Ok(None) => match self.recover_substream_next_offset(topition).await {
+                    Ok(high) => {
+                        _ = self
+                            .set_high(topition, high)
+                            .inspect_err(|err| debug!(?err));
+                        high
+                    }
                     Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
                 },
                 Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
@@ -2824,8 +2914,6 @@ impl DynoStore {
     /// Parse a [`SegmentFooter`] from `footer_bytes`, the `footer_len` bytes that
     /// precede the trailer (#64). Inverse of [`Self::encode_footer`]; a
     /// truncated or malformed footer is a corrupt segment, not a legacy object.
-    // Reached via `decode_segment_footer`, wired into the read path by #60.
-    #[allow(dead_code)]
     fn decode_footer(footer_bytes: &[u8], entry_count: usize) -> Result<SegmentFooter> {
         let mut entries = Vec::with_capacity(entry_count);
         let mut cursor = footer_bytes;
@@ -2870,8 +2958,6 @@ impl DynoStore {
     /// whole object). Returns `Ok(None)` when the trailer magic is absent — the
     /// object is a legacy single-topic coalesced object (#50, the v0 case) and
     /// must be read as a bare batch concatenation via [`Self::decode_frame`].
-    // Wired into the fetch / recovery path by #60 / #58; unused until then.
-    #[allow(dead_code)]
     fn decode_segment_footer(&self, tail: &[u8]) -> Result<Option<SegmentFooter>> {
         if tail.len() < SEGMENT_TRAILER_LEN {
             return Ok(None);

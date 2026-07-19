@@ -212,3 +212,31 @@ async fn prefix_mode_off_uses_legacy_layout() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// After a cold restart — a fresh process on the same bucket, so the in-memory
+/// offset counter is empty — each sub-stream resumes at the exact next offset,
+/// recovered from the tail segment footer (#58): no gap, no reuse.
+#[tokio::test]
+async fn cold_restart_recovers_offsets_from_the_footer() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let topic_a = "org.env.conn.tab_a";
+    let a = Topition::new(topic_a, 0);
+
+    // First process: two windows -> offsets 0 then 3 (5 records total).
+    {
+        let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+        create_topic(&store, topic_a).await?;
+        assert_eq!(0, store.produce(None, &a, batch(3)?).await?);
+        assert_eq!(3, store.produce(None, &a, batch(2)?).await?);
+    }
+
+    // A fresh process on the same bucket: empty in-memory counters. The next
+    // produce must continue at 5, recovered from the tail segment footer, and
+    // land in a third segment (sequence recovered from the tail listing).
+    let restarted = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let resumed = restarted.produce(None, &a, batch(1)?).await?;
+    assert_eq!(5, resumed, "resume past the footer end offset, no reuse");
+    assert_eq!(3, segments(&bucket).await.len());
+
+    Ok(())
+}
