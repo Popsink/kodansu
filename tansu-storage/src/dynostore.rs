@@ -18,7 +18,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fmt::{Debug, Display},
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{self, AtomicU64},
+    },
     time::SystemTime,
 };
 
@@ -212,6 +215,24 @@ pub struct DynoStore {
     /// failover edge case rather than the steady state).
     segment_seqs: Arc<Mutex<BTreeMap<String, u64>>>,
 
+    /// Per-prefix single-writer leases this process currently holds (#59). The
+    /// durable side is `prefixes/{prefix}/lease.json`; this caches the held
+    /// epoch, its etag (for the next CAS) and its expiry (the no-write fast
+    /// path). Consulted before every prefix flush to fence a stale writer.
+    prefix_leases: Arc<Mutex<BTreeMap<String, HeldLease>>>,
+
+    /// This writer's identity, recorded in the lease `holder` field (#59) for
+    /// observability. Unique per process instance so two brokers (or two test
+    /// stores) are distinguishable.
+    writer_id: String,
+
+    /// Prefix-lease term length (#59). A held lease is reused without a write
+    /// while more than a third of the term remains, so renewal happens ~once per
+    /// `2/3 · ttl` — kept well above GCS's ~1/s/object mutation cap (#13) and
+    /// never tied to the flush cadence. Defaults to [`Self::PREFIX_LEASE_TTL`];
+    /// lowered in tests to exercise failover.
+    prefix_lease_ttl: Duration,
+
     /// Runtime coalescing (#50) / producer-checkpoint (#48) flush thresholds
     /// (#54). Each is seeded from its compile-time default
     /// ([`Self::COALESCE_LINGER`], [`Self::COALESCE_BATCHES`],
@@ -265,6 +286,33 @@ struct PrefixCoalesceBuffer {
     bytes: usize,
 }
 
+/// The durable per-prefix single-writer lease (#59), stored at
+/// `clusters/{cluster}/prefixes/{prefix}/lease.json`. Its etag is the fence: a
+/// writer takes/renews the lease with a conditional PUT, and a stale holder's
+/// CAS fails `Precondition`, so at most one writer is live per prefix — with no
+/// external coordinator. `epoch` is bumped on every (re)acquire and stamped into
+/// each segment; `expires_at_ms` bounds how long a crashed holder blocks a
+/// takeover. The object is CAS-**mutated**, so renewal stays well under GCS's
+/// ~1/s/object mutation cap (#13): it renews once per lease term, never per
+/// flush.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct PrefixLease {
+    epoch: i64,
+    holder: String,
+    expires_at_ms: i64,
+}
+
+/// A prefix lease this process currently holds (#59): the in-memory side of
+/// [`PrefixLease`]. `version` is the etag the next renewal CASes against;
+/// `expires_at` gates the no-write fast path so a live term is reused without
+/// touching the object.
+#[derive(Clone, Debug)]
+struct HeldLease {
+    epoch: i64,
+    expires_at: SystemTime,
+    version: Option<UpdateVersion>,
+}
+
 /// Debounce accounting for one producer's lazy `producers/{id}.json` checkpoint
 /// (see [`DynoStore::producer_checkpoints`], #48).
 #[derive(Clone, Copy, Debug)]
@@ -286,6 +334,40 @@ pub struct CoalesceTuning {
     pub coalesce_bytes: Option<usize>,
     pub producer_checkpoint_interval: Option<Duration>,
     pub producer_checkpoint_batches: Option<u64>,
+}
+
+/// Process-wide counter making each [`DynoStore`]'s `writer_id` unique (#59), so
+/// two stores in one process (or two brokers) are distinguishable holders in a
+/// prefix lease.
+static WRITER_INSTANCE: AtomicU64 = AtomicU64::new(0);
+
+/// Deterministic owner node for a connector prefix (#59): rendezvous
+/// (highest-random-weight) hashing over the broker set — a pure function with no
+/// shared state, so every broker computes the same owner, and adding/removing a
+/// broker moves only ~1/N of prefixes. A multi-broker deployment routes a
+/// prefix's produce to this node to avoid lease contention; the lease
+/// (`acquire_or_renew_lease`) is the actual single-writer *guarantee*, so
+/// assignment is an optimization, not the fence. This single-node broker
+/// (node 111) trivially owns every prefix, so the routing layer that would
+/// consult this is out of scope here. Orthogonal to consumer-group coordination
+/// (still node 111). `None` iff `nodes` is empty.
+#[allow(dead_code)]
+fn prefix_owner_node(prefix: &str, nodes: &[i32]) -> Option<i32> {
+    fn weight(prefix: &str, node: i32) -> u64 {
+        // FNV-1a over the prefix bytes then the node, mixing both so the winner
+        // is stable per (prefix, node-set) and independent of node ordering.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in prefix.as_bytes().iter().chain(node.to_be_bytes().iter()) {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    nodes
+        .iter()
+        .copied()
+        .max_by_key(|node| weight(prefix, *node))
 }
 
 /// Magic trailer word marking a prefix-coalesced multi-topic segment object
@@ -332,10 +414,15 @@ struct SubstreamEntry {
 
 /// The self-describing footer index of a prefix-coalesced segment (#64): one
 /// [`SubstreamEntry`] per `(topic, partition)` multiplexed into the shared
-/// object. Serialized at the segment tail ahead of the [`SEGMENT_TRAILER_LEN`]
-/// trailer and treated as the published external-reader contract (kotatsu#80).
+/// object, plus the epoch of the writer that produced it (#59). Serialized at
+/// the segment tail ahead of the [`SEGMENT_TRAILER_LEN`] trailer and treated as
+/// the published external-reader contract (kotatsu#82).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct SegmentFooter {
+    /// The lease epoch of the writer that produced this segment (#59). `0` when
+    /// prefix leasing is not in effect. Stamped so a stale-epoch segment (from a
+    /// fenced writer) is identifiable on read/recovery.
+    writer_epoch: i64,
     entries: Vec<SubstreamEntry>,
 }
 
@@ -680,6 +767,12 @@ impl DynoStore {
             prefix_coalesce: false,
             prefix_coalesce_buffers: Arc::new(Mutex::new(BTreeMap::new())),
             segment_seqs: Arc::new(Mutex::new(BTreeMap::new())),
+            prefix_leases: Arc::new(Mutex::new(BTreeMap::new())),
+            writer_id: format!(
+                "{node}-{}",
+                WRITER_INSTANCE.fetch_add(1, atomic::Ordering::Relaxed)
+            ),
+            prefix_lease_ttl: Self::PREFIX_LEASE_TTL,
             coalesce_linger: Self::COALESCE_LINGER,
             coalesce_batches: Self::COALESCE_BATCHES,
             coalesce_bytes: Self::COALESCE_BYTES,
@@ -738,6 +831,16 @@ impl DynoStore {
     pub fn prefix_coalesce(self, prefix_coalesce: bool) -> Self {
         Self {
             prefix_coalesce,
+            ..self
+        }
+    }
+
+    /// Override the prefix single-writer lease term (#59). Kept above ~1s in
+    /// production so lease renewal stays under GCS's per-object mutation cap
+    /// (#13); lowered only in tests to exercise failover/fencing quickly.
+    pub fn prefix_lease_ttl(self, prefix_lease_ttl: Duration) -> Self {
+        Self {
+            prefix_lease_ttl,
             ..self
         }
     }
@@ -891,6 +994,11 @@ impl DynoStore {
     const COALESCE_BATCHES: usize = 64;
     const COALESCE_BYTES: usize = 1 << 20;
     const COALESCE_MAX_RECORDS: i64 = 100_000;
+
+    /// Default prefix-lease term (#59). Renewal happens once ~`2/3 · ttl`
+    /// remains, i.e. every ~7s — well under GCS's ~1/s/object mutation cap (#13)
+    /// — while a crashed holder blocks a takeover for at most one term.
+    const PREFIX_LEASE_TTL: Duration = Duration::from_secs(10);
 
     /// All topics, served from the in-memory [`TopicIndex`]. Returns the shared
     /// snapshot if fresh; otherwise refreshes it (single-flight) by LISTing the
@@ -1964,6 +2072,151 @@ impl DynoStore {
         Ok(0)
     }
 
+    /// The durable single-writer lease object for a connector prefix (#59).
+    fn lease_location(&self, prefix: &str) -> Path {
+        Path::from(format!(
+            "clusters/{}/prefixes/{}/lease.json",
+            self.cluster, prefix,
+        ))
+    }
+
+    /// Wall-clock milliseconds since the Unix epoch, for lease expiry (#59).
+    fn now_ms() -> i64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    /// Acquire or renew this writer's single-writer lease on `prefix` and return
+    /// the held epoch (#59). The etag CAS is the fence: if another writer holds a
+    /// live lease, or wins the acquire race, this call returns
+    /// `NotLeaderOrFollower` and the produce is retried (and routed to the
+    /// current writer) — so at most one writer appends per prefix, with no
+    /// external coordinator.
+    ///
+    /// A held term is reused with no write while more than a third of it
+    /// remains, so the lease object is mutated ~once per `2/3 · ttl`, never per
+    /// flush — keeping it under GCS's ~1/s/object mutation cap (#13).
+    async fn acquire_or_renew_lease(&self, prefix: &str) -> Result<i64> {
+        let now = SystemTime::now();
+        let margin = self.prefix_lease_ttl / 3;
+
+        // Fast path: comfortably within our term — no object mutation.
+        if let Some(held) = self
+            .prefix_leases
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .get(prefix)
+            && held.expires_at > now + margin
+        {
+            return Ok(held.epoch);
+        }
+
+        let location = self.lease_location(prefix);
+
+        // Read the current lease and its version (etag) to CAS against.
+        let (current, version) = match self.object_store.get(&location).await {
+            Ok(result) => {
+                let version = UpdateVersion {
+                    e_tag: result.meta.e_tag.clone(),
+                    version: result.meta.version.clone(),
+                };
+                let lease = serde_json::from_slice::<PrefixLease>(&result.bytes().await?)?;
+                (Some(lease), Some(version))
+            }
+            Err(object_store::Error::NotFound { .. }) => (None, None),
+            Err(err) => return Err(err.into()),
+        };
+
+        // "Ours" iff the object's etag matches the one we last wrote — then this
+        // is a renewal, not a takeover of a foreign live lease.
+        let our_version = self
+            .prefix_leases
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .get(prefix)
+            .and_then(|held| held.version.clone());
+        let ours = matches!((&version, &our_version), (Some(v), Some(o)) if v.e_tag == o.e_tag);
+        let expired = current
+            .as_ref()
+            .is_none_or(|lease| Self::now_ms() >= lease.expires_at_ms);
+
+        // A live lease held by someone else — we are fenced. Drop any stale
+        // cached term and yield.
+        if !ours && !expired {
+            if let Some(lease) = &current {
+                debug!(prefix, holder = %lease.holder, epoch = lease.epoch, "prefix lease held elsewhere");
+            }
+            _ = self
+                .prefix_leases
+                .lock()
+                .map(|mut leases| leases.remove(prefix));
+            return Err(Error::Api(ErrorCode::NotLeaderOrFollower));
+        }
+
+        // Acquirable (unheld / expired / ours): bump epoch, CAS on the read
+        // version so a concurrent acquirer loses.
+        let epoch = current.as_ref().map(|lease| lease.epoch).unwrap_or(0) + 1;
+        let lease = PrefixLease {
+            epoch,
+            holder: self.writer_id.clone(),
+            expires_at_ms: Self::now_ms() + self.prefix_lease_ttl.as_millis() as i64,
+        };
+        let payload = PutPayload::from(Bytes::from(serde_json::to_vec(&lease)?));
+        let mode = match &version {
+            Some(version) => PutMode::Update(version.clone()),
+            None => PutMode::Create,
+        };
+
+        match self
+            .object_store
+            .put_opts(
+                &location,
+                payload,
+                PutOptions {
+                    mode,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(result) => {
+                let version = Some(UpdateVersion {
+                    e_tag: result.e_tag,
+                    version: result.version,
+                });
+                _ = self.prefix_leases.lock().map(|mut leases| {
+                    _ = leases.insert(
+                        prefix.to_owned(),
+                        HeldLease {
+                            epoch,
+                            expires_at: now + self.prefix_lease_ttl,
+                            version,
+                        },
+                    );
+                });
+                debug!(prefix, epoch, "prefix lease acquired/renewed");
+                Ok(epoch)
+            }
+
+            // Lost the CAS: another writer acquired concurrently. Fenced.
+            Err(
+                object_store::Error::Precondition { .. }
+                | object_store::Error::AlreadyExists { .. },
+            ) => {
+                debug!(prefix, "prefix lease CAS lost — fenced");
+                _ = self
+                    .prefix_leases
+                    .lock()
+                    .map(|mut leases| leases.remove(prefix));
+                Err(Error::Api(ErrorCode::NotLeaderOrFollower))
+            }
+
+            Err(err) => Err(err.into()),
+        }
+    }
+
     /// Buffer `deflated` for a prefix-coalesced flush and await its assigned
     /// offset (#57). Like [`Self::enqueue_coalesced`] but keyed by the topition's
     /// connector prefix, so one buffer accumulates batches across every topic
@@ -2057,6 +2310,16 @@ impl DynoStore {
             return;
         }
 
+        // Fence first (#59): acquire/renew the single-writer lease before writing.
+        // A fenced writer fails here and never appends a segment; the parked
+        // producers get NotLeaderOrFollower and retry (routed to the live
+        // writer). On a fresh acquire this precedes offset recovery below, so a
+        // new writer recovers the tail before it writes (the handoff order).
+        let epoch = match self.acquire_or_renew_lease(prefix).await {
+            Ok(epoch) => epoch,
+            Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+        };
+
         // Group pending batches by topition (arrival order preserved within a
         // topition). BTreeMap gives a deterministic per-segment sub-stream order.
         let mut grouped: BTreeMap<Topition, Vec<usize>> = BTreeMap::new();
@@ -2108,7 +2371,7 @@ impl DynoStore {
         }
 
         let seq = match async {
-            let (payload, _footer) = self.encode_segment(&substreams)?;
+            let (payload, _footer) = self.encode_segment(&substreams, epoch)?;
             self.assign_and_create_segment(prefix, payload).await
         }
         .await
@@ -2843,12 +3106,15 @@ impl DynoStore {
     /// locates any sub-stream by footer lookup + a ranged GET of its byte span
     /// (#60) rather than deriving offsets from the filename. Each element is
     /// `(topition, base_offset, batches)`, where `base_offset` is the absolute
-    /// offset already assigned to the sub-stream's first record (#58). Empty
+    /// offset already assigned to the sub-stream's first record (#58).
+    /// `writer_epoch` is the producing writer's lease epoch (#59), stamped into
+    /// the footer so a fenced writer's segment is identifiable. Empty
     /// sub-streams are skipped. Returns the payload and the footer, which the
     /// writer keeps as the segment's in-memory index.
     fn encode_segment(
         &self,
         substreams: &[(Topition, i64, Vec<deflated::Batch>)],
+        writer_epoch: i64,
     ) -> Result<(PutPayload, SegmentFooter)> {
         let mut body = Vec::new();
         let mut entries = Vec::with_capacity(substreams.len());
@@ -2879,7 +3145,10 @@ impl DynoStore {
             });
         }
 
-        let footer = SegmentFooter { entries };
+        let footer = SegmentFooter {
+            writer_epoch,
+            entries,
+        };
         let footer_bytes = Self::encode_footer(&footer);
 
         body.extend_from_slice(&footer_bytes);
@@ -2891,12 +3160,14 @@ impl DynoStore {
         Ok((PutPayload::from(Bytes::from(body)), footer))
     }
 
-    /// Serialize a [`SegmentFooter`] index (#64). Each entry:
-    /// `topic_len (u16) + topic (utf8) + partition (i32) + base_offset (i64) +
-    /// record_count (i64) + byte_start (u64) + byte_len (u64) +
-    /// max_timestamp (i64)`, all big-endian. Paired with [`Self::decode_footer`].
+    /// Serialize a [`SegmentFooter`] index (#64/#59). Header: `writer_epoch
+    /// (i64)`. Then each entry: `topic_len (u16) + topic (utf8) +
+    /// partition (i32) + base_offset (i64) + record_count (i64) +
+    /// byte_start (u64) + byte_len (u64) + max_timestamp (i64)`, all big-endian.
+    /// Paired with [`Self::decode_footer`].
     fn encode_footer(footer: &SegmentFooter) -> Vec<u8> {
         let mut buf = Vec::new();
+        buf.extend_from_slice(&footer.writer_epoch.to_be_bytes());
         for entry in &footer.entries {
             let topic = entry.topic.as_bytes();
             buf.extend_from_slice(&(topic.len() as u16).to_be_bytes());
@@ -2927,6 +3198,8 @@ impl DynoStore {
             Ok(head)
         }
 
+        let writer_epoch = i64::from_be_bytes(take(&mut cursor, 8)?.try_into()?);
+
         for _ in 0..entry_count {
             let topic_len = u16::from_be_bytes(take(&mut cursor, 2)?.try_into()?) as usize;
             let topic = String::from_utf8(take(&mut cursor, topic_len)?.to_vec())
@@ -2949,7 +3222,10 @@ impl DynoStore {
             });
         }
 
-        Ok(SegmentFooter { entries })
+        Ok(SegmentFooter {
+            writer_epoch,
+            entries,
+        })
     }
 
     /// Recover the [`SegmentFooter`] of a segment given its tail bytes (#64):

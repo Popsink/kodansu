@@ -18,6 +18,8 @@
 //! from ~`(topics × flushes)` to ~`(connectors × flushes)` — while each
 //! `(topic, partition)` sub-stream keeps its own independent offset sequence.
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use futures::TryStreamExt as _;
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
@@ -215,20 +217,28 @@ async fn prefix_mode_off_uses_legacy_layout() -> Result<(), Error> {
 
 /// After a cold restart — a fresh process on the same bucket, so the in-memory
 /// offset counter is empty — each sub-stream resumes at the exact next offset,
-/// recovered from the tail segment footer (#58): no gap, no reuse.
+/// recovered from the tail segment footer (#58): no gap, no reuse. The new
+/// process takes over only once the previous writer's lease (#59) has lapsed
+/// (lease fencing bounds failover to one lease term after an unclean stop).
 #[tokio::test]
 async fn cold_restart_recovers_offsets_from_the_footer() -> Result<(), Error> {
+    let ttl = Duration::from_millis(150);
     let bucket = InMemory::new();
     let topic_a = "org.env.conn.tab_a";
     let a = Topition::new(topic_a, 0);
 
     // First process: two windows -> offsets 0 then 3 (5 records total).
     {
-        let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+        let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+            .prefix_coalesce(true)
+            .prefix_lease_ttl(ttl);
         create_topic(&store, topic_a).await?;
         assert_eq!(0, store.produce(None, &a, batch(3)?).await?);
         assert_eq!(3, store.produce(None, &a, batch(2)?).await?);
     }
+
+    // The lease lapses, so a takeover is allowed.
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
     // A fresh process on the same bucket: empty in-memory counters. The next
     // produce must continue at 5, recovered from the tail segment footer, and
@@ -239,4 +249,95 @@ async fn cold_restart_recovers_offsets_from_the_footer() -> Result<(), Error> {
     assert_eq!(3, segments(&bucket).await.len());
 
     Ok(())
+}
+
+/// Two writers contending for the same prefix: exactly one acquires the lease
+/// and appends; the other is fenced (NotLeaderOrFollower) and its produce fails
+/// (#59) — at most one writer per prefix, no coordinator.
+#[tokio::test]
+async fn two_writers_contend_one_is_fenced() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.tab_a";
+    let a = Topition::new(topic, 0);
+
+    let store1 = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    create_topic(&store1, topic).await?;
+    let store2 = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+
+    let (r1, r2) = tokio::join!(
+        store1.produce(None, &a, batch(1)?),
+        store2.produce(None, &a, batch(1)?),
+    );
+
+    let winners = [r1.is_ok(), r2.is_ok()]
+        .into_iter()
+        .filter(|ok| *ok)
+        .count();
+    assert_eq!(
+        1, winners,
+        "exactly one writer appends, the other is fenced"
+    );
+    assert_eq!(1, segments(&bucket).await.len(), "one segment written");
+
+    Ok(())
+}
+
+/// After a lease expires and a new writer takes it over (bumping the epoch), the
+/// old writer is a zombie: its next append is fenced by the etag CAS and never
+/// reaches storage (#59).
+#[tokio::test]
+async fn a_zombie_writer_is_fenced_after_takeover() -> Result<(), Error> {
+    let ttl = Duration::from_millis(80);
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.tab_a";
+    let a = Topition::new(topic, 0);
+
+    let old = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .prefix_lease_ttl(ttl);
+    create_topic(&old, topic).await?;
+    assert_eq!(0, old.produce(None, &a, batch(1)?).await?);
+
+    // The lease lapses.
+    tokio::time::sleep(Duration::from_millis(160)).await;
+
+    // A new writer takes over (epoch bumped), recovers offset 1 from the footer.
+    let new = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .prefix_lease_ttl(ttl);
+    assert_eq!(1, new.produce(None, &a, batch(1)?).await?);
+
+    // The old writer, now holding a stale lease, is fenced and cannot append.
+    let zombie = old.produce(None, &a, batch(1)?).await;
+    assert!(zombie.is_err(), "fenced zombie must not append");
+    assert_eq!(
+        2,
+        segments(&bucket).await.len(),
+        "only old+new segments, no zombie"
+    );
+
+    Ok(())
+}
+
+/// `prefix_owner_node` is a deterministic, order-independent pure assignment and
+/// removing a non-owner leaves the owner unchanged (rendezvous-hash stability).
+#[test]
+fn prefix_owner_is_deterministic_and_stable() {
+    use crate::dynostore::prefix_owner_node;
+
+    assert_eq!(None, prefix_owner_node("x", &[]));
+    assert_eq!(Some(111), prefix_owner_node("x", &[111]));
+
+    let nodes = [1, 2, 3, 4];
+    let owner = prefix_owner_node("org.env.conn", &nodes).expect("owner");
+    // Order-independent.
+    assert_eq!(
+        Some(owner),
+        prefix_owner_node("org.env.conn", &[4, 3, 2, 1])
+    );
+
+    // Removing a non-owner node keeps the owner.
+    let non_owner = nodes.into_iter().find(|n| *n != owner).unwrap();
+    let pruned: Vec<i32> = nodes.into_iter().filter(|n| *n != non_owner).collect();
+    assert_eq!(Some(owner), prefix_owner_node("org.env.conn", &pruned));
 }

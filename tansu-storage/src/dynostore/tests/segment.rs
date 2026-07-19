@@ -72,10 +72,11 @@ async fn round_trips_multiple_substreams() -> Result<(), Error> {
         (beta0.clone(), 900, vec![batch(4)?]),            // 4 records
     ];
 
-    let (payload, footer) = store.encode_segment(&substreams)?;
+    let (payload, footer) = store.encode_segment(&substreams, 7)?;
     let segment = Bytes::from(payload);
 
-    // The returned footer is the durable index.
+    // The returned footer is the durable index, stamped with the writer epoch.
+    assert_eq!(7, footer.writer_epoch);
     assert_eq!(3, footer.entries.len());
 
     let a0 = footer.get("alpha", 0).expect("alpha-0 entry");
@@ -126,7 +127,7 @@ async fn footer_recovered_from_tail_only() -> Result<(), Error> {
         (Topition::new("beta", 0), 10, vec![batch(2)?]),
     ];
 
-    let (payload, footer) = store.encode_segment(&substreams)?;
+    let (payload, footer) = store.encode_segment(&substreams, 0)?;
     let segment = Bytes::from(payload);
 
     // Trailer carries footer_len; a reader takes the last SEGMENT_TRAILER_LEN
