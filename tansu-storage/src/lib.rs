@@ -2351,6 +2351,17 @@ fn auto_topic_create(storage: &Url) -> AutoTopicCreate {
 /// / `batch_min_size`. Any absent or unparseable key is left as `None`, keeping
 /// that trigger at its [`DynoStore`] compile-time default — so omitting every
 /// key reproduces today's behaviour.
+/// Parse a boolean feature flag from the storage URL query string: `true` iff
+/// `key` is present and parses as `true` (an absent or unparseable value is
+/// `false`). Shared by the per-backend `produce_coalesce` / `prefix_coalesce`
+/// switches.
+#[cfg(feature = "dynostore")]
+fn url_flag(storage: &Url, key: &str) -> bool {
+    storage
+        .query_pairs()
+        .any(|(k, v)| k == key && v.as_ref().parse().unwrap_or(false))
+}
+
 #[cfg(feature = "dynostore")]
 fn coalesce_tuning(storage: &Url) -> CoalesceTuning {
     let mut tuning = CoalesceTuning::default();
@@ -2461,7 +2472,18 @@ impl Builder<i32, String, Url, Url> {
                     .query_pairs()
                     .any(|(k, v)| k == "produce_coalesce" && v.as_ref().parse().unwrap_or(false));
 
-                debug!(?minimum_size, ?maximum_delay, produce_coalesce);
+                // Prefix-coalesced "virtual topics" (#56/#63): coalesce per
+                // connector prefix into shared segments. Opt-in, off by default,
+                // and takes precedence over `produce_coalesce` for eligible
+                // batches.
+                let prefix_coalesce = url_flag(&self.storage, "prefix_coalesce");
+
+                debug!(
+                    ?minimum_size,
+                    ?maximum_delay,
+                    produce_coalesce,
+                    prefix_coalesce
+                );
 
                 AmazonS3Builder::from_env()
                     .with_bucket_name(bucket_name)
@@ -2490,6 +2512,7 @@ impl Builder<i32, String, Url, Url> {
                             .lake(self.lake_house.clone())
                             .auto_create(auto_topic_create(&self.storage))
                             .produce_coalesce(produce_coalesce)
+                            .prefix_coalesce(prefix_coalesce)
                             .coalesce_tuning(coalesce_tuning(&self.storage))
                     })
                     .map(|storage| {
@@ -2542,6 +2565,12 @@ impl Builder<i32, String, Url, Url> {
                     .query_pairs()
                     .any(|(k, v)| k == "produce_coalesce" && v.as_ref().parse().unwrap_or(false));
 
+                // Prefix-coalesced "virtual topics" (#56/#63). On GCS the read
+                // path is footer-only (no per-flush-mutated manifest) and the
+                // segment data objects are create-only, so this stays under the
+                // ~1/s/object mutation cap (#13) by construction.
+                let prefix_coalesce = url_flag(&self.storage, "prefix_coalesce");
+
                 GoogleCloudStorageBuilder::from_env()
                     .with_bucket_name(bucket_name)
                     // GCS caps updates to a single object at ~1 write/second; an
@@ -2574,6 +2603,7 @@ impl Builder<i32, String, Url, Url> {
                             .lake(self.lake_house.clone())
                             .auto_create(auto_topic_create(&self.storage))
                             .produce_coalesce(produce_coalesce)
+                            .prefix_coalesce(prefix_coalesce)
                             .coalesce_tuning(coalesce_tuning(&self.storage))
                     })
                     .map(|storage| {
@@ -2596,6 +2626,7 @@ impl Builder<i32, String, Url, Url> {
                     .produce_coalesce(self.storage.query_pairs().any(|(k, v)| {
                         k == "produce_coalesce" && v.as_ref().parse().unwrap_or(false)
                     }))
+                    .prefix_coalesce(url_flag(&self.storage, "prefix_coalesce"))
                     .coalesce_tuning(coalesce_tuning(&self.storage)),
             )
             .map(|storage| Box::new(storage) as Box<dyn Storage>)
@@ -3991,6 +4022,29 @@ mod tests {
         let topition = Topition::from_str("test-topic-0000000-eFC79C8-2147483647")?;
         assert_eq!("test-topic-0000000-eFC79C8", topition.topic());
         assert_eq!(i32::MAX, topition.partition());
+        Ok(())
+    }
+
+    #[cfg(feature = "dynostore")]
+    #[test]
+    fn url_flag_parses_prefix_coalesce() -> Result<()> {
+        assert!(url_flag(
+            &Url::parse("memory://tansu/?prefix_coalesce=true")?,
+            "prefix_coalesce"
+        ));
+        assert!(!url_flag(
+            &Url::parse("memory://tansu/?prefix_coalesce=false")?,
+            "prefix_coalesce"
+        ));
+        // Absent and unparseable both read as off, so default is off.
+        assert!(!url_flag(
+            &Url::parse("memory://tansu/")?,
+            "prefix_coalesce"
+        ));
+        assert!(!url_flag(
+            &Url::parse("memory://tansu/?prefix_coalesce=notabool")?,
+            "prefix_coalesce"
+        ));
         Ok(())
     }
 

@@ -79,6 +79,58 @@ and reduces checkpoint PUTs, though the gain is small unless you have many
 active idempotent producers (the object count scales with *distinct producers*,
 not partitions).
 
+## Prefix coalescing — virtual topics (`prefix_coalesce`)
+
+With `prefix_coalesce=true`, the broker coalesces per **connector prefix**
+(`org.env.conn` — the first three dotted components of a topic) rather than per
+partition (#56). The batches produced across *every* topic under a prefix within
+a linger window are flushed into one shared, immutable segment object:
+
+```
+clusters/{cluster}/prefixes/{org.env.conn}/segments/{seq:020}.seg
+```
+
+This is for **high topic fan-out** CDC (thousands of topics, a handful of events
+each per poll), where per-partition coalescing (`produce_coalesce`) still leaves
+one PUT per topic. Prefix coalescing collapses PUTs from ~`(topics × flushes)`
+to ~`(connectors × flushes)`, and serves fetch from the segment footer + a
+ranged GET, retiring the per-fetch `records/` LIST. Off by default; when on it
+takes precedence over `produce_coalesce` for eligible batches. Transactional,
+control and compacted batches always stay on the legacy per-object path, as do
+large **backfill/snapshot** batches (already S3-efficient and parallel, #62).
+
+Segments are keyed by a monotonic sequence, not by offset; each carries a
+self-describing footer with every `(topic, partition)` sub-stream's offset
+range, byte range and max timestamp. A single writer per prefix is enforced
+coordinator-free by an S3 conditional-write lease
+(`prefixes/{prefix}/lease.json`), and retention is whole-segment, per-prefix,
+under a uniform retention (the longest `retention.ms` among the prefix's topics).
+
+| Query param | Default | Meaning |
+|---|---|---|
+| `prefix_coalesce` | `false` | Coalesce per connector prefix into shared segments. |
+
+The linger / batch-count / byte thresholds are shared with `produce_coalesce`
+(`coalesce_linger` / `coalesce_batches` / `coalesce_bytes`, above).
+
+**GCS:** safe by construction. The segment data objects are create-only
+(immutable) and the read path is footer-only (no per-flush-mutated manifest), so
+nothing on the produce or fetch hot path mutates a hot object — the ~1/s/object
+mutation cap (#13) is never approached. The only mutated control object is the
+per-prefix lease, which renews about once per lease term (≫ 1 s), never per
+flush.
+
+**Migration / coexistence:** a topic created before the flag keeps its per-topic
+`records/` objects; once opted in, new data goes to segments and the old objects
+stay readable until retention drains them. A fetch spanning the cutover stitches
+the legacy region and the segment region into one continuous offset sequence.
+Default off is byte-for-byte the current behaviour.
+
+**External S3-direct readers** must understand the segment frame + footer to read
+a coalesced prefix; the format is the published contract (see
+`docs/virtual-topics-format.md`), tracked for the reference reader in
+kotatsu#82.
+
 ## Coalescing vs the `batch_*` request batcher
 
 There are two independent write-batching paths; **enable one or the other, not
