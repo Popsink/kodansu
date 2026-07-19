@@ -126,6 +126,13 @@ stay readable until retention drains them. A fetch spanning the cutover stitches
 the legacy region and the segment region into one continuous offset sequence.
 Default off is byte-for-byte the current behaviour.
 
+**Single-broker for now.** Single-writer-per-prefix is enforced by the S3 lease,
+but the produce-routing layer that would send a fenced writer's retry to the
+owning broker (`consistent_hash(prefix) → broker`) is not yet implemented. Until
+it is, enable `prefix_coalesce` only on single-broker deployments (Tansu's
+default node model); on multiple brokers a producer landing on a non-owner would
+be fenced persistently.
+
 **External S3-direct readers** must understand the segment frame + footer to read
 a coalesced prefix; the format is the published contract (see
 `docs/virtual-topics-format.md`), tracked for the reference reader in

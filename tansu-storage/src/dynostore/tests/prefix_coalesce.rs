@@ -25,13 +25,13 @@ use futures::TryStreamExt as _;
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
 use tansu_sans_io::{
     IsolationLevel, ListOffset,
-    create_topics_request::CreatableTopic,
+    create_topics_request::{CreatableTopic, CreatableTopicConfig},
     record::{Record, deflated, inflated},
 };
 
 use crate::{
     Error, Result, Storage, Topition,
-    dynostore::{CoalesceTuning, DynoStore, SegmentFooter},
+    dynostore::{CoalesceTuning, DynoStore, SegmentFooter, SubstreamEntry},
 };
 
 const CLUSTER: &str = "tansu";
@@ -97,6 +97,33 @@ async fn create_topic(storage: &DynoStore, name: &str) -> Result<()> {
         )
         .await?;
 
+    Ok(())
+}
+
+async fn create_topic_with_configs(
+    storage: &DynoStore,
+    name: &str,
+    configs: &[(&str, &str)],
+) -> Result<()> {
+    let configs: Vec<CreatableTopicConfig> = configs
+        .iter()
+        .map(|(k, v)| {
+            CreatableTopicConfig::default()
+                .name((*k).to_owned())
+                .value(Some((*v).to_owned()))
+        })
+        .collect();
+    _ = storage
+        .create_topic(
+            CreatableTopic::default()
+                .name(name.into())
+                .num_partitions(1)
+                .replication_factor(1)
+                .assignments(Some([].into()))
+                .configs(Some(configs)),
+            false,
+        )
+        .await?;
     Ok(())
 }
 
@@ -689,6 +716,176 @@ async fn backfill_then_cdc_is_continuous() -> Result<(), Error> {
         .sum();
     assert_eq!(1003, total);
     assert_eq!(0, fetched.first().map(|b| b.base_offset).unwrap());
+
+    Ok(())
+}
+
+/// Epoch fencing on read (#59 review fix): when two segments' offset ranges
+/// overlap (only a fenced/zombie writer produces that), the higher writer_epoch
+/// wins and the stale one is dropped; non-overlapping legitimate history is
+/// kept.
+#[tokio::test]
+async fn epoch_fencing_drops_stale_overlapping_segment() -> Result<(), Error> {
+    let store = DynoStore::new(CLUSTER, NODE, InMemory::new()).prefix_coalesce(true);
+    let topic = "org.env.conn.tab_a";
+
+    let entry = |base: i64, count: i64| SubstreamEntry {
+        topic: topic.to_owned(),
+        partition: 0,
+        base_offset: base,
+        record_count: count,
+        byte_start: 0,
+        byte_len: 8,
+        max_timestamp: 0,
+    };
+    let footer = |epoch: i64, base: i64, count: i64| SegmentFooter {
+        writer_epoch: epoch,
+        entries: vec![entry(base, count)],
+    };
+
+    // seq0 epoch1 [0,10) — legit history.
+    store.index_insert(PREFIX, 0, footer(1, 0, 10))?;
+    // seq1 epoch2 [10,20) — the new writer after a takeover (contiguous, kept).
+    store.index_insert(PREFIX, 1, footer(2, 10, 10))?;
+    // seq2 epoch1 [10,20) — a zombie overlapping seq1 with the OLD epoch.
+    store.index_insert(PREFIX, 2, footer(1, 10, 10))?;
+
+    let valid = store.valid_substream_segments(PREFIX, topic, 0)?;
+    let seqs: Vec<u64> = valid.iter().map(|(seq, _)| *seq).collect();
+    assert_eq!(vec![0, 1], seqs, "zombie seq2 dropped, higher epoch wins");
+
+    Ok(())
+}
+
+/// A large batch arriving AFTER the sub-stream is segmented must coalesce, not
+/// bypass to legacy (#62 review fix) — otherwise it would write records/ above
+/// segments and break the seam.
+#[tokio::test]
+async fn large_batch_after_segmentation_coalesces() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    // A small batch segments the sub-stream, then a large one arrives.
+    assert_eq!(0, store.produce(None, &a, batch(1)?).await?);
+    let big = store.produce(None, &a, batch(1_000)?).await?;
+    assert_eq!(1, big, "continues in a segment, no offset break");
+
+    let records = Path::from(format!(
+        "clusters/{CLUSTER}/topics/{topic}/partitions/{:0>10}/records/",
+        0
+    ));
+    let legacy = bucket
+        .list(Some(&records))
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("list records")
+        .len();
+    assert_eq!(0, legacy, "no legacy object written after segmentation");
+    assert_eq!(2, segments(&bucket).await.len());
+
+    Ok(())
+}
+
+/// After retention drains every segment, a restart must not reuse offsets: the
+/// per-sub-stream floor persisted before deletion keeps the next offset (#61
+/// review fix).
+#[tokio::test]
+async fn full_drain_then_restart_keeps_offset() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.tab_a";
+    let a = Topition::new(topic, 0);
+
+    {
+        let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+            .prefix_coalesce(true)
+            .prefix_lease_ttl(Duration::from_millis(80));
+        create_topic(&store, topic).await?;
+        assert_eq!(0, store.produce(None, &a, batch_at(1, 1_000)?).await?);
+        assert_eq!(1, store.produce(None, &a, batch_at(1, 2_000)?).await?);
+
+        // Expire everything (threshold far in the future) → both segments gone.
+        let deleted = store.expire_prefix_segments(PREFIX, now_ms()).await?;
+        assert_eq!(2, deleted);
+        assert!(segments(&bucket).await.is_empty());
+    }
+
+    // Let the previous holder's lease lapse so the restart can take over.
+    tokio::time::sleep(Duration::from_millis(160)).await;
+
+    // Fresh process: no in-memory state, no segments, legacy drained. The next
+    // offset must still be 2 (recovered from the persisted floor), not 0.
+    let restarted = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let resumed = restarted.produce(None, &a, batch(1)?).await?;
+    assert_eq!(2, resumed, "no offset reuse after a full retention drain");
+
+    Ok(())
+}
+
+/// A byte-budget-limited hybrid fetch must not jump into segments and skip the
+/// unserved legacy tail — it returns only the legacy prefix, contiguous (#60
+/// review fix).
+#[tokio::test]
+async fn hybrid_fetch_budget_limited_does_not_skip_legacy() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.tab_a";
+    let a = Topition::new(topic, 0);
+
+    // Legacy [0,5): two batches. Then a segment at [5,9).
+    {
+        let legacy = DynoStore::new(CLUSTER, NODE, bucket.clone());
+        create_topic(&legacy, topic).await?;
+        assert_eq!(0, legacy.produce(None, &a, batch(3)?).await?);
+        assert_eq!(3, legacy.produce(None, &a, batch(2)?).await?);
+    }
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    assert_eq!(5, store.produce(None, &a, batch(4)?).await?);
+
+    // max_bytes=1 stops the legacy read after the first batch (base 0). The fetch
+    // must NOT append the segment [5,9) — that would skip legacy [3,5).
+    let fetched = store
+        .fetch(
+            &a,
+            0,
+            0,
+            1,
+            IsolationLevel::ReadUncommitted,
+            Duration::from_millis(200),
+        )
+        .await?;
+    assert!(
+        fetched.iter().all(|b| b.base_offset < 5),
+        "no segment data before the legacy tail is served"
+    );
+    assert_eq!(Some(0), fetched.first().map(|b| b.base_offset));
+
+    Ok(())
+}
+
+/// `retention.ms=-1` (retain forever) must keep every segment, not delete them
+/// all (#61 review fix for the -1 parse).
+#[tokio::test]
+async fn retention_forever_keeps_segments() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let topic = "org.env.conn.tab_a";
+    create_topic_with_configs(
+        &store,
+        topic,
+        &[("cleanup.policy", "delete"), ("retention.ms", "-1")],
+    )
+    .await?;
+    let a = Topition::new(topic, 0);
+
+    // An ancient segment that a positive retention would delete.
+    _ = store.produce(None, &a, batch_at(2, 1_000)?).await?;
+    assert_eq!(1, segments(&bucket).await.len());
+
+    let deleted = store.policy_delete(std::time::SystemTime::now()).await?;
+    assert_eq!(0, deleted, "retain-forever deletes nothing");
+    assert_eq!(1, segments(&bucket).await.len());
 
     Ok(())
 }
