@@ -55,6 +55,35 @@ fn batch(records: usize) -> Result<deflated::Batch> {
         .map_err(Into::into)
 }
 
+/// A `records`-record batch stamped with `max_timestamp` (for retention #61).
+fn batch_at(records: usize, max_timestamp: i64) -> Result<deflated::Batch> {
+    let mut builder = inflated::Batch::builder();
+
+    for i in 0..records {
+        builder = builder.record(Record::builder().value(Some(Bytes::copy_from_slice(
+            format!("record-{i}").as_bytes(),
+        ))));
+    }
+
+    builder
+        .last_offset_delta(records as i32 - 1)
+        .base_timestamp(max_timestamp)
+        .max_timestamp(max_timestamp)
+        .build()
+        .and_then(deflated::Batch::try_from)
+        .map_err(Into::into)
+}
+
+fn now_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(i64::MAX)
+}
+
 async fn create_topic(storage: &DynoStore, name: &str) -> Result<()> {
     _ = storage
         .create_topic(
@@ -496,6 +525,64 @@ async fn hybrid_fetch_stitches_legacy_and_segment() -> Result<(), Error> {
         )
         .await?;
     assert_eq!(Some(9), latest[0].1.offset, "high watermark spans the seam");
+
+    Ok(())
+}
+
+/// Whole-segment retention (#61): a segment all of whose records are past the
+/// threshold is deleted; a segment with any recent record survives.
+#[tokio::test]
+async fn expires_aged_segments_keeps_recent_ones() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    let recent = now_ms();
+    // Two windows -> two segments: one ancient, one recent.
+    _ = store.produce(None, &a, batch_at(2, 1_000)?).await?;
+    _ = store.produce(None, &a, batch_at(2, recent)?).await?;
+    assert_eq!(2, segments(&bucket).await.len());
+
+    // Threshold just below the recent record: the ancient segment expires, the
+    // recent one survives.
+    let deleted = store.expire_prefix_segments(PREFIX, recent - 1_000).await?;
+    assert_eq!(1, deleted);
+    assert_eq!(1, segments(&bucket).await.len());
+
+    Ok(())
+}
+
+/// A shared segment is kept while *any* of its sub-streams is still live (#61):
+/// whole-segment expiry never drops a segment a live topic still needs.
+#[tokio::test]
+async fn keeps_a_segment_while_any_substream_is_live() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+
+    let topic_a = "org.env.conn.tab_a";
+    let topic_b = "org.env.conn.tab_b";
+    create_topic(&store, topic_a).await?;
+    create_topic(&store, topic_b).await?;
+    let a = Topition::new(topic_a, 0);
+    let b = Topition::new(topic_b, 0);
+
+    let recent = now_ms();
+    // One window, one segment: A ancient, B recent.
+    let (ra, rb) = tokio::join!(
+        store.produce(None, &a, batch_at(1, 1_000)?),
+        store.produce(None, &b, batch_at(1, recent)?),
+    );
+    _ = ra?;
+    _ = rb?;
+    assert_eq!(1, segments(&bucket).await.len());
+
+    // Even though A's records are ancient, B is live, so the shared segment stays.
+    let deleted = store.expire_prefix_segments(PREFIX, recent - 1_000).await?;
+    assert_eq!(0, deleted);
+    assert_eq!(1, segments(&bucket).await.len());
 
     Ok(())
 }

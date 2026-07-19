@@ -177,6 +177,13 @@ pub struct DynoStore {
     /// after a restart, and independent per maintain node.
     oldest_retained: Arc<Mutex<BTreeMap<Topition, i64>>>,
 
+    /// Per-*prefix* analogue of [`Self::oldest_retained`] for whole-segment
+    /// retention (#61): the oldest surviving segment's age (ms) observed at the
+    /// last scan, letting the maintenance loop skip the `segments/` LIST of a
+    /// prefix whose oldest segment is still within retention. Same lower-bound
+    /// soundness as the per-partition hint. In-memory only.
+    oldest_retained_prefix: Arc<Mutex<BTreeMap<String, i64>>>,
+
     /// When set, the produce path buffers batches per partition and flushes them
     /// as one coalesced `records/` object per linger window (#50), cutting the
     /// PUT (and matching fetch GET) count on small-batch workloads. Off by
@@ -772,6 +779,7 @@ impl DynoStore {
             producers: Arc::new(Mutex::new(BTreeMap::new())),
             producer_checkpoints: Arc::new(Mutex::new(BTreeMap::new())),
             oldest_retained: Arc::new(Mutex::new(BTreeMap::new())),
+            oldest_retained_prefix: Arc::new(Mutex::new(BTreeMap::new())),
             produce_coalesce: false,
             coalesce: Arc::new(Mutex::new(BTreeMap::new())),
             prefix_coalesce: false,
@@ -2969,6 +2977,13 @@ impl DynoStore {
             }
         }
 
+        // Prefix-coalesced data lives in shared segments, not `records/` (the
+        // per-partition loop above only drains a hybrid topic's legacy region);
+        // expire whole segments per prefix (#61).
+        if self.prefix_coalesce {
+            deleted += self.policy_delete_segments(now_ms).await?;
+        }
+
         Ok(deleted)
     }
 
@@ -3007,6 +3022,175 @@ impl DynoStore {
                     _ = locked.remove(topition);
                 }
             })
+    }
+
+    /// Whether a prefix might hold a segment older than `threshold_ms`, from the
+    /// per-prefix oldest-retained hint (#61, the per-prefix analogue of
+    /// [`Self::partition_maybe_expirable`]). `true` (must scan) when unknown.
+    fn prefix_maybe_expirable(&self, prefix: &str, threshold_ms: i64) -> Result<bool> {
+        self.oldest_retained_prefix
+            .lock()
+            .map_err(Into::into)
+            .map(|locked| {
+                locked
+                    .get(prefix)
+                    .is_none_or(|oldest| *oldest < threshold_ms)
+            })
+    }
+
+    /// Update the per-prefix oldest-retained hint after a segment scan (#61).
+    fn record_prefix_oldest_retained(&self, prefix: &str, oldest_ms: Option<i64>) -> Result<()> {
+        self.oldest_retained_prefix
+            .lock()
+            .map_err(Into::into)
+            .map(|mut locked| match oldest_ms {
+                Some(ms) => {
+                    _ = locked.insert(prefix.to_owned(), ms);
+                }
+                None => {
+                    _ = locked.remove(prefix);
+                }
+            })
+    }
+
+    /// Delete every segment under `prefix` whose records are all older than
+    /// `threshold_ms` (#61). A segment is written atomically, so all its
+    /// sub-streams share an append time; it is expirable only when the newest
+    /// record across **every** sub-stream (the max footer timestamp, falling back
+    /// to the object's append time when record timestamps are unset) is past the
+    /// threshold — never dropping a segment while any topic in it is still live.
+    /// Deletes in bounded `DeleteObjects` chunks and refreshes the per-prefix
+    /// skip hint from what survived.
+    async fn expire_prefix_segments(&self, prefix: &str, threshold_ms: i64) -> Result<u64> {
+        /// Matches the S3 `DeleteObjects` per-request key cap.
+        const EXPIRE_DELETE_CHUNK: usize = 1_000;
+
+        let listing = self.segment_prefix(prefix);
+        let mut list_stream = self.object_store.list(Some(&listing));
+
+        let mut chunk: Vec<Path> = Vec::new();
+        let mut surviving_oldest_ms: Option<i64> = None;
+        let mut deleted: u64 = 0;
+
+        while let Some(meta) = list_stream
+            .next()
+            .await
+            .transpose()
+            .inspect_err(|err| error!(?err, prefix))?
+        {
+            let Some(footer) = self.read_segment_footer(&meta.location).await? else {
+                continue;
+            };
+
+            // Newest record across all sub-streams; append time when the record
+            // timestamps are unset (<= 0).
+            let newest = footer
+                .entries
+                .iter()
+                .map(|entry| entry.max_timestamp)
+                .max()
+                .unwrap_or(i64::MIN);
+            let age_ms = if newest > 0 {
+                newest
+            } else {
+                meta.last_modified.timestamp_millis()
+            };
+
+            if age_ms < threshold_ms {
+                chunk.push(meta.location);
+
+                if chunk.len() >= EXPIRE_DELETE_CHUNK {
+                    deleted += chunk.len() as u64;
+                    self.delete_batches(std::mem::take(&mut chunk)).await?;
+                }
+            } else {
+                surviving_oldest_ms =
+                    Some(surviving_oldest_ms.map_or(age_ms, |oldest| oldest.min(age_ms)));
+            }
+        }
+
+        if !chunk.is_empty() {
+            deleted += chunk.len() as u64;
+            self.delete_batches(chunk).await?;
+        }
+
+        self.record_prefix_oldest_retained(prefix, surviving_oldest_ms)?;
+
+        Ok(deleted)
+    }
+
+    /// Whole-segment retention across all coalesced prefixes (#61). Groups the
+    /// delete-policy topics by connector prefix and expires each prefix's
+    /// segments under one **uniform** retention — the longest `retention.ms`
+    /// among the prefix's topics, so a per-topic override can never delete a
+    /// shared segment early (heterogeneous per-topic retention is not honoured in
+    /// coalesced mode, per the epic; the longest wins). Compacted topics never
+    /// reach segments (they stay on the legacy path at produce), so they are
+    /// excluded here.
+    async fn policy_delete_segments(&self, now_ms: i64) -> Result<u64> {
+        const DEFAULT_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+
+        let mut retention_by_prefix: BTreeMap<String, i64> = BTreeMap::new();
+
+        for metadata in self.topics_index().await?.iter() {
+            let configs = metadata.topic.configs.as_deref().unwrap_or_default();
+
+            let delete = configs.iter().any(|config| {
+                config.name == "cleanup.policy"
+                    && config
+                        .value
+                        .as_deref()
+                        .is_some_and(|value| value.contains("delete"))
+            });
+            let compact = configs.iter().any(|config| {
+                config.name == "cleanup.policy"
+                    && config
+                        .value
+                        .as_deref()
+                        .is_some_and(|value| value.contains("compact"))
+            });
+
+            if !delete || compact {
+                continue;
+            }
+
+            let retention_ms = configs
+                .iter()
+                .find(|config| config.name == "retention.ms")
+                .and_then(|config| config.value.as_deref())
+                .and_then(|value| i64::from_str(value).ok())
+                .unwrap_or(DEFAULT_RETENTION_MS);
+
+            for partition in 0..metadata.topic.num_partitions {
+                let prefix = self.prefix_of(&Topition::new(metadata.topic.name.clone(), partition));
+
+                _ = retention_by_prefix
+                    .entry(prefix)
+                    .and_modify(|existing| {
+                        if retention_ms > *existing {
+                            *existing = retention_ms;
+                        }
+                    })
+                    .or_insert(retention_ms);
+            }
+        }
+
+        let mut deleted = 0;
+
+        for (prefix, retention_ms) in retention_by_prefix {
+            let threshold_ms = now_ms.saturating_sub(retention_ms);
+
+            if !self.prefix_maybe_expirable(&prefix, threshold_ms)? {
+                continue;
+            }
+
+            deleted += self
+                .expire_prefix_segments(&prefix, threshold_ms)
+                .await
+                .inspect_err(|err| error!(?err, prefix))?;
+        }
+
+        Ok(deleted)
     }
 
     /// List the batch files of `topition` as a map of base offset to its object
