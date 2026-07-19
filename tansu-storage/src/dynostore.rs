@@ -1019,6 +1019,15 @@ impl DynoStore {
     /// — while a crashed holder blocks a takeover for at most one term.
     const PREFIX_LEASE_TTL: Duration = Duration::from_secs(10);
 
+    /// A batch this large bypasses the prefix segment buffer and takes the legacy
+    /// per-object create path (#62 backfill). CDC steady-state batches fan a
+    /// handful of events per topition (well below this) and coalesce into
+    /// segments; a snapshot's bulk batches are already S3-efficient alone and
+    /// take the parallel create path. Between the two regimes by a wide margin,
+    /// so the exact value only shifts a throughput/PUT tradeoff, never
+    /// correctness.
+    const PREFIX_BACKFILL_MIN_RECORDS: i64 = 1_000;
+
     /// All topics, served from the in-memory [`TopicIndex`]. Returns the shared
     /// snapshot if fresh; otherwise refreshes it (single-flight) by LISTing the
     /// `topic-metadata/` prefix and GETting only the objects whose etag changed.
@@ -4335,7 +4344,20 @@ impl Storage for DynoStore {
 
             if coalesce_eligible {
                 if self.prefix_coalesce {
-                    return self.enqueue_prefix_coalesced(topition, deflated).await;
+                    // Backfill high-throughput bypass (#62): a snapshot streams a
+                    // whole table to one partition in large batches that are
+                    // already S3-efficient on their own (~thousands of events per
+                    // PUT), and it wants the parallelism single-writer segments
+                    // cap. So a large batch bypasses the segment buffer and takes
+                    // the legacy per-(topic,partition) create path below — which is
+                    // also lock-free/parallel (the create-race, no lease). The CDC
+                    // steady state (small batches) coalesces into segments; the
+                    // offset continues across the seam (#58) and reads stitch via
+                    // the hybrid path (#60), so snapshot→streaming has no gap.
+                    let records = deflated.last_offset_delta as i64 + 1;
+                    if records < Self::PREFIX_BACKFILL_MIN_RECORDS {
+                        return self.enqueue_prefix_coalesced(topition, deflated).await;
+                    }
                 } else if self.produce_coalesce {
                     return self.enqueue_coalesced(topition, deflated).await;
                 }

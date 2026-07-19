@@ -587,6 +587,74 @@ async fn keeps_a_segment_while_any_substream_is_live() -> Result<(), Error> {
     Ok(())
 }
 
+/// A large backfill batch bypasses the segment buffer and takes the legacy
+/// per-object path (#62): already S3-efficient, and parallel (no lease).
+#[tokio::test]
+async fn a_large_backfill_batch_bypasses_coalescing() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    // 1000 records >= the backfill threshold -> bypass to a records/ object.
+    let offset = store.produce(None, &a, batch(1_000)?).await?;
+    assert_eq!(0, offset);
+
+    assert!(
+        segments(&bucket).await.is_empty(),
+        "backfill must not write a segment"
+    );
+
+    let records = Path::from(format!(
+        "clusters/{CLUSTER}/topics/{topic}/partitions/{:0>10}/records/",
+        0
+    ));
+    let count = bucket
+        .list(Some(&records))
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("list records")
+        .len();
+    assert_eq!(1, count, "one backfill batch object");
+
+    Ok(())
+}
+
+/// Snapshot → streaming: a backfill (legacy objects) followed by CDC (segments)
+/// keeps one continuous offset sequence with no gap/duplicate, and a fetch
+/// stitches both (#62 handoff over #58 seam / #60 hybrid).
+#[tokio::test]
+async fn backfill_then_cdc_is_continuous() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    // Backfill: one bulk batch of 1000 records -> legacy object, offsets [0, 1000).
+    assert_eq!(0, store.produce(None, &a, batch(1_000)?).await?);
+
+    // CDC steady state resumes: a small batch coalesces into a segment, and it
+    // must continue at 1000 (no gap/overlap at the snapshot→streaming seam).
+    let cdc = store.produce(None, &a, batch(3)?).await?;
+    assert_eq!(1000, cdc, "streaming continues from the backfill tail");
+    assert_eq!(1, segments(&bucket).await.len());
+
+    // A fetch from 0 stitches backfill + CDC: 1003 records, continuous.
+    let fetched = fetch_from(&store, &a, 0).await?;
+    let total: i64 = fetched
+        .iter()
+        .map(|batch| batch.last_offset_delta as i64 + 1)
+        .sum();
+    assert_eq!(1003, total);
+    assert_eq!(0, fetched.first().map(|b| b.base_offset).unwrap());
+
+    Ok(())
+}
+
 /// `prefix_owner_node` is a deterministic, order-independent pure assignment and
 /// removing a non-owner leaves the owner unchanged (rendezvous-hash stability).
 #[test]
