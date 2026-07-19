@@ -24,6 +24,7 @@ use bytes::Bytes;
 use futures::TryStreamExt as _;
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
 use tansu_sans_io::{
+    IsolationLevel, ListOffset,
     create_topics_request::CreatableTopic,
     record::{Record, deflated, inflated},
 };
@@ -315,6 +316,186 @@ async fn a_zombie_writer_is_fenced_after_takeover() -> Result<(), Error> {
         segments(&bucket).await.len(),
         "only old+new segments, no zombie"
     );
+
+    Ok(())
+}
+
+async fn fetch_from(store: &DynoStore, tp: &Topition, offset: i64) -> Result<Vec<deflated::Batch>> {
+    store
+        .fetch(
+            tp,
+            offset,
+            0,
+            100_000,
+            IsolationLevel::ReadUncommitted,
+            Duration::from_millis(200),
+        )
+        .await
+}
+
+/// A consumer of one topic reads exactly its own records out of a shared
+/// segment via a ranged GET — correct offsets, no cross-topic data (#60).
+#[tokio::test]
+async fn fetch_reads_only_its_topition_from_a_shared_segment() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+
+    let topic_a = "org.env.conn.tab_a";
+    let topic_b = "org.env.conn.tab_b";
+    create_topic(&store, topic_a).await?;
+    create_topic(&store, topic_b).await?;
+    let a = Topition::new(topic_a, 0);
+    let b = Topition::new(topic_b, 0);
+
+    // One window, one shared segment: A=5 records, B=4 records.
+    let (ra, rb) = tokio::join!(
+        store.produce(None, &a, batch(5)?),
+        store.produce(None, &b, batch(4)?),
+    );
+    _ = ra?;
+    _ = rb?;
+    assert_eq!(1, segments(&bucket).await.len());
+
+    // A reads its 5 records from offset 0 — only A's bytes.
+    let fa = fetch_from(&store, &a, 0).await?;
+    let a_records: i64 = fa
+        .iter()
+        .map(|batch| batch.last_offset_delta as i64 + 1)
+        .sum();
+    assert_eq!(5, a_records, "A reads exactly its own records");
+    assert_eq!(0, fa[0].base_offset);
+
+    // B reads its 4 records from offset 0 — only B's bytes, independent offsets.
+    let fb = fetch_from(&store, &b, 0).await?;
+    let b_records: i64 = fb
+        .iter()
+        .map(|batch| batch.last_offset_delta as i64 + 1)
+        .sum();
+    assert_eq!(4, b_records, "B reads exactly its own records");
+    assert_eq!(0, fb[0].base_offset);
+
+    Ok(())
+}
+
+/// A fresh reader process (empty in-memory hint) fetches from segments: it
+/// recovers the high watermark footer-only and returns the records (#60/#58).
+#[tokio::test]
+async fn a_fresh_reader_fetches_from_segments() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let topic_a = "org.env.conn.tab_a";
+    let a = Topition::new(topic_a, 0);
+
+    {
+        let writer = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+        create_topic(&writer, topic_a).await?;
+        assert_eq!(0, writer.produce(None, &a, batch(3)?).await?);
+    }
+
+    // Fresh reader: no cached hint, no lease — read path only.
+    let reader = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+
+    let latest = reader
+        .list_offsets(
+            IsolationLevel::ReadUncommitted,
+            &[(a.clone(), ListOffset::Latest)],
+        )
+        .await?;
+    assert_eq!(Some(3), latest[0].1.offset, "high watermark recovered");
+
+    let earliest = reader
+        .list_offsets(
+            IsolationLevel::ReadUncommitted,
+            &[(a.clone(), ListOffset::Earliest)],
+        )
+        .await?;
+    assert_eq!(Some(0), earliest[0].1.offset, "log start from footer");
+
+    let fetched = fetch_from(&reader, &a, 0).await?;
+    let records: i64 = fetched
+        .iter()
+        .map(|batch| batch.last_offset_delta as i64 + 1)
+        .sum();
+    assert_eq!(3, records, "fresh reader returns the records");
+
+    Ok(())
+}
+
+/// Seam continuity (#58): a topic with existing legacy `records/{offset}.batch`
+/// data flipped to segment mode continues its offset sequence unbroken — the
+/// first segment offset equals the legacy tail, no gap/overlap/off-by-one.
+#[tokio::test]
+async fn first_segment_continues_from_the_legacy_tail() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.tab_a";
+    let a = Topition::new(topic, 0);
+
+    // Legacy phase (prefix mode off): per-batch records/ objects, tail -> 5.
+    {
+        let legacy = DynoStore::new(CLUSTER, NODE, bucket.clone());
+        create_topic(&legacy, topic).await?;
+        assert_eq!(0, legacy.produce(None, &a, batch(3)?).await?);
+        assert_eq!(3, legacy.produce(None, &a, batch(2)?).await?);
+    }
+
+    // Cutover to segment mode: the first segment must start at the legacy tail.
+    let seg = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let first = seg.produce(None, &a, batch(4)?).await?;
+    assert_eq!(
+        5, first,
+        "first segment offset == legacy tail, no gap/overlap"
+    );
+
+    Ok(())
+}
+
+/// Hybrid reads (#60): a topic with `[0, C)` legacy objects and `[C, ∞)`
+/// segments serves both layouts, a single fetch spanning `C` stitches them with
+/// a continuous offset sequence, and earliest/high_watermark span both layouts.
+#[tokio::test]
+async fn hybrid_fetch_stitches_legacy_and_segment() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.tab_a";
+    let a = Topition::new(topic, 0);
+
+    // Legacy [0, 5): batch(3)@0, batch(2)@3.
+    {
+        let legacy = DynoStore::new(CLUSTER, NODE, bucket.clone());
+        create_topic(&legacy, topic).await?;
+        assert_eq!(0, legacy.produce(None, &a, batch(3)?).await?);
+        assert_eq!(3, legacy.produce(None, &a, batch(2)?).await?);
+    }
+
+    // Segment [5, 9): batch(4)@5 (continues from the seam).
+    let seg = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    assert_eq!(5, seg.produce(None, &a, batch(4)?).await?);
+
+    // A single fetch from 0 stitches legacy + segment: 9 records, base offsets
+    // 0, 3, 5, contiguous across the seam at C=5, no gap/duplicate/reorder.
+    let fetched = fetch_from(&seg, &a, 0).await?;
+    let bases: Vec<i64> = fetched.iter().map(|batch| batch.base_offset).collect();
+    assert_eq!(vec![0, 3, 5], bases, "legacy then segment, continuous");
+    let total: i64 = fetched
+        .iter()
+        .map(|batch| batch.last_offset_delta as i64 + 1)
+        .sum();
+    assert_eq!(9, total, "all records across the seam");
+
+    // earliest follows the legacy objects; high watermark spans both layouts.
+    let earliest = seg
+        .list_offsets(
+            IsolationLevel::ReadUncommitted,
+            &[(a.clone(), ListOffset::Earliest)],
+        )
+        .await?;
+    assert_eq!(Some(0), earliest[0].1.offset, "earliest from legacy");
+
+    let latest = seg
+        .list_offsets(
+            IsolationLevel::ReadUncommitted,
+            &[(a.clone(), ListOffset::Latest)],
+        )
+        .await?;
+    assert_eq!(Some(9), latest[0].1.offset, "high watermark spans the seam");
 
     Ok(())
 }

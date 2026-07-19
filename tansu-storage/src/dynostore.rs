@@ -221,6 +221,16 @@ pub struct DynoStore {
     /// path). Consulted before every prefix flush to fence a stale writer.
     prefix_leases: Arc<Mutex<BTreeMap<String, HeldLease>>>,
 
+    /// Whether a topition still has legacy `records/` objects, cached to keep the
+    /// prefix-coalesced read path off a per-fetch `records/` LIST (#60). A topic
+    /// flipped to segment mode mid-life is a *hybrid*: `[0, C)` legacy objects,
+    /// `[C, ∞)` segments; its fetch must serve both. A greenfield prefix has no
+    /// legacy objects and must not pay that LIST. `records/` only shrinks under
+    /// prefix mode (produce goes to segments), so a `false` is permanent and a
+    /// `true` stays hybrid until retention drains it — checked at most once, then
+    /// served from memory (GCS-safe: no per-flush object).
+    legacy_records_present: Arc<Mutex<BTreeMap<Topition, bool>>>,
+
     /// This writer's identity, recorded in the lease `holder` field (#59) for
     /// observability. Unique per process instance so two brokers (or two test
     /// stores) are distinguishable.
@@ -768,6 +778,7 @@ impl DynoStore {
             prefix_coalesce_buffers: Arc::new(Mutex::new(BTreeMap::new())),
             segment_seqs: Arc::new(Mutex::new(BTreeMap::new())),
             prefix_leases: Arc::new(Mutex::new(BTreeMap::new())),
+            legacy_records_present: Arc::new(Mutex::new(BTreeMap::new())),
             writer_id: format!(
                 "{node}-{}",
                 WRITER_INSTANCE.fetch_add(1, atomic::Ordering::Relaxed)
@@ -1601,6 +1612,19 @@ impl DynoStore {
             return Ok(hint.max(from_watermark));
         }
 
+        // Prefix-coalesced (#60): the tail offset lives in the segment footers,
+        // not in a `records/` listing (there is none). Recover it footer-only
+        // (#58) and refresh the hint so the hot path serves from memory next
+        // time. GCS-safe: no per-flush-mutated manifest is read.
+        if self.prefix_coalesce {
+            let recovered = self.recover_substream_next_offset(topition).await?;
+            let high = recovered
+                .max(self.cached_high(topition)?.unwrap_or(0))
+                .max(from_watermark);
+            self.mark_listed(topition, high)?;
+            return Ok(high);
+        }
+
         let cached = self.cached_high(topition)?;
         let was_cold = cached.is_none();
         let floor = cached.unwrap_or(0).max(from_watermark);
@@ -2066,6 +2090,313 @@ impl DynoStore {
                 && let Some(entry) = footer.get(topition.topic(), topition.partition())
             {
                 return Ok(entry.base_offset + entry.record_count);
+            }
+        }
+
+        // No segment holds this sub-stream yet. Fall back to the legacy
+        // `records/` tail (#58 seam): a topic flipped to segment mode mid-life
+        // has pre-cutover `{offset}.batch` objects, and its first segment must
+        // continue from that tail (offset = legacy tail, no gap/overlap). For a
+        // greenfield prefix there are no such objects and this is 0.
+        self.tail_next_offset(topition, None).await
+    }
+
+    /// Fetch a topition's records out of shared prefix-coalesced segments (#60).
+    /// For each segment (ascending sequence) the footer is read (a ranged GET of
+    /// the tail, #58/#64) to find this topition's sub-stream; only the segments
+    /// that overlap `[offset, high_watermark)` are then read, and only the
+    /// sub-stream's contiguous byte span — a ranged GET, never the whole object,
+    /// so no cross-topic data is downloaded. Absolute offsets come from the
+    /// footer, not the object name. Batches run from `offset` up to `max_bytes`,
+    /// bounded by `max_wait` from `started_at`.
+    ///
+    /// Locating lists `segments/` (a handful of objects per prefix — orders of
+    /// magnitude fewer than the per-topic `records/` objects the legacy path
+    /// LISTed, #40) then reads footers; no per-flush-mutated manifest is
+    /// consulted, so the read path stays footer-only and GCS-safe by
+    /// construction (the epic's hard GCS constraint).
+    async fn fetch_prefix_coalesced(
+        &self,
+        topition: &Topition,
+        offset: i64,
+        max_bytes: u32,
+        high_watermark: i64,
+        started_at: SystemTime,
+        max_wait: Duration,
+    ) -> Result<Vec<deflated::Batch>> {
+        let has_deadline_expired = || {
+            started_at
+                .elapsed()
+                .map(|elapsed| max_wait.saturating_sub(elapsed).is_zero())
+                .unwrap_or_default()
+        };
+
+        let prefix = self.prefix_of(topition);
+        let listing = self.segment_prefix(&prefix);
+
+        let mut names: Vec<Path> = self
+            .object_store
+            .list(Some(&listing))
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .inspect_err(|error| error!(?error, ?topition, ?offset))
+            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?;
+
+        // Zero-padded sequence names sort lexicographically by sequence.
+        names.sort_unstable();
+
+        let mut batches = vec![];
+        let mut bytes = max_bytes as u64;
+
+        for location in names {
+            if has_deadline_expired() {
+                break;
+            }
+
+            let Some(footer) = self.read_segment_footer(&location).await? else {
+                continue;
+            };
+            let Some(entry) = footer.get(topition.topic(), topition.partition()) else {
+                continue;
+            };
+
+            // Skip a segment whose sub-stream ends at or before the requested
+            // offset; stop once one starts at or past the high watermark.
+            if entry.base_offset + entry.record_count <= offset {
+                continue;
+            }
+            if entry.base_offset >= high_watermark {
+                break;
+            }
+
+            // Ranged GET of exactly this sub-stream's bytes.
+            let region = self
+                .object_store
+                .get_opts(
+                    &location,
+                    GetOptions {
+                        range: Some(GetRange::Bounded(
+                            entry.byte_start..entry.byte_start + entry.byte_len,
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .inspect_err(|error| error!(?error, location = %location))
+                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+                .bytes()
+                .await
+                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
+                .and_then(|encoded| self.decode_frame(encoded))?;
+
+            let mut running = entry.base_offset;
+            for mut batch in region {
+                let span = batch.last_offset_delta as i64 + 1;
+                batch.base_offset = running;
+                running += span;
+                batches.push(batch);
+            }
+
+            if entry.byte_len > bytes {
+                break;
+            } else {
+                bytes = bytes.saturating_sub(entry.byte_len);
+            }
+        }
+
+        Ok(batches)
+    }
+
+    /// Whether `topition` still has legacy `records/` objects (#60 hybrid). The
+    /// result is cached: a `false` is permanent under prefix mode (produce goes
+    /// to segments, so `records/` never grows), so a greenfield prefix topic
+    /// pays at most one bounded LIST and every later fetch is segment-only — the
+    /// per-fetch `records/` LIST (#40) stays retired.
+    async fn has_legacy_records(&self, topition: &Topition) -> Result<bool> {
+        if let Some(present) = self
+            .legacy_records_present
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .get(topition)
+            .copied()
+        {
+            return Ok(present);
+        }
+
+        let prefix = Path::from(format!(
+            "clusters/{}/topics/{}/partitions/{:0>10}/records/",
+            self.cluster, topition.topic, topition.partition
+        ));
+        let present = self
+            .object_store
+            .list(Some(&prefix))
+            .next()
+            .await
+            .transpose()
+            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+            .is_some();
+
+        _ = self
+            .legacy_records_present
+            .lock()
+            .map(|mut cache| cache.insert(topition.to_owned(), present));
+
+        Ok(present)
+    }
+
+    /// Fetch a topition's records from the legacy per-`(topic, partition)`
+    /// `records/{offset}.batch` objects (the pre-#57 layout). Extracted from
+    /// [`Storage::fetch`] so the prefix-coalesced path can serve the legacy
+    /// region of a hybrid topic (#60 coexistence) before continuing into
+    /// segments. Seeks with `start-after` (offsets are filenames) and reads up to
+    /// `max_bytes`, bounded by `max_wait` from `started_at`.
+    async fn fetch_legacy_records(
+        &self,
+        topition: &Topition,
+        offset: i64,
+        max_bytes: u32,
+        high_watermark: i64,
+        started_at: SystemTime,
+        max_wait: Duration,
+    ) -> Result<Vec<deflated::Batch>> {
+        let has_deadline_expired = || {
+            started_at
+                .elapsed()
+                .map(|elapsed| max_wait.saturating_sub(elapsed).is_zero())
+                .unwrap_or_default()
+        };
+
+        let mut batches = vec![];
+
+        let prefix = Path::from(format!(
+            "clusters/{}/topics/{}/partitions/{:0>10}/records/",
+            self.cluster, topition.topic, topition.partition
+        ));
+
+        // Under #50 coalescing `offset` may fall inside a multi-batch object;
+        // start from the object that contains it so the seek does not skip it.
+        let start_offset = if self.produce_coalesce {
+            self.coalesce_fetch_floor(topition, offset)
+                .await?
+                .unwrap_or(offset)
+        } else {
+            offset
+        };
+
+        let start_after = Path::from(format!(
+            "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}",
+            self.cluster, topition.topic, topition.partition, start_offset,
+        ));
+
+        let mut list_stream = self
+            .object_store
+            .list_with_offset(Some(&prefix), &start_after);
+
+        let mut bytes = max_bytes as u64;
+
+        while let Some(meta) = list_stream
+            .next()
+            .await
+            .inspect(|meta| debug!(?meta))
+            .transpose()
+            .inspect_err(|error| error!(?error, ?topition, ?offset, ?max_bytes))
+            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+            && !has_deadline_expired()
+        {
+            let Some(file_name) = meta.location.parts().next_back() else {
+                continue;
+            };
+
+            let base_offset = i64::from_str(&file_name.as_ref()[0..20])?;
+            debug!(base_offset);
+
+            if base_offset >= high_watermark {
+                break;
+            }
+
+            let size = meta.size;
+
+            let frame = self
+                .object_store
+                .get(&meta.location)
+                .await
+                .inspect_err(|error| error!(?error, ?topition, ?offset, ?max_bytes))
+                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+                .bytes()
+                .await
+                .inspect_err(|error| error!(?error, location = %meta.location))
+                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
+                .and_then(|encoded| self.decode_frame(encoded))?;
+
+            let mut running = base_offset;
+            for mut batch in frame {
+                let span = batch.last_offset_delta as i64 + 1;
+                batch.base_offset = running;
+                running += span;
+                batches.push(batch);
+            }
+
+            if size > bytes {
+                break;
+            } else {
+                bytes = bytes.saturating_sub(size);
+            }
+        }
+
+        Ok(batches)
+    }
+
+    /// The earliest (log-start) offset for a prefix-coalesced sub-stream (#60):
+    /// the base offset of the oldest legacy `records/` object if any survive
+    /// (they hold the lowest offsets until retention drains them, #60 hybrid),
+    /// otherwise the base offset in the oldest segment (lowest sequence) that
+    /// carries the sub-stream. `0` when neither exists yet.
+    async fn coalesced_earliest_offset(&self, topition: &Topition) -> Result<i64> {
+        // Legacy region first: the smallest base offset present in `records/`.
+        let records = Path::from(format!(
+            "clusters/{}/topics/{}/partitions/{:0>10}/records/",
+            self.cluster, topition.topic, topition.partition,
+        ));
+        let mut legacy: Vec<i64> = self
+            .object_store
+            .list(Some(&records))
+            .map_ok(|meta| meta.location)
+            .try_collect::<Vec<_>>()
+            .await
+            .inspect_err(|error| error!(?error, ?topition))
+            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+            .into_iter()
+            .filter_map(|location| {
+                location
+                    .parts()
+                    .next_back()
+                    .and_then(|name| i64::from_str(&name.as_ref()[0..20]).ok())
+            })
+            .collect();
+        legacy.sort_unstable();
+        if let Some(earliest) = legacy.first() {
+            return Ok(*earliest);
+        }
+        let prefix = self.prefix_of(topition);
+        let listing = self.segment_prefix(&prefix);
+
+        let mut names: Vec<Path> = self
+            .object_store
+            .list(Some(&listing))
+            .map_ok(|meta| meta.location)
+            .try_collect()
+            .await
+            .inspect_err(|error| error!(?error, ?topition))
+            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?;
+
+        names.sort_unstable();
+
+        for location in names {
+            if let Some(footer) = self.read_segment_footer(&location).await?
+                && let Some(entry) = footer.get(topition.topic(), topition.partition())
+            {
+                return Ok(entry.base_offset);
             }
         }
 
@@ -3912,20 +4243,12 @@ impl Storage for DynoStore {
         &self,
         topition: &'_ Topition,
         offset: i64,
-        min_bytes: u32,
+        _min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
         max_wait: Duration,
     ) -> Result<Vec<deflated::Batch>> {
         let started_at = SystemTime::now();
-
-        let has_deadline_expired = || {
-            started_at
-                .elapsed()
-                .inspect(|elapsed| debug!(?elapsed, ?max_wait))
-                .map(|elapsed| max_wait.saturating_sub(elapsed).is_zero())
-                .unwrap_or_default()
-        };
 
         // Read-committed needs the last-stable offset, which `offset_stage`
         // derives from the cluster `meta.json` transactions. Read-uncommitted
@@ -3943,100 +4266,64 @@ impl Storage for DynoStore {
         let mut batches = vec![];
 
         if offset < high_watermark {
-            let prefix = Path::from(format!(
-                "clusters/{}/topics/{}/partitions/{:0>10}/records/",
-                self.cluster, topition.topic, topition.partition
-            ));
+            if self.prefix_coalesce {
+                // Prefix-coalesced (#60): records live in shared segments, located
+                // by footer index and read with a ranged GET of exactly the
+                // topition's byte span — no cross-topic download. A *hybrid* topic
+                // (flipped to segment mode mid-life) also has legacy `records/`
+                // objects for `[0, C)`; serve those first, then segments from `C`.
+                // Legacy offsets are all below segment offsets (the #58 seam), so
+                // legacy-then-segment preserves order and a single fetch with
+                // budget to spare stitches across the seam.
+                let mut from = offset;
 
-            // Seek directly to the requested offset using `start-after` instead of
-            // enumerating the whole partition prefix on every fetch. Batch filenames are
-            // zero-padded to 20 digits, so lexicographic order == numeric order. The start
-            // key is the 20-digit offset *without* the `.batch` suffix: it is a strict prefix
-            // of `{offset:0>20}.batch`, so listing returns exactly `base_offset >= offset`
-            // (matching the previous `split_off(&offset)` semantics) while also handling
-            // `offset == 0` without underflow.
-            //
-            // Under coalescing (#50) `offset` may fall *inside* a multi-batch object; start
-            // from the object that contains it (greatest base <= offset) so the seek does
-            // not skip it. When coalescing is off, or the offset is aligned to an object
-            // base, this is exactly `offset` — the fast path is unchanged.
-            let start_offset = if self.produce_coalesce {
-                self.coalesce_fetch_floor(topition, offset)
-                    .await?
-                    .unwrap_or(offset)
+                if self.has_legacy_records(topition).await? {
+                    batches = self
+                        .fetch_legacy_records(
+                            topition,
+                            offset,
+                            max_bytes,
+                            high_watermark,
+                            started_at,
+                            max_wait,
+                        )
+                        .await?;
+                    from = batches
+                        .last()
+                        .map(|batch| batch.base_offset + batch.last_offset_delta as i64 + 1)
+                        .unwrap_or(offset);
+                }
+
+                let consumed: u64 = batches
+                    .iter()
+                    .map(|batch| batch.batch_length.max(0) as u64)
+                    .sum();
+                let remaining = (max_bytes as u64).saturating_sub(consumed);
+
+                if from < high_watermark && remaining > 0 {
+                    let segment = self
+                        .fetch_prefix_coalesced(
+                            topition,
+                            from,
+                            remaining.min(u32::MAX as u64) as u32,
+                            high_watermark,
+                            started_at,
+                            max_wait,
+                        )
+                        .await?;
+                    batches.extend(segment);
+                }
             } else {
-                offset
-            };
-
-            let start_after = Path::from(format!(
-                "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}",
-                self.cluster, topition.topic, topition.partition, start_offset,
-            ));
-
-            let mut list_stream = self
-                .object_store
-                .list_with_offset(Some(&prefix), &start_after);
-
-            let mut bytes = max_bytes as u64;
-
-            // The object_store trait does not guarantee ordering, but every dynostore backend
-            // yields ascending keys (S3 ListObjectsV2 sorts by key, the memory store iterates a
-            // BTreeMap). We rely on that to stop as soon as enough batches to satisfy `max_bytes`
-            // are collected, keeping fetch cost proportional to the bytes returned rather than to
-            // the partition's history.
-            while let Some(meta) = list_stream
-                .next()
-                .await
-                .inspect(|meta| debug!(?meta))
-                .transpose()
-                .inspect_err(|error| error!(?error, ?topition, ?offset, ?min_bytes, ?max_bytes))
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
-                && !has_deadline_expired()
-            {
-                let Some(file_name) = meta.location.parts().next_back() else {
-                    continue;
-                };
-
-                let base_offset = i64::from_str(&file_name.as_ref()[0..20])?;
-                debug!(base_offset);
-
-                if base_offset >= high_watermark {
-                    break;
-                }
-
-                let size = meta.size;
-
-                // A coalesced object (#50) holds several contiguous batches; a
-                // legacy object holds one. Expand them, assigning each sub-batch
-                // its absolute base offset by running from the object's base (the
-                // authority in the filename) over each sub-batch's offset span.
-                // For a single-batch object this pushes exactly one batch with
-                // `base_offset` set from the filename, as before.
-                let frame = self
-                    .object_store
-                    .get(&meta.location)
-                    .await
-                    .inspect_err(|error| error!(?error, ?topition, ?offset, ?min_bytes, ?max_bytes))
-                    .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
-                    .bytes()
-                    .await
-                    .inspect_err(|error| error!(?error, location = %meta.location))
-                    .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
-                    .and_then(|encoded| self.decode_frame(encoded))?;
-
-                let mut running = base_offset;
-                for mut batch in frame {
-                    let span = batch.last_offset_delta as i64 + 1;
-                    batch.base_offset = running;
-                    running += span;
-                    batches.push(batch);
-                }
-
-                if size > bytes {
-                    break;
-                } else {
-                    bytes = bytes.saturating_sub(size);
-                }
+                batches = self
+                    .fetch_legacy_records(
+                        topition,
+                        offset,
+                        max_bytes,
+                        high_watermark,
+                        started_at,
+                        max_wait,
+                    )
+                    .await?;
             }
         }
 
@@ -4186,6 +4473,25 @@ impl Storage for DynoStore {
                         error_code: ErrorCode::None,
                         offset: Some(high),
                         timestamp,
+                    },
+                ));
+
+                continue;
+            }
+
+            // Prefix-coalesced (#60): EARLIEST is the oldest segment's base
+            // offset for this sub-stream, read from the footer index — no
+            // `records/` listing (there is none). LATEST already went through
+            // `high_watermark` above (footer-aware).
+            if self.prefix_coalesce && *offset_request == ListOffset::Earliest {
+                let earliest = self.coalesced_earliest_offset(topition).await?;
+
+                responses.push((
+                    topition.to_owned(),
+                    ListOffsetResponse {
+                        error_code: ErrorCode::None,
+                        offset: Some(earliest),
+                        timestamp: None,
                     },
                 ));
 
