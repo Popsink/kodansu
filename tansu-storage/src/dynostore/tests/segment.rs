@@ -107,10 +107,7 @@ async fn round_trips_multiple_substreams() -> Result<(), Error> {
         let start = entry.byte_start as usize;
         let end = start + entry.byte_len as usize;
         let batches = store.decode_frame(segment.slice(start..end))?;
-        let records: i64 = batches
-            .iter()
-            .map(|b| b.last_offset_delta as i64 + 1)
-            .sum();
+        let records: i64 = batches.iter().map(|b| b.last_offset_delta as i64 + 1).sum();
         assert_eq!(entry.record_count, records);
     }
 

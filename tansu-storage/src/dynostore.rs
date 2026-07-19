@@ -187,6 +187,31 @@ pub struct DynoStore {
     /// drained (never held across an await) on a threshold or linger-timer flush.
     coalesce: Arc<Mutex<BTreeMap<Topition, CoalesceBuffer>>>,
 
+    /// When set, eligible batches are coalesced per *connector prefix* rather
+    /// than per `(topic, partition)`: one shared, immutable segment object holds
+    /// interleaved batches from every topition under the prefix produced in one
+    /// flush window (the #56 "virtual topics" write path, #57). This collapses
+    /// PUTs from ~`(topics × flushes)` to ~`(connectors × flushes)`. Off by
+    /// default; takes precedence over [`Self::produce_coalesce`] for eligible
+    /// batches when both are set. The URL flag that drives it is wired by #63.
+    prefix_coalesce: bool,
+
+    /// Per-prefix coalescing buffer (#57), used only when
+    /// [`Self::prefix_coalesce`] is set. Like [`Self::coalesce`] but keyed by
+    /// prefix, so one buffer accumulates `PrefixPending` batches across many
+    /// topitions; drained (never held across an await) on a threshold or linger
+    /// flush into one create-only segment object.
+    prefix_coalesce_buffers: Arc<Mutex<BTreeMap<String, PrefixCoalesceBuffer>>>,
+
+    /// Per-prefix next segment sequence hint (#57). The segment object name
+    /// `prefixes/{prefix}/segments/{seq:020}.seg` is monotonic and create-only,
+    /// so — exactly as the `{offset}.batch` name is the offset authority for the
+    /// legacy layout — the segment sequence is the ordering authority for the
+    /// coalesced layout. A `Create` conflict resyncs the hint from the tail of
+    /// the segment listing (single-writer per prefix, #59, makes conflicts a
+    /// failover edge case rather than the steady state).
+    segment_seqs: Arc<Mutex<BTreeMap<String, u64>>>,
+
     /// Runtime coalescing (#50) / producer-checkpoint (#48) flush thresholds
     /// (#54). Each is seeded from its compile-time default
     /// ([`Self::COALESCE_LINGER`], [`Self::COALESCE_BATCHES`],
@@ -216,6 +241,26 @@ struct Pending {
 #[derive(Debug, Default)]
 struct CoalesceBuffer {
     pending: Vec<Pending>,
+    records: i64,
+    bytes: usize,
+}
+
+/// A batch parked in the prefix coalescing buffer (#57), carrying the topition
+/// it belongs to (a prefix buffer multiplexes many) alongside the one-shot the
+/// producing `produce` call awaits its assigned offset on.
+#[derive(Debug)]
+struct PrefixPending {
+    topition: Topition,
+    batch: deflated::Batch,
+    ack: oneshot::Sender<Result<i64>>,
+}
+
+/// Per-prefix accumulator for prefix-coalesced produce (#57): batches from every
+/// topition under the prefix awaiting a flush, plus the running record and byte
+/// counts used for the flush triggers. Flushed as one shared segment object.
+#[derive(Debug, Default)]
+struct PrefixCoalesceBuffer {
+    pending: Vec<PrefixPending>,
     records: i64,
     bytes: usize,
 }
@@ -634,6 +679,9 @@ impl DynoStore {
             oldest_retained: Arc::new(Mutex::new(BTreeMap::new())),
             produce_coalesce: false,
             coalesce: Arc::new(Mutex::new(BTreeMap::new())),
+            prefix_coalesce: false,
+            prefix_coalesce_buffers: Arc::new(Mutex::new(BTreeMap::new())),
+            segment_seqs: Arc::new(Mutex::new(BTreeMap::new())),
             coalesce_linger: Self::COALESCE_LINGER,
             coalesce_batches: Self::COALESCE_BATCHES,
             coalesce_bytes: Self::COALESCE_BYTES,
@@ -679,6 +727,19 @@ impl DynoStore {
     pub fn produce_coalesce(self, produce_coalesce: bool) -> Self {
         Self {
             produce_coalesce,
+            ..self
+        }
+    }
+
+    /// Enable prefix-coalesced "virtual topics" produce (#56/#57): buffer
+    /// eligible batches per connector prefix and flush them as one shared,
+    /// immutable segment object per linger window, collapsing the PUT count from
+    /// ~`(topics × flushes)` to ~`(connectors × flushes)`. Off by default; takes
+    /// precedence over [`Self::produce_coalesce`] for eligible batches. The URL
+    /// flag driving this is wired by #63.
+    pub fn prefix_coalesce(self, prefix_coalesce: bool) -> Self {
+        Self {
+            prefix_coalesce,
             ..self
         }
     }
@@ -1673,6 +1734,363 @@ impl DynoStore {
         }
     }
 
+    /// The connector prefix a topition's records coalesce under (#57). Popsink
+    /// topics are `org.env.conn.<schema>.<table>`; the prefix is the connector
+    /// unit `org.env.conn` (the first three dotted components) — the
+    /// tenant/retention/isolation boundary the epic coalesces on. A topic with
+    /// fewer than three components is its own prefix. The explicit `prefix_map`
+    /// override is wired by #63.
+    fn prefix_of(&self, topition: &Topition) -> String {
+        let topic = topition.topic();
+        let mut parts = topic.split('.');
+        let mut prefix = String::new();
+
+        for i in 0..3 {
+            match parts.next() {
+                Some(part) => {
+                    if i > 0 {
+                        prefix.push('.');
+                    }
+                    prefix.push_str(part);
+                }
+                None => return topic.to_owned(),
+            }
+        }
+
+        prefix
+    }
+
+    /// The `segments/` listing prefix for a connector prefix (#57).
+    fn segment_prefix(&self, prefix: &str) -> Path {
+        Path::from(format!(
+            "clusters/{}/prefixes/{}/segments/",
+            self.cluster, prefix,
+        ))
+    }
+
+    /// The object name of the `seq`-th segment under a connector prefix (#57).
+    /// The zero-padded sequence makes the name monotonic and, written
+    /// create-only, the ordering authority (as `{offset}.batch` is for #50).
+    fn segment_location(&self, prefix: &str, seq: u64) -> Path {
+        Path::from(format!(
+            "clusters/{}/prefixes/{}/segments/{:0>20}.seg",
+            self.cluster, prefix, seq,
+        ))
+    }
+
+    /// The cached next segment sequence for `prefix`, if known to this process.
+    fn cached_seq(&self, prefix: &str) -> Result<Option<u64>> {
+        self.segment_seqs
+            .lock()
+            .map(|locked| locked.get(prefix).copied())
+            .map_err(Into::into)
+    }
+
+    /// Advance the cached next-segment-sequence hint. Monotonic, like
+    /// [`Self::set_high`]: a sequence is never reused.
+    fn set_seq(&self, prefix: &str, next: u64) -> Result<()> {
+        self.segment_seqs
+            .lock()
+            .map(|mut locked| {
+                let entry = locked.entry(prefix.to_owned()).or_default();
+                *entry = (*entry).max(next);
+            })
+            .map_err(Into::into)
+    }
+
+    /// The next free segment sequence for `prefix`, read from the tail of the
+    /// `segments/` listing (#57). Zero-padded names sort lexicographically by
+    /// sequence, so the greatest listed name is the tail. Used to seed the hint
+    /// cold and to resync after a `Create` conflict.
+    async fn tail_next_seq(&self, prefix: &str) -> Result<u64> {
+        let listing = self.segment_prefix(prefix);
+        let mut list_stream = self.object_store.list(Some(&listing));
+        let mut max: Option<u64> = None;
+
+        while let Some(meta) = list_stream
+            .next()
+            .await
+            .transpose()
+            .inspect_err(|err| error!(?err, prefix))?
+        {
+            let Some(name) = meta.location.parts().next_back() else {
+                continue;
+            };
+
+            let name = name.as_ref();
+            if name.len() < 20 {
+                continue;
+            }
+
+            let Ok(seq) = u64::from_str(&name[0..20]) else {
+                continue;
+            };
+
+            max = Some(max.map_or(seq, |m| m.max(seq)));
+        }
+
+        Ok(max.map_or(0, |m| m + 1))
+    }
+
+    /// Write `payload` as the next create-only segment under `prefix` and return
+    /// its assigned sequence (#57). The create is the authority: a conflicting
+    /// sequence (a racing writer during a #59 failover) resyncs from the tail
+    /// and retries. Single-writer per prefix makes the conflict path an edge
+    /// case, not the steady state.
+    async fn assign_and_create_segment(&self, prefix: &str, payload: PutPayload) -> Result<u64> {
+        /// Bounds the conflict-resync loop; far above any real contention.
+        const MAX_ATTEMPTS: usize = 64;
+
+        let mut candidate = match self.cached_seq(prefix)? {
+            Some(seq) => seq,
+            None => self.tail_next_seq(prefix).await?,
+        };
+
+        for attempt in 0..MAX_ATTEMPTS {
+            match self
+                .object_store
+                .put_opts(
+                    &self.segment_location(prefix, candidate),
+                    payload.clone(),
+                    PutOptions {
+                        mode: PutMode::Create,
+                        attributes: Attributes::new(),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(outcome) => {
+                    debug!(?outcome, candidate, prefix);
+                    self.set_seq(prefix, candidate + 1)?;
+                    return Ok(candidate);
+                }
+
+                Err(object_store::Error::AlreadyExists { .. }) => {
+                    debug!(candidate, attempt, prefix, "segment seq taken, resyncing");
+                    candidate = self.tail_next_seq(prefix).await?;
+                }
+
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        error!(
+            prefix,
+            candidate, "segment sequence assignment exhausted retries"
+        );
+        Err(Error::Api(ErrorCode::UnknownServerError))
+    }
+
+    /// Buffer `deflated` for a prefix-coalesced flush and await its assigned
+    /// offset (#57). Like [`Self::enqueue_coalesced`] but keyed by the topition's
+    /// connector prefix, so one buffer accumulates batches across every topic
+    /// under the prefix and flushes them into one shared segment object. The
+    /// idempotent sequence and schema were already validated by `produce`.
+    async fn enqueue_prefix_coalesced(
+        &self,
+        topition: &Topition,
+        deflated: deflated::Batch,
+    ) -> Result<i64> {
+        let prefix = self.prefix_of(topition);
+        let (ack, offset) = oneshot::channel();
+        let span = deflated.last_offset_delta as i64 + 1;
+        let size = size_of::<i64>() + size_of::<i32>() + deflated.batch_length.max(0) as usize;
+
+        enum Action {
+            Flush(PrefixCoalesceBuffer),
+            StartTimer,
+            Wait,
+        }
+
+        let action = {
+            let mut buffers = self
+                .prefix_coalesce_buffers
+                .lock()
+                .map_err(Into::<Error>::into)?;
+            let buffer = buffers.entry(prefix.clone()).or_default();
+
+            let first = buffer.pending.is_empty();
+            buffer.pending.push(PrefixPending {
+                topition: topition.to_owned(),
+                batch: deflated,
+                ack,
+            });
+            buffer.records += span;
+            buffer.bytes += size;
+
+            if buffer.pending.len() >= self.coalesce_batches
+                || buffer.bytes >= self.coalesce_bytes
+                || buffer.records >= Self::COALESCE_MAX_RECORDS
+            {
+                Action::Flush(std::mem::take(buffer))
+            } else if first {
+                Action::StartTimer
+            } else {
+                Action::Wait
+            }
+        };
+
+        match action {
+            Action::Flush(buffer) => self.flush_prefix_coalesced(&prefix, buffer).await,
+
+            Action::StartTimer => {
+                let store = self.clone();
+                let prefix = prefix.clone();
+                let linger = self.coalesce_linger;
+
+                _ = tokio::spawn(async move {
+                    tokio::time::sleep(linger).await;
+
+                    let buffer = store
+                        .prefix_coalesce_buffers
+                        .lock()
+                        .ok()
+                        .and_then(|mut buffers| buffers.remove(&prefix));
+
+                    if let Some(buffer) = buffer.filter(|buffer| !buffer.pending.is_empty()) {
+                        store.flush_prefix_coalesced(&prefix, buffer).await;
+                    }
+                });
+            }
+
+            Action::Wait => {}
+        }
+
+        offset
+            .await
+            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+    }
+
+    /// Flush a drained prefix buffer as one shared segment object and resolve
+    /// each parked produce with its assigned offset (#57). Batches are grouped
+    /// by topition; each sub-stream is assigned an independent base offset from
+    /// its in-memory high-watermark hint (#58 assignment — the single-writer
+    /// counter is authoritative, cold-start footer recovery is #58), and the
+    /// whole set is written as one create-only segment via
+    /// [`Self::assign_and_create_segment`]. On failure every parked producer
+    /// gets the error and retries.
+    async fn flush_prefix_coalesced(&self, prefix: &str, buffer: PrefixCoalesceBuffer) {
+        if buffer.pending.is_empty() {
+            return;
+        }
+
+        // Group pending batches by topition (arrival order preserved within a
+        // topition). BTreeMap gives a deterministic per-segment sub-stream order.
+        let mut grouped: BTreeMap<Topition, Vec<usize>> = BTreeMap::new();
+        for (index, pending) in buffer.pending.iter().enumerate() {
+            grouped
+                .entry(pending.topition.clone())
+                .or_default()
+                .push(index);
+        }
+
+        // Resolve each sub-stream's base offset and the absolute offset of every
+        // batch within it. `assigned[index]` is the offset the pending at that
+        // index will be acked with; `advances` is the post-flush high per
+        // topition.
+        let mut substreams: Vec<(Topition, i64, Vec<deflated::Batch>)> =
+            Vec::with_capacity(grouped.len());
+        let mut assigned = vec![0i64; buffer.pending.len()];
+        let mut advances: Vec<(Topition, i64)> = Vec::with_capacity(grouped.len());
+
+        for (topition, indices) in &grouped {
+            let base = match self.cached_high(topition) {
+                Ok(Some(hint)) => hint,
+                Ok(None) => match self.refresh_high(topition).await {
+                    Ok(high) => high,
+                    Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+                },
+                Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+            };
+
+            let mut running = base;
+            let mut batches = Vec::with_capacity(indices.len());
+            for &index in indices {
+                assigned[index] = running;
+                let batch = &buffer.pending[index].batch;
+                running += batch.last_offset_delta as i64 + 1;
+                batches.push(batch.clone());
+            }
+
+            substreams.push((topition.clone(), base, batches));
+            advances.push((topition.clone(), running));
+        }
+
+        let seq = match async {
+            let (payload, _footer) = self.encode_segment(&substreams)?;
+            self.assign_and_create_segment(prefix, payload).await
+        }
+        .await
+        {
+            Ok(seq) => seq,
+            Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+        };
+
+        debug!(
+            prefix,
+            seq,
+            substreams = substreams.len(),
+            "prefix segment flushed"
+        );
+
+        // The write succeeded and is durable — advance each sub-stream's hint.
+        for (topition, high) in &advances {
+            _ = self
+                .set_high(topition, *high)
+                .inspect_err(|err| debug!(?err));
+        }
+
+        // Mirror the immediate path's lake sink per sub-batch. Config is fetched
+        // once per topic and only when a lake is configured.
+        let mut configs: BTreeMap<String, Option<_>> = BTreeMap::new();
+        for (index, pending) in buffer.pending.into_iter().enumerate() {
+            let offset = assigned[index];
+            let topition = &pending.topition;
+
+            if self.lake.is_some() {
+                let config = match configs.get(topition.topic()) {
+                    Some(config) => config.clone(),
+                    None => {
+                        let config = self
+                            .describe_config(topition.topic(), ConfigResource::Topic, None)
+                            .await
+                            .inspect_err(|err| debug!(?err))
+                            .ok();
+                        _ = configs.insert(topition.topic().to_owned(), config.clone());
+                        config
+                    }
+                };
+
+                if let (Some(lake), Some(config)) = (self.lake.as_ref(), config.as_ref())
+                    && let Ok(inflated) = inflated::Batch::try_from(&pending.batch)
+                {
+                    _ = lake
+                        .store(
+                            topition.topic(),
+                            topition.partition(),
+                            offset,
+                            &inflated,
+                            config.clone(),
+                        )
+                        .await
+                        .inspect_err(|err| debug!(?err));
+                }
+            }
+
+            _ = pending.ack.send(Ok(offset));
+        }
+    }
+
+    /// Send `error` to every parked producer in a failed prefix flush (#57) so
+    /// each retries; the unflushed batches are never acked.
+    fn fail_prefix_flush(buffer: PrefixCoalesceBuffer, error: Error, prefix: &str) {
+        error!(?error, prefix, "prefix coalesced flush failed");
+        for pending in buffer.pending {
+            _ = pending.ack.send(Err(error.clone()));
+        }
+    }
+
     /// The base offset of the object that *contains* `offset` — the greatest
     /// base `<= offset` — or `None` when no such object exists (offset is at or
     /// before the log start). Used only under coalescing (#50): a consumer that
@@ -2338,8 +2756,6 @@ impl DynoStore {
     /// offset already assigned to the sub-stream's first record (#58). Empty
     /// sub-streams are skipped. Returns the payload and the footer, which the
     /// writer keeps as the segment's in-memory index.
-    // Wired into the prefix flush path by #57; unused until then.
-    #[allow(dead_code)]
     fn encode_segment(
         &self,
         substreams: &[(Topition, i64, Vec<deflated::Batch>)],
@@ -2389,8 +2805,6 @@ impl DynoStore {
     /// `topic_len (u16) + topic (utf8) + partition (i32) + base_offset (i64) +
     /// record_count (i64) + byte_start (u64) + byte_len (u64) +
     /// max_timestamp (i64)`, all big-endian. Paired with [`Self::decode_footer`].
-    // Reached via `encode_segment` once #57 wires it; unused until then.
-    #[allow(dead_code)]
     fn encode_footer(footer: &SegmentFooter) -> Vec<u8> {
         let mut buf = Vec::new();
         for entry in &footer.entries {
@@ -3018,14 +3432,15 @@ impl Storage for DynoStore {
             let attributes =
                 BatchAttribute::try_from(deflated.attributes).inspect_err(|err| debug!(?err))?;
 
-            // Server-side coalescing (#50): buffer the batch and flush a run as
-            // one object per linger window. Transactional, control and compacted
-            // batches bypass it (offset/txn-marker/compaction semantics must stay
-            // one batch per object); the idempotent sequence and schema were
-            // already validated above, so a duplicate is rejected before it is
-            // ever buffered.
-            if self.produce_coalesce
-                && transaction_id.is_none()
+            // Server-side coalescing: buffer the batch and flush a run as one
+            // object per linger window — per connector prefix into a shared
+            // segment (#57) when prefix mode is on, else per partition (#50).
+            // Transactional, control and compacted batches bypass both paths
+            // (offset/txn-marker/compaction semantics must stay one batch per
+            // object, and a compacted topic can't share a whole-segment-expiry
+            // segment, #61); the idempotent sequence and schema were already
+            // validated above, so a duplicate is rejected before it is buffered.
+            let coalesce_eligible = transaction_id.is_none()
                 && !attributes.transaction
                 && !attributes.control
                 && !config
@@ -3039,9 +3454,14 @@ impl Storage for DynoStore {
                                 .value
                                 .as_deref()
                                 .is_some_and(|value| value.contains("compact"))
-                    })
-            {
-                return self.enqueue_coalesced(topition, deflated).await;
+                    });
+
+            if coalesce_eligible {
+                if self.prefix_coalesce {
+                    return self.enqueue_prefix_coalesced(topition, deflated).await;
+                } else if self.produce_coalesce {
+                    return self.enqueue_coalesced(topition, deflated).await;
+                }
             }
 
             // Assign the offset by *creating* the immutable batch object (its

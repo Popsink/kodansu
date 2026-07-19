@@ -26,6 +26,7 @@ mod idempotent;
 mod latency;
 mod metadata_visibility;
 mod offset_assignment;
+mod prefix_coalesce;
 mod retention;
 mod scaling;
 mod segment;
