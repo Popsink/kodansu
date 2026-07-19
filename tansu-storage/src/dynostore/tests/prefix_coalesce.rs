@@ -31,7 +31,7 @@ use tansu_sans_io::{
 
 use crate::{
     Error, Result, Storage, Topition,
-    dynostore::{DynoStore, SegmentFooter},
+    dynostore::{CoalesceTuning, DynoStore, SegmentFooter},
 };
 
 const CLUSTER: &str = "tansu";
@@ -525,6 +525,44 @@ async fn hybrid_fetch_stitches_legacy_and_segment() -> Result<(), Error> {
         )
         .await?;
     assert_eq!(Some(9), latest[0].1.offset, "high watermark spans the seam");
+
+    Ok(())
+}
+
+/// Many concurrent produces to one prefix, with a tiny flush threshold forcing
+/// overlapping flush windows, must yield a gap-free, duplicate-free offset
+/// sequence — the per-prefix flush lock serializes offset assignment (#1 fix).
+#[tokio::test]
+async fn concurrent_flushes_assign_unique_offsets() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .coalesce_tuning(CoalesceTuning {
+            coalesce_batches: Some(2),
+            ..Default::default()
+        });
+
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    // 40 single-record batches produced concurrently: with a 2-batch flush
+    // threshold this drains many overlapping windows.
+    const N: usize = 40;
+    let mut batches = Vec::with_capacity(N);
+    for _ in 0..N {
+        batches.push(batch(1)?);
+    }
+    let results =
+        futures::future::join_all(batches.into_iter().map(|b| store.produce(None, &a, b))).await;
+
+    let mut offsets = results.into_iter().collect::<Result<Vec<i64>>>()?;
+    offsets.sort_unstable();
+    assert_eq!(
+        (0..N as i64).collect::<Vec<_>>(),
+        offsets,
+        "exactly one of each offset 0..N — no gap, no duplicate"
+    );
 
     Ok(())
 }

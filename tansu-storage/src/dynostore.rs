@@ -222,6 +222,15 @@ pub struct DynoStore {
     /// failover edge case rather than the steady state).
     segment_seqs: Arc<Mutex<BTreeMap<String, u64>>>,
 
+    /// Per-prefix async flush lock: serializes `flush_prefix_coalesced` for a
+    /// given prefix so a window's `cached_high` read → segment PUT → `set_high`
+    /// is atomic. Without it two overlapping flushes (a threshold flush and a
+    /// linger-timer flush) could both read the same base offset before either
+    /// advanced the hint, writing two segments at the same offsets. The segment
+    /// `Create` only guards the *sequence* name, not offsets, so this lock — not
+    /// the create-race — is the per-prefix offset authority.
+    prefix_flush_locks: Arc<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+
     /// Per-prefix single-writer leases this process currently holds (#59). The
     /// durable side is `prefixes/{prefix}/lease.json`; this caches the held
     /// epoch, its etag (for the next CAS) and its expiry (the no-write fast
@@ -785,6 +794,7 @@ impl DynoStore {
             prefix_coalesce: false,
             prefix_coalesce_buffers: Arc::new(Mutex::new(BTreeMap::new())),
             segment_seqs: Arc::new(Mutex::new(BTreeMap::new())),
+            prefix_flush_locks: Arc::new(Mutex::new(BTreeMap::new())),
             prefix_leases: Arc::new(Mutex::new(BTreeMap::new())),
             legacy_records_present: Arc::new(Mutex::new(BTreeMap::new())),
             writer_id: format!(
@@ -2420,6 +2430,14 @@ impl DynoStore {
         Ok(0)
     }
 
+    /// The per-prefix flush serialization lock (see [`Self::prefix_flush_locks`]).
+    fn prefix_flush_lock(&self, prefix: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
+        self.prefix_flush_locks
+            .lock()
+            .map_err(Into::into)
+            .map(|mut locks| locks.entry(prefix.to_owned()).or_default().clone())
+    }
+
     /// The durable single-writer lease object for a connector prefix (#59).
     fn lease_location(&self, prefix: &str) -> Path {
         Path::from(format!(
@@ -2657,6 +2675,17 @@ impl DynoStore {
         if buffer.pending.is_empty() {
             return;
         }
+
+        // Serialize flushes for this prefix so offset assignment (read
+        // `cached_high`) → segment PUT → `set_high` is atomic (#1 fix): two
+        // overlapping windows must not both read the same base offset. Held
+        // across the whole flush; per-prefix, so distinct prefixes still flush
+        // concurrently.
+        let flush_lock = match self.prefix_flush_lock(prefix) {
+            Ok(lock) => lock,
+            Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+        };
+        let _flush_guard = flush_lock.lock().await;
 
         // Fence first (#59): acquire/renew the single-writer lease before writing.
         // A fenced writer fails here and never appends a segment; the parked
