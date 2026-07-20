@@ -739,6 +739,46 @@ async fn backfill_then_cdc_is_continuous() -> Result<(), Error> {
     Ok(())
 }
 
+/// A dedicated maintenance worker (a fresh process that never produced, so its
+/// in-memory index is cold) discovers the prefix from the topic metadata and
+/// compacts it (#66 review fix) — it does not depend on a warm local index.
+#[tokio::test]
+async fn maintainer_with_cold_index_compacts() -> Result<(), Error> {
+    let tuning = CoalesceTuning {
+        prefix_compact_min_segments: Some(2),
+        prefix_compact_keep_hot: Some(0),
+        prefix_compact_target_bytes: Some(1 << 30),
+        ..Default::default()
+    };
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.tab_a";
+    let a = Topition::new(topic, 0);
+
+    // A producer writes four segments, then goes away.
+    {
+        let producer = DynoStore::new(CLUSTER, NODE, bucket.clone())
+            .prefix_coalesce(true)
+            .coalesce_tuning(tuning);
+        create_topic(&producer, topic).await?;
+        for _ in 0..4 {
+            _ = producer.produce(None, &a, batch(1)?).await?;
+        }
+        assert_eq!(4, segments(&bucket).await.len());
+    }
+
+    // A fresh maintainer (cold index) runs the compaction pass.
+    let maintainer = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .coalesce_tuning(tuning);
+    assert!(
+        maintainer.policy_compact_segments().await? > 0,
+        "maintainer discovered the prefix and compacted"
+    );
+    assert!(segments(&bucket).await.len() < 4);
+
+    Ok(())
+}
+
 /// Compaction merges the epoch-fenced view, NOT raw footers (#69 review fix,
 /// critical): a zombie/overlapping segment in the run is dropped, never fused —
 /// so the merged segment doesn't duplicate records.

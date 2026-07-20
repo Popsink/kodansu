@@ -3783,19 +3783,46 @@ impl DynoStore {
         Ok(run.len() as u64)
     }
 
-    /// Compact segments across every prefix this node has in its index (#66).
+    /// Compact segments across every coalesced prefix (#66).
     async fn policy_compact_segments(&self) -> Result<u64> {
         if !self.prefix_coalesce || self.prefix_compact_min_segments == 0 {
             return Ok(0);
         }
 
-        let prefixes: Vec<String> = self
+        // Derive the prefixes from the topic metadata (#66 review fix), NOT just
+        // the in-memory index: a dedicated maintenance worker never produces or
+        // fetches, so its index is empty — it must discover prefixes from the
+        // topics (as retention does). Union with any locally-indexed prefixes.
+        let mut prefix_set: BTreeSet<String> = self
             .prefix_index
             .lock()
             .map_err(Into::<Error>::into)?
             .keys()
             .cloned()
             .collect();
+        for metadata in self.topics_index().await?.iter() {
+            let compact = metadata
+                .topic
+                .configs
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|config| {
+                    config.name == "cleanup.policy"
+                        && config
+                            .value
+                            .as_deref()
+                            .is_some_and(|value| value.contains("compact"))
+                });
+            if compact {
+                continue;
+            }
+            for partition in 0..metadata.topic.num_partitions {
+                _ = prefix_set
+                    .insert(self.prefix_of(&Topition::new(metadata.topic.name.clone(), partition)));
+            }
+        }
+        let prefixes: Vec<String> = prefix_set.into_iter().collect();
 
         /// Bounds the drain loop so a pathological prefix can't monopolize a
         /// maintenance tick; far above the runs a real backlog needs.
