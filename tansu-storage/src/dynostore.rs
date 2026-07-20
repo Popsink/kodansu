@@ -359,6 +359,20 @@ struct PrefixLease {
     expires_at_ms: i64,
 }
 
+/// Durable lower bound on the next segment sequence for a prefix (#77). Segment
+/// names are a create-only, monotonic sequence, but a *name* can be freed by
+/// retention/compaction while a peer (another replica, or an external S3-direct
+/// reader) still caches the old footer for that sequence — reusing the name would
+/// then serve the old byte ranges against a new object. Persisting a floor,
+/// raised write-ahead of every delete, guarantees a freed name is never reused.
+/// CAS-mutated at most once per maintenance tick per prefix that deleted
+/// something — never on the produce hot path — so it stays well under GCS's
+/// ~1/s/object mutation cap.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct SeqFloor {
+    next_seq_floor: u64,
+}
+
 /// In-memory index of a connector prefix's segments (read-path #60 review fix):
 /// segment footers are immutable, so once read they are cached by sequence
 /// forever. Locate (fetch), high-watermark, earliest and retention all resolve
@@ -2106,6 +2120,90 @@ impl DynoStore {
             .map_err(Into::into)
     }
 
+    /// The durable sequence-floor object for `prefix` (#77).
+    fn seq_floor_location(&self, prefix: &str) -> Path {
+        Path::from(format!(
+            "clusters/{}/prefixes/{}/seq-floor.json",
+            self.cluster, prefix,
+        ))
+    }
+
+    /// Read the persisted next-sequence floor for `prefix` (#77); `0` when absent.
+    async fn read_seq_floor(&self, prefix: &str) -> Result<u64> {
+        match self
+            .object_store
+            .get(&self.seq_floor_location(prefix))
+            .await
+        {
+            Ok(result) => {
+                Ok(serde_json::from_slice::<SeqFloor>(&result.bytes().await?)?.next_seq_floor)
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(0),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Raise the persisted next-sequence floor for `prefix` to at least `floor`
+    /// (#77). MUST be called write-ahead of deleting any segment, so a freed
+    /// sequence name is never reused. Max-fold CAS: a lost race means another
+    /// worker wrote concurrently — re-read and, if the value already covers our
+    /// floor, we are done; otherwise retry. Returns an error on persistent
+    /// contention so the caller aborts the delete rather than break the invariant.
+    async fn raise_seq_floor(&self, prefix: &str, floor: u64) -> Result<()> {
+        const MAX_ATTEMPTS: usize = 16;
+        let location = self.seq_floor_location(prefix);
+
+        for _ in 0..MAX_ATTEMPTS {
+            let (current, version) = match self.object_store.get(&location).await {
+                Ok(result) => {
+                    let version = UpdateVersion {
+                        e_tag: result.meta.e_tag.clone(),
+                        version: result.meta.version.clone(),
+                    };
+                    let current =
+                        serde_json::from_slice::<SeqFloor>(&result.bytes().await?)?.next_seq_floor;
+                    (current, Some(version))
+                }
+                Err(object_store::Error::NotFound { .. }) => (0, None),
+                Err(err) => return Err(err.into()),
+            };
+
+            if current >= floor {
+                return Ok(());
+            }
+
+            let payload = PutPayload::from(Bytes::from(serde_json::to_vec(&SeqFloor {
+                next_seq_floor: floor,
+            })?));
+            let mode = match &version {
+                Some(version) => PutMode::Update(version.clone()),
+                None => PutMode::Create,
+            };
+
+            match self
+                .object_store
+                .put_opts(
+                    &location,
+                    payload,
+                    PutOptions {
+                        mode,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(_) => return Ok(()),
+                // Lost the CAS (create race or stale version) — re-read and retry.
+                Err(object_store::Error::AlreadyExists { .. })
+                | Err(object_store::Error::Precondition { .. }) => continue,
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        error!(prefix, floor, "seq floor CAS exhausted retries");
+        Err(Error::Api(ErrorCode::UnknownServerError))
+    }
+
     /// The next free segment sequence for `prefix`, read from the tail of the
     /// `segments/` listing (#57). Zero-padded names sort lexicographically by
     /// sequence, so the greatest listed name is the tail. Used to seed the hint
@@ -2137,7 +2235,11 @@ impl DynoStore {
             max = Some(max.map_or(seq, |m| m.max(seq)));
         }
 
-        Ok(max.map_or(0, |m| m + 1))
+        // Fold in the persisted floor (#77): a sequence name freed by
+        // retention/compaction must never be reused, even when the surviving
+        // listing's max has dropped below it (or the prefix listed empty).
+        let floor = self.read_seq_floor(prefix).await?;
+        Ok(max.map_or(0, |m| m + 1).max(floor))
     }
 
     /// Write `payload` as the next create-only segment under `prefix` and return
@@ -3684,6 +3786,15 @@ impl DynoStore {
             }
         }
 
+        // Raise the durable sequence floor past every seq we are about to delete,
+        // write-ahead of the delete (#77): a freed sequence name must never be
+        // reused, or a peer caching the old footer would serve stale byte ranges
+        // against a reborn object. On error, abort before deleting (retry next
+        // tick) rather than break the invariant.
+        if let Some(max_expirable) = expirable.iter().copied().max() {
+            self.raise_seq_floor(prefix, max_expirable + 1).await?;
+        }
+
         // Delete the expired segment objects in bounded chunks.
         let mut deleted: u64 = 0;
         let mut chunk: Vec<Path> = Vec::new();
@@ -3880,6 +3991,15 @@ impl DynoStore {
             self.index_insert(prefix, seq, footer, max_last_modified)?;
             Some(seq)
         };
+
+        // Raise the durable sequence floor past every run seq, write-ahead of the
+        // delete (#77). Compaction usually adds a higher merged seq so the listing
+        // max is unchanged, but when every run segment is superseded no merged seq
+        // is written (`new_seq == None`) and deleting the run *can* lower the
+        // listing max — freeing a run name for reuse without the floor.
+        if let Some(max_run) = run.iter().copied().max() {
+            self.raise_seq_floor(prefix, max_run + 1).await?;
+        }
 
         let locations: Vec<Path> = run
             .iter()

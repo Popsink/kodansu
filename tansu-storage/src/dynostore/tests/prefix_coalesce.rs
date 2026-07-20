@@ -1186,6 +1186,52 @@ async fn full_drain_then_restart_keeps_offset() -> Result<(), Error> {
     Ok(())
 }
 
+/// A segment sequence *name* freed by full retention must not be reused (#77).
+/// After every segment expires, a fresh writer must continue at the persisted
+/// sequence floor, never the freed seq 0 — otherwise a peer (or an external
+/// S3-direct reader) still caching the old seq-0 footer would serve its stale
+/// byte ranges against a reborn object.
+#[tokio::test]
+async fn seq_name_not_reused_after_full_expiry() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.tab_a";
+    let a = Topition::new(topic, 0);
+
+    {
+        let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+            .prefix_coalesce(true)
+            .prefix_lease_ttl(Duration::from_millis(80));
+        create_topic(&store, topic).await?;
+        assert_eq!(0, store.produce(None, &a, batch_at(1, 1_000)?).await?);
+        assert_eq!(1, store.produce(None, &a, batch_at(1, 2_000)?).await?);
+
+        // Segments live at seq 0 and 1.
+        let mut seqs = segments(&bucket).await;
+        seqs.sort();
+        assert_eq!(vec![segment_path(0), segment_path(1)], seqs);
+
+        // Expire everything → both segment objects gone, seq floor raised to 2.
+        assert_eq!(2, store.expire_prefix_segments(PREFIX, now_ms()).await?);
+        assert!(segments(&bucket).await.is_empty());
+    }
+
+    tokio::time::sleep(Duration::from_millis(160)).await;
+
+    // Fresh process: cold state, all segments gone. The next segment must be
+    // written at seq 2 (the floor), never at the freed seq 0.
+    let restarted = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    _ = restarted.produce(None, &a, batch(1)?).await?;
+
+    let seqs = segments(&bucket).await;
+    assert!(
+        !seqs.contains(&segment_path(0)),
+        "freed seq 0 name must not be reused",
+    );
+    assert_eq!(vec![segment_path(2)], seqs);
+
+    Ok(())
+}
+
 /// A byte-budget-limited hybrid fetch must not jump into segments and skip the
 /// unserved legacy tail — it returns only the legacy prefix, contiguous (#60
 /// review fix).
