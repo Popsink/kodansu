@@ -546,3 +546,41 @@ async fn repeated_high_watermark_on_fresh_reader_lists_once() -> Result<(), Erro
 
     Ok(())
 }
+
+/// A caught-up consumer long-polling an idle partition serves the high watermark
+/// from the fresh in-memory hint, issuing ZERO object-store requests per poll:
+/// neither the tail listing (#40) nor the persisted `watermark.json` GET (#72).
+/// Before #72 the `persisted_high` GET ran ahead of the fresh-hint check, so
+/// every poll cost one GET; steady-state fetch cost is now nil.
+#[tokio::test]
+async fn warm_high_watermark_polls_hit_object_store_zero_times() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+    let (storage, counters) = store();
+
+    create(&storage, "hot", 1).await?;
+    let topition = Topition::new("hot", 0);
+    for n in 0..4 {
+        _ = storage
+            .produce(None, &topition, batch(format!("m-{n}").as_bytes())?)
+            .await?;
+    }
+
+    // One read reconciles against a listing and warms the hint (sets listed_at).
+    assert_eq!(4, storage.high_watermark(&topition).await?);
+
+    // Steady-state long-poll: every read within the TTL is served from the hint
+    // with no object-store traffic at all.
+    counters.reset();
+    for _ in 0..50 {
+        assert_eq!(4, storage.high_watermark(&topition).await?);
+    }
+    let warm = counters.report("50 warm high_watermark polls");
+
+    assert_eq!(
+        (0, 0, 0, 0, 0),
+        warm,
+        "a fresh-hint high watermark must issue no GET (#72) and no LIST (#40)"
+    );
+
+    Ok(())
+}
