@@ -13,10 +13,16 @@
 // limitations under the License.
 
 use dotenv::dotenv;
+use mimalloc::MiMalloc;
 use tansu_broker::{TracingFormat, otel};
 use tansu_cli::{Cli, Result};
 use tansu_sans_io::ErrorCode;
 use tracing::{debug, error};
+
+// The docker image is a statically linked musl binary: without a custom
+// allocator it would use musl's malloc, which contends badly across threads.
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 const CLIENT_ERROR_MESSAGE: &str = "A client error occurred. Possible causes:
   • No network connection

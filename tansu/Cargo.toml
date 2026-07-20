@@ -15,6 +15,7 @@ workspace = true
 
 [dependencies]
 dotenv.workspace = true
+mimalloc.workspace = true
 tansu-broker = { workspace = true, default-features = false, optional = true }
 tansu-cat.workspace = true
 tansu-cli = { workspace = true, default-features = false, optional = true }
