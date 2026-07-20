@@ -523,8 +523,21 @@ const SEGMENT_MAGIC: u32 = 0x5453_4547;
 /// On-disk version of the segment frame + footer format (#64). Version `0` is
 /// the implicit legacy single-topic layout (a bare batch concatenation with no
 /// trailer, produced by #50); `1` is the first self-describing multi-topic
-/// segment. Versioned so future footer fields stay forward-compatible.
+/// segment; `2` (#87) adds a per-flush footer nonce and per-batch producer
+/// coordinates for log-based idempotent dedup (#88). Versioned so footer fields
+/// stay forward-compatible.
+///
+/// This is the version the writer currently *emits*. Readers accept `1` and `2`
+/// (see [`Self::decode_segment_footer`]); v2 fields are only serialized when this
+/// is bumped, which is gated on the leaseless-writer cutover (#86) and the
+/// external S3-direct reader accepting v2 (kotatsu#82) — writing v2 before then
+/// would break a v1-only reader.
 const SEGMENT_FORMAT_VERSION: u16 = 1;
+
+/// Segment format version carrying the v2 footer additions (#87): a per-flush
+/// nonce and per-(idempotent-)batch producer coordinates. Accepted by the reader
+/// today; emitted once [`SEGMENT_FORMAT_VERSION`] is bumped to it.
+const SEGMENT_FORMAT_VERSION_V2: u16 = 2;
 
 /// Fixed-size trailer at the very end of every multi-topic segment (#64):
 /// `footer_len (u64) + entry_count (u32) + version (u16) + magic (u32)`. A
@@ -555,6 +568,26 @@ struct SubstreamEntry {
     /// Greatest record timestamp in the sub-stream, read by per-prefix
     /// whole-segment retention (#61) to decide expiry without a body read.
     max_timestamp: i64,
+    /// Producer coordinates of the idempotent/transactional batches in this
+    /// sub-stream's region, in region (offset) order (#87, footer v2). Empty in a
+    /// v1 footer and for non-idempotent batches. Consumed by log-based idempotent
+    /// dedup (#88) so duplicate detection derives from the durable log rather than
+    /// a lazily-checkpointed `producers/{id}.json`.
+    producers: Vec<ProducerCoord>,
+}
+
+/// One idempotent/transactional batch's producer coordinates as carried in a v2
+/// segment footer (#87). `offset_delta` is the batch's base offset *relative to
+/// its sub-stream's* `base_offset` (so it survives the offset re-derivation on a
+/// conflict-correction re-encode); `last_sequence` is `base_sequence +
+/// (record_count - 1)`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProducerCoord {
+    producer_id: i64,
+    producer_epoch: i16,
+    base_sequence: i32,
+    last_sequence: i32,
+    offset_delta: u32,
 }
 
 /// The self-describing footer index of a prefix-coalesced segment (#64): one
@@ -568,6 +601,11 @@ struct SegmentFooter {
     /// prefix leasing is not in effect. Stamped so a stale-epoch segment (from a
     /// fenced writer) is identifiable on read/recovery.
     writer_epoch: i64,
+    /// Per-flush nonce (#87, footer v2): lets a writer recognise its own segment
+    /// after an ambiguous PUT (create succeeded but the response was lost) and
+    /// adopt it instead of re-writing the batch at the next sequence (#89). `0` in
+    /// a v1 footer.
+    nonce: u64,
     entries: Vec<SubstreamEntry>,
 }
 
@@ -4669,14 +4707,18 @@ impl DynoStore {
                 byte_start,
                 byte_len: body.len() as u64 - byte_start,
                 max_timestamp,
+                // Populated when the writer emits v2 (#88); empty on the current
+                // v1 write path.
+                producers: Vec::new(),
             });
         }
 
         let footer = SegmentFooter {
             writer_epoch,
+            nonce: 0,
             entries,
         };
-        let footer_bytes = Self::encode_footer(&footer);
+        let footer_bytes = Self::encode_footer(&footer, SEGMENT_FORMAT_VERSION);
 
         body.extend_from_slice(&footer_bytes);
         body.extend_from_slice(&(footer_bytes.len() as u64).to_be_bytes());
@@ -4692,9 +4734,13 @@ impl DynoStore {
     /// partition (i32) + base_offset (i64) + record_count (i64) +
     /// byte_start (u64) + byte_len (u64) + max_timestamp (i64)`, all big-endian.
     /// Paired with [`Self::decode_footer`].
-    fn encode_footer(footer: &SegmentFooter) -> Vec<u8> {
+    fn encode_footer(footer: &SegmentFooter, version: u16) -> Vec<u8> {
+        let v2 = version >= SEGMENT_FORMAT_VERSION_V2;
         let mut buf = Vec::new();
         buf.extend_from_slice(&footer.writer_epoch.to_be_bytes());
+        if v2 {
+            buf.extend_from_slice(&footer.nonce.to_be_bytes());
+        }
         for entry in &footer.entries {
             let topic = entry.topic.as_bytes();
             buf.extend_from_slice(&(topic.len() as u16).to_be_bytes());
@@ -4705,6 +4751,16 @@ impl DynoStore {
             buf.extend_from_slice(&entry.byte_start.to_be_bytes());
             buf.extend_from_slice(&entry.byte_len.to_be_bytes());
             buf.extend_from_slice(&entry.max_timestamp.to_be_bytes());
+            if v2 {
+                buf.extend_from_slice(&(entry.producers.len() as u16).to_be_bytes());
+                for pc in &entry.producers {
+                    buf.extend_from_slice(&pc.producer_id.to_be_bytes());
+                    buf.extend_from_slice(&pc.producer_epoch.to_be_bytes());
+                    buf.extend_from_slice(&pc.base_sequence.to_be_bytes());
+                    buf.extend_from_slice(&pc.last_sequence.to_be_bytes());
+                    buf.extend_from_slice(&pc.offset_delta.to_be_bytes());
+                }
+            }
         }
         buf
     }
@@ -4712,7 +4768,12 @@ impl DynoStore {
     /// Parse a [`SegmentFooter`] from `footer_bytes`, the `footer_len` bytes that
     /// precede the trailer (#64). Inverse of [`Self::encode_footer`]; a
     /// truncated or malformed footer is a corrupt segment, not a legacy object.
-    fn decode_footer(footer_bytes: &[u8], entry_count: usize) -> Result<SegmentFooter> {
+    fn decode_footer(
+        footer_bytes: &[u8],
+        entry_count: usize,
+        version: u16,
+    ) -> Result<SegmentFooter> {
+        let v2 = version >= SEGMENT_FORMAT_VERSION_V2;
         let mut entries = Vec::with_capacity(entry_count);
         let mut cursor = footer_bytes;
 
@@ -4726,6 +4787,11 @@ impl DynoStore {
         }
 
         let writer_epoch = i64::from_be_bytes(take(&mut cursor, 8)?.try_into()?);
+        let nonce = if v2 {
+            u64::from_be_bytes(take(&mut cursor, 8)?.try_into()?)
+        } else {
+            0
+        };
 
         for _ in 0..entry_count {
             let topic_len = u16::from_be_bytes(take(&mut cursor, 2)?.try_into()?) as usize;
@@ -4738,6 +4804,23 @@ impl DynoStore {
             let byte_len = u64::from_be_bytes(take(&mut cursor, 8)?.try_into()?);
             let max_timestamp = i64::from_be_bytes(take(&mut cursor, 8)?.try_into()?);
 
+            let producers = if v2 {
+                let pcoord_count = u16::from_be_bytes(take(&mut cursor, 2)?.try_into()?) as usize;
+                let mut producers = Vec::with_capacity(pcoord_count);
+                for _ in 0..pcoord_count {
+                    producers.push(ProducerCoord {
+                        producer_id: i64::from_be_bytes(take(&mut cursor, 8)?.try_into()?),
+                        producer_epoch: i16::from_be_bytes(take(&mut cursor, 2)?.try_into()?),
+                        base_sequence: i32::from_be_bytes(take(&mut cursor, 4)?.try_into()?),
+                        last_sequence: i32::from_be_bytes(take(&mut cursor, 4)?.try_into()?),
+                        offset_delta: u32::from_be_bytes(take(&mut cursor, 4)?.try_into()?),
+                    });
+                }
+                producers
+            } else {
+                Vec::new()
+            };
+
             entries.push(SubstreamEntry {
                 topic,
                 partition,
@@ -4746,11 +4829,13 @@ impl DynoStore {
                 byte_start,
                 byte_len,
                 max_timestamp,
+                producers,
             });
         }
 
         Ok(SegmentFooter {
             writer_epoch,
+            nonce,
             entries,
         })
     }
@@ -4775,7 +4860,7 @@ impl DynoStore {
         let footer_len = u64::from_be_bytes(trailer[0..8].try_into()?) as usize;
         let entry_count = u32::from_be_bytes(trailer[8..12].try_into()?) as usize;
         let version = u16::from_be_bytes(trailer[12..14].try_into()?);
-        if version != SEGMENT_FORMAT_VERSION {
+        if version != SEGMENT_FORMAT_VERSION && version != SEGMENT_FORMAT_VERSION_V2 {
             return Err(Error::Message(format!(
                 "unsupported segment format version {version}"
             )));
@@ -4786,7 +4871,7 @@ impl DynoStore {
             .checked_sub(footer_len)
             .ok_or_else(|| Error::Message(String::from("segment footer length exceeds tail")))?;
 
-        Self::decode_footer(&tail[footer_start..footer_end], entry_count).map(Some)
+        Self::decode_footer(&tail[footer_start..footer_end], entry_count, version).map(Some)
     }
 
     async fn get<V>(&self, location: &Path) -> Result<(V, Version)>
