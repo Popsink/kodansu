@@ -177,6 +177,18 @@ pub struct DynoStore {
     /// after a restart, and independent per maintain node.
     oldest_retained: Arc<Mutex<BTreeMap<Topition, i64>>>,
 
+    /// Pure-segment retention skip (#71): the instant a maintenance scan last
+    /// found a partition's legacy `records/` prefix empty under prefix coalescing.
+    /// While this is within [`Self::RETENTION_EMPTY_SKIP_TTL`] the maintenance loop
+    /// skips the empty per-topic LIST entirely (segment retention is handled
+    /// per-prefix by `expire_prefix_segments`), instead of re-LISTing every tick
+    /// forever. It SELF-HEALS: once the TTL lapses the partition is scanned again,
+    /// so a legacy write that lands afterwards — even from another process (the
+    /// broker and the dedicated `maintain` worker do not share this map) — is
+    /// still expired within one TTL. That bounds worst-case over-retention to the
+    /// TTL while cutting the empty-LIST rate to ~one per TTL. In-memory only.
+    retention_empty_skip: Arc<Mutex<BTreeMap<Topition, SystemTime>>>,
+
     /// Per-*prefix* analogue of [`Self::oldest_retained`] for whole-segment
     /// retention (#61): the oldest surviving segment's age (ms) observed at the
     /// last scan, letting the maintenance loop skip the `segments/` LIST of a
@@ -881,6 +893,7 @@ impl DynoStore {
             producers: Arc::new(Mutex::new(BTreeMap::new())),
             producer_checkpoints: Arc::new(Mutex::new(BTreeMap::new())),
             oldest_retained: Arc::new(Mutex::new(BTreeMap::new())),
+            retention_empty_skip: Arc::new(Mutex::new(BTreeMap::new())),
             oldest_retained_prefix: Arc::new(Mutex::new(BTreeMap::new())),
             produce_coalesce: false,
             coalesce: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1106,6 +1119,16 @@ impl DynoStore {
     /// unaffected in semantics — a stale (lower) high watermark can only *delay*
     /// visibility, never expose unstable offsets.
     const HIGH_WATERMARK_HINT_TTL: Duration = Duration::from_secs(5);
+
+    /// How long a pure-segment partition is skipped by retention after a scan
+    /// found its legacy `records/` prefix empty (#71), before it is re-scanned
+    /// once. This is the worst-case over-retention of a legacy object later
+    /// written to such a partition by another process (see
+    /// [`Self::retention_empty_skip`]); one hour is negligible against the
+    /// multi-day `retention.ms` typical of CDC while cutting the empty per-topic
+    /// LIST rate on the maintainer by roughly this window over the maintenance
+    /// interval.
+    const RETENTION_EMPTY_SKIP_TTL: Duration = Duration::from_secs(60 * 60);
 
     /// Default debounce window for persisting a producer's `producers/{id}.json`
     /// (#48): the durable object is checkpointed after at most this many
@@ -1747,28 +1770,34 @@ impl DynoStore {
     /// (`tansu.lake.sink`) write no batch objects and carry the offset in
     /// `watermark.high`, which the `max` below preserves.
     async fn high_watermark(&self, topition: &Topition) -> Result<i64> {
-        let from_watermark = self.persisted_high(topition).await?;
-
-        // Warm fast path: serve from the in-memory hint without a tail LIST while
-        // it is fresh (reconciled against a listing within the TTL). This is what
-        // takes the consumer Fetch hot path off ~1 `ListObjectsV2` per poll per
-        // partition (#40); `from_watermark` still folds in lake-sink topics'
-        // authoritative high (they write no batch objects). Bounded staleness:
-        // another replica's just-produced batch is picked up on the next
-        // TTL-triggered listing below.
+        // Warm fast path: serve from the in-memory hint without ANY per-poll S3
+        // request while it is fresh (reconciled against a listing within the TTL).
+        // Every hint refresh (`mark_listed`) already folds in `from_watermark` —
+        // including lake-sink topics' authoritative high (they write no batch
+        // objects) — see the `mark_listed` call sites below, so a fresh hint needs
+        // neither the tail `ListObjectsV2` (#40) nor the `watermark.json` GET
+        // (#72). This is what takes the consumer Fetch hot path off ~1 GET per
+        // poll per partition. Bounded staleness (== the hint TTL): another
+        // replica's just-produced batch, or a lake-sink high bump in the last TTL
+        // window, is picked up on the next TTL-triggered listing below.
         if let Some(hint) = self.cached_high_fresh(topition)? {
-            return Ok(hint.max(from_watermark));
+            return Ok(hint);
         }
+
+        // Cold/stale hint: read the persisted watermark as the listing floor (and
+        // to fold in lake-sink topics' authoritative high). Only on this slow
+        // path, not on every poll.
+        let from_watermark = self.persisted_high(topition).await?;
 
         // Prefix-coalesced (#60): the tail offset lives in the segment footers,
         // not in a `records/` listing (there is none). Recover it footer-only
         // (#58) and refresh the hint so the hot path serves from memory next
         // time. GCS-safe: no per-flush-mutated manifest is read.
         if self.prefix_coalesce {
-            let recovered = self.recover_substream_next_offset(topition).await?;
-            let high = recovered
-                .max(self.cached_high(topition)?.unwrap_or(0))
-                .max(from_watermark);
+            let recovered = self
+                .recover_substream_next_offset(topition, from_watermark)
+                .await?;
+            let high = recovered.max(self.cached_high(topition)?.unwrap_or(0));
             self.mark_listed(topition, high)?;
             return Ok(high);
         }
@@ -2443,7 +2472,11 @@ impl DynoStore {
     /// unacceptable — so the true next offset is the highest either source knows.
     /// Also folds in the persisted `watermark.high` floor so a fully
     /// retention-drained sub-stream never regresses to 0 (#61 review fix).
-    async fn recover_substream_next_offset(&self, topition: &Topition) -> Result<i64> {
+    async fn recover_substream_next_offset(
+        &self,
+        topition: &Topition,
+        persisted_floor: i64,
+    ) -> Result<i64> {
         let prefix = self.prefix_of(topition);
         self.refresh_prefix_index(&prefix).await?;
 
@@ -2453,10 +2486,26 @@ impl DynoStore {
             .map(|(_, entry)| entry.base_offset + entry.record_count)
             .unwrap_or(0);
 
-        let legacy_tail = self.tail_next_offset(topition, None).await?;
-        let persisted = self.persisted_high(topition).await.unwrap_or(0);
+        // Legacy tail only when the sub-stream still has legacy `records/` objects
+        // (#73): a pure-segment sub-stream has an empty prefix, so the
+        // unconditional per-call LIST here was a residual on the recurring
+        // stale-hint refresh path. Gated on the memoized `has_legacy_records` (the
+        // flag the fetch path warms). The writer/flush path reaches this only when
+        // the in-memory counter is genuinely cold (never set on this process),
+        // where the memo is also cold and does a real probe — so offset recovery
+        // stays authoritative and never regresses. On the read path any memo
+        // staleness is folded away by the caller's `.max(cached_high)` and bounded
+        // by the hint TTL, consistent with #40/#72.
+        let legacy_tail = if self.has_legacy_records(topition).await? {
+            self.tail_next_offset(topition, None).await?
+        } else {
+            0
+        };
 
-        Ok(segment_tail.max(legacy_tail).max(persisted))
+        // `persisted_floor` is supplied by the caller (the persisted
+        // `watermark.high`) so this shares the single GET the read path already
+        // issued instead of re-fetching it (#72).
+        Ok(segment_tail.max(legacy_tail).max(persisted_floor))
     }
 
     /// Fetch a topition's records out of shared prefix-coalesced segments (#60).
@@ -2745,30 +2794,61 @@ impl DynoStore {
     /// otherwise the base offset in the oldest segment (lowest sequence) that
     /// carries the sub-stream. `0` when neither exists yet.
     async fn coalesced_earliest_offset(&self, topition: &Topition) -> Result<i64> {
-        // Legacy region first: the smallest base offset present in `records/`
-        // (listing order is ascending, so the first parseable name is the min).
-        let records = Path::from(format!(
-            "clusters/{}/topics/{}/partitions/{:0>10}/records/",
-            self.cluster, topition.topic, topition.partition,
-        ));
-        let mut stream = self.object_store.list(Some(&records));
-        while let Some(meta) = stream
-            .next()
-            .await
-            .transpose()
-            .inspect_err(|error| error!(?error, ?topition))
-            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
-        {
-            if let Some(name) = meta.location.parts().next_back()
-                && name.as_ref().len() >= 20
-                && let Ok(base) = i64::from_str(&name.as_ref()[0..20])
+        // Hybrid topic: the legacy region holds the lowest offsets (below the #58
+        // seam), so the smallest base offset present in `records/` is the log
+        // start (listing is ascending, so the first parseable name is the min).
+        // Gated on the memoized hybrid check (#73) so a pure-segment topic — the
+        // common case under prefix coalescing — pays NO per-call `records/` LIST;
+        // `has_legacy_records` is the same TTL-cached flag the fetch path warms.
+        if self.has_legacy_records(topition).await? {
+            let records = Path::from(format!(
+                "clusters/{}/topics/{}/partitions/{:0>10}/records/",
+                self.cluster, topition.topic, topition.partition,
+            ));
+            let mut stream = self.object_store.list(Some(&records));
+            while let Some(meta) = stream
+                .next()
+                .await
+                .transpose()
+                .inspect_err(|error| error!(?error, ?topition))
+                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
             {
-                return Ok(base);
+                if let Some(name) = meta.location.parts().next_back()
+                    && name.as_ref().len() >= 20
+                    && let Ok(base) = i64::from_str(&name.as_ref()[0..20])
+                {
+                    return Ok(base);
+                }
             }
         }
 
         // Otherwise the oldest segment's base for this sub-stream, from the index.
         Ok(self.segment_region_start(topition).await?.unwrap_or(0))
+    }
+
+    /// The newest record timestamp for a PURE-segment sub-stream (#73), from the
+    /// footer index — the tail segment's `max_timestamp`. Returns `None` (caller
+    /// falls back to the legacy `records/` listing) when the sub-stream has no
+    /// segment yet, when the footer carries no timestamp, OR when the topic is
+    /// hybrid: a topic under prefix coalescing can hold legacy `records/` objects
+    /// (transactional/control/compacted/backfill batches are never coalesced) at
+    /// offsets ABOVE the segment tail, so the footer's max_timestamp is NOT the
+    /// log's latest timestamp there. Gated on the memoized `has_legacy_records`
+    /// (like `coalesced_earliest_offset`) so the common pure-segment case pays no
+    /// per-topic LIST while the hybrid case stays correct.
+    async fn coalesced_latest_timestamp(&self, topition: &Topition) -> Result<Option<SystemTime>> {
+        if self.has_legacy_records(topition).await? {
+            return Ok(None);
+        }
+
+        let prefix = self.prefix_of(topition);
+        self.refresh_prefix_index(&prefix).await?;
+        Ok(self
+            .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
+            .last()
+            .map(|(_, entry)| entry.max_timestamp)
+            .filter(|&ms| ms >= 0)
+            .map(|ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms as u64)))
     }
 
     /// The per-prefix flush serialization lock (see [`Self::prefix_flush_locks`]).
@@ -3096,15 +3176,23 @@ impl DynoStore {
                 // offset as max(segment footer tail, legacy records/ tail,
                 // persisted floor) so a seam/backfill/drained sub-stream never
                 // reuses or regresses an offset (#58/#61 review fixes).
-                Ok(None) => match self.recover_substream_next_offset(topition).await {
-                    Ok(high) => {
-                        _ = self
-                            .set_high(topition, high)
-                            .inspect_err(|err| debug!(?err));
-                        high
+                Ok(None) => {
+                    // Cold writer path: fetch the persisted floor once and hand it
+                    // to recovery (which no longer fetches it itself, #72).
+                    let persisted = self.persisted_high(topition).await.unwrap_or(0);
+                    match self
+                        .recover_substream_next_offset(topition, persisted)
+                        .await
+                    {
+                        Ok(high) => {
+                            _ = self
+                                .set_high(topition, high)
+                                .inspect_err(|err| debug!(?err));
+                            high
+                        }
+                        Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
                     }
-                    Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
-                },
+                }
                 Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
             };
 
@@ -3416,14 +3504,30 @@ impl DynoStore {
     }
 
     /// Whether `topition` might hold data older than `threshold_ms`, cheaply,
-    /// from the in-memory oldest-retained hint (#49). Returns `true` (must scan)
-    /// when the hint is absent, and `false` (safe to skip the full LIST) only
-    /// when a known oldest-surviving timestamp is at or after the threshold.
+    /// without a LIST. Returns `false` (safe to skip the full LIST) when either
+    /// (a) a maintenance scan found the legacy `records/` prefix empty within
+    /// [`Self::RETENTION_EMPTY_SKIP_TTL`] (#71 — a pure-segment partition), or
+    /// (b) the oldest-retained hint's known oldest-surviving timestamp is at or
+    /// after the threshold (#49). Returns `true` (must scan) otherwise, including
+    /// when nothing is known.
     ///
-    /// The hint is a lower bound on the true oldest timestamp, so `false` is
-    /// always sound: it can never hide expirable data, only skip a partition
-    /// that has none.
+    /// Both signals are lower bounds and time-bounded, so `false` is always sound:
+    /// the empty-skip self-heals after the TTL (re-scanning picks up any legacy
+    /// object written meanwhile, even by another process), and the oldest-retained
+    /// hint only ever under-states the oldest. Neither can hide expirable data for
+    /// longer than the TTL / until the next scan.
     fn partition_maybe_expirable(&self, topition: &Topition, threshold_ms: i64) -> Result<bool> {
+        if self
+            .retention_empty_skip
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .get(topition)
+            .and_then(|at| SystemTime::now().duration_since(*at).ok())
+            .is_some_and(|elapsed| elapsed < Self::RETENTION_EMPTY_SKIP_TTL)
+        {
+            return Ok(false);
+        }
+
         self.oldest_retained
             .lock()
             .map_err(Into::into)
@@ -3436,8 +3540,7 @@ impl DynoStore {
 
     /// Update the oldest-retained hint for `topition` after a scan: `Some(ms)`
     /// records the oldest surviving batch's `last_modified`; `None` (no surviving
-    /// object) drops the entry so the next tick scans again rather than skipping
-    /// a partition that may since have been produced to.
+    /// object) drops the entry.
     fn record_oldest_retained(&self, topition: &Topition, oldest_ms: Option<i64>) -> Result<()> {
         self.oldest_retained
             .lock()
@@ -3449,6 +3552,19 @@ impl DynoStore {
                 None => {
                     _ = locked.remove(topition);
                 }
+            })
+    }
+
+    /// Record that a maintenance scan found `topition`'s legacy `records/` prefix
+    /// empty under prefix coalescing (#71), so it is skipped for
+    /// [`Self::RETENTION_EMPTY_SKIP_TTL`] before being re-scanned once. See
+    /// [`Self::retention_empty_skip`].
+    fn record_retention_empty_skip(&self, topition: &Topition) -> Result<()> {
+        self.retention_empty_skip
+            .lock()
+            .map_err(Into::into)
+            .map(|mut locked| {
+                _ = locked.insert(topition.to_owned(), SystemTime::now());
             })
     }
 
@@ -4151,8 +4267,22 @@ impl DynoStore {
 
         // Refresh the skip hint from what this scan observed — even when nothing
         // was deleted, so a partition well within retention is skipped next tick
-        // (#49). `None` (no survivor) drops the entry.
+        // (#49).
         self.record_oldest_retained(topition, surviving_oldest_ms)?;
+
+        // #71: under prefix coalescing a pure-segment partition has an empty
+        // legacy `records/` prefix, so this scan found nothing every tick — a
+        // per-topic LIST that would otherwise never go away (segment retention is
+        // handled per-prefix by `expire_prefix_segments`, #61). Record a
+        // time-bounded skip so subsequent ticks skip the empty LIST, self-healing
+        // after `RETENTION_EMPTY_SKIP_TTL` so a legacy object written afterwards —
+        // possibly by another process, since the broker and the dedicated
+        // `maintain` worker do not share this map — is still expired within one
+        // TTL. The non-coalesce path is unchanged: ordinary writes go to
+        // `records/` there, so an empty partition must keep being re-scanned.
+        if self.prefix_coalesce && surviving_oldest_ms.is_none() {
+            self.record_retention_empty_skip(topition)?;
+        }
 
         if deleted == 0 {
             return Ok(0);
@@ -4969,6 +5099,14 @@ impl Storage for DynoStore {
                 .inspect(|offset| debug!(offset, transaction_id, ?topition))
                 .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
 
+            // Advance the in-memory hint so a read on THIS broker reflects the
+            // lake-sink write immediately (#72). The lake-sink branch is the only
+            // producer path that writes no batch object, so without this the
+            // fresh-hint fast path would serve a stale high watermark until the
+            // hint TTL expired — a read-your-writes regression the pre-#72 per-poll
+            // GET masked.
+            self.set_high(topition, offset + deflated.last_offset_delta as i64 + 1)?;
+
             if let Some(ref registry) = self.schemas {
                 let batch_attribute = BatchAttribute::try_from(deflated.attributes)
                     .inspect(|batch_attribute| debug!(?batch_attribute))
@@ -5407,17 +5545,32 @@ impl Storage for DynoStore {
             // (max base offset + that batch's record count). The previous
             // `last_modified` ordering was wrong under inter-replica clock skew
             // and `max_base + 1` ignored multi-record batches; `high_watermark`
-            // is correct on both counts. The timestamp is still the tail batch's
-            // mtime (a positive value), preserving the contract the SQL backends
-            // also honour; `None` (→ -1 on the wire) only for an empty log.
+            // is correct on both counts. `None` (→ -1 on the wire) only for an
+            // empty log.
             if *offset_request == ListOffset::Latest && !stable.contains_key(topition) {
                 let high = self.high_watermark(topition).await?;
 
-                let timestamp = self
-                    .list_batch_offsets(topition)
-                    .await?
-                    .last_key_value()
-                    .map(|(_, meta)| meta.last_modified.into());
+                // Tail timestamp. For a PURE-segment topic (#73) read it from the
+                // footer index (the newest segment's max record timestamp) rather
+                // than a per-topic `records/` LIST. This is the segment's
+                // record-time (closer to the SQL backends' record `timestamp` than
+                // the legacy object mtime), but the two sources differ, so the
+                // fallback is used whenever a segment isn't the authoritative tail:
+                // `coalesced_latest_timestamp` returns `None` for a non-coalesced
+                // or hybrid topic (a legacy object may sit above the segments), and
+                // we then take the legacy tail's mtime as before.
+                let timestamp = match if self.prefix_coalesce {
+                    self.coalesced_latest_timestamp(topition).await?
+                } else {
+                    None
+                } {
+                    Some(timestamp) => Some(timestamp),
+                    None => self
+                        .list_batch_offsets(topition)
+                        .await?
+                        .last_key_value()
+                        .map(|(_, meta)| meta.last_modified.into()),
+                };
 
                 responses.push((
                     topition.to_owned(),

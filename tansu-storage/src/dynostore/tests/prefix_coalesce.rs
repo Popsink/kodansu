@@ -495,6 +495,91 @@ async fn a_fresh_reader_fetches_from_segments() -> Result<(), Error> {
     Ok(())
 }
 
+/// `ListOffsets` LATEST serves the tail *timestamp* for a pure-segment topic
+/// from the footer's `max_timestamp` (#73), not from a per-topic `records/`
+/// listing (there is none). The offset already comes from `high_watermark`.
+#[tokio::test]
+async fn list_offsets_latest_timestamp_from_footer() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    const TS: i64 = 1_700_000_000_000;
+    assert_eq!(0, store.produce(None, &a, batch_at(2, TS)?).await?);
+
+    let latest = store
+        .list_offsets(
+            IsolationLevel::ReadUncommitted,
+            &[(a.clone(), ListOffset::Latest)],
+        )
+        .await?;
+
+    assert_eq!(Some(2), latest[0].1.offset, "high watermark");
+    assert_eq!(
+        Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_millis(TS as u64)),
+        latest[0].1.timestamp,
+        "tail timestamp derived from the footer max_timestamp",
+    );
+
+    Ok(())
+}
+
+/// Retention (#71): a pure-segment partition has an empty legacy `records/`
+/// prefix, so the maintainer must not re-LIST it every tick. The real scan path
+/// (`expire_partition`) records a time-bounded skip; subsequent ticks skip it;
+/// the skip self-heals once its TTL lapses so a legacy object written afterwards
+/// (possibly by another process) is still scanned and expired.
+#[tokio::test]
+async fn pure_segment_partition_retention_skips_rescan() -> Result<(), Error> {
+    use std::time::{Duration, SystemTime};
+
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    // Produce lands in a segment; the legacy `records/` prefix stays empty.
+    assert_eq!(0, store.produce(None, &a, batch(1)?).await?);
+
+    // A threshold far in the future would expire anything present.
+    let threshold = now_ms() + 1_000_000;
+
+    // Cold: no skip recorded yet, so the partition must be scanned once.
+    assert!(
+        store.partition_maybe_expirable(&a, threshold)?,
+        "cold partition must be scanned",
+    );
+
+    // The real maintenance scan finds an empty `records/`; under prefix
+    // coalescing it records the time-bounded skip (not a permanent sentinel).
+    _ = store.expire_partition(&a, threshold).await?;
+
+    // Subsequent maintenance ticks within the TTL skip the empty per-topic LIST.
+    assert!(
+        !store.partition_maybe_expirable(&a, threshold)?,
+        "pure-segment partition must be skipped while the skip is fresh",
+    );
+
+    // Simulate the TTL lapsing (backdate the recorded instant beyond the TTL):
+    // the skip self-heals so retention scans the partition again — which is how a
+    // legacy object written meanwhile (even by another process that never touched
+    // this in-memory map) is eventually expired.
+    {
+        let mut skip = store.retention_empty_skip.lock().expect("skip lock");
+        let stale = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+        _ = skip.insert(a.clone(), stale);
+    }
+    assert!(
+        store.partition_maybe_expirable(&a, threshold)?,
+        "a lapsed skip must re-arm the retention scan (self-heal)",
+    );
+
+    Ok(())
+}
+
 /// Seam continuity (#58): a topic with existing legacy `records/{offset}.batch`
 /// data flipped to segment mode continues its offset sequence unbroken — the
 /// first segment offset equals the legacy tail, no gap/overlap/off-by-one.
