@@ -2506,6 +2506,7 @@ impl Builder<i32, String, Url, Url> {
                 // and takes precedence over `produce_coalesce` for eligible
                 // batches.
                 let prefix_coalesce = url_flag(&self.storage, "prefix_coalesce");
+                let prefix_leaseless = url_flag(&self.storage, "prefix_leaseless");
 
                 debug!(
                     ?minimum_size,
@@ -2542,6 +2543,7 @@ impl Builder<i32, String, Url, Url> {
                             .auto_create(auto_topic_create(&self.storage))
                             .produce_coalesce(produce_coalesce)
                             .prefix_coalesce(prefix_coalesce)
+                            .prefix_leaseless(prefix_leaseless)
                             .coalesce_tuning(coalesce_tuning(&self.storage))
                     })
                     .map(|storage| {
@@ -2599,6 +2601,7 @@ impl Builder<i32, String, Url, Url> {
                 // segment data objects are create-only, so this stays under the
                 // ~1/s/object mutation cap (#13) by construction.
                 let prefix_coalesce = url_flag(&self.storage, "prefix_coalesce");
+                let prefix_leaseless = url_flag(&self.storage, "prefix_leaseless");
 
                 GoogleCloudStorageBuilder::from_env()
                     .with_bucket_name(bucket_name)
@@ -2633,6 +2636,7 @@ impl Builder<i32, String, Url, Url> {
                             .auto_create(auto_topic_create(&self.storage))
                             .produce_coalesce(produce_coalesce)
                             .prefix_coalesce(prefix_coalesce)
+                            .prefix_leaseless(prefix_leaseless)
                             .coalesce_tuning(coalesce_tuning(&self.storage))
                     })
                     .map(|storage| {
@@ -2656,6 +2660,7 @@ impl Builder<i32, String, Url, Url> {
                         k == "produce_coalesce" && v.as_ref().parse().unwrap_or(false)
                     }))
                     .prefix_coalesce(url_flag(&self.storage, "prefix_coalesce"))
+                    .prefix_leaseless(url_flag(&self.storage, "prefix_leaseless"))
                     .coalesce_tuning(coalesce_tuning(&self.storage)),
             )
             .map(|storage| Box::new(storage) as Box<dyn Storage>)
