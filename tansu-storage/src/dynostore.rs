@@ -279,6 +279,13 @@ pub struct DynoStore {
     producer_checkpoint_interval: Duration,
     producer_checkpoint_batches: u64,
 
+    /// Segment-compaction thresholds (#66), each seeded from its compile-time
+    /// default and overridable per deployment via [`Self::coalesce_tuning`].
+    /// `prefix_compact_min_segments == 0` disables compaction.
+    prefix_compact_min_segments: usize,
+    prefix_compact_target_bytes: usize,
+    prefix_compact_keep_hot: usize,
+
     object_store: Arc<DynObjectStore>,
 }
 
@@ -396,6 +403,9 @@ pub struct CoalesceTuning {
     pub coalesce_bytes: Option<usize>,
     pub producer_checkpoint_interval: Option<Duration>,
     pub producer_checkpoint_batches: Option<u64>,
+    pub prefix_compact_min_segments: Option<usize>,
+    pub prefix_compact_target_bytes: Option<usize>,
+    pub prefix_compact_keep_hot: Option<usize>,
 }
 
 /// Process-wide counter making each [`DynoStore`]'s `writer_id` unique (#59), so
@@ -408,6 +418,14 @@ static SEGMENT_FLUSHES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_prefix_segment_flushes")
         .with_description("prefix-coalesced segment objects written")
+        .build()
+});
+
+/// Segments merged away by compaction (#66) — bounds live segment count.
+static SEGMENT_COMPACTIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_segment_compactions")
+        .with_description("segments merged away by prefix compaction")
         .build()
 });
 
@@ -869,6 +887,9 @@ impl DynoStore {
             coalesce_bytes: Self::COALESCE_BYTES,
             producer_checkpoint_interval: Self::PRODUCER_CHECKPOINT_INTERVAL,
             producer_checkpoint_batches: Self::PRODUCER_CHECKPOINT_BATCHES,
+            prefix_compact_min_segments: Self::PREFIX_COMPACT_MIN_SEGMENTS,
+            prefix_compact_target_bytes: Self::PREFIX_COMPACT_TARGET_BYTES,
+            prefix_compact_keep_hot: Self::PREFIX_COMPACT_KEEP_HOT,
             topic_metas: Arc::new(Mutex::new(BTreeMap::new())),
             topic_index: Arc::new(Mutex::new(TopicIndex::default())),
             topic_index_refresh: Arc::new(tokio::sync::Mutex::new(())),
@@ -951,6 +972,15 @@ impl DynoStore {
             producer_checkpoint_batches: tuning
                 .producer_checkpoint_batches
                 .unwrap_or(self.producer_checkpoint_batches),
+            prefix_compact_min_segments: tuning
+                .prefix_compact_min_segments
+                .unwrap_or(self.prefix_compact_min_segments),
+            prefix_compact_target_bytes: tuning
+                .prefix_compact_target_bytes
+                .unwrap_or(self.prefix_compact_target_bytes),
+            prefix_compact_keep_hot: tuning
+                .prefix_compact_keep_hot
+                .unwrap_or(self.prefix_compact_keep_hot),
             ..self
         }
     }
@@ -1099,6 +1129,20 @@ impl DynoStore {
     /// so the exact value only shifts a throughput/PUT tradeoff, never
     /// correctness.
     const PREFIX_BACKFILL_MIN_RECORDS: i64 = 1_000;
+
+    /// Compact a prefix's segments once it holds more than this many live ones
+    /// (#66), bounding `S` (segments per prefix ≈ flush_rate × retention, which
+    /// is otherwise unbounded) so the footer index footprint and per-fetch scan
+    /// stay bounded. `0` disables compaction.
+    const PREFIX_COMPACT_MIN_SEGMENTS: usize = 256;
+
+    /// Target byte size of a merged segment (#66): the oldest eligible run is
+    /// merged until it reaches this, then written as one create-only object.
+    const PREFIX_COMPACT_TARGET_BYTES: usize = 64 << 20;
+
+    /// Newest segments never compacted (#66): leaves the actively-produced tail
+    /// alone so compaction never races the current write point.
+    const PREFIX_COMPACT_KEEP_HOT: usize = 16;
 
     /// All topics, served from the in-memory [`TopicIndex`]. Returns the shared
     /// snapshot if fresh; otherwise refreshes it (single-flight) by LISTing the
@@ -2247,9 +2291,17 @@ impl DynoStore {
     }
 
     /// Record a freshly-written segment in the index (writer fast path): its
-    /// footer is authoritative and its append time is ~now, so a following read
-    /// on this node needs no listing/GET.
-    fn index_insert(&self, prefix: &str, seq: u64, footer: SegmentFooter) -> Result<()> {
+    /// footer is authoritative, so a following read on this node needs no
+    /// listing/GET. `last_modified_ms` is the object's append time — `now` for a
+    /// normal flush, but the max of the merged inputs for a compaction (#66) so
+    /// compaction does not reset the retention clock of timestamp-less data.
+    fn index_insert(
+        &self,
+        prefix: &str,
+        seq: u64,
+        footer: SegmentFooter,
+        last_modified_ms: i64,
+    ) -> Result<()> {
         self.prefix_index
             .lock()
             .map_err(Into::into)
@@ -2259,10 +2311,23 @@ impl DynoStore {
                     seq,
                     CachedSegment {
                         footer,
-                        last_modified_ms: Self::now_ms(),
+                        last_modified_ms,
                     },
                 );
                 entry.refreshed_at = Some(SystemTime::now());
+            })
+    }
+
+    /// Force the next index access to re-list (bust the TTL) — used when a data
+    /// GET 404s (a segment was compacted/expired out from under a reader, #66).
+    fn index_invalidate(&self, prefix: &str) -> Result<()> {
+        self.prefix_index
+            .lock()
+            .map_err(Into::into)
+            .map(|mut index| {
+                if let Some(entry) = index.get_mut(prefix) {
+                    entry.refreshed_at = None;
+                }
             })
     }
 
@@ -2384,78 +2449,97 @@ impl DynoStore {
                 .unwrap_or_default()
         };
 
+        /// A segment can be deleted mid-fetch by compaction/retention; the merged
+        /// segment covers the same offsets, so on a 404 we refresh the index and
+        /// restart cleanly. Bounded so a genuinely missing object can't loop.
+        const MAX_ATTEMPTS: usize = 3;
+
         let prefix = self.prefix_of(topition);
-        self.refresh_prefix_index(&prefix).await?;
-        let segments =
-            self.valid_substream_segments(&prefix, topition.topic(), topition.partition())?;
 
-        let mut batches = vec![];
-        let mut bytes = max_bytes as u64;
+        for _ in 0..MAX_ATTEMPTS {
+            self.refresh_prefix_index(&prefix).await?;
+            let segments =
+                self.valid_substream_segments(&prefix, topition.topic(), topition.partition())?;
 
-        for (seq, entry) in segments {
-            if has_deadline_expired() {
-                break;
-            }
+            let mut batches = vec![];
+            let mut bytes = max_bytes as u64;
+            let mut restart = false;
 
-            // Segments are sorted by base offset; skip those ending at/before the
-            // requested offset, stop once one starts at/past the high watermark.
-            if entry.base_offset + entry.record_count <= offset {
-                continue;
-            }
-            if entry.base_offset >= high_watermark {
-                break;
-            }
+            for (seq, entry) in segments {
+                if has_deadline_expired() {
+                    break;
+                }
 
-            // One ranged GET of exactly this sub-stream's byte span.
-            let location = self.segment_location(&prefix, seq);
-            let region = match self
-                .object_store
-                .get_opts(
-                    &location,
-                    GetOptions {
-                        range: Some(GetRange::Bounded(
-                            entry.byte_start..entry.byte_start + entry.byte_len,
-                        )),
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(result) => result
-                    .bytes()
-                    .await
-                    .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
-                    .and_then(|encoded| self.decode_frame(encoded))?,
-
-                // Retention deleted this segment between locate and read: prune
-                // the stale index entry and move on.
-                Err(object_store::Error::NotFound { .. }) => {
-                    _ = self.index_prune(&prefix, &[seq]);
+                // Segments are sorted by base offset; skip those ending at/before
+                // the requested offset, stop once one starts at/past the HWM.
+                if entry.base_offset + entry.record_count <= offset {
                     continue;
                 }
-
-                Err(error) => {
-                    error!(?error, location = %location);
-                    return Err(Error::Api(ErrorCode::UnknownServerError));
+                if entry.base_offset >= high_watermark {
+                    break;
                 }
-            };
 
-            let mut running = entry.base_offset;
-            for mut batch in region {
-                let span = batch.last_offset_delta as i64 + 1;
-                batch.base_offset = running;
-                running += span;
-                batches.push(batch);
+                // One ranged GET of exactly this sub-stream's byte span.
+                let location = self.segment_location(&prefix, seq);
+                let region = match self
+                    .object_store
+                    .get_opts(
+                        &location,
+                        GetOptions {
+                            range: Some(GetRange::Bounded(
+                                entry.byte_start..entry.byte_start + entry.byte_len,
+                            )),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    Ok(result) => result
+                        .bytes()
+                        .await
+                        .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
+                        .and_then(|encoded| self.decode_frame(encoded))?,
+
+                    // Deleted between locate and read (compaction #66 / retention
+                    // #61): drop the anything gathered so far, invalidate the
+                    // index and restart — the merged/surviving segments cover the
+                    // same offsets, so a clean restart avoids any duplicate.
+                    Err(object_store::Error::NotFound { .. }) => {
+                        self.index_invalidate(&prefix)?;
+                        restart = true;
+                        break;
+                    }
+
+                    Err(error) => {
+                        error!(?error, location = %location);
+                        return Err(Error::Api(ErrorCode::UnknownServerError));
+                    }
+                };
+
+                let mut running = entry.base_offset;
+                for mut batch in region {
+                    let span = batch.last_offset_delta as i64 + 1;
+                    batch.base_offset = running;
+                    running += span;
+                    batches.push(batch);
+                }
+
+                if entry.byte_len > bytes {
+                    break;
+                } else {
+                    bytes = bytes.saturating_sub(entry.byte_len);
+                }
             }
 
-            if entry.byte_len > bytes {
-                break;
-            } else {
-                bytes = bytes.saturating_sub(entry.byte_len);
+            if !restart {
+                return Ok(batches);
             }
         }
 
-        Ok(batches)
+        // Exhausted retries (persistent 404 churn): return what a final clean
+        // pass can read rather than erroring.
+        self.refresh_prefix_index(&prefix).await?;
+        Ok(vec![])
     }
 
     /// The lowest segment base offset for a sub-stream, from the index (#60): the
@@ -2989,7 +3073,7 @@ impl DynoStore {
         // Populate the in-memory footer index so reads on this node need no
         // listing/GET to see the segment we just wrote (read-path #60 fix).
         _ = self
-            .index_insert(prefix, seq, footer)
+            .index_insert(prefix, seq, footer, Self::now_ms())
             .inspect_err(|err| debug!(?err));
         SEGMENT_FLUSHES.add(1, &[]);
 
@@ -3438,6 +3522,187 @@ impl DynoStore {
         self.index_prune(prefix, &expirable)?;
 
         Ok(deleted)
+    }
+
+    /// Compact a prefix's oldest segments into fewer, larger ones (#66) to bound
+    /// the live segment count `S` (otherwise ≈ flush_rate × retention, unbounded)
+    /// — keeping the footer index footprint and the per-fetch scan bounded.
+    /// Returns the number of segments merged away.
+    ///
+    /// Coordinator-free and GCS-safe: only the single lease holder compacts, the
+    /// merged segment is written as a new create-only object (the merged records
+    /// are byte-identical to the originals, #64 contract preserved) carrying the
+    /// max input epoch, and only then are the originals deleted — no object is
+    /// ever mutated. During the write→delete window the merged and original
+    /// segments overlap in offset, but they hold identical records and the read
+    /// path's overlap resolver returns exactly one copy, so a concurrent fetch is
+    /// correct; a fetch that GETs an original just as it is deleted retries off a
+    /// refreshed index (see `fetch_prefix_coalesced`).
+    async fn compact_prefix_segments(&self, prefix: &str) -> Result<u64> {
+        if self.prefix_compact_min_segments == 0 {
+            return Ok(0);
+        }
+
+        self.refresh_prefix_index(prefix).await?;
+
+        // Snapshot (seq, epoch, last_modified, region bytes) for every cached
+        // segment, ascending by seq (== ascending offset for a sub-stream).
+        let mut segs: Vec<(u64, i64, i64, usize)> = {
+            let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            index
+                .get(prefix)
+                .map(|entry| {
+                    entry
+                        .segments
+                        .iter()
+                        .map(|(seq, cached)| {
+                            let bytes: usize = cached
+                                .footer
+                                .entries
+                                .iter()
+                                .map(|e| e.byte_len as usize)
+                                .sum();
+                            (
+                                *seq,
+                                cached.footer.writer_epoch,
+                                cached.last_modified_ms,
+                                bytes,
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        segs.sort_by_key(|(seq, ..)| *seq);
+
+        // Only above the trigger, and never touch the hot (newest) tail.
+        if segs.len() <= self.prefix_compact_min_segments {
+            return Ok(0);
+        }
+        let eligible_end = segs.len().saturating_sub(self.prefix_compact_keep_hot);
+        if eligible_end < 2 {
+            return Ok(0);
+        }
+
+        // Pick a run from the oldest, up to the target size (at least 2).
+        let mut run: Vec<u64> = Vec::new();
+        let mut bytes = 0usize;
+        let mut max_epoch = i64::MIN;
+        let mut max_last_modified = i64::MIN;
+        for (seq, epoch, last_modified, size) in &segs[..eligible_end] {
+            if !run.is_empty() && bytes + size > self.prefix_compact_target_bytes {
+                break;
+            }
+            run.push(*seq);
+            bytes += size;
+            max_epoch = max_epoch.max(*epoch);
+            max_last_modified = max_last_modified.max(*last_modified);
+        }
+        if run.len() < 2 {
+            return Ok(0);
+        }
+
+        // Only the lease holder compacts (fence, #59).
+        let epoch = self.acquire_or_renew_lease(prefix).await?;
+        let merged_epoch = max_epoch.max(epoch);
+
+        // Snapshot the run's footers, then read each segment and regroup its
+        // sub-streams by topition in seq (== offset) order.
+        let footers: BTreeMap<u64, SegmentFooter> = {
+            let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            let entry = index.get(prefix);
+            run.iter()
+                .filter_map(|seq| {
+                    entry
+                        .and_then(|e| e.segments.get(seq))
+                        .map(|cached| (*seq, cached.footer.clone()))
+                })
+                .collect()
+        };
+
+        let mut grouped: BTreeMap<Topition, (i64, Vec<deflated::Batch>)> = BTreeMap::new();
+        for seq in &run {
+            let Some(footer) = footers.get(seq) else {
+                continue;
+            };
+            let object = self
+                .object_store
+                .get(&self.segment_location(prefix, *seq))
+                .await
+                .inspect_err(|err| error!(?err, prefix, seq))?
+                .bytes()
+                .await
+                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?;
+
+            for entry in &footer.entries {
+                let start = entry.byte_start as usize;
+                let end = start + entry.byte_len as usize;
+                if end > object.len() {
+                    continue;
+                }
+                let batches = self.decode_frame(object.slice(start..end))?;
+                let tp = Topition::new(entry.topic.clone(), entry.partition);
+                let acc = grouped.entry(tp).or_insert((entry.base_offset, Vec::new()));
+                acc.1.extend(batches);
+            }
+        }
+
+        let substreams: Vec<(Topition, i64, Vec<deflated::Batch>)> = grouped
+            .into_iter()
+            .map(|(tp, (base, batches))| (tp, base, batches))
+            .collect();
+        if substreams.is_empty() {
+            return Ok(0);
+        }
+
+        // Write the merged segment (create-only), index it, then delete the
+        // originals. Preserve the max input append time so compaction does not
+        // reset the retention clock of timestamp-less data.
+        let (payload, footer) = self.encode_segment(&substreams, merged_epoch)?;
+        let new_seq = self.assign_and_create_segment(prefix, payload).await?;
+        self.index_insert(prefix, new_seq, footer, max_last_modified)?;
+
+        let locations: Vec<Path> = run
+            .iter()
+            .map(|seq| self.segment_location(prefix, *seq))
+            .collect();
+        self.delete_batches(locations).await?;
+        self.index_prune(prefix, &run)?;
+
+        SEGMENT_COMPACTIONS.add(run.len() as u64, &[]);
+        debug!(
+            prefix,
+            new_seq,
+            merged = run.len(),
+            "compacted prefix segments"
+        );
+
+        Ok(run.len() as u64)
+    }
+
+    /// Compact segments across every prefix this node has in its index (#66).
+    async fn policy_compact_segments(&self) -> Result<u64> {
+        if !self.prefix_coalesce || self.prefix_compact_min_segments == 0 {
+            return Ok(0);
+        }
+
+        let prefixes: Vec<String> = self
+            .prefix_index
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .keys()
+            .cloned()
+            .collect();
+
+        let mut compacted = 0;
+        for prefix in prefixes {
+            compacted += self
+                .compact_prefix_segments(&prefix)
+                .await
+                .inspect_err(|err| error!(?err, prefix))
+                .unwrap_or(0);
+        }
+        Ok(compacted)
     }
 
     /// Whole-segment retention across all coalesced prefixes (#61). Groups the
@@ -6484,8 +6749,11 @@ impl Storage for DynoStore {
     async fn maintain(&self, now: SystemTime) -> Result<()> {
         let deleted = self.policy_delete(now).await?;
         let compacted = self.policy_compact().await?;
+        // Bound the live segment count per prefix (#66): merge old segments after
+        // retention has pruned the expired ones.
+        let compacted_segments = self.policy_compact_segments().await?;
         let expired_groups = self.expire_groups(now).await?;
-        debug!(deleted, compacted, expired_groups);
+        debug!(deleted, compacted, compacted_segments, expired_groups);
 
         if let Some(ref lake) = self.lake {
             return lake

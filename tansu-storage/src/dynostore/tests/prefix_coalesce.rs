@@ -720,6 +720,84 @@ async fn backfill_then_cdc_is_continuous() -> Result<(), Error> {
     Ok(())
 }
 
+/// Compaction (#66) merges old segments into fewer, and reads are byte-for-byte
+/// unchanged (same offsets, no gap/dup); produce continues past the merge.
+#[tokio::test]
+async fn compaction_merges_segments_and_reads_are_unchanged() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .coalesce_tuning(CoalesceTuning {
+            prefix_compact_min_segments: Some(2),
+            prefix_compact_keep_hot: Some(0),
+            prefix_compact_target_bytes: Some(1 << 30),
+            ..Default::default()
+        });
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    // Four windows -> four segments, offsets 0..4.
+    for _ in 0..4 {
+        _ = store.produce(None, &a, batch(1)?).await?;
+    }
+    assert_eq!(4, segments(&bucket).await.len());
+
+    let before: Vec<i64> = fetch_from(&store, &a, 0)
+        .await?
+        .iter()
+        .map(|b| b.base_offset)
+        .collect();
+    assert_eq!(vec![0, 1, 2, 3], before);
+
+    // Compact: the four merge into one.
+    let merged = store.compact_prefix_segments(PREFIX).await?;
+    assert_eq!(4, merged);
+    assert_eq!(1, segments(&bucket).await.len());
+
+    // Reads are identical after the merge.
+    let after: Vec<i64> = fetch_from(&store, &a, 0)
+        .await?
+        .iter()
+        .map(|b| b.base_offset)
+        .collect();
+    assert_eq!(before, after);
+
+    // Produce continues from the tail — no gap.
+    assert_eq!(4, store.produce(None, &a, batch(1)?).await?);
+
+    Ok(())
+}
+
+/// Compaction is a no-op below the trigger threshold (#66).
+#[tokio::test]
+async fn compaction_below_threshold_is_a_noop() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .coalesce_tuning(CoalesceTuning {
+            prefix_compact_min_segments: Some(10),
+            ..Default::default()
+        });
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    for _ in 0..3 {
+        _ = store.produce(None, &a, batch(1)?).await?;
+    }
+    assert_eq!(3, segments(&bucket).await.len());
+
+    assert_eq!(0, store.compact_prefix_segments(PREFIX).await?);
+    assert_eq!(
+        3,
+        segments(&bucket).await.len(),
+        "below threshold: untouched"
+    );
+
+    Ok(())
+}
+
 /// Epoch fencing on read (#59 review fix): when two segments' offset ranges
 /// overlap (only a fenced/zombie writer produces that), the higher writer_epoch
 /// wins and the stale one is dropped; non-overlapping legitimate history is
@@ -744,11 +822,11 @@ async fn epoch_fencing_drops_stale_overlapping_segment() -> Result<(), Error> {
     };
 
     // seq0 epoch1 [0,10) — legit history.
-    store.index_insert(PREFIX, 0, footer(1, 0, 10))?;
+    store.index_insert(PREFIX, 0, footer(1, 0, 10), 0)?;
     // seq1 epoch2 [10,20) — the new writer after a takeover (contiguous, kept).
-    store.index_insert(PREFIX, 1, footer(2, 10, 10))?;
+    store.index_insert(PREFIX, 1, footer(2, 10, 10), 0)?;
     // seq2 epoch1 [10,20) — a zombie overlapping seq1 with the OLD epoch.
-    store.index_insert(PREFIX, 2, footer(1, 10, 10))?;
+    store.index_insert(PREFIX, 2, footer(1, 10, 10), 0)?;
 
     let valid = store.valid_substream_segments(PREFIX, topic, 0)?;
     let seqs: Vec<u64> = valid.iter().map(|(seq, _)| *seq).collect();
