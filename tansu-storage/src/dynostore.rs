@@ -1864,6 +1864,27 @@ impl DynoStore {
         /// fails fast instead of spinning; far above any real contention.
         const MAX_ATTEMPTS: usize = 64;
 
+        // Under prefix coalescing, a segment-routed topic's ineligible batches
+        // (transactional / control / backfill) still take this legacy
+        // `records/{offset}.batch` path, and assign offsets from the SAME
+        // per-(topic,partition) `cached_high` that a coalesced flush of the same
+        // prefix reads under the per-prefix flush lock. Without holding that lock
+        // here, a legacy write and a flush can both stamp the same offset — a
+        // legacy object and a segment record at one offset, which the two
+        // create-only namespaces cannot detect across each other (#78). Take the
+        // lock so the two offset authorities serialize. No re-entrancy: the flush
+        // path holds this lock and calls `assign_and_create_segment`, never this
+        // function. `None` on the non-coalesce path leaves behaviour unchanged.
+        let _flush_guard = if self.prefix_coalesce {
+            Some(
+                self.prefix_flush_lock(&self.prefix_of(topition))?
+                    .lock_owned()
+                    .await,
+            )
+        } else {
+            None
+        };
+
         let mut candidate = match self.cached_high(topition)? {
             Some(hint) => hint,
             None => self.refresh_high(topition).await?,
