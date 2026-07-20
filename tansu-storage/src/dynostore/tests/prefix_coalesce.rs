@@ -1151,6 +1151,41 @@ async fn large_batch_after_segmentation_coalesces() -> Result<(), Error> {
     Ok(())
 }
 
+/// A backfill batch (large, before any segment) takes the legacy per-object path
+/// under prefix coalescing; with the dual-authority guard (#78) it holds the
+/// per-prefix flush lock, so it serializes with coalesced flushes of the same
+/// prefix. Offsets stay contiguous across the legacy→segment seam (no
+/// duplicate/overlapping offset), and the guarded legacy write does not deadlock
+/// against the coalesced flush lock.
+#[tokio::test]
+async fn backfill_then_coalesce_offsets_are_contiguous() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    // Large first batch (>= PREFIX_BACKFILL_MIN_RECORDS, no segment yet) → the
+    // legacy `records/{offset}.batch` create path (`assign_and_create`), now
+    // guarded by the per-prefix flush lock.
+    assert_eq!(0, store.produce(None, &a, batch(1_000)?).await?);
+
+    // Smaller follow-ups coalesce into segments, continuing from the legacy tail.
+    assert_eq!(1_000, store.produce(None, &a, batch(2)?).await?);
+    assert_eq!(1_002, store.produce(None, &a, batch(3)?).await?);
+
+    // The hybrid read stitches legacy [0,1000) + segments [1000,1005) with no
+    // gap or duplicate.
+    let fetched = fetch_from(&store, &a, 0).await?;
+    let total: i64 = fetched
+        .iter()
+        .map(|batch| batch.last_offset_delta as i64 + 1)
+        .sum();
+    assert_eq!(1_005, total, "contiguous across the legacy→segment seam");
+
+    Ok(())
+}
+
 /// After retention drains every segment, a restart must not reuse offsets: the
 /// per-sub-stream floor persisted before deletion keeps the next offset (#61
 /// review fix).
