@@ -136,11 +136,16 @@ bounded:
   divides `S` by 20–40. Per-topic pressure no longer applies in prefix mode
   (many topics share one segment), so a wide linger is appropriate here.
 - **Compaction** (`prefix_compact_*`, on by default) — merges old segments into
-  fewer, larger ones so `S` stays bounded regardless of flush rate, keeping the
-  footer-index footprint and per-fetch scan flat. It runs on the maintenance
-  loop, only on the single lease holder, writing the merged segment create-only
-  before deleting the originals (no object mutation — GCS-safe). Set
-  `prefix_compact_min_segments=0` to disable.
+  fewer, larger ones. It runs on the maintenance loop and each tick **drains a
+  prefix down to `prefix_compact_min_segments`**, so `S` is bounded to roughly
+  that threshold plus one maintenance interval's worth of new segments — keeping
+  the footer-index footprint and per-fetch scan flat. Widen the linger too if
+  the between-tick growth is large. Compaction merges the epoch-fenced view
+  (never fuses a stale/overlapping segment), writes the merged segment
+  create-only before deleting the originals (no object mutation — GCS-safe), and
+  is coordinated by a **separate compaction lease** (`compaction-lease.json`) so
+  it runs on the maintenance workers without holding or fencing the produce
+  writer. Set `prefix_compact_min_segments=0` to disable.
 
 **GCS:** safe by construction. The segment data objects are create-only
 (immutable) and the read path is footer-only (no per-flush-mutated manifest), so

@@ -127,6 +127,25 @@ async fn create_topic_with_configs(
     Ok(())
 }
 
+fn segment_path(seq: u64) -> Path {
+    Path::from(format!(
+        "clusters/{CLUSTER}/prefixes/{PREFIX}/segments/{seq:0>20}.seg"
+    ))
+}
+
+/// A SubstreamEntry for a topic-0 sub-stream (test scaffolding).
+fn entry(topic: &str, base: i64, count: i64) -> SubstreamEntry {
+    SubstreamEntry {
+        topic: topic.to_owned(),
+        partition: 0,
+        base_offset: base,
+        record_count: count,
+        byte_start: 0,
+        byte_len: 8,
+        max_timestamp: 0,
+    }
+}
+
 /// The segment objects under a connector prefix.
 async fn segments(bucket: &InMemory) -> Vec<Path> {
     let listing = Path::from(format!("clusters/{CLUSTER}/prefixes/{PREFIX}/segments/"));
@@ -716,6 +735,146 @@ async fn backfill_then_cdc_is_continuous() -> Result<(), Error> {
         .sum();
     assert_eq!(1003, total);
     assert_eq!(0, fetched.first().map(|b| b.base_offset).unwrap());
+
+    Ok(())
+}
+
+/// Compaction merges the epoch-fenced view, NOT raw footers (#69 review fix,
+/// critical): a zombie/overlapping segment in the run is dropped, never fused —
+/// so the merged segment doesn't duplicate records.
+#[tokio::test]
+async fn compaction_drops_zombie_overlap_input() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .coalesce_tuning(CoalesceTuning {
+            prefix_compact_min_segments: Some(1),
+            prefix_compact_keep_hot: Some(0),
+            prefix_compact_target_bytes: Some(1 << 30),
+            ..Default::default()
+        });
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    // Legit segment (epoch 2) and a zombie (epoch 1) both covering [0,3).
+    let (legit, legit_footer) = store.encode_segment(&[(a.clone(), 0, vec![batch(3)?])], 2)?;
+    _ = bucket
+        .put(&segment_path(0), legit)
+        .await
+        .expect("put legit");
+    store.index_insert(PREFIX, 0, legit_footer, 100)?;
+
+    let (zombie, zombie_footer) = store.encode_segment(&[(a.clone(), 0, vec![batch(3)?])], 1)?;
+    _ = bucket
+        .put(&segment_path(1), zombie)
+        .await
+        .expect("put zombie");
+    store.index_insert(PREFIX, 1, zombie_footer, 100)?;
+
+    // The fence already hides the zombie: 3 records, not 6.
+    let before: i64 = fetch_from(&store, &a, 0)
+        .await?
+        .iter()
+        .map(|b| b.last_offset_delta as i64 + 1)
+        .sum();
+    assert_eq!(3, before);
+
+    // Compaction removes both run segments and merges only the fenced view.
+    assert_eq!(2, store.compact_prefix_segments(PREFIX).await?);
+
+    // Still 3 records — the zombie was not fused into the merged segment.
+    let after: i64 = fetch_from(&store, &a, 0)
+        .await?
+        .iter()
+        .map(|b| b.last_offset_delta as i64 + 1)
+        .sum();
+    assert_eq!(3, after, "zombie not fused → no duplicate");
+
+    Ok(())
+}
+
+/// A reader whose index still points at an original that compaction deleted must
+/// still read the data — the merged segment wins the overlap (higher seq) and is
+/// served instead (#69 review fix, no empty-result data loss).
+#[tokio::test]
+async fn stale_index_entry_reads_via_merged() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .coalesce_tuning(CoalesceTuning {
+            prefix_compact_min_segments: Some(1),
+            prefix_compact_keep_hot: Some(0),
+            prefix_compact_target_bytes: Some(1 << 30),
+            ..Default::default()
+        });
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    // Two segments [0,2) then [2,4); compact into one merged, originals deleted.
+    _ = store.produce(None, &a, batch(2)?).await?;
+    _ = store.produce(None, &a, batch(2)?).await?;
+    assert_eq!(2, store.compact_prefix_segments(PREFIX).await?);
+
+    // Re-inject a now-deleted original (seq 0) as a stale index entry.
+    store.index_insert(
+        PREFIX,
+        0,
+        SegmentFooter {
+            writer_epoch: 1,
+            entries: vec![entry(topic, 0, 2)],
+        },
+        0,
+    )?;
+
+    // The merged segment (higher seq) wins the overlap, so the stale seq is
+    // ignored and the read returns all 4 records.
+    let records: i64 = fetch_from(&store, &a, 0)
+        .await?
+        .iter()
+        .map(|b| b.last_offset_delta as i64 + 1)
+        .sum();
+    assert_eq!(4, records);
+
+    Ok(())
+}
+
+/// Draining: one maintenance pass compacts a prefix down to <= min_segments,
+/// regardless of how fast segments accrued (#69 review fix).
+#[tokio::test]
+async fn compaction_drains_to_min_segments() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .coalesce_tuning(CoalesceTuning {
+            prefix_compact_min_segments: Some(2),
+            prefix_compact_keep_hot: Some(0),
+            prefix_compact_target_bytes: Some(4096),
+            ..Default::default()
+        });
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    for _ in 0..8 {
+        _ = store.produce(None, &a, batch(1)?).await?;
+    }
+    assert_eq!(8, segments(&bucket).await.len());
+
+    _ = store.policy_compact_segments().await?;
+    assert!(
+        segments(&bucket).await.len() <= 2,
+        "drained to <= min_segments in one pass"
+    );
+
+    // All 8 records still readable, in order.
+    let bases: Vec<i64> = fetch_from(&store, &a, 0)
+        .await?
+        .iter()
+        .map(|b| b.base_offset)
+        .collect();
+    assert_eq!((0..8).collect::<Vec<_>>(), bases);
 
     Ok(())
 }
