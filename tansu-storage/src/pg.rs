@@ -2096,6 +2096,7 @@ impl Storage for Postgres {
             last_stable,
             high_watermark,
             log_start,
+            aborted: Vec::new(),
         })
     }
 

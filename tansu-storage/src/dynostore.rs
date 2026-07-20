@@ -5421,10 +5421,10 @@ impl Storage for DynoStore {
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
-        let stable = self
+        let (stable, aborted_raw) = self
             .meta
             .with(&self.object_store, |meta| {
-                Ok(meta
+                let stable = meta
                     .transactions
                     .values()
                     .flat_map(|txn| {
@@ -5456,11 +5456,32 @@ impl Storage for DynoStore {
 
                         acc
                     })
-                    .unwrap_or(BTreeMap::new()))
+                    .unwrap_or(BTreeMap::new());
+
+                // Aborted transactions that produced to `topition` (#81), as
+                // `(producer_id, first_offset, last_offset)` — read-committed
+                // consumers use these to drop aborted records below the LSO. The
+                // abort state is retained in `meta.transactions` (`txn_end` sets
+                // `Aborted`, never prunes), so this is a pure meta read.
+                let mut aborted_raw: Vec<(i64, i64, i64)> = Vec::new();
+                for txn in meta.transactions.values() {
+                    for detail in txn.epochs.values() {
+                        if detail.state != Some(TxnState::Aborted) {
+                            continue;
+                        }
+                        if let Some(partitions) = detail.produces.get(&topition.topic)
+                            && let Some(Some(range)) = partitions.get(&topition.partition)
+                        {
+                            aborted_raw.push((txn.producer, range.offset_start, range.offset_end));
+                        }
+                    }
+                }
+
+                Ok((stable, aborted_raw))
             })
             .await?;
 
-        debug!(?stable);
+        debug!(?stable, ?aborted_raw);
 
         // The high watermark is derived from the immutable batch objects (the
         // authority), not from the mutable `watermark` object — so it is correct
@@ -5484,10 +5505,21 @@ impl Storage for DynoStore {
                 let log_start = watermark.low.unwrap_or(0);
                 let last_stable = stable.get(topition).copied().unwrap_or(high_watermark);
 
+                // Keep aborted transactions whose records are still in the log
+                // (last offset at/after the log start), as `(producer_id,
+                // first_offset)` sorted by first offset (#81).
+                let mut aborted: Vec<(i64, i64)> = aborted_raw
+                    .iter()
+                    .filter(|(_, _, offset_end)| *offset_end >= log_start)
+                    .map(|(producer_id, offset_start, _)| (*producer_id, *offset_start))
+                    .collect();
+                aborted.sort_by_key(|(_, first_offset)| *first_offset);
+
                 Ok(OffsetStage {
                     last_stable,
                     high_watermark,
                     log_start,
+                    aborted,
                 })
             })
             .await
@@ -7012,7 +7044,16 @@ impl Storage for DynoStore {
                                 }
                             }
 
-                            txn_detail.produces.clear();
+                            // Keep an ABORTED transaction's produce ranges so a
+                            // read-committed fetch can report its aborted offsets
+                            // (#81) — the txn_detail is retained in
+                            // `meta.transactions` regardless, only its produces
+                            // were being dropped. A committed transaction's ranges
+                            // are no longer needed. Consumer-offset commit state is
+                            // cleared either way.
+                            if txn_detail.state != Some(TxnState::Aborted) {
+                                txn_detail.produces.clear();
+                            }
                             txn_detail.offsets.clear();
                             _ = txn_detail.started_at.take();
                         }
