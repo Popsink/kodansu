@@ -109,9 +109,38 @@ under a uniform retention (the longest `retention.ms` among the prefix's topics)
 | Query param | Default | Meaning |
 |---|---|---|
 | `prefix_coalesce` | `false` | Coalesce per connector prefix into shared segments. |
+| `prefix_compact_min_segments` | `256` | Compact a prefix once it holds more than this many live segments (`0` disables). |
+| `prefix_compact_target_bytes` | `64m` | Target size of a merged segment. |
+| `prefix_compact_keep_hot` | `16` | Newest segments never compacted (leaves the active tail alone). |
 
 The linger / batch-count / byte thresholds are shared with `produce_coalesce`
 (`coalesce_linger` / `coalesce_batches` / `coalesce_bytes`, above).
+
+### Bounding the segment count (linger vs. compaction)
+
+Segments are written one object per flush window per prefix and are never
+mutated, so the number of live segments per prefix grows as:
+
+```
+S ≈ flush_rate × retention
+```
+
+At the default `coalesce_linger` of 50 ms a continuously-active connector writes
+up to ~20 segments/s, so `S` reaches ~10^5 in hours and ~10^6 within days over a
+7-day retention. Reads no longer pay per-fetch S3 requests for this (the footer
+index caches immutable footers and refreshes incrementally), but the index's
+memory footprint and per-fetch scan still scale with `S`. Two levers keep it
+bounded:
+
+- **`coalesce_linger`** — the cheap, immediate lever. Widening it to `1s`–`2s`
+  divides `S` by 20–40. Per-topic pressure no longer applies in prefix mode
+  (many topics share one segment), so a wide linger is appropriate here.
+- **Compaction** (`prefix_compact_*`, on by default) — merges old segments into
+  fewer, larger ones so `S` stays bounded regardless of flush rate, keeping the
+  footer-index footprint and per-fetch scan flat. It runs on the maintenance
+  loop, only on the single lease holder, writing the merged segment create-only
+  before deleting the originals (no object mutation — GCS-safe). Set
+  `prefix_compact_min_segments=0` to disable.
 
 **GCS:** safe by construction. The segment data objects are create-only
 (immutable) and the read path is footer-only (no per-flush-mutated manifest), so
