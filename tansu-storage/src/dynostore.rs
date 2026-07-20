@@ -218,6 +218,16 @@ pub struct DynoStore {
     /// batches when both are set. The URL flag that drives it is wired by #63.
     prefix_coalesce: bool,
 
+    /// When set (with `prefix_coalesce`), prefix flushes use the leaseless
+    /// seq-CAS offset arbiter (#86): the create-only segment-sequence CAS assigns
+    /// offsets directly (no `lease.json`, no fencing epoch, no #70 forwarding), so
+    /// any replica may append to any prefix. On a create conflict the writer folds
+    /// the winner's footer, re-derives the sub-stream bases and re-encodes, then
+    /// retries the next sequence. Off by default: production keeps the
+    /// single-writer lease path until the quiesce-and-flip migration (#92) turns
+    /// this on fleet-wide. See `docs/design-multiwriter-segments.md`.
+    prefix_leaseless: bool,
+
     /// Per-prefix coalescing buffer (#57), used only when
     /// [`Self::prefix_coalesce`] is set. Like [`Self::coalesce`] but keyed by
     /// prefix, so one buffer accumulates `PrefixPending` batches across many
@@ -950,6 +960,7 @@ impl DynoStore {
             produce_coalesce: false,
             coalesce: Arc::new(Mutex::new(BTreeMap::new())),
             prefix_coalesce: false,
+            prefix_leaseless: false,
             prefix_coalesce_buffers: Arc::new(Mutex::new(BTreeMap::new())),
             segment_seqs: Arc::new(Mutex::new(BTreeMap::new())),
             prefix_flush_locks: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1020,6 +1031,13 @@ impl DynoStore {
     /// ~`(topics × flushes)` to ~`(connectors × flushes)`. Off by default; takes
     /// precedence over [`Self::produce_coalesce`] for eligible batches. The URL
     /// flag driving this is wired by #63.
+    pub fn prefix_leaseless(self, prefix_leaseless: bool) -> Self {
+        Self {
+            prefix_leaseless,
+            ..self
+        }
+    }
+
     pub fn prefix_coalesce(self, prefix_coalesce: bool) -> Self {
         Self {
             prefix_coalesce,
@@ -2428,6 +2446,20 @@ impl DynoStore {
     /// *new* segments, so steady-state cost is O(new), not O(total segments).
     /// Cheap for the writer (its own flushes already populated the cache).
     async fn refresh_prefix_index(&self, prefix: &str) -> Result<()> {
+        self.refresh_prefix_index_inner(prefix, false).await
+    }
+
+    /// Refresh the prefix index unconditionally, bypassing the TTL freshness
+    /// gate (#86). The leaseless write path (`fold-before-claim`) must observe
+    /// every live segment — including a peer replica's seconds-old write — before
+    /// it derives offsets and claims a sequence, or two writers could stamp the
+    /// same offset. The TTL'd [`Self::refresh_prefix_index`] is fine for the read
+    /// path (bounded staleness), but not for the offset-assignment authority.
+    async fn refresh_prefix_index_forced(&self, prefix: &str) -> Result<()> {
+        self.refresh_prefix_index_inner(prefix, true).await
+    }
+
+    async fn refresh_prefix_index_inner(&self, prefix: &str, force: bool) -> Result<()> {
         let (fresh, start_after) = {
             let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
             match index.get(prefix) {
@@ -2443,7 +2475,7 @@ impl DynoStore {
             }
         };
 
-        if fresh {
+        if !force && fresh {
             return Ok(());
         }
 
@@ -3290,6 +3322,11 @@ impl DynoStore {
             return;
         }
 
+        // Leaseless seq-CAS arbiter (#86): no lease, any replica may append.
+        if self.prefix_leaseless {
+            return self.flush_prefix_coalesced_leaseless(prefix, buffer).await;
+        }
+
         // Serialize flushes for this prefix so offset assignment (read
         // `cached_high`) → segment PUT → `set_high` is atomic (#1 fix): two
         // overlapping windows must not both read the same base offset. Held
@@ -3383,6 +3420,33 @@ impl DynoStore {
             Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
         };
 
+        self.finalize_prefix_flush(
+            prefix,
+            seq,
+            &substreams,
+            footer,
+            buffer,
+            &assigned,
+            &advances,
+        )
+        .await;
+    }
+
+    /// Post-write finalization shared by the lease and leaseless (#86) flush
+    /// paths: cache the footer in the in-memory index, advance each sub-stream's
+    /// hint, mirror the lake sink per batch, and ack every parked producer with
+    /// its assigned offset. Called only after the segment PUT is durable.
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_prefix_flush(
+        &self,
+        prefix: &str,
+        seq: u64,
+        substreams: &[(Topition, i64, Vec<deflated::Batch>)],
+        footer: SegmentFooter,
+        buffer: PrefixCoalesceBuffer,
+        assigned: &[i64],
+        advances: &[(Topition, i64)],
+    ) {
         // Populate the in-memory footer index so reads on this node need no
         // listing/GET to see the segment we just wrote (read-path #60 fix).
         _ = self
@@ -3398,7 +3462,7 @@ impl DynoStore {
         );
 
         // The write succeeded and is durable — advance each sub-stream's hint.
-        for (topition, high) in &advances {
+        for (topition, high) in advances {
             _ = self
                 .set_high(topition, *high)
                 .inspect_err(|err| debug!(?err));
@@ -3451,6 +3515,163 @@ impl DynoStore {
         error!(?error, prefix, "prefix coalesced flush failed");
         for pending in buffer.pending {
             _ = pending.ack.send(Err(error.clone()));
+        }
+    }
+
+    /// Leaseless prefix flush (#86): the create-only segment-sequence CAS is the
+    /// offset arbiter, so any replica may append to any prefix — no lease, no
+    /// fencing epoch, no #70 forwarding. Fold every live segment (bypassing the
+    /// index TTL), derive each sub-stream's base from the folded tail, encode a v2
+    /// segment and try to create it at the next free sequence. On a create
+    /// conflict a peer won that sequence: fold its footer, re-derive the bases and
+    /// re-encode, then retry the next sequence. Contiguity holds because a writer
+    /// only ever targets `folded_max + 1`, and each conflict forces it to ingest
+    /// the winner before re-deriving.
+    ///
+    /// Known gap, closed by #89: an *ambiguous* PUT (our create landed but the
+    /// response was lost) is retried at the next sequence, re-writing the batch.
+    /// The per-flush `nonce` written into the footer is what lets #89 recognise
+    /// our own segment on conflict and adopt it instead of re-writing.
+    async fn flush_prefix_coalesced_leaseless(&self, prefix: &str, buffer: PrefixCoalesceBuffer) {
+        /// Bounds the conflict-correction loop; far above any real concurrency.
+        const MAX_ATTEMPTS: usize = 64;
+
+        // Per-partition FIFO across two concurrent local flushes of this prefix:
+        // the seq-CAS is the cross-writer offset authority, but this lock still
+        // keeps a single pod's buffer order == offset order.
+        let flush_lock = match self.prefix_flush_lock(prefix) {
+            Ok(lock) => lock,
+            Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+        };
+        let _flush_guard = flush_lock.lock().await;
+
+        // Group pending by topition (arrival order preserved within a topition).
+        let mut grouped: BTreeMap<Topition, Vec<usize>> = BTreeMap::new();
+        for (index, pending) in buffer.pending.iter().enumerate() {
+            grouped
+                .entry(pending.topition.clone())
+                .or_default()
+                .push(index);
+        }
+
+        // Per-flush nonce, stamped into the footer (#89 self-recognition).
+        let nonce = rng().random::<u64>();
+
+        for attempt in 0..MAX_ATTEMPTS {
+            // Fold-before-claim: observe every live segment so the candidate
+            // sequence and the derived bases reflect all writers, not a stale view.
+            if let Err(error) = self.refresh_prefix_index_forced(prefix).await {
+                return Self::fail_prefix_flush(buffer, error, prefix);
+            }
+            let candidate = match self.tail_next_seq(prefix).await {
+                Ok(seq) => seq,
+                Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+            };
+
+            // Re-derive each sub-stream's base from the folded index.
+            let mut substreams: Vec<(Topition, i64, Vec<deflated::Batch>)> =
+                Vec::with_capacity(grouped.len());
+            let mut assigned = vec![0i64; buffer.pending.len()];
+            let mut advances: Vec<(Topition, i64)> = Vec::with_capacity(grouped.len());
+            for (topition, indices) in &grouped {
+                let base = match self.leaseless_base(topition).await {
+                    Ok(base) => base,
+                    Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+                };
+                let mut running = base;
+                let mut batches = Vec::with_capacity(indices.len());
+                for &index in indices {
+                    assigned[index] = running;
+                    let batch = &buffer.pending[index].batch;
+                    running += batch.last_offset_delta as i64 + 1;
+                    batches.push(batch.clone());
+                }
+                substreams.push((topition.clone(), base, batches));
+                advances.push((topition.clone(), running));
+            }
+
+            // Encode a v2 segment (writer_epoch 0 = leaseless era; the migration
+            // seeds a real era epoch, #92) and try to create it at `candidate`.
+            let (payload, footer) = match self.encode_segment_v2(&substreams, 0, nonce) {
+                Ok(encoded) => encoded,
+                Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+            };
+
+            match self
+                .object_store
+                .put_opts(
+                    &self.segment_location(prefix, candidate),
+                    payload,
+                    PutOptions {
+                        mode: PutMode::Create,
+                        attributes: Attributes::new(),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                // Won the sequence — this create is the linearization point.
+                Ok(_) => {
+                    _ = self
+                        .set_seq(prefix, candidate + 1)
+                        .inspect_err(|err| debug!(?err));
+                    return self
+                        .finalize_prefix_flush(
+                            prefix,
+                            candidate,
+                            &substreams,
+                            footer,
+                            buffer,
+                            &assigned,
+                            &advances,
+                        )
+                        .await;
+                }
+
+                // A peer took `candidate`: fold it and retry the next free
+                // sequence with re-derived bases (adopting our own segment on an
+                // ambiguous PUT is #89).
+                Err(object_store::Error::AlreadyExists { .. }) => {
+                    debug!(prefix, candidate, attempt, "segment seq taken, re-deriving");
+                    continue;
+                }
+
+                Err(error) => return Self::fail_prefix_flush(buffer, error.into(), prefix),
+            }
+        }
+
+        error!(prefix, "leaseless flush exhausted retries");
+        Self::fail_prefix_flush(buffer, Error::Api(ErrorCode::UnknownServerError), prefix)
+    }
+
+    /// The next offset for `topition` under the leaseless path (#86), derived from
+    /// the already force-folded prefix index: the epoch-fenced segment tail folded
+    /// with this process's hint, and — only for a cold/drained sub-stream — the
+    /// legacy `records/` tail and persisted floor, so an offset is never reused.
+    async fn leaseless_base(&self, topition: &Topition) -> Result<i64> {
+        let prefix = self.prefix_of(topition);
+        let segment_tail = self
+            .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
+            .last()
+            .map(|(_, entry)| entry.base_offset + entry.record_count)
+            .unwrap_or(0);
+        let cached = self.cached_high(topition)?.unwrap_or(0);
+
+        // Legacy objects can sit above segments until single-authority routing
+        // (#78) folds them in, so always consider the legacy tail — cheap
+        // (memoized, and 0 for a pure-segment sub-stream). The persisted floor
+        // only matters when nothing else is known (a fully retention-drained
+        // sub-stream), so it costs a GET only then.
+        let legacy = if self.has_legacy_records(topition).await? {
+            self.tail_next_offset(topition, None).await?
+        } else {
+            0
+        };
+        let base = segment_tail.max(cached).max(legacy);
+        if base > 0 {
+            Ok(base)
+        } else {
+            Ok(self.persisted_high(topition).await.unwrap_or(0))
         }
     }
 
@@ -4724,6 +4945,76 @@ impl DynoStore {
         body.extend_from_slice(&(footer_bytes.len() as u64).to_be_bytes());
         body.extend_from_slice(&(footer.entries.len() as u32).to_be_bytes());
         body.extend_from_slice(&SEGMENT_FORMAT_VERSION.to_be_bytes());
+        body.extend_from_slice(&SEGMENT_MAGIC.to_be_bytes());
+
+        Ok((PutPayload::from(Bytes::from(body)), footer))
+    }
+
+    /// Like [`Self::encode_segment`] but emits a **v2** footer (#87): a per-flush
+    /// `nonce` plus, per sub-stream, the producer coordinates of its idempotent
+    /// batches (in region/offset order). Used by the leaseless write path (#86);
+    /// the coordinates back log-based idempotent dedup (#88) and the nonce backs
+    /// ambiguous-PUT adoption (#89). `offset_delta` is the batch's offset within
+    /// its sub-stream so it survives the conflict-correction re-encode.
+    fn encode_segment_v2(
+        &self,
+        substreams: &[(Topition, i64, Vec<deflated::Batch>)],
+        writer_epoch: i64,
+        nonce: u64,
+    ) -> Result<(PutPayload, SegmentFooter)> {
+        let mut body = Vec::new();
+        let mut entries = Vec::with_capacity(substreams.len());
+
+        for (topition, base_offset, batches) in substreams {
+            if batches.is_empty() {
+                continue;
+            }
+
+            let byte_start = body.len() as u64;
+            let mut record_count = 0i64;
+            let mut max_timestamp = i64::MIN;
+            let mut producers = Vec::new();
+
+            for batch in batches {
+                // Offset of this batch within the sub-stream, before it is added.
+                let offset_delta = record_count as u32;
+                body.extend_from_slice(&Bytes::from(batch.clone()));
+                if batch.is_idempotent() {
+                    producers.push(ProducerCoord {
+                        producer_id: batch.producer_id,
+                        producer_epoch: batch.producer_epoch,
+                        base_sequence: batch.base_sequence,
+                        last_sequence: batch.base_sequence.wrapping_add(batch.last_offset_delta),
+                        offset_delta,
+                    });
+                }
+                record_count += batch.last_offset_delta as i64 + 1;
+                max_timestamp = max_timestamp.max(batch.max_timestamp);
+            }
+
+            entries.push(SubstreamEntry {
+                topic: topition.topic().to_owned(),
+                partition: topition.partition(),
+                base_offset: *base_offset,
+                record_count,
+                byte_start,
+                byte_len: body.len() as u64 - byte_start,
+                max_timestamp,
+                producers,
+            });
+        }
+
+        let footer = SegmentFooter {
+            writer_epoch,
+            nonce,
+            entries,
+        };
+        let footer_bytes = Self::encode_footer(&footer, SEGMENT_FORMAT_VERSION_V2);
+
+        body.extend_from_slice(&footer_bytes);
+        body.extend_from_slice(&(footer_bytes.len() as u64).to_be_bytes());
+        body.extend_from_slice(&(footer.entries.len() as u32).to_be_bytes());
+        body.extend_from_slice(&SEGMENT_FORMAT_VERSION_V2.to_be_bytes());
         body.extend_from_slice(&SEGMENT_MAGIC.to_be_bytes());
 
         Ok((PutPayload::from(Bytes::from(body)), footer))

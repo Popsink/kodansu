@@ -1359,3 +1359,84 @@ fn prefix_owner_is_deterministic_and_stable() {
     let pruned: Vec<i32> = nodes.into_iter().filter(|n| *n != non_owner).collect();
     assert_eq!(Some(owner), prefix_owner_node("org.env.conn", &pruned));
 }
+
+/// Leaseless (#86): with no lease, two replicas append to the SAME sub-stream by
+/// alternating, and the fold-before-claim step makes each observe the other's
+/// segment before deriving its base — so offsets stay dense and contiguous with
+/// no reuse. Segments are written v2 and read back correctly.
+#[tokio::test]
+async fn leaseless_alternating_writers_stay_contiguous() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let mk = || {
+        DynoStore::new(CLUSTER, NODE, bucket.clone())
+            .prefix_coalesce(true)
+            .prefix_leaseless(true)
+    };
+    let a_store = mk();
+    let b_store = mk();
+    let topic = "org.env.conn.tab_a";
+    create_topic(&a_store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    // A → B → A → B, each awaited: every writer folds the other's latest segment
+    // before it claims its own, so the next offset is always the true tail.
+    assert_eq!(0, a_store.produce(None, &a, batch(1)?).await?);
+    assert_eq!(1, b_store.produce(None, &a, batch(1)?).await?);
+    assert_eq!(2, a_store.produce(None, &a, batch(1)?).await?);
+    assert_eq!(3, b_store.produce(None, &a, batch(1)?).await?);
+
+    // A fresh reader (cold index) recovers all four records footer-only.
+    let reader = mk();
+    let fetched = fetch_from(&reader, &a, 0).await?;
+    let total: i64 = fetched
+        .iter()
+        .map(|batch| batch.last_offset_delta as i64 + 1)
+        .sum();
+    assert_eq!(4, total, "four records, contiguous across two writers");
+
+    Ok(())
+}
+
+/// Leaseless (#86): two replicas producing to the SAME sub-stream *concurrently*
+/// exercise the seq-CAS conflict-correction loop — a create conflict makes the
+/// loser fold the winner and retry the next sequence with a re-derived base. The
+/// four records must land at four distinct, dense offsets (no reuse, no gap).
+#[tokio::test]
+async fn leaseless_concurrent_writers_no_reuse_or_gap() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let mk = || {
+        DynoStore::new(CLUSTER, NODE, bucket.clone())
+            .prefix_coalesce(true)
+            .prefix_leaseless(true)
+    };
+    let a_store = mk();
+    let b_store = mk();
+    let topic = "org.env.conn.tab_a";
+    create_topic(&a_store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    let (o1, o2, o3, o4) = tokio::join!(
+        a_store.produce(None, &a, batch(1)?),
+        b_store.produce(None, &a, batch(1)?),
+        a_store.produce(None, &a, batch(1)?),
+        b_store.produce(None, &a, batch(1)?),
+    );
+
+    let mut offsets = vec![o1?, o2?, o3?, o4?];
+    offsets.sort_unstable();
+    assert_eq!(
+        vec![0, 1, 2, 3],
+        offsets,
+        "four concurrent produces → four distinct contiguous offsets",
+    );
+
+    let reader = mk();
+    let fetched = fetch_from(&reader, &a, 0).await?;
+    let total: i64 = fetched
+        .iter()
+        .map(|batch| batch.last_offset_delta as i64 + 1)
+        .sum();
+    assert_eq!(4, total, "no record lost or duplicated under contention");
+
+    Ok(())
+}
