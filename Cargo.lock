@@ -3781,7 +3781,7 @@ dependencies = [
 
 [[package]]
 name = "fuzz"
-version = "0.7.0-beta.9"
+version = "0.7.0-beta.10"
 dependencies = [
  "bytes",
  "libfuzzer-sys",
@@ -4702,6 +4702,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "itertools"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
+dependencies = [
+ "either",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4998,6 +5007,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
+name = "libmimalloc-sys"
+version = "0.1.49"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a45a52f43e1c16f667ccfe4dd8c85b7f7c204fd5e3bf46c5b0db9a5c3c0b8e9"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "libredox"
 version = "0.1.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5287,6 +5305,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mimalloc"
+version = "0.1.52"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d4139bb28d14ad1facf21d5eb8825051b326e172d216b39f6d31df53cc97862"
+dependencies = [
+ "libmimalloc-sys",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5396,6 +5423,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77a5d83df9f36fe23f0c3648c6bbb8b0298bb5f1939c8f2704431371f4b84d43"
 dependencies = [
  "smallvec",
+]
+
+[[package]]
+name = "nix"
+version = "0.31.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf20d2fde8ff38632c426f1165ed7436270b44f199fc55284c38276f9db47c3d"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]
@@ -5624,14 +5663,16 @@ dependencies = [
 
 [[package]]
 name = "object_store"
-version = "0.13.2"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "622acbc9100d3c10e2ee15804b0caa40e55c933d5aa53814cd520805b7958a49"
+checksum = "d354792e39fa5f0009e47623cf8b15b099bf9a652fa55c6f817fe28ac84fea50"
 dependencies = [
  "async-trait",
+ "aws-lc-rs",
  "base64",
  "bytes",
  "chrono",
+ "crc-fast",
  "form_urlencoded",
  "futures-channel",
  "futures-core",
@@ -5640,14 +5681,14 @@ dependencies = [
  "http-body-util",
  "humantime",
  "hyper",
- "itertools 0.14.0",
- "md-5 0.10.6",
+ "itertools 0.15.0",
+ "md-5 0.11.0",
+ "nix",
  "parking_lot",
  "percent-encoding",
- "quick-xml 0.39.4",
+ "quick-xml 0.41.0",
  "rand 0.10.1",
- "reqwest 0.12.28",
- "ring",
+ "reqwest 0.13.3",
  "rustls-pki-types",
  "serde",
  "serde_json",
@@ -5659,6 +5700,7 @@ dependencies = [
  "walkdir",
  "wasm-bindgen-futures",
  "web-time",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6537,9 +6579,9 @@ dependencies = [
 
 [[package]]
 name = "quick-xml"
-version = "0.39.4"
+version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cdcc8dd4e2f670d309a5f0e83fe36dfdc05af317008fea29144da1a2ac858e5e"
+checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
 dependencies = [
  "memchr",
  "serde",
@@ -6571,6 +6613,7 @@ version = "0.11.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
 dependencies = [
+ "aws-lc-rs",
  "bytes",
  "getrandom 0.3.4",
  "lru-slab",
@@ -7202,7 +7245,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams",
+ "wasm-streams 0.4.2",
  "web-sys",
  "webpki-roots",
 ]
@@ -7229,6 +7272,7 @@ dependencies = [
  "log",
  "percent-encoding",
  "pin-project-lite",
+ "quinn",
  "rustls",
  "rustls-pki-types",
  "rustls-platform-verifier",
@@ -7237,12 +7281,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams 0.5.0",
  "web-sys",
 ]
 
@@ -8288,9 +8334,10 @@ checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 
 [[package]]
 name = "tansu"
-version = "0.7.0-beta.9"
+version = "0.7.0-beta.10"
 dependencies = [
  "dotenv",
+ "mimalloc",
  "tansu-broker",
  "tansu-cat",
  "tansu-cli",
@@ -8307,7 +8354,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-auth"
-version = "0.7.0-beta.9"
+version = "0.7.0-beta.10"
 dependencies = [
  "bytes",
  "rama",
@@ -8321,7 +8368,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-broker"
-version = "0.7.0-beta.9"
+version = "0.7.0-beta.10"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -8338,7 +8385,7 @@ dependencies = [
  "indicatif",
  "jsonschema",
  "libsql",
- "object_store 0.13.2",
+ "object_store 0.14.1",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",
@@ -8373,7 +8420,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-cat"
-version = "0.7.0-beta.9"
+version = "0.7.0-beta.10"
 dependencies = [
  "bytes",
  "futures",
@@ -8393,7 +8440,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-cli"
-version = "0.7.0-beta.9"
+version = "0.7.0-beta.10"
 dependencies = [
  "bytes",
  "clap",
@@ -8428,7 +8475,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-client"
-version = "0.7.0-beta.9"
+version = "0.7.0-beta.10"
 dependencies = [
  "anyhow",
  "backoff",
@@ -8452,7 +8499,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-generator"
-version = "0.7.0-beta.9"
+version = "0.7.0-beta.10"
 dependencies = [
  "futures",
  "futures-core",
@@ -8479,7 +8526,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-model"
-version = "0.7.0-beta.9"
+version = "0.7.0-beta.10"
 dependencies = [
  "convert_case 0.11.0",
  "lazy_static",
@@ -8494,7 +8541,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-otel"
-version = "0.7.0-beta.9"
+version = "0.7.0-beta.10"
 dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
@@ -8507,7 +8554,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-perf"
-version = "0.7.0-beta.9"
+version = "0.7.0-beta.10"
 dependencies = [
  "bytes",
  "futures",
@@ -8536,7 +8583,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-proxy"
-version = "0.7.0-beta.9"
+version = "0.7.0-beta.10"
 dependencies = [
  "async-trait",
  "bytes",
@@ -8561,7 +8608,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-sans-io"
-version = "0.7.0-beta.9"
+version = "0.7.0-beta.10"
 dependencies = [
  "bytes",
  "clap",
@@ -8590,7 +8637,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-schema"
-version = "0.7.0-beta.9"
+version = "0.7.0-beta.10"
 dependencies = [
  "anyhow",
  "apache-avro",
@@ -8610,7 +8657,7 @@ dependencies = [
  "iceberg-datafusion",
  "jsonschema",
  "num-bigint",
- "object_store 0.13.2",
+ "object_store 0.14.1",
  "opentelemetry",
  "opentelemetry-semantic-conventions",
  "ordered-float 5.3.0",
@@ -8637,7 +8684,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-service"
-version = "0.7.0-beta.9"
+version = "0.7.0-beta.10"
 dependencies = [
  "async-trait",
  "bytes",
@@ -8662,7 +8709,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-storage"
-version = "0.7.0-beta.9"
+version = "0.7.0-beta.10"
 dependencies = [
  "assert_matches",
  "async-trait",
@@ -8682,7 +8729,7 @@ dependencies = [
  "human-units",
  "indicatif",
  "libsql",
- "object_store 0.13.2",
+ "object_store 0.14.1",
  "opentelemetry",
  "opentelemetry-semantic-conventions",
  "postcard",
@@ -8716,7 +8763,7 @@ dependencies = [
 
 [[package]]
 name = "tansu-topic"
-version = "0.7.0-beta.9"
+version = "0.7.0-beta.10"
 dependencies = [
  "futures",
  "futures-core",
@@ -9852,6 +9899,19 @@ name = "wasm-streams"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
 dependencies = [
  "futures-util",
  "js-sys",
