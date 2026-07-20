@@ -816,6 +816,7 @@ impl Storage for Engine {
             log_start: watermark.low.unwrap_or(0),
             last_stable,
             high_watermark,
+            aborted: Vec::new(),
         })
     }
 

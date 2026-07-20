@@ -841,13 +841,17 @@ impl MetadataResponse {
 /// Offset Stage
 ///
 /// An offset stage structure represents the `last_stable`, `high_watermark` and `log_start` offsets.
-#[derive(
-    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct OffsetStage {
     last_stable: i64,
     high_watermark: i64,
     log_start: i64,
+    /// Aborted transactions whose data is still in the log for this partition
+    /// (#81), as `(producer_id, first_offset)` sorted by first offset — what a
+    /// read-committed consumer needs to filter out aborted records below the
+    /// last-stable offset. Empty for backends that do not surface it (unchanged
+    /// behaviour) and for non-transactional workloads.
+    aborted: Vec<(i64, i64)>,
 }
 
 impl OffsetStage {
@@ -861,6 +865,12 @@ impl OffsetStage {
 
     pub fn log_start(&self) -> i64 {
         self.log_start
+    }
+
+    /// Aborted transactions `(producer_id, first_offset)` for a read-committed
+    /// fetch response (#81).
+    pub fn aborted(&self) -> &[(i64, i64)] {
+        &self.aborted
     }
 }
 

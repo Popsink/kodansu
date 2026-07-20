@@ -2998,6 +2998,7 @@ impl Storage for Delegate {
             last_stable,
             high_watermark,
             log_start,
+            aborted: Vec::new(),
         })
         .inspect(|_| {
             DELEGATE_REQUEST_DURATION.record(

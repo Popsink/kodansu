@@ -19,7 +19,8 @@ use tansu_sans_io::{
     ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel,
     fetch_request::{FetchPartition, FetchTopic},
     fetch_response::{
-        EpochEndOffset, FetchableTopicResponse, LeaderIdAndEpoch, PartitionData, SnapshotId,
+        AbortedTransaction, EpochEndOffset, FetchableTopicResponse, LeaderIdAndEpoch,
+        PartitionData, SnapshotId,
     },
     metadata_response::MetadataResponseTopic,
     record::deflated::{Batch, Frame},
@@ -206,7 +207,23 @@ impl FetchService {
             .diverging_epoch(None)
             .current_leader(None)
             .snapshot_id(None)
-            .aborted_transactions(Some([].into()))
+            // Aborted transactions overlapping the log, so a read-committed
+            // consumer filters out aborted records below the LSO (#81). Only
+            // read-committed fetches receive the list (Kafka's contract); empty
+            // for read-uncommitted and for non-transactional workloads.
+            .aborted_transactions(Some(if isolation == IsolationLevel::ReadCommitted {
+                offset_stage
+                    .aborted()
+                    .iter()
+                    .map(|(producer_id, first_offset)| {
+                        AbortedTransaction::default()
+                            .producer_id(*producer_id)
+                            .first_offset(*first_offset)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }))
             .preferred_read_replica(Some(-1))
             .records(if batches.is_empty() {
                 None

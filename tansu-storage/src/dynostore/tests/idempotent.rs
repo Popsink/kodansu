@@ -32,12 +32,13 @@ use std::time::Duration;
 use bytes::Bytes;
 use object_store::memory::InMemory;
 use tansu_sans_io::{
-    ErrorCode, create_topics_request::CreatableTopic, record::Record, record::deflated,
-    record::inflated,
+    BatchAttribute, ErrorCode, add_partitions_to_txn_request::AddPartitionsToTxnTopic,
+    create_topics_request::CreatableTopic, record::Record, record::deflated, record::inflated,
 };
 
 use crate::{
-    Error, Result, Storage, Topition, dynostore::DynoStore, dynostore::tests::init_tracing,
+    Error, Result, Storage, Topition, TxnAddPartitionsRequest, dynostore::DynoStore,
+    dynostore::tests::init_tracing,
 };
 
 const CLUSTER: &str = "tansu";
@@ -301,6 +302,89 @@ async fn stale_epoch_is_fenced() -> Result<(), Error> {
             .produce(None, &topition, idempotent_batch(producer, 0, 0, 1)?)
             .await?
     );
+
+    Ok(())
+}
+
+/// A transactional batch for `producer_id`/`epoch` at `base_sequence`.
+fn txn_batch(
+    producer_id: i64,
+    epoch: i16,
+    base_sequence: i32,
+    records: usize,
+) -> Result<deflated::Batch> {
+    let mut builder = inflated::Batch::builder()
+        .attributes(BatchAttribute::default().transaction(true).into())
+        .producer_id(producer_id)
+        .producer_epoch(epoch)
+        .base_sequence(base_sequence)
+        .last_offset_delta(records as i32 - 1);
+
+    for i in 0..records {
+        builder = builder.record(Record::builder().value(Some(Bytes::copy_from_slice(
+            format!("record-{i}").as_bytes(),
+        ))));
+    }
+
+    builder
+        .build()
+        .and_then(deflated::Batch::try_from)
+        .map_err(Into::into)
+}
+
+/// After a transaction is aborted, its produced range surfaces in `offset_stage`
+/// as an aborted transaction (#81) — what a read-committed fetch needs to filter
+/// out the aborted records. An open (not-yet-ended) transaction does not.
+#[tokio::test]
+async fn aborted_transaction_surfaces_in_offset_stage() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+    let store = DynoStore::new(CLUSTER, NODE, InMemory::new());
+    let topic = "txn-topic";
+    create_topic(&store, topic).await?;
+    let tp = Topition::new(topic, 0);
+    let txn = "txn-1";
+
+    let producer = store
+        .init_producer(Some(txn), 60_000, Some(-1), Some(-1))
+        .await?;
+
+    _ = store
+        .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+            transaction_id: txn.into(),
+            producer_id: producer.id,
+            producer_epoch: producer.epoch,
+            topics: [AddPartitionsToTxnTopic::default()
+                .name(topic.into())
+                .partitions(Some([0].into()))]
+            .into(),
+        })
+        .await?;
+
+    assert_eq!(
+        0,
+        store
+            .produce(
+                Some(txn),
+                &tp,
+                txn_batch(producer.id, producer.epoch, 0, 3)?
+            )
+            .await?
+    );
+
+    // Open transaction: nothing aborted yet.
+    assert!(store.offset_stage(&tp).await?.aborted().is_empty());
+
+    // Abort it.
+    assert_eq!(
+        ErrorCode::None,
+        store
+            .txn_end(txn, producer.id, producer.epoch, false)
+            .await?
+    );
+
+    // The aborted transaction now surfaces as (producer_id, first_offset).
+    let staged = store.offset_stage(&tp).await?;
+    assert_eq!(vec![(producer.id, 0)], staged.aborted().to_vec());
 
     Ok(())
 }

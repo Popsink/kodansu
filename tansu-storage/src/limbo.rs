@@ -1753,6 +1753,7 @@ impl Storage for Engine {
             last_stable,
             high_watermark,
             log_start,
+            aborted: Vec::new(),
         })
     }
 
