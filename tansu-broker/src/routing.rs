@@ -19,7 +19,7 @@
 //! [`tansu_storage::PrefixRouter`] implementation, injected into the storage
 //! builder by the broker binary.
 
-use std::{collections::HashMap, sync::Mutex};
+use std::{collections::HashMap, sync::Mutex, time::Duration};
 
 use async_trait::async_trait;
 use tansu_client::{Client, ConnectionManager, Pool};
@@ -29,6 +29,7 @@ use tansu_sans_io::{
     record::deflated,
 };
 use tansu_storage::{Error, PrefixRouter, Result, Topition};
+use tokio::time::timeout;
 use tracing::error;
 use url::Url;
 
@@ -40,9 +41,12 @@ pub struct ClientRouter {
 }
 
 impl ClientRouter {
-    /// Timeout for a forwarded produce (bounded so a slow/failing owner surfaces
-    /// a retriable error rather than hanging produce).
-    const FORWARD_TIMEOUT_MS: i32 = 3_000;
+    /// Wall-clock deadline for a whole forwarded produce — pool build (which can
+    /// otherwise spin in `tansu-client`'s ~30 s connect backoff against a dead
+    /// owner) AND the request/response round trip. On elapse the forward returns
+    /// a retriable error so the client retries, rather than parking a produce
+    /// task (and its pooled connection) indefinitely behind a wedged owner.
+    const FORWARD_TIMEOUT: Duration = Duration::from_secs(3);
 
     pub fn new() -> Self {
         Self::default()
@@ -89,12 +93,36 @@ impl PrefixRouter for ClientRouter {
         topition: &Topition,
         batch: deflated::Batch,
     ) -> Result<i64> {
+        // Bound the whole hop (pool build + round trip) so a wedged owner yields
+        // a retriable error instead of hanging produce indefinitely (#70 review).
+        match timeout(
+            Self::FORWARD_TIMEOUT,
+            self.forward_inner(owner, topition, batch),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                error!(%owner, "forward to prefix owner timed out");
+                Err(Error::Api(ErrorCode::NotLeaderOrFollower))
+            }
+        }
+    }
+}
+
+impl ClientRouter {
+    async fn forward_inner(
+        &self,
+        owner: &Url,
+        topition: &Topition,
+        batch: deflated::Batch,
+    ) -> Result<i64> {
         let pool = self.pool(owner).await?;
 
         let request = ProduceRequest::default()
             .transactional_id(None)
             .acks(-1)
-            .timeout_ms(Self::FORWARD_TIMEOUT_MS)
+            .timeout_ms(Self::FORWARD_TIMEOUT.as_millis() as i32)
             .topic_data(Some(vec![
                 TopicProduceData::default()
                     .name(topition.topic().to_owned())
@@ -134,8 +162,11 @@ impl PrefixRouter for ClientRouter {
                 }
                 Ok(partition.base_offset)
             }
+            // Relay the owner's error. An unparseable code (version skew on a
+            // rolling upgrade) maps to a RETRIABLE error, never the fatal
+            // UnknownServerError (-1) that would make the client drop the batch.
             Some(partition) => Err(Error::Api(
-                ErrorCode::try_from(partition.error_code).unwrap_or(ErrorCode::UnknownServerError),
+                ErrorCode::try_from(partition.error_code).unwrap_or(ErrorCode::NotLeaderOrFollower),
             )),
             None => Err(Error::Api(ErrorCode::NotLeaderOrFollower)),
         }

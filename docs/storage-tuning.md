@@ -173,13 +173,15 @@ params, per replica:
 | Param | Meaning |
 |-------|---------|
 | `routing_node_id` | This replica's routing identity (an integer, distinct per pod). Omit to disable routing (single-broker; current behaviour). |
-| `members` | The full broker set as `id@internal-addr` pairs, comma-separated, e.g. `members=0@tansu-0.tansu:9092,1@tansu-1.tansu:9092,2@tansu-2.tansu:9092`. Malformed entries are skipped with a warning. |
+| `members` | The full broker set as `id@<url>` pairs, comma-separated, where each `<url>` is a **`tcp://host:port`** internal (pod-to-pod) address — e.g. `members=0@tcp://tansu-0.tansu:9092,1@tcp://tansu-1.tansu:9092,2@tcp://tansu-2.tansu:9092`. The scheme and port are required (a scheme-less `host:port` is rejected). Malformed entries are skipped with a warning. |
 
 Routing is inert unless **both** are set and `members` is non-empty; a
-single-broker deployment leaves them off and behaves exactly as before. The
-`routing_node_id` is a routing identity only — it is orthogonal to the logical
-`NODE_ID` (still 111) that clients see, so metadata/advertised-listener
-behaviour is unchanged.
+single-broker deployment leaves them off and behaves exactly as before. This
+pod's own `routing_node_id` **must** appear in `members` — if it does not, the
+broker logs an error and disables routing (rather than forwarding every prefix
+and risking a forward loop). The `routing_node_id` is a routing identity only —
+it is orthogonal to the logical `NODE_ID` (still 111) that clients see, so
+metadata/advertised-listener behaviour is unchanged.
 
 Deployment: run the brokers as a StatefulSet behind a headless Service so each
 pod has a stable ordinal and DNS name; template `routing_node_id` from the pod
@@ -212,11 +214,13 @@ s3://my-bucket/?produce_coalesce=true&coalesce_linger=300ms&coalesce_batches=128
 Coalesces produce with a 300 ms linger (or 128 batches / 4 MiB, whichever comes
 first) and checkpoints idempotent producers at most every 5 s.
 
-Multi-broker (replica 1 of a 3-pod StatefulSet), adding prefix-owner routing
-(#70):
+Multi-broker (replica 1 of a 3-pod StatefulSet) running prefix coalescing with
+prefix-owner routing (#70). Note routing gates on `prefix_coalesce` (the
+virtual-topics path), not `produce_coalesce`:
 
 ```
-s3://my-bucket/?produce_coalesce=true&coalesce_linger=300ms&routing_node_id=1&members=0@tansu-0.tansu:9092,1@tansu-1.tansu:9092,2@tansu-2.tansu:9092
+s3://my-bucket/?prefix_coalesce=true&coalesce_linger=1s&routing_node_id=1&members=0@tcp://tansu-0.tansu:9092,1@tcp://tansu-1.tansu:9092,2@tcp://tansu-2.tansu:9092
 ```
 
-Each pod uses the same URL except for its own `routing_node_id`.
+Each pod uses the same URL except for its own `routing_node_id` (0, 1, 2 — the
+pod's StatefulSet ordinal).

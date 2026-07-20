@@ -5104,37 +5104,26 @@ impl Storage for DynoStore {
 
             Ok(offset)
         } else {
-            // Prefix-owner routing (#70): forward a coalesce-eligible batch to the
-            // prefix's deterministic owner BEFORE any local idempotent-sequence
-            // validation or offset assignment, so ONLY the owner validates and
-            // advances the durable producer sequence (two brokers validating would
-            // double-advance it and break idempotent dedup). Owned prefixes — and
-            // routing-disabled deployments — fall through to local handling.
+            // Prefix-owner routing (#70): forward produce for a prefix this pod
+            // does not own to the deterministic owner BEFORE any local
+            // idempotent-sequence validation or offset assignment, so ONLY the
+            // owner validates and advances the durable producer sequence (two
+            // brokers validating would double-advance it and break idempotent
+            // dedup). Owned prefixes — and routing-disabled deployments — fall
+            // through to local handling.
+            //
+            // ALL batches are forwarded, not only coalesce-eligible ones: a
+            // transactional / control / compacted batch handled locally on a
+            // non-owner would take the legacy per-`(topic,partition)` create path
+            // and assign an offset the owner's segment writer never observes,
+            // duplicating offsets across the two pods (a legacy `records/` object
+            // and a segment record at the same offset). Forwarding makes the owner
+            // the single writer for the whole sub-stream, matching single-broker
+            // semantics; the owner still decides coalesce-vs-legacy per batch.
             if self.prefix_coalesce {
-                let attributes = BatchAttribute::try_from(deflated.attributes)
-                    .inspect_err(|err| debug!(?err))?;
-                let compacted =
-                    config
-                        .configs
-                        .as_deref()
-                        .unwrap_or_default()
-                        .iter()
-                        .any(|config| {
-                            config.name == "cleanup.policy"
-                                && config
-                                    .value
-                                    .as_deref()
-                                    .is_some_and(|value| value.contains("compact"))
-                        });
-                let eligible = transaction_id.is_none()
-                    && !attributes.transaction
-                    && !attributes.control
-                    && !compacted;
-                if eligible {
-                    let prefix = self.prefix_of(topition);
-                    if !self.owns_prefix(&prefix) {
-                        return self.route_produce(&prefix, topition, deflated).await;
-                    }
+                let prefix = self.prefix_of(topition);
+                if !self.owns_prefix(&prefix) {
+                    return self.route_produce(&prefix, topition, deflated).await;
                 }
             }
 

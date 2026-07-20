@@ -199,7 +199,7 @@ use url::Url;
 use uuid::Uuid;
 
 #[cfg(feature = "dynostore")]
-use tracing::warn;
+use tracing::{error, warn};
 
 #[cfg(feature = "dynostore")]
 mod dynostore;
@@ -2424,11 +2424,18 @@ fn routing_config(storage: &Url) -> (Option<i32>, BTreeMap<i32, Url>) {
                 for entry in value.split(',').filter(|entry| !entry.is_empty()) {
                     match entry.split_once('@') {
                         Some((id, address)) => match (id.parse::<i32>(), Url::parse(address)) {
-                            (Ok(id), Ok(url)) => {
+                            // Require a real host AND port. A scheme-less
+                            // `host:9092` parses as a URL whose "scheme" is the
+                            // host (no `host_str()`, no `port()`), which would then
+                            // fail every forward in `host_port` — the #70 storm
+                            // back on, silently. Demand `tcp://<host>:<port>`.
+                            (Ok(id), Ok(url))
+                                if url.host_str().is_some() && url.port().is_some() =>
+                            {
                                 _ = members.insert(id, url);
                             }
                             _ => {
-                                warn!(storage = %storage, key = "members", entry, "unparseable member")
+                                warn!(storage = %storage, key = "members", entry, "unparseable member — expected <id>@tcp://<host>:<port>")
                             }
                         },
                         None => {
@@ -2439,6 +2446,19 @@ fn routing_config(storage: &Url) -> (Option<i32>, BTreeMap<i32, Url>) {
             }
             _ => {}
         }
+    }
+
+    // A configured `routing_node_id` MUST be present in a non-empty member set:
+    // otherwise this pod owns no prefix and forwards everything (and can ping-pong
+    // with a peer whose view disagrees). Treat that as a misconfiguration — log
+    // loudly and DISABLE routing (fall back to local single-writer handling)
+    // rather than risk a forward loop.
+    if let Some(id) = routing_node_id
+        && !members.is_empty()
+        && !members.contains_key(&id)
+    {
+        error!(storage = %storage, routing_node_id = id, "routing_node_id absent from members; disabling prefix-owner routing");
+        return (None, BTreeMap::new());
     }
 
     (routing_node_id, members)
@@ -2724,25 +2744,25 @@ impl Builder<i32, String, Url, Url> {
             }
 
             #[cfg(feature = "dynostore")]
-            "memory" => Ok(
-                DynoStore::new(self.cluster_id.as_str(), self.node_id, InMemory::new())
-                    .advertised_listener(self.advertised_listener.clone())
-                    .schemas(self.schema_registry)
-                    .lake(self.lake_house.clone())
-                    .auto_create(auto_topic_create(&self.storage))
-                    .produce_coalesce(self.storage.query_pairs().any(|(k, v)| {
-                        k == "produce_coalesce" && v.as_ref().parse().unwrap_or(false)
-                    }))
-                    .prefix_coalesce(url_flag(&self.storage, "prefix_coalesce"))
-                    .routing(
-                        routing_config(&self.storage).0,
-                        routing_config(&self.storage).1,
-                    )
-                    .prefix_router(self.prefix_router.clone())
-                    .coalesce_tuning(coalesce_tuning(&self.storage)),
-            )
-            .map(|storage| Box::new(storage) as Box<dyn Storage>)
-            .map(Arc::new),
+            "memory" => {
+                let (routing_node_id, members) = routing_config(&self.storage);
+                Ok(
+                    DynoStore::new(self.cluster_id.as_str(), self.node_id, InMemory::new())
+                        .advertised_listener(self.advertised_listener.clone())
+                        .schemas(self.schema_registry)
+                        .lake(self.lake_house.clone())
+                        .auto_create(auto_topic_create(&self.storage))
+                        .produce_coalesce(self.storage.query_pairs().any(|(k, v)| {
+                            k == "produce_coalesce" && v.as_ref().parse().unwrap_or(false)
+                        }))
+                        .prefix_coalesce(url_flag(&self.storage, "prefix_coalesce"))
+                        .routing(routing_node_id, members)
+                        .prefix_router(self.prefix_router.clone())
+                        .coalesce_tuning(coalesce_tuning(&self.storage)),
+                )
+                .map(|storage| Box::new(storage) as Box<dyn Storage>)
+                .map(Arc::new)
+            }
 
             #[cfg(not(feature = "dynostore"))]
             "s3" | "memory" => Err(Error::FeatureNotEnabled {
@@ -4180,6 +4200,20 @@ mod tests {
         let (node, members) = routing_config(&Url::parse("s3://tansu/")?);
         assert_eq!(None, node);
         assert!(members.is_empty());
+
+        // A scheme-less `host:port` member is rejected (it would have no
+        // host/port and fail every forward).
+        let (_node, members) = routing_config(&Url::parse("s3://tansu/?members=1@h1:9092")?);
+        assert!(members.is_empty(), "scheme-less member must be rejected");
+
+        // A routing_node_id absent from a non-empty member set is a misconfig →
+        // routing disabled (fail-safe, no forward loop).
+        let (node, members) = routing_config(&Url::parse(
+            "s3://tansu/?routing_node_id=9&members=1@tcp://h1:9092,2@tcp://h2:9092",
+        )?);
+        assert_eq!(None, node, "misconfig disables routing");
+        assert!(members.is_empty(), "misconfig disables routing");
+
         Ok(())
     }
 
