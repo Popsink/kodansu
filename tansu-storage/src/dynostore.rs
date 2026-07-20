@@ -39,7 +39,7 @@ use object_store::{
 };
 use opentelemetry::{
     KeyValue,
-    metrics::{Counter, Histogram},
+    metrics::{Counter, Gauge, Histogram},
 };
 use opticon::OptiCon;
 use rand::{prelude::*, rng};
@@ -243,6 +243,11 @@ pub struct DynoStore {
     /// path). Consulted before every prefix flush to fence a stale writer.
     prefix_leases: Arc<Mutex<BTreeMap<String, HeldLease>>>,
 
+    /// Per-prefix compaction leases this process holds (#66) — the maintenance
+    /// side of the single-writer fence, kept separate from `prefix_leases` so
+    /// compaction on a maintenance worker never touches the produce lease.
+    compaction_leases: Arc<Mutex<BTreeMap<String, HeldLease>>>,
+
     /// Whether a topition still has legacy `records/` objects, cached (with the
     /// check time) to keep the prefix-coalesced read path off a per-fetch
     /// `records/` LIST (#60). A topic flipped to segment mode mid-life is a
@@ -278,6 +283,13 @@ pub struct DynoStore {
     coalesce_bytes: usize,
     producer_checkpoint_interval: Duration,
     producer_checkpoint_batches: u64,
+
+    /// Segment-compaction thresholds (#66), each seeded from its compile-time
+    /// default and overridable per deployment via [`Self::coalesce_tuning`].
+    /// `prefix_compact_min_segments == 0` disables compaction.
+    prefix_compact_min_segments: usize,
+    prefix_compact_target_bytes: usize,
+    prefix_compact_keep_hot: usize,
 
     object_store: Arc<DynObjectStore>,
 }
@@ -396,6 +408,9 @@ pub struct CoalesceTuning {
     pub coalesce_bytes: Option<usize>,
     pub producer_checkpoint_interval: Option<Duration>,
     pub producer_checkpoint_batches: Option<u64>,
+    pub prefix_compact_min_segments: Option<usize>,
+    pub prefix_compact_target_bytes: Option<usize>,
+    pub prefix_compact_keep_hot: Option<usize>,
 }
 
 /// Process-wide counter making each [`DynoStore`]'s `writer_id` unique (#59), so
@@ -408,6 +423,23 @@ static SEGMENT_FLUSHES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_prefix_segment_flushes")
         .with_description("prefix-coalesced segment objects written")
+        .build()
+});
+
+/// Segments merged away by compaction (#66) — bounds live segment count.
+static SEGMENT_COMPACTIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_segment_compactions")
+        .with_description("segments merged away by prefix compaction")
+        .build()
+});
+
+/// Live segment count per prefix after a maintenance tick (#66) — the signal
+/// that tells whether compaction is keeping `S` bounded (a counter can't).
+static SEGMENTS_LIVE: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("tansu_prefix_segments_live")
+        .with_description("live segments for a prefix after maintenance")
         .build()
 });
 
@@ -858,6 +890,7 @@ impl DynoStore {
             prefix_flush_locks: Arc::new(Mutex::new(BTreeMap::new())),
             prefix_index: Arc::new(Mutex::new(BTreeMap::new())),
             prefix_leases: Arc::new(Mutex::new(BTreeMap::new())),
+            compaction_leases: Arc::new(Mutex::new(BTreeMap::new())),
             legacy_records_present: Arc::new(Mutex::new(BTreeMap::new())),
             writer_id: format!(
                 "{node}-{}",
@@ -869,6 +902,9 @@ impl DynoStore {
             coalesce_bytes: Self::COALESCE_BYTES,
             producer_checkpoint_interval: Self::PRODUCER_CHECKPOINT_INTERVAL,
             producer_checkpoint_batches: Self::PRODUCER_CHECKPOINT_BATCHES,
+            prefix_compact_min_segments: Self::PREFIX_COMPACT_MIN_SEGMENTS,
+            prefix_compact_target_bytes: Self::PREFIX_COMPACT_TARGET_BYTES,
+            prefix_compact_keep_hot: Self::PREFIX_COMPACT_KEEP_HOT,
             topic_metas: Arc::new(Mutex::new(BTreeMap::new())),
             topic_index: Arc::new(Mutex::new(TopicIndex::default())),
             topic_index_refresh: Arc::new(tokio::sync::Mutex::new(())),
@@ -951,6 +987,15 @@ impl DynoStore {
             producer_checkpoint_batches: tuning
                 .producer_checkpoint_batches
                 .unwrap_or(self.producer_checkpoint_batches),
+            prefix_compact_min_segments: tuning
+                .prefix_compact_min_segments
+                .unwrap_or(self.prefix_compact_min_segments),
+            prefix_compact_target_bytes: tuning
+                .prefix_compact_target_bytes
+                .unwrap_or(self.prefix_compact_target_bytes),
+            prefix_compact_keep_hot: tuning
+                .prefix_compact_keep_hot
+                .unwrap_or(self.prefix_compact_keep_hot),
             ..self
         }
     }
@@ -1099,6 +1144,20 @@ impl DynoStore {
     /// so the exact value only shifts a throughput/PUT tradeoff, never
     /// correctness.
     const PREFIX_BACKFILL_MIN_RECORDS: i64 = 1_000;
+
+    /// Compact a prefix's segments once it holds more than this many live ones
+    /// (#66), bounding `S` (segments per prefix ≈ flush_rate × retention, which
+    /// is otherwise unbounded) so the footer index footprint and per-fetch scan
+    /// stay bounded. `0` disables compaction.
+    const PREFIX_COMPACT_MIN_SEGMENTS: usize = 256;
+
+    /// Target byte size of a merged segment (#66): the oldest eligible run is
+    /// merged until it reaches this, then written as one create-only object.
+    const PREFIX_COMPACT_TARGET_BYTES: usize = 64 << 20;
+
+    /// Newest segments never compacted (#66): leaves the actively-produced tail
+    /// alone so compaction never races the current write point.
+    const PREFIX_COMPACT_KEEP_HOT: usize = 16;
 
     /// All topics, served from the in-memory [`TopicIndex`]. Returns the shared
     /// snapshot if fresh; otherwise refreshes it (single-flight) by LISTing the
@@ -2057,7 +2116,18 @@ impl DynoStore {
     /// sequence (a racing writer during a #59 failover) resyncs from the tail
     /// and retries. Single-writer per prefix makes the conflict path an edge
     /// case, not the steady state.
-    async fn assign_and_create_segment(&self, prefix: &str, payload: PutPayload) -> Result<u64> {
+    ///
+    /// `fence_on_conflict` controls the produce vs. compaction contract: the
+    /// produce path passes `true` — a seq conflict means a lease takeover, so it
+    /// re-validates the lease and aborts if fenced (#59). Compaction passes
+    /// `false` — it does not hold the produce lease and a conflict just means the
+    /// producer grabbed that tail seq, so it simply resyncs to the next free one.
+    async fn assign_and_create_segment(
+        &self,
+        prefix: &str,
+        payload: PutPayload,
+        fence_on_conflict: bool,
+    ) -> Result<u64> {
         /// Bounds the conflict-resync loop; far above any real contention.
         const MAX_ATTEMPTS: usize = 64;
 
@@ -2093,8 +2163,12 @@ impl DynoStore {
                     // lease before resyncing (#59 review fix): if we've been
                     // fenced, abort now instead of appending the next sequence
                     // with stale offsets (which would split-brain the log). A
-                    // still-valid holder resyncs and retries.
-                    _ = self.acquire_or_renew_lease(prefix).await?;
+                    // still-valid holder resyncs and retries. Compaction
+                    // (fence_on_conflict=false) is not the produce writer, so a
+                    // conflict is just the producer taking that seq — resync only.
+                    if fence_on_conflict {
+                        _ = self.acquire_or_renew_lease(prefix).await?;
+                    }
                     debug!(candidate, attempt, prefix, "segment seq taken, resyncing");
                     candidate = self.tail_next_seq(prefix).await?;
                 }
@@ -2247,9 +2321,17 @@ impl DynoStore {
     }
 
     /// Record a freshly-written segment in the index (writer fast path): its
-    /// footer is authoritative and its append time is ~now, so a following read
-    /// on this node needs no listing/GET.
-    fn index_insert(&self, prefix: &str, seq: u64, footer: SegmentFooter) -> Result<()> {
+    /// footer is authoritative, so a following read on this node needs no
+    /// listing/GET. `last_modified_ms` is the object's append time — `now` for a
+    /// normal flush, but the max of the merged inputs for a compaction (#66) so
+    /// compaction does not reset the retention clock of timestamp-less data.
+    fn index_insert(
+        &self,
+        prefix: &str,
+        seq: u64,
+        footer: SegmentFooter,
+        last_modified_ms: i64,
+    ) -> Result<()> {
         self.prefix_index
             .lock()
             .map_err(Into::into)
@@ -2259,10 +2341,23 @@ impl DynoStore {
                     seq,
                     CachedSegment {
                         footer,
-                        last_modified_ms: Self::now_ms(),
+                        last_modified_ms,
                     },
                 );
                 entry.refreshed_at = Some(SystemTime::now());
+            })
+    }
+
+    /// Force the next index access to re-list (bust the TTL) — used when a data
+    /// GET 404s (a segment was compacted/expired out from under a reader, #66).
+    fn index_invalidate(&self, prefix: &str) -> Result<()> {
+        self.prefix_index
+            .lock()
+            .map_err(Into::into)
+            .map(|mut index| {
+                if let Some(entry) = index.get_mut(prefix) {
+                    entry.refreshed_at = None;
+                }
             })
     }
 
@@ -2313,12 +2408,18 @@ impl DynoStore {
             })
             .unwrap_or_default();
 
-        // Ascending base offset; on a tie the higher epoch first so it is the one
-        // that claims the overlapping range.
+        // Ascending base offset; on a tie prefer the higher epoch, then the
+        // higher sequence, so the winner claims the overlapping range. The
+        // higher-sequence tie-break matters when epochs are equal: a compacted
+        // segment (#66) always has a higher sequence than the originals it
+        // merged, so it wins the overlap during the write→delete window even
+        // though it carries the same epoch — a reader replica with a lingering
+        // deleted-original entry still selects the merged segment.
         segs.sort_by(|a, b| {
             a.2.base_offset
                 .cmp(&b.2.base_offset)
                 .then_with(|| b.0.cmp(&a.0))
+                .then_with(|| b.1.cmp(&a.1))
         });
 
         let mut out: Vec<(u64, SubstreamEntry)> = Vec::with_capacity(segs.len());
@@ -2384,78 +2485,100 @@ impl DynoStore {
                 .unwrap_or_default()
         };
 
+        /// A segment can be deleted mid-fetch by compaction/retention; the merged
+        /// segment covers the same offsets, so on a 404 we refresh the index and
+        /// restart cleanly. Bounded so a genuinely missing object can't loop.
+        const MAX_ATTEMPTS: usize = 3;
+
         let prefix = self.prefix_of(topition);
-        self.refresh_prefix_index(&prefix).await?;
-        let segments =
-            self.valid_substream_segments(&prefix, topition.topic(), topition.partition())?;
 
-        let mut batches = vec![];
-        let mut bytes = max_bytes as u64;
+        for _ in 0..MAX_ATTEMPTS {
+            self.refresh_prefix_index(&prefix).await?;
+            let segments =
+                self.valid_substream_segments(&prefix, topition.topic(), topition.partition())?;
 
-        for (seq, entry) in segments {
-            if has_deadline_expired() {
-                break;
-            }
+            let mut batches = vec![];
+            let mut bytes = max_bytes as u64;
+            let mut restart = false;
 
-            // Segments are sorted by base offset; skip those ending at/before the
-            // requested offset, stop once one starts at/past the high watermark.
-            if entry.base_offset + entry.record_count <= offset {
-                continue;
-            }
-            if entry.base_offset >= high_watermark {
-                break;
-            }
+            for (seq, entry) in segments {
+                if has_deadline_expired() {
+                    break;
+                }
 
-            // One ranged GET of exactly this sub-stream's byte span.
-            let location = self.segment_location(&prefix, seq);
-            let region = match self
-                .object_store
-                .get_opts(
-                    &location,
-                    GetOptions {
-                        range: Some(GetRange::Bounded(
-                            entry.byte_start..entry.byte_start + entry.byte_len,
-                        )),
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(result) => result
-                    .bytes()
-                    .await
-                    .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
-                    .and_then(|encoded| self.decode_frame(encoded))?,
-
-                // Retention deleted this segment between locate and read: prune
-                // the stale index entry and move on.
-                Err(object_store::Error::NotFound { .. }) => {
-                    _ = self.index_prune(&prefix, &[seq]);
+                // Segments are sorted by base offset; skip those ending at/before
+                // the requested offset, stop once one starts at/past the HWM.
+                if entry.base_offset + entry.record_count <= offset {
                     continue;
                 }
-
-                Err(error) => {
-                    error!(?error, location = %location);
-                    return Err(Error::Api(ErrorCode::UnknownServerError));
+                if entry.base_offset >= high_watermark {
+                    break;
                 }
-            };
 
-            let mut running = entry.base_offset;
-            for mut batch in region {
-                let span = batch.last_offset_delta as i64 + 1;
-                batch.base_offset = running;
-                running += span;
-                batches.push(batch);
+                // One ranged GET of exactly this sub-stream's byte span.
+                let location = self.segment_location(&prefix, seq);
+                let region = match self
+                    .object_store
+                    .get_opts(
+                        &location,
+                        GetOptions {
+                            range: Some(GetRange::Bounded(
+                                entry.byte_start..entry.byte_start + entry.byte_len,
+                            )),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    Ok(result) => result
+                        .bytes()
+                        .await
+                        .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
+                        .and_then(|encoded| self.decode_frame(encoded))?,
+
+                    // Deleted between locate and read (compaction #66 / retention
+                    // #61): drop anything gathered so far, evict the stale seq
+                    // (prune-on-404 — the add-only refresh never would), force a
+                    // re-list to pick up the merged/surviving segments, and
+                    // restart clean. The merged segment covers the same offsets
+                    // and wins the overlap (higher seq), so no gap/duplicate.
+                    Err(object_store::Error::NotFound { .. }) => {
+                        self.index_prune(&prefix, &[seq])?;
+                        self.index_invalidate(&prefix)?;
+                        restart = true;
+                        break;
+                    }
+
+                    Err(error) => {
+                        error!(?error, location = %location);
+                        return Err(Error::Api(ErrorCode::UnknownServerError));
+                    }
+                };
+
+                let mut running = entry.base_offset;
+                for mut batch in region {
+                    let span = batch.last_offset_delta as i64 + 1;
+                    batch.base_offset = running;
+                    running += span;
+                    batches.push(batch);
+                }
+
+                if entry.byte_len > bytes {
+                    break;
+                } else {
+                    bytes = bytes.saturating_sub(entry.byte_len);
+                }
             }
 
-            if entry.byte_len > bytes {
-                break;
-            } else {
-                bytes = bytes.saturating_sub(entry.byte_len);
+            if !restart {
+                return Ok(batches);
             }
         }
 
-        Ok(batches)
+        // Exhausted retries (persistent 404 churn): return what a final clean
+        // pass can read rather than erroring.
+        self.refresh_prefix_index(&prefix).await?;
+        Ok(vec![])
     }
 
     /// The lowest segment base offset for a sub-stream, from the index (#60): the
@@ -2664,6 +2787,17 @@ impl DynoStore {
         ))
     }
 
+    /// The durable compaction lease object for a connector prefix (#66): a lease
+    /// distinct from the produce lease, so compaction (which runs on the
+    /// maintenance workers, not the producing broker) coordinates
+    /// compactor-vs-compactor without needing — or fencing — the produce writer.
+    fn compaction_lease_location(&self, prefix: &str) -> Path {
+        Path::from(format!(
+            "clusters/{}/prefixes/{}/compaction-lease.json",
+            self.cluster, prefix,
+        ))
+    }
+
     /// Wall-clock milliseconds since the Unix epoch, for lease expiry (#59).
     fn now_ms() -> i64 {
         SystemTime::now()
@@ -2689,24 +2823,43 @@ impl DynoStore {
     /// remains, so the lease object is mutated ~once per `2/3 · ttl`, never per
     /// flush — keeping it under GCS's ~1/s/object mutation cap (#13).
     async fn acquire_or_renew_lease(&self, prefix: &str) -> Result<i64> {
+        let location = self.lease_location(prefix);
+        self.acquire_or_renew_lease_at(prefix, &location, &self.prefix_leases)
+            .await
+    }
+
+    /// Acquire or renew the compaction lease for `prefix` (#66) — same fence as
+    /// the produce lease but on a separate object/cache, so a maintenance worker
+    /// can compact without holding (or fencing) the produce lease.
+    async fn acquire_compaction_lease(&self, prefix: &str) -> Result<i64> {
+        let location = self.compaction_lease_location(prefix);
+        self.acquire_or_renew_lease_at(prefix, &location, &self.compaction_leases)
+            .await
+    }
+
+    /// Generic lease acquire/renew against `location`, caching the held term in
+    /// `cache` under `key` (#59/#66). The etag CAS is the fence; a live foreign
+    /// lease or a lost CAS yields `NotLeaderOrFollower`. A held term is reused
+    /// with no write while more than a third of it remains, keeping the object's
+    /// mutation rate well under GCS's ~1/s cap (#13).
+    async fn acquire_or_renew_lease_at(
+        &self,
+        key: &str,
+        location: &Path,
+        cache: &Arc<Mutex<BTreeMap<String, HeldLease>>>,
+    ) -> Result<i64> {
         let now = SystemTime::now();
         let margin = self.prefix_lease_ttl / 3;
 
         // Fast path: comfortably within our term — no object mutation.
-        if let Some(held) = self
-            .prefix_leases
-            .lock()
-            .map_err(Into::<Error>::into)?
-            .get(prefix)
+        if let Some(held) = cache.lock().map_err(Into::<Error>::into)?.get(key)
             && held.expires_at > now + margin
         {
             return Ok(held.epoch);
         }
 
-        let location = self.lease_location(prefix);
-
         // Read the current lease and its version (etag) to CAS against.
-        let (current, version) = match self.object_store.get(&location).await {
+        let (current, version) = match self.object_store.get(location).await {
             Ok(result) => {
                 let version = UpdateVersion {
                     e_tag: result.meta.e_tag.clone(),
@@ -2721,11 +2874,10 @@ impl DynoStore {
 
         // "Ours" iff the object's etag matches the one we last wrote — then this
         // is a renewal, not a takeover of a foreign live lease.
-        let our_version = self
-            .prefix_leases
+        let our_version = cache
             .lock()
             .map_err(Into::<Error>::into)?
-            .get(prefix)
+            .get(key)
             .and_then(|held| held.version.clone());
         let ours = matches!((&version, &our_version), (Some(v), Some(o)) if v.e_tag == o.e_tag);
         let expired = current
@@ -2736,12 +2888,9 @@ impl DynoStore {
         // cached term and yield.
         if !ours && !expired {
             if let Some(lease) = &current {
-                debug!(prefix, holder = %lease.holder, epoch = lease.epoch, "prefix lease held elsewhere");
+                debug!(key, holder = %lease.holder, epoch = lease.epoch, "lease held elsewhere");
             }
-            _ = self
-                .prefix_leases
-                .lock()
-                .map(|mut leases| leases.remove(prefix));
+            _ = cache.lock().map(|mut leases| leases.remove(key));
             LEASE_FENCED.add(1, &[]);
             return Err(Error::Api(ErrorCode::NotLeaderOrFollower));
         }
@@ -2763,7 +2912,7 @@ impl DynoStore {
         match self
             .object_store
             .put_opts(
-                &location,
+                location,
                 payload,
                 PutOptions {
                     mode,
@@ -2777,9 +2926,9 @@ impl DynoStore {
                     e_tag: result.e_tag,
                     version: result.version,
                 });
-                _ = self.prefix_leases.lock().map(|mut leases| {
+                _ = cache.lock().map(|mut leases| {
                     _ = leases.insert(
-                        prefix.to_owned(),
+                        key.to_owned(),
                         HeldLease {
                             epoch,
                             expires_at: now + self.prefix_lease_ttl,
@@ -2788,7 +2937,7 @@ impl DynoStore {
                     );
                 });
                 LEASE_ACQUIRES.add(1, &[]);
-                debug!(prefix, epoch, "prefix lease acquired/renewed");
+                debug!(key, epoch, "lease acquired/renewed");
                 Ok(epoch)
             }
 
@@ -2797,11 +2946,8 @@ impl DynoStore {
                 object_store::Error::Precondition { .. }
                 | object_store::Error::AlreadyExists { .. },
             ) => {
-                debug!(prefix, "prefix lease CAS lost — fenced");
-                _ = self
-                    .prefix_leases
-                    .lock()
-                    .map(|mut leases| leases.remove(prefix));
+                debug!(key, "lease CAS lost — fenced");
+                _ = cache.lock().map(|mut leases| leases.remove(key));
                 LEASE_FENCED.add(1, &[]);
                 Err(Error::Api(ErrorCode::NotLeaderOrFollower))
             }
@@ -2977,7 +3123,9 @@ impl DynoStore {
 
         let (seq, footer) = match async {
             let (payload, footer) = self.encode_segment(&substreams, epoch)?;
-            let seq = self.assign_and_create_segment(prefix, payload).await?;
+            let seq = self
+                .assign_and_create_segment(prefix, payload, true)
+                .await?;
             Ok::<_, Error>((seq, footer))
         }
         .await
@@ -2989,7 +3137,7 @@ impl DynoStore {
         // Populate the in-memory footer index so reads on this node need no
         // listing/GET to see the segment we just wrote (read-path #60 fix).
         _ = self
-            .index_insert(prefix, seq, footer)
+            .index_insert(prefix, seq, footer, Self::now_ms())
             .inspect_err(|err| debug!(?err));
         SEGMENT_FLUSHES.add(1, &[]);
 
@@ -3438,6 +3586,274 @@ impl DynoStore {
         self.index_prune(prefix, &expirable)?;
 
         Ok(deleted)
+    }
+
+    /// Compact a prefix's oldest segments into fewer, larger ones (#66) to bound
+    /// the live segment count `S` (otherwise ≈ flush_rate × retention, unbounded)
+    /// — keeping the footer index footprint and the per-fetch scan bounded.
+    /// Returns the number of segments merged away.
+    ///
+    /// Coordinator-free and GCS-safe: only the single lease holder compacts, the
+    /// merged segment is written as a new create-only object (the merged records
+    /// are byte-identical to the originals, #64 contract preserved) carrying the
+    /// max input epoch, and only then are the originals deleted — no object is
+    /// ever mutated. During the write→delete window the merged and original
+    /// segments overlap in offset, but they hold identical records and the read
+    /// path's overlap resolver returns exactly one copy, so a concurrent fetch is
+    /// correct; a fetch that GETs an original just as it is deleted retries off a
+    /// refreshed index (see `fetch_prefix_coalesced`).
+    async fn compact_prefix_segments(&self, prefix: &str) -> Result<u64> {
+        if self.prefix_compact_min_segments == 0 {
+            return Ok(0);
+        }
+
+        self.refresh_prefix_index(prefix).await?;
+
+        // Snapshot (seq, epoch, last_modified, region bytes) for every cached
+        // segment, ascending by seq (== ascending offset for a sub-stream).
+        let mut segs: Vec<(u64, i64, i64, usize)> = {
+            let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            index
+                .get(prefix)
+                .map(|entry| {
+                    entry
+                        .segments
+                        .iter()
+                        .map(|(seq, cached)| {
+                            let bytes: usize = cached
+                                .footer
+                                .entries
+                                .iter()
+                                .map(|e| e.byte_len as usize)
+                                .sum();
+                            (
+                                *seq,
+                                cached.footer.writer_epoch,
+                                cached.last_modified_ms,
+                                bytes,
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        segs.sort_by_key(|(seq, ..)| *seq);
+
+        // Only above the trigger, and never touch the hot (newest) tail.
+        if segs.len() <= self.prefix_compact_min_segments {
+            return Ok(0);
+        }
+        let eligible_end = segs.len().saturating_sub(self.prefix_compact_keep_hot);
+        if eligible_end < 2 {
+            return Ok(0);
+        }
+
+        // Pick a run from the oldest, up to the target size (at least 2). The
+        // merged epoch is taken from the fenced view below, not from this raw
+        // scan, so the segment epoch is ignored here.
+        let mut run: Vec<u64> = Vec::new();
+        let mut bytes = 0usize;
+        let mut max_last_modified = i64::MIN;
+        for (seq, _epoch, last_modified, size) in &segs[..eligible_end] {
+            if !run.is_empty() && bytes + size > self.prefix_compact_target_bytes {
+                break;
+            }
+            run.push(*seq);
+            bytes += size;
+            max_last_modified = max_last_modified.max(*last_modified);
+        }
+        if run.len() < 2 {
+            return Ok(0);
+        }
+
+        // Coordinate compactors with a *separate* compaction lease (#66 review):
+        // compaction runs on the maintenance workers, which do not hold the
+        // produce lease, so it must not require — or fence — the produce writer.
+        // If another compactor holds this prefix, yield.
+        if self.acquire_compaction_lease(prefix).await.is_err() {
+            return Ok(0);
+        }
+
+        // Snapshot the run's footers; GET each run segment once.
+        let footers: BTreeMap<u64, SegmentFooter> = {
+            let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            let entry = index.get(prefix);
+            run.iter()
+                .filter_map(|seq| {
+                    entry
+                        .and_then(|e| e.segments.get(seq))
+                        .map(|cached| (*seq, cached.footer.clone()))
+                })
+                .collect()
+        };
+
+        let mut objects: BTreeMap<u64, Bytes> = BTreeMap::new();
+        for seq in &run {
+            let object = self
+                .object_store
+                .get(&self.segment_location(prefix, *seq))
+                .await
+                .inspect_err(|err| error!(?err, prefix, seq))?
+                .bytes()
+                .await
+                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?;
+            _ = objects.insert(*seq, object);
+        }
+
+        // Merge the EPOCH-FENCED view (#66 review fix, critical): rebuild each
+        // sub-stream from `valid_substream_segments` (overlap-resolved, higher
+        // epoch/sequence wins) restricted to the run — NOT the raw footer
+        // entries. A zombie/overlap input is dropped here, never fused into the
+        // merged segment, so compaction can't bake in duplicate/shifted offsets.
+        let run_set: BTreeSet<u64> = run.iter().copied().collect();
+        let substream_keys: BTreeSet<(String, i32)> = footers
+            .values()
+            .flat_map(|footer| {
+                footer
+                    .entries
+                    .iter()
+                    .map(|e| (e.topic.clone(), e.partition))
+            })
+            .collect();
+
+        let mut substreams: Vec<(Topition, i64, Vec<deflated::Batch>)> = Vec::new();
+        let mut merged_epoch = i64::MIN;
+
+        for (topic, partition) in substream_keys {
+            let in_run: Vec<(u64, SubstreamEntry)> = self
+                .valid_substream_segments(prefix, &topic, partition)?
+                .into_iter()
+                .filter(|(seq, _)| run_set.contains(seq))
+                .collect();
+            if in_run.is_empty() {
+                // Every run segment holding this sub-stream is superseded by a
+                // segment outside the run — nothing to carry forward.
+                continue;
+            }
+
+            let base = in_run[0].1.base_offset;
+            let mut batches = Vec::new();
+            for (seq, entry) in &in_run {
+                let Some(object) = objects.get(seq) else {
+                    continue;
+                };
+                let start = entry.byte_start as usize;
+                let end = start + entry.byte_len as usize;
+                if end > object.len() {
+                    continue;
+                }
+                batches.extend(self.decode_frame(object.slice(start..end))?);
+                if let Some(footer) = footers.get(seq) {
+                    merged_epoch = merged_epoch.max(footer.writer_epoch);
+                }
+            }
+            substreams.push((Topition::new(topic, partition), base, batches));
+        }
+
+        // Write the merged segment (create-only, no produce-lease fencing), index
+        // it (preserving the max input append time so retention isn't reset),
+        // then delete ALL run segments — including any zombie/dominated ones,
+        // whose data was intentionally excluded above.
+        let new_seq = if substreams.is_empty() {
+            None
+        } else {
+            let (payload, footer) = self.encode_segment(&substreams, merged_epoch.max(0))?;
+            let seq = self
+                .assign_and_create_segment(prefix, payload, false)
+                .await?;
+            self.index_insert(prefix, seq, footer, max_last_modified)?;
+            Some(seq)
+        };
+
+        let locations: Vec<Path> = run
+            .iter()
+            .map(|seq| self.segment_location(prefix, *seq))
+            .collect();
+        self.delete_batches(locations).await?;
+        self.index_prune(prefix, &run)?;
+
+        SEGMENT_COMPACTIONS.add(run.len() as u64, &[]);
+        debug!(
+            prefix,
+            ?new_seq,
+            merged = run.len(),
+            "compacted prefix segments"
+        );
+
+        Ok(run.len() as u64)
+    }
+
+    /// Compact segments across every coalesced prefix (#66).
+    async fn policy_compact_segments(&self) -> Result<u64> {
+        if !self.prefix_coalesce || self.prefix_compact_min_segments == 0 {
+            return Ok(0);
+        }
+
+        // Derive the prefixes from the topic metadata (#66 review fix), NOT just
+        // the in-memory index: a dedicated maintenance worker never produces or
+        // fetches, so its index is empty — it must discover prefixes from the
+        // topics (as retention does). Union with any locally-indexed prefixes.
+        let mut prefix_set: BTreeSet<String> = self
+            .prefix_index
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .keys()
+            .cloned()
+            .collect();
+        for metadata in self.topics_index().await?.iter() {
+            let compact = metadata
+                .topic
+                .configs
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|config| {
+                    config.name == "cleanup.policy"
+                        && config
+                            .value
+                            .as_deref()
+                            .is_some_and(|value| value.contains("compact"))
+                });
+            if compact {
+                continue;
+            }
+            for partition in 0..metadata.topic.num_partitions {
+                _ = prefix_set
+                    .insert(self.prefix_of(&Topition::new(metadata.topic.name.clone(), partition)));
+            }
+        }
+        let prefixes: Vec<String> = prefix_set.into_iter().collect();
+
+        /// Bounds the drain loop so a pathological prefix can't monopolize a
+        /// maintenance tick; far above the runs a real backlog needs.
+        const MAX_RUNS_PER_PREFIX: usize = 4_096;
+
+        let mut compacted = 0;
+        for prefix in prefixes {
+            // Drain the prefix to <= min_segments in one tick (#66 review fix):
+            // a single run per tick can't keep up with a high flush rate, so loop
+            // until compaction finds nothing more to merge. Each call re-lists,
+            // so `S` converges to the trigger threshold within the tick.
+            for _ in 0..MAX_RUNS_PER_PREFIX {
+                match self
+                    .compact_prefix_segments(&prefix)
+                    .await
+                    .inspect_err(|err| error!(?err, prefix))
+                {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => compacted += n,
+                }
+            }
+
+            // Report the live segment count so runaway `S` is observable even if
+            // the drain can't keep up.
+            if let Ok(index) = self.prefix_index.lock()
+                && let Some(entry) = index.get(&prefix)
+            {
+                SEGMENTS_LIVE.record(entry.segments.len() as u64, &[]);
+            }
+        }
+        Ok(compacted)
     }
 
     /// Whole-segment retention across all coalesced prefixes (#61). Groups the
@@ -6484,8 +6900,11 @@ impl Storage for DynoStore {
     async fn maintain(&self, now: SystemTime) -> Result<()> {
         let deleted = self.policy_delete(now).await?;
         let compacted = self.policy_compact().await?;
+        // Bound the live segment count per prefix (#66): merge old segments after
+        // retention has pruned the expired ones.
+        let compacted_segments = self.policy_compact_segments().await?;
         let expired_groups = self.expire_groups(now).await?;
-        debug!(deleted, compacted, expired_groups);
+        debug!(deleted, compacted, compacted_segments, expired_groups);
 
         if let Some(ref lake) = self.lake {
             return lake

@@ -7,11 +7,17 @@ immutable **segment** objects:
 clusters/{cluster}/prefixes/{prefix}/segments/{seq:020}.seg
 ```
 
-`{seq}` is a zero-padded, monotonic segment sequence (the ordering authority —
-the object name is *not* an offset). A segment multiplexes the batches of every
-`(topic, partition)` sub-stream produced in one flush window, and is
-self-describing: an external S3-direct reader (e.g. kotatsu, kotatsu#82) can
-locate and decode any sub-stream from the object alone, with no external index.
+`{seq}` is a zero-padded segment sequence: a unique, create-only object name
+(the create is the write-ordering authority for producing), **not** an offset.
+A reader must **not** assume sequence order equals offset order — **segment
+compaction (#66) writes a merged segment covering old offsets under a fresh
+(higher) sequence**, so a high sequence can hold low offsets. Offset order comes
+from the footer, never from the name. A segment multiplexes the batches of every
+`(topic, partition)` sub-stream, and is self-describing: an external S3-direct
+reader (e.g. kotatsu, kotatsu#82) locates and decodes any sub-stream from the
+object alone, with no external index — resolving `(topic, partition, offset)`
+through the footer's offset ranges (on the rare overlap left by a
+compaction/failover, the higher `writer_epoch` wins).
 
 This document is the **wire contract**. All integers are **big-endian**.
 

@@ -2406,6 +2406,25 @@ fn coalesce_tuning(storage: &Url) -> CoalesceTuning {
                     .inspect_err(|err| warn!(storage = %storage, key = "producer_checkpoint_batches", value, ?err))
                     .ok();
             }
+            "prefix_compact_min_segments" => {
+                tuning.prefix_compact_min_segments = value
+                    .parse()
+                    .inspect_err(|err| warn!(storage = %storage, key = "prefix_compact_min_segments", value, ?err))
+                    .ok();
+            }
+            "prefix_compact_target_bytes" => {
+                tuning.prefix_compact_target_bytes = human_units::Size::from_str(value)
+                    .map(|size| size.0)
+                    .inspect_err(|err| warn!(storage = %storage, key = "prefix_compact_target_bytes", value, ?err))
+                    .ok()
+                    .and_then(|size| usize::try_from(size).ok());
+            }
+            "prefix_compact_keep_hot" => {
+                tuning.prefix_compact_keep_hot = value
+                    .parse()
+                    .inspect_err(|err| warn!(storage = %storage, key = "prefix_compact_keep_hot", value, ?err))
+                    .ok();
+            }
             _ => {}
         }
     }
@@ -4045,6 +4064,21 @@ mod tests {
             &Url::parse("memory://tansu/?prefix_coalesce=notabool")?,
             "prefix_coalesce"
         ));
+        Ok(())
+    }
+
+    #[cfg(feature = "dynostore")]
+    #[test]
+    fn coalesce_tuning_parses_compaction_keys() -> Result<()> {
+        let tuning = coalesce_tuning(&Url::parse(
+            "s3://tansu/?prefix_compact_min_segments=512&prefix_compact_target_bytes=128m&prefix_compact_keep_hot=32",
+        )?);
+        assert_eq!(Some(512), tuning.prefix_compact_min_segments);
+        assert_eq!(Some(128 * 1024 * 1024), tuning.prefix_compact_target_bytes);
+        assert_eq!(Some(32), tuning.prefix_compact_keep_hot);
+        // Absent keys stay None (compile-time defaults).
+        let empty = coalesce_tuning(&Url::parse("s3://tansu/")?);
+        assert_eq!(None, empty.prefix_compact_min_segments);
         Ok(())
     }
 
