@@ -118,6 +118,8 @@ use console::Emoji;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use deadpool::managed::PoolError;
 #[cfg(feature = "dynostore")]
+pub use dynostore::PrefixRouter;
+#[cfg(feature = "dynostore")]
 use dynostore::{CoalesceTuning, DynoStore};
 
 use glob::{GlobError, PatternError};
@@ -2362,6 +2364,50 @@ fn url_flag(storage: &Url, key: &str) -> bool {
         .any(|(k, v)| k == key && v.as_ref().parse().unwrap_or(false))
 }
 
+/// Parse prefix-owner routing (#70) from the storage URL: this pod's
+/// `routing_node_id` and the broker set `members=<id>@<addr>,...` (internal
+/// pod-to-pod addresses, e.g. a headless-service DNS). Both absent → routing off
+/// (single-broker / current behaviour). Malformed member entries are skipped
+/// with a warning.
+#[cfg(feature = "dynostore")]
+fn routing_config(storage: &Url) -> (Option<i32>, BTreeMap<i32, Url>) {
+    let mut routing_node_id = None;
+    let mut members = BTreeMap::new();
+
+    for (key, value) in storage.query_pairs() {
+        match key.as_ref() {
+            "routing_node_id" => {
+                routing_node_id = value
+                    .parse()
+                    .inspect_err(
+                        |err| warn!(storage = %storage, key = "routing_node_id", %value, ?err),
+                    )
+                    .ok();
+            }
+            "members" => {
+                for entry in value.split(',').filter(|entry| !entry.is_empty()) {
+                    match entry.split_once('@') {
+                        Some((id, address)) => match (id.parse::<i32>(), Url::parse(address)) {
+                            (Ok(id), Ok(url)) => {
+                                _ = members.insert(id, url);
+                            }
+                            _ => {
+                                warn!(storage = %storage, key = "members", entry, "unparseable member")
+                            }
+                        },
+                        None => {
+                            warn!(storage = %storage, key = "members", entry, "member missing '@'")
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (routing_node_id, members)
+}
+
 #[cfg(feature = "dynostore")]
 fn coalesce_tuning(storage: &Url) -> CoalesceTuning {
     let mut tuning = CoalesceTuning::default();
@@ -2525,6 +2571,7 @@ impl Builder<i32, String, Url, Url> {
                     })
                     .build()
                     .map(|object_store| {
+                        let (routing_node_id, members) = routing_config(&self.storage);
                         DynoStore::new(self.cluster_id.as_str(), self.node_id, object_store)
                             .advertised_listener(self.advertised_listener.clone())
                             .schemas(self.schema_registry)
@@ -2532,6 +2579,7 @@ impl Builder<i32, String, Url, Url> {
                             .auto_create(auto_topic_create(&self.storage))
                             .produce_coalesce(produce_coalesce)
                             .prefix_coalesce(prefix_coalesce)
+                            .routing(routing_node_id, members)
                             .coalesce_tuning(coalesce_tuning(&self.storage))
                     })
                     .map(|storage| {
@@ -2616,6 +2664,7 @@ impl Builder<i32, String, Url, Url> {
                             .with_jitter(Some(Duration::from_millis(50)))
                     })
                     .map(|object_store| {
+                        let (routing_node_id, members) = routing_config(&self.storage);
                         DynoStore::new(self.cluster_id.as_str(), self.node_id, object_store)
                             .advertised_listener(self.advertised_listener.clone())
                             .schemas(self.schema_registry)
@@ -2623,6 +2672,7 @@ impl Builder<i32, String, Url, Url> {
                             .auto_create(auto_topic_create(&self.storage))
                             .produce_coalesce(produce_coalesce)
                             .prefix_coalesce(prefix_coalesce)
+                            .routing(routing_node_id, members)
                             .coalesce_tuning(coalesce_tuning(&self.storage))
                     })
                     .map(|storage| {
@@ -2646,6 +2696,10 @@ impl Builder<i32, String, Url, Url> {
                         k == "produce_coalesce" && v.as_ref().parse().unwrap_or(false)
                     }))
                     .prefix_coalesce(url_flag(&self.storage, "prefix_coalesce"))
+                    .routing(
+                        routing_config(&self.storage).0,
+                        routing_config(&self.storage).1,
+                    )
                     .coalesce_tuning(coalesce_tuning(&self.storage)),
             )
             .map(|storage| Box::new(storage) as Box<dyn Storage>)
@@ -4064,6 +4118,29 @@ mod tests {
             &Url::parse("memory://tansu/?prefix_coalesce=notabool")?,
             "prefix_coalesce"
         ));
+        Ok(())
+    }
+
+    #[cfg(feature = "dynostore")]
+    #[test]
+    fn routing_config_parses_node_and_members() -> Result<()> {
+        let (node, members) = routing_config(&Url::parse(
+            "s3://tansu/?routing_node_id=2&members=1@tcp://h1:9092,2@tcp://h2:9092,3@tcp://h3:9092",
+        )?);
+        assert_eq!(Some(2), node);
+        assert_eq!(3, members.len());
+        assert_eq!(Some(&Url::parse("tcp://h2:9092")?), members.get(&2));
+
+        // Malformed members are skipped; absent keys → routing off.
+        let (node, members) =
+            routing_config(&Url::parse("s3://tansu/?members=bad,4@tcp://h4:9092")?);
+        assert_eq!(None, node);
+        assert_eq!(1, members.len());
+        assert!(members.contains_key(&4));
+
+        let (node, members) = routing_config(&Url::parse("s3://tansu/")?);
+        assert_eq!(None, node);
+        assert!(members.is_empty());
         Ok(())
     }
 

@@ -91,11 +91,47 @@ use crate::{
 
 const APPLICATION_JSON: &str = "application/json";
 
+/// Forwards a produce for a prefix this pod does not own to the owner broker
+/// (#70). Storage decides the owner and its address (pure); this performs the
+/// `tansu-client` wire hop — implemented in the binary, which can depend on
+/// `tansu-client` (storage cannot, or it would cycle via
+/// tansu-client → service → auth → storage). Returns the owner's assigned base
+/// offset, or a retriable error so the client retries.
+#[async_trait]
+pub trait PrefixRouter: Debug + Send + Sync {
+    async fn forward(
+        &self,
+        owner: &Url,
+        topition: &Topition,
+        batch: deflated::Batch,
+    ) -> Result<i64>;
+}
+
 #[derive(Clone, Debug)]
 pub struct DynoStore {
     cluster: String,
     node: i32,
     advertised_listener: Url,
+
+    /// This pod's routing identity for prefix-owner forwarding (#70), distinct
+    /// per replica — separate from `node` (which stays 111, the single logical
+    /// broker clients see). `None` disables routing (single-broker / current
+    /// behavior).
+    routing_node_id: Option<i32>,
+
+    /// The broker set for prefix-owner routing (#70): `routing_node_id ->
+    /// internal (pod-to-pod) address`. Empty disables routing. Used only to pick
+    /// and reach a prefix's owner; never advertised to clients.
+    members: BTreeMap<i32, Url>,
+
+    /// Injected forwarder for prefix-owner routing (#70). Storage decides the
+    /// owner (pure), but the network hop to a peer broker uses `tansu-client`,
+    /// which storage cannot depend on (it would cycle via
+    /// tansu-client → service → auth → storage). So the wire-forward is a trait
+    /// object supplied by the binary. `None` = no forwarding (single-broker /
+    /// current behavior).
+    router: Option<Arc<dyn PrefixRouter>>,
+
     schemas: Option<Registry>,
     lake: Option<House>,
     watermarks: Arc<Mutex<BTreeMap<Topition, OptiCon<Watermark>>>>,
@@ -443,6 +479,15 @@ static SEGMENTS_LIVE: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Produce requests forwarded to a prefix's owner (#70) — nonzero is normal on a
+/// multi-replica deployment; it replaces the fenced-flush error storm.
+static FORWARDED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_produce_forwarded")
+        .with_description("produce requests forwarded to the prefix owner")
+        .build()
+});
+
 /// Prefix leases acquired or renewed (#59).
 static LEASE_ACQUIRES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
@@ -460,17 +505,14 @@ static LEASE_FENCED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
-/// Deterministic owner node for a connector prefix (#59): rendezvous
+/// Deterministic owner node for a connector prefix (#59/#70): rendezvous
 /// (highest-random-weight) hashing over the broker set — a pure function with no
 /// shared state, so every broker computes the same owner, and adding/removing a
-/// broker moves only ~1/N of prefixes. A multi-broker deployment routes a
-/// prefix's produce to this node to avoid lease contention; the lease
-/// (`acquire_or_renew_lease`) is the actual single-writer *guarantee*, so
-/// assignment is an optimization, not the fence. This single-node broker
-/// (node 111) trivially owns every prefix, so the routing layer that would
-/// consult this is out of scope here. Orthogonal to consumer-group coordination
-/// (still node 111). `None` iff `nodes` is empty.
-#[allow(dead_code)]
+/// broker moves only ~1/N of prefixes. The prefix-owner routing (#70) consults
+/// this to forward produce to the owner; the lease (`acquire_or_renew_lease`) is
+/// the actual single-writer *guarantee*, so assignment is a routing optimization,
+/// not the fence. Orthogonal to consumer-group coordination (still node 111).
+/// `None` iff `nodes` is empty.
 fn prefix_owner_node(prefix: &str, nodes: &[i32]) -> Option<i32> {
     fn weight(prefix: &str, node: i32) -> u64 {
         // FNV-1a over the prefix bytes then the node, mixing both so the winner
@@ -872,6 +914,9 @@ impl DynoStore {
             cluster: cluster.into(),
             node,
             advertised_listener: Url::parse("tcp://127.0.0.1/").unwrap(),
+            routing_node_id: None,
+            members: BTreeMap::new(),
+            router: None,
             schemas: None,
 
             lake: None,
@@ -923,6 +968,78 @@ impl DynoStore {
             advertised_listener,
             ..self
         }
+    }
+
+    /// Configure prefix-owner routing (#70): this pod's `routing_node_id` and the
+    /// broker set (`routing_node_id -> internal address`). With a non-empty set,
+    /// produce for a prefix is handled by its deterministic owner — a non-owner
+    /// forwards to the owner instead of being fenced. Empty (the default)
+    /// disables routing.
+    pub fn routing(self, routing_node_id: Option<i32>, members: BTreeMap<i32, Url>) -> Self {
+        Self {
+            routing_node_id,
+            members,
+            ..self
+        }
+    }
+
+    /// The deterministic owner of `prefix` within the routing broker set (#70),
+    /// or `None` when routing is disabled (no members). Pure — the same across
+    /// every replica, so all agree who buffers a prefix.
+    fn prefix_owner(&self, prefix: &str) -> Option<i32> {
+        if self.members.is_empty() {
+            return None;
+        }
+        let nodes: Vec<i32> = self.members.keys().copied().collect();
+        prefix_owner_node(prefix, &nodes)
+    }
+
+    /// Whether this pod owns `prefix` (or routing is off, in which case every
+    /// pod handles its own produce as before).
+    fn owns_prefix(&self, prefix: &str) -> bool {
+        match (self.prefix_owner(prefix), self.routing_node_id) {
+            (Some(owner), Some(me)) => owner == me,
+            _ => true,
+        }
+    }
+
+    /// Route a coalesce-eligible batch for a prefix this pod does NOT own to its
+    /// owner (#70) and relay the assigned offset. Storage decides the owner
+    /// (pure `prefix_owner_node`) and looks up its internal address; the actual
+    /// wire-forward is delegated to the injected [`PrefixRouter`] (a `tansu-client`
+    /// hop, kept out of storage to avoid the dependency cycle). A missing router
+    /// or unknown owner yields a retriable error so the client retries; the epoch
+    /// lease stays the authoritative fence.
+    async fn route_produce(
+        &self,
+        prefix: &str,
+        topition: &Topition,
+        deflated: deflated::Batch,
+    ) -> Result<i64> {
+        let Some(owner) = self.prefix_owner(prefix) else {
+            return Err(Error::Api(ErrorCode::NotLeaderOrFollower));
+        };
+        let Some(address) = self.members.get(&owner) else {
+            error!(prefix, owner, "prefix owner not in the member set");
+            return Err(Error::Api(ErrorCode::NotLeaderOrFollower));
+        };
+        let Some(router) = self.router.as_ref() else {
+            error!(
+                prefix,
+                owner, "routing configured but no PrefixRouter injected"
+            );
+            return Err(Error::Api(ErrorCode::NotLeaderOrFollower));
+        };
+
+        let offset = router.forward(address, topition, deflated).await?;
+        FORWARDED.add(1, &[]);
+        Ok(offset)
+    }
+
+    /// Inject the prefix-owner forwarder (#70). Supplied by the binary (which can
+    /// depend on `tansu-client`); `None` leaves forwarding disabled.
+    pub fn prefix_router(self, router: Option<Arc<dyn PrefixRouter>>) -> Self {
+        Self { router, ..self }
     }
 
     pub fn schemas(self, schemas: Option<Registry>) -> Self {
@@ -5002,6 +5119,40 @@ impl Storage for DynoStore {
 
             Ok(offset)
         } else {
+            // Prefix-owner routing (#70): forward a coalesce-eligible batch to the
+            // prefix's deterministic owner BEFORE any local idempotent-sequence
+            // validation or offset assignment, so ONLY the owner validates and
+            // advances the durable producer sequence (two brokers validating would
+            // double-advance it and break idempotent dedup). Owned prefixes — and
+            // routing-disabled deployments — fall through to local handling.
+            if self.prefix_coalesce {
+                let attributes = BatchAttribute::try_from(deflated.attributes)
+                    .inspect_err(|err| debug!(?err))?;
+                let compacted =
+                    config
+                        .configs
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|config| {
+                            config.name == "cleanup.policy"
+                                && config
+                                    .value
+                                    .as_deref()
+                                    .is_some_and(|value| value.contains("compact"))
+                        });
+                let eligible = transaction_id.is_none()
+                    && !attributes.transaction
+                    && !attributes.control
+                    && !compacted;
+                if eligible {
+                    let prefix = self.prefix_of(topition);
+                    if !self.owns_prefix(&prefix) {
+                        return self.route_produce(&prefix, topition, deflated).await;
+                    }
+                }
+            }
+
             if deflated.is_idempotent() {
                 // Validate (and advance) the idempotent sequence on the producer's
                 // own `producers/{id}.json` object rather than the cluster-global

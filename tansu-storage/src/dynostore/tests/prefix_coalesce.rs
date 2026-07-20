@@ -1167,6 +1167,42 @@ async fn retention_forever_keeps_segments() -> Result<(), Error> {
     Ok(())
 }
 
+/// Prefix-owner routing decision (#70): every replica agrees on one owner per
+/// prefix, exactly one owns it, and routing-off means every node owns its own.
+#[tokio::test]
+async fn prefix_owner_routing_decision() -> Result<(), Error> {
+    let members: std::collections::BTreeMap<i32, url::Url> = [1, 2, 3]
+        .into_iter()
+        .map(|n| (n, url::Url::parse(&format!("tcp://n{n}:9092")).unwrap()))
+        .collect();
+    let store = |me: i32| {
+        DynoStore::new(CLUSTER, NODE, InMemory::new())
+            .prefix_coalesce(true)
+            .routing(Some(me), members.clone())
+    };
+
+    let prefix = "org.env.conn";
+    let owner = store(1).prefix_owner(prefix).expect("an owner");
+    assert!([1, 2, 3].contains(&owner));
+
+    // Deterministic across replicas.
+    assert_eq!(Some(owner), store(2).prefix_owner(prefix));
+
+    // Exactly one node owns the prefix.
+    let owns: Vec<i32> = [1, 2, 3]
+        .into_iter()
+        .filter(|me| store(*me).owns_prefix(prefix))
+        .collect();
+    assert_eq!(vec![owner], owns);
+
+    // Routing off (no members): every node owns its own produce (current behavior).
+    let off = DynoStore::new(CLUSTER, NODE, InMemory::new()).prefix_coalesce(true);
+    assert!(off.owns_prefix(prefix));
+    assert_eq!(None, off.prefix_owner(prefix));
+
+    Ok(())
+}
+
 /// `prefix_owner_node` is a deterministic, order-independent pure assignment and
 /// removing a non-owner leaves the owner unchanged (rendezvous-hash stability).
 #[test]
