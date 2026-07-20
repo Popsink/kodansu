@@ -19,10 +19,7 @@
 //! [`tansu_storage::PrefixRouter`] implementation, injected into the storage
 //! builder by the broker binary.
 
-use std::{
-    collections::HashMap,
-    sync::Mutex,
-};
+use std::{collections::HashMap, sync::Mutex};
 
 use async_trait::async_trait;
 use tansu_client::{Client, ConnectionManager, Pool};
@@ -110,20 +107,23 @@ impl PrefixRouter for ClientRouter {
                     ])),
             ]));
 
-        let response = Client::new(pool)
-            .call(request)
-            .await
-            .map_err(|err| {
-                error!(?err, %owner, "forward to prefix owner failed");
-                Error::Api(ErrorCode::NotLeaderOrFollower)
-            })?;
+        let response = Client::new(pool).call(request).await.map_err(|err| {
+            error!(?err, %owner, "forward to prefix owner failed");
+            Error::Api(ErrorCode::NotLeaderOrFollower)
+        })?;
 
         let partition = response
             .responses
             .as_deref()
             .unwrap_or_default()
             .first()
-            .and_then(|topic| topic.partition_responses.as_deref().unwrap_or_default().first())
+            .and_then(|topic| {
+                topic
+                    .partition_responses
+                    .as_deref()
+                    .unwrap_or_default()
+                    .first()
+            })
             .cloned();
 
         match partition {
