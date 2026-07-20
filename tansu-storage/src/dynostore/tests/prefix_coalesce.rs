@@ -527,11 +527,14 @@ async fn list_offsets_latest_timestamp_from_footer() -> Result<(), Error> {
 }
 
 /// Retention (#71): a pure-segment partition has an empty legacy `records/`
-/// prefix, so the maintainer must not re-LIST it every tick. After the first
-/// scan finds nothing it records a skip sentinel; a later legacy write clears it
-/// so retention re-scans the newly-written legacy object.
+/// prefix, so the maintainer must not re-LIST it every tick. The real scan path
+/// (`expire_partition`) records a time-bounded skip; subsequent ticks skip it;
+/// the skip self-heals once its TTL lapses so a legacy object written afterwards
+/// (possibly by another process) is still scanned and expired.
 #[tokio::test]
 async fn pure_segment_partition_retention_skips_rescan() -> Result<(), Error> {
+    use std::time::{Duration, SystemTime};
+
     let bucket = InMemory::new();
     let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
     let topic = "org.env.conn.tab_a";
@@ -544,28 +547,34 @@ async fn pure_segment_partition_retention_skips_rescan() -> Result<(), Error> {
     // A threshold far in the future would expire anything present.
     let threshold = now_ms() + 1_000_000;
 
-    // Cold: no hint yet, so the partition must be scanned once.
+    // Cold: no skip recorded yet, so the partition must be scanned once.
     assert!(
         store.partition_maybe_expirable(&a, threshold)?,
         "cold partition must be scanned",
     );
 
-    // The scan finds an empty `records/`; under prefix coalescing it records the
-    // far-future skip sentinel instead of dropping the hint.
+    // The real maintenance scan finds an empty `records/`; under prefix
+    // coalescing it records the time-bounded skip (not a permanent sentinel).
     _ = store.expire_partition(&a, threshold).await?;
 
-    // Subsequent maintenance ticks skip the empty per-topic LIST.
+    // Subsequent maintenance ticks within the TTL skip the empty per-topic LIST.
     assert!(
         !store.partition_maybe_expirable(&a, threshold)?,
-        "pure-segment partition must be skipped on the next tick",
+        "pure-segment partition must be skipped while the skip is fresh",
     );
 
-    // A later legacy write (txn/control/compacted/backfill) clears the sentinel,
-    // so retention re-scans and can expire the new legacy object.
-    store.note_legacy_records_write(&a)?;
+    // Simulate the TTL lapsing (backdate the recorded instant beyond the TTL):
+    // the skip self-heals so retention scans the partition again — which is how a
+    // legacy object written meanwhile (even by another process that never touched
+    // this in-memory map) is eventually expired.
+    {
+        let mut skip = store.retention_empty_skip.lock().expect("skip lock");
+        let stale = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+        _ = skip.insert(a.clone(), stale);
+    }
     assert!(
         store.partition_maybe_expirable(&a, threshold)?,
-        "a legacy write must re-arm the retention scan",
+        "a lapsed skip must re-arm the retention scan (self-heal)",
     );
 
     Ok(())
