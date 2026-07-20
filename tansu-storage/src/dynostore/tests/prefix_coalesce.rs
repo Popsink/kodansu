@@ -143,6 +143,7 @@ fn entry(topic: &str, base: i64, count: i64) -> SubstreamEntry {
         byte_start: 0,
         byte_len: 8,
         max_timestamp: 0,
+        producers: Vec::new(),
     }
 }
 
@@ -948,6 +949,7 @@ async fn stale_index_entry_reads_via_merged() -> Result<(), Error> {
         0,
         SegmentFooter {
             writer_epoch: 1,
+            nonce: 0,
             entries: vec![entry(topic, 0, 2)],
         },
         0,
@@ -1099,9 +1101,11 @@ async fn epoch_fencing_drops_stale_overlapping_segment() -> Result<(), Error> {
         byte_start: 0,
         byte_len: 8,
         max_timestamp: 0,
+        producers: Vec::new(),
     };
     let footer = |epoch: i64, base: i64, count: i64| SegmentFooter {
         writer_epoch: epoch,
+        nonce: 0,
         entries: vec![entry(base, count)],
     };
 

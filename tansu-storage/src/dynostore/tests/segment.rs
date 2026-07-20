@@ -26,7 +26,10 @@ use tansu_sans_io::record::{Record, deflated, inflated};
 
 use crate::{
     Error, Result, Topition,
-    dynostore::{DynoStore, SEGMENT_TRAILER_LEN},
+    dynostore::{
+        DynoStore, ProducerCoord, SEGMENT_FORMAT_VERSION_V2, SEGMENT_MAGIC, SEGMENT_TRAILER_LEN,
+        SegmentFooter, SubstreamEntry,
+    },
 };
 
 const CLUSTER: &str = "tansu";
@@ -172,5 +175,75 @@ async fn tail_shorter_than_trailer_is_not_a_segment() -> Result<(), Error> {
     let store = store();
     let tiny = Bytes::from(vec![0u8; SEGMENT_TRAILER_LEN - 1]);
     assert!(store.decode_segment_footer(&tiny)?.is_none());
+    Ok(())
+}
+
+/// A v2 footer (per-flush nonce + per-batch producer coordinates, #87) round-trips
+/// through `encode_footer` / `decode_segment_footer`, and the reader accepts
+/// version 2 alongside version 1. (The writer still emits v1 until the leaseless
+/// cutover; this pins the format so v2 segments are readable once it flips.)
+#[test]
+fn footer_v2_round_trips_producer_coords_and_nonce() -> Result<(), Error> {
+    let store = store();
+
+    let footer = SegmentFooter {
+        writer_epoch: 9,
+        nonce: 0x0123_4567_89ab_cdef,
+        entries: vec![
+            // An idempotent sub-stream: two batches → two producer coordinates,
+            // in region (offset) order.
+            SubstreamEntry {
+                topic: "org.env.conn.tab_a".into(),
+                partition: 0,
+                base_offset: 100,
+                record_count: 5,
+                byte_start: 0,
+                byte_len: 42,
+                max_timestamp: 1_700_000_000_000,
+                producers: vec![
+                    ProducerCoord {
+                        producer_id: 7,
+                        producer_epoch: 3,
+                        base_sequence: 0,
+                        last_sequence: 2,
+                        offset_delta: 0,
+                    },
+                    ProducerCoord {
+                        producer_id: 7,
+                        producer_epoch: 3,
+                        base_sequence: 3,
+                        last_sequence: 4,
+                        offset_delta: 3,
+                    },
+                ],
+            },
+            // A non-idempotent sub-stream carries no producer coordinates.
+            SubstreamEntry {
+                topic: "org.env.conn.tab_b".into(),
+                partition: 1,
+                base_offset: 0,
+                record_count: 2,
+                byte_start: 42,
+                byte_len: 10,
+                max_timestamp: 1_700_000_000_500,
+                producers: vec![],
+            },
+        ],
+    };
+
+    // Assemble a v2 segment tail: the encoded footer followed by the fixed
+    // trailer (footer_len u64 + entry_count u32 + version u16 + magic u32).
+    let footer_bytes = DynoStore::encode_footer(&footer, SEGMENT_FORMAT_VERSION_V2);
+    let mut tail = footer_bytes.clone();
+    tail.extend_from_slice(&(footer_bytes.len() as u64).to_be_bytes());
+    tail.extend_from_slice(&(footer.entries.len() as u32).to_be_bytes());
+    tail.extend_from_slice(&SEGMENT_FORMAT_VERSION_V2.to_be_bytes());
+    tail.extend_from_slice(&SEGMENT_MAGIC.to_be_bytes());
+
+    let decoded = store
+        .decode_segment_footer(&tail)?
+        .expect("v2 footer must decode");
+    assert_eq!(footer, decoded);
+
     Ok(())
 }
