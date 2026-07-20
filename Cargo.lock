@@ -8400,6 +8400,7 @@ dependencies = [
  "serde_json",
  "slatedb",
  "tansu-auth",
+ "tansu-client",
  "tansu-model",
  "tansu-sans-io",
  "tansu-schema",

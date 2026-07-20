@@ -679,6 +679,11 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             .storage(self.storage.clone())
             .cancellation(self.cancellation.clone())
             .silent(self.silent)
+            // Prefix-owner produce forwarding (#70): inert unless the storage URL
+            // configures routing (routing_node_id + members); then a non-owner
+            // replica forwards a coalesced produce to the owner instead of being
+            // fenced.
+            .prefix_router(Some(Arc::new(crate::routing::ClientRouter::new())))
             .build()
             .await
             .map(|storage| Arc::new(storage) as ArcDynStorage)?;

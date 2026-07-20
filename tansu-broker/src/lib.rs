@@ -40,6 +40,7 @@ use url::Url;
 pub mod broker;
 pub mod coordinator;
 pub mod otel;
+pub mod routing;
 pub mod service;
 
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

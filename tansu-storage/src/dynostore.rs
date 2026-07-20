@@ -84,28 +84,12 @@ mod tests;
 
 use crate::{
     AutoTopicCreate, BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, PrefixRouter,
+    ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
     TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
 };
 
 const APPLICATION_JSON: &str = "application/json";
-
-/// Forwards a produce for a prefix this pod does not own to the owner broker
-/// (#70). Storage decides the owner and its address (pure); this performs the
-/// `tansu-client` wire hop — implemented in the binary, which can depend on
-/// `tansu-client` (storage cannot, or it would cycle via
-/// tansu-client → service → auth → storage). Returns the owner's assigned base
-/// offset, or a retriable error so the client retries.
-#[async_trait]
-pub trait PrefixRouter: Debug + Send + Sync {
-    async fn forward(
-        &self,
-        owner: &Url,
-        topition: &Topition,
-        batch: deflated::Batch,
-    ) -> Result<i64>;
-}
 
 #[derive(Clone, Debug)]
 pub struct DynoStore {

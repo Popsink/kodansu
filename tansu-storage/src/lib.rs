@@ -118,8 +118,6 @@ use console::Emoji;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use deadpool::managed::PoolError;
 #[cfg(feature = "dynostore")]
-pub use dynostore::PrefixRouter;
-#[cfg(feature = "dynostore")]
 use dynostore::{CoalesceTuning, DynoStore};
 
 use glob::{GlobError, PatternError};
@@ -205,6 +203,26 @@ use tracing::warn;
 
 #[cfg(feature = "dynostore")]
 mod dynostore;
+
+/// Forwards a produce for a prefix this pod does not own to the owner broker
+/// (#70). Storage decides the owner and its address (pure); this performs the
+/// `tansu-client` wire hop — implemented in the binary, which can depend on
+/// `tansu-client` (storage cannot, or it would cycle via
+/// tansu-client → service → auth → storage). Returns the owner's assigned base
+/// offset, or a retriable error so the client retries.
+///
+/// Defined here (not in the `dynostore` module) so the storage `Builder` can
+/// carry it regardless of feature flags; only the object-store backends
+/// actually route.
+#[async_trait]
+pub trait PrefixRouter: Debug + Send + Sync {
+    async fn forward(
+        &self,
+        owner: &Url,
+        topition: &Topition,
+        batch: deflated::Batch,
+    ) -> Result<i64>;
+}
 
 #[cfg(feature = "postgres")]
 mod pg;
@@ -2223,6 +2241,10 @@ pub struct Builder<N, C, A, S> {
     silent: bool,
 
     cancellation: CancellationToken,
+
+    /// Prefix-owner forwarder (#70), injected by the binary; threaded into the
+    /// dynostore backend. `None` = routing off.
+    prefix_router: Option<Arc<dyn PrefixRouter>>,
 }
 
 type PhantomBuilder =
@@ -2239,6 +2261,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             lake_house: self.lake_house,
             silent: self.silent,
             cancellation: self.cancellation,
+            prefix_router: self.prefix_router,
         }
     }
 
@@ -2252,6 +2275,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             lake_house: self.lake_house,
             silent: self.silent,
             cancellation: self.cancellation,
+            prefix_router: self.prefix_router,
         }
     }
 
@@ -2265,6 +2289,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             lake_house: self.lake_house,
             silent: self.silent,
             cancellation: self.cancellation,
+            prefix_router: self.prefix_router,
         }
     }
 
@@ -2280,6 +2305,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             lake_house: self.lake_house,
             silent: self.silent,
             cancellation: self.cancellation,
+            prefix_router: self.prefix_router,
         }
     }
 
@@ -2311,6 +2337,16 @@ impl<N, C, A, S> Builder<N, C, A, S> {
 
     pub fn silent(self, silent: bool) -> Self {
         Self { silent, ..self }
+    }
+
+    /// Inject the prefix-owner forwarder (#70). The binary supplies a
+    /// `tansu-client`-backed implementation; storage cannot build one itself
+    /// (dependency cycle), so it is passed in here.
+    pub fn prefix_router(self, prefix_router: Option<Arc<dyn PrefixRouter>>) -> Self {
+        Self {
+            prefix_router,
+            ..self
+        }
     }
 }
 
@@ -2580,6 +2616,7 @@ impl Builder<i32, String, Url, Url> {
                             .produce_coalesce(produce_coalesce)
                             .prefix_coalesce(prefix_coalesce)
                             .routing(routing_node_id, members)
+                            .prefix_router(self.prefix_router.clone())
                             .coalesce_tuning(coalesce_tuning(&self.storage))
                     })
                     .map(|storage| {
@@ -2673,6 +2710,7 @@ impl Builder<i32, String, Url, Url> {
                             .produce_coalesce(produce_coalesce)
                             .prefix_coalesce(prefix_coalesce)
                             .routing(routing_node_id, members)
+                            .prefix_router(self.prefix_router.clone())
                             .coalesce_tuning(coalesce_tuning(&self.storage))
                     })
                     .map(|storage| {
@@ -2700,6 +2738,7 @@ impl Builder<i32, String, Url, Url> {
                         routing_config(&self.storage).0,
                         routing_config(&self.storage).1,
                     )
+                    .prefix_router(self.prefix_router.clone())
                     .coalesce_tuning(coalesce_tuning(&self.storage)),
             )
             .map(|storage| Box::new(storage) as Box<dyn Storage>)

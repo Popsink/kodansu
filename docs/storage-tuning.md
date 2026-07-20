@@ -160,12 +160,31 @@ stay readable until retention drains them. A fetch spanning the cutover stitches
 the legacy region and the segment region into one continuous offset sequence.
 Default off is byte-for-byte the current behaviour.
 
-**Single-broker for now.** Single-writer-per-prefix is enforced by the S3 lease,
-but the produce-routing layer that would send a fenced writer's retry to the
-owning broker (`consistent_hash(prefix) → broker`) is not yet implemented. Until
-it is, enable `prefix_coalesce` only on single-broker deployments (Tansu's
-default node model); on multiple brokers a producer landing on a non-owner would
-be fenced persistently.
+**Multi-broker: prefix-owner routing (#70).** Single-writer-per-prefix is
+enforced by the S3 lease, so on multiple replicas a producer landing on a
+non-owner would otherwise be fenced persistently (a `NotLeaderOrFollower`
+storm). To run `prefix_coalesce` across replicas, enable prefix-owner routing:
+each replica hashes the prefix to a deterministic owner
+(`prefix_owner_node`, rendezvous/HRW over the member set) and a non-owner
+**forwards** the coalesced produce to the owner over the internal broker port
+instead of trying to acquire the lease itself. Configure two extra storage-URL
+params, per replica:
+
+| Param | Meaning |
+|-------|---------|
+| `routing_node_id` | This replica's routing identity (an integer, distinct per pod). Omit to disable routing (single-broker; current behaviour). |
+| `members` | The full broker set as `id@internal-addr` pairs, comma-separated, e.g. `members=0@tansu-0.tansu:9092,1@tansu-1.tansu:9092,2@tansu-2.tansu:9092`. Malformed entries are skipped with a warning. |
+
+Routing is inert unless **both** are set and `members` is non-empty; a
+single-broker deployment leaves them off and behaves exactly as before. The
+`routing_node_id` is a routing identity only — it is orthogonal to the logical
+`NODE_ID` (still 111) that clients see, so metadata/advertised-listener
+behaviour is unchanged.
+
+Deployment: run the brokers as a StatefulSet behind a headless Service so each
+pod has a stable ordinal and DNS name; template `routing_node_id` from the pod
+ordinal and list every pod's internal address in `members`. The addresses in
+`members` are pod-to-pod (internal) and are never advertised to clients.
 
 **External S3-direct readers** must understand the segment frame + footer to read
 a coalesced prefix; the format is the published contract (see
@@ -192,3 +211,12 @@ s3://my-bucket/?produce_coalesce=true&coalesce_linger=300ms&coalesce_batches=128
 
 Coalesces produce with a 300 ms linger (or 128 batches / 4 MiB, whichever comes
 first) and checkpoints idempotent producers at most every 5 s.
+
+Multi-broker (replica 1 of a 3-pod StatefulSet), adding prefix-owner routing
+(#70):
+
+```
+s3://my-bucket/?produce_coalesce=true&coalesce_linger=300ms&routing_node_id=1&members=0@tansu-0.tansu:9092,1@tansu-1.tansu:9092,2@tansu-2.tansu:9092
+```
+
+Each pod uses the same URL except for its own `routing_node_id`.
