@@ -18,7 +18,10 @@ use std::{
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fmt::{Debug, Display},
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{self, AtomicU64},
+    },
     time::SystemTime,
 };
 
@@ -30,8 +33,8 @@ use futures::{
 };
 use metadata::Cache;
 use object_store::{
-    Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetResult,
-    ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode,
+    Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetRange,
+    GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, UpdateVersion, path::Path,
 };
 use opentelemetry::{
@@ -174,6 +177,13 @@ pub struct DynoStore {
     /// after a restart, and independent per maintain node.
     oldest_retained: Arc<Mutex<BTreeMap<Topition, i64>>>,
 
+    /// Per-*prefix* analogue of [`Self::oldest_retained`] for whole-segment
+    /// retention (#61): the oldest surviving segment's age (ms) observed at the
+    /// last scan, letting the maintenance loop skip the `segments/` LIST of a
+    /// prefix whose oldest segment is still within retention. Same lower-bound
+    /// soundness as the per-partition hint. In-memory only.
+    oldest_retained_prefix: Arc<Mutex<BTreeMap<String, i64>>>,
+
     /// When set, the produce path buffers batches per partition and flushes them
     /// as one coalesced `records/` object per linger window (#50), cutting the
     /// PUT (and matching fetch GET) count on small-batch workloads. Off by
@@ -186,6 +196,75 @@ pub struct DynoStore {
     /// one-shot ack channels their produce calls are parked on; the map is
     /// drained (never held across an await) on a threshold or linger-timer flush.
     coalesce: Arc<Mutex<BTreeMap<Topition, CoalesceBuffer>>>,
+
+    /// When set, eligible batches are coalesced per *connector prefix* rather
+    /// than per `(topic, partition)`: one shared, immutable segment object holds
+    /// interleaved batches from every topition under the prefix produced in one
+    /// flush window (the #56 "virtual topics" write path, #57). This collapses
+    /// PUTs from ~`(topics × flushes)` to ~`(connectors × flushes)`. Off by
+    /// default; takes precedence over [`Self::produce_coalesce`] for eligible
+    /// batches when both are set. The URL flag that drives it is wired by #63.
+    prefix_coalesce: bool,
+
+    /// Per-prefix coalescing buffer (#57), used only when
+    /// [`Self::prefix_coalesce`] is set. Like [`Self::coalesce`] but keyed by
+    /// prefix, so one buffer accumulates `PrefixPending` batches across many
+    /// topitions; drained (never held across an await) on a threshold or linger
+    /// flush into one create-only segment object.
+    prefix_coalesce_buffers: Arc<Mutex<BTreeMap<String, PrefixCoalesceBuffer>>>,
+
+    /// Per-prefix next segment sequence hint (#57). The segment object name
+    /// `prefixes/{prefix}/segments/{seq:020}.seg` is monotonic and create-only,
+    /// so — exactly as the `{offset}.batch` name is the offset authority for the
+    /// legacy layout — the segment sequence is the ordering authority for the
+    /// coalesced layout. A `Create` conflict resyncs the hint from the tail of
+    /// the segment listing (single-writer per prefix, #59, makes conflicts a
+    /// failover edge case rather than the steady state).
+    segment_seqs: Arc<Mutex<BTreeMap<String, u64>>>,
+
+    /// Per-prefix async flush lock: serializes `flush_prefix_coalesced` for a
+    /// given prefix so a window's `cached_high` read → segment PUT → `set_high`
+    /// is atomic. Without it two overlapping flushes (a threshold flush and a
+    /// linger-timer flush) could both read the same base offset before either
+    /// advanced the hint, writing two segments at the same offsets. The segment
+    /// `Create` only guards the *sequence* name, not offsets, so this lock — not
+    /// the create-race — is the per-prefix offset authority.
+    prefix_flush_locks: Arc<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+
+    /// Per-prefix in-memory segment-footer index (read-path #60 review fix). See
+    /// [`PrefixIndex`]: caches immutable footers so fetch/high-watermark/earliest/
+    /// retention resolve without a per-call `segments/` LIST or per-segment footer
+    /// GET.
+    prefix_index: Arc<Mutex<BTreeMap<String, PrefixIndex>>>,
+
+    /// Per-prefix single-writer leases this process currently holds (#59). The
+    /// durable side is `prefixes/{prefix}/lease.json`; this caches the held
+    /// epoch, its etag (for the next CAS) and its expiry (the no-write fast
+    /// path). Consulted before every prefix flush to fence a stale writer.
+    prefix_leases: Arc<Mutex<BTreeMap<String, HeldLease>>>,
+
+    /// Whether a topition still has legacy `records/` objects, cached (with the
+    /// check time) to keep the prefix-coalesced read path off a per-fetch
+    /// `records/` LIST (#60). A topic flipped to segment mode mid-life is a
+    /// *hybrid*: `[0, C)` legacy objects, `[C, ∞)` segments; its fetch must serve
+    /// both. A greenfield prefix has no legacy objects and must not pay that
+    /// LIST. Re-checked at most once per [`Self::HIGH_WATERMARK_HINT_TTL`] so a
+    /// `true` flips to `false` once retention drains the legacy region, and a
+    /// `false` flips back if a txn/control batch (which always takes the legacy
+    /// path) re-creates one — otherwise served from memory (no per-fetch LIST).
+    legacy_records_present: Arc<Mutex<BTreeMap<Topition, (bool, SystemTime)>>>,
+
+    /// This writer's identity, recorded in the lease `holder` field (#59) for
+    /// observability. Unique per process instance so two brokers (or two test
+    /// stores) are distinguishable.
+    writer_id: String,
+
+    /// Prefix-lease term length (#59). A held lease is reused without a write
+    /// while more than a third of the term remains, so renewal happens ~once per
+    /// `2/3 · ttl` — kept well above GCS's ~1/s/object mutation cap (#13) and
+    /// never tied to the flush cadence. Defaults to [`Self::PREFIX_LEASE_TTL`];
+    /// lowered in tests to exercise failover.
+    prefix_lease_ttl: Duration,
 
     /// Runtime coalescing (#50) / producer-checkpoint (#48) flush thresholds
     /// (#54). Each is seeded from its compile-time default
@@ -220,6 +299,82 @@ struct CoalesceBuffer {
     bytes: usize,
 }
 
+/// A batch parked in the prefix coalescing buffer (#57), carrying the topition
+/// it belongs to (a prefix buffer multiplexes many) alongside the one-shot the
+/// producing `produce` call awaits its assigned offset on.
+#[derive(Debug)]
+struct PrefixPending {
+    topition: Topition,
+    batch: deflated::Batch,
+    ack: oneshot::Sender<Result<i64>>,
+}
+
+/// Per-prefix accumulator for prefix-coalesced produce (#57): batches from every
+/// topition under the prefix awaiting a flush, plus the running record and byte
+/// counts used for the flush triggers. Flushed as one shared segment object.
+#[derive(Debug, Default)]
+struct PrefixCoalesceBuffer {
+    pending: Vec<PrefixPending>,
+    records: i64,
+    bytes: usize,
+}
+
+/// The durable per-prefix single-writer lease (#59), stored at
+/// `clusters/{cluster}/prefixes/{prefix}/lease.json`. Its etag is the fence: a
+/// writer takes/renews the lease with a conditional PUT, and a stale holder's
+/// CAS fails `Precondition`, so at most one writer is live per prefix — with no
+/// external coordinator. `epoch` is bumped on every (re)acquire and stamped into
+/// each segment; `expires_at_ms` bounds how long a crashed holder blocks a
+/// takeover. The object is CAS-**mutated**, so renewal stays well under GCS's
+/// ~1/s/object mutation cap (#13): it renews once per lease term, never per
+/// flush.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct PrefixLease {
+    epoch: i64,
+    holder: String,
+    expires_at_ms: i64,
+}
+
+/// In-memory index of a connector prefix's segments (read-path #60 review fix):
+/// segment footers are immutable, so once read they are cached by sequence
+/// forever. Locate (fetch), high-watermark, earliest and retention all resolve
+/// from this cache instead of LISTing `segments/` and GETting every footer on
+/// each call. The writer populates it on flush and prunes it on retention, so on
+/// the (single-node) write path reads cost zero object requests; a reader on a
+/// cold cache (or another broker) refreshes it with a TTL'd **incremental** list
+/// (`start_after` the highest known sequence), fetching only *new* footers — so
+/// steady-state refresh is O(new), not O(total segments). Deleted (expired)
+/// segments are pruned lazily when a data GET 404s.
+#[derive(Clone, Debug)]
+struct CachedSegment {
+    footer: SegmentFooter,
+    /// The segment object's append time (ms), used as the retention age when a
+    /// sub-stream's record timestamps are unset. The writer stamps ~`now` on
+    /// insert; a refresh takes the listing's `last_modified`.
+    last_modified_ms: i64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PrefixIndex {
+    /// `seq -> segment` for every segment known to this process. Immutable
+    /// content, so an entry never needs re-reading.
+    segments: BTreeMap<u64, CachedSegment>,
+    /// When the live segment set was last reconciled by a listing; gates the
+    /// TTL so a hot prefix lists at most once per [`DynoStore::HIGH_WATERMARK_HINT_TTL`].
+    refreshed_at: Option<SystemTime>,
+}
+
+/// A prefix lease this process currently holds (#59): the in-memory side of
+/// [`PrefixLease`]. `version` is the etag the next renewal CASes against;
+/// `expires_at` gates the no-write fast path so a live term is reused without
+/// touching the object.
+#[derive(Clone, Debug)]
+struct HeldLease {
+    epoch: i64,
+    expires_at: SystemTime,
+    version: Option<UpdateVersion>,
+}
+
 /// Debounce accounting for one producer's lazy `producers/{id}.json` checkpoint
 /// (see [`DynoStore::producer_checkpoints`], #48).
 #[derive(Clone, Copy, Debug)]
@@ -241,6 +396,131 @@ pub struct CoalesceTuning {
     pub coalesce_bytes: Option<usize>,
     pub producer_checkpoint_interval: Option<Duration>,
     pub producer_checkpoint_batches: Option<u64>,
+}
+
+/// Process-wide counter making each [`DynoStore`]'s `writer_id` unique (#59), so
+/// two stores in one process (or two brokers) are distinguishable holders in a
+/// prefix lease.
+static WRITER_INSTANCE: AtomicU64 = AtomicU64::new(0);
+
+/// Segments written (one create-only PUT per flush window per prefix, #57).
+static SEGMENT_FLUSHES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_segment_flushes")
+        .with_description("prefix-coalesced segment objects written")
+        .build()
+});
+
+/// Prefix leases acquired or renewed (#59).
+static LEASE_ACQUIRES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_lease_acquires")
+        .with_description("prefix single-writer lease acquisitions/renewals")
+        .build()
+});
+
+/// Times this writer was fenced off a prefix lease (#59) — a nonzero rate means
+/// contention/failover, so it is worth alerting on.
+static LEASE_FENCED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_lease_fenced")
+        .with_description("prefix lease acquisitions lost to another writer (fenced)")
+        .build()
+});
+
+/// Deterministic owner node for a connector prefix (#59): rendezvous
+/// (highest-random-weight) hashing over the broker set — a pure function with no
+/// shared state, so every broker computes the same owner, and adding/removing a
+/// broker moves only ~1/N of prefixes. A multi-broker deployment routes a
+/// prefix's produce to this node to avoid lease contention; the lease
+/// (`acquire_or_renew_lease`) is the actual single-writer *guarantee*, so
+/// assignment is an optimization, not the fence. This single-node broker
+/// (node 111) trivially owns every prefix, so the routing layer that would
+/// consult this is out of scope here. Orthogonal to consumer-group coordination
+/// (still node 111). `None` iff `nodes` is empty.
+#[allow(dead_code)]
+fn prefix_owner_node(prefix: &str, nodes: &[i32]) -> Option<i32> {
+    fn weight(prefix: &str, node: i32) -> u64 {
+        // FNV-1a over the prefix bytes then the node, mixing both so the winner
+        // is stable per (prefix, node-set) and independent of node ordering.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in prefix.as_bytes().iter().chain(node.to_be_bytes().iter()) {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    nodes
+        .iter()
+        .copied()
+        .max_by_key(|node| weight(prefix, *node))
+}
+
+/// Magic trailer word marking a prefix-coalesced multi-topic segment object
+/// (#64), distinguishing a `.seg` from a legacy single-topic coalesced object
+/// (#50), which carries no trailer. ASCII `TSEG`.
+const SEGMENT_MAGIC: u32 = 0x5453_4547;
+
+/// On-disk version of the segment frame + footer format (#64). Version `0` is
+/// the implicit legacy single-topic layout (a bare batch concatenation with no
+/// trailer, produced by #50); `1` is the first self-describing multi-topic
+/// segment. Versioned so future footer fields stay forward-compatible.
+const SEGMENT_FORMAT_VERSION: u16 = 1;
+
+/// Fixed-size trailer at the very end of every multi-topic segment (#64):
+/// `footer_len (u64) + entry_count (u32) + version (u16) + magic (u32)`. A
+/// reader recovers the index with one ranged GET of the last
+/// [`SEGMENT_TRAILER_LEN`] bytes, then a second ranged GET of the `footer_len`
+/// bytes immediately preceding it — never downloading the record body.
+const SEGMENT_TRAILER_LEN: usize =
+    size_of::<u64>() + size_of::<u32>() + size_of::<u16>() + size_of::<u32>();
+
+/// One `(topic, partition)` sub-stream's self-describing entry in a segment
+/// footer (#64): where its batches live in the shared object and what offset
+/// span they cover. This is what the fetch path (#60) and cold-start offset
+/// recovery (#58) read, instead of deriving offsets from the object filename
+/// (the legacy `{offset}.batch` authority).
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SubstreamEntry {
+    topic: String,
+    partition: i32,
+    /// Absolute base offset of this sub-stream's first record in the segment.
+    base_offset: i64,
+    /// Offsets this sub-stream occupies
+    /// (`last_offset == base_offset + record_count - 1`).
+    record_count: i64,
+    /// Byte offset of this sub-stream's contiguous region within the segment.
+    byte_start: u64,
+    /// Byte length of that region (its batches, wire-encoded and concatenated).
+    byte_len: u64,
+    /// Greatest record timestamp in the sub-stream, read by per-prefix
+    /// whole-segment retention (#61) to decide expiry without a body read.
+    max_timestamp: i64,
+}
+
+/// The self-describing footer index of a prefix-coalesced segment (#64): one
+/// [`SubstreamEntry`] per `(topic, partition)` multiplexed into the shared
+/// object, plus the epoch of the writer that produced it (#59). Serialized at
+/// the segment tail ahead of the [`SEGMENT_TRAILER_LEN`] trailer and treated as
+/// the published external-reader contract (kotatsu#82).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SegmentFooter {
+    /// The lease epoch of the writer that produced this segment (#59). `0` when
+    /// prefix leasing is not in effect. Stamped so a stale-epoch segment (from a
+    /// fenced writer) is identifiable on read/recovery.
+    writer_epoch: i64,
+    entries: Vec<SubstreamEntry>,
+}
+
+impl SegmentFooter {
+    /// The entry for a `(topic, partition)` sub-stream, if it is present in this
+    /// segment. `None` means the segment holds no records for that topition.
+    fn get(&self, topic: &str, partition: i32) -> Option<&SubstreamEntry> {
+        self.entries
+            .iter()
+            .find(|entry| entry.topic == topic && entry.partition == partition)
+    }
 }
 
 type Group = String;
@@ -569,8 +849,21 @@ impl DynoStore {
             producers: Arc::new(Mutex::new(BTreeMap::new())),
             producer_checkpoints: Arc::new(Mutex::new(BTreeMap::new())),
             oldest_retained: Arc::new(Mutex::new(BTreeMap::new())),
+            oldest_retained_prefix: Arc::new(Mutex::new(BTreeMap::new())),
             produce_coalesce: false,
             coalesce: Arc::new(Mutex::new(BTreeMap::new())),
+            prefix_coalesce: false,
+            prefix_coalesce_buffers: Arc::new(Mutex::new(BTreeMap::new())),
+            segment_seqs: Arc::new(Mutex::new(BTreeMap::new())),
+            prefix_flush_locks: Arc::new(Mutex::new(BTreeMap::new())),
+            prefix_index: Arc::new(Mutex::new(BTreeMap::new())),
+            prefix_leases: Arc::new(Mutex::new(BTreeMap::new())),
+            legacy_records_present: Arc::new(Mutex::new(BTreeMap::new())),
+            writer_id: format!(
+                "{node}-{}",
+                WRITER_INSTANCE.fetch_add(1, atomic::Ordering::Relaxed)
+            ),
+            prefix_lease_ttl: Self::PREFIX_LEASE_TTL,
             coalesce_linger: Self::COALESCE_LINGER,
             coalesce_batches: Self::COALESCE_BATCHES,
             coalesce_bytes: Self::COALESCE_BYTES,
@@ -616,6 +909,29 @@ impl DynoStore {
     pub fn produce_coalesce(self, produce_coalesce: bool) -> Self {
         Self {
             produce_coalesce,
+            ..self
+        }
+    }
+
+    /// Enable prefix-coalesced "virtual topics" produce (#56/#57): buffer
+    /// eligible batches per connector prefix and flush them as one shared,
+    /// immutable segment object per linger window, collapsing the PUT count from
+    /// ~`(topics × flushes)` to ~`(connectors × flushes)`. Off by default; takes
+    /// precedence over [`Self::produce_coalesce`] for eligible batches. The URL
+    /// flag driving this is wired by #63.
+    pub fn prefix_coalesce(self, prefix_coalesce: bool) -> Self {
+        Self {
+            prefix_coalesce,
+            ..self
+        }
+    }
+
+    /// Override the prefix single-writer lease term (#59). Kept above ~1s in
+    /// production so lease renewal stays under GCS's per-object mutation cap
+    /// (#13); lowered only in tests to exercise failover/fencing quickly.
+    pub fn prefix_lease_ttl(self, prefix_lease_ttl: Duration) -> Self {
+        Self {
+            prefix_lease_ttl,
             ..self
         }
     }
@@ -769,6 +1085,20 @@ impl DynoStore {
     const COALESCE_BATCHES: usize = 64;
     const COALESCE_BYTES: usize = 1 << 20;
     const COALESCE_MAX_RECORDS: i64 = 100_000;
+
+    /// Default prefix-lease term (#59). Renewal happens once ~`2/3 · ttl`
+    /// remains, i.e. every ~7s — well under GCS's ~1/s/object mutation cap (#13)
+    /// — while a crashed holder blocks a takeover for at most one term.
+    const PREFIX_LEASE_TTL: Duration = Duration::from_secs(10);
+
+    /// A batch this large bypasses the prefix segment buffer and takes the legacy
+    /// per-object create path (#62 backfill). CDC steady-state batches fan a
+    /// handful of events per topition (well below this) and coalesce into
+    /// segments; a snapshot's bulk batches are already S3-efficient alone and
+    /// take the parallel create path. Between the two regimes by a wide margin,
+    /// so the exact value only shifts a throughput/PUT tradeoff, never
+    /// correctness.
+    const PREFIX_BACKFILL_MIN_RECORDS: i64 = 1_000;
 
     /// All topics, served from the in-memory [`TopicIndex`]. Returns the shared
     /// snapshot if fresh; otherwise refreshes it (single-flight) by LISTing the
@@ -1371,6 +1701,19 @@ impl DynoStore {
             return Ok(hint.max(from_watermark));
         }
 
+        // Prefix-coalesced (#60): the tail offset lives in the segment footers,
+        // not in a `records/` listing (there is none). Recover it footer-only
+        // (#58) and refresh the hint so the hot path serves from memory next
+        // time. GCS-safe: no per-flush-mutated manifest is read.
+        if self.prefix_coalesce {
+            let recovered = self.recover_substream_next_offset(topition).await?;
+            let high = recovered
+                .max(self.cached_high(topition)?.unwrap_or(0))
+                .max(from_watermark);
+            self.mark_listed(topition, high)?;
+            return Ok(high);
+        }
+
         let cached = self.cached_high(topition)?;
         let was_cold = cached.is_none();
         let floor = cached.unwrap_or(0).max(from_watermark);
@@ -1610,6 +1953,1110 @@ impl DynoStore {
         }
     }
 
+    /// The connector prefix a topition's records coalesce under (#57). Popsink
+    /// topics are `org.env.conn.<schema>.<table>`; the prefix is the connector
+    /// unit `org.env.conn` (the first three dotted components) — the
+    /// tenant/retention/isolation boundary the epic coalesces on. A topic with
+    /// fewer than three components is its own prefix. A configurable
+    /// `prefix_map` override (custom topic-glob → prefix) is not yet implemented;
+    /// tracked as a follow-up. This derivation is the only mapping today.
+    fn prefix_of(&self, topition: &Topition) -> String {
+        let topic = topition.topic();
+        let mut parts = topic.split('.');
+        let mut prefix = String::new();
+
+        for i in 0..3 {
+            match parts.next() {
+                Some(part) => {
+                    if i > 0 {
+                        prefix.push('.');
+                    }
+                    prefix.push_str(part);
+                }
+                None => return topic.to_owned(),
+            }
+        }
+
+        prefix
+    }
+
+    /// The `segments/` listing prefix for a connector prefix (#57).
+    fn segment_prefix(&self, prefix: &str) -> Path {
+        Path::from(format!(
+            "clusters/{}/prefixes/{}/segments/",
+            self.cluster, prefix,
+        ))
+    }
+
+    /// The object name of the `seq`-th segment under a connector prefix (#57).
+    /// The zero-padded sequence makes the name monotonic and, written
+    /// create-only, the ordering authority (as `{offset}.batch` is for #50).
+    fn segment_location(&self, prefix: &str, seq: u64) -> Path {
+        Path::from(format!(
+            "clusters/{}/prefixes/{}/segments/{:0>20}.seg",
+            self.cluster, prefix, seq,
+        ))
+    }
+
+    /// The cached next segment sequence for `prefix`, if known to this process.
+    fn cached_seq(&self, prefix: &str) -> Result<Option<u64>> {
+        self.segment_seqs
+            .lock()
+            .map(|locked| locked.get(prefix).copied())
+            .map_err(Into::into)
+    }
+
+    /// Advance the cached next-segment-sequence hint. Monotonic, like
+    /// [`Self::set_high`]: a sequence is never reused.
+    fn set_seq(&self, prefix: &str, next: u64) -> Result<()> {
+        self.segment_seqs
+            .lock()
+            .map(|mut locked| {
+                let entry = locked.entry(prefix.to_owned()).or_default();
+                *entry = (*entry).max(next);
+            })
+            .map_err(Into::into)
+    }
+
+    /// The next free segment sequence for `prefix`, read from the tail of the
+    /// `segments/` listing (#57). Zero-padded names sort lexicographically by
+    /// sequence, so the greatest listed name is the tail. Used to seed the hint
+    /// cold and to resync after a `Create` conflict.
+    async fn tail_next_seq(&self, prefix: &str) -> Result<u64> {
+        let listing = self.segment_prefix(prefix);
+        let mut list_stream = self.object_store.list(Some(&listing));
+        let mut max: Option<u64> = None;
+
+        while let Some(meta) = list_stream
+            .next()
+            .await
+            .transpose()
+            .inspect_err(|err| error!(?err, prefix))?
+        {
+            let Some(name) = meta.location.parts().next_back() else {
+                continue;
+            };
+
+            let name = name.as_ref();
+            if name.len() < 20 {
+                continue;
+            }
+
+            let Ok(seq) = u64::from_str(&name[0..20]) else {
+                continue;
+            };
+
+            max = Some(max.map_or(seq, |m| m.max(seq)));
+        }
+
+        Ok(max.map_or(0, |m| m + 1))
+    }
+
+    /// Write `payload` as the next create-only segment under `prefix` and return
+    /// its assigned sequence (#57). The create is the authority: a conflicting
+    /// sequence (a racing writer during a #59 failover) resyncs from the tail
+    /// and retries. Single-writer per prefix makes the conflict path an edge
+    /// case, not the steady state.
+    async fn assign_and_create_segment(&self, prefix: &str, payload: PutPayload) -> Result<u64> {
+        /// Bounds the conflict-resync loop; far above any real contention.
+        const MAX_ATTEMPTS: usize = 64;
+
+        let mut candidate = match self.cached_seq(prefix)? {
+            Some(seq) => seq,
+            None => self.tail_next_seq(prefix).await?,
+        };
+
+        for attempt in 0..MAX_ATTEMPTS {
+            match self
+                .object_store
+                .put_opts(
+                    &self.segment_location(prefix, candidate),
+                    payload.clone(),
+                    PutOptions {
+                        mode: PutMode::Create,
+                        attributes: Attributes::new(),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(outcome) => {
+                    debug!(?outcome, candidate, prefix);
+                    self.set_seq(prefix, candidate + 1)?;
+                    return Ok(candidate);
+                }
+
+                Err(object_store::Error::AlreadyExists { .. }) => {
+                    // A seq conflict means another writer wrote this sequence.
+                    // With per-prefix flush serialization (#1) that can only be a
+                    // *different* broker — i.e. a lease takeover. Re-validate the
+                    // lease before resyncing (#59 review fix): if we've been
+                    // fenced, abort now instead of appending the next sequence
+                    // with stale offsets (which would split-brain the log). A
+                    // still-valid holder resyncs and retries.
+                    _ = self.acquire_or_renew_lease(prefix).await?;
+                    debug!(candidate, attempt, prefix, "segment seq taken, resyncing");
+                    candidate = self.tail_next_seq(prefix).await?;
+                }
+
+                Err(err) => return Err(err.into()),
+            }
+        }
+
+        error!(
+            prefix,
+            candidate, "segment sequence assignment exhausted retries"
+        );
+        Err(Error::Api(ErrorCode::UnknownServerError))
+    }
+
+    /// Read a segment's self-describing footer (#58/#64) with at most two ranged
+    /// GETs of the object tail — never the record body: one `Suffix` GET of the
+    /// fixed trailer to learn the footer length, then one `Suffix` GET of the
+    /// footer + trailer. Returns `None` if the object carries no trailer (a
+    /// legacy #50 object). This is the read primitive the fetch path (#60) also
+    /// builds on.
+    async fn read_segment_footer(&self, location: &Path) -> Result<Option<SegmentFooter>> {
+        let trailer = self
+            .object_store
+            .get_opts(
+                location,
+                GetOptions {
+                    range: Some(GetRange::Suffix(SEGMENT_TRAILER_LEN as u64)),
+                    ..Default::default()
+                },
+            )
+            .await?
+            .bytes()
+            .await?;
+
+        if trailer.len() < SEGMENT_TRAILER_LEN {
+            return Ok(None);
+        }
+
+        let magic = u32::from_be_bytes(trailer[14..18].try_into()?);
+        if magic != SEGMENT_MAGIC {
+            return Ok(None);
+        }
+
+        let footer_len = u64::from_be_bytes(trailer[0..8].try_into()?) as usize;
+
+        let tail = self
+            .object_store
+            .get_opts(
+                location,
+                GetOptions {
+                    range: Some(GetRange::Suffix((SEGMENT_TRAILER_LEN + footer_len) as u64)),
+                    ..Default::default()
+                },
+            )
+            .await?
+            .bytes()
+            .await?;
+
+        self.decode_segment_footer(&tail)
+    }
+
+    /// Refresh the in-memory [`PrefixIndex`] for `prefix` (read-path #60 review
+    /// fix). Skips the listing while the cache is fresh (within
+    /// [`Self::HIGH_WATERMARK_HINT_TTL`]); otherwise lists **incrementally**
+    /// (`start_after` the highest known sequence) and reads only the footers of
+    /// *new* segments, so steady-state cost is O(new), not O(total segments).
+    /// Cheap for the writer (its own flushes already populated the cache).
+    async fn refresh_prefix_index(&self, prefix: &str) -> Result<()> {
+        let (fresh, start_after) = {
+            let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            match index.get(prefix) {
+                Some(entry) => {
+                    let fresh = entry.refreshed_at.is_some_and(|at| {
+                        SystemTime::now()
+                            .duration_since(at)
+                            .is_ok_and(|elapsed| elapsed < Self::HIGH_WATERMARK_HINT_TTL)
+                    });
+                    (fresh, entry.segments.keys().next_back().copied())
+                }
+                None => (false, None),
+            }
+        };
+
+        if fresh {
+            return Ok(());
+        }
+
+        let listing = self.segment_prefix(prefix);
+        let mut stream = match start_after {
+            Some(seq) => self
+                .object_store
+                .list_with_offset(Some(&listing), &self.segment_location(prefix, seq)),
+            None => self.object_store.list(Some(&listing)),
+        };
+
+        let mut discovered: Vec<(u64, Path, i64)> = Vec::new();
+        while let Some(meta) = stream
+            .next()
+            .await
+            .transpose()
+            .inspect_err(|err| error!(?err, prefix))?
+        {
+            let Some(name) = meta.location.parts().next_back() else {
+                continue;
+            };
+            let name = name.as_ref();
+            if name.len() < 20 {
+                continue;
+            }
+            let Ok(seq) = u64::from_str(&name[0..20]) else {
+                continue;
+            };
+            discovered.push((seq, meta.location, meta.last_modified.timestamp_millis()));
+        }
+
+        // Read footers only for sequences not already cached.
+        let mut fetched: Vec<(u64, CachedSegment)> = Vec::new();
+        for (seq, location, last_modified_ms) in discovered {
+            let cached = self
+                .prefix_index
+                .lock()
+                .map(|index| {
+                    index
+                        .get(prefix)
+                        .is_some_and(|entry| entry.segments.contains_key(&seq))
+                })
+                .unwrap_or(false);
+            if cached {
+                continue;
+            }
+            if let Some(footer) = self.read_segment_footer(&location).await? {
+                fetched.push((
+                    seq,
+                    CachedSegment {
+                        footer,
+                        last_modified_ms,
+                    },
+                ));
+            }
+        }
+
+        let mut index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+        let entry = index.entry(prefix.to_owned()).or_default();
+        for (seq, segment) in fetched {
+            _ = entry.segments.insert(seq, segment);
+        }
+        entry.refreshed_at = Some(SystemTime::now());
+        Ok(())
+    }
+
+    /// Record a freshly-written segment in the index (writer fast path): its
+    /// footer is authoritative and its append time is ~now, so a following read
+    /// on this node needs no listing/GET.
+    fn index_insert(&self, prefix: &str, seq: u64, footer: SegmentFooter) -> Result<()> {
+        self.prefix_index
+            .lock()
+            .map_err(Into::into)
+            .map(|mut index| {
+                let entry = index.entry(prefix.to_owned()).or_default();
+                _ = entry.segments.insert(
+                    seq,
+                    CachedSegment {
+                        footer,
+                        last_modified_ms: Self::now_ms(),
+                    },
+                );
+                entry.refreshed_at = Some(SystemTime::now());
+            })
+    }
+
+    /// Drop expired sequences from the index after a retention delete (#61).
+    fn index_prune(&self, prefix: &str, seqs: &[u64]) -> Result<()> {
+        self.prefix_index
+            .lock()
+            .map_err(Into::into)
+            .map(|mut index| {
+                if let Some(entry) = index.get_mut(prefix) {
+                    for seq in seqs {
+                        _ = entry.segments.remove(seq);
+                    }
+                }
+            })
+    }
+
+    /// The epoch-fenced segments holding a sub-stream, as `(seq, entry)` sorted
+    /// by base offset (#59 review fix). A segment is written atomically under a
+    /// single-writer lease, so under normal operation a sub-stream's segments are
+    /// disjoint and monotonic; a fenced/zombie writer is the only way two
+    /// segments' offset ranges overlap. On overlap the higher `writer_epoch`
+    /// wins and the stale (lower-epoch) segment is dropped — so a stale-epoch
+    /// segment is ignored on read/recovery, exactly as the epic requires.
+    /// Operates on the cached index (no object requests).
+    fn valid_substream_segments(
+        &self,
+        prefix: &str,
+        topic: &str,
+        partition: i32,
+    ) -> Result<Vec<(u64, SubstreamEntry)>> {
+        let mut segs: Vec<(i64, u64, SubstreamEntry)> = self
+            .prefix_index
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .get(prefix)
+            .map(|index| {
+                index
+                    .segments
+                    .iter()
+                    .filter_map(|(seq, cached)| {
+                        cached
+                            .footer
+                            .get(topic, partition)
+                            .map(|entry| (cached.footer.writer_epoch, *seq, entry.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Ascending base offset; on a tie the higher epoch first so it is the one
+        // that claims the overlapping range.
+        segs.sort_by(|a, b| {
+            a.2.base_offset
+                .cmp(&b.2.base_offset)
+                .then_with(|| b.0.cmp(&a.0))
+        });
+
+        let mut out: Vec<(u64, SubstreamEntry)> = Vec::with_capacity(segs.len());
+        let mut covered_to = i64::MIN;
+        for (_epoch, seq, entry) in segs {
+            if entry.base_offset < covered_to {
+                // Overlaps an already-accepted (>= epoch) segment: stale, drop it.
+                continue;
+            }
+            covered_to = covered_to.max(entry.base_offset + entry.record_count);
+            out.push((seq, entry));
+        }
+        Ok(out)
+    }
+
+    /// Recover a prefix-coalesced sub-stream's next offset (#58) when the
+    /// in-memory counter is cold (fresh process / #59 failover). Takes the
+    /// **max** of the epoch-fenced segment tail and the legacy `records/` tail
+    /// (#58 seam / #62 backfill bypass): a topic can have pre-cutover or bypassed
+    /// `{offset}.batch` objects above or below segments, and reusing an offset is
+    /// unacceptable — so the true next offset is the highest either source knows.
+    /// Also folds in the persisted `watermark.high` floor so a fully
+    /// retention-drained sub-stream never regresses to 0 (#61 review fix).
+    async fn recover_substream_next_offset(&self, topition: &Topition) -> Result<i64> {
+        let prefix = self.prefix_of(topition);
+        self.refresh_prefix_index(&prefix).await?;
+
+        let segment_tail = self
+            .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
+            .last()
+            .map(|(_, entry)| entry.base_offset + entry.record_count)
+            .unwrap_or(0);
+
+        let legacy_tail = self.tail_next_offset(topition, None).await?;
+        let persisted = self.persisted_high(topition).await.unwrap_or(0);
+
+        Ok(segment_tail.max(legacy_tail).max(persisted))
+    }
+
+    /// Fetch a topition's records out of shared prefix-coalesced segments (#60).
+    /// Segments are located from the in-memory footer index (read-path #60 review
+    /// fix — no `segments/` LIST and no per-segment footer GET per fetch), and
+    /// only the segments overlapping `[offset, high_watermark)` are read, each
+    /// with a single ranged GET of exactly the sub-stream's contiguous byte span
+    /// — never the whole object, no cross-topic data. Absolute offsets come from
+    /// the footer. Epoch-fenced (`valid_substream_segments`), so a stale-epoch
+    /// (zombie) segment is skipped. A segment deleted by retention mid-fetch (a
+    /// 404 on the data GET) is pruned and skipped. Bounded by `max_bytes` and by
+    /// `max_wait` from `started_at`.
+    async fn fetch_prefix_coalesced(
+        &self,
+        topition: &Topition,
+        offset: i64,
+        max_bytes: u32,
+        high_watermark: i64,
+        started_at: SystemTime,
+        max_wait: Duration,
+    ) -> Result<Vec<deflated::Batch>> {
+        let has_deadline_expired = || {
+            started_at
+                .elapsed()
+                .map(|elapsed| max_wait.saturating_sub(elapsed).is_zero())
+                .unwrap_or_default()
+        };
+
+        let prefix = self.prefix_of(topition);
+        self.refresh_prefix_index(&prefix).await?;
+        let segments =
+            self.valid_substream_segments(&prefix, topition.topic(), topition.partition())?;
+
+        let mut batches = vec![];
+        let mut bytes = max_bytes as u64;
+
+        for (seq, entry) in segments {
+            if has_deadline_expired() {
+                break;
+            }
+
+            // Segments are sorted by base offset; skip those ending at/before the
+            // requested offset, stop once one starts at/past the high watermark.
+            if entry.base_offset + entry.record_count <= offset {
+                continue;
+            }
+            if entry.base_offset >= high_watermark {
+                break;
+            }
+
+            // One ranged GET of exactly this sub-stream's byte span.
+            let location = self.segment_location(&prefix, seq);
+            let region = match self
+                .object_store
+                .get_opts(
+                    &location,
+                    GetOptions {
+                        range: Some(GetRange::Bounded(
+                            entry.byte_start..entry.byte_start + entry.byte_len,
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(result) => result
+                    .bytes()
+                    .await
+                    .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
+                    .and_then(|encoded| self.decode_frame(encoded))?,
+
+                // Retention deleted this segment between locate and read: prune
+                // the stale index entry and move on.
+                Err(object_store::Error::NotFound { .. }) => {
+                    _ = self.index_prune(&prefix, &[seq]);
+                    continue;
+                }
+
+                Err(error) => {
+                    error!(?error, location = %location);
+                    return Err(Error::Api(ErrorCode::UnknownServerError));
+                }
+            };
+
+            let mut running = entry.base_offset;
+            for mut batch in region {
+                let span = batch.last_offset_delta as i64 + 1;
+                batch.base_offset = running;
+                running += span;
+                batches.push(batch);
+            }
+
+            if entry.byte_len > bytes {
+                break;
+            } else {
+                bytes = bytes.saturating_sub(entry.byte_len);
+            }
+        }
+
+        Ok(batches)
+    }
+
+    /// The lowest segment base offset for a sub-stream, from the index (#60): the
+    /// start of the segment region (`C` in the hybrid layout). `None` when the
+    /// sub-stream has no segment yet.
+    async fn segment_region_start(&self, topition: &Topition) -> Result<Option<i64>> {
+        let prefix = self.prefix_of(topition);
+        self.refresh_prefix_index(&prefix).await?;
+        Ok(self
+            .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
+            .first()
+            .map(|(_, entry)| entry.base_offset))
+    }
+
+    /// Whether `topition` still has legacy `records/` objects (#60 hybrid),
+    /// memoized with a TTL so the common case pays no per-fetch LIST while a
+    /// drain (`true`→`false`) or a txn/control write (`false`→`true`) is still
+    /// picked up within [`Self::HIGH_WATERMARK_HINT_TTL`].
+    async fn has_legacy_records(&self, topition: &Topition) -> Result<bool> {
+        if let Some((present, checked_at)) = self
+            .legacy_records_present
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .get(topition)
+            .copied()
+            && checked_at
+                .elapsed()
+                .is_ok_and(|elapsed| elapsed < Self::HIGH_WATERMARK_HINT_TTL)
+        {
+            return Ok(present);
+        }
+
+        let prefix = Path::from(format!(
+            "clusters/{}/topics/{}/partitions/{:0>10}/records/",
+            self.cluster, topition.topic, topition.partition
+        ));
+        let present = self
+            .object_store
+            .list(Some(&prefix))
+            .next()
+            .await
+            .transpose()
+            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+            .is_some();
+
+        _ = self.legacy_records_present.lock().map(|mut cache| {
+            _ = cache.insert(topition.to_owned(), (present, SystemTime::now()));
+        });
+
+        Ok(present)
+    }
+
+    /// Fetch a topition's records from the legacy per-`(topic, partition)`
+    /// `records/{offset}.batch` objects (the pre-#57 layout). Extracted from
+    /// [`Storage::fetch`] so the prefix-coalesced path can serve the legacy
+    /// region of a hybrid topic (#60 coexistence) before continuing into
+    /// segments. Seeks with `start-after` (offsets are filenames) and reads up to
+    /// `max_bytes`, bounded by `max_wait` from `started_at`.
+    async fn fetch_legacy_records(
+        &self,
+        topition: &Topition,
+        offset: i64,
+        max_bytes: u32,
+        high_watermark: i64,
+        started_at: SystemTime,
+        max_wait: Duration,
+    ) -> Result<Vec<deflated::Batch>> {
+        let has_deadline_expired = || {
+            started_at
+                .elapsed()
+                .map(|elapsed| max_wait.saturating_sub(elapsed).is_zero())
+                .unwrap_or_default()
+        };
+
+        let mut batches = vec![];
+
+        let prefix = Path::from(format!(
+            "clusters/{}/topics/{}/partitions/{:0>10}/records/",
+            self.cluster, topition.topic, topition.partition
+        ));
+
+        // Under #50 coalescing `offset` may fall inside a multi-batch object;
+        // start from the object that contains it so the seek does not skip it.
+        let start_offset = if self.produce_coalesce {
+            self.coalesce_fetch_floor(topition, offset)
+                .await?
+                .unwrap_or(offset)
+        } else {
+            offset
+        };
+
+        let start_after = Path::from(format!(
+            "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}",
+            self.cluster, topition.topic, topition.partition, start_offset,
+        ));
+
+        let mut list_stream = self
+            .object_store
+            .list_with_offset(Some(&prefix), &start_after);
+
+        let mut bytes = max_bytes as u64;
+
+        while let Some(meta) = list_stream
+            .next()
+            .await
+            .inspect(|meta| debug!(?meta))
+            .transpose()
+            .inspect_err(|error| error!(?error, ?topition, ?offset, ?max_bytes))
+            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+            && !has_deadline_expired()
+        {
+            let Some(file_name) = meta.location.parts().next_back() else {
+                continue;
+            };
+
+            let file_name = file_name.as_ref();
+            if file_name.len() < 20 {
+                continue;
+            }
+            let Ok(base_offset) = i64::from_str(&file_name[0..20]) else {
+                continue;
+            };
+            debug!(base_offset);
+
+            if base_offset >= high_watermark {
+                break;
+            }
+
+            let size = meta.size;
+
+            let frame = self
+                .object_store
+                .get(&meta.location)
+                .await
+                .inspect_err(|error| error!(?error, ?topition, ?offset, ?max_bytes))
+                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+                .bytes()
+                .await
+                .inspect_err(|error| error!(?error, location = %meta.location))
+                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
+                .and_then(|encoded| self.decode_frame(encoded))?;
+
+            let mut running = base_offset;
+            for mut batch in frame {
+                let span = batch.last_offset_delta as i64 + 1;
+                batch.base_offset = running;
+                running += span;
+                batches.push(batch);
+            }
+
+            if size > bytes {
+                break;
+            } else {
+                bytes = bytes.saturating_sub(size);
+            }
+        }
+
+        Ok(batches)
+    }
+
+    /// The earliest (log-start) offset for a prefix-coalesced sub-stream (#60):
+    /// the base offset of the oldest legacy `records/` object if any survive
+    /// (they hold the lowest offsets until retention drains them, #60 hybrid),
+    /// otherwise the base offset in the oldest segment (lowest sequence) that
+    /// carries the sub-stream. `0` when neither exists yet.
+    async fn coalesced_earliest_offset(&self, topition: &Topition) -> Result<i64> {
+        // Legacy region first: the smallest base offset present in `records/`
+        // (listing order is ascending, so the first parseable name is the min).
+        let records = Path::from(format!(
+            "clusters/{}/topics/{}/partitions/{:0>10}/records/",
+            self.cluster, topition.topic, topition.partition,
+        ));
+        let mut stream = self.object_store.list(Some(&records));
+        while let Some(meta) = stream
+            .next()
+            .await
+            .transpose()
+            .inspect_err(|error| error!(?error, ?topition))
+            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+        {
+            if let Some(name) = meta.location.parts().next_back()
+                && name.as_ref().len() >= 20
+                && let Ok(base) = i64::from_str(&name.as_ref()[0..20])
+            {
+                return Ok(base);
+            }
+        }
+
+        // Otherwise the oldest segment's base for this sub-stream, from the index.
+        Ok(self.segment_region_start(topition).await?.unwrap_or(0))
+    }
+
+    /// The per-prefix flush serialization lock (see [`Self::prefix_flush_locks`]).
+    fn prefix_flush_lock(&self, prefix: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
+        self.prefix_flush_locks
+            .lock()
+            .map_err(Into::into)
+            .map(|mut locks| locks.entry(prefix.to_owned()).or_default().clone())
+    }
+
+    /// The durable single-writer lease object for a connector prefix (#59).
+    fn lease_location(&self, prefix: &str) -> Path {
+        Path::from(format!(
+            "clusters/{}/prefixes/{}/lease.json",
+            self.cluster, prefix,
+        ))
+    }
+
+    /// Wall-clock milliseconds since the Unix epoch, for lease expiry (#59).
+    fn now_ms() -> i64 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as i64)
+            .unwrap_or(0)
+    }
+
+    /// Acquire or renew this writer's single-writer lease on `prefix` and return
+    /// the held epoch (#59). The etag CAS is the fence: if another writer holds a
+    /// live lease, or wins the acquire race, this call returns
+    /// `NotLeaderOrFollower` (retriable) — so at most one writer appends per
+    /// prefix, with no external coordinator.
+    ///
+    /// Note: this broker is single-node (node 111), so the fenced writer *is*
+    /// this process and the retry lands back here after the stale lease lapses.
+    /// A true multi-broker deployment would need a routing layer to send the
+    /// retried produce to the `prefix_owner_node` holder; that layer does not
+    /// exist yet, so prefix coalescing is intended for single-broker deployments
+    /// until it does.
+    ///
+    /// A held term is reused with no write while more than a third of it
+    /// remains, so the lease object is mutated ~once per `2/3 · ttl`, never per
+    /// flush — keeping it under GCS's ~1/s/object mutation cap (#13).
+    async fn acquire_or_renew_lease(&self, prefix: &str) -> Result<i64> {
+        let now = SystemTime::now();
+        let margin = self.prefix_lease_ttl / 3;
+
+        // Fast path: comfortably within our term — no object mutation.
+        if let Some(held) = self
+            .prefix_leases
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .get(prefix)
+            && held.expires_at > now + margin
+        {
+            return Ok(held.epoch);
+        }
+
+        let location = self.lease_location(prefix);
+
+        // Read the current lease and its version (etag) to CAS against.
+        let (current, version) = match self.object_store.get(&location).await {
+            Ok(result) => {
+                let version = UpdateVersion {
+                    e_tag: result.meta.e_tag.clone(),
+                    version: result.meta.version.clone(),
+                };
+                let lease = serde_json::from_slice::<PrefixLease>(&result.bytes().await?)?;
+                (Some(lease), Some(version))
+            }
+            Err(object_store::Error::NotFound { .. }) => (None, None),
+            Err(err) => return Err(err.into()),
+        };
+
+        // "Ours" iff the object's etag matches the one we last wrote — then this
+        // is a renewal, not a takeover of a foreign live lease.
+        let our_version = self
+            .prefix_leases
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .get(prefix)
+            .and_then(|held| held.version.clone());
+        let ours = matches!((&version, &our_version), (Some(v), Some(o)) if v.e_tag == o.e_tag);
+        let expired = current
+            .as_ref()
+            .is_none_or(|lease| Self::now_ms() >= lease.expires_at_ms);
+
+        // A live lease held by someone else — we are fenced. Drop any stale
+        // cached term and yield.
+        if !ours && !expired {
+            if let Some(lease) = &current {
+                debug!(prefix, holder = %lease.holder, epoch = lease.epoch, "prefix lease held elsewhere");
+            }
+            _ = self
+                .prefix_leases
+                .lock()
+                .map(|mut leases| leases.remove(prefix));
+            LEASE_FENCED.add(1, &[]);
+            return Err(Error::Api(ErrorCode::NotLeaderOrFollower));
+        }
+
+        // Acquirable (unheld / expired / ours): bump epoch, CAS on the read
+        // version so a concurrent acquirer loses.
+        let epoch = current.as_ref().map(|lease| lease.epoch).unwrap_or(0) + 1;
+        let lease = PrefixLease {
+            epoch,
+            holder: self.writer_id.clone(),
+            expires_at_ms: Self::now_ms() + self.prefix_lease_ttl.as_millis() as i64,
+        };
+        let payload = PutPayload::from(Bytes::from(serde_json::to_vec(&lease)?));
+        let mode = match &version {
+            Some(version) => PutMode::Update(version.clone()),
+            None => PutMode::Create,
+        };
+
+        match self
+            .object_store
+            .put_opts(
+                &location,
+                payload,
+                PutOptions {
+                    mode,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(result) => {
+                let version = Some(UpdateVersion {
+                    e_tag: result.e_tag,
+                    version: result.version,
+                });
+                _ = self.prefix_leases.lock().map(|mut leases| {
+                    _ = leases.insert(
+                        prefix.to_owned(),
+                        HeldLease {
+                            epoch,
+                            expires_at: now + self.prefix_lease_ttl,
+                            version,
+                        },
+                    );
+                });
+                LEASE_ACQUIRES.add(1, &[]);
+                debug!(prefix, epoch, "prefix lease acquired/renewed");
+                Ok(epoch)
+            }
+
+            // Lost the CAS: another writer acquired concurrently. Fenced.
+            Err(
+                object_store::Error::Precondition { .. }
+                | object_store::Error::AlreadyExists { .. },
+            ) => {
+                debug!(prefix, "prefix lease CAS lost — fenced");
+                _ = self
+                    .prefix_leases
+                    .lock()
+                    .map(|mut leases| leases.remove(prefix));
+                LEASE_FENCED.add(1, &[]);
+                Err(Error::Api(ErrorCode::NotLeaderOrFollower))
+            }
+
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Buffer `deflated` for a prefix-coalesced flush and await its assigned
+    /// offset (#57). Like [`Self::enqueue_coalesced`] but keyed by the topition's
+    /// connector prefix, so one buffer accumulates batches across every topic
+    /// under the prefix and flushes them into one shared segment object. The
+    /// idempotent sequence and schema were already validated by `produce`.
+    async fn enqueue_prefix_coalesced(
+        &self,
+        topition: &Topition,
+        deflated: deflated::Batch,
+    ) -> Result<i64> {
+        let prefix = self.prefix_of(topition);
+        let (ack, offset) = oneshot::channel();
+        let span = deflated.last_offset_delta as i64 + 1;
+        let size = size_of::<i64>() + size_of::<i32>() + deflated.batch_length.max(0) as usize;
+
+        enum Action {
+            Flush(PrefixCoalesceBuffer),
+            StartTimer,
+            Wait,
+        }
+
+        let action = {
+            let mut buffers = self
+                .prefix_coalesce_buffers
+                .lock()
+                .map_err(Into::<Error>::into)?;
+            let buffer = buffers.entry(prefix.clone()).or_default();
+
+            let first = buffer.pending.is_empty();
+            buffer.pending.push(PrefixPending {
+                topition: topition.to_owned(),
+                batch: deflated,
+                ack,
+            });
+            buffer.records += span;
+            buffer.bytes += size;
+
+            if buffer.pending.len() >= self.coalesce_batches
+                || buffer.bytes >= self.coalesce_bytes
+                || buffer.records >= Self::COALESCE_MAX_RECORDS
+            {
+                Action::Flush(std::mem::take(buffer))
+            } else if first {
+                Action::StartTimer
+            } else {
+                Action::Wait
+            }
+        };
+
+        match action {
+            Action::Flush(buffer) => self.flush_prefix_coalesced(&prefix, buffer).await,
+
+            Action::StartTimer => {
+                let store = self.clone();
+                let prefix = prefix.clone();
+                let linger = self.coalesce_linger;
+
+                _ = tokio::spawn(async move {
+                    tokio::time::sleep(linger).await;
+
+                    let buffer = store
+                        .prefix_coalesce_buffers
+                        .lock()
+                        .ok()
+                        .and_then(|mut buffers| buffers.remove(&prefix));
+
+                    if let Some(buffer) = buffer.filter(|buffer| !buffer.pending.is_empty()) {
+                        store.flush_prefix_coalesced(&prefix, buffer).await;
+                    }
+                });
+            }
+
+            Action::Wait => {}
+        }
+
+        offset
+            .await
+            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+    }
+
+    /// Flush a drained prefix buffer as one shared segment object and resolve
+    /// each parked produce with its assigned offset (#57). Batches are grouped
+    /// by topition; each sub-stream is assigned an independent base offset from
+    /// its in-memory high-watermark hint (#58 assignment — the single-writer
+    /// counter is authoritative, cold-start footer recovery is #58), and the
+    /// whole set is written as one create-only segment via
+    /// [`Self::assign_and_create_segment`]. On failure every parked producer
+    /// gets the error and retries.
+    async fn flush_prefix_coalesced(&self, prefix: &str, buffer: PrefixCoalesceBuffer) {
+        if buffer.pending.is_empty() {
+            return;
+        }
+
+        // Serialize flushes for this prefix so offset assignment (read
+        // `cached_high`) → segment PUT → `set_high` is atomic (#1 fix): two
+        // overlapping windows must not both read the same base offset. Held
+        // across the whole flush; per-prefix, so distinct prefixes still flush
+        // concurrently.
+        let flush_lock = match self.prefix_flush_lock(prefix) {
+            Ok(lock) => lock,
+            Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+        };
+        let _flush_guard = flush_lock.lock().await;
+
+        // Fence first (#59): acquire/renew the single-writer lease before writing.
+        // A fenced writer fails here and never appends a segment; the parked
+        // producers get NotLeaderOrFollower and retry (routed to the live
+        // writer). On a fresh acquire this precedes offset recovery below, so a
+        // new writer recovers the tail before it writes (the handoff order).
+        let epoch = match self.acquire_or_renew_lease(prefix).await {
+            Ok(epoch) => epoch,
+            Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+        };
+
+        // Group pending batches by topition (arrival order preserved within a
+        // topition). BTreeMap gives a deterministic per-segment sub-stream order.
+        let mut grouped: BTreeMap<Topition, Vec<usize>> = BTreeMap::new();
+        for (index, pending) in buffer.pending.iter().enumerate() {
+            grouped
+                .entry(pending.topition.clone())
+                .or_default()
+                .push(index);
+        }
+
+        // Resolve each sub-stream's base offset and the absolute offset of every
+        // batch within it. `assigned[index]` is the offset the pending at that
+        // index will be acked with; `advances` is the post-flush high per
+        // topition.
+        let mut substreams: Vec<(Topition, i64, Vec<deflated::Batch>)> =
+            Vec::with_capacity(grouped.len());
+        let mut assigned = vec![0i64; buffer.pending.len()];
+        let mut advances: Vec<(Topition, i64)> = Vec::with_capacity(grouped.len());
+
+        for (topition, indices) in &grouped {
+            let base = match self.cached_high(topition) {
+                Ok(Some(hint)) => hint,
+                // Cold counter (fresh process / #59 failover): recover the next
+                // offset as max(segment footer tail, legacy records/ tail,
+                // persisted floor) so a seam/backfill/drained sub-stream never
+                // reuses or regresses an offset (#58/#61 review fixes).
+                Ok(None) => match self.recover_substream_next_offset(topition).await {
+                    Ok(high) => {
+                        _ = self
+                            .set_high(topition, high)
+                            .inspect_err(|err| debug!(?err));
+                        high
+                    }
+                    Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+                },
+                Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+            };
+
+            let mut running = base;
+            let mut batches = Vec::with_capacity(indices.len());
+            for &index in indices {
+                assigned[index] = running;
+                let batch = &buffer.pending[index].batch;
+                running += batch.last_offset_delta as i64 + 1;
+                batches.push(batch.clone());
+            }
+
+            substreams.push((topition.clone(), base, batches));
+            advances.push((topition.clone(), running));
+        }
+
+        let (seq, footer) = match async {
+            let (payload, footer) = self.encode_segment(&substreams, epoch)?;
+            let seq = self.assign_and_create_segment(prefix, payload).await?;
+            Ok::<_, Error>((seq, footer))
+        }
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+        };
+
+        // Populate the in-memory footer index so reads on this node need no
+        // listing/GET to see the segment we just wrote (read-path #60 fix).
+        _ = self
+            .index_insert(prefix, seq, footer)
+            .inspect_err(|err| debug!(?err));
+        SEGMENT_FLUSHES.add(1, &[]);
+
+        debug!(
+            prefix,
+            seq,
+            substreams = substreams.len(),
+            "prefix segment flushed"
+        );
+
+        // The write succeeded and is durable — advance each sub-stream's hint.
+        for (topition, high) in &advances {
+            _ = self
+                .set_high(topition, *high)
+                .inspect_err(|err| debug!(?err));
+        }
+
+        // Mirror the immediate path's lake sink per sub-batch. Config is fetched
+        // once per topic and only when a lake is configured.
+        let mut configs: BTreeMap<String, Option<_>> = BTreeMap::new();
+        for (index, pending) in buffer.pending.into_iter().enumerate() {
+            let offset = assigned[index];
+            let topition = &pending.topition;
+
+            if self.lake.is_some() {
+                let config = match configs.get(topition.topic()) {
+                    Some(config) => config.clone(),
+                    None => {
+                        let config = self
+                            .describe_config(topition.topic(), ConfigResource::Topic, None)
+                            .await
+                            .inspect_err(|err| debug!(?err))
+                            .ok();
+                        _ = configs.insert(topition.topic().to_owned(), config.clone());
+                        config
+                    }
+                };
+
+                if let (Some(lake), Some(config)) = (self.lake.as_ref(), config.as_ref())
+                    && let Ok(inflated) = inflated::Batch::try_from(&pending.batch)
+                {
+                    _ = lake
+                        .store(
+                            topition.topic(),
+                            topition.partition(),
+                            offset,
+                            &inflated,
+                            config.clone(),
+                        )
+                        .await
+                        .inspect_err(|err| debug!(?err));
+                }
+            }
+
+            _ = pending.ack.send(Ok(offset));
+        }
+    }
+
+    /// Send `error` to every parked producer in a failed prefix flush (#57) so
+    /// each retries; the unflushed batches are never acked.
+    fn fail_prefix_flush(buffer: PrefixCoalesceBuffer, error: Error, prefix: &str) {
+        error!(?error, prefix, "prefix coalesced flush failed");
+        for pending in buffer.pending {
+            _ = pending.ack.send(Err(error.clone()));
+        }
+    }
+
     /// The base offset of the object that *contains* `offset` — the greatest
     /// base `<= offset` — or `None` when no such object exists (offset is at or
     /// before the log start). Used only under coalescing (#50): a consumer that
@@ -1768,12 +3215,18 @@ impl DynoStore {
                     return None;
                 }
 
-                let retention_ms = configs
+                // `retention.ms=-1` is retain-forever → i64::MAX (nothing expires),
+                // not `now+1` which would delete everything.
+                let retention_ms = match configs
                     .iter()
                     .find(|config| config.name == "retention.ms")
                     .and_then(|config| config.value.as_deref())
                     .and_then(|value| i64::from_str(value).ok())
-                    .unwrap_or(DEFAULT_RETENTION.as_millis() as i64);
+                {
+                    Some(ms) if ms < 0 => i64::MAX,
+                    Some(ms) => ms,
+                    None => DEFAULT_RETENTION.as_millis() as i64,
+                };
 
                 Some((
                     metadata.topic.name.clone(),
@@ -1802,6 +3255,13 @@ impl DynoStore {
                     .await
                     .inspect_err(|err| error!(?err, ?topition))?;
             }
+        }
+
+        // Prefix-coalesced data lives in shared segments, not `records/` (the
+        // per-partition loop above only drains a hybrid topic's legacy region);
+        // expire whole segments per prefix (#61).
+        if self.prefix_coalesce {
+            deleted += self.policy_delete_segments(now_ms).await?;
         }
 
         Ok(deleted)
@@ -1842,6 +3302,220 @@ impl DynoStore {
                     _ = locked.remove(topition);
                 }
             })
+    }
+
+    /// Whether a prefix might hold a segment older than `threshold_ms`, from the
+    /// per-prefix oldest-retained hint (#61, the per-prefix analogue of
+    /// [`Self::partition_maybe_expirable`]). `true` (must scan) when unknown.
+    fn prefix_maybe_expirable(&self, prefix: &str, threshold_ms: i64) -> Result<bool> {
+        self.oldest_retained_prefix
+            .lock()
+            .map_err(Into::into)
+            .map(|locked| {
+                locked
+                    .get(prefix)
+                    .is_none_or(|oldest| *oldest < threshold_ms)
+            })
+    }
+
+    /// Update the per-prefix oldest-retained hint after a segment scan (#61).
+    fn record_prefix_oldest_retained(&self, prefix: &str, oldest_ms: Option<i64>) -> Result<()> {
+        self.oldest_retained_prefix
+            .lock()
+            .map_err(Into::into)
+            .map(|mut locked| match oldest_ms {
+                Some(ms) => {
+                    _ = locked.insert(prefix.to_owned(), ms);
+                }
+                None => {
+                    _ = locked.remove(prefix);
+                }
+            })
+    }
+
+    /// Delete every segment under `prefix` whose records are all older than
+    /// `threshold_ms` (#61). A segment is written atomically, so all its
+    /// sub-streams share an append time; it is expirable only when the newest
+    /// record across **every** sub-stream (the max footer timestamp, falling back
+    /// to the object's append time when record timestamps are unset) is past the
+    /// threshold — never dropping a segment while any topic in it is still live.
+    /// Deletes in bounded `DeleteObjects` chunks and refreshes the per-prefix
+    /// skip hint from what survived.
+    async fn expire_prefix_segments(&self, prefix: &str, threshold_ms: i64) -> Result<u64> {
+        /// Matches the S3 `DeleteObjects` per-request key cap.
+        const EXPIRE_DELETE_CHUNK: usize = 1_000;
+
+        self.refresh_prefix_index(prefix).await?;
+
+        // Decide from the cached footers (no per-segment footer GET). A segment
+        // is expirable only when its newest record across every sub-stream (max
+        // footer timestamp, or the object append time when record timestamps are
+        // unset) is past the threshold — so a live topic never loses a shared
+        // segment.
+        let (expirable, affected, surviving_oldest_ms): (
+            Vec<u64>,
+            BTreeSet<(String, i32)>,
+            Option<i64>,
+        ) = {
+            let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            let mut expirable = Vec::new();
+            let mut affected = BTreeSet::new();
+            let mut surviving: Option<i64> = None;
+
+            if let Some(entry) = index.get(prefix) {
+                for (seq, cached) in &entry.segments {
+                    let newest = cached
+                        .footer
+                        .entries
+                        .iter()
+                        .map(|e| e.max_timestamp)
+                        .max()
+                        .unwrap_or(i64::MIN);
+                    let age_ms = if newest > 0 {
+                        newest
+                    } else {
+                        cached.last_modified_ms
+                    };
+
+                    if age_ms < threshold_ms {
+                        expirable.push(*seq);
+                        for e in &cached.footer.entries {
+                            _ = affected.insert((e.topic.clone(), e.partition));
+                        }
+                    } else {
+                        surviving = Some(surviving.map_or(age_ms, |o: i64| o.min(age_ms)));
+                    }
+                }
+            }
+            (expirable, affected, surviving)
+        };
+
+        self.record_prefix_oldest_retained(prefix, surviving_oldest_ms)?;
+
+        if expirable.is_empty() {
+            return Ok(0);
+        }
+
+        // Persist a durable offset floor for every sub-stream losing segments
+        // BEFORE deleting (#61 review fix): if a drain removes a sub-stream's last
+        // segment, cold recovery must not regress to 0 / reuse offsets. The floor
+        // is the sub-stream's current tail; recovery folds it in via `max`.
+        // Bounded to the affected sub-streams (a window's worth), on the maintain
+        // path — not the produce hot path.
+        for (topic, partition) in &affected {
+            let tail = self
+                .valid_substream_segments(prefix, topic, *partition)?
+                .last()
+                .map(|(_, e)| e.base_offset + e.record_count);
+            if let Some(tail) = tail {
+                let tp = Topition::new(topic.clone(), *partition);
+                _ = self
+                    .watermark(&tp)?
+                    .with_mut(&self.object_store, |watermark| {
+                        watermark.high = Some(watermark.high.unwrap_or(0).max(tail));
+                        Ok(())
+                    })
+                    .await
+                    .inspect_err(|err| debug!(?err, ?tp));
+            }
+        }
+
+        // Delete the expired segment objects in bounded chunks.
+        let mut deleted: u64 = 0;
+        let mut chunk: Vec<Path> = Vec::new();
+        for seq in &expirable {
+            chunk.push(self.segment_location(prefix, *seq));
+            if chunk.len() >= EXPIRE_DELETE_CHUNK {
+                deleted += chunk.len() as u64;
+                self.delete_batches(std::mem::take(&mut chunk)).await?;
+            }
+        }
+        if !chunk.is_empty() {
+            deleted += chunk.len() as u64;
+            self.delete_batches(chunk).await?;
+        }
+
+        self.index_prune(prefix, &expirable)?;
+
+        Ok(deleted)
+    }
+
+    /// Whole-segment retention across all coalesced prefixes (#61). Groups the
+    /// topics by connector prefix and expires each prefix's segments under one
+    /// **uniform** retention — the longest `retention.ms` among the prefix's
+    /// topics, so a per-topic override can never delete a shared segment early
+    /// (heterogeneous per-topic retention is not honoured in coalesced mode, per
+    /// the epic; the longest wins). Every non-compacted topic counts: Kafka's
+    /// default `cleanup.policy` is `delete`, and a topic with no explicit policy
+    /// still coalesces into the shared segments, so it must be included in the
+    /// max — otherwise a sibling's shorter retention could delete its data (#61
+    /// review fix). `retention.ms=-1` (retain forever) makes the whole prefix
+    /// infinite. Compacted topics never reach segments (legacy path at produce).
+    async fn policy_delete_segments(&self, now_ms: i64) -> Result<u64> {
+        const DEFAULT_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+
+        let mut retention_by_prefix: BTreeMap<String, i64> = BTreeMap::new();
+
+        for metadata in self.topics_index().await?.iter() {
+            let configs = metadata.topic.configs.as_deref().unwrap_or_default();
+
+            let compact = configs.iter().any(|config| {
+                config.name == "cleanup.policy"
+                    && config
+                        .value
+                        .as_deref()
+                        .is_some_and(|value| value.contains("compact"))
+            });
+
+            // Compacted topics stay on the legacy path — never in segments.
+            if compact {
+                continue;
+            }
+
+            // `retention.ms=-1` is retain-forever → treat as effectively infinite
+            // (mapped to i64::MAX, so `now - retention` floors to the log start and
+            // nothing expires). Absent → the 7-day default.
+            let retention_ms = match configs
+                .iter()
+                .find(|config| config.name == "retention.ms")
+                .and_then(|config| config.value.as_deref())
+                .and_then(|value| i64::from_str(value).ok())
+            {
+                Some(ms) if ms < 0 => i64::MAX,
+                Some(ms) => ms,
+                None => DEFAULT_RETENTION_MS,
+            };
+
+            for partition in 0..metadata.topic.num_partitions {
+                let prefix = self.prefix_of(&Topition::new(metadata.topic.name.clone(), partition));
+
+                _ = retention_by_prefix
+                    .entry(prefix)
+                    .and_modify(|existing| {
+                        if retention_ms > *existing {
+                            *existing = retention_ms;
+                        }
+                    })
+                    .or_insert(retention_ms);
+            }
+        }
+
+        let mut deleted = 0;
+
+        for (prefix, retention_ms) in retention_by_prefix {
+            let threshold_ms = now_ms.saturating_sub(retention_ms);
+
+            if !self.prefix_maybe_expirable(&prefix, threshold_ms)? {
+                continue;
+            }
+
+            deleted += self
+                .expire_prefix_segments(&prefix, threshold_ms)
+                .await
+                .inspect_err(|err| error!(?err, prefix))?;
+        }
+
+        Ok(deleted)
     }
 
     /// List the batch files of `topition` as a map of base offset to its object
@@ -2261,6 +3935,171 @@ impl DynoStore {
             buf.extend_from_slice(&Bytes::from(batch.clone()));
         }
         Ok(PutPayload::from(Bytes::from(buf)))
+    }
+
+    /// Serialize many `(topic, partition)` sub-streams into one shared,
+    /// prefix-coalesced segment object (#64) — the write produced by #57. Each
+    /// sub-stream's batches are concatenated contiguously (byte-compatible with
+    /// [`Self::encode_frame`], so a region decodes with [`Self::decode_frame`]);
+    /// the regions are laid end to end; then a self-describing [`SegmentFooter`]
+    /// and a fixed [`SEGMENT_TRAILER_LEN`] trailer are appended. A reader
+    /// locates any sub-stream by footer lookup + a ranged GET of its byte span
+    /// (#60) rather than deriving offsets from the filename. Each element is
+    /// `(topition, base_offset, batches)`, where `base_offset` is the absolute
+    /// offset already assigned to the sub-stream's first record (#58).
+    /// `writer_epoch` is the producing writer's lease epoch (#59), stamped into
+    /// the footer so a fenced writer's segment is identifiable. Empty
+    /// sub-streams are skipped. Returns the payload and the footer, which the
+    /// writer keeps as the segment's in-memory index.
+    fn encode_segment(
+        &self,
+        substreams: &[(Topition, i64, Vec<deflated::Batch>)],
+        writer_epoch: i64,
+    ) -> Result<(PutPayload, SegmentFooter)> {
+        let mut body = Vec::new();
+        let mut entries = Vec::with_capacity(substreams.len());
+
+        for (topition, base_offset, batches) in substreams {
+            if batches.is_empty() {
+                continue;
+            }
+
+            let byte_start = body.len() as u64;
+            let mut record_count = 0i64;
+            let mut max_timestamp = i64::MIN;
+
+            for batch in batches {
+                body.extend_from_slice(&Bytes::from(batch.clone()));
+                record_count += batch.last_offset_delta as i64 + 1;
+                max_timestamp = max_timestamp.max(batch.max_timestamp);
+            }
+
+            entries.push(SubstreamEntry {
+                topic: topition.topic().to_owned(),
+                partition: topition.partition(),
+                base_offset: *base_offset,
+                record_count,
+                byte_start,
+                byte_len: body.len() as u64 - byte_start,
+                max_timestamp,
+            });
+        }
+
+        let footer = SegmentFooter {
+            writer_epoch,
+            entries,
+        };
+        let footer_bytes = Self::encode_footer(&footer);
+
+        body.extend_from_slice(&footer_bytes);
+        body.extend_from_slice(&(footer_bytes.len() as u64).to_be_bytes());
+        body.extend_from_slice(&(footer.entries.len() as u32).to_be_bytes());
+        body.extend_from_slice(&SEGMENT_FORMAT_VERSION.to_be_bytes());
+        body.extend_from_slice(&SEGMENT_MAGIC.to_be_bytes());
+
+        Ok((PutPayload::from(Bytes::from(body)), footer))
+    }
+
+    /// Serialize a [`SegmentFooter`] index (#64/#59). Header: `writer_epoch
+    /// (i64)`. Then each entry: `topic_len (u16) + topic (utf8) +
+    /// partition (i32) + base_offset (i64) + record_count (i64) +
+    /// byte_start (u64) + byte_len (u64) + max_timestamp (i64)`, all big-endian.
+    /// Paired with [`Self::decode_footer`].
+    fn encode_footer(footer: &SegmentFooter) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&footer.writer_epoch.to_be_bytes());
+        for entry in &footer.entries {
+            let topic = entry.topic.as_bytes();
+            buf.extend_from_slice(&(topic.len() as u16).to_be_bytes());
+            buf.extend_from_slice(topic);
+            buf.extend_from_slice(&entry.partition.to_be_bytes());
+            buf.extend_from_slice(&entry.base_offset.to_be_bytes());
+            buf.extend_from_slice(&entry.record_count.to_be_bytes());
+            buf.extend_from_slice(&entry.byte_start.to_be_bytes());
+            buf.extend_from_slice(&entry.byte_len.to_be_bytes());
+            buf.extend_from_slice(&entry.max_timestamp.to_be_bytes());
+        }
+        buf
+    }
+
+    /// Parse a [`SegmentFooter`] from `footer_bytes`, the `footer_len` bytes that
+    /// precede the trailer (#64). Inverse of [`Self::encode_footer`]; a
+    /// truncated or malformed footer is a corrupt segment, not a legacy object.
+    fn decode_footer(footer_bytes: &[u8], entry_count: usize) -> Result<SegmentFooter> {
+        let mut entries = Vec::with_capacity(entry_count);
+        let mut cursor = footer_bytes;
+
+        fn take<'a>(cursor: &mut &'a [u8], n: usize) -> Result<&'a [u8]> {
+            if cursor.len() < n {
+                return Err(Error::Message(String::from("truncated segment footer")));
+            }
+            let (head, tail) = cursor.split_at(n);
+            *cursor = tail;
+            Ok(head)
+        }
+
+        let writer_epoch = i64::from_be_bytes(take(&mut cursor, 8)?.try_into()?);
+
+        for _ in 0..entry_count {
+            let topic_len = u16::from_be_bytes(take(&mut cursor, 2)?.try_into()?) as usize;
+            let topic = String::from_utf8(take(&mut cursor, topic_len)?.to_vec())
+                .map_err(|e| Error::Message(e.to_string()))?;
+            let partition = i32::from_be_bytes(take(&mut cursor, 4)?.try_into()?);
+            let base_offset = i64::from_be_bytes(take(&mut cursor, 8)?.try_into()?);
+            let record_count = i64::from_be_bytes(take(&mut cursor, 8)?.try_into()?);
+            let byte_start = u64::from_be_bytes(take(&mut cursor, 8)?.try_into()?);
+            let byte_len = u64::from_be_bytes(take(&mut cursor, 8)?.try_into()?);
+            let max_timestamp = i64::from_be_bytes(take(&mut cursor, 8)?.try_into()?);
+
+            entries.push(SubstreamEntry {
+                topic,
+                partition,
+                base_offset,
+                record_count,
+                byte_start,
+                byte_len,
+                max_timestamp,
+            });
+        }
+
+        Ok(SegmentFooter {
+            writer_epoch,
+            entries,
+        })
+    }
+
+    /// Recover the [`SegmentFooter`] of a segment given its tail bytes (#64):
+    /// `tail` must include at least the footer and the [`SEGMENT_TRAILER_LEN`]
+    /// trailer (in practice the last N bytes fetched by a ranged GET, or the
+    /// whole object). Returns `Ok(None)` when the trailer magic is absent — the
+    /// object is a legacy single-topic coalesced object (#50, the v0 case) and
+    /// must be read as a bare batch concatenation via [`Self::decode_frame`].
+    fn decode_segment_footer(&self, tail: &[u8]) -> Result<Option<SegmentFooter>> {
+        if tail.len() < SEGMENT_TRAILER_LEN {
+            return Ok(None);
+        }
+
+        let trailer = &tail[tail.len() - SEGMENT_TRAILER_LEN..];
+        let magic = u32::from_be_bytes(trailer[14..18].try_into()?);
+        if magic != SEGMENT_MAGIC {
+            return Ok(None);
+        }
+
+        let footer_len = u64::from_be_bytes(trailer[0..8].try_into()?) as usize;
+        let entry_count = u32::from_be_bytes(trailer[8..12].try_into()?) as usize;
+        let version = u16::from_be_bytes(trailer[12..14].try_into()?);
+        if version != SEGMENT_FORMAT_VERSION {
+            return Err(Error::Message(format!(
+                "unsupported segment format version {version}"
+            )));
+        }
+
+        let footer_end = tail.len() - SEGMENT_TRAILER_LEN;
+        let footer_start = footer_end
+            .checked_sub(footer_len)
+            .ok_or_else(|| Error::Message(String::from("segment footer length exceeds tail")))?;
+
+        Self::decode_footer(&tail[footer_start..footer_end], entry_count).map(Some)
     }
 
     async fn get<V>(&self, location: &Path) -> Result<(V, Version)>
@@ -2795,14 +4634,15 @@ impl Storage for DynoStore {
             let attributes =
                 BatchAttribute::try_from(deflated.attributes).inspect_err(|err| debug!(?err))?;
 
-            // Server-side coalescing (#50): buffer the batch and flush a run as
-            // one object per linger window. Transactional, control and compacted
-            // batches bypass it (offset/txn-marker/compaction semantics must stay
-            // one batch per object); the idempotent sequence and schema were
-            // already validated above, so a duplicate is rejected before it is
-            // ever buffered.
-            if self.produce_coalesce
-                && transaction_id.is_none()
+            // Server-side coalescing: buffer the batch and flush a run as one
+            // object per linger window — per connector prefix into a shared
+            // segment (#57) when prefix mode is on, else per partition (#50).
+            // Transactional, control and compacted batches bypass both paths
+            // (offset/txn-marker/compaction semantics must stay one batch per
+            // object, and a compacted topic can't share a whole-segment-expiry
+            // segment, #61); the idempotent sequence and schema were already
+            // validated above, so a duplicate is rejected before it is buffered.
+            let coalesce_eligible = transaction_id.is_none()
                 && !attributes.transaction
                 && !attributes.control
                 && !config
@@ -2816,9 +4656,31 @@ impl Storage for DynoStore {
                                 .value
                                 .as_deref()
                                 .is_some_and(|value| value.contains("compact"))
-                    })
-            {
-                return self.enqueue_coalesced(topition, deflated).await;
+                    });
+
+            if coalesce_eligible {
+                if self.prefix_coalesce {
+                    // Backfill high-throughput bypass (#62): a snapshot streams a
+                    // whole table to one partition in large batches that are
+                    // already S3-efficient on their own (~thousands of events per
+                    // PUT) and want the parallelism single-writer segments cap. A
+                    // large batch takes the legacy per-(topic,partition) create
+                    // path below (lock-free/parallel, no lease) — BUT only while
+                    // the sub-stream has no segment yet, so legacy offsets stay
+                    // strictly below segment offsets (the #58 seam the hybrid read
+                    // path depends on). A large batch arriving *after* segmentation
+                    // (e.g. a mid-life add-table snapshot or lag catch-up) must
+                    // coalesce, or it would write legacy objects above segments and
+                    // break fetch ordering / cold recovery (#60 review fix).
+                    let records = deflated.last_offset_delta as i64 + 1;
+                    let bypass_backfill = records >= Self::PREFIX_BACKFILL_MIN_RECORDS
+                        && self.segment_region_start(topition).await?.is_none();
+                    if !bypass_backfill {
+                        return self.enqueue_prefix_coalesced(topition, deflated).await;
+                    }
+                } else if self.produce_coalesce {
+                    return self.enqueue_coalesced(topition, deflated).await;
+                }
             }
 
             // Assign the offset by *creating* the immutable batch object (its
@@ -2907,20 +4769,12 @@ impl Storage for DynoStore {
         &self,
         topition: &'_ Topition,
         offset: i64,
-        min_bytes: u32,
+        _min_bytes: u32,
         max_bytes: u32,
         isolation_level: IsolationLevel,
         max_wait: Duration,
     ) -> Result<Vec<deflated::Batch>> {
         let started_at = SystemTime::now();
-
-        let has_deadline_expired = || {
-            started_at
-                .elapsed()
-                .inspect(|elapsed| debug!(?elapsed, ?max_wait))
-                .map(|elapsed| max_wait.saturating_sub(elapsed).is_zero())
-                .unwrap_or_default()
-        };
 
         // Read-committed needs the last-stable offset, which `offset_stage`
         // derives from the cluster `meta.json` transactions. Read-uncommitted
@@ -2938,100 +4792,74 @@ impl Storage for DynoStore {
         let mut batches = vec![];
 
         if offset < high_watermark {
-            let prefix = Path::from(format!(
-                "clusters/{}/topics/{}/partitions/{:0>10}/records/",
-                self.cluster, topition.topic, topition.partition
-            ));
+            if self.prefix_coalesce {
+                // Prefix-coalesced (#60): records live in shared segments, located
+                // by footer index and read with a ranged GET of exactly the
+                // topition's byte span — no cross-topic download. A *hybrid* topic
+                // (flipped to segment mode mid-life) also has legacy `records/`
+                // objects for `[0, C)`; serve those first, then segments from `C`.
+                // Legacy offsets are all below segment offsets (the #58 seam), so
+                // legacy-then-segment preserves order and a single fetch with
+                // budget to spare stitches across the seam.
+                let mut from = offset;
+                let hybrid = self.has_legacy_records(topition).await?;
 
-            // Seek directly to the requested offset using `start-after` instead of
-            // enumerating the whole partition prefix on every fetch. Batch filenames are
-            // zero-padded to 20 digits, so lexicographic order == numeric order. The start
-            // key is the 20-digit offset *without* the `.batch` suffix: it is a strict prefix
-            // of `{offset:0>20}.batch`, so listing returns exactly `base_offset >= offset`
-            // (matching the previous `split_off(&offset)` semantics) while also handling
-            // `offset == 0` without underflow.
-            //
-            // Under coalescing (#50) `offset` may fall *inside* a multi-batch object; start
-            // from the object that contains it (greatest base <= offset) so the seek does
-            // not skip it. When coalescing is off, or the offset is aligned to an object
-            // base, this is exactly `offset` — the fast path is unchanged.
-            let start_offset = if self.produce_coalesce {
-                self.coalesce_fetch_floor(topition, offset)
-                    .await?
-                    .unwrap_or(offset)
+                if hybrid {
+                    batches = self
+                        .fetch_legacy_records(
+                            topition,
+                            offset,
+                            max_bytes,
+                            high_watermark,
+                            started_at,
+                            max_wait,
+                        )
+                        .await?;
+                    from = batches
+                        .last()
+                        .map(|batch| batch.base_offset + batch.last_offset_delta as i64 + 1)
+                        .unwrap_or(offset);
+                }
+
+                // Enter the segment region only once the legacy region is
+                // consumed up to the seam C (the lowest segment base). If the
+                // legacy read was byte-budget-limited and stopped below C, do NOT
+                // jump into segments — that would skip the un-served legacy range
+                // [from, C) (#60 review fix). The consumer re-fetches from `from`
+                // and continues. Non-hybrid topics have no such gap.
+                let seam = self.segment_region_start(topition).await?;
+                let blocked_by_legacy = hybrid && seam.is_some_and(|c| from < c);
+
+                let consumed: u64 = batches
+                    .iter()
+                    .map(|batch| batch.batch_length.max(0) as u64)
+                    .sum();
+                let remaining = (max_bytes as u64).saturating_sub(consumed);
+
+                if !blocked_by_legacy && from < high_watermark && remaining > 0 {
+                    let segment = self
+                        .fetch_prefix_coalesced(
+                            topition,
+                            from,
+                            remaining.min(u32::MAX as u64) as u32,
+                            high_watermark,
+                            started_at,
+                            max_wait,
+                        )
+                        .await?;
+                    batches.extend(segment);
+                }
             } else {
-                offset
-            };
-
-            let start_after = Path::from(format!(
-                "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}",
-                self.cluster, topition.topic, topition.partition, start_offset,
-            ));
-
-            let mut list_stream = self
-                .object_store
-                .list_with_offset(Some(&prefix), &start_after);
-
-            let mut bytes = max_bytes as u64;
-
-            // The object_store trait does not guarantee ordering, but every dynostore backend
-            // yields ascending keys (S3 ListObjectsV2 sorts by key, the memory store iterates a
-            // BTreeMap). We rely on that to stop as soon as enough batches to satisfy `max_bytes`
-            // are collected, keeping fetch cost proportional to the bytes returned rather than to
-            // the partition's history.
-            while let Some(meta) = list_stream
-                .next()
-                .await
-                .inspect(|meta| debug!(?meta))
-                .transpose()
-                .inspect_err(|error| error!(?error, ?topition, ?offset, ?min_bytes, ?max_bytes))
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
-                && !has_deadline_expired()
-            {
-                let Some(file_name) = meta.location.parts().next_back() else {
-                    continue;
-                };
-
-                let base_offset = i64::from_str(&file_name.as_ref()[0..20])?;
-                debug!(base_offset);
-
-                if base_offset >= high_watermark {
-                    break;
-                }
-
-                let size = meta.size;
-
-                // A coalesced object (#50) holds several contiguous batches; a
-                // legacy object holds one. Expand them, assigning each sub-batch
-                // its absolute base offset by running from the object's base (the
-                // authority in the filename) over each sub-batch's offset span.
-                // For a single-batch object this pushes exactly one batch with
-                // `base_offset` set from the filename, as before.
-                let frame = self
-                    .object_store
-                    .get(&meta.location)
-                    .await
-                    .inspect_err(|error| error!(?error, ?topition, ?offset, ?min_bytes, ?max_bytes))
-                    .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
-                    .bytes()
-                    .await
-                    .inspect_err(|error| error!(?error, location = %meta.location))
-                    .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
-                    .and_then(|encoded| self.decode_frame(encoded))?;
-
-                let mut running = base_offset;
-                for mut batch in frame {
-                    let span = batch.last_offset_delta as i64 + 1;
-                    batch.base_offset = running;
-                    running += span;
-                    batches.push(batch);
-                }
-
-                if size > bytes {
-                    break;
-                } else {
-                    bytes = bytes.saturating_sub(size);
-                }
+                batches = self
+                    .fetch_legacy_records(
+                        topition,
+                        offset,
+                        max_bytes,
+                        high_watermark,
+                        started_at,
+                        max_wait,
+                    )
+                    .await?;
             }
         }
 
@@ -3181,6 +5009,25 @@ impl Storage for DynoStore {
                         error_code: ErrorCode::None,
                         offset: Some(high),
                         timestamp,
+                    },
+                ));
+
+                continue;
+            }
+
+            // Prefix-coalesced (#60): EARLIEST is the oldest segment's base
+            // offset for this sub-stream, read from the footer index — no
+            // `records/` listing (there is none). LATEST already went through
+            // `high_watermark` above (footer-aware).
+            if self.prefix_coalesce && *offset_request == ListOffset::Earliest {
+                let earliest = self.coalesced_earliest_offset(topition).await?;
+
+                responses.push((
+                    topition.to_owned(),
+                    ListOffsetResponse {
+                        error_code: ErrorCode::None,
+                        offset: Some(earliest),
+                        timestamp: None,
                     },
                 ));
 
