@@ -14,15 +14,13 @@ clean-workspace:
 license:
     cargo about generate about.hbs > license.html
 
-build profile="dev" features="delta,dynostore,iceberg,libsql,parquet,postgres,slatedb" bin="tansu": (cargo-build "--profile" profile "--timings" "--bin" bin "--no-default-features" "--features" features)
+build profile="dev" features="dynostore" bin="tansu": (cargo-build "--profile" profile "--timings" "--bin" bin "--no-default-features" "--features" features)
 
-build-storage: clean-workspace (build "dev" "libsql") (build "dev" "postgres") (build "dev" "slatedb")
+build-storage: clean-workspace (build "dev" "dynostore")
 
 build-examples: (cargo-build "--examples")
 
-release: (cargo-build "--release" "--bin" "tansu" "--no-default-features" "--features" "delta,dynostore,iceberg,libsql,parquet,postgres,slatedb")
-
-release-sqlite: (cargo-build "--release" "--bin" "tansu" "--no-default-features" "--features" "libsql")
+release: (cargo-build "--release" "--bin" "tansu" "--no-default-features" "--features" "dynostore")
 
 test: test-workspace test-doc
 
@@ -373,7 +371,7 @@ gdb: (cargo-build "--bin" "tansu") docker-compose-down db-up minio-up minio-read
 lldb: (cargo-build "--bin" "tansu") docker-compose-down db-up minio-up minio-ready-local minio-local-alias minio-tansu-bucket minio-lake-bucket lakehouse-catalog-up
     rust-lldb target/debug/tansu broker
 
-ci: docker-compose-down db-up minio-up minio-ready-local minio-local-alias minio-tansu-bucket minio-lake-bucket lakehouse-catalog-up lakehouse-accept-terms-of-use lakehouse-create-warehouse
+ci: docker-compose-down minio-up minio-ready-local minio-local-alias minio-tansu-bucket
 
 # produce etc/data/observations.json with schema etc/schema/observation.avsc
 observation-produce: (cat-produce "observation" "etc/data/observations.json")
