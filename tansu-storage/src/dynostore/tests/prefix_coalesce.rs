@@ -1492,16 +1492,41 @@ async fn leaseless_idempotent_dedup_is_log_based() -> Result<(), Error> {
 
     let pid = 42;
     // In order: seq 0 (2 records → offsets 0,1), then seq 2 (offset 2).
-    assert_eq!(0, store.produce(None, &tp, idempotent_batch(pid, 0, 0, 2)?).await?);
-    assert_eq!(2, store.produce(None, &tp, idempotent_batch(pid, 0, 2, 1)?).await?);
+    assert_eq!(
+        0,
+        store
+            .produce(None, &tp, idempotent_batch(pid, 0, 0, 2)?)
+            .await?
+    );
+    assert_eq!(
+        2,
+        store
+            .produce(None, &tp, idempotent_batch(pid, 0, 2, 1)?)
+            .await?
+    );
 
     // Retries of both batches are acked with their original offsets, not
     // re-appended.
-    assert_eq!(0, store.produce(None, &tp, idempotent_batch(pid, 0, 0, 2)?).await?);
-    assert_eq!(2, store.produce(None, &tp, idempotent_batch(pid, 0, 2, 1)?).await?);
+    assert_eq!(
+        0,
+        store
+            .produce(None, &tp, idempotent_batch(pid, 0, 0, 2)?)
+            .await?
+    );
+    assert_eq!(
+        2,
+        store
+            .produce(None, &tp, idempotent_batch(pid, 0, 2, 1)?)
+            .await?
+    );
 
     // The next in-order batch continues densely at offset 3.
-    assert_eq!(3, store.produce(None, &tp, idempotent_batch(pid, 0, 3, 1)?).await?);
+    assert_eq!(
+        3,
+        store
+            .produce(None, &tp, idempotent_batch(pid, 0, 3, 1)?)
+            .await?
+    );
 
     // The log holds exactly the four distinct records — the two duplicates added
     // nothing.
@@ -1545,18 +1570,38 @@ async fn leaseless_dedup_survives_pod_migration() -> Result<(), Error> {
 
     let pid = 7;
     // Replica A writes seq 0 and 1.
-    assert_eq!(0, a_store.produce(None, &tp, idempotent_batch(pid, 0, 0, 1)?).await?);
-    assert_eq!(1, a_store.produce(None, &tp, idempotent_batch(pid, 0, 1, 1)?).await?);
+    assert_eq!(
+        0,
+        a_store
+            .produce(None, &tp, idempotent_batch(pid, 0, 0, 1)?)
+            .await?
+    );
+    assert_eq!(
+        1,
+        a_store
+            .produce(None, &tp, idempotent_batch(pid, 0, 1, 1)?)
+            .await?
+    );
 
     // The producer migrates to a brand-new replica B (cold: no in-memory
     // producer state, no checkpoint from A). Folding A's segments gives the
     // right expected sequence, so seq 2 is admitted contiguously.
     let b_store = mk();
-    assert_eq!(2, b_store.produce(None, &tp, idempotent_batch(pid, 0, 2, 1)?).await?);
+    assert_eq!(
+        2,
+        b_store
+            .produce(None, &tp, idempotent_batch(pid, 0, 2, 1)?)
+            .await?
+    );
 
     // A retry of seq 1 on B is deduped from A's log, acked with the original
     // offset — no false out-of-order, no re-append.
-    assert_eq!(1, b_store.produce(None, &tp, idempotent_batch(pid, 0, 1, 1)?).await?);
+    assert_eq!(
+        1,
+        b_store
+            .produce(None, &tp, idempotent_batch(pid, 0, 1, 1)?)
+            .await?
+    );
 
     let reader = mk();
     let fetched = fetch_from(&reader, &tp, 0).await?;
@@ -1584,12 +1629,21 @@ async fn leaseless_out_of_order_sequence_is_rejected() -> Result<(), Error> {
     let tp = Topition::new(topic, 0);
 
     let pid = 99;
-    assert_eq!(0, store.produce(None, &tp, idempotent_batch(pid, 0, 0, 1)?).await?);
+    assert_eq!(
+        0,
+        store
+            .produce(None, &tp, idempotent_batch(pid, 0, 0, 1)?)
+            .await?
+    );
 
     // seq 3 skips 1 and 2 — a gap.
     assert_eq!(
         ErrorCode::OutOfOrderSequenceNumber,
-        api_error(store.produce(None, &tp, idempotent_batch(pid, 0, 3, 1)?).await)
+        api_error(
+            store
+                .produce(None, &tp, idempotent_batch(pid, 0, 3, 1)?)
+                .await
+        )
     );
 
     // The rejected batch appended nothing.

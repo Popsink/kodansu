@@ -689,7 +689,11 @@ impl ProducerTail {
     /// to 0 (sequences stay non-negative), keeping the dedup arithmetic
     /// wraparound-safe (#80).
     fn seq_increment(sequence: i32) -> i32 {
-        if sequence == i32::MAX { 0 } else { sequence + 1 }
+        if sequence == i32::MAX {
+            0
+        } else {
+            sequence + 1
+        }
     }
 }
 
@@ -3634,9 +3638,11 @@ impl DynoStore {
                         let tail = match tails.entry(producer_id) {
                             Entry::Occupied(occupied) => occupied.into_mut(),
                             Entry::Vacant(vacant) => {
-                                let folded = match self
-                                    .producer_tail_folded(prefix, topition, producer_id)
-                                {
+                                let folded = match self.producer_tail_folded(
+                                    prefix,
+                                    topition,
+                                    producer_id,
+                                ) {
                                     Ok(tail) => tail,
                                     Err(error) => {
                                         return Self::fail_prefix_flush(buffer, error, prefix);

@@ -282,7 +282,10 @@ fn producer_tail_classifies_dedup_epoch_and_wraparound() {
     let mut wrap = ProducerTail::default();
     wrap.fold(0, i32::MAX - 1, i32::MAX, 300);
     assert_eq!(IdempotentClass::Admit, wrap.classify(0, 0));
-    assert_eq!(IdempotentClass::Duplicate(300), wrap.classify(0, i32::MAX - 1));
+    assert_eq!(
+        IdempotentClass::Duplicate(300),
+        wrap.classify(0, i32::MAX - 1)
+    );
 }
 
 /// The duplicate window holds only the last five batches (Kafka's bound): a
