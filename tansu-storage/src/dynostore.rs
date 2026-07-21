@@ -3616,10 +3616,13 @@ impl DynoStore {
     /// only ever targets `folded_max + 1`, and each conflict forces it to ingest
     /// the winner before re-deriving.
     ///
-    /// Known gap, closed by #89: an *ambiguous* PUT (our create landed but the
-    /// response was lost) is retried at the next sequence, re-writing the batch.
-    /// The per-flush `nonce` written into the footer is what lets #89 recognise
-    /// our own segment on conflict and adopt it instead of re-writing.
+    /// An *ambiguous* PUT (our create may have landed before the response was
+    /// lost) is disambiguated by the per-flush `nonce` written into the footer
+    /// (#89): probe the object at `candidate` and adopt it iff it carries our
+    /// nonce, rather than blind-retrying at the next sequence and double-writing
+    /// the batch. A peer's footer (or none) means we did not win — fold and
+    /// re-derive; a probe that itself errors leaves it unknown, so we fail for a
+    /// client retry, which the log-based dedup (#88) makes safe.
     async fn flush_prefix_coalesced_leaseless(&self, prefix: &str, buffer: PrefixCoalesceBuffer) {
         /// Bounds the conflict-correction loop; far above any real concurrency.
         const MAX_ATTEMPTS: usize = 64;
@@ -3790,14 +3793,61 @@ impl DynoStore {
                 }
 
                 // A peer took `candidate`: fold it and retry the next free
-                // sequence with re-derived bases (adopting our own segment on an
-                // ambiguous PUT is #89).
+                // sequence with re-derived bases.
                 Err(object_store::Error::AlreadyExists { .. }) => {
                     debug!(prefix, candidate, attempt, "segment seq taken, re-deriving");
                     continue;
                 }
 
-                Err(error) => return Self::fail_prefix_flush(buffer, error.into(), prefix),
+                // Ambiguous PUT (#89): the create may have landed durably before
+                // the transport error. Probe the footer at `candidate` and adopt
+                // it iff the nonce is ours — a blind retry at the next sequence
+                // would double-write the batch. Our nonce can only exist at a
+                // sequence our PUT actually won, so a match is proof the create
+                // succeeded. A peer's footer or none → we did not win, fold and
+                // re-derive. A probe error leaves it genuinely unknown → fail for
+                // a client retry (log-based dedup, #88, dedups the replay).
+                Err(error) => {
+                    match self
+                        .read_segment_footer(&self.segment_location(prefix, candidate))
+                        .await
+                    {
+                        Ok(Some(found)) if found.nonce == nonce => {
+                            debug!(
+                                prefix,
+                                candidate, attempt, "ambiguous PUT adopted via nonce"
+                            );
+                            _ = self
+                                .set_seq(prefix, candidate + 1)
+                                .inspect_err(|err| debug!(?err));
+                            return self
+                                .finalize_prefix_flush_leaseless(
+                                    prefix, candidate, footer, buffer, outcomes, &advances,
+                                )
+                                .await;
+                        }
+                        Ok(_) => {
+                            debug!(
+                                prefix,
+                                candidate,
+                                attempt,
+                                ?error,
+                                "ambiguous PUT not ours, re-deriving"
+                            );
+                            continue;
+                        }
+                        Err(probe_error) => {
+                            debug!(
+                                prefix,
+                                candidate,
+                                ?error,
+                                ?probe_error,
+                                "ambiguous PUT unresolved"
+                            );
+                            return Self::fail_prefix_flush(buffer, error.into(), prefix);
+                        }
+                    }
+                }
             }
         }
 

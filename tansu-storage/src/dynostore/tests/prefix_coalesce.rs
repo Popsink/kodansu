@@ -18,11 +18,23 @@
 //! from ~`(topics × flushes)` to ~`(connectors × flushes)` — while each
 //! `(topic, partition)` sub-stream keeps its own independent offset sequence.
 
-use std::time::Duration;
+use std::{
+    fmt::{self, Debug, Display},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering::Relaxed},
+    },
+    time::Duration,
+};
 
+use async_trait::async_trait;
 use bytes::Bytes;
-use futures::TryStreamExt as _;
-use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
+use futures::{TryStreamExt as _, stream::BoxStream};
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    memory::InMemory, path::Path,
+};
 use tansu_sans_io::{
     ErrorCode, IsolationLevel, ListOffset,
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
@@ -1653,6 +1665,167 @@ async fn leaseless_out_of_order_sequence_is_rejected() -> Result<(), Error> {
         .map(|batch| batch.last_offset_delta as i64 + 1)
         .sum();
     assert_eq!(1, total, "the out-of-order batch must not append");
+
+    Ok(())
+}
+
+/// An `ObjectStore` that makes the *first* create-PUT of a `.seg` object
+/// ambiguous: the write lands durably in the inner store, then the call returns
+/// a transport error as if the response were lost. Every other call (later seg
+/// PUTs, gets, lists, the topic-metadata `.json` writes) delegates unchanged.
+/// Drives the #89 adoption path.
+#[derive(Clone)]
+struct AmbiguousSegmentPut<O> {
+    inner: O,
+    armed: Arc<AtomicBool>,
+}
+
+impl<O> AmbiguousSegmentPut<O> {
+    fn new(inner: O) -> Self {
+        Self {
+            inner,
+            armed: Arc::new(AtomicBool::new(true)),
+        }
+    }
+}
+
+impl<O> Debug for AmbiguousSegmentPut<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AmbiguousSegmentPut").finish()
+    }
+}
+
+impl<O> Display for AmbiguousSegmentPut<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AmbiguousSegmentPut").finish()
+    }
+}
+
+#[async_trait]
+impl<O> ObjectStore for AmbiguousSegmentPut<O>
+where
+    O: ObjectStore,
+{
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult, object_store::Error> {
+        let segment_create =
+            matches!(opts.mode, PutMode::Create) && location.as_ref().ends_with(".seg");
+        if segment_create && self.armed.swap(false, Relaxed) {
+            // Land the write, then simulate a lost response.
+            _ = self.inner.put_opts(location, payload, opts).await?;
+            return Err(object_store::Error::Generic {
+                store: "ambiguous",
+                source: "simulated lost PUT response".into(),
+            });
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> Result<GetResult, object_store::Error> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path, object_store::Error>>,
+    ) -> BoxStream<'static, Result<Path, object_store::Error>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> Result<ListResult, object_store::Error> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: CopyOptions,
+    ) -> Result<(), object_store::Error> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+}
+
+/// #89: an ambiguous create-PUT — our segment landed durably but the response
+/// was lost — is adopted via the footer nonce rather than blind-retried at the
+/// next sequence. The produce still succeeds with the assigned offset, and the
+/// log holds the batch exactly once: a single segment at seq 0, no double-write
+/// at seq 1.
+#[tokio::test]
+async fn leaseless_ambiguous_put_is_adopted_via_nonce() -> Result<(), Error> {
+    let inner = InMemory::new();
+    let fault = AmbiguousSegmentPut::new(inner.clone());
+    let armed = fault.armed.clone();
+    let store = DynoStore::new(CLUSTER, NODE, fault)
+        .prefix_coalesce(true)
+        .prefix_leaseless(true);
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let tp = Topition::new(topic, 0);
+
+    // The flush's first seg PUT lands then errors; the ambiguous arm probes the
+    // footer at the candidate, matches our nonce, and adopts the create.
+    let offset = store
+        .produce(None, &tp, idempotent_batch(11, 0, 0, 3)?)
+        .await?;
+    assert_eq!(0, offset, "adopted create keeps the assigned base offset");
+
+    // Guard against a false positive: the ambiguous fault must actually have
+    // fired (a normal, no-error flush would also leave one segment).
+    assert!(
+        !armed.load(Relaxed),
+        "the ambiguous-PUT fault never triggered — test would not exercise #89"
+    );
+
+    // Exactly one segment — the create was adopted at seq 0, not repeated at 1.
+    let segs = segments(&inner).await;
+    assert_eq!(
+        vec![segment_path(0)],
+        segs,
+        "ambiguous PUT must be adopted, not re-written at the next sequence"
+    );
+
+    // And the log holds the three records exactly once.
+    let fetched = fetch_from(&store, &tp, 0).await?;
+    let total: i64 = fetched
+        .iter()
+        .map(|batch| batch.last_offset_delta as i64 + 1)
+        .sum();
+    assert_eq!(3, total, "no double-write: the batch is present once");
 
     Ok(())
 }
