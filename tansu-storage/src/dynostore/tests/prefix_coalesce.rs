@@ -170,6 +170,20 @@ async fn segments(bucket: &InMemory) -> Vec<Path> {
         .expect("list segments")
 }
 
+/// The legacy per-`(topic, partition)` `records/` objects for partition 0.
+async fn legacy_records(bucket: &InMemory, topic: &str) -> Vec<Path> {
+    let listing = Path::from(format!(
+        "clusters/{CLUSTER}/topics/{topic}/partitions/{:0>10}/records/",
+        0
+    ));
+    bucket
+        .list(Some(&listing))
+        .map_ok(|meta| meta.location)
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("list records")
+}
+
 async fn footer_of(bucket: &InMemory, store: &DynoStore, location: &Path) -> SegmentFooter {
     let bytes = bucket
         .get(location)
@@ -1778,6 +1792,100 @@ where
     ) -> Result<(), object_store::Error> {
         self.inner.copy_opts(from, to, opts).await
     }
+}
+
+/// #90: under the leaseless arbiter a backfill-class batch on a fresh sub-stream
+/// folds into the segment path — the single offset authority — instead of the
+/// #62 legacy per-topic bypass. No `records/` object is written (so the per-topic
+/// LIST/GET residuals, #75, never engage), and offsets stay dense and readable.
+#[tokio::test]
+async fn leaseless_backfill_folds_into_segments() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .prefix_leaseless(true);
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let tp = Topition::new(topic, 0);
+
+    // A backfill-class batch (>= PREFIX_BACKFILL_MIN_RECORDS) on a fresh
+    // sub-stream: the leaseless path routes it through the segment buffer.
+    assert_eq!(0, store.produce(None, &tp, batch(1000)?).await?);
+
+    assert_eq!(
+        vec![segment_path(0)],
+        segments(&bucket).await,
+        "backfill landed as a segment"
+    );
+    assert!(
+        legacy_records(&bucket, topic).await.is_empty(),
+        "leaseless backfill must not write a legacy records/ object"
+    );
+
+    let fetched = fetch_from(&store, &tp, 0).await?;
+    let total: i64 = fetched
+        .iter()
+        .map(|batch| batch.last_offset_delta as i64 + 1)
+        .sum();
+    assert_eq!(
+        1000, total,
+        "all backfill records are readable from the segment"
+    );
+
+    Ok(())
+}
+
+/// #90 gating: on the pre-SCOS *lease* path the #62 backfill bypass is preserved
+/// (its #70 multi-replica routing can't safely carry the bulk load), so a
+/// backfill-class batch on a fresh sub-stream still takes the legacy per-topic
+/// create path — no segment.
+#[tokio::test]
+async fn lease_backfill_keeps_legacy_bypass() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let tp = Topition::new(topic, 0);
+
+    assert_eq!(0, store.produce(None, &tp, batch(1000)?).await?);
+
+    assert!(
+        segments(&bucket).await.is_empty(),
+        "the lease-path bypass writes no segment"
+    );
+    assert_eq!(
+        1,
+        legacy_records(&bucket, topic).await.len(),
+        "the lease-path bypass writes a legacy records/ object"
+    );
+
+    Ok(())
+}
+
+/// #90 adaptive coalescing: a buffer that has seen a backfill-class batch relaxes
+/// its flush triggers to backfill floors (byte floor >= 32 MiB, batch count past
+/// the record cap so it never fires first), leaving the record cap as the
+/// limiter — so a folded-in snapshot coalesces into a few large segments rather
+/// than one per batch. Steady state keeps the tight configured triggers.
+#[test]
+fn backfill_relaxes_flush_thresholds() {
+    let store = DynoStore::new(CLUSTER, NODE, InMemory::new());
+
+    assert_eq!(
+        (DynoStore::COALESCE_BATCHES, DynoStore::COALESCE_BYTES),
+        store.flush_thresholds(false),
+        "steady state uses the configured triggers"
+    );
+
+    let (batches, bytes) = store.flush_thresholds(true);
+    assert!(
+        bytes >= DynoStore::BACKFILL_COALESCE_BYTES,
+        "backfill raises the byte floor to >= 32 MiB"
+    );
+    assert!(
+        batches as i64 >= DynoStore::COALESCE_MAX_RECORDS,
+        "backfill count trigger never fires before the record cap"
+    );
 }
 
 /// #89: an ambiguous create-PUT — our segment landed durably but the response
