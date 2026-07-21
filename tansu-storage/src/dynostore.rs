@@ -2800,38 +2800,68 @@ impl DynoStore {
             discovered.push((seq, meta.location, meta.last_modified.timestamp_millis()));
         }
 
-        // Read footers only for sequences not already cached.
-        let mut fetched: Vec<(u64, CachedSegment)> = Vec::new();
-        for (seq, location, last_modified_ms) in discovered {
-            let cached = self
-                .prefix_index
-                .lock()
-                .map(|index| {
-                    index
-                        .get(prefix)
-                        .is_some_and(|entry| entry.segments.contains_key(&seq))
-                })
-                .unwrap_or(false);
-            if cached {
-                continue;
-            }
-            if let Some(footer) = self.read_segment_footer(&location).await? {
-                fetched.push((
+        // Fetch not-yet-cached footers CONCURRENTLY and commit each to the index
+        // as it arrives (#105). Two properties matter at scale — with compaction
+        // disabled a prefix accrues thousands of segments:
+        //
+        // - **Concurrency.** A sequential footer-per-segment loop is O(#segments)
+        //   round-trips; a cold `list_offsets` (LATEST via `high_watermark`,
+        //   EARLIEST via `segment_region_start`) then blocked past the 60s client
+        //   timeout, stalling the whole read path. `buffered` keeps up to
+        //   `FOOTER_FETCH_CONCURRENCY` ranged GETs in flight (as the topic-index
+        //   warm does), cutting wall-time ~N×.
+        // - **Incremental, in-order commit.** Committing per footer rather than
+        //   once at the end means a request the client abandons at its timeout
+        //   (dropping this future) still leaves progress cached — so the index
+        //   warms across attempts instead of restarting from zero (the
+        //   "sustained, not decaying" stall). Ordered `buffered` preserves the
+        //   ascending-sequence LIST order, so the committed set stays a
+        //   contiguous prefix and the next refresh's `start_after` watermark is
+        //   correct even after a partial build.
+        const FOOTER_FETCH_CONCURRENCY: usize = 32;
+
+        let cached: BTreeSet<u64> = self
+            .prefix_index
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .get(prefix)
+            .map(|entry| entry.segments.keys().copied().collect())
+            .unwrap_or_default();
+
+        let mut footers = futures::stream::iter(
+            discovered
+                .into_iter()
+                .filter(|(seq, _, _)| !cached.contains(seq)),
+        )
+        .map(|(seq, location, last_modified_ms)| async move {
+            self.read_segment_footer(&location)
+                .await
+                .map(|footer| (seq, last_modified_ms, footer))
+        })
+        .buffered(FOOTER_FETCH_CONCURRENCY);
+
+        while let Some(result) = footers.next().await {
+            let (seq, last_modified_ms, footer) = result?;
+            if let Some(footer) = footer {
+                let mut index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+                let entry = index.entry(prefix.to_owned()).or_default();
+                _ = entry.segments.insert(
                     seq,
                     CachedSegment {
                         footer,
                         last_modified_ms,
                     },
-                ));
+                );
             }
         }
 
-        let mut index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
-        let entry = index.entry(prefix.to_owned()).or_default();
-        for (seq, segment) in fetched {
-            _ = entry.segments.insert(seq, segment);
-        }
-        entry.refreshed_at = Some(SystemTime::now());
+        // Whole live set observed: stamp fresh so the TTL fast-path can serve.
+        self.prefix_index
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .entry(prefix.to_owned())
+            .or_default()
+            .refreshed_at = Some(SystemTime::now());
         Ok(())
     }
 
@@ -6552,6 +6582,48 @@ impl Storage for DynoStore {
                         error_code: ErrorCode::None,
                         offset: Some(earliest),
                         timestamp: None,
+                    },
+                ));
+
+                continue;
+            }
+
+            // Prefix-coalesced TIMESTAMP / `offsetsForTimes` (#105): resolve from
+            // the footer index — the earliest segment whose newest record
+            // timestamp is at/after the target — instead of the legacy `records/`
+            // scan below, which for a pure-segment topic finds nothing and wrongly
+            // returned offset 0. This is an in-memory scan of the warm index (no
+            // per-segment I/O); `None` (→ -1 on the wire) when no record is at or
+            // after the target, matching Kafka's "no offset" semantics. A hybrid
+            // topic (legacy objects above the segment tail) falls through to the
+            // records/ path so those batches are still considered.
+            if self.prefix_coalesce
+                && let ListOffset::Timestamp(target) = offset_request
+                && !self.has_legacy_records(topition).await?
+            {
+                let prefix = self.prefix_of(topition);
+                self.refresh_prefix_index(&prefix).await?;
+                let target_ms = target
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_millis() as i64)
+                    .unwrap_or(0);
+
+                let found = self
+                    .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
+                    .into_iter()
+                    .find(|(_, entry)| {
+                        entry.max_timestamp >= 0 && entry.max_timestamp >= target_ms
+                    });
+
+                responses.push((
+                    topition.to_owned(),
+                    ListOffsetResponse {
+                        error_code: ErrorCode::None,
+                        offset: found.as_ref().map(|(_, entry)| entry.base_offset),
+                        timestamp: found.as_ref().map(|(_, entry)| {
+                            SystemTime::UNIX_EPOCH
+                                + Duration::from_millis(entry.max_timestamp as u64)
+                        }),
                     },
                 ));
 
