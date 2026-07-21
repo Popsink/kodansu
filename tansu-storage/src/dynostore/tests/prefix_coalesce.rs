@@ -812,6 +812,45 @@ async fn keeps_a_segment_while_any_substream_is_live() -> Result<(), Error> {
     Ok(())
 }
 
+/// Segment expiry is single-writer per prefix (#115): every replica runs
+/// `maintain`, so without a lease all N would race the same deletes + floor
+/// writes. Reusing the compaction lease makes a non-holder yield rather than
+/// re-run the expiry against already-gone keys. Two stores share a bucket; the
+/// lease holder expires, the other yields with the segments untouched.
+#[tokio::test]
+async fn segment_expiry_yields_to_the_lease_holder() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let holder = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let other = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+
+    let topic = "org.env.conn.tab_a";
+    create_topic(&holder, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    // Two ancient segments, both past any positive retention threshold.
+    _ = holder.produce(None, &a, batch_at(1, 1_000)?).await?;
+    _ = holder.produce(None, &a, batch_at(1, 2_000)?).await?;
+    assert_eq!(2, segments(&bucket).await.len());
+
+    // The holder takes the maintenance (compaction) lease; `other` is fenced.
+    assert!(holder.acquire_compaction_lease(PREFIX).await.is_ok());
+
+    // A non-holder must yield: no deletes, segments untouched.
+    let threshold = now_ms();
+    assert_eq!(0, other.expire_prefix_segments(PREFIX, threshold).await?);
+    assert_eq!(
+        2,
+        segments(&bucket).await.len(),
+        "a non-holder must not delete segments (#115)"
+    );
+
+    // The lease holder performs the expiry.
+    assert_eq!(2, holder.expire_prefix_segments(PREFIX, threshold).await?);
+    assert_eq!(0, segments(&bucket).await.len());
+
+    Ok(())
+}
+
 /// A large backfill batch bypasses the segment buffer and takes the legacy
 /// per-object path (#62): already S3-efficient, and parallel (no lease).
 #[tokio::test]
@@ -1135,6 +1174,68 @@ async fn compaction_below_threshold_is_a_noop() -> Result<(), Error> {
         segments(&bucket).await.len(),
         "below threshold: untouched"
     );
+
+    Ok(())
+}
+
+/// A large oldest segment (a prior merge, or a folded-in backfill segment) must
+/// not head-of-line-block compaction of the small segments behind it (#114).
+/// Before the fix the run seeded at the big segment; adding the next overflowed
+/// the target, so the run collapsed to length one, `compact_prefix_segments`
+/// returned `Ok(0)`, and `policy_compact_segments` treated the prefix as drained
+/// while the small segments piled up — `S` unbounded until retention. Now the
+/// big segment is left in place as a boundary and the small run behind it is
+/// merged.
+#[tokio::test]
+async fn large_oldest_segment_does_not_stall_compaction() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    // Leaseless so every produce routes through the segment path (the
+    // non-leaseless backfill bypass would send the big batch to legacy
+    // `records/` instead of making it the large oldest *segment* under test).
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .prefix_leaseless(true)
+        .coalesce_tuning(CoalesceTuning {
+            prefix_compact_min_segments: Some(2),
+            prefix_compact_keep_hot: Some(0),
+            prefix_compact_target_bytes: Some(2048),
+            ..Default::default()
+        });
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    // Oldest segment is large (well above target_bytes): a big batch.
+    _ = store.produce(None, &a, batch(1_000)?).await?;
+    // Six small segments behind it (each far below target_bytes).
+    for _ in 0..6 {
+        _ = store.produce(None, &a, batch(1)?).await?;
+    }
+    assert_eq!(7, segments(&bucket).await.len());
+
+    let before: Vec<i64> = fetch_from(&store, &a, 0)
+        .await?
+        .iter()
+        .map(|b| b.base_offset)
+        .collect();
+
+    // Without the fix this stalls at 7 (the run collapses to length one). With
+    // it, the small run behind the big segment merges and the prefix drains to
+    // <= min_segments.
+    _ = store.policy_compact_segments().await?;
+    let after_count = segments(&bucket).await.len();
+    assert!(
+        after_count <= 2,
+        "small segments behind a large one must still compact (S = {after_count})"
+    );
+
+    // Reads unchanged — offsets and order preserved across the merge.
+    let after: Vec<i64> = fetch_from(&store, &a, 0)
+        .await?
+        .iter()
+        .map(|b| b.base_offset)
+        .collect();
+    assert_eq!(before, after);
 
     Ok(())
 }

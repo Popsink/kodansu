@@ -4573,6 +4573,27 @@ impl DynoStore {
             return Ok(0);
         }
 
+        // Serialize expiry per prefix with the maintenance (compaction) lease
+        // (#115). Every replica runs `maintain`, so without a lease all N race
+        // the same expiry: each duplicates the per-sub-stream watermark-floor CAS
+        // and the seq-floor CAS, and — because the incremental index refresh
+        // never observes deletions below its cached max — a replica that did not
+        // perform the delete keeps stale entries and re-attempts `DeleteObjects`
+        // on already-gone keys. The compaction lease already gates the only other
+        // segment-mutating maintenance op, so reusing it makes retention
+        // single-writer per prefix AND serializes it against compaction on the
+        // same segments. A replica that does not hold the lease yields here; the
+        // holder performs the floor writes, deletes, and prunes its own index.
+        //
+        // A non-holder still carries ghost index entries for the segments the
+        // holder deleted (below its refresh watermark) until a cold rebuild —
+        // read-side benign, since `fetch` retries off a refreshed index on a 404
+        // — but it no longer drives redundant floor writes or deletes here.
+        if self.acquire_compaction_lease(prefix).await.is_err() {
+            debug!(prefix, "yielding segment expiry to the lease holder");
+            return Ok(0);
+        }
+
         // Persist a durable offset floor for every sub-stream losing segments
         // BEFORE deleting (#61 review fix): if a drain removes a sub-stream's last
         // segment, cold recovery must not regress to 0 / reuse offsets. The floor
@@ -4686,20 +4707,58 @@ impl DynoStore {
             return Ok(0);
         }
 
-        // Pick a run from the oldest, up to the target size (at least 2). The
+        // Pick the OLDEST contiguous run of at least two segments to merge, up to
+        // the target size — but skip any *leading* segment already at/above the
+        // target (a prior merge, or a large folded-in backfill segment). Such a
+        // segment is effectively done: re-merging it just rewrites ~target_bytes
+        // to absorb one small neighbour (R=2 write amplification), and — worse —
+        // if the next segment overflowed the target the run would collapse to
+        // length one, `compact_prefix_segments` would return `Ok(0)`, and
+        // `policy_compact_segments` would treat the prefix as drained while small
+        // segments pile up behind the big one, so `S` grows unbounded until
+        // retention (#114). A segment at/above the target also *bounds* a run
+        // (never merged across), leaving it in place as its own segment. The
         // merged epoch is taken from the fenced view below, not from this raw
         // scan, so the segment epoch is ignored here.
-        let mut run: Vec<u64> = Vec::new();
-        let mut bytes = 0usize;
-        let mut max_last_modified = i64::MIN;
-        for (seq, _epoch, last_modified, size) in &segs[..eligible_end] {
-            if !run.is_empty() && bytes + size > self.prefix_compact_target_bytes {
-                break;
+        let (run, max_last_modified): (Vec<u64>, i64) = {
+            let mut chosen: Vec<u64> = Vec::new();
+            let mut chosen_last_modified = i64::MIN;
+            let mut start = 0usize;
+
+            while start < eligible_end {
+                // A leading (or intervening) already-target-sized segment is a
+                // boundary: leave it alone and seed the run after it.
+                if segs[start].3 >= self.prefix_compact_target_bytes {
+                    start += 1;
+                    continue;
+                }
+
+                let mut bytes = 0usize;
+                let mut end = start;
+                while end < eligible_end
+                    && segs[end].3 < self.prefix_compact_target_bytes
+                    && (end == start || bytes + segs[end].3 <= self.prefix_compact_target_bytes)
+                {
+                    bytes += segs[end].3;
+                    end += 1;
+                }
+
+                if end - start >= 2 {
+                    chosen = segs[start..end].iter().map(|(seq, ..)| *seq).collect();
+                    chosen_last_modified = segs[start..end]
+                        .iter()
+                        .map(|(_, _, last_modified, _)| *last_modified)
+                        .max()
+                        .unwrap_or(i64::MIN);
+                    break;
+                }
+
+                // A lone small segment wedged between large ones: advance past it.
+                start = end.max(start + 1);
             }
-            run.push(*seq);
-            bytes += size;
-            max_last_modified = max_last_modified.max(*last_modified);
-        }
+
+            (chosen, chosen_last_modified)
+        };
         if run.len() < 2 {
             return Ok(0);
         }
