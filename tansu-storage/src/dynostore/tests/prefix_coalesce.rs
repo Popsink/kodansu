@@ -24,7 +24,7 @@ use bytes::Bytes;
 use futures::TryStreamExt as _;
 use object_store::{ObjectStore, ObjectStoreExt, memory::InMemory, path::Path};
 use tansu_sans_io::{
-    IsolationLevel, ListOffset,
+    ErrorCode, IsolationLevel, ListOffset,
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
     record::{Record, deflated, inflated},
 };
@@ -1437,6 +1437,222 @@ async fn leaseless_concurrent_writers_no_reuse_or_gap() -> Result<(), Error> {
         .map(|batch| batch.last_offset_delta as i64 + 1)
         .sum();
     assert_eq!(4, total, "no record lost or duplicated under contention");
+
+    Ok(())
+}
+
+/// An idempotent batch for `producer_id`/`epoch` at `base_sequence`.
+fn idempotent_batch(
+    producer_id: i64,
+    epoch: i16,
+    base_sequence: i32,
+    records: usize,
+) -> Result<deflated::Batch> {
+    let mut builder = inflated::Batch::builder()
+        .producer_id(producer_id)
+        .producer_epoch(epoch)
+        .base_sequence(base_sequence)
+        .last_offset_delta(records as i32 - 1);
+
+    for i in 0..records {
+        builder = builder.record(Record::builder().value(Some(Bytes::copy_from_slice(
+            format!("record-{i}").as_bytes(),
+        ))));
+    }
+
+    builder
+        .build()
+        .and_then(deflated::Batch::try_from)
+        .map_err(Into::into)
+}
+
+fn api_error(result: Result<i64>) -> ErrorCode {
+    match result {
+        Err(Error::Api(code)) => code,
+        otherwise => panic!("expected Error::Api, got {otherwise:?}"),
+    }
+}
+
+/// Leaseless idempotent dedup is folded from the log, not from
+/// `producers/{id}.json` (#88): an in-order batch is admitted, a retried batch is
+/// acked with its *original* offset without being re-appended, and the producer
+/// object is never consulted or written on the segment path (its per-pod,
+/// advance-before-durable view is exactly what the fold replaces, #79). This
+/// asserts the demotion directly: no `producers/{id}.json` object exists, yet
+/// dedup is exact.
+#[tokio::test]
+async fn leaseless_idempotent_dedup_is_log_based() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .prefix_leaseless(true);
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let tp = Topition::new(topic, 0);
+
+    let pid = 42;
+    // In order: seq 0 (2 records → offsets 0,1), then seq 2 (offset 2).
+    assert_eq!(
+        0,
+        store
+            .produce(None, &tp, idempotent_batch(pid, 0, 0, 2)?)
+            .await?
+    );
+    assert_eq!(
+        2,
+        store
+            .produce(None, &tp, idempotent_batch(pid, 0, 2, 1)?)
+            .await?
+    );
+
+    // Retries of both batches are acked with their original offsets, not
+    // re-appended.
+    assert_eq!(
+        0,
+        store
+            .produce(None, &tp, idempotent_batch(pid, 0, 0, 2)?)
+            .await?
+    );
+    assert_eq!(
+        2,
+        store
+            .produce(None, &tp, idempotent_batch(pid, 0, 2, 1)?)
+            .await?
+    );
+
+    // The next in-order batch continues densely at offset 3.
+    assert_eq!(
+        3,
+        store
+            .produce(None, &tp, idempotent_batch(pid, 0, 3, 1)?)
+            .await?
+    );
+
+    // The log holds exactly the four distinct records — the two duplicates added
+    // nothing.
+    let fetched = fetch_from(&store, &tp, 0).await?;
+    let total: i64 = fetched
+        .iter()
+        .map(|batch| batch.last_offset_delta as i64 + 1)
+        .sum();
+    assert_eq!(4, total, "duplicates must not append records");
+
+    // Dedup came from the folded footers, so the producer object was never
+    // written on this path.
+    let producer_object = Path::from(format!("clusters/{CLUSTER}/producers/{pid}.json"));
+    assert!(
+        bucket.head(&producer_object).await.is_err(),
+        "leaseless idempotent produce must not write producers/{{id}}.json"
+    );
+
+    Ok(())
+}
+
+/// The dedup state converges across a connection migration (#88): a producer
+/// whose earlier batches were written by one replica continues on a *fresh*
+/// replica with no local producer state. The fresh replica folds the log and
+/// derives the correct expected sequence — so the continuation is admitted (no
+/// false `OutOfOrderSequenceNumber`) and a retry of an earlier batch is still
+/// recognised as a duplicate and acked with its original offset. This is the
+/// window the lazy `producers/{id}.json` checkpoint (#48) left open.
+#[tokio::test]
+async fn leaseless_dedup_survives_pod_migration() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let mk = || {
+        DynoStore::new(CLUSTER, NODE, bucket.clone())
+            .prefix_coalesce(true)
+            .prefix_leaseless(true)
+    };
+    let a_store = mk();
+    let topic = "org.env.conn.tab_a";
+    create_topic(&a_store, topic).await?;
+    let tp = Topition::new(topic, 0);
+
+    let pid = 7;
+    // Replica A writes seq 0 and 1.
+    assert_eq!(
+        0,
+        a_store
+            .produce(None, &tp, idempotent_batch(pid, 0, 0, 1)?)
+            .await?
+    );
+    assert_eq!(
+        1,
+        a_store
+            .produce(None, &tp, idempotent_batch(pid, 0, 1, 1)?)
+            .await?
+    );
+
+    // The producer migrates to a brand-new replica B (cold: no in-memory
+    // producer state, no checkpoint from A). Folding A's segments gives the
+    // right expected sequence, so seq 2 is admitted contiguously.
+    let b_store = mk();
+    assert_eq!(
+        2,
+        b_store
+            .produce(None, &tp, idempotent_batch(pid, 0, 2, 1)?)
+            .await?
+    );
+
+    // A retry of seq 1 on B is deduped from A's log, acked with the original
+    // offset — no false out-of-order, no re-append.
+    assert_eq!(
+        1,
+        b_store
+            .produce(None, &tp, idempotent_batch(pid, 0, 1, 1)?)
+            .await?
+    );
+
+    let reader = mk();
+    let fetched = fetch_from(&reader, &tp, 0).await?;
+    let total: i64 = fetched
+        .iter()
+        .map(|batch| batch.last_offset_delta as i64 + 1)
+        .sum();
+    assert_eq!(3, total, "three distinct records across the migration");
+
+    Ok(())
+}
+
+/// A genuine sequence gap is still rejected on the leaseless path (#88): after
+/// the log-fold, an out-of-order batch (`base_sequence` ahead of the expected
+/// next) returns `OutOfOrderSequenceNumber` — the fold makes the classification
+/// exact, so this is a real gap, not a stale-view artifact.
+#[tokio::test]
+async fn leaseless_out_of_order_sequence_is_rejected() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .prefix_leaseless(true);
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let tp = Topition::new(topic, 0);
+
+    let pid = 99;
+    assert_eq!(
+        0,
+        store
+            .produce(None, &tp, idempotent_batch(pid, 0, 0, 1)?)
+            .await?
+    );
+
+    // seq 3 skips 1 and 2 — a gap.
+    assert_eq!(
+        ErrorCode::OutOfOrderSequenceNumber,
+        api_error(
+            store
+                .produce(None, &tp, idempotent_batch(pid, 0, 3, 1)?)
+                .await
+        )
+    );
+
+    // The rejected batch appended nothing.
+    let fetched = fetch_from(&store, &tp, 0).await?;
+    let total: i64 = fetched
+        .iter()
+        .map(|batch| batch.last_offset_delta as i64 + 1)
+        .sum();
+    assert_eq!(1, total, "the out-of-order batch must not append");
 
     Ok(())
 }

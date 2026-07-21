@@ -27,8 +27,8 @@ use tansu_sans_io::record::{Record, deflated, inflated};
 use crate::{
     Error, Result, Topition,
     dynostore::{
-        DynoStore, ProducerCoord, SEGMENT_FORMAT_VERSION_V2, SEGMENT_MAGIC, SEGMENT_TRAILER_LEN,
-        SegmentFooter, SubstreamEntry,
+        DynoStore, IdempotentClass, ProducerCoord, ProducerTail, SEGMENT_FORMAT_VERSION_V2,
+        SEGMENT_MAGIC, SEGMENT_TRAILER_LEN, SegmentFooter, SubstreamEntry,
     },
 };
 
@@ -246,4 +246,60 @@ fn footer_v2_round_trips_producer_coords_and_nonce() -> Result<(), Error> {
     assert_eq!(footer, decoded);
 
     Ok(())
+}
+
+/// The folded [`ProducerTail`] (#88) classifies idempotent batches exactly:
+/// in-order admit, duplicate-with-offset over the last-five window, a gap → out
+/// of order, a lower epoch → fenced, a higher epoch → reset. Sequence arithmetic
+/// wraps at `i32::MAX` back to 0 (#80), so a producer that wraps stays deduped.
+#[test]
+fn producer_tail_classifies_dedup_epoch_and_wraparound() {
+    // Fresh producer: only sequence 0 is in order.
+    let mut tail = ProducerTail::default();
+    assert_eq!(IdempotentClass::Admit, tail.classify(0, 0));
+    assert_eq!(IdempotentClass::OutOfOrder, tail.classify(0, 1));
+
+    // Fold seq 0 (1 record) at offset 100, then seq 1..=2 (2 records) at 101.
+    tail.fold(0, 0, 0, 100);
+    assert_eq!(IdempotentClass::Admit, tail.classify(0, 1));
+    tail.fold(0, 1, 2, 101);
+
+    // Next in order is seq 3; retries ack their original offsets; a gap is OOO.
+    assert_eq!(IdempotentClass::Admit, tail.classify(0, 3));
+    assert_eq!(IdempotentClass::Duplicate(100), tail.classify(0, 0));
+    assert_eq!(IdempotentClass::Duplicate(101), tail.classify(0, 1));
+    assert_eq!(IdempotentClass::OutOfOrder, tail.classify(0, 5));
+
+    // A higher epoch resets the stream; the old epoch's window no longer applies.
+    assert_eq!(IdempotentClass::Admit, tail.classify(1, 0));
+    tail.fold(1, 0, 0, 200);
+    // A lower epoch is fenced; the old-epoch offset is no longer a duplicate.
+    assert_eq!(IdempotentClass::Fenced, tail.classify(0, 1));
+    assert_eq!(IdempotentClass::OutOfOrder, tail.classify(1, 5));
+
+    // Wraparound: a batch whose last_sequence is i32::MAX makes the next
+    // expected sequence 0, not i32::MIN.
+    let mut wrap = ProducerTail::default();
+    wrap.fold(0, i32::MAX - 1, i32::MAX, 300);
+    assert_eq!(IdempotentClass::Admit, wrap.classify(0, 0));
+    assert_eq!(
+        IdempotentClass::Duplicate(300),
+        wrap.classify(0, i32::MAX - 1)
+    );
+}
+
+/// The duplicate window holds only the last five batches (Kafka's bound): a
+/// sixth fold evicts the oldest, which then reads as out of order rather than a
+/// duplicate.
+#[test]
+fn producer_tail_window_keeps_last_five() {
+    let mut tail = ProducerTail::default();
+    for seq in 0..6 {
+        tail.fold(0, seq, seq, seq as i64);
+    }
+    // The oldest (seq 0) has been evicted; seq 1..=5 remain; next is seq 6.
+    assert_eq!(IdempotentClass::OutOfOrder, tail.classify(0, 0));
+    assert_eq!(IdempotentClass::Duplicate(1), tail.classify(0, 1));
+    assert_eq!(IdempotentClass::Duplicate(5), tail.classify(0, 5));
+    assert_eq!(IdempotentClass::Admit, tail.classify(0, 6));
 }

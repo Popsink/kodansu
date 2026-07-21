@@ -594,6 +594,109 @@ struct ProducerCoord {
     offset_delta: u32,
 }
 
+/// Kafka's per-producer duplicate window: the last five batches are retained so
+/// a retried (duplicate) batch is acked with its *original* offset rather than
+/// re-appended.
+const IDEMPOTENT_WINDOW: usize = 5;
+
+/// The idempotent-dedup outcome for one batch, classified against the folded
+/// [`ProducerTail`] (#88).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IdempotentClass {
+    /// In order (`base_sequence == expected`): assign a fresh offset and append.
+    Admit,
+    /// A retried batch already in the log: ack with its original base offset and
+    /// do not re-append (Kafka's duplicate-with-offset).
+    Duplicate(i64),
+    /// A gap, or a stale sequence too old to verify: `OutOfOrderSequenceNumber`.
+    OutOfOrder,
+    /// A batch from a fenced (lower) producer epoch: `ProducerFenced`.
+    Fenced,
+}
+
+/// Per-`(producer_id, topition)` idempotent state folded from the segment
+/// footers' producer coordinates (#88) — i.e. from the log itself, so every
+/// replica that has folded the same segment set derives the same tail. This
+/// replaces the per-pod `producers/{id}.json` view (which diverges across a
+/// connection migration and advances *before* the batch is durable, #79) as the
+/// dedup authority on the leaseless path. Folding is a pure function of the
+/// footer set; classification reads it plus the current flush's in-flight
+/// reservations.
+#[derive(Clone, Debug, Default)]
+struct ProducerTail {
+    /// Highest producer epoch folded so far. A lower-epoch batch is fenced; a
+    /// higher-epoch batch resets the expected sequence to 0.
+    epoch: i16,
+    /// Whether any coordinate has been folded at `epoch` — distinguishes a brand
+    /// new producer (which must start at sequence 0) from one sitting at a
+    /// wrapped 0.
+    seen: bool,
+    /// The next in-order sequence: Kafka's wrapping increment of the last folded
+    /// `last_sequence`. Meaningful only when `seen`.
+    next_sequence: i32,
+    /// The last <= [`IDEMPOTENT_WINDOW`] folded batches at `epoch`, oldest first,
+    /// as `(base_sequence, base_offset)` — the duplicate lookup window.
+    window: Vec<(i32, i64)>,
+}
+
+impl ProducerTail {
+    /// The sequence a next in-order batch must carry (0 for an unseen producer).
+    fn expected(&self) -> i32 {
+        if self.seen { self.next_sequence } else { 0 }
+    }
+
+    /// Fold one batch's coordinate (in log order) into the tail.
+    fn fold(&mut self, epoch: i16, base_sequence: i32, last_sequence: i32, base_offset: i64) {
+        if epoch < self.epoch {
+            return; // a stale, fenced writer's coordinate — ignore it
+        }
+        if epoch > self.epoch {
+            self.window.clear(); // the new epoch resets the stream
+        }
+        self.epoch = epoch;
+        self.seen = true;
+        self.next_sequence = Self::seq_increment(last_sequence);
+        if self.window.len() == IDEMPOTENT_WINDOW {
+            _ = self.window.remove(0);
+        }
+        self.window.push((base_sequence, base_offset));
+    }
+
+    /// Classify a batch's `(epoch, base_sequence)` against the folded tail.
+    fn classify(&self, epoch: i16, base_sequence: i32) -> IdempotentClass {
+        if epoch < self.epoch {
+            return IdempotentClass::Fenced;
+        }
+        // A higher epoch resets the stream: only sequence 0 is in order, and the
+        // prior epoch's duplicate window no longer applies.
+        let (expected, fresh_epoch) = if epoch > self.epoch {
+            (0, true)
+        } else {
+            (self.expected(), false)
+        };
+        if base_sequence == expected {
+            IdempotentClass::Admit
+        } else if !fresh_epoch
+            && let Some((_, offset)) = self.window.iter().find(|(seq, _)| *seq == base_sequence)
+        {
+            IdempotentClass::Duplicate(*offset)
+        } else {
+            IdempotentClass::OutOfOrder
+        }
+    }
+
+    /// Kafka's `DefaultRecordBatch` sequence increment: wraps at `i32::MAX` back
+    /// to 0 (sequences stay non-negative), keeping the dedup arithmetic
+    /// wraparound-safe (#80).
+    fn seq_increment(sequence: i32) -> i32 {
+        if sequence == i32::MAX {
+            0
+        } else {
+            sequence + 1
+        }
+    }
+}
+
 /// The self-describing footer index of a prefix-coalesced segment (#64): one
 /// [`SubstreamEntry`] per `(topic, partition)` multiplexed into the shared
 /// object, plus the epoch of the writer that produced it (#59). Serialized at
@@ -3488,26 +3591,103 @@ impl DynoStore {
                 Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
             };
 
-            // Re-derive each sub-stream's base from the folded index.
+            // Re-derive each sub-stream's base from the folded index, and
+            // classify each idempotent batch against the log-folded
+            // `ProducerTable` (#88): only an in-order batch is admitted and
+            // consumes a fresh offset; a batch already durable in the log is
+            // acked with its original offset (duplicate) and not re-appended; a
+            // gap or a fenced epoch is rejected. `outcomes[index]` is what the
+            // parked producer is acked with — recomputed every attempt, so a
+            // batch that raced in through a peer (folded on the conflict retry)
+            // flips to a duplicate acked with the winner's offset, closing the
+            // cross-pod dedup window.
             let mut substreams: Vec<(Topition, i64, Vec<deflated::Batch>)> =
                 Vec::with_capacity(grouped.len());
-            let mut assigned = vec![0i64; buffer.pending.len()];
+            let mut outcomes: Vec<Result<i64>> = vec![Ok(0); buffer.pending.len()];
             let mut advances: Vec<(Topition, i64)> = Vec::with_capacity(grouped.len());
+
             for (topition, indices) in &grouped {
                 let base = match self.leaseless_base(topition).await {
                     Ok(base) => base,
                     Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
                 };
+
+                // Working `ProducerTail`s for this sub-stream: seeded from the
+                // fold, then advanced by each batch we admit ahead of another in
+                // the same flush (the in-flight reservations).
+                let mut tails: BTreeMap<i64, ProducerTail> = BTreeMap::new();
+
                 let mut running = base;
                 let mut batches = Vec::with_capacity(indices.len());
                 for &index in indices {
-                    assigned[index] = running;
-                    let batch = &buffer.pending[index].batch;
-                    running += batch.last_offset_delta as i64 + 1;
-                    batches.push(batch.clone());
+                    // Copy the scalars first so no borrow of `buffer` is held
+                    // across the fallible fold below.
+                    let (producer_id, epoch, base_seq, last_offset_delta, is_idempotent) = {
+                        let batch = &buffer.pending[index].batch;
+                        (
+                            batch.producer_id,
+                            batch.producer_epoch,
+                            batch.base_sequence,
+                            batch.last_offset_delta,
+                            batch.is_idempotent(),
+                        )
+                    };
+                    let records = last_offset_delta as i64 + 1;
+
+                    if is_idempotent {
+                        let tail = match tails.entry(producer_id) {
+                            Entry::Occupied(occupied) => occupied.into_mut(),
+                            Entry::Vacant(vacant) => {
+                                let folded = match self.producer_tail_folded(
+                                    prefix,
+                                    topition,
+                                    producer_id,
+                                ) {
+                                    Ok(tail) => tail,
+                                    Err(error) => {
+                                        return Self::fail_prefix_flush(buffer, error, prefix);
+                                    }
+                                };
+                                vacant.insert(folded)
+                            }
+                        };
+
+                        match tail.classify(epoch, base_seq) {
+                            IdempotentClass::Admit => {
+                                let last_seq = base_seq.wrapping_add(last_offset_delta);
+                                outcomes[index] = Ok(running);
+                                tail.fold(epoch, base_seq, last_seq, running);
+                                running += records;
+                                batches.push(buffer.pending[index].batch.clone());
+                            }
+                            IdempotentClass::Duplicate(offset) => {
+                                outcomes[index] = Ok(offset);
+                            }
+                            IdempotentClass::OutOfOrder => {
+                                outcomes[index] =
+                                    Err(Error::Api(ErrorCode::OutOfOrderSequenceNumber));
+                            }
+                            IdempotentClass::Fenced => {
+                                outcomes[index] = Err(Error::Api(ErrorCode::ProducerFenced));
+                            }
+                        }
+                    } else {
+                        outcomes[index] = Ok(running);
+                        running += records;
+                        batches.push(buffer.pending[index].batch.clone());
+                    }
                 }
-                substreams.push((topition.clone(), base, batches));
-                advances.push((topition.clone(), running));
+
+                if !batches.is_empty() {
+                    advances.push((topition.clone(), running));
+                    substreams.push((topition.clone(), base, batches));
+                }
+            }
+
+            // Every batch was a duplicate / rejected: ack the resolved outcomes
+            // without writing an empty segment or burning a sequence.
+            if substreams.is_empty() {
+                return Self::ack_leaseless_outcomes(buffer, outcomes);
             }
 
             // Encode a v2 segment (writer_epoch 0 = leaseless era; the migration
@@ -3536,14 +3716,8 @@ impl DynoStore {
                         .set_seq(prefix, candidate + 1)
                         .inspect_err(|err| debug!(?err));
                     return self
-                        .finalize_prefix_flush(
-                            prefix,
-                            candidate,
-                            &substreams,
-                            footer,
-                            buffer,
-                            &assigned,
-                            &advances,
+                        .finalize_prefix_flush_leaseless(
+                            prefix, candidate, footer, buffer, outcomes, &advances,
                         )
                         .await;
                 }
@@ -3592,6 +3766,81 @@ impl DynoStore {
             Ok(base)
         } else {
             Ok(self.persisted_high(topition).await.unwrap_or(0))
+        }
+    }
+
+    /// Build the folded [`ProducerTail`] for `(topition, producer_id)` from the
+    /// cached prefix index (#88) — no object requests; the leaseless flush
+    /// force-folds the index first. Coordinates fold in log order: segments
+    /// ascending by base offset (epoch-deduped by [`Self::valid_substream_segments`]),
+    /// and producers in offset order within each segment. Because this is a pure
+    /// function of the folded footer set, two replicas that have observed the
+    /// same segments derive an identical tail — the property that makes the
+    /// dedup state converge across a connection migration.
+    fn producer_tail_folded(
+        &self,
+        prefix: &str,
+        topition: &Topition,
+        producer_id: i64,
+    ) -> Result<ProducerTail> {
+        let mut tail = ProducerTail::default();
+        for (_seq, entry) in
+            self.valid_substream_segments(prefix, topition.topic(), topition.partition())?
+        {
+            for pc in &entry.producers {
+                if pc.producer_id == producer_id {
+                    tail.fold(
+                        pc.producer_epoch,
+                        pc.base_sequence,
+                        pc.last_sequence,
+                        entry.base_offset + pc.offset_delta as i64,
+                    );
+                }
+            }
+        }
+        Ok(tail)
+    }
+
+    /// Leaseless finalization (#88): like [`Self::finalize_prefix_flush`] but acks
+    /// each parked producer with its *per-batch* idempotent outcome — the assigned
+    /// offset (admitted), the original offset (duplicate), or an
+    /// `OutOfOrderSequenceNumber` / `ProducerFenced` error — rather than one
+    /// assigned offset for all. Called only after the segment PUT is durable.
+    async fn finalize_prefix_flush_leaseless(
+        &self,
+        prefix: &str,
+        seq: u64,
+        footer: SegmentFooter,
+        buffer: PrefixCoalesceBuffer,
+        outcomes: Vec<Result<i64>>,
+        advances: &[(Topition, i64)],
+    ) {
+        _ = self
+            .index_insert(prefix, seq, footer, Self::now_ms())
+            .inspect_err(|err| debug!(?err));
+        SEGMENT_FLUSHES.add(1, &[]);
+        debug!(prefix, seq, "leaseless prefix segment flushed");
+
+        // The write is durable — advance each admitted sub-stream's hint.
+        for (topition, high) in advances {
+            _ = self
+                .set_high(topition, *high)
+                .inspect_err(|err| debug!(?err));
+        }
+
+        Self::ack_leaseless_outcomes(buffer, outcomes);
+    }
+
+    /// Ack every parked producer in a leaseless flush with its classified
+    /// idempotent outcome (#88): `Ok(offset)` for an admitted or duplicate batch,
+    /// `Err(code)` for an out-of-order or fenced one.
+    fn ack_leaseless_outcomes(buffer: PrefixCoalesceBuffer, outcomes: Vec<Result<i64>>) {
+        for (index, pending) in buffer.pending.into_iter().enumerate() {
+            let outcome = outcomes
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| Err(Error::Api(ErrorCode::UnknownServerError)));
+            _ = pending.ack.send(outcome);
         }
     }
 
@@ -5492,36 +5741,6 @@ impl Storage for DynoStore {
             .inspect_err(|err| debug!(?err))?;
 
         {
-            if deflated.is_idempotent() {
-                // Validate (and advance) the idempotent sequence on the producer's
-                // own `producers/{id}.json` object rather than the cluster-global
-                // `meta` object, so distinct producers no longer contend on one
-                // hot object on GCS (#13). The advance is applied in memory (the
-                // fast-path authority) and the object is checkpointed lazily, so
-                // an idempotent batch no longer costs a second S3 PUT (#48); the
-                // exact OutOfOrder/Duplicate/Fenced semantics are unchanged.
-                self.advance_idempotent_sequence(
-                    deflated.producer_id,
-                    deflated.producer_epoch,
-                    topition,
-                    deflated.base_sequence,
-                    deflated.last_offset_delta,
-                )
-                .await
-                .inspect(|outcome| debug!(transaction_id, ?topition, ?outcome))
-                // `DuplicateSequenceNumber` / `OutOfOrderSequenceNumber` are the
-                // expected idempotent-producer outcomes for a retried batch, not
-                // broker failures — log them at debug like the CAS itself, and
-                // reserve error! for genuinely unexpected Api errors (#37).
-                .inspect_err(|err| {
-                    if err.is_expected_idempotent_outcome() {
-                        debug!(?err, transaction_id, ?topition);
-                    } else {
-                        error!(?err, transaction_id, ?topition);
-                    }
-                })?;
-            }
-
             let attributes =
                 BatchAttribute::try_from(deflated.attributes).inspect_err(|err| debug!(?err))?;
 
@@ -5531,8 +5750,7 @@ impl Storage for DynoStore {
             // Transactional, control and compacted batches bypass both paths
             // (offset/txn-marker/compaction semantics must stay one batch per
             // object, and a compacted topic can't share a whole-segment-expiry
-            // segment, #61); the idempotent sequence and schema were already
-            // validated above, so a duplicate is rejected before it is buffered.
+            // segment, #61).
             let coalesce_eligible = transaction_id.is_none()
                 && !attributes.transaction
                 && !attributes.control
@@ -5549,29 +5767,73 @@ impl Storage for DynoStore {
                                 .is_some_and(|value| value.contains("compact"))
                     });
 
-            if coalesce_eligible {
-                if self.prefix_coalesce {
-                    // Backfill high-throughput bypass (#62): a snapshot streams a
-                    // whole table to one partition in large batches that are
-                    // already S3-efficient on their own (~thousands of events per
-                    // PUT) and want the parallelism single-writer segments cap. A
-                    // large batch takes the legacy per-(topic,partition) create
-                    // path below (lock-free/parallel, no lease) — BUT only while
-                    // the sub-stream has no segment yet, so legacy offsets stay
-                    // strictly below segment offsets (the #58 seam the hybrid read
-                    // path depends on). A large batch arriving *after* segmentation
-                    // (e.g. a mid-life add-table snapshot or lag catch-up) must
-                    // coalesce, or it would write legacy objects above segments and
-                    // break fetch ordering / cold recovery (#60 review fix).
-                    let records = deflated.last_offset_delta as i64 + 1;
-                    let bypass_backfill = records >= Self::PREFIX_BACKFILL_MIN_RECORDS
-                        && self.segment_region_start(topition).await?.is_none();
-                    if !bypass_backfill {
-                        return self.enqueue_prefix_coalesced(topition, deflated).await;
-                    }
-                } else if self.produce_coalesce {
-                    return self.enqueue_coalesced(topition, deflated).await;
+            // Will this batch be buffered into a prefix-coalesced segment
+            // (#57)? Backfill high-throughput bypass (#62): a snapshot streams a
+            // whole table to one partition in large batches that are already
+            // S3-efficient on their own (~thousands of events per PUT) and want
+            // the parallelism single-writer segments cap. A large batch takes
+            // the legacy per-(topic,partition) create path below (lock-free /
+            // parallel, no lease) — BUT only while the sub-stream has no segment
+            // yet, so legacy offsets stay strictly below segment offsets (the
+            // #58 seam the hybrid read path depends on). A large batch arriving
+            // *after* segmentation (e.g. a mid-life add-table snapshot or lag
+            // catch-up) must coalesce, or it would write legacy objects above
+            // segments and break fetch ordering / cold recovery (#60).
+            let prefix_buffer_route = if coalesce_eligible && self.prefix_coalesce {
+                let records = deflated.last_offset_delta as i64 + 1;
+                let bypass_backfill = records >= Self::PREFIX_BACKFILL_MIN_RECORDS
+                    && self.segment_region_start(topition).await?.is_none();
+                !bypass_backfill
+            } else {
+                false
+            };
+
+            if deflated.is_idempotent() {
+                // Under the leaseless arbiter (#86) the segment flush owns
+                // idempotent dedup: it folds the log's producer coordinates into
+                // a `ProducerTable` (#88) — a cross-pod-convergent authority that
+                // also cannot advance before the batch is durable. So the per-pod
+                // `producers/{id}.json` gate is *skipped* for batches taking that
+                // route, since it diverges across a connection migration (#79)
+                // and mishandles i32 sequence wraparound (#80). Every other path
+                // (non-leaseless, transactional/control/compacted, backfill
+                // bypass, legacy create) keeps the gate: validate (and advance)
+                // the idempotent sequence on the producer's own
+                // `producers/{id}.json` object rather than the cluster-global
+                // `meta` object, so distinct producers no longer contend on one
+                // hot object on GCS (#13); the advance is applied in memory and
+                // checkpointed lazily so an idempotent batch costs ~1 PUT (#48).
+                let leaseless_segment_route = self.prefix_leaseless && prefix_buffer_route;
+                if !leaseless_segment_route {
+                    self.advance_idempotent_sequence(
+                        deflated.producer_id,
+                        deflated.producer_epoch,
+                        topition,
+                        deflated.base_sequence,
+                        deflated.last_offset_delta,
+                    )
+                    .await
+                    .inspect(|outcome| debug!(transaction_id, ?topition, ?outcome))
+                    // `DuplicateSequenceNumber` / `OutOfOrderSequenceNumber` are
+                    // the expected idempotent-producer outcomes for a retried
+                    // batch, not broker failures — log them at debug like the CAS
+                    // itself, and reserve error! for genuinely unexpected Api
+                    // errors (#37).
+                    .inspect_err(|err| {
+                        if err.is_expected_idempotent_outcome() {
+                            debug!(?err, transaction_id, ?topition);
+                        } else {
+                            error!(?err, transaction_id, ?topition);
+                        }
+                    })?;
                 }
+            }
+
+            if prefix_buffer_route {
+                return self.enqueue_prefix_coalesced(topition, deflated).await;
+            }
+            if coalesce_eligible && !self.prefix_coalesce && self.produce_coalesce {
+                return self.enqueue_coalesced(topition, deflated).await;
             }
 
             // Assign the offset by *creating* the immutable batch object (its
