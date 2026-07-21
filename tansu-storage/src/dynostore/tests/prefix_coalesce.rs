@@ -20,11 +20,12 @@
 
 use std::{
     fmt::{self, Debug, Display},
+    str::FromStr,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
@@ -88,8 +89,8 @@ fn batch_at(records: usize, max_timestamp: i64) -> Result<deflated::Batch> {
 
 fn now_ms() -> i64 {
     i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis(),
     )
@@ -575,7 +576,7 @@ async fn list_offsets_latest_timestamp_from_footer() -> Result<(), Error> {
 
     assert_eq!(Some(2), latest[0].1.offset, "high watermark");
     assert_eq!(
-        Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_millis(TS as u64)),
+        Some(SystemTime::UNIX_EPOCH + Duration::from_millis(TS as u64)),
         latest[0].1.timestamp,
         "tail timestamp derived from the footer max_timestamp",
     );
@@ -590,8 +591,6 @@ async fn list_offsets_latest_timestamp_from_footer() -> Result<(), Error> {
 /// (possibly by another process) is still scanned and expired.
 #[tokio::test]
 async fn pure_segment_partition_retention_skips_rescan() -> Result<(), Error> {
-    use std::time::{Duration, SystemTime};
-
     let bucket = InMemory::new();
     let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
     let topic = "org.env.conn.tab_a";
@@ -1386,7 +1385,7 @@ async fn retention_forever_keeps_segments() -> Result<(), Error> {
     _ = store.produce(None, &a, batch_at(2, 1_000)?).await?;
     assert_eq!(1, segments(&bucket).await.len());
 
-    let deleted = store.policy_delete(std::time::SystemTime::now()).await?;
+    let deleted = store.policy_delete(SystemTime::now()).await?;
     assert_eq!(0, deleted, "retain-forever deletes nothing");
     assert_eq!(1, segments(&bucket).await.len());
 
@@ -2030,6 +2029,236 @@ async fn rollback_rewrites_lease_above_era() -> Result<(), Error> {
         7,
         store.read_lease_epoch(PREFIX).await?,
         "durable lease epoch now exceeds the era"
+    );
+
+    Ok(())
+}
+
+fn at_ms(ms: u64) -> SystemTime {
+    SystemTime::UNIX_EPOCH + Duration::from_millis(ms)
+}
+
+/// #105: `offsetsForTimes` (ListOffset::Timestamp) on a pure-segment topic is
+/// resolved from the footer index — the earliest segment whose newest record
+/// timestamp is at/after the target — instead of scanning the (empty) legacy
+/// `records/` prefix and wrongly returning offset 0. A target past every segment
+/// returns no offset (`None` → -1), per Kafka semantics.
+#[tokio::test]
+async fn list_offsets_by_timestamp_resolves_from_segments() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .prefix_leaseless(true);
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let tp = Topition::new(topic, 0);
+
+    // Three single-record batches, each its own segment (one flush per produce),
+    // with strictly increasing timestamps → segments at offsets 0,1,2.
+    assert_eq!(0, store.produce(None, &tp, batch_at(1, 1000)?).await?);
+    assert_eq!(1, store.produce(None, &tp, batch_at(1, 2000)?).await?);
+    assert_eq!(2, store.produce(None, &tp, batch_at(1, 3000)?).await?);
+
+    let ask = |ts: u64| {
+        let store = &store;
+        let tp = tp.clone();
+        async move {
+            store
+                .list_offsets(
+                    IsolationLevel::ReadUncommitted,
+                    &[(tp, ListOffset::Timestamp(at_ms(ts)))],
+                )
+                .await
+        }
+    };
+
+    // Before everything → first segment (offset 0).
+    assert_eq!(Some(0), ask(500).await?[0].1.offset);
+    // Between seg0 and seg1 → first segment at/after 1500 is seg1 (offset 1).
+    assert_eq!(Some(1), ask(1500).await?[0].1.offset);
+    // Exactly the tail timestamp → the tail segment (offset 2).
+    assert_eq!(Some(2), ask(3000).await?[0].1.offset);
+    // After every record → no offset (regression guard: must NOT be 0).
+    assert_eq!(None, ask(4000).await?[0].1.offset);
+
+    Ok(())
+}
+
+/// An `ObjectStore` that fails the footer GET of any segment whose sequence is
+/// `>= fail_from_seq` (an `AtomicU64`, raisable to disarm). Drives the #105
+/// incremental-commit test: a cold index build that errors partway must still
+/// have committed the footers it read before the error.
+#[derive(Clone)]
+struct FailSegmentFooterFrom<O> {
+    inner: O,
+    fail_from_seq: Arc<AtomicU64>,
+}
+
+impl<O> Debug for FailSegmentFooterFrom<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FailSegmentFooterFrom").finish()
+    }
+}
+
+impl<O> Display for FailSegmentFooterFrom<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FailSegmentFooterFrom").finish()
+    }
+}
+
+fn seg_seq_of(location: &Path) -> Option<u64> {
+    let name = location.parts().next_back()?;
+    let name = name.as_ref();
+    name.strip_suffix(".seg")
+        .filter(|seq| seq.len() >= 20)
+        .and_then(|seq| u64::from_str(&seq[0..20]).ok())
+}
+
+#[async_trait]
+impl<O> ObjectStore for FailSegmentFooterFrom<O>
+where
+    O: ObjectStore,
+{
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult, object_store::Error> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> Result<GetResult, object_store::Error> {
+        if let Some(seq) = seg_seq_of(location)
+            && seq >= self.fail_from_seq.load(Relaxed)
+        {
+            return Err(object_store::Error::Generic {
+                store: "fail-footer",
+                source: format!("injected footer failure at seq {seq}").into(),
+            });
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path, object_store::Error>>,
+    ) -> BoxStream<'static, Result<Path, object_store::Error>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> Result<ListResult, object_store::Error> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: CopyOptions,
+    ) -> Result<(), object_store::Error> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+}
+
+/// #105: a cold prefix-index build commits footers **incrementally**, so a build
+/// that errors partway (a client abandoning its request, modelled here as a
+/// footer GET failure) still caches the footers it read — the index warms across
+/// attempts instead of restarting from zero (the "sustained, not decaying"
+/// stall). The retry only reads the segments still missing.
+#[tokio::test]
+async fn prefix_index_cold_build_commits_incrementally() -> Result<(), Error> {
+    let inner = InMemory::new();
+
+    // Writer populates 6 segments (0..=5) under one prefix.
+    {
+        let writer = DynoStore::new(CLUSTER, NODE, inner.clone())
+            .prefix_coalesce(true)
+            .prefix_leaseless(true);
+        let topic = "org.env.conn.tab_a";
+        create_topic(&writer, topic).await?;
+        let tp = Topition::new(topic, 0);
+        for _ in 0..6 {
+            _ = writer.produce(None, &tp, batch(1)?).await?;
+        }
+        assert_eq!(
+            6,
+            segments(&inner).await.len(),
+            "writer laid down 6 segments"
+        );
+    }
+
+    // A fresh (cold-index) reader whose footer GETs fail from seq 3 onward.
+    let fail_from_seq = Arc::new(AtomicU64::new(3));
+    let reader = DynoStore::new(
+        CLUSTER,
+        NODE,
+        FailSegmentFooterFrom {
+            inner: inner.clone(),
+            fail_from_seq: fail_from_seq.clone(),
+        },
+    )
+    .prefix_coalesce(true)
+    .prefix_leaseless(true);
+
+    let cached = |store: &DynoStore| {
+        store
+            .prefix_index
+            .lock()
+            .unwrap()
+            .get(PREFIX)
+            .map(|entry| entry.segments.len())
+            .unwrap_or(0)
+    };
+
+    // The cold build errors at seq 3 — but seq 0,1,2 were read and committed.
+    assert!(
+        reader.refresh_prefix_index(PREFIX).await.is_err(),
+        "cold build should surface the injected footer failure"
+    );
+    assert_eq!(
+        3,
+        cached(&reader),
+        "footers read before the failure are committed (incremental, not all-or-nothing)"
+    );
+
+    // Disarm the fault; the retry reads only the still-missing seq 3,4,5.
+    fail_from_seq.store(u64::MAX, Relaxed);
+    reader.refresh_prefix_index(PREFIX).await?;
+    assert_eq!(
+        6,
+        cached(&reader),
+        "retry completes the index — warms across attempts"
     );
 
     Ok(())
