@@ -66,10 +66,6 @@ use tansu_sans_io::{
     record::{Record, deflated, inflated},
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
 };
-use tansu_schema::{
-    Registry,
-    lake::{House, LakeHouse as _},
-};
 use tokio::sync::oneshot;
 use tokio::time::Duration;
 use tracing::{debug, error, info, instrument, warn};
@@ -96,8 +92,6 @@ pub struct DynoStore {
     cluster: String,
     node: i32,
     advertised_listener: Url,
-    schemas: Option<Registry>,
-    lake: Option<House>,
     watermarks: Arc<Mutex<BTreeMap<Topition, OptiCon<Watermark>>>>,
     meta: OptiCon<Meta>,
 
@@ -946,10 +940,6 @@ impl DynoStore {
             cluster: cluster.into(),
             node,
             advertised_listener: Url::parse("tcp://127.0.0.1/").unwrap(),
-            schemas: None,
-
-            lake: None,
-
             watermarks: Arc::new(Mutex::new(BTreeMap::new())),
             next_offsets: Arc::new(Mutex::new(BTreeMap::new())),
             producers: Arc::new(Mutex::new(BTreeMap::new())),
@@ -999,14 +989,6 @@ impl DynoStore {
             advertised_listener,
             ..self
         }
-    }
-
-    pub fn schemas(self, schemas: Option<Registry>) -> Self {
-        Self { schemas, ..self }
-    }
-
-    pub fn lake(self, lake: Option<House>) -> Self {
-        Self { lake, ..self }
     }
 
     pub fn auto_create(self, auto_create: AutoTopicCreate) -> Self {
@@ -2097,37 +2079,10 @@ impl DynoStore {
             }
         };
 
-        // Mirror the immediate path's lake sink, per sub-batch, with offsets
-        // running from the frame base. Only fetched when a lake is configured.
-        let config = if self.lake.is_some() {
-            self.describe_config(topition.topic(), ConfigResource::Topic, None)
-                .await
-                .inspect_err(|err| debug!(?err))
-                .ok()
-        } else {
-            None
-        };
-
         let mut running = base;
         for pending in buffer.pending {
             let offset = running;
             running += pending.batch.last_offset_delta as i64 + 1;
-
-            if let (Some(lake), Some(config)) = (self.lake.as_ref(), config.as_ref())
-                && let Ok(inflated) = inflated::Batch::try_from(&pending.batch)
-            {
-                _ = lake
-                    .store(
-                        topition.topic(),
-                        topition.partition(),
-                        offset,
-                        &inflated,
-                        config.clone(),
-                    )
-                    .await
-                    .inspect_err(|err| debug!(?err));
-            }
-
             _ = pending.ack.send(Ok(offset));
         }
     }
@@ -3468,43 +3423,8 @@ impl DynoStore {
                 .inspect_err(|err| debug!(?err));
         }
 
-        // Mirror the immediate path's lake sink per sub-batch. Config is fetched
-        // once per topic and only when a lake is configured.
-        let mut configs: BTreeMap<String, Option<_>> = BTreeMap::new();
         for (index, pending) in buffer.pending.into_iter().enumerate() {
             let offset = assigned[index];
-            let topition = &pending.topition;
-
-            if self.lake.is_some() {
-                let config = match configs.get(topition.topic()) {
-                    Some(config) => config.clone(),
-                    None => {
-                        let config = self
-                            .describe_config(topition.topic(), ConfigResource::Topic, None)
-                            .await
-                            .inspect_err(|err| debug!(?err))
-                            .ok();
-                        _ = configs.insert(topition.topic().to_owned(), config.clone());
-                        config
-                    }
-                };
-
-                if let (Some(lake), Some(config)) = (self.lake.as_ref(), config.as_ref())
-                    && let Ok(inflated) = inflated::Batch::try_from(&pending.batch)
-                {
-                    _ = lake
-                        .store(
-                            topition.topic(),
-                            topition.partition(),
-                            offset,
-                            &inflated,
-                            config.clone(),
-                        )
-                        .await
-                        .inspect_err(|err| debug!(?err));
-                }
-            }
-
             _ = pending.ack.send(Ok(offset));
         }
     }
@@ -5571,92 +5491,7 @@ impl Storage for DynoStore {
             .await
             .inspect_err(|err| debug!(?err))?;
 
-        if self.lake.is_some()
-            && config
-                .configs
-                .as_ref()
-                .map(|configs| {
-                    configs
-                        .iter()
-                        .inspect(|config| debug!(?config))
-                        .any(|config| {
-                            config.name.as_str() == "tansu.lake.sink"
-                                && config
-                                    .value
-                                    .as_deref()
-                                    .and_then(|value| bool::from_str(value).ok())
-                                    .unwrap_or(false)
-                        })
-                })
-                .unwrap_or(false)
         {
-            // Get watermark to calculate proper offset for lake sink
-            let watermark = self.watermarks.lock().map(|mut locked| {
-                locked
-                    .entry(topition.to_owned())
-                    .or_insert_with(|| OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
-                    .to_owned()
-            })?;
-
-            let offset = watermark
-                .with_mut(&self.object_store, |watermark| {
-                    debug!(?watermark);
-
-                    let offset = watermark.high.unwrap_or_default();
-                    watermark.high = watermark.high.map_or_else(
-                        || Some(deflated.last_offset_delta as i64 + 1i64),
-                        |high| Some(high + deflated.last_offset_delta as i64 + 1i64),
-                    );
-
-                    debug!(?watermark);
-
-                    Ok(offset)
-                })
-                .await
-                .inspect(|offset| debug!(offset, transaction_id, ?topition))
-                .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
-
-            // Advance the in-memory hint so a read on THIS broker reflects the
-            // lake-sink write immediately (#72). The lake-sink branch is the only
-            // producer path that writes no batch object, so without this the
-            // fresh-hint fast path would serve a stale high watermark until the
-            // hint TTL expired — a read-your-writes regression the pre-#72 per-poll
-            // GET masked.
-            self.set_high(topition, offset + deflated.last_offset_delta as i64 + 1)?;
-
-            if let Some(ref registry) = self.schemas {
-                let batch_attribute = BatchAttribute::try_from(deflated.attributes)
-                    .inspect(|batch_attribute| debug!(?batch_attribute))
-                    .inspect_err(|err| debug!(?err))?;
-
-                if !batch_attribute.control {
-                    let inflated = inflated::Batch::try_from(&deflated)
-                        .inspect(|inflated| debug!(?inflated))
-                        .inspect_err(|err| debug!(?err))?;
-
-                    registry
-                        .validate(topition.topic(), &inflated)
-                        .await
-                        .inspect(|validation| debug!(?validation))
-                        .inspect_err(|err| debug!(?err))?;
-
-                    if let Some(ref lake) = self.lake {
-                        lake.store(
-                            topition.topic(),
-                            topition.partition(),
-                            offset,
-                            &inflated,
-                            config,
-                        )
-                        .await
-                        .inspect(|store| debug!(?store))
-                        .inspect_err(|err| debug!(?err))?;
-                    }
-                }
-            }
-
-            Ok(offset)
-        } else {
             if deflated.is_idempotent() {
                 // Validate (and advance) the idempotent sequence on the producer's
                 // own `producers/{id}.json` object rather than the cluster-global
@@ -5685,21 +5520,6 @@ impl Storage for DynoStore {
                         error!(?err, transaction_id, ?topition);
                     }
                 })?;
-            }
-
-            if let Some(ref registry) = self.schemas {
-                let batch_attribute = BatchAttribute::try_from(deflated.attributes)
-                    .inspect_err(|err| debug!(?err))?;
-
-                if !batch_attribute.control {
-                    let inflated =
-                        inflated::Batch::try_from(&deflated).inspect_err(|err| debug!(?err))?;
-
-                    registry
-                        .validate(topition.topic(), &inflated)
-                        .await
-                        .inspect_err(|err| debug!(?err))?;
-                }
             }
 
             let attributes =
@@ -5769,24 +5589,6 @@ impl Storage for DynoStore {
                 .await
                 .inspect(|offset| debug!(offset, transaction_id, ?topition))
                 .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
-
-            if !attributes.control
-                && let Some(ref lake) = self.lake
-            {
-                let inflated =
-                    inflated::Batch::try_from(&deflated).inspect_err(|err| debug!(?err))?;
-
-                lake.store(
-                    topition.topic(),
-                    topition.partition(),
-                    offset,
-                    &inflated,
-                    config,
-                )
-                .await
-                .inspect(|store| debug!(?store))
-                .inspect_err(|err| debug!(?err))?;
-            }
 
             if let Some(transaction_id) = transaction_id
                 && attributes.transaction
@@ -7616,15 +7418,6 @@ impl Storage for DynoStore {
         let compacted_segments = self.policy_compact_segments().await?;
         let expired_groups = self.expire_groups(now).await?;
         debug!(deleted, compacted, compacted_segments, expired_groups);
-
-        if let Some(ref lake) = self.lake {
-            return lake
-                .maintain()
-                .await
-                .inspect(|maintain| debug!(?maintain))
-                .inspect_err(|err| debug!(?err))
-                .map_err(Into::into);
-        }
 
         Ok(())
     }
