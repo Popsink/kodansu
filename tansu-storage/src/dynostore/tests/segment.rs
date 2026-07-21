@@ -20,6 +20,8 @@
 //! legacy single-topic coalesced objects (#50, the v0 case) still decode as a
 //! bare batch concatenation.
 
+use std::time::Duration;
+
 use bytes::Bytes;
 use object_store::{PutPayload, memory::InMemory};
 use tansu_sans_io::record::{Record, deflated, inflated};
@@ -27,8 +29,9 @@ use tansu_sans_io::record::{Record, deflated, inflated};
 use crate::{
     Error, Result, Topition,
     dynostore::{
-        DynoStore, IdempotentClass, ProducerCoord, ProducerTail, SEGMENT_FORMAT_VERSION_V2,
-        SEGMENT_MAGIC, SEGMENT_TRAILER_LEN, SegmentFooter, SubstreamEntry,
+        CoalesceTuning, DynoStore, IdempotentClass, ProducerCoord, ProducerTail,
+        SEGMENT_FORMAT_VERSION_V2, SEGMENT_MAGIC, SEGMENT_TRAILER_LEN, SegmentFooter,
+        SubstreamEntry,
     },
 };
 
@@ -302,4 +305,60 @@ fn producer_tail_window_keeps_last_five() {
     assert_eq!(IdempotentClass::Duplicate(1), tail.classify(0, 1));
     assert_eq!(IdempotentClass::Duplicate(5), tail.classify(0, 5));
     assert_eq!(IdempotentClass::Admit, tail.classify(0, 6));
+}
+
+/// #91: the leaseless conflict path derives the next segment sequence from the
+/// already force-folded in-memory index (folded-max + 1) instead of a fresh
+/// LIST, and still honours the persisted seq floor so a name freed by
+/// retention/compaction is never reused.
+#[tokio::test]
+async fn tail_next_seq_folded_derives_from_index_and_floor() -> Result<(), Error> {
+    let store = store();
+    let prefix = "topic-0";
+
+    // Cold: no cached segments, no floor → the first free sequence is 0.
+    assert_eq!(0, store.tail_next_seq_folded(prefix).await?);
+
+    // Fold three segments into the index (no object LIST). Footer content is
+    // irrelevant here — only the sequence keys are read.
+    for seq in 0..3 {
+        store.index_insert(prefix, seq, SegmentFooter::default(), 0)?;
+    }
+    assert_eq!(3, store.tail_next_seq_folded(prefix).await?);
+
+    // A persisted floor above the folded max wins (a retention/compaction delete
+    // freed those names, which must not be reused).
+    store.raise_seq_floor(prefix, 10).await?;
+    assert_eq!(10, store.tail_next_seq_folded(prefix).await?);
+
+    Ok(())
+}
+
+/// #91: the coalesce linger is jittered ±20% per flush so independent pods
+/// de-phase and stop racing the create of the same next segment name. Every
+/// draw stays within the band, and across many draws we actually observe spread
+/// on both sides of the base (it is not a constant).
+#[test]
+fn jittered_linger_stays_within_twenty_percent_band() {
+    let base = Duration::from_millis(100);
+    let store = store().coalesce_tuning(CoalesceTuning {
+        coalesce_linger: Some(base),
+        ..Default::default()
+    });
+
+    let mut below = false;
+    let mut above = false;
+    for _ in 0..1_000 {
+        let linger = store.jittered_linger();
+        assert!(
+            linger >= Duration::from_millis(80) && linger <= Duration::from_millis(120),
+            "jittered linger {linger:?} outside ±20% of {base:?}",
+        );
+        below |= linger < base;
+        above |= linger > base;
+    }
+    assert!(
+        below && above,
+        "jitter did not spread on both sides of the base"
+    );
 }
