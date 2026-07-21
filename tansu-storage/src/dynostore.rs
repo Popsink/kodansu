@@ -1605,6 +1605,18 @@ impl DynoStore {
             .map_err(Into::into)
     }
 
+    /// The cached log-start (`watermark.low`) for `topition` **without any
+    /// object-store request**, or `None` when this process has never read the
+    /// watermark object. Serving `log_start` from here keeps a warm,
+    /// read-uncommitted fetch off the per-poll `watermark.json` GET (#109). A
+    /// missing (or stale-low) value reports 0 — the correct pre-retention log
+    /// start; a consumer that fetches from it self-corrects to the true
+    /// earliest, and the value is refreshed whenever the cold high-watermark
+    /// path reads the watermark object.
+    fn cached_low(&self, topition: &Topition) -> Result<Option<i64>> {
+        Ok(self.watermark(topition)?.cached().and_then(|w| w.low))
+    }
+
     /// Optimistic-concurrency handle on the per-producer `producers/{id}.json`
     /// object holding `producer_id`'s idempotent sequence state.
     fn producer(&self, producer_id: ProducerId) -> Result<OptiCon<ProducerDetail>> {
@@ -6371,6 +6383,37 @@ impl Storage for DynoStore {
         }
 
         Ok(batches)
+    }
+
+    async fn offset_stage_at(
+        &self,
+        topition: &Topition,
+        isolation: IsolationLevel,
+    ) -> Result<OffsetStage> {
+        // Read-committed needs the last-stable offset and the aborted-transaction
+        // list, both derived from the cluster `meta.json` object — take the full,
+        // transaction-aware path (a fresh meta read, unchanged semantics).
+        if isolation == IsolationLevel::ReadCommitted {
+            return self.offset_stage(topition).await;
+        }
+
+        // Read-uncommitted (the common consumer case): no transaction state is
+        // needed. The last-stable offset is the high watermark and there are no
+        // aborted transactions to surface, so `meta.json` — the single, hot,
+        // cluster-wide key — is never read. The high watermark comes from the
+        // in-memory hint (#40) and the log start from the cached watermark
+        // (#109), so a warm, caught-up consumer resolves its fetch-response
+        // offsets with zero object-store requests, off the meta-object throttle
+        // ceiling entirely.
+        let high_watermark = self.high_watermark(topition).await?;
+        let log_start = self.cached_low(topition)?.unwrap_or(0);
+
+        Ok(OffsetStage {
+            last_stable: high_watermark,
+            high_watermark,
+            log_start,
+            aborted: Vec::new(),
+        })
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {

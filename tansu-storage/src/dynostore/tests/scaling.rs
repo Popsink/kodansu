@@ -584,3 +584,91 @@ async fn warm_high_watermark_polls_hit_object_store_zero_times() -> Result<(), E
 
     Ok(())
 }
+
+/// The read-uncommitted fetch response resolves its offsets from
+/// `offset_stage_at`, which for read-uncommitted serves the high watermark from
+/// the fresh hint and the log start from the cached watermark — **never reading
+/// the cluster-wide `meta.json` object** (#109). So a caught-up consumer
+/// long-polling an idle partition issues ZERO object-store requests per poll for
+/// its response metadata. Before #109 the fetch service always called the full,
+/// meta-reading `offset_stage`, adding a `meta.json` GET (a single hot key, an
+/// S3 request ceiling at consumer-fan-out scale) plus a `watermark.json` GET to
+/// every poll.
+#[tokio::test]
+async fn warm_read_uncommitted_offset_stage_hits_object_store_zero_times() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+    let (storage, counters) = store();
+
+    create(&storage, "hot", 1).await?;
+    let topition = Topition::new("hot", 0);
+    for n in 0..4 {
+        _ = storage
+            .produce(None, &topition, batch(format!("m-{n}").as_bytes())?)
+            .await?;
+    }
+
+    // Warm the high-watermark hint once (a real fetch does this via the produce
+    // and the first read); this is the only step that touches the store.
+    let warmed = storage
+        .offset_stage_at(&topition, IsolationLevel::ReadUncommitted)
+        .await?;
+    assert_eq!(4, warmed.high_watermark());
+
+    // Steady-state long-poll: every response-offset resolution within the TTL is
+    // served from memory with no object-store traffic.
+    counters.reset();
+    for _ in 0..50 {
+        let stage = storage
+            .offset_stage_at(&topition, IsolationLevel::ReadUncommitted)
+            .await?;
+        assert_eq!(4, stage.high_watermark());
+        // Read-uncommitted: last-stable == high watermark, no aborted list.
+        assert_eq!(4, stage.last_stable());
+        assert!(stage.aborted().is_empty());
+    }
+    let warm = counters.report("50 warm read-uncommitted offset_stage_at polls");
+
+    assert_eq!(
+        (0, 0, 0, 0, 0),
+        warm,
+        "read-uncommitted offset_stage_at must read neither meta.json nor watermark.json on a warm poll (#109)"
+    );
+
+    Ok(())
+}
+
+/// Consistency guard: read-uncommitted `offset_stage_at` reports the same high
+/// watermark as the full `offset_stage`, and the read-committed variant still
+/// funnels through the full path (surfacing transaction state). This pins that
+/// #109 only *dropped the meta read for read-uncommitted*, without changing the
+/// observed offsets on a non-transactional workload.
+#[tokio::test]
+async fn read_uncommitted_offset_stage_matches_full_stage() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+    let (storage, _counters) = store();
+
+    create(&storage, "hot", 1).await?;
+    let topition = Topition::new("hot", 0);
+    for n in 0..7 {
+        _ = storage
+            .produce(None, &topition, batch(format!("m-{n}").as_bytes())?)
+            .await?;
+    }
+
+    let full = storage.offset_stage(&topition).await?;
+    let uncommitted = storage
+        .offset_stage_at(&topition, IsolationLevel::ReadUncommitted)
+        .await?;
+    let committed = storage
+        .offset_stage_at(&topition, IsolationLevel::ReadCommitted)
+        .await?;
+
+    assert_eq!(full.high_watermark(), uncommitted.high_watermark());
+    assert_eq!(full.log_start(), uncommitted.log_start());
+    // No open/aborted transactions on this workload, so last-stable == high.
+    assert_eq!(full.high_watermark(), uncommitted.last_stable());
+    // Read-committed goes through the full path unchanged.
+    assert_eq!(full, committed);
+
+    Ok(())
+}

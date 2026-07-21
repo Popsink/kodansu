@@ -261,6 +261,19 @@ where
     /// not exist. Unlike [`Self::with`], absence is reported as `None` rather
     /// than the `Default` value, so callers can distinguish an absent key from
     /// one holding default fields (topic existence checks rely on this).
+    /// The in-memory cached value **without any object-store request**, or
+    /// `None` when nothing has been read into the cache yet. Used to serve a
+    /// rarely-changing value (e.g. the log-start watermark) on a hot read path
+    /// without a per-call conditional GET (#109). Freshness is the caller's
+    /// responsibility — the cache is populated by [`Self::with`]/[`Self::get`]
+    /// on the cold/slow path.
+    pub(super) fn cached(&self) -> Option<D> {
+        self.data_version
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|dv| dv.data.clone()))
+    }
+
     #[instrument(skip_all, fields(path = %self.path))]
     pub(super) async fn get_opt(&self, object_store: &impl ObjectStore) -> Result<Option<D>> {
         REQUESTS.add(1, &[KeyValue::new("method", "get_opt")]);
