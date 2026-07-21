@@ -285,6 +285,14 @@ pub struct DynoStore {
     /// path) re-creates one — otherwise served from memory (no per-fetch LIST).
     legacy_records_present: Arc<Mutex<BTreeMap<Topition, (bool, SystemTime)>>>,
 
+    /// Per-topic memo of whether `cleanup.policy` is `compact`, with a check
+    /// time (#113). `produce` consults this on every batch to decide the
+    /// coalesce route; the topic config changes only on `AlterConfigs` (rare), so
+    /// a short TTL keeps the produce hot path off a per-batch conditional GET of
+    /// `topic-metadata/<name>.json` while still picking up a policy change within
+    /// the window.
+    compacted_topics: Arc<Mutex<BTreeMap<String, (bool, SystemTime)>>>,
+
     /// This writer's identity, recorded in the lease `holder` field (#59) for
     /// observability. Unique per process instance so two brokers (or two test
     /// stores) are distinguishable.
@@ -1071,6 +1079,7 @@ impl DynoStore {
             compaction_leases: Arc::new(Mutex::new(BTreeMap::new())),
             era_epochs: Arc::new(Mutex::new(BTreeMap::new())),
             legacy_records_present: Arc::new(Mutex::new(BTreeMap::new())),
+            compacted_topics: Arc::new(Mutex::new(BTreeMap::new())),
             writer_id: format!(
                 "{node}-{}",
                 WRITER_INSTANCE.fetch_add(1, atomic::Ordering::Relaxed)
@@ -3244,6 +3253,49 @@ impl DynoStore {
         });
 
         Ok(present)
+    }
+
+    /// Whether `topic`'s `cleanup.policy` is `compact`, memoized for
+    /// [`Self::HIGH_WATERMARK_HINT_TTL`] (#113). `produce` needs this on every
+    /// batch to choose the coalesce route; the value changes only on a rare
+    /// `AlterConfigs`, so serving it from memory keeps the produce hot path off a
+    /// per-batch conditional GET of the `topic-metadata/<name>.json` object. A
+    /// policy change is observed within the TTL.
+    async fn topic_is_compacted(&self, topic: &str) -> Result<bool> {
+        if let Some((compacted, checked_at)) = self
+            .compacted_topics
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .get(topic)
+            .copied()
+            && checked_at
+                .elapsed()
+                .is_ok_and(|elapsed| elapsed < Self::HIGH_WATERMARK_HINT_TTL)
+        {
+            return Ok(compacted);
+        }
+
+        let compacted = self
+            .describe_config(topic, ConfigResource::Topic, None)
+            .await
+            .inspect_err(|err| debug!(?err))?
+            .configs
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|config| {
+                config.name == "cleanup.policy"
+                    && config
+                        .value
+                        .as_deref()
+                        .is_some_and(|value| value.contains("compact"))
+            });
+
+        _ = self.compacted_topics.lock().map(|mut cache| {
+            _ = cache.insert(topic.to_owned(), (compacted, SystemTime::now()));
+        });
+
+        Ok(compacted)
     }
 
     /// Fetch a topition's records from the legacy per-`(topic, partition)`
@@ -6193,11 +6245,6 @@ impl Storage for DynoStore {
         topition: &Topition,
         deflated: deflated::Batch,
     ) -> Result<i64> {
-        let config = self
-            .describe_config(topition.topic(), ConfigResource::Topic, None)
-            .await
-            .inspect_err(|err| debug!(?err))?;
-
         {
             let attributes =
                 BatchAttribute::try_from(deflated.attributes).inspect_err(|err| debug!(?err))?;
@@ -6208,22 +6255,13 @@ impl Storage for DynoStore {
             // Transactional, control and compacted batches bypass both paths
             // (offset/txn-marker/compaction semantics must stay one batch per
             // object, and a compacted topic can't share a whole-segment-expiry
-            // segment, #61).
+            // segment, #61). The compacted-policy check is memoized (#113) so a
+            // steady-state produce does not read the topic metadata object per
+            // batch.
             let coalesce_eligible = transaction_id.is_none()
                 && !attributes.transaction
                 && !attributes.control
-                && !config
-                    .configs
-                    .as_deref()
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|config| {
-                        config.name == "cleanup.policy"
-                            && config
-                                .value
-                                .as_deref()
-                                .is_some_and(|value| value.contains("compact"))
-                    });
+                && !self.topic_is_compacted(topition.topic()).await?;
 
             // Will this batch be buffered into a prefix-coalesced segment (#57)?
             //
@@ -6677,6 +6715,15 @@ impl Storage for DynoStore {
                     None
                 } {
                     Some(timestamp) => Some(timestamp),
+                    // Only the legacy `records/` tail can carry a timestamp when
+                    // the segment index has none. For a pure-segment coalesced
+                    // topic there are no legacy objects, so that LIST would scan
+                    // an empty prefix and return nothing (#113) — skip it (the
+                    // memo is cheap, #110) and report no timestamp. A hybrid /
+                    // non-coalesced topic still lists for the legacy tail mtime.
+                    None if self.prefix_coalesce && !self.has_legacy_records(topition).await? => {
+                        None
+                    }
                     None => self
                         .list_batch_offsets(topition)
                         .await?
