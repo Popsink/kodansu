@@ -543,11 +543,22 @@ const SEGMENT_FORMAT_VERSION_V2: u16 = 2;
 
 /// Fixed-size trailer at the very end of every multi-topic segment (#64):
 /// `footer_len (u64) + entry_count (u32) + version (u16) + magic (u32)`. A
-/// reader recovers the index with one ranged GET of the last
-/// [`SEGMENT_TRAILER_LEN`] bytes, then a second ranged GET of the `footer_len`
-/// bytes immediately preceding it — never downloading the record body.
+/// reader recovers the index with one ranged GET of a suffix that, for almost
+/// every segment, already covers the whole footer (see
+/// [`SEGMENT_FOOTER_OVER_READ`]); only a footer larger than the over-read needs
+/// a second exact GET — never downloading the record body.
 const SEGMENT_TRAILER_LEN: usize =
     size_of::<u64>() + size_of::<u32>() + size_of::<u16>() + size_of::<u32>();
+
+/// Speculative suffix size for reading a segment footer in a single ranged GET
+/// (#112 follow-up). The trailer + footer of the overwhelming majority of
+/// segments fit within this, so one over-reading GET replaces the previous
+/// read-trailer-then-read-footer two-GET dance — halving the footer GETs the
+/// read/refresh path pays on every non-writer replica. A footer larger than
+/// this (a prefix with very many sub-streams) falls back to a second exact GET.
+/// Footers are immutable, so the over-read is always self-consistent; the extra
+/// bytes are in-region and cost nothing per request.
+const SEGMENT_FOOTER_OVER_READ: usize = 64 * 1024;
 
 /// One `(topic, partition)` sub-stream's self-describing entry in a segment
 /// footer (#64): where its batches live in the shared object and what offset
@@ -2704,12 +2715,18 @@ impl DynoStore {
     /// legacy #50 object). This is the read primitive the fetch path (#60) also
     /// builds on.
     async fn read_segment_footer(&self, location: &Path) -> Result<Option<SegmentFooter>> {
-        let trailer = self
+        // One speculative suffix GET covers the trailer and, for almost every
+        // segment, the whole footer too (#112 follow-up) — halving the per-footer
+        // GETs the read/refresh path pays on non-writer replicas. `decode_segment_footer`
+        // reads the trailer from the end of the buffer and slices the footer just
+        // before it, so leading record bytes in the over-read are ignored.
+        let over_read = SEGMENT_FOOTER_OVER_READ.max(SEGMENT_TRAILER_LEN);
+        let buffer = self
             .object_store
             .get_opts(
                 location,
                 GetOptions {
-                    range: Some(GetRange::Suffix(SEGMENT_TRAILER_LEN as u64)),
+                    range: Some(GetRange::Suffix(over_read as u64)),
                     ..Default::default()
                 },
             )
@@ -2717,10 +2734,11 @@ impl DynoStore {
             .bytes()
             .await?;
 
-        if trailer.len() < SEGMENT_TRAILER_LEN {
+        if buffer.len() < SEGMENT_TRAILER_LEN {
             return Ok(None);
         }
 
+        let trailer = &buffer[buffer.len() - SEGMENT_TRAILER_LEN..];
         let magic = u32::from_be_bytes(trailer[14..18].try_into()?);
         if magic != SEGMENT_MAGIC {
             return Ok(None);
@@ -2728,6 +2746,13 @@ impl DynoStore {
 
         let footer_len = u64::from_be_bytes(trailer[0..8].try_into()?) as usize;
 
+        // Fast path: the over-read already holds the whole `[footer || trailer]`.
+        if SEGMENT_TRAILER_LEN + footer_len <= buffer.len() {
+            return self.decode_segment_footer(&buffer);
+        }
+
+        // Rare: a footer larger than the over-read (a prefix with very many
+        // sub-streams). Fetch exactly the `[footer || trailer]` suffix.
         let tail = self
             .object_store
             .get_opts(

@@ -672,3 +672,57 @@ async fn read_uncommitted_offset_stage_matches_full_stage() -> Result<(), Error>
 
     Ok(())
 }
+
+/// Reading a segment footer takes ONE ranged GET, not two (#112 follow-up): the
+/// over-read suffix already holds the trailer and the (small) footer, so a cold
+/// index build on a non-writer replica pays one GET per segment footer instead
+/// of two — halving the residual footer-GET plane. Correctness unchanged: the
+/// footer decodes and the segment is located.
+#[tokio::test]
+async fn cold_prefix_index_reads_one_get_per_small_footer() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let writer = DynoStore::new(
+        CLUSTER,
+        NODE,
+        Counting {
+            inner: bucket.clone(),
+            counters: Arc::new(Counters::default()),
+        },
+    )
+    .prefix_coalesce(true)
+    .prefix_leaseless(true);
+    create(&writer, "org.env.conn.hot", 1).await?;
+    let topition = Topition::new("org.env.conn.hot", 0);
+    _ = writer.produce(None, &topition, batch(b"m")?).await?;
+
+    // Fresh reader (cold index) locates the segment: one full LIST of the
+    // segments prefix + exactly ONE GET for the single small footer.
+    let reader_counters = Arc::new(Counters::default());
+    let reader = DynoStore::new(
+        CLUSTER,
+        NODE,
+        Counting {
+            inner: bucket.clone(),
+            counters: reader_counters.clone(),
+        },
+    )
+    .prefix_coalesce(true)
+    .prefix_leaseless(true);
+
+    let region_start = reader.segment_region_start(&topition).await?;
+    let reads = reader_counters.report("cold segment_region_start (1 segment)");
+
+    assert_eq!(
+        Some(0),
+        region_start,
+        "the footer decoded from the over-read locates the segment at base offset 0"
+    );
+    assert_eq!(
+        1, reads.1,
+        "one GET for the single small footer (was two before #112 follow-up)"
+    );
+
+    Ok(())
+}
