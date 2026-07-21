@@ -43,7 +43,7 @@ use tansu_sans_io::{
 
 use crate::{
     Error, Result, Storage, Topition,
-    dynostore::{CoalesceTuning, DynoStore, SegmentFooter, SubstreamEntry},
+    dynostore::{CoalesceTuning, DynoStore, Era, PrefixLease, SegmentFooter, SubstreamEntry},
 };
 
 const CLUSTER: &str = "tansu";
@@ -197,6 +197,36 @@ async fn footer_of(bucket: &InMemory, store: &DynoStore, location: &Path) -> Seg
         .decode_segment_footer(&bytes)
         .expect("decode footer")
         .expect("segment carries a footer")
+}
+
+/// Write a pre-cutover `lease.json` for `prefix` with a chosen epoch (expired),
+/// standing in for the lease-era state the #92 migration seeds the era above.
+async fn write_lease(bucket: &InMemory, store: &DynoStore, prefix: &str, epoch: i64) {
+    let payload = PutPayload::from(Bytes::from(
+        serde_json::to_vec(&PrefixLease {
+            epoch,
+            holder: "old".to_owned(),
+            expires_at_ms: 0,
+        })
+        .expect("serialize lease"),
+    ));
+    _ = bucket
+        .put(&store.lease_location(prefix), payload)
+        .await
+        .expect("write lease");
+}
+
+/// The durable seeded era epoch for `prefix`, or `None` if not yet seeded.
+async fn read_era(bucket: &InMemory, store: &DynoStore, prefix: &str) -> Option<i64> {
+    match bucket.get(&store.era_location(prefix)).await {
+        Ok(result) => Some(
+            serde_json::from_slice::<Era>(&result.bytes().await.expect("era bytes"))
+                .expect("decode era")
+                .era_epoch,
+        ),
+        Err(object_store::Error::NotFound { .. }) => None,
+        Err(err) => panic!("read era: {err}"),
+    }
 }
 
 /// Batches produced across two topics of the same prefix in one window land in
@@ -1934,6 +1964,96 @@ async fn leaseless_ambiguous_put_is_adopted_via_nonce() -> Result<(), Error> {
         .map(|batch| batch.last_offset_delta as i64 + 1)
         .sum();
     assert_eq!(3, total, "no double-write: the batch is present once");
+
+    Ok(())
+}
+
+/// #92: the first leaseless flush of a prefix seeds a durable era epoch of
+/// `max(lease epoch, max footer epoch) + 1` (never 0) and stamps it as the
+/// segment's `writer_epoch`. With a pre-cutover lease at epoch 5, the leaseless
+/// segment carries epoch 6 — strictly above the lease era, so a straggler can
+/// never win the overlap tie-break and erase acked data.
+#[tokio::test]
+async fn leaseless_segment_stamps_seeded_era_above_lease() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .prefix_leaseless(true);
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let tp = Topition::new(topic, 0);
+
+    // Pre-cutover lease-era state.
+    write_lease(&bucket, &store, PREFIX, 5).await;
+
+    assert_eq!(0, store.produce(None, &tp, batch(3)?).await?);
+
+    let footer = footer_of(&bucket, &store, &segment_path(0)).await;
+    assert_eq!(
+        6, footer.writer_epoch,
+        "era = max(lease 5, footer 0) + 1, stamped into the segment"
+    );
+    assert_eq!(
+        Some(6),
+        read_era(&bucket, &store, PREFIX).await,
+        "era is persisted durably"
+    );
+
+    Ok(())
+}
+
+/// #92: a brand-new prefix (no lease, no segments) seeds era 1 — never 0, so a
+/// leaseless segment always out-epochs a legacy `writer_epoch: 0` footer — and
+/// the seeded value is stable and shared: a second call and a fresh process
+/// (cold cache) both read the same durable era.
+#[tokio::test]
+async fn era_seed_defaults_to_one_and_is_stable() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let a = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .prefix_leaseless(true);
+
+    assert_eq!(
+        1,
+        a.seed_era_epoch(PREFIX).await?,
+        "fresh prefix seeds era 1"
+    );
+    assert_eq!(
+        1,
+        a.seed_era_epoch(PREFIX).await?,
+        "stable within a process"
+    );
+
+    // A fresh process (cold in-memory cache) reads the durable value, not a
+    // re-seed — the era is a constant for the whole leaseless regime.
+    let b = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .prefix_leaseless(true);
+    assert_eq!(1, b.seed_era_epoch(PREFIX).await?, "shared across replicas");
+
+    Ok(())
+}
+
+/// #92 rollback: rewriting `lease.json` above the seeded era lets a restarted
+/// lease-holder's next acquire (epoch + 1) out-epoch every leaseless-era
+/// segment. After seeding era 6 (lease 5), rollback writes a lease epoch of 7.
+#[tokio::test]
+async fn rollback_rewrites_lease_above_era() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .prefix_leaseless(true);
+
+    write_lease(&bucket, &store, PREFIX, 5).await;
+    assert_eq!(6, store.seed_era_epoch(PREFIX).await?);
+
+    let rolled = store.rollback_prefix_to_lease(PREFIX).await?;
+    assert_eq!(7, rolled, "lease rewritten to era + 1");
+    assert_eq!(
+        7,
+        store.read_lease_epoch(PREFIX).await?,
+        "durable lease epoch now exceeds the era"
+    );
 
     Ok(())
 }

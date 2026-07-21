@@ -264,6 +264,15 @@ pub struct DynoStore {
     /// compaction on a maintenance worker never touches the produce lease.
     compaction_leases: Arc<Mutex<BTreeMap<String, HeldLease>>>,
 
+    /// Per-prefix leaseless *era* epoch (#92), the durable side being
+    /// `prefixes/{prefix}/era.json`. Seeded on the first leaseless flush of a
+    /// prefix as `max(lease.json epoch, max footer epoch) + 1` (never 0) and
+    /// stamped as a constant `writer_epoch` into every leaseless segment, so a
+    /// straggler from the pre-cutover lease era can never win the overlap
+    /// tie-break in [`Self::valid_substream_segments`] and erase acked data. This
+    /// caches it so the seeding object is read once per process per prefix.
+    era_epochs: Arc<Mutex<BTreeMap<String, i64>>>,
+
     /// Whether a topition still has legacy `records/` objects, cached (with the
     /// check time) to keep the prefix-coalesced read path off a per-fetch
     /// `records/` LIST (#60). A topic flipped to segment mode mid-life is a
@@ -380,6 +389,18 @@ struct PrefixLease {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 struct SeqFloor {
     next_seq_floor: u64,
+}
+
+/// Durable per-prefix leaseless *era* marker (#92): the `writer_epoch` every
+/// leaseless segment of the prefix carries. Seeded once, at the migration
+/// cutover, as `max(lease epoch, max footer epoch) + 1` (never 0) so leaseless
+/// writes strictly out-epoch every pre-cutover lease-era segment — a mixed fleet
+/// is otherwise corrupt (a straggler's lease-era epoch would win the overlap
+/// tie-break and erase acked data). Create-only and immutable: a constant era
+/// for the whole leaseless regime, read once per process per prefix.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct Era {
+    era_epoch: i64,
 }
 
 /// In-memory index of a connector prefix's segments (read-path #60 review fix):
@@ -1065,6 +1086,7 @@ impl DynoStore {
             prefix_index: Arc::new(Mutex::new(BTreeMap::new())),
             prefix_leases: Arc::new(Mutex::new(BTreeMap::new())),
             compaction_leases: Arc::new(Mutex::new(BTreeMap::new())),
+            era_epochs: Arc::new(Mutex::new(BTreeMap::new())),
             legacy_records_present: Arc::new(Mutex::new(BTreeMap::new())),
             writer_id: format!(
                 "{node}-{}",
@@ -2387,6 +2409,180 @@ impl DynoStore {
         Err(Error::Api(ErrorCode::UnknownServerError))
     }
 
+    /// The durable era-epoch object for `prefix` (#92).
+    fn era_location(&self, prefix: &str) -> Path {
+        Path::from(format!(
+            "clusters/{}/prefixes/{}/era.json",
+            self.cluster, prefix,
+        ))
+    }
+
+    /// The lease epoch currently recorded in `prefix`'s `lease.json` (#59); `0`
+    /// when no lease object exists. Read-only — does not acquire or renew.
+    async fn read_lease_epoch(&self, prefix: &str) -> Result<i64> {
+        match self.object_store.get(&self.lease_location(prefix)).await {
+            Ok(result) => Ok(serde_json::from_slice::<PrefixLease>(&result.bytes().await?)?.epoch),
+            Err(object_store::Error::NotFound { .. }) => Ok(0),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// The highest `writer_epoch` across `prefix`'s currently-cached segment
+    /// footers; `0` when none are known. The leaseless flush force-refreshes the
+    /// index (fold-before-claim) immediately before seeding, so at seed time this
+    /// reflects every live pre-cutover segment.
+    fn max_footer_epoch(&self, prefix: &str) -> Result<i64> {
+        Ok(self
+            .prefix_index
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .get(prefix)
+            .map(|index| {
+                index
+                    .segments
+                    .values()
+                    .map(|cached| cached.footer.writer_epoch)
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0))
+    }
+
+    /// The leaseless era epoch for `prefix` (#92), seeding it on first use. The
+    /// era is `max(lease epoch, max footer epoch) + 1` (never 0), so a leaseless
+    /// segment strictly out-epochs every pre-cutover lease-era segment and a
+    /// straggler can never win the overlap tie-break. Create-only and cached: the
+    /// first writer to seed wins, and any peer racing the same prefix reads and
+    /// adopts that value — so all replicas converge on one constant era. Called
+    /// on the leaseless flush path *after* the forced index refresh, so
+    /// `max_footer_epoch` sees every folded segment.
+    async fn seed_era_epoch(&self, prefix: &str) -> Result<i64> {
+        if let Some(era) = self
+            .era_epochs
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .get(prefix)
+            .copied()
+        {
+            return Ok(era);
+        }
+
+        let location = self.era_location(prefix);
+
+        // Already seeded durably (this process is cold, or a peer seeded first)?
+        match self.object_store.get(&location).await {
+            Ok(result) => {
+                let era = serde_json::from_slice::<Era>(&result.bytes().await?)?.era_epoch;
+                self.cache_era(prefix, era)?;
+                return Ok(era);
+            }
+            Err(object_store::Error::NotFound { .. }) => {}
+            Err(err) => return Err(err.into()),
+        }
+
+        let floor = self
+            .read_lease_epoch(prefix)
+            .await?
+            .max(self.max_footer_epoch(prefix)?);
+        let era = floor + 1;
+        let payload = PutPayload::from(Bytes::from(serde_json::to_vec(&Era { era_epoch: era })?));
+
+        match self
+            .object_store
+            .put_opts(
+                &location,
+                payload,
+                PutOptions {
+                    mode: PutMode::Create,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => {
+                self.cache_era(prefix, era)?;
+                debug!(prefix, era, "leaseless era seeded");
+                Ok(era)
+            }
+            // A peer seeded concurrently — adopt the durable value, not ours.
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                let result = self.object_store.get(&location).await?;
+                let era = serde_json::from_slice::<Era>(&result.bytes().await?)?.era_epoch;
+                self.cache_era(prefix, era)?;
+                Ok(era)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Cache a resolved era epoch (monotonic, like the other hints — the durable
+    /// object is immutable, so the value can only ever be the same one).
+    fn cache_era(&self, prefix: &str, era: i64) -> Result<()> {
+        self.era_epochs
+            .lock()
+            .map(|mut cache| {
+                let entry = cache.entry(prefix.to_owned()).or_default();
+                *entry = (*entry).max(era);
+            })
+            .map_err(Into::into)
+    }
+
+    /// Roll `prefix` back to the lease regime (#92): rewrite `lease.json` with an
+    /// epoch strictly above the seeded era, so a restarted old lease-holder — on
+    /// its next acquire (which bumps `epoch + 1`) — stamps segments that
+    /// out-epoch every leaseless-era segment and wins the overlap tie-break. Run
+    /// per active prefix during the *reverse* quiesce-and-flip, after the
+    /// leaseless fleet has drained and before old pods restart. Returns the lease
+    /// epoch written.
+    ///
+    /// The write is a plain CAS against the current lease version (or a create),
+    /// with an already-expired term so the first old pod re-acquires immediately.
+    ///
+    /// Operationally invoked (see `docs/migration-scos.md`); no in-tree caller
+    /// until a migration CLI subcommand wires it, so allow it to stand unused.
+    #[allow(dead_code)]
+    async fn rollback_prefix_to_lease(&self, prefix: &str) -> Result<i64> {
+        let era = self.seed_era_epoch(prefix).await?;
+        let epoch = era + 1;
+        let location = self.lease_location(prefix);
+
+        let version = match self.object_store.get(&location).await {
+            Ok(result) => Some(UpdateVersion {
+                e_tag: result.meta.e_tag.clone(),
+                version: result.meta.version.clone(),
+            }),
+            Err(object_store::Error::NotFound { .. }) => None,
+            Err(err) => return Err(err.into()),
+        };
+
+        let lease = PrefixLease {
+            epoch,
+            holder: format!("{}-rollback", self.writer_id),
+            // Expired on purpose: the first restarted lease pod re-acquires at
+            // once (bumping to `epoch + 1`), rather than waiting out a term.
+            expires_at_ms: 0,
+        };
+        let payload = PutPayload::from(Bytes::from(serde_json::to_vec(&lease)?));
+        let mode = match &version {
+            Some(version) => PutMode::Update(version.clone()),
+            None => PutMode::Create,
+        };
+
+        _ = self
+            .object_store
+            .put_opts(
+                &location,
+                payload,
+                PutOptions {
+                    mode,
+                    ..Default::default()
+                },
+            )
+            .await?;
+        debug!(prefix, epoch, era, "prefix rolled back to lease regime");
+        Ok(epoch)
+    }
+
     /// The next free segment sequence for `prefix`, read from the tail of the
     /// `segments/` listing (#57). Zero-padded names sort lexicographically by
     /// sequence, so the greatest listed name is the tail. Used to seed the hint
@@ -3700,6 +3896,15 @@ impl DynoStore {
                 Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
             };
 
+            // Seed / read the leaseless era epoch stamped into this segment
+            // (#92). Computed after the fold above, so it out-epochs every
+            // pre-cutover lease-era segment; cached, so only the first flush of a
+            // prefix pays the seeding round-trip.
+            let era = match self.seed_era_epoch(prefix).await {
+                Ok(era) => era,
+                Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+            };
+
             // Re-derive each sub-stream's base from the folded index, and
             // classify each idempotent batch against the log-folded
             // `ProducerTable` (#88): only an in-order batch is admitted and
@@ -3799,9 +4004,9 @@ impl DynoStore {
                 return Self::ack_leaseless_outcomes(buffer, outcomes);
             }
 
-            // Encode a v2 segment (writer_epoch 0 = leaseless era; the migration
-            // seeds a real era epoch, #92) and try to create it at `candidate`.
-            let (payload, footer) = match self.encode_segment_v2(&substreams, 0, nonce) {
+            // Encode a v2 segment stamped with the leaseless era epoch (#92) and
+            // try to create it at `candidate`.
+            let (payload, footer) = match self.encode_segment_v2(&substreams, era, nonce) {
                 Ok(encoded) => encoded,
                 Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
             };
