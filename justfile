@@ -14,15 +14,13 @@ clean-workspace:
 license:
     cargo about generate about.hbs > license.html
 
-build profile="dev" features="delta,dynostore,iceberg,libsql,parquet,postgres,slatedb" bin="tansu": (cargo-build "--profile" profile "--timings" "--bin" bin "--no-default-features" "--features" features)
+build profile="dev" features="dynostore" bin="tansu": (cargo-build "--profile" profile "--timings" "--bin" bin "--no-default-features" "--features" features)
 
-build-storage: clean-workspace (build "dev" "libsql") (build "dev" "postgres") (build "dev" "slatedb")
+build-storage: clean-workspace (build "dev" "dynostore")
 
 build-examples: (cargo-build "--examples")
 
-release: (cargo-build "--release" "--bin" "tansu" "--no-default-features" "--features" "delta,dynostore,iceberg,libsql,parquet,postgres,slatedb")
-
-release-sqlite: (cargo-build "--release" "--bin" "tansu" "--no-default-features" "--features" "libsql")
+release: (cargo-build "--release" "--bin" "tansu" "--no-default-features" "--features" "dynostore")
 
 test: test-workspace test-doc
 
@@ -75,17 +73,11 @@ minio-local-alias: (minio-mc "alias" "set" "local" "http://localhost:9000" "mini
 
 minio-tansu-bucket: (minio-mc "mb" "local/tansu")
 
-minio-lake-bucket: (minio-mc "mb" "local/lake")
-
 minio-ready-local: (minio-mc "ready" "local")
 
 tansu-up: (docker-compose-up "tansu")
 
 tansu-down: (docker-compose-down "tansu")
-
-db-up: (docker-compose-up "db")
-
-db-down: (docker-compose-down "db")
 
 jaeger-up: (docker-compose-up "jaeger")
 
@@ -102,19 +94,6 @@ grafana-down: (docker-compose-down "grafana")
 grafana-ui:
     open http://localhost:3000
 
-lakehouse-catalog-up: (docker-compose-up "lakehouse-catalog")
-
-lakehouse-catalog-down: (docker-compose-down "lakehouse-catalog")
-
-lakehouse-accept-terms-of-use:
-    curl http://localhost:8181/management/v1/bootstrap -H "Content-Type: application/json" --data '{"accept-terms-of-use": true}'
-
-lakehouse-create-warehouse:
-    curl http://localhost:8181/management/v1/warehouse -H "Content-Type: application/json" --data @etc/lakekeeper/create-default-warehouse.json
-
-lakehouse-migrate:
-    docker compose exec lakehouse-catalog /home/nonroot/iceberg-catalog migrate
-
 docker-compose-up *args:
     docker compose --ansi never --progress plain up --no-color --quiet-pull --wait --detach {{ args }}
 
@@ -126,19 +105,6 @@ ps:
 
 docker-compose-logs *args:
     docker compose logs {{ args }}
-
-psql:
-    docker compose exec db psql $*
-
-docker-run-postgres:
-    docker run \
-        --detach \
-        --name postgres \
-        --publish 5432:5432 \
-        --env PGUSER=postgres \
-        --env POSTGRES_PASSWORD=postgres \
-        --volume ./etc/initdb.d/:/docker-entrypoint-initdb.d/ \
-        postgres:16.4
 
 docker-prune:
     docker system prune --force
@@ -216,71 +182,6 @@ topic-create topic *args:
 topic-delete topic:
     target/debug/tansu topic delete {{ topic }}
 
-cat-produce topic file:
-    target/debug/tansu cat produce {{ topic }} {{ file }}
-
-cat-consume topic:
-    target/debug/tansu cat consume {{ topic }} --max-wait-time-ms=5000
-
-generator topic *args:
-    target/debug/tansu generator {{ args }} {{ topic }} 2>&1 >generator.log
-
-duckdb-k-unnest-v-parquet topic:
-    duckdb -init duckdb-init.sql :memory: "SELECT key,unnest(value) FROM '{{ replace(env("DATA_LAKE"), "file://./", "") }}/{{ topic }}/*/*.parquet'"
-
-duckdb-parquet topic:
-    duckdb -init duckdb-init.sql :memory: "SELECT * FROM '{{ replace(env("DATA_LAKE"), "file://./", "") }}/{{ topic }}/*/*.parquet'"
-
-# create person topic with schema etc/schema/person.json
-person-topic-create: (topic-create "person")
-
-# delete person topic
-person-topic-delete: (topic-delete "person")
-
-# produce etc/data/persons.json with schema etc/schema/person.json
-person-topic-populate: (cat-produce "person" "etc/data/persons.json")
-
-# produce valid data, that is accepted by the broker
-person-topic-produce-valid:
-    echo '{"key": "345-67-6543", "value": {"firstName": "John", "lastName": "Doe", "age": 21}}' | target/debug/tansu cat produce person
-
-# produce invalid data, that is rejected by the broker
-person-topic-produce-invalid:
-    echo '{"key": "ABC-12-4242", "value": {"firstName": "John", "lastName": "Doe", "age": -1}}' | target/debug/tansu cat produce person
-
-# person parquet
-person-duckdb-parquet: (duckdb-k-unnest-v-parquet "person")
-
-person-topic-consume:
-    kafka-console-consumer \
-        --bootstrap-server ${ADVERTISED_LISTENER} \
-        --timeout-ms=15000 \
-        --group person-consumer-group \
-        --topic person \
-        --from-beginning \
-        --formatter-property print.timestamp=true \
-        --formatter-property print.key=true \
-        --formatter-property print.offset=true \
-        --formatter-property print.partition=true \
-        --formatter-property print.headers=true \
-        --formatter-property print.value=true
-
-# create search topic with etc/schema/search.proto
-search-topic-create: (topic-create "search")
-
-# delete search topic
-search-topic-delete: (topic-delete "search")
-
-# produce data to search topic with etc/schema/search.proto
-search-topic-produce:
-    echo '{"value": {"query": "abc/def", "page_number": 6, "results_per_page": 13, "corpus": "CORPUS_WEB"}}' | target/debug/tansu cat produce search
-
-# search parquet
-search-duckdb-parquet: (duckdb-parquet "search")
-
-tansu-server:
-    target/debug/tansu broker --schema-registry file://./etc/schema 2>&1 | tee broker.log
-
 kafka-proxy:
     docker run -d -p 19092:9092 apache/kafka:3.9.0
 
@@ -339,148 +240,54 @@ benchmark-flamegraph: build docker-compose-down minio-up minio-ready-local minio
 benchmark: build docker-compose-down minio-up minio-ready-local minio-local-alias minio-tansu-bucket prometheus-up grafana-up
     target/debug/tansu broker 2>&1  | tee broker.log
 
-otel profile="dev" *args: build docker-compose-down db-up minio-up minio-ready-local minio-local-alias minio-tansu-bucket prometheus-up grafana-up
+otel profile="dev" *args: build docker-compose-down minio-up minio-ready-local minio-local-alias minio-tansu-bucket prometheus-up grafana-up
     OTEL_METRIC_EXPORT_INTERVAL=5000 OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:9090/api/v1/otlp/" target/{{ replace(profile, "dev", "debug") }}/tansu broker {{ args }}  | tee broker.log
 
-otel-up: docker-compose-down db-up minio-up minio-ready-local minio-local-alias minio-tansu-bucket prometheus-up grafana-up tansu-up
+otel-up: docker-compose-down minio-up minio-ready-local minio-local-alias minio-tansu-bucket prometheus-up grafana-up tansu-up
 
 tansu-broker profile *args:
     target/{{ replace(profile, "dev", "debug") }}/tansu broker {{ args }} 2>&1 >broker.log
 
 flamegraph-tansu-broker profile *args:
     #!/usr/bin/env zsh
-    unset SCHEMA_REGISTRY
     export RUST_LOG=warn
     flamegraph --verbose -- ./target/{{ replace(profile, "dev", "debug") }}/tansu broker {{ args }}
 
 # run a debug broker with configuration from .env
-broker *args: build docker-compose-down prometheus-up grafana-up db-up minio-up minio-ready-local minio-local-alias minio-tansu-bucket minio-lake-bucket lakehouse-catalog-up (tansu-broker "debug" args)
+broker *args: build docker-compose-down prometheus-up grafana-up minio-up minio-ready-local minio-local-alias minio-tansu-bucket (tansu-broker "debug" args)
 
 # run a release broker with configuration from .env
-broker-release *args: release docker-compose-down prometheus-up grafana-up db-up minio-up minio-ready-local minio-local-alias minio-tansu-bucket minio-lake-bucket lakehouse-catalog-up (tansu-broker "release" args)
+broker-release *args: release docker-compose-down prometheus-up grafana-up minio-up minio-ready-local minio-local-alias minio-tansu-bucket (tansu-broker "release" args)
 
 # run a proxy with configuration from .env
 proxy *args:
     target/debug/tansu proxy {{ args }} 2>&1 | tee proxy.log
 
-# teardown compose, rebuild: minio, db, tansu and lake buckets
-server: (cargo-build "--bin" "tansu") docker-compose-down db-up minio-up minio-ready-local minio-local-alias minio-tansu-bucket minio-lake-bucket lakehouse-catalog-up
+# teardown compose, rebuild: minio and tansu bucket
+server: (cargo-build "--bin" "tansu") docker-compose-down minio-up minio-ready-local minio-local-alias minio-tansu-bucket
     target/debug/tansu broker 2>&1  | tee broker.log
 
-gdb: (cargo-build "--bin" "tansu") docker-compose-down db-up minio-up minio-ready-local minio-local-alias minio-tansu-bucket minio-lake-bucket
+gdb: (cargo-build "--bin" "tansu") docker-compose-down minio-up minio-ready-local minio-local-alias minio-tansu-bucket
     rust-gdb --args target/debug/tansu broker
 
-lldb: (cargo-build "--bin" "tansu") docker-compose-down db-up minio-up minio-ready-local minio-local-alias minio-tansu-bucket minio-lake-bucket lakehouse-catalog-up
+lldb: (cargo-build "--bin" "tansu") docker-compose-down minio-up minio-ready-local minio-local-alias minio-tansu-bucket
     rust-lldb target/debug/tansu broker
 
-ci: docker-compose-down db-up minio-up minio-ready-local minio-local-alias minio-tansu-bucket minio-lake-bucket lakehouse-catalog-up lakehouse-accept-terms-of-use lakehouse-create-warehouse
-
-# produce etc/data/observations.json with schema etc/schema/observation.avsc
-observation-produce: (cat-produce "observation" "etc/data/observations.json")
-
-# consume observation topic with schema etc/schema/observation.avsc
-observation-consume: (cat-consume "observation")
-
-# create observation topic with schema etc/schema/observation.avsc
-observation-topic-create: (topic-create "observation")
-
-# observation parquet
-observation-duckdb-parquet: (duckdb-k-unnest-v-parquet "observation")
-
-duckdb *sql:
-    duckdb -init duckdb-init.sql -markdown :memory: {{ sql }}
-
-# produce etc/data/trips.json with schema etc/schema/taxi.proto
-taxi-topic-populate: (cat-produce "taxi" "etc/data/trips.json")
-
-# consume taxi topic with schema etc/schema/taxi.proto
-taxi-topic-consume: (cat-consume "taxi")
-
-# create taxi topic with generated fields with schema etc/schema/taxi.proto
-taxi-topic-create: (topic-create "taxi" "--partitions=1" "--config=tansu.lake.normalize=true" "--config=tansu.lake.partition=meta.day" "--config=tansu.lake.z_order=vendor_id" "--config=tansu.lake.sink=true" "--config=tansu.batch=true" "--config=tansu.batch.max_records=200" "--config=tansu.batch.timeout_ms=1000")
-
-# create taxi topic with schema etc/schema/taxi.proto
-taxi-topic-create-plain: (topic-create "taxi" "--partitions" "1" "--config" "tansu.lake.sink=true")
-
-# create taxi topic with a flattened schema etc/schema/taxi.proto
-taxi-topic-create-normalize: (topic-create "taxi" "--partitions" "1" "--config" "tansu.lake.sink=true" "--config" "tansu.lake.normalize=true" "--config" "tansu.lake.normalize.separator=_" "--config" "tansu.lake.z_order=value_vendor_id")
-
-taxi-topic-generator: (generator "taxi" "--broker=tcp://localhost:9092" "--per-second=10" "--producers=16" "--batch-size=1" "--duration-seconds=60")
-
-# delete taxi topic
-taxi-topic-delete: (topic-delete "taxi")
-
-# taxi parquet
-taxi-duckdb-parquet: (duckdb-parquet "taxi")
-
-# taxi duckdb delta lake
-taxi-duckdb-delta: (duckdb "\"select * from delta_scan('s3://lake/tansu.taxi');\"")
-
-# create employee topic with etc/schema/employee.proto
-employee-topic-create: (topic-create "employee")
-
-# produce etc/data/persons.json with etc/schema/person.json
-employee-produce: (cat-produce "employee" "etc/data/employees.json")
-
-# employee duckdb delta lake
-employee-duckdb-delta: (duckdb "\"select * from delta_scan('s3://lake/tansu.employee');\"")
-
-# create customer topic with schema etc/schema/customer.proto
-customer-topic-create *args: (topic-create "customer" "--partitions=1" "--config=tansu.lake.normalize=true" "--config=tansu.lake.partition=meta.day" "--config=tansu.lake.sink=true" "--config=tansu.batch=true" "--config=tansu.batch.max_records=200" "--config=tansu.batch.timeout_ms=1000" args)
-
-customer-topic-generator *args: (generator "customer" args)
-
-customer-duckdb-delta: (duckdb "\"select * from delta_scan('s3://lake/tansu.customer');\"")
+ci: docker-compose-down minio-up minio-ready-local minio-local-alias minio-tansu-bucket
 
 broker-memory profile="profiling": (build profile "dynostore") (tansu-broker profile "--storage-engine=memory://")
 
 broker-null profile="profiling": (build profile "default") (tansu-broker profile "--storage-engine=null://")
 
-clean-tansu-db:
-    rm -f tansu.db* snapshot.db
-
-clean-lake-dir:
-    rm -rf lake/*
-
-broker-sqlite-parquet profile="dev": clean-tansu-db clean-lake-dir (build profile "libsql,parquet") (tansu-broker profile "--storage-engine=sqlite://tansu.db" "parquet" "--location=file://./lake")
-
-broker-sqlite-delta profile="profiling": docker-compose-down minio-up minio-ready-local minio-local-alias minio-lake-bucket clean-tansu-db (build profile "libsql,delta") (tansu-broker profile "--storage-engine=sqlite://tansu.db" "delta")
-
-broker-sqlite profile="profiling": clean-tansu-db (build profile "libsql") (tansu-broker profile "--silent" "--storage-engine=sqlite://tansu.db")
-
-broker-sqlite-existing profile="profiling": (build profile "libsql") (tansu-broker profile "--silent" "--storage-engine=sqlite://tansu.db")
-
-broker-sqlite-no-maintenance profile="profiling": clean-tansu-db (build profile "libsql") (tansu-broker profile "--silent" "--storage-engine='sqlite://tansu.db'")
-
-broker-sqlite-authentication profile="profiling": (build profile "libsql") (tansu-broker profile "--authentication" "--storage-engine=sqlite://tansu.db")
-
-broker-sqlite-maintenance-1m profile="profiling": clean-tansu-db (build profile "libsql") (tansu-broker profile "--storage-engine=sqlite://tansu.db?maintenance_interval=1m")
-
-broker-sqlite-vacuum-into profile="profiling": clean-tansu-db (build profile "libsql") (tansu-broker profile "--storage-engine=sqlite://tansu.db?vacuum_into=snapshot.db")
-
 s3-up: docker-compose-down minio-up minio-ready-local minio-local-alias minio-tansu-bucket
 
 broker-s3 profile="profiling": (build profile "dynostore") s3-up (tansu-broker profile "--storage-engine=s3://tansu/")
-
-broker-postgres profile="profiling": (build profile "postgres") docker-compose-down db-up (tansu-broker profile "--storage-engine=postgres://postgres:postgres@localhost")
-
-broker-postgres-existing profile="profiling": (build profile "postgres") (tansu-broker profile "--silent" "--storage-engine=postgres://postgres:postgres@localhost")
-
-broker-postgres-local profile="profiling": (build profile "postgres") (tansu-broker profile "--silent" "--storage-engine=postgres://pmorgan@localhost/pmorgan")
-
-broker-postgres-authentication profile="profiling": (build profile "postgres") (tansu-broker profile "--authentication" "--storage-engine=postgres://postgres:postgres@localhost")
-
-broker-postgres-maintenance-1m profile="profiling": (build profile "postgres") (tansu-broker profile "--storage-engine=postgres://postgres:postgres@localhost?maintenance_interval=1m")
 
 samply-null profile="profiling":
     cargo build --profile {{ profile }} --bin tansu
     RUST_LOG=warn samply record ./target/{{ replace(profile, "dev", "debug") }}/tansu --storage-engine=null://sink
 
 flamegraph-null profile="profiling": (build profile "default") (flamegraph-tansu-broker profile "--storage-engine=null://sink")
-
-flamegraph-sqlite profile="profiling": (build profile "libsql") clean-tansu-db (flamegraph-tansu-broker profile "--storage-engine=sqlite://tansu.db")
-
-flamegraph-postgres profile="profiling": (build profile "postgres") docker-compose-down db-up (flamegraph-tansu-broker profile "--storage-engine=postgres://postgres:postgres@localhost")
 
 flamegraph-memory profile="profiling": (build profile "dynostore") (flamegraph-tansu-broker profile "--storage-engine=memory://tansu/")
 
@@ -493,24 +300,6 @@ samply-produce profile="profiling":
 flamegraph-produce profile="profiling":
     cargo build --profile {{ profile }} --bin bench_produce_v11
     RUST_LOG=warn flamegraph -- ./target/{{ replace(profile, "dev", "debug") }}/bench_produce_v11
-
-bench-hyperfine iterations="100000" profile="release": (build profile "libsql" "bench")
-    hyperfine -N './target/{{ replace(profile, "dev", "debug") }}/bench --iterations {{ iterations }}'
-
-bench-dhat mode="heap" profile="release": (build profile "libsql" "bench")
-    valgrind --tool=dhat --mode={{ mode }} ./target/{{ replace(profile, "dev", "debug") }}/bench
-
-bench-flamegraph profile="profiling": (build profile "libsql" "bench")
-    RUST_LOG=warn flamegraph -- ./target/{{ replace(profile, "dev", "debug") }}/bench
-
-bench-flamegraph-produce profile="profiling": (build profile "libsql" "bench")
-    RUST_LOG=warn flamegraph -- ./target/{{ replace(profile, "dev", "debug") }}/bench --api-key=0
-
-bench-flamegraph-fetch iterations="100000" profile="profiling": (build profile "libsql" "bench")
-    RUST_LOG=warn flamegraph -- ./target/{{ replace(profile, "dev", "debug") }}/bench  --iterations {{ iterations }} --api-key=1
-
-bench-perf profile="profiling": (build profile "libsql" "bench")
-    RUST_LOG=warn perf record --call-graph dwarf ./target/{{ replace(profile, "dev", "debug") }}/bench 2>&1 >/dev/null
 
 consumer-perf num_records="1000" topic="test":
     kafka-consumer-perf-test --topic {{ topic }} --num-records {{ num_records }} --bootstrap-server ${ADVERTISED_LISTENER}
@@ -586,9 +375,6 @@ ps-tansu-rss:
 
 telemetry-topic-create: (topic-create "telemetry" "--config" "tansu.virtual=true")
 
-telemetry-produce-valid profile="dev":
-    echo '{"key": "SK06 YPM", "value": {"latitude":52.930412156530465,"longitude":-4.894550244518114,"altitude":158.06766871179406}}' | target/{{ replace(profile, "dev", "debug") }}/tansu cat produce telemetry
-
 telemetry-consume:
     kafka-console-consumer \
         --bootstrap-server ${ADVERTISED_LISTENER} \
@@ -616,9 +402,6 @@ telemetry-vrm-consume vrm="SK06 YPM":
         --formatter-property print.partition=true \
         --formatter-property print.headers=true \
         --formatter-property print.value=true
-
-postgres-local:
-    LC_ALL="en_US.UTF-8" /opt/homebrew/opt/postgresql@18/bin/postgres -D /opt/homebrew/var/postgresql@18
 
 group-consumer-example topics="test":
     cargo run --package tansu-client --example group_consumer -- --topics {{ topics }}

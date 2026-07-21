@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Tansu is a stateless, Apache Kafka-compatible broker written in Rust. It is a drop-in replacement for Apache Kafka with pluggable storage backends: PostgreSQL, libSQL (SQLite), S3/object store, and memory. Schema-backed topics (Avro, JSON Schema, Protocol Buffers) can be written as Apache Iceberg or Delta Lake tables.
+Tansu is a stateless, Apache Kafka-compatible broker written in Rust. It is a drop-in replacement for Apache Kafka backed by an object store: S3, Google Cloud Storage, or in-memory (for tests). This fork is deliberately **object-store only** — the PostgreSQL/libSQL/SlateDB/Turso backends and the schema-registry validation + Iceberg/Delta/Parquet lakehouse have been removed (see #96).
 
-- Rust edition 2024, toolchain pinned to 1.93 (`rust-toolchain.toml`)
+- Rust edition 2024, toolchain pinned in `rust-toolchain.toml`
 - License: Apache-2.0
 - `unsafe_code` is forbidden workspace-wide
 
@@ -16,7 +16,7 @@ The project uses `just` as a task runner (loads `.env` automatically).
 
 ```shell
 just                 # default: fmt, build, test, clippy
-just build           # build with all features (dev profile)
+just build           # build (dev profile)
 just test            # nextest + doc tests
 just test-workspace  # cargo nextest run --workspace --all-targets --all-features
 just test-doc        # cargo test --workspace --doc --all-features
@@ -24,6 +24,10 @@ just clippy          # cargo clippy --workspace --all-features --all-targets -- 
 just fmt             # cargo fmt --all --check
 just check           # cargo check --workspace --all-features --all-targets
 ```
+
+Note: the `fuzz` crate depends on a C++ libfuzzer toolchain that is not always
+present locally. When building/checking the whole workspace by hand, exclude it:
+`cargo check --workspace --exclude fuzz --all-targets`.
 
 Run a single test with nextest:
 ```shell
@@ -34,10 +38,8 @@ cargo nextest run --workspace --all-features -E 'test(test_name_here)'
 
 ```shell
 cp example.env .env    # then edit .env as needed (AWS_ENDPOINT for local minio, etc.)
-just ci                # starts minio, postgres, lakehouse via docker compose
+just ci                # starts minio via docker compose
 just broker            # build + start broker with full infrastructure
-just broker-postgres   # broker with postgres backend only
-just broker-sqlite     # broker with sqlite backend only
 just broker-memory     # broker with in-memory backend only
 just broker-s3         # broker with S3/minio backend only
 ```
@@ -46,7 +48,7 @@ Note: when running tansu directly (not via docker compose), set `AWS_ENDPOINT="h
 
 ## Architecture
 
-Cargo workspace with 15 member crates, producing a single binary (`tansu`) with subcommands: `broker` (default), `cat`, `topic`, `generator`, `perf`, `proxy`.
+Cargo workspace producing a single binary (`tansu`) with subcommands: `broker` (default), `topic`, `perf`, `proxy`.
 
 ### Key Crates
 
@@ -56,11 +58,9 @@ Cargo workspace with 15 member crates, producing a single binary (`tansu`) with 
 | `tansu-broker` | Kafka API broker: `Broker<G, S>` generic over Coordinator + Storage |
 | `tansu-sans-io` | **Code-generated** Kafka wire protocol (pure serde, no I/O) |
 | `tansu-service` | Network service layers built on `rama` (Layer/Service composition) |
-| `tansu-storage` | Storage abstraction: `StorageContainer` enum over backends |
-| `tansu-schema` | Schema registry + Iceberg/Delta/Parquet lake integration |
+| `tansu-storage` | Storage abstraction: `StorageContainer` enum over the object store (`DynoStore`) and the `Null` engine |
 | `tansu-client` | Async Kafka protocol client (rama service layers) |
 | `tansu-model` | Kafka JSON protocol definitions (used in build.rs) |
-| `tansu-cat` | CLI: produce/consume Avro, JSON, Protobuf messages |
 | `tansu-cli` | Clap-based CLI argument parsing |
 
 ### Sans-I/O Code Generation (`tansu-sans-io`)
@@ -73,14 +73,19 @@ Uses `rama` crate for Layer/Service composition:
 - `TcpBytesLayer` (TCP) -> `BytesFrameLayer` (bytes -> Kafka Frame) -> `FrameRouteService` (route to typed handlers) -> `FrameBytesLayer` -> `BytesTcpService`
 - Same layering pattern used for broker, proxy, and CLI clients
 
-### Storage Backends (`tansu-storage`)
+### Storage (`tansu-storage`)
 
-Selected at compile time via feature flags, dispatched at runtime through `StorageContainer` enum:
-- `memory://` - in-memory (feature: `dynostore`)
-- `s3://` - S3/MinIO (feature: `dynostore`)
-- `postgres://` - PostgreSQL (feature: `postgres`)
-- `sqlite://` - libSQL/SQLite (feature: `libsql`)
-- `slatedb://` - SlateDB KV store (feature: `slatedb`)
+Runtime dispatch through the `StorageContainer` enum. There is a single real
+backend — the object store (`DynoStore`) — plus a `Null` engine. The storage
+engine is selected from the URL scheme:
+- `memory://` - in-memory (tests / ephemeral)
+- `s3://` - S3 / MinIO
+- `gs://` - Google Cloud Storage
+
+Object layout is create-only / immutable: coalesced segments carry a
+self-describing footer index, and readers locate a sub-stream from the footer
+alone (never from the filename). See `docs/` for the segment/coalescing and
+multi-writer design notes.
 
 ### Broker Specifics
 
@@ -91,22 +96,20 @@ Selected at compile time via feature flags, dispatched at runtime through `Stora
 
 ## Feature Flags
 
-Default: `dynostore`, `postgres`, `libsql`, `slatedb`. Full build: `delta,dynostore,iceberg,libsql,parquet,postgres,slatedb`.
-
-Lake features: `parquet`, `iceberg`, `delta` - enable writing schema-backed topics to data lake tables.
+Default: `dynostore` (the object store). There are no alternate-backend or
+lake feature flags any more.
 
 ## Testing Notes
 
 - Tests use `cargo-nextest` (not `cargo test` for workspace tests)
 - Test logs go to `logs/<crate-name>/` (one file per test thread, dirs must exist)
-- Integration tests require external services started via `just ci`
+- Integration tests use minio (S3) started via `just ci`, or the in-memory store
 - Tests load `.env` via `dotenv().ok()`
-- Tests in `tansu-broker` run against multiple backends: InMemory, Lite (libSQL), Postgres, SlateDb
-- Tests with specific feature requirements use `required-features` in their `Cargo.toml`
+- Storage tests run against `DynoStore` over an in-memory/object store
 
 ## CI Pipeline
 
-GitHub Actions (`.github/workflows/ci.yml`): check -> fmt -> clippy -> build-storage (each feature independently) -> build-storage-lake (feature combinations) -> test (PostgreSQL 16/17/18 matrix) -> publish dry-run -> typos -> smoke tests (Java Kafka client, Kafka 3.7/3.8/3.9).
+GitHub Actions (`.github/workflows/`): check -> fmt -> clippy -> build-storage (the `dynostore` feature) -> test (against the S3/minio object store) -> publish dry-run -> typos -> smoke tests (Java Kafka client, multiple Kafka versions).
 
 ## Key Files
 
@@ -114,9 +117,7 @@ GitHub Actions (`.github/workflows/ci.yml`): check -> fmt -> clippy -> build-sto
 |------|---------|
 | `justfile` | All build/test/run tasks |
 | `example.env` | Template for local `.env` config |
-| `compose.yaml` | Docker Compose: postgres, minio, grafana, jaeger, prometheus, lakehouse |
-| `etc/initdb.d/010-schema.sql` | PostgreSQL schema DDL |
-| `etc/schema/` | Sample schemas: `.avsc` (Avro), `.json` (JSON Schema), `.proto` (Protobuf) |
+| `compose.yaml` | Docker Compose: minio, grafana, jaeger, prometheus |
 | `tansu-sans-io/message/` | Kafka JSON protocol descriptors (upstream, ~185 files) |
 | `tansu-sans-io/build.rs` | Code generator: JSON descriptors -> Rust types |
 

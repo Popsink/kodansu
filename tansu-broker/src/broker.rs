@@ -37,7 +37,6 @@ use std::{
     time::{Duration, SystemTime},
 };
 use tansu_sans_io::{ErrorCode, RootMessageMeta};
-use tansu_schema::{Registry, lake::House};
 use tansu_storage::{
     ArcDynStorage, BrokerRegistrationRequest, Storage, StorageContainer, TopicDefaults,
 };
@@ -432,8 +431,6 @@ pub struct Builder<N, C, I, A, S, L> {
     storage: S,
     listener: L,
     otlp_endpoint_url: Option<Url>,
-    schema_registry: Option<Registry>,
-    lake_house: Option<House>,
     authentication: bool,
     tls_server_config: Option<ServerConfig>,
     silent: bool,
@@ -464,8 +461,6 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             storage: self.storage,
             listener: self.listener,
             otlp_endpoint_url: self.otlp_endpoint_url,
-            schema_registry: self.schema_registry,
-            lake_house: self.lake_house,
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
@@ -485,8 +480,6 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             storage: self.storage,
             listener: self.listener,
             otlp_endpoint_url: self.otlp_endpoint_url,
-            schema_registry: self.schema_registry,
-            lake_house: self.lake_house,
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
@@ -506,8 +499,6 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             storage: self.storage,
             listener: self.listener,
             otlp_endpoint_url: self.otlp_endpoint_url,
-            schema_registry: self.schema_registry,
-            lake_house: self.lake_house,
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
@@ -530,8 +521,6 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             storage: self.storage,
             listener: self.listener,
             otlp_endpoint_url: self.otlp_endpoint_url,
-            schema_registry: self.schema_registry,
-            lake_house: self.lake_house,
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
@@ -578,8 +567,6 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             storage,
             listener: self.listener,
             otlp_endpoint_url: self.otlp_endpoint_url,
-            schema_registry: self.schema_registry,
-            lake_house: self.lake_house,
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
@@ -601,8 +588,6 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             storage: self.storage,
             listener,
             otlp_endpoint_url: self.otlp_endpoint_url,
-            schema_registry: self.schema_registry,
-            lake_house: self.lake_house,
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
@@ -611,21 +596,6 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
 
             cancellation: self.cancellation,
         }
-    }
-
-    pub fn schema_registry(self, schema_registry: Option<Registry>) -> Self {
-        Self {
-            schema_registry,
-            ..self
-        }
-    }
-
-    pub fn lake_house(self, lake_house: Option<House>) -> Self {
-        _ = lake_house
-            .as_ref()
-            .inspect(|lake_house| debug!(?lake_house));
-
-        Self { lake_house, ..self }
     }
 
     pub fn otlp_endpoint_url(self, otlp_endpoint_url: Option<Url>) -> Self {
@@ -674,8 +644,6 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             .cluster_id(self.cluster_id.clone())
             .node_id(self.node_id)
             .advertised_listener(self.advertised_listener.clone())
-            .schema_registry(self.schema_registry.clone())
-            .lake_house(self.lake_house.clone())
             .storage(self.storage.clone())
             .cancellation(self.cancellation.clone())
             .silent(self.silent)

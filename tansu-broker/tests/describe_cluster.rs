@@ -80,48 +80,6 @@ where
     Ok(())
 }
 
-#[cfg(feature = "postgres")]
-mod pg {
-    use std::sync::Arc;
-
-    use common::{StorageType, init_tracing};
-    use rand::{prelude::*, rng};
-
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String>,
-        node: i32,
-        advertised_listener: Url,
-    ) -> Result<Arc<Box<dyn Storage>>> {
-        common::storage_container(
-            StorageType::Postgres,
-            cluster,
-            node,
-            advertised_listener,
-            None,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn describe() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster = Uuid::now_v7();
-        let node = rng().random_range(0..i32::MAX);
-        let advertised_listener = Url::parse("tcp://example.com:9092/")?;
-
-        super::describe(
-            cluster,
-            node,
-            advertised_listener.clone(),
-            storage_container(cluster, node, advertised_listener).await?,
-        )
-        .await
-    }
-}
-
 #[cfg(feature = "dynostore")]
 mod in_memory {
     use std::sync::Arc;
@@ -136,91 +94,7 @@ mod in_memory {
         node: i32,
         advertised_listener: Url,
     ) -> Result<Arc<Box<dyn Storage>>> {
-        common::storage_container(
-            StorageType::InMemory,
-            cluster,
-            node,
-            advertised_listener,
-            None,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn describe() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster = Uuid::now_v7();
-        let node = rng().random_range(0..i32::MAX);
-        let advertised_listener = Url::parse("tcp://example.com:9092/")?;
-
-        super::describe(
-            cluster,
-            node,
-            advertised_listener.clone(),
-            storage_container(cluster, node, advertised_listener).await?,
-        )
-        .await
-    }
-}
-
-#[cfg(feature = "libsql")]
-mod lite {
-    use std::sync::Arc;
-
-    use common::{StorageType, init_tracing};
-    use rand::{prelude::*, rng};
-
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String>,
-        node: i32,
-        advertised_listener: Url,
-    ) -> Result<Arc<Box<dyn Storage>>> {
-        common::storage_container(StorageType::Lite, cluster, node, advertised_listener, None).await
-    }
-
-    #[tokio::test]
-    async fn describe() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster = Uuid::now_v7();
-        let node = rng().random_range(0..i32::MAX);
-        let advertised_listener = Url::parse("tcp://example.com:9092/")?;
-
-        super::describe(
-            cluster,
-            node,
-            advertised_listener.clone(),
-            storage_container(cluster, node, advertised_listener).await?,
-        )
-        .await
-    }
-}
-
-#[cfg(feature = "slatedb")]
-mod slatedb {
-    use std::sync::Arc;
-
-    use common::{StorageType, init_tracing};
-    use rand::{prelude::*, rng};
-
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String>,
-        node: i32,
-        advertised_listener: Url,
-    ) -> Result<Arc<Box<dyn Storage>>> {
-        common::storage_container(
-            StorageType::SlateDb,
-            cluster,
-            node,
-            advertised_listener,
-            None,
-        )
-        .await
+        common::storage_container(StorageType::InMemory, cluster, node, advertised_listener).await
     }
 
     #[tokio::test]

@@ -16,8 +16,6 @@
 //!
 //! The CLI is a single statically linked binary that contains:
 //! - Broker
-//! - Cat: produce, validate (if backed by a schema) and fetch messages
-//! - Generator: use fake data generators to produce messages with a rate limit
 //! - Proxy: a Kafka API proxy
 //! - Topic: Topic administration
 
@@ -29,8 +27,6 @@ use tansu_sans_io::ErrorCode;
 use tracing::debug;
 
 mod broker;
-mod cat;
-mod generator;
 mod perf;
 mod proxy;
 mod topic;
@@ -42,32 +38,11 @@ fn storage_engines() -> Vec<&'static str> {
     vec![
         #[cfg(feature = "dynostore")]
         "dynostore",
-        #[cfg(feature = "libsql")]
-        "libsql",
-        #[cfg(feature = "postgres")]
-        "postgres",
-        #[cfg(feature = "slatedb")]
-        "slatedb",
-        #[cfg(feature = "turso")]
-        "turso",
-    ]
-}
-
-fn lakes() -> Vec<&'static str> {
-    vec![
-        #[cfg(feature = "delta")]
-        "delta",
-        #[cfg(feature = "iceberg")]
-        "iceberg",
     ]
 }
 
 fn after_help() -> String {
-    [
-        format!("Storage engines: {}", storage_engines().join(", ")),
-        format!("Data lakes: {}", lakes().join(", ")),
-    ]
-    .join("\n")
+    format!("Storage engines: {}", storage_engines().join(", "))
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -89,17 +64,8 @@ pub struct Cli {
 
 #[derive(Clone, Debug, Subcommand)]
 enum Command {
-    /// Apache Kafka compatible broker with Avro, JSON, Protobuf schema validation [default if no command supplied]
+    /// Apache Kafka compatible broker backed by an object store (S3, GCS or memory) [default if no command supplied]
     Broker(Box<broker::Arg>),
-
-    /// Easily consume or produce Avro, JSON or Protobuf messages to a topic
-    Cat {
-        #[command(subcommand)]
-        command: cat::Command,
-    },
-
-    /// Traffic Generator for schema backed topics
-    Generator(Box<generator::Arg>),
 
     /// Performance
     Perf(Box<perf::Arg>),
@@ -124,16 +90,13 @@ impl Cli {
     pub async fn main() -> Result<ErrorCode> {
         debug!(
             pid = process::id(),
-            storage = ?storage_engines(),
-            lakes = ?lakes()
+            storage = ?storage_engines()
         );
 
         let cli = Cli::parse();
 
         match cli.command.unwrap_or(Command::Broker(Box::new(cli.broker))) {
             Command::Broker(arg) => arg.main().await,
-            Command::Cat { command } => command.main().await,
-            Command::Generator(arg) => arg.main().await,
             Command::Perf(arg) => arg.main().await,
             Command::Proxy(arg) => tansu_proxy::Proxy::main(
                 arg.listener_url.into_inner(),

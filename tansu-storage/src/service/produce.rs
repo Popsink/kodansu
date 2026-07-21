@@ -138,7 +138,7 @@ use crate::{Error, Result, Storage, Topition};
 /// signals a genuine bug rather than something a retry would fix.
 fn storage_error_code(error: &Error) -> ErrorCode {
     match error {
-        #[cfg(any(feature = "dynostore", feature = "slatedb"))]
+        #[cfg(feature = "dynostore")]
         Error::ObjectStore(_) => ErrorCode::KafkaStorageError,
 
         _ => ErrorCode::UnknownServerError,

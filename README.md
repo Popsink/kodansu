@@ -1,7 +1,7 @@
 <div align="center">
 
 # Tansu 🗃️
-stateless Kafka-compatible broker with pluggable storage (PostgreSQL, SQLite, S3, memory)
+stateless Kafka-compatible broker backed by an object store (S3, GCS, memory)
 
 <br>
 
@@ -26,31 +26,24 @@ stateless Kafka-compatible broker with pluggable storage (PostgreSQL, SQLite, S3
 # What is Tansu?
 
 [Tansu][github-com-tansu-io] is a drop-in replacement for
-Apache Kafka with PostgreSQL, libSQL (SQLite), S3 or memory storage engines.
-Schema backed topics (Avro, JSON or Protocol buffers) can
-be written as [Apache Iceberg](https://iceberg.apache.org) or [Delta Lake](https://delta.io) tables.
+Apache Kafka backed by an object store: S3, Google Cloud Storage or memory.
 
 Features:
 
 - Apache Kafka API compatible
-- Available with [PostgreSQL](https://www.postgresql.org), [libSQL](https://docs.turso.tech/libsql), [S3](https://en.wikipedia.org/wiki/Amazon_S3) or memory storage engines
-- Topics [validated](docs/schema-registry.md) by [JSON Schema][json-schema-org], [Apache Avro](https://avro.apache.org)
-  or [Protocol buffers](protocol-buffers) can be written as [Apache Iceberg](https://iceberg.apache.org) or [Delta Lake](https://delta.io) tables
-
-See [examples using pyiceberg](https://github.com/tansu-io/example-pyiceberg), [examples using Apache Spark](https://github.com/tansu-io/example-spark) or 🆕 [examples using Delta Lake](https://github.com/tansu-io/example-delta-lake).
+- Backed by [S3](https://en.wikipedia.org/wiki/Amazon_S3), Google Cloud Storage or an in-memory store
+- A single, statically linked binary
 
 For data durability:
 
 - S3 is designed to exceed [99.999999999% (11 nines)][aws-s3-storage-classes]
-- PostgreSQL with [continuous archiving][continuous-archiving]
-  streaming transaction logs files to an archive
 - The memory storage engine is designed for ephemeral non-production environments
 
 Tansu is a single statically linked binary containing the following:
 
-- **broker** an Apache Kafka API compatible broker and schema registry
+- **broker** an Apache Kafka API compatible broker
 - **topic** a CLI to create/delete Topics
-- **cat** a CLI to consume or produce Avro, JSON or Protobuf messages to a topic
+- **perf** a CLI to benchmark broker throughput
 - **proxy** an Apache Kafka compatible proxy
 
 ## broker
@@ -62,9 +55,9 @@ Usage: tansu [OPTIONS]
        tansu <COMMAND>
 
 Commands:
-  broker  Apache Kafka compatible broker with Avro, JSON, Protobuf schema validation [default if no command supplied]
-  cat     Easily consume or produce Avro, JSON or Protobuf messages to a topic
+  broker  Apache Kafka compatible broker [default if no command supplied]
   topic   Create or delete topics managed by the broker
+  perf    Benchmark broker throughput
   proxy   Apache Kafka compatible proxy
   help    Print this message or the help of the given subcommand(s)
 
@@ -76,15 +69,7 @@ Options:
       --kafka-advertised-listener-url <KAFKA_ADVERTISED_LISTENER_URL>
           This location is advertised to clients in metadata [env: ADVERTISED_LISTENER_URL=tcp://localhost:9092] [default: tcp://localhost:9092]
       --storage-engine <STORAGE_ENGINE>
-          Storage engine examples are: postgres://postgres:postgres@localhost, memory://tansu/ or s3://tansu/ [env: STORAGE_ENGINE=s3://tansu/] [default: memory://tansu/]
-      --schema-registry <SCHEMA_REGISTRY>
-          Schema registry examples are: file://./etc/schema or s3://tansu/, containing: topic.json, topic.proto or topic.avsc [env: SCHEMA_REGISTRY=file://./etc/schema]
-      --data-lake <DATA_LAKE>
-          Apache Parquet files are written to this location, examples are: file://./lake or s3://lake/ [env: DATA_LAKE=s3://lake/]
-      --iceberg-catalog <ICEBERG_CATALOG>
-          Apache Iceberg Catalog, examples are: http://localhost:8181/ [env: ICEBERG_CATALOG=http://localhost:8181/]
-      --iceberg-namespace <ICEBERG_NAMESPACE>
-          Iceberg namespace [env: ICEBERG_NAMESPACE=] [default: tansu]
+          Storage engine examples are: s3://tansu/, gs://tansu/ or memory://tansu/ [env: STORAGE_ENGINE=s3://tansu/] [default: memory://tansu/]
       --prometheus-listener-url <PROMETHEUS_LISTENER_URL>
           Broker metrics can be scraped by Prometheus from this URL [env: PROMETHEUS_LISTENER_URL=tcp://0.0.0.0:9100] [default: tcp://[::]:9100]
   -h, --help
@@ -95,11 +80,7 @@ Options:
 
 A broker can be started by simply running `tansu`, all options have defaults. Tansu pickup any existing environment,
 loading any found in `.env`. An [example.env](example.env) is provided as part of the distribution
-and can be copied into `.env` for local modification. Sample schemas can be found in [etc/schema](etc/schema), used in the examples.
-
-If an Apache Avro, Protobuf or JSON schema has been assigned to a topic, the
-broker will reject any messages that are invalid. Schema backed topics are written
-as Apache Parquet when the `-data-lake` option is provided.
+and can be copied into `.env` for local modification.
 
 ## topic
 
@@ -125,58 +106,7 @@ To create a topic use:
 tansu topic create taxi
 ```
 
-## cat
-
-The `tansu cat` command, has the following subcommands:
-
-```shell
-tansu cat --help
-Easily consume or produce Avro, JSON or Protobuf messages to a topic
-
-Usage: tansu cat <COMMAND>
-
-Commands:
-  produce  Produce Avro/JSON/Protobuf messages to a topic
-  consume  Consume Avro/JSON/Protobuf messages from a topic
-  help     Print this message or the help of the given subcommand(s)
-
-Options:
-  -h, --help  Print help
-```
-
-The `produce` subcommand reads JSON formatted messages encoding them into
-Apache Avro, Protobuf or JSON depending on the schema used by the topic.
-
-For example, the `taxi` topic is backed by [taxi.proto](etc/schema/taxi.proto).
-Using [trips.json](etc/data/trips.json) containing a JSON array of objects,
-`tansu cat produce` encodes each message into protobuf into the broker:
-
-```
-tansu cat produce taxi etc/data/trips.json
-```
-
-Using [duckdb](https://duckdb.org) we can read the
-[Apache Parquet](https://parquet.apache.org) files
-created by the broker:
-
-```shell
-duckdb :memory: "SELECT * FROM 'data/taxi/*/*.parquet'"
-```
-
-Results in the following output:
-
-```shell
-|-----------+---------+---------------+-------------+---------------|
-| vendor_id | trip_id | trip_distance | fare_amount | store_and_fwd |
-|     int64 |   int64 |         float |      double |         int32 |
-|-----------+---------+---------------+-------------+---------------|
-|         1 | 1000371 |           1.8 |       15.32 |             0 |
-|         2 | 1000372 |           2.5 |       22.15 |             0 |
-|         2 | 1000373 |           0.9 |        9.01 |             0 |
-|         1 | 1000374 |           8.4 |       42.13 |             1 |
-|-----------+---------+---------------+-------------+---------------|
-```
-
+## storage
 
 ### s3
 
@@ -287,89 +217,20 @@ kafka-consumer-groups \
   --describe
 ```
 
-### PostgreSQL
+### memory
 
-To switch between the minio and PostgreSQL examples, firstly
-shutdown Tansu:
-
-```shell
-docker compose down tansu
-```
-
-Switch to the PostgreSQL storage engine by updating [.env](.env):
-
-```env
-# minio storage engine
-# STORAGE_ENGINE="s3://tansu/"
-
-# PostgreSQL storage engine -- NB: @db and NOT @localhost :)
-STORAGE_ENGINE="postgres://postgres:postgres@db"
-```
-
-Start PostgreSQL:
+The memory storage engine keeps everything in process and is intended for
+ephemeral, non-production environments (tests, demos, local experiments). Set
+the storage engine in [.env](.env):
 
 ```shell
-docker compose up -d db
+STORAGE_ENGINE="memory://tansu/"
 ```
 
-Bring Tansu back up:
+Then start the broker:
 
 ```shell
-docker compose up -d tansu
-```
-
-Using the regular Apache Kafka CLI you can create topics, produce and consume
-messages with Tansu:
-
-```shell
-kafka-topics \
-  --bootstrap-server localhost:9092 \
-  --partitions=3 \
-  --replication-factor=1 \
-  --create --topic test
-```
-
-Producer:
-
-```shell
-echo "hello world" | kafka-console-producer \
-    --bootstrap-server localhost:9092 \
-    --topic test
-```
-
-Consumer:
-
-```shell
-kafka-console-consumer \
-  --bootstrap-server localhost:9092 \
-  --group test-consumer-group \
-  --topic test \
-  --from-beginning \
-  --property print.timestamp=true \
-  --property print.key=true \
-  --property print.offset=true \
-  --property print.partition=true \
-  --property print.headers=true \
-  --property print.value=true
-```
-
-Or using [librdkafka][librdkafka] to produce:
-
-```shell
-echo "Lorem ipsum dolor..." | \
-  ./examples/rdkafka_example -P \
-  -t test -p 1 \
-  -b localhost:9092 \
-  -z gzip
-```
-
-Consumer:
-
-```shell
-./examples/rdkafka_example \
-  -C \
-  -t test -p 1 \
-  -b localhost:9092
+tansu
 ```
 
 ## Feedback
@@ -386,7 +247,6 @@ Tansu is licensed under [Apache 2.0][apache-license].
 [aws-s3-conditional-writes]: https://aws.amazon.com/about-aws/whats-new/2024/08/amazon-s3-conditional-writes/
 [aws-s3-storage-classes]: https://aws.amazon.com/s3/storage-classes/
 [cloudflare-r2]: https://developers.cloudflare.com/r2/
-[continuous-archiving]: https://www.postgresql.org/docs/current/continuous-archiving.html
 [crates-io-object-store]: https://crates.io/crates/object_store
 [github-com-tansu-io]: https://github.com/tansu-io/tansu
 [json-schema-org]: https://json-schema.org/

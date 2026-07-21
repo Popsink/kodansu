@@ -50,9 +50,6 @@ jobs:
       matrix:
         storage:
           - dynostore
-          - libsql
-          - postgres
-          - slatedb
     steps:
       - uses: actions/checkout@v6
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -62,31 +59,8 @@ jobs:
       - run: sudo apt-get install -y libclang-dev libkrb5-dev
       - run: cargo build --features ${{ matrix.storage }}
 
-  build-storage-lake:
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        storage:
-          - dynostore
-          - libsql
-          - postgres
-          - slatedb
-        lake:
-          - delta
-          - iceberg
-          - parquet
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          components: clippy, rustfmt
-          cache: false
-      - run: sudo apt-get install -y libclang-dev libkrb5-dev
-      - run: cargo build --features ${{ matrix.storage }} --features ${{ matrix.lake }}
-
   test:
-    needs: [check, fmt, clippy, build-storage, build-storage-lake]
+    needs: [check, fmt, clippy, build-storage]
     runs-on: ubuntu-latest-8-cores
     env:
       ADVERTISED_LISTENER_URL: tcp://localhost:9092
@@ -97,16 +71,10 @@ jobs:
       AWS_SECRET_ACCESS_KEY: minioadmin
       CARGO_BUILD_BUILD_DIR: /mnt/build
       CLUSTER_ID: tansu-ci
-      DATA_LAKE: s3://lake
-      ICEBERG_CATALOG: http://localhost:8181/catalog
-      ICEBERG_WAREHOUSE: tansu
-      LAKEKEEPER_IMAGE: quay.io/lakekeeper/catalog:v0.8.5
-      POSTGRES_IMAGE: postgres:17
       TANSU_IMAGE: ghcr.io/popsink/tansu
       PROMETHEUS_LISTENER_URL: tcp://[::]:9100
       RUST_BACKTRACE: 1
       RUST_LOG: debug,tansu_sans_io=warn,tansu_model=warn
-      SCHEMA_REGISTRY: file://./etc/schema
       STORAGE_ENGINE: s3://tansu/
     steps:
       - run: sudo mkdir /mnt/build

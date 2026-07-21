@@ -1,1 +1,0 @@
-select freelist_count, page_size from pragma_freelist_count(), pragma_page_size();
