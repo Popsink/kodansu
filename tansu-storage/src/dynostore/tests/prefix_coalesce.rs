@@ -1393,29 +1393,6 @@ async fn retention_forever_keeps_segments() -> Result<(), Error> {
     Ok(())
 }
 
-/// `prefix_owner_node` is a deterministic, order-independent pure assignment and
-/// removing a non-owner leaves the owner unchanged (rendezvous-hash stability).
-#[test]
-fn prefix_owner_is_deterministic_and_stable() {
-    use crate::dynostore::prefix_owner_node;
-
-    assert_eq!(None, prefix_owner_node("x", &[]));
-    assert_eq!(Some(111), prefix_owner_node("x", &[111]));
-
-    let nodes = [1, 2, 3, 4];
-    let owner = prefix_owner_node("org.env.conn", &nodes).expect("owner");
-    // Order-independent.
-    assert_eq!(
-        Some(owner),
-        prefix_owner_node("org.env.conn", &[4, 3, 2, 1])
-    );
-
-    // Removing a non-owner node keeps the owner.
-    let non_owner = nodes.into_iter().find(|n| *n != owner).unwrap();
-    let pruned: Vec<i32> = nodes.into_iter().filter(|n| *n != non_owner).collect();
-    assert_eq!(Some(owner), prefix_owner_node("org.env.conn", &pruned));
-}
-
 /// Leaseless (#86): with no lease, two replicas append to the SAME sub-stream by
 /// alternating, and the fold-before-claim step makes each observe the other's
 /// segment before deriving its base — so offsets stay dense and contiguous with
@@ -1866,9 +1843,9 @@ async fn leaseless_backfill_folds_into_segments() -> Result<(), Error> {
 }
 
 /// #90 gating: on the pre-SCOS *lease* path the #62 backfill bypass is preserved
-/// (its #70 multi-replica routing can't safely carry the bulk load), so a
-/// backfill-class batch on a fresh sub-stream still takes the legacy per-topic
-/// create path — no segment.
+/// (single-broker only — a multi-replica lease deployment hits the #70 fence
+/// storm), so a backfill-class batch on a fresh sub-stream still takes the
+/// legacy per-topic create path — no segment.
 #[tokio::test]
 async fn lease_backfill_keeps_legacy_bypass() -> Result<(), Error> {
     let bucket = InMemory::new();

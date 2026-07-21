@@ -214,8 +214,9 @@ pub struct DynoStore {
 
     /// When set (with `prefix_coalesce`), prefix flushes use the leaseless
     /// seq-CAS offset arbiter (#86): the create-only segment-sequence CAS assigns
-    /// offsets directly (no `lease.json`, no fencing epoch, no #70 forwarding), so
-    /// any replica may append to any prefix. On a create conflict the writer folds
+    /// offsets directly (no `lease.json`, no fencing epoch, no cross-broker
+    /// produce forwarding), so any replica may append to any prefix. On a create
+    /// conflict the writer folds
     /// the winner's footer, re-derives the sub-stream bases and re-encodes, then
     /// retries the next sequence. Off by default: production keeps the
     /// single-writer lease path until the quiesce-and-flip migration (#92) turns
@@ -515,35 +516,6 @@ static LEASE_FENCED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .with_description("prefix lease acquisitions lost to another writer (fenced)")
         .build()
 });
-
-/// Deterministic owner node for a connector prefix (#59): rendezvous
-/// (highest-random-weight) hashing over the broker set — a pure function with no
-/// shared state, so every broker computes the same owner, and adding/removing a
-/// broker moves only ~1/N of prefixes. A multi-broker deployment routes a
-/// prefix's produce to this node to avoid lease contention; the lease
-/// (`acquire_or_renew_lease`) is the actual single-writer *guarantee*, so
-/// assignment is an optimization, not the fence. This single-node broker
-/// (node 111) trivially owns every prefix, so the routing layer that would
-/// consult this is out of scope here. Orthogonal to consumer-group coordination
-/// (still node 111). `None` iff `nodes` is empty.
-#[allow(dead_code)]
-fn prefix_owner_node(prefix: &str, nodes: &[i32]) -> Option<i32> {
-    fn weight(prefix: &str, node: i32) -> u64 {
-        // FNV-1a over the prefix bytes then the node, mixing both so the winner
-        // is stable per (prefix, node-set) and independent of node ordering.
-        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-        for byte in prefix.as_bytes().iter().chain(node.to_be_bytes().iter()) {
-            hash ^= *byte as u64;
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        hash
-    }
-
-    nodes
-        .iter()
-        .copied()
-        .max_by_key(|node| weight(prefix, *node))
-}
 
 /// Magic trailer word marking a prefix-coalesced multi-topic segment object
 /// (#64), distinguishing a `.seg` from a legacy single-topic coalesced object
@@ -3421,10 +3393,9 @@ impl DynoStore {
     ///
     /// Note: this broker is single-node (node 111), so the fenced writer *is*
     /// this process and the retry lands back here after the stale lease lapses.
-    /// A true multi-broker deployment would need a routing layer to send the
-    /// retried produce to the `prefix_owner_node` holder; that layer does not
-    /// exist yet, so prefix coalescing is intended for single-broker deployments
-    /// until it does.
+    /// The lease path is therefore intended for single-broker deployments; the
+    /// multi-replica answer is the leaseless seq-CAS arbiter (`prefix_leaseless`,
+    /// #86), which needs no produce routing at all.
     ///
     /// A held term is reused with no write while more than a third of it
     /// remains, so the lease object is mutated ~once per `2/3 · ttl`, never per
@@ -3843,7 +3814,7 @@ impl DynoStore {
 
     /// Leaseless prefix flush (#86): the create-only segment-sequence CAS is the
     /// offset arbiter, so any replica may append to any prefix — no lease, no
-    /// fencing epoch, no #70 forwarding. Fold every live segment (bypassing the
+    /// fencing epoch, no cross-broker produce forwarding. Fold every live segment (bypassing the
     /// index TTL), derive each sub-stream's base from the folded tail, encode a v2
     /// segment and try to create it at the next free sequence. On a create
     /// conflict a peer won that sequence: fold its footer, re-derive the bases and
@@ -6142,7 +6113,8 @@ impl Storage for DynoStore {
             // pipelines sequences (a failed N after N+1 landed would mint a gap).
             //
             // On the lease path (pre-SCOS), keep the #62 backfill high-throughput
-            // bypass: its #70 multi-replica routing can't safely carry the bulk
+            // bypass: it is single-broker only (a multi-replica lease deployment
+            // hits the #70 fence storm), so it can't safely carry the bulk
             // load, and legacy offsets stay strictly below segment offsets only
             // while the sub-stream has no segment yet (the #58 seam the hybrid
             // read path depends on) — so a large batch bypasses only then, and one
