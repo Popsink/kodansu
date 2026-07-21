@@ -1798,13 +1798,20 @@ impl DynoStore {
     /// The listing observed every batch at/after its floor — including other
     /// replicas' writes in that range — so it resets the [`Self::cached_high_fresh`]
     /// TTL clock.
-    fn mark_listed(&self, topition: &Topition, high: i64) -> Result<()> {
+    ///
+    /// `as_of` is *when the underlying data was observed*, not `now`: a live
+    /// listing passes the instant captured before the LIST; the prefix-coalesce
+    /// read path passes the prefix index's `refreshed_at`, because that index is
+    /// itself served from a cache up to one TTL old. Stamping `now` instead let
+    /// cross-pod visibility staleness compound toward ~2×TTL — the index could be
+    /// a TTL stale and then be treated as fresh for another full TTL (#91).
+    fn mark_listed(&self, topition: &Topition, high: i64, as_of: SystemTime) -> Result<()> {
         self.next_offsets
             .lock()
             .map(|mut locked| {
                 let entry = locked.entry(topition.to_owned()).or_default();
                 entry.next = entry.next.max(high);
-                entry.listed_at = Some(SystemTime::now());
+                entry.listed_at = Some(as_of);
             })
             .map_err(Into::into)
     }
@@ -1906,8 +1913,11 @@ impl DynoStore {
             Some(hint) => hint,
             None => self.persisted_high(topition).await?,
         };
+        // Anchor freshness to before the listing (#91): the LIST reflects state
+        // no newer than this instant, so the fresh window never over-claims.
+        let listed_at = SystemTime::now();
         let high = self.tail_next_offset(topition, Some(floor)).await?;
-        self.mark_listed(topition, high)?;
+        self.mark_listed(topition, high, listed_at)?;
         Ok(high)
     }
 
@@ -1953,7 +1963,15 @@ impl DynoStore {
                 .recover_substream_next_offset(topition, from_watermark)
                 .await?;
             let high = recovered.max(self.cached_high(topition)?.unwrap_or(0));
-            self.mark_listed(topition, high)?;
+            // Anchor to when the prefix index was actually listed, not `now`:
+            // `recover_substream_next_offset` may have served a TTL-cached index,
+            // so stamping `now` would let cross-pod staleness compound to ~2×TTL
+            // (#91). Fall back to `now` only if the index has no timestamp (it was
+            // just refreshed above, so this is the safe degenerate case).
+            let as_of = self
+                .prefix_index_refreshed_at(&self.prefix_of(topition))
+                .unwrap_or_else(SystemTime::now);
+            self.mark_listed(topition, high, as_of)?;
             return Ok(high);
         }
 
@@ -1961,8 +1979,9 @@ impl DynoStore {
         let was_cold = cached.is_none();
         let floor = cached.unwrap_or(0).max(from_watermark);
 
+        let listed_at = SystemTime::now();
         let from_objects = self.tail_next_offset(topition, Some(floor)).await?;
-        self.mark_listed(topition, from_objects)?;
+        self.mark_listed(topition, from_objects, listed_at)?;
 
         let high = from_objects.max(from_watermark);
 
@@ -2058,8 +2077,9 @@ impl DynoStore {
                         ?topition,
                         "offset taken, resyncing tail"
                     );
+                    let listed_at = SystemTime::now();
                     candidate = self.tail_next_offset(topition, Some(candidate)).await?;
-                    self.mark_listed(topition, candidate)?;
+                    self.mark_listed(topition, candidate, listed_at)?;
                 }
 
                 Err(err) => return Err(err.into()),
@@ -2121,7 +2141,7 @@ impl DynoStore {
             Action::StartTimer => {
                 let store = self.clone();
                 let topition = topition.to_owned();
-                let linger = self.coalesce_linger;
+                let linger = self.jittered_linger();
 
                 _ = tokio::spawn(async move {
                     tokio::time::sleep(linger).await;
@@ -2255,6 +2275,19 @@ impl DynoStore {
             .map_err(Into::into)
     }
 
+    /// The coalesce linger with per-flush random jitter (±20%, within the #91
+    /// 10–25% guidance). Independent pods — and successive windows on one pod —
+    /// draw uncorrelated flush instants instead of staying phase-aligned, so
+    /// they stop racing the create of the *same* next segment name; on GCS that
+    /// collision returns a 429 and burns a conflict-retry. Same desync trick as
+    /// [`throttle_backoff`].
+    fn jittered_linger(&self) -> Duration {
+        let base_ms = self.coalesce_linger.as_millis().min(u128::from(u64::MAX)) as u64;
+        let span = base_ms / 5; // ±20%
+        let jitter = rng().random_range(0..=2 * span);
+        Duration::from_millis(base_ms.saturating_sub(span) + jitter)
+    }
+
     /// The durable sequence-floor object for `prefix` (#77).
     fn seq_floor_location(&self, prefix: &str) -> Path {
         Path::from(format!(
@@ -2375,6 +2408,25 @@ impl DynoStore {
         // listing's max has dropped below it (or the prefix listed empty).
         let floor = self.read_seq_floor(prefix).await?;
         Ok(max.map_or(0, |m| m + 1).max(floor))
+    }
+
+    /// The next free segment sequence for `prefix`, derived from the *already
+    /// force-folded* in-memory index instead of a fresh LIST (#91). The leaseless
+    /// flush (`fold-before-claim`) calls [`Self::refresh_prefix_index_forced`]
+    /// immediately before this, so the cached segment set already reflects every
+    /// live sequence — including a peer replica's seconds-old create. The full
+    /// `tail_next_seq` LIST per conflict attempt was therefore redundant: it
+    /// re-read what the forced refresh had just listed. Still folds the persisted
+    /// seq floor (#77) so a name freed by retention/compaction is never reused.
+    async fn tail_next_seq_folded(&self, prefix: &str) -> Result<u64> {
+        let listed_max = self
+            .prefix_index
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .get(prefix)
+            .and_then(|index| index.segments.keys().next_back().copied());
+        let floor = self.read_seq_floor(prefix).await?;
+        Ok(listed_max.map_or(0, |m| m + 1).max(floor))
     }
 
     /// Write `payload` as the next create-only segment under `prefix` and return
@@ -2626,6 +2678,19 @@ impl DynoStore {
                 );
                 entry.refreshed_at = Some(SystemTime::now());
             })
+    }
+
+    /// When the cached prefix index for `prefix` was last reconciled by a
+    /// listing, if this process has one. Used to anchor a high-watermark hint's
+    /// freshness clock to when the *segment set* was observed rather than to
+    /// `now` (#91): the read path serves the index from a cache that may itself
+    /// be up to one TTL old, so stamping `mark_listed` with `now` let cross-pod
+    /// staleness compound toward ~2×TTL.
+    fn prefix_index_refreshed_at(&self, prefix: &str) -> Option<SystemTime> {
+        self.prefix_index
+            .lock()
+            .ok()
+            .and_then(|index| index.get(prefix).and_then(|entry| entry.refreshed_at))
     }
 
     /// Force the next index access to re-list (bust the TTL) — used when a data
@@ -3342,7 +3407,7 @@ impl DynoStore {
             Action::StartTimer => {
                 let store = self.clone();
                 let prefix = prefix.clone();
-                let linger = self.coalesce_linger;
+                let linger = self.jittered_linger();
 
                 _ = tokio::spawn(async move {
                     tokio::time::sleep(linger).await;
@@ -3586,7 +3651,9 @@ impl DynoStore {
             if let Err(error) = self.refresh_prefix_index_forced(prefix).await {
                 return Self::fail_prefix_flush(buffer, error, prefix);
             }
-            let candidate = match self.tail_next_seq(prefix).await {
+            // Derive the candidate from the index the forced refresh just folded
+            // — no second LIST per attempt (#91).
+            let candidate = match self.tail_next_seq_folded(prefix).await {
                 Ok(seq) => seq,
                 Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
             };
