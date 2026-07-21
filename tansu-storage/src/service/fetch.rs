@@ -192,9 +192,14 @@ impl FetchService {
             batches.append(&mut fetched);
         }
 
+        // Isolation-aware: read-uncommitted resolves its response offsets from
+        // the in-memory high-watermark hint + cached log start, without reading
+        // the cluster-wide `meta.json` object — keeping this hot path off the
+        // single meta key's request ceiling (#109). Read-committed still reads
+        // meta for the last-stable offset and aborted-transaction list.
         let offset_stage = ctx
             .state()
-            .offset_stage(&tp)
+            .offset_stage_at(&tp, isolation)
             .await
             .inspect_err(|error| error!(?error, ?tp))?;
 
@@ -262,59 +267,6 @@ impl FetchService {
             })))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    #[instrument(skip(self, ctx, min_bytes, isolation, fetch))]
-    async fn fetch_topic<G>(
-        &self,
-        ctx: &Context<G>,
-        max_wait: Duration,
-        min_bytes: u32,
-        max_bytes: &mut u32,
-        isolation: IsolationLevel,
-        fetch: &FetchTopic,
-    ) -> Result<FetchableTopicResponse>
-    where
-        G: Storage,
-    {
-        let started_at = Instant::now();
-
-        let metadata = ctx.state().metadata(Some(&[fetch.into()])).await?;
-
-        if let Some(MetadataResponseTopic {
-            topic_id,
-            name: Some(name),
-            ..
-        }) = metadata.topics().first()
-        {
-            let mut partitions = Vec::new();
-
-            for fetch_partition in fetch.partitions.as_ref().unwrap_or(&Vec::new()) {
-                let remaining = max_wait.saturating_sub(started_at.elapsed());
-
-                let partition = self
-                    .fetch_partition(
-                        ctx,
-                        remaining,
-                        min_bytes,
-                        max_bytes,
-                        isolation,
-                        name,
-                        fetch_partition,
-                    )
-                    .await?;
-
-                partitions.push(partition);
-            }
-
-            Ok(FetchableTopicResponse::default()
-                .topic(fetch.topic.to_owned())
-                .topic_id(topic_id.to_owned())
-                .partitions(Some(partitions)))
-        } else {
-            self.unknown_topic_response(fetch)
-        }
-    }
-
     #[instrument(skip(self, ctx, isolation, topics))]
     pub(crate) async fn fetch<G>(
         &self,
@@ -331,64 +283,113 @@ impl FetchService {
         debug!(?isolation, ?topics);
 
         if topics.is_empty() {
-            Ok(vec![])
-        } else {
-            let started_at = SystemTime::now();
-            let mut responses = vec![];
-            let mut iteration = 0;
-            let mut bytes = 0;
+            return Ok(vec![]);
+        }
 
-            while !max_wait.saturating_sub(started_at.elapsed()?).is_zero() && bytes <= min_bytes {
-                debug!(?bytes, remaining = ?max_wait.saturating_sub(started_at.elapsed()?));
+        // Resolve topic metadata ONCE for the whole request, not on every
+        // long-poll iteration (#109). The name/id mapping is stable for the
+        // fetch's lifetime, so re-reading `topic-metadata/<name>.json` each
+        // iteration was pure per-poll S3 traffic. `known` is `None` for an
+        // unknown topic (its error response is likewise stable).
+        let mut resolved: Vec<ResolvedTopic<'_>> = Vec::with_capacity(topics.len());
+        for fetch in topics.iter() {
+            let metadata = ctx.state().metadata(Some(&[fetch.into()])).await?;
 
-                responses.clear();
+            let known = if let Some(MetadataResponseTopic {
+                topic_id,
+                name: Some(name),
+                ..
+            }) = metadata.topics().first()
+            {
+                Some((name.clone(), topic_id.to_owned()))
+            } else {
+                None
+            };
 
-                let fetch_started_at = SystemTime::now();
-                for fetch in topics.iter() {
-                    let fetch_response = self
-                        .fetch_topic(
-                            ctx,
-                            max_wait.saturating_sub(started_at.elapsed()?),
-                            min_bytes,
-                            max_bytes,
-                            isolation,
-                            fetch,
-                        )
-                        .await?;
+            resolved.push(ResolvedTopic { fetch, known });
+        }
 
-                    responses.push(fetch_response);
-                }
+        let started_at = SystemTime::now();
+        let mut responses = vec![];
+        let mut iteration = 0;
+        let mut bytes = 0;
 
-                bytes += u32::try_from(responses.byte_size())?;
+        while !max_wait.saturating_sub(started_at.elapsed()?).is_zero() && bytes <= min_bytes {
+            debug!(?bytes, remaining = ?max_wait.saturating_sub(started_at.elapsed()?));
 
-                let remaining = max_wait.saturating_sub(started_at.elapsed()?);
+            responses.clear();
 
-                debug!(?iteration, ?max_wait, ?remaining, ?bytes, ?min_bytes);
+            let fetch_started_at = SystemTime::now();
+            for topic in resolved.iter() {
+                let fetch_response = if let Some((name, topic_id)) = topic.known.as_ref() {
+                    let mut partitions = Vec::new();
 
-                if bytes > min_bytes {
-                    break;
-                }
+                    for fetch_partition in topic.fetch.partitions.as_ref().unwrap_or(&Vec::new()) {
+                        let remaining = max_wait.saturating_sub(started_at.elapsed()?);
 
-                {
-                    let fetch_elapsed = fetch_started_at.elapsed()?;
+                        let partition = self
+                            .fetch_partition(
+                                ctx,
+                                remaining,
+                                min_bytes,
+                                max_bytes,
+                                isolation,
+                                name,
+                                fetch_partition,
+                            )
+                            .await?;
 
-                    // we have some data to return to the client,
-                    // we haven't met the minimum size requirement,
-                    // but we don't have enough (estimated) time remaining to do another round
-                    if !responses.is_empty() && remaining < fetch_elapsed {
-                        debug!(responses.len = responses.len(), ?remaining, ?fetch_elapsed);
-                        break;
+                        partitions.push(partition);
                     }
-                }
 
-                sleep(remaining / 2).await;
+                    FetchableTopicResponse::default()
+                        .topic(topic.fetch.topic.to_owned())
+                        .topic_id(topic_id.to_owned())
+                        .partitions(Some(partitions))
+                } else {
+                    self.unknown_topic_response(topic.fetch)?
+                };
 
-                iteration += 1;
+                responses.push(fetch_response);
             }
 
-            Ok(responses)
+            bytes += u32::try_from(responses.byte_size())?;
+
+            let remaining = max_wait.saturating_sub(started_at.elapsed()?);
+
+            debug!(?iteration, ?max_wait, ?remaining, ?bytes, ?min_bytes);
+
+            if bytes > min_bytes {
+                break;
+            }
+
+            {
+                let fetch_elapsed = fetch_started_at.elapsed()?;
+
+                // we have some data to return to the client,
+                // we haven't met the minimum size requirement,
+                // but we don't have enough (estimated) time remaining to do another round
+                if !responses.is_empty() && remaining < fetch_elapsed {
+                    debug!(responses.len = responses.len(), ?remaining, ?fetch_elapsed);
+                    break;
+                }
+            }
+
+            sleep(remaining / 2).await;
+
+            iteration += 1;
         }
+
+        Ok(responses)
     }
+}
+
+/// A `FetchTopic` paired with its metadata resolved once per request (#109):
+/// `known` is `Some((name, topic_id))` for a known topic, `None` for an unknown
+/// one.
+struct ResolvedTopic<'a> {
+    fetch: &'a FetchTopic,
+    known: Option<(String, Option<[u8; 16]>)>,
 }
 
 impl<G> Service<G, FetchRequest> for FetchService

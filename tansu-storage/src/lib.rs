@@ -1326,6 +1326,26 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// Query the offset stage for a topic partition.
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage>;
 
+    /// Offset stage for a fetch *response* at the given isolation level.
+    ///
+    /// Read-uncommitted (the common consumer case) needs no transaction state:
+    /// the last-stable offset equals the high watermark and the
+    /// aborted-transaction list is empty. A backend may therefore serve it
+    /// without reading the cluster-wide `meta.json` object, keeping the consumer
+    /// fetch hot path off that single hot key — which at consumer-fan-out scale
+    /// is both an S3 request ceiling (503 SlowDown) and ~2 extra round-trips per
+    /// fetch (#109). Read-committed falls through to the full, transaction-aware
+    /// [`Self::offset_stage`]. The default delegates for backends that do not
+    /// distinguish the two.
+    async fn offset_stage_at(
+        &self,
+        topition: &Topition,
+        isolation: IsolationLevel,
+    ) -> Result<OffsetStage> {
+        let _ = isolation;
+        self.offset_stage(topition).await
+    }
+
     /// Query the offsets for one or more topic partitions.
     async fn list_offsets(
         &self,
@@ -1538,6 +1558,14 @@ where
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
         self.as_ref().offset_stage(topition).await
+    }
+
+    async fn offset_stage_at(
+        &self,
+        topition: &Topition,
+        isolation: IsolationLevel,
+    ) -> Result<OffsetStage> {
+        self.as_ref().offset_stage_at(topition, isolation).await
     }
 
     async fn list_offsets(
@@ -1797,6 +1825,14 @@ where
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
         self.as_ref().offset_stage(topition).await
+    }
+
+    async fn offset_stage_at(
+        &self,
+        topition: &Topition,
+        isolation: IsolationLevel,
+    ) -> Result<OffsetStage> {
+        self.as_ref().offset_stage_at(topition, isolation).await
     }
 
     async fn list_offsets(
@@ -2707,6 +2743,29 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.offset_stage(topition),
 
             Self::Null(engine) => engine.offset_stage(topition),
+        }
+        .await
+        .inspect(|_| {
+            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
+        })
+        .inspect_err(|_| {
+            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
+        })
+    }
+
+    #[instrument(skip_all)]
+    async fn offset_stage_at(
+        &self,
+        topition: &Topition,
+        isolation: IsolationLevel,
+    ) -> Result<OffsetStage> {
+        let attributes = [KeyValue::new("method", "offset_stage_at")];
+
+        match self {
+            #[cfg(feature = "dynostore")]
+            Self::DynoStore(engine) => engine.offset_stage_at(topition, isolation),
+
+            Self::Null(engine) => engine.offset_stage_at(topition, isolation),
         }
         .await
         .inspect(|_| {
