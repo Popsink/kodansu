@@ -160,12 +160,13 @@ stay readable until retention drains them. A fetch spanning the cutover stitches
 the legacy region and the segment region into one continuous offset sequence.
 Default off is byte-for-byte the current behaviour.
 
-**Single-broker for now.** Single-writer-per-prefix is enforced by the S3 lease,
-but the produce-routing layer that would send a fenced writer's retry to the
-owning broker (`consistent_hash(prefix) → broker`) is not yet implemented. Until
-it is, enable `prefix_coalesce` only on single-broker deployments (Tansu's
-default node model); on multiple brokers a producer landing on a non-owner would
-be fenced persistently.
+**Multi-broker.** On the lease path, single-writer-per-prefix is enforced by the
+S3 lease, so `prefix_coalesce` alone is single-broker: on multiple brokers a
+producer landing on a non-owner is fenced persistently (no produce-routing layer
+exists to forward it). The multi-replica answer is the leaseless seq-CAS arbiter
+(`prefix_leaseless`, #86): the create-only segment-sequence CAS assigns offsets
+directly, so any replica may append to any prefix with no lease and no routing.
+See `docs/migration-scos.md` for the quiesce-and-flip cutover.
 
 **External S3-direct readers** must understand the segment frame + footer to read
 a coalesced prefix; the format is the published contract (see

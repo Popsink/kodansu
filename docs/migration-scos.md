@@ -44,10 +44,9 @@ guarantees.
    the lease lapses.
 3. **Start leaseless.** Bring up the new pods with the leaseless flag on
    (`prefix_leaseless`). The first flush of each prefix seeds and stamps the era
-   automatically (step above).
-4. **Delete #70 routing config.** With no lease and no owner, the
-   `routing_node_id` / `members` produce-routing configuration is inert and
-   should be removed.
+   automatically (step above). No produce routing is involved — any replica may
+   append to any prefix (this tree never wired a multi-broker routing layer, so
+   there is no routing config to remove).
 
 Format note: v2 segments (footer nonce + producer coordinates) coexist with v1
 per-object. All readers — the broker and any external S3-direct reader
@@ -70,7 +69,7 @@ leaseless-era segment:
    immediately, bumping to `era_epoch + 2`). A restarted holder therefore stamps
    segments that out-epoch every leaseless-era segment and wins the overlap
    tie-break — the mirror of the forward guarantee.
-4. **Start** the old lease-mode pods and restore the #70 routing config.
+4. **Start** the old lease-mode pods (there is no routing config to restore).
 
 If any v2 segment was written during the leaseless window, the segments must be
 rewritten to v1 before old readers that predate v2 can read them; gate the
