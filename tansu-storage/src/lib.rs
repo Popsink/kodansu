@@ -1441,6 +1441,19 @@ pub trait Storage: Debug + Send + Sync + 'static {
         version: Option<Version>,
     ) -> Result<Version, UpdateError<GroupDetail>>;
 
+    /// The persisted state of a group and its version, or `None` when the group
+    /// has no persisted state. Lets the coordinator detect a cross-replica change
+    /// with a cheap (tier-2) read and skip the group-state PUT when a
+    /// heartbeat/commit changed nothing persistent (#111) — while still observing
+    /// a rebalance another replica triggered, which the unconditional
+    /// [`Self::update_group`]'s `Outdated` path used to be the only source of. The
+    /// default returns `None`, so a backend that does not implement it keeps the
+    /// always-write path unchanged.
+    async fn read_group(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        let _ = group_id;
+        Ok(None)
+    }
+
     /// Initialise a transactional or idempotent producer in this storage.
     async fn init_producer(
         &self,
@@ -1687,6 +1700,10 @@ where
         version: Option<Version>,
     ) -> Result<Version, UpdateError<GroupDetail>> {
         self.as_ref().update_group(group_id, detail, version).await
+    }
+
+    async fn read_group(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        self.as_ref().read_group(group_id).await
     }
 
     async fn init_producer(
@@ -1954,6 +1971,10 @@ where
         version: Option<Version>,
     ) -> Result<Version, UpdateError<GroupDetail>> {
         self.as_ref().update_group(group_id, detail, version).await
+    }
+
+    async fn read_group(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        self.as_ref().read_group(group_id).await
     }
 
     async fn init_producer(
@@ -3024,6 +3045,25 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.update_group(group_id, detail, version),
 
             Self::Null(engine) => engine.update_group(group_id, detail, version),
+        }
+        .await
+        .inspect(|_| {
+            STORAGE_CONTAINER_REQUESTS.add(1, &attributes);
+        })
+        .inspect_err(|_| {
+            STORAGE_CONTAINER_ERRORS.add(1, &attributes);
+        })
+    }
+
+    #[instrument(skip_all)]
+    async fn read_group(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        let attributes = [KeyValue::new("method", "read_group")];
+
+        match self {
+            #[cfg(feature = "dynostore")]
+            Self::DynoStore(engine) => engine.read_group(group_id),
+
+            Self::Null(engine) => engine.read_group(group_id),
         }
         .await
         .inspect(|_| {
