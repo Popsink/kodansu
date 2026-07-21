@@ -1286,7 +1286,7 @@ where
         loop {
             COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "offset_commit_loop")]);
 
-            let (wrapper, version) = self.wrappers.lock().map(|mut wrappers| {
+            let (mut wrapper, mut version) = self.wrappers.lock().map(|mut wrappers| {
                 wrappers
                     .remove(group_id)
                     .unwrap_or_else(|| (Wrapper::Forming(Inner::new(self.storage.clone())), None))
@@ -1294,10 +1294,34 @@ where
 
             debug!(?group_id, ?wrapper, ?version, ?iteration);
 
+            // GET-first (#111): observe a cross-replica change with a cheap read
+            // and evaluate the commit against current state; committed offsets go
+            // to their own per-topition objects inside `offset_commit` regardless.
+            let persisted = self.storage.read_group(group_id).await?;
+            if let Some((current, current_version)) = &persisted
+                && version.as_ref() != Some(current_version)
+            {
+                wrapper = Wrapper::with_storage_group_detail(self.storage.clone(), current.clone());
+                version = Some(current_version.clone());
+            }
+
+            let before = GroupDetail::from(&wrapper);
+
             let now = SystemTime::now();
 
             let (wrapper, body) = wrapper.offset_commit(now, &offset_commit).await;
             debug!(group_id, ?wrapper, ?version, iteration,);
+
+            // Skip the redundant group-state PUT when the commit changed nothing
+            // in `GroupDetail` (#111): the offsets were persisted to their own
+            // objects, so re-writing the group object is pure overhead.
+            if persisted.is_some() && GroupDetail::from(&wrapper) == before {
+                _ = self
+                    .wrappers
+                    .lock()
+                    .map(|mut wrappers| wrappers.insert(group_id.to_owned(), (wrapper, version)))?;
+                return Ok(body);
+            }
 
             match self
                 .storage
@@ -1385,13 +1409,30 @@ where
         loop {
             COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "heartbeat_loop")]);
 
-            let (mut wrapper, version) = self.wrappers.lock().map(|mut wrappers| {
+            let (mut wrapper, mut version) = self.wrappers.lock().map(|mut wrappers| {
                 wrappers
                     .remove(group_id)
                     .unwrap_or_else(|| (Wrapper::Forming(Inner::new(self.storage.clone())), None))
             })?;
 
             debug!(?group_id, ?wrapper, ?version, ?iteration);
+
+            // GET-first (#111): read the persisted group so a rebalance triggered
+            // on another replica is observed with a cheap (tier-2) read rather
+            // than an unconditional (tier-1) PUT. If it changed since we cached it
+            // (a different version), adopt it so the heartbeat is evaluated
+            // against current state — this is the cross-replica propagation the
+            // unconditional PUT's `Outdated` path used to be the only source of.
+            let persisted = self.storage.read_group(group_id).await?;
+            if let Some((current, current_version)) = &persisted
+                && version.as_ref() != Some(current_version)
+            {
+                wrapper = Wrapper::with_storage_group_detail(self.storage.clone(), current.clone());
+                version = Some(current_version.clone());
+            }
+
+            // The persisted projection we are about to (maybe) rewrite.
+            let before = GroupDetail::from(&wrapper);
 
             let now = SystemTime::now();
 
@@ -1404,6 +1445,20 @@ where
                 .await;
 
             debug!(group_id, %wrapper, ?version, iteration,);
+
+            // Skip the group-state PUT when nothing persistent changed (#111): the
+            // object exists and already holds `before` (just read), so a
+            // steady-state heartbeat — and a heartbeat that merely observed a
+            // rebalance — writes zero tier-1 PUTs. Only a real membership /
+            // generation change makes `before != after` and falls through to the
+            // CAS below.
+            if persisted.is_some() && GroupDetail::from(&wrapper) == before {
+                _ = self
+                    .wrappers
+                    .lock()
+                    .map(|mut wrappers| wrappers.insert(group_id.to_owned(), (wrapper, version)))?;
+                return Ok(body);
+            }
 
             match self
                 .storage

@@ -54,3 +54,39 @@ async fn expires_only_stale_groups() -> Result<()> {
 
     Ok(())
 }
+
+/// `read_group` returns the persisted group detail and the **same version**
+/// `update_group` last returned, and `None` for an absent group (#111). The
+/// coordinator's GET-first heartbeat/commit path relies on this version
+/// matching: it is how a stale replica is detected (version differs → refresh)
+/// and how a no-op is recognised (version equal + detail unchanged → skip the
+/// PUT).
+#[tokio::test]
+async fn read_group_returns_persisted_detail_and_matching_version() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let store = DynoStore::new(CLUSTER, NODE, InMemory::new());
+
+    // Absent group → None (not a default-valued Some).
+    assert!(store.read_group("absent").await?.is_none());
+
+    // Seed a group with a distinctive field.
+    let detail = GroupDetail {
+        generation_id: 7,
+        ..GroupDetail::default()
+    };
+    let written = store
+        .update_group("group-a", detail.clone(), None)
+        .await
+        .expect("seed group state");
+
+    // read_group round-trips the detail and returns the version update_group gave.
+    let (read_detail, read_version) = store.read_group("group-a").await?.expect("group present");
+    assert_eq!(detail, read_detail);
+    assert_eq!(
+        written, read_version,
+        "read_group version must equal the one update_group returned"
+    );
+
+    Ok(())
+}

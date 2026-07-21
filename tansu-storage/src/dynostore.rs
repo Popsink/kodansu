@@ -7396,6 +7396,23 @@ impl Storage for DynoStore {
         .map(Into::into)
     }
 
+    async fn read_group(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        let location = Path::from(format!(
+            "clusters/{}/groups/consumers/{}.json",
+            self.cluster, group_id,
+        ));
+
+        match self.get::<GroupDetail>(&location).await {
+            Ok(pair) => Ok(Some(pair)),
+            Err(Error::ObjectStore(error))
+                if matches!(error.as_ref(), object_store::Error::NotFound { .. }) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     async fn init_producer(
         &self,
         transaction_id: Option<&str>,
