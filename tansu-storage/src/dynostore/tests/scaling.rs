@@ -672,3 +672,146 @@ async fn read_uncommitted_offset_stage_matches_full_stage() -> Result<(), Error>
 
     Ok(())
 }
+
+/// `has_legacy_records`'s negative memo is held for the LONG window only for the
+/// provably-safe segment-routed case (prefix-coalesced + owns a segment), and
+/// for the SHORT window otherwise; a local legacy write flips it to present at
+/// once (#110). Grouped into one test so the shared helpers stay local.
+#[tokio::test]
+async fn legacy_records_presence_memo_ttls_and_write_through() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    /// The memoized TTL for `topition`'s legacy-presence entry, if any.
+    fn memo_ttl(storage: &DynoStore, topition: &Topition) -> Option<Duration> {
+        storage
+            .legacy_records_present
+            .lock()
+            .unwrap()
+            .get(topition)
+            .map(|(_, _, ttl)| *ttl)
+    }
+
+    let coalesce_store = || {
+        let counters = Arc::new(Counters::default());
+        let storage = DynoStore::new(
+            CLUSTER,
+            NODE,
+            Counting {
+                inner: InMemory::new(),
+                counters: counters.clone(),
+            },
+        )
+        .prefix_coalesce(true)
+        .prefix_leaseless(true);
+        (storage, counters)
+    };
+
+    // A segment-routed topition (prefix-coalesced, owns a segment) with no legacy
+    // `records/` objects memoizes its negative result for the LONG window (#110),
+    // so it is not re-listed every few seconds — the dominant residual
+    // per-topition LIST the topic→prefix collapse had left behind. And a poll
+    // within the window is served from memory (no LIST).
+    {
+        // Writer produces so the sub-stream owns a segment; a fresh reader (cold
+        // memo, separate process) then observes the segment-routed empty
+        // topition. (On the writer the flush's own `leaseless_base` warms the
+        // memo before the segment exists, so a fresh reader is what exercises the
+        // segment-present branch deterministically.)
+        let bucket = InMemory::new();
+        let writer = DynoStore::new(
+            CLUSTER,
+            NODE,
+            Counting {
+                inner: bucket.clone(),
+                counters: Arc::new(Counters::default()),
+            },
+        )
+        .prefix_coalesce(true)
+        .prefix_leaseless(true);
+        create(&writer, "org.env.conn.hot", 1).await?;
+        let topition = Topition::new("org.env.conn.hot", 0);
+        for n in 0..4 {
+            _ = writer
+                .produce(None, &topition, batch(format!("m-{n}").as_bytes())?)
+                .await?;
+        }
+
+        let reader_counters = Arc::new(Counters::default());
+        let reader = DynoStore::new(
+            CLUSTER,
+            NODE,
+            Counting {
+                inner: bucket.clone(),
+                counters: reader_counters.clone(),
+            },
+        )
+        .prefix_coalesce(true)
+        .prefix_leaseless(true);
+
+        assert!(!reader.has_legacy_records(&topition).await?);
+        assert_eq!(
+            Some(DynoStore::LEGACY_ABSENCE_TTL),
+            memo_ttl(&reader, &topition),
+            "a segment-routed empty topition memoizes its negative for the long window"
+        );
+
+        reader_counters.reset();
+        for _ in 0..50 {
+            assert!(!reader.has_legacy_records(&topition).await?);
+        }
+        let warm = reader_counters.report("50 warm has_legacy_records polls (segment-routed)");
+        assert_eq!(
+            (0, 0),
+            (warm.2, warm.3),
+            "a memoized negative is served from memory — no LIST per poll (#110)"
+        );
+    }
+
+    // Contrast: a topition that is NOT yet segment-routed (no segment) keeps the
+    // SHORT TTL, so a drain / first segment / legacy write is still picked up
+    // within seconds — the long window is confined to the provably-safe case.
+    {
+        let (storage, _counters) = coalesce_store();
+        create(&storage, "org.env.conn.cold", 1).await?;
+        let topition = Topition::new("org.env.conn.cold", 0);
+
+        assert!(!storage.has_legacy_records(&topition).await?);
+        assert_eq!(
+            Some(DynoStore::HIGH_WATERMARK_HINT_TTL),
+            memo_ttl(&storage, &topition),
+            "a topition without a segment keeps the short TTL"
+        );
+    }
+
+    // A legacy `records/` write on this process flips the memo to `true` at once
+    // (the write-through the produce path performs after an `assign_and_create`),
+    // so a stale long-negative cannot hide a just-written legacy record: the next
+    // read returns `true` from memory, no LIST.
+    {
+        let (storage, counters) = coalesce_store();
+        create(&storage, "org.env.conn.hot", 1).await?;
+        let topition = Topition::new("org.env.conn.hot", 0);
+        for n in 0..4 {
+            _ = storage
+                .produce(None, &topition, batch(format!("m-{n}").as_bytes())?)
+                .await?;
+        }
+
+        assert!(!storage.has_legacy_records(&topition).await?);
+        storage.note_legacy_records_present(&topition)?;
+
+        counters.reset();
+        assert!(
+            storage.has_legacy_records(&topition).await?,
+            "a local legacy write must flip the memo to present"
+        );
+        let after = counters.report("has_legacy_records after write-through");
+        assert_eq!(
+            (0, 0),
+            (after.2, after.3),
+            "the flipped-present memo is served from memory, no LIST"
+        );
+    }
+
+    Ok(())
+}

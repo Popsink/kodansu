@@ -279,11 +279,16 @@ pub struct DynoStore {
     /// `records/` LIST (#60). A topic flipped to segment mode mid-life is a
     /// *hybrid*: `[0, C)` legacy objects, `[C, ∞)` segments; its fetch must serve
     /// both. A greenfield prefix has no legacy objects and must not pay that
-    /// LIST. Re-checked at most once per [`Self::HIGH_WATERMARK_HINT_TTL`] so a
-    /// `true` flips to `false` once retention drains the legacy region, and a
-    /// `false` flips back if a txn/control batch (which always takes the legacy
-    /// path) re-creates one — otherwise served from memory (no per-fetch LIST).
-    legacy_records_present: Arc<Mutex<BTreeMap<Topition, (bool, SystemTime)>>>,
+    /// LIST. Each entry carries its own TTL (`checked_at`, `ttl`): a `true`
+    /// result — or a `false` for a topition not yet proven segment-routed —
+    /// expires after [`Self::HIGH_WATERMARK_HINT_TTL`] so a drain
+    /// (`true`→`false`) or a fresh legacy write (`false`→`true`) is picked up
+    /// within seconds; a `false` for a segment-routed topition is held for
+    /// [`Self::LEGACY_ABSENCE_TTL`] (its legacy seam only ever drains), cutting
+    /// the dominant per-topition LIST rate (#109/#110). A legacy write on this
+    /// process flips the entry to `true` immediately via
+    /// [`Self::note_legacy_records_present`].
+    legacy_records_present: Arc<Mutex<BTreeMap<Topition, (bool, SystemTime, Duration)>>>,
 
     /// This writer's identity, recorded in the lease `holder` field (#59) for
     /// observability. Unique per process instance so two brokers (or two test
@@ -1284,6 +1289,24 @@ impl DynoStore {
     /// interval.
     const RETENTION_EMPTY_SKIP_TTL: Duration = Duration::from_secs(60 * 60);
 
+    /// How long a *negative* `has_legacy_records` result is served from memory
+    /// for a topition that is provably segment-routed (prefix-coalesced and
+    /// already owning at least one segment), before the `records/` prefix is
+    /// re-listed once (#109/#110). Such a topition's only legacy objects are the
+    /// drained `[0, C)` hybrid seam, which retention only shrinks and the
+    /// segment write path never re-creates — so "no legacy records" is stable
+    /// for hours, not seconds, and re-listing it every
+    /// [`Self::HIGH_WATERMARK_HINT_TTL`] was the dominant residual per-topition
+    /// LIST cost. A *positive* result keeps the short TTL so a drain
+    /// (`true`→`false`) is still picked up within seconds, and any legacy write
+    /// on this process flips the entry back to `true` immediately via
+    /// [`Self::note_legacy_records_present`]. The only cross-process
+    /// `false`→`true` source is a txn/control/compacted batch written to a
+    /// segment-routed topic on another replica — which the single-authority CDC
+    /// model does not produce; the bound here is that worst case (≤ this window),
+    /// symmetric to [`Self::RETENTION_EMPTY_SKIP_TTL`].
+    const LEGACY_ABSENCE_TTL: Duration = Duration::from_secs(60 * 60);
+
     /// Default debounce window for persisting a producer's `producers/{id}.json`
     /// (#48): the durable object is checkpointed after at most this many
     /// idempotent batches have advanced its in-memory sequence. Overridable per
@@ -2088,6 +2111,11 @@ impl DynoStore {
                 Ok(outcome) => {
                     debug!(?outcome, candidate, ?topition);
                     self.set_high(topition, candidate + record_count)?;
+                    // A legacy `records/` object now exists for this topition:
+                    // flip the presence memo to `true` so a following read on
+                    // this process does not serve a stale "no legacy" from the
+                    // long negative window (#110).
+                    self.note_legacy_records_present(topition)?;
                     return Ok(candidate);
                 }
 
@@ -3184,19 +3212,22 @@ impl DynoStore {
     }
 
     /// Whether `topition` still has legacy `records/` objects (#60 hybrid),
-    /// memoized with a TTL so the common case pays no per-fetch LIST while a
-    /// drain (`true`→`false`) or a txn/control write (`false`→`true`) is still
-    /// picked up within [`Self::HIGH_WATERMARK_HINT_TTL`].
+    /// memoized with a per-entry TTL so the common case pays no per-fetch LIST.
+    /// A `true` result (and a `false` for a not-yet-segment-routed topition) is
+    /// held only [`Self::HIGH_WATERMARK_HINT_TTL`] so a drain or a fresh legacy
+    /// write is picked up within seconds; a `false` for a segment-routed
+    /// topition — whose only legacy is the monotonically-draining `[0, C)` seam
+    /// — is held [`Self::LEGACY_ABSENCE_TTL`], removing the dominant residual
+    /// per-topition LIST (#109/#110). A legacy write on this process flips the
+    /// entry to `true` at once ([`Self::note_legacy_records_present`]).
     async fn has_legacy_records(&self, topition: &Topition) -> Result<bool> {
-        if let Some((present, checked_at)) = self
+        if let Some((present, checked_at, ttl)) = self
             .legacy_records_present
             .lock()
             .map_err(Into::<Error>::into)?
             .get(topition)
             .copied()
-            && checked_at
-                .elapsed()
-                .is_ok_and(|elapsed| elapsed < Self::HIGH_WATERMARK_HINT_TTL)
+            && checked_at.elapsed().is_ok_and(|elapsed| elapsed < ttl)
         {
             return Ok(present);
         }
@@ -3214,11 +3245,44 @@ impl DynoStore {
             .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
             .is_some();
 
+        // A negative result is stable for a topition that is provably
+        // segment-routed (prefix-coalesced and already owning a segment): its
+        // only legacy objects are the `[0, C)` seam, which retention only
+        // shrinks and the segment write path never re-creates. Hold that for the
+        // long window; everything else (any positive, or a topition without a
+        // segment yet) keeps the short TTL so a change is seen within seconds.
+        let ttl = if !present
+            && self.prefix_coalesce
+            && self.segment_region_start(topition).await?.is_some()
+        {
+            Self::LEGACY_ABSENCE_TTL
+        } else {
+            Self::HIGH_WATERMARK_HINT_TTL
+        };
+
         _ = self.legacy_records_present.lock().map(|mut cache| {
-            _ = cache.insert(topition.to_owned(), (present, SystemTime::now()));
+            _ = cache.insert(topition.to_owned(), (present, SystemTime::now(), ttl));
         });
 
         Ok(present)
+    }
+
+    /// Record that a legacy `records/` object was just written for `topition` on
+    /// this process, flipping the memoized presence to `true` at once so a
+    /// following read does not serve a stale "no legacy" from the long negative
+    /// window ([`Self::LEGACY_ABSENCE_TTL`]). Called on the legacy create path
+    /// (txn/control/compacted/backfill/non-coalesced batches); the segment write
+    /// path does not touch `records/` and so does not call this.
+    fn note_legacy_records_present(&self, topition: &Topition) -> Result<()> {
+        self.legacy_records_present
+            .lock()
+            .map_err(Into::into)
+            .map(|mut cache| {
+                _ = cache.insert(
+                    topition.to_owned(),
+                    (true, SystemTime::now(), Self::HIGH_WATERMARK_HINT_TTL),
+                );
+            })
     }
 
     /// Fetch a topition's records from the legacy per-`(topic, partition)`
