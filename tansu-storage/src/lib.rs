@@ -2037,7 +2037,6 @@ pub enum StorageContainer {
     // so the delegating `Storage` impl arms are unaffected.
     #[cfg(feature = "dynostore")]
     DynoStore(Box<DynoStore>),
-
 }
 
 impl Debug for StorageContainer {
@@ -2049,7 +2048,6 @@ impl Debug for StorageContainer {
             Self::DynoStore(_) => f
                 .debug_tuple(stringify!(StorageContainer::DynoStore))
                 .finish(),
-
         }
     }
 }
@@ -2534,7 +2532,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.register_broker(broker_registration),
 
             Self::Null(engine) => engine.register_broker(broker_registration),
-
         }
         .await
         .inspect(|_| {
@@ -2557,7 +2554,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.incremental_alter_resource(resource),
 
             Self::Null(engine) => engine.incremental_alter_resource(resource),
-
         }
         .await
         .inspect(|_| {
@@ -2577,7 +2573,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.create_topic(topic, validate_only),
 
             Self::Null(engine) => engine.create_topic(topic, validate_only),
-
         }
         .await
         .inspect(|_| {
@@ -2600,7 +2595,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.delete_records(topics),
 
             Self::Null(engine) => engine.delete_records(topics),
-
         }
         .await
         .inspect(|_| {
@@ -2620,7 +2614,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.delete_topic(topic),
 
             Self::Null(engine) => engine.delete_topic(topic),
-
         }
         .await
         .inspect(|_| {
@@ -2640,7 +2633,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.brokers(),
 
             Self::Null(engine) => engine.brokers(),
-
         }
         .await
         .inspect(|_| {
@@ -2665,7 +2657,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.produce(transaction_id, topition, batch),
 
             Self::Null(engine) => engine.produce(transaction_id, topition, batch),
-
         }
         .await
         .inspect(|_| {
@@ -2697,7 +2688,6 @@ impl Storage for StorageContainer {
             Self::Null(engine) => {
                 engine.fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
             }
-
         }
         .await
         .inspect(|_| {
@@ -2717,7 +2707,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.offset_stage(topition),
 
             Self::Null(engine) => engine.offset_stage(topition),
-
         }
         .await
         .inspect(|_| {
@@ -2741,7 +2730,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.list_offsets(isolation_level, offsets),
 
             Self::Null(engine) => engine.list_offsets(isolation_level, offsets),
-
         }
         .await
         .inspect(|_| {
@@ -2766,7 +2754,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.offset_commit(group_id, retention_time_ms, offsets),
 
             Self::Null(engine) => engine.offset_commit(group_id, retention_time_ms, offsets),
-
         }
         .await
         .inspect(|_| {
@@ -2786,7 +2773,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.committed_offset_topitions(group_id),
 
             Self::Null(engine) => engine.committed_offset_topitions(group_id),
-
         }
         .await
         .inspect(|_| {
@@ -2811,7 +2797,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.offset_fetch(group_id, topics, require_stable),
 
             Self::Null(engine) => engine.offset_fetch(group_id, topics, require_stable),
-
         }
         .await
         .inspect(|_| {
@@ -2831,7 +2816,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.metadata(topics),
 
             Self::Null(engine) => engine.metadata(topics),
-
         }
         .await
         .inspect(|_| {
@@ -2848,7 +2832,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.auto_create_topic_config(),
 
             Self::Null(engine) => engine.auto_create_topic_config(),
-
         }
     }
 
@@ -2866,7 +2849,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.describe_config(name, resource, keys),
 
             Self::Null(engine) => engine.describe_config(name, resource, keys),
-
         }
         .await
         .inspect(|_| {
@@ -2893,7 +2875,6 @@ impl Storage for StorageContainer {
             }
 
             Self::Null(engine) => engine.describe_topic_partitions(topics, partition_limit, cursor),
-
         }
         .await
         .inspect(|_| {
@@ -2913,7 +2894,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.list_groups(states_filter),
 
             Self::Null(engine) => engine.list_groups(states_filter),
-
         }
         .await
         .inspect(|_| {
@@ -2936,7 +2916,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.delete_groups(group_ids),
 
             Self::Null(engine) => engine.delete_groups(group_ids),
-
         }
         .await
         .inspect(|_| {
@@ -2962,7 +2941,6 @@ impl Storage for StorageContainer {
             }
 
             Self::Null(engine) => engine.describe_groups(group_ids, include_authorized_operations),
-
         }
         .await
         .inspect(|_| {
@@ -2987,7 +2965,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.update_group(group_id, detail, version),
 
             Self::Null(engine) => engine.update_group(group_id, detail, version),
-
         }
         .await
         .inspect(|_| {
@@ -3023,7 +3000,6 @@ impl Storage for StorageContainer {
                 producer_id,
                 producer_epoch,
             ),
-
         }
         .await
         .inspect(|_| {
@@ -3053,7 +3029,6 @@ impl Storage for StorageContainer {
             Self::Null(engine) => {
                 engine.txn_add_offsets(transaction_id, producer_id, producer_epoch, group_id)
             }
-
         }
         .await
         .inspect(|_| {
@@ -3076,7 +3051,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.txn_add_partitions(partitions),
 
             Self::Null(engine) => engine.txn_add_partitions(partitions),
-
         }
         .await
         .inspect(|_| {
@@ -3099,7 +3073,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.txn_offset_commit(offsets),
 
             Self::Null(engine) => engine.txn_offset_commit(offsets),
-
         }
         .await
         .inspect(|_| {
@@ -3129,7 +3102,6 @@ impl Storage for StorageContainer {
             Self::Null(engine) => {
                 engine.txn_end(transaction_id, producer_id, producer_epoch, committed)
             }
-
         }
         .await
         .inspect(|_| {
@@ -3149,7 +3121,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.maintain(now),
 
             Self::Null(engine) => engine.maintain(now),
-
         }
         .await
         .inspect(|maintain| {
@@ -3169,7 +3140,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.cluster_id().await,
 
             Self::Null(engine) => engine.cluster_id().await,
-
         }
     }
 
@@ -3180,7 +3150,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.node().await,
 
             Self::Null(engine) => engine.node().await,
-
         }
     }
 
@@ -3191,7 +3160,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.advertised_listener().await,
 
             Self::Null(engine) => engine.advertised_listener().await,
-
         }
     }
 
@@ -3205,7 +3173,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.delete_user_scram_credential(user, mechanism).await,
 
             Self::Null(engine) => engine.delete_user_scram_credential(user, mechanism).await,
-
         }
     }
 
@@ -3228,7 +3195,6 @@ impl Storage for StorageContainer {
                     .upsert_user_scram_credential(user, mechanism, credential)
                     .await
             }
-
         }
     }
 
@@ -3242,7 +3208,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.user_scram_credential(user, mechanism).await,
 
             Self::Null(engine) => engine.user_scram_credential(user, mechanism).await,
-
         }
     }
 
@@ -3255,7 +3220,6 @@ impl Storage for StorageContainer {
             Self::DynoStore(engine) => engine.ping(),
 
             Self::Null(engine) => engine.ping(),
-
         }
         .await
         .inspect(|_| {

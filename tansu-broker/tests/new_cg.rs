@@ -89,7 +89,6 @@ pub async fn one_consumer_session_delay_after_initial_join() -> Result<()> {
         .cluster_id(cluster)
         .node_id(NODE_ID)
         .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-        .schema_registry(None)
         .storage(Url::parse("memory://")?)
         .build()
         .await?;
@@ -216,7 +215,6 @@ pub async fn one_consumer_next_action() -> Result<()> {
         .cluster_id(cluster)
         .node_id(NODE_ID)
         .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-        .schema_registry(None)
         .storage(Url::parse("memory://")?)
         .build()
         .await?;
@@ -299,7 +297,6 @@ pub async fn two_consumer_next_action() -> Result<()> {
         .cluster_id(cluster)
         .node_id(NODE_ID)
         .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-        .schema_registry(None)
         .storage(Url::parse("memory://")?)
         .build()
         .await?;
@@ -456,7 +453,6 @@ async fn group_consumer_next_action(consumers: Range<i32>) -> Result<()> {
         .cluster_id(cluster)
         .node_id(NODE_ID)
         .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-        .schema_registry(None)
         .storage(Url::parse("memory://")?)
         .build()
         .await?;
@@ -610,7 +606,6 @@ pub async fn two_consumer_interleave_join() -> Result<()> {
         .cluster_id(cluster)
         .node_id(NODE_ID)
         .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-        .schema_registry(None)
         .storage(Url::parse("memory://")?)
         .build()
         .await?;

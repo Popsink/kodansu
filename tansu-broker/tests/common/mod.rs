@@ -14,13 +14,12 @@
 
 #![allow(dead_code)]
 use bytes::Bytes;
-use glob::glob;
 use rand::{
     distr::{Alphanumeric, StandardUniform},
     prelude::*,
     rng,
 };
-use std::{env, io::ErrorKind, sync::Arc, thread};
+use std::{sync::Arc, thread};
 use tansu_broker::{
     Error, Result,
     coordinator::group::{Coordinator, administrator::Controller},
@@ -31,10 +30,8 @@ use tansu_sans_io::{
     join_group_response::JoinGroupResponseMember, leave_group_request::MemberIdentity,
     offset_fetch_request::OffsetFetchRequestTopic, sync_group_request::SyncGroupRequestAssignment,
 };
-use tansu_schema::Registry;
 use tansu_storage::{BrokerRegistrationRequest, Storage, StorageContainer};
-use tokio::fs::remove_file;
-use tracing::{debug, subscriber::DefaultGuard};
+use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
 use url::Url;
 use uuid::Uuid;
@@ -71,10 +68,6 @@ pub(crate) fn init_tracing() -> Result<DefaultGuard> {
 
 pub(crate) enum StorageType {
     InMemory,
-    Lite,
-    Postgres,
-    SlateDb,
-    Turso,
 }
 
 pub(crate) async fn storage_container<C>(
@@ -82,137 +75,16 @@ pub(crate) async fn storage_container<C>(
     cluster: C,
     node: i32,
     advertised_listener: Url,
-    schemas: Option<Registry>,
 ) -> Result<Arc<Box<dyn Storage>>>
 where
     C: Into<String>,
 {
     match storage_type {
-        StorageType::Postgres => StorageContainer::builder()
-            .cluster_id(cluster)
-            .node_id(node)
-            .advertised_listener(advertised_listener)
-            .schema_registry(schemas)
-            .storage(Url::parse("postgres://postgres:postgres@localhost")?)
-            .build()
-            .await
-            .map_err(Into::into),
-
         StorageType::InMemory => StorageContainer::builder()
             .cluster_id(cluster)
             .node_id(node)
             .advertised_listener(advertised_listener)
-            .schema_registry(schemas)
             .storage(Url::parse("memory://")?)
-            .build()
-            .await
-            .map_err(Into::into),
-
-        StorageType::Lite => {
-            let relative = thread::current()
-                .name()
-                .ok_or(Error::Message(String::from("unnamed thread")))
-                .map(|name| {
-                    format!(
-                        "../logs/{}/{}::{name}.db",
-                        env!("CARGO_PKG_NAME"),
-                        env!("CARGO_CRATE_NAME")
-                    )
-                })?;
-
-            let mut path = env::current_dir()?;
-            path.push(relative);
-            debug!(?path);
-
-            match remove_file(path).await {
-                Ok(_) => Ok(()),
-                Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-                otherwise @ Err(_) => otherwise,
-            }?;
-
-            StorageContainer::builder()
-                .cluster_id(cluster)
-                .node_id(node)
-                .advertised_listener(advertised_listener)
-                .schema_registry(schemas)
-                .storage(
-                    thread::current()
-                        .name()
-                        .ok_or(Error::Message(String::from("unnamed thread")))
-                        .map(|name| {
-                            format!(
-                                "sqlite://../logs/{}/{}::{name}.db",
-                                env!("CARGO_PKG_NAME"),
-                                env!("CARGO_CRATE_NAME")
-                            )
-                        })
-                        .inspect(|url| debug!(url))
-                        .and_then(|url| Url::parse(&url).map_err(Into::into))?,
-                )
-                .build()
-                .await
-                .map_err(Into::into)
-        }
-
-        StorageType::Turso => {
-            let relative = thread::current()
-                .name()
-                .ok_or(Error::Message(String::from("unnamed thread")))
-                .map(|name| {
-                    format!(
-                        "../logs/{}/{}::{name}.db*",
-                        env!("CARGO_PKG_NAME"),
-                        env!("CARGO_CRATE_NAME")
-                    )
-                })?;
-
-            let mut path = env::current_dir()?;
-            path.push(relative);
-            debug!(?path);
-
-            if let Some(pattern) = path.to_str() {
-                debug!(pattern);
-
-                let paths = glob(pattern)?;
-
-                for path in paths.flatten() {
-                    debug!(?path);
-
-                    remove_file(path).await?;
-                }
-            }
-
-            StorageContainer::builder()
-                .cluster_id(cluster)
-                .node_id(node)
-                .advertised_listener(advertised_listener)
-                .schema_registry(schemas)
-                .storage(
-                    thread::current()
-                        .name()
-                        .ok_or(Error::Message(String::from("unnamed thread")))
-                        .map(|name| {
-                            format!(
-                                "turso://../logs/{}/{}::{name}.db",
-                                env!("CARGO_PKG_NAME"),
-                                env!("CARGO_CRATE_NAME")
-                            )
-                        })
-                        .inspect(|url| debug!(url))
-                        .and_then(|url| Url::parse(&url).map_err(Into::into))?,
-                )
-                .build()
-                .await
-                .map_err(Into::into)
-        }
-
-        // Uses slatedb://memory for in-memory testing, no external S3 needed
-        StorageType::SlateDb => StorageContainer::builder()
-            .cluster_id(cluster)
-            .node_id(node)
-            .advertised_listener(advertised_listener)
-            .schema_registry(schemas)
-            .storage(Url::parse("slatedb://memory")?)
             .build()
             .await
             .map_err(Into::into),

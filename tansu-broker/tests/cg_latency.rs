@@ -46,7 +46,6 @@ async fn stack() -> Result<(), Error> {
         .cluster_id(cluster)
         .node_id(NODE_ID)
         .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-        .schema_registry(None)
         .storage(Url::parse("memory://")?)
         .build()
         .await?;

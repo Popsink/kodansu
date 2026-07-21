@@ -15,14 +15,7 @@ workspace = true
 
 [features]
 default = []
-delta = []
 dynostore = []
-iceberg = []
-libsql = []
-parquet = []
-postgres = []
-slatedb = []
-turso = []
 
 [dependencies]
 bytes.workspace = true
@@ -39,13 +32,10 @@ rsasl.workspace = true
 rustls.workspace = true
 sha2.workspace = true
 tansu-broker.workspace = true
-tansu-cat.workspace = true
 tansu-client.workspace = true
-tansu-generator.workspace = true
 tansu-perf.workspace = true
 tansu-proxy.workspace = true
 tansu-sans-io.workspace = true
-tansu-schema.workspace = true
 tansu-storage.workspace = true
 tansu-topic.workspace = true
 thiserror.workspace = true

@@ -31,7 +31,6 @@ use rustls::{
 };
 use tansu_broker::{NODE_ID, broker::Broker, coordinator::group::administrator::Controller};
 use tansu_sans_io::ErrorCode;
-use tansu_schema::Registry;
 use tansu_storage::{
     ArcDynStorage, DEFAULT_CLEANUP_POLICY, DEFAULT_RETENTION_MS, StorageContainer, TopicDefaults,
 };
@@ -40,15 +39,8 @@ use tracing::debug;
 use url::Url;
 use uuid::Uuid;
 
-#[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
-use clap::Subcommand;
-
 #[derive(Clone, Debug, Parser)]
 pub(super) struct Arg {
-    #[command(subcommand)]
-    #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
-    command: Option<Lake>,
-
     /// All members of the same cluster should use the same id
     #[arg(
         long,
@@ -76,17 +68,9 @@ pub(super) struct Arg {
     )]
     advertised_listener_url: EnvVarExp<Url>,
 
-    /// Storage engine examples are: postgres://postgres:postgres@localhost, memory://tansu/ or s3://tansu/
+    /// Storage engine examples are: memory://tansu/, s3://tansu/ or gs://tansu/
     #[arg(long, env = "STORAGE_ENGINE", default_value = "memory://tansu/")]
     storage_engine: EnvVarExp<Url>,
-
-    /// Schema registry examples are: file://./etc/schema or s3://tansu/, containing: topic.json, topic.proto or topic.avsc
-    #[arg(long, env = "SCHEMA_REGISTRY")]
-    schema_registry: Option<EnvVarExp<Url>>,
-
-    /// Schema registry cache expiry duration
-    #[arg(long,value_parser = humantime::parse_duration)]
-    schema_registry_cache_expiry: Option<Duration>,
 
     /// OTEL Exporter OTLP endpoint
     #[arg(long, env = "OTEL_EXPORTER_OTLP_ENDPOINT")]
@@ -134,54 +118,6 @@ fn server_config(certs: &Path, private_key: &Path) -> Result<ServerConfig> {
         .map_err(Into::into)
 }
 
-#[derive(Clone, Debug, Subcommand)]
-#[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
-pub(super) enum Lake {
-    /// Schema topics are written as Apache Iceberg tables
-    #[cfg(feature = "iceberg")]
-    Iceberg {
-        /// Apache Parquet files are written to this location, examples are: file://./lake or s3://lake/
-        #[arg(long, env = "DATA_LAKE")]
-        location: EnvVarExp<Url>,
-
-        /// Apache Iceberg Catalog, examples are: http://localhost:8181/
-        #[arg(long, env = "ICEBERG_CATALOG")]
-        catalog: EnvVarExp<Url>,
-
-        /// Iceberg namespace
-        #[arg(long, env = "ICEBERG_NAMESPACE", default_value = "tansu")]
-        namespace: Option<String>,
-
-        /// Iceberg warehouse
-        #[arg(long, env = "ICEBERG_WAREHOUSE")]
-        warehouse: Option<String>,
-    },
-
-    /// Schema topics are written as Delta Lake tables
-    #[cfg(feature = "delta")]
-    Delta {
-        /// Apache Parquet files are written to this location, examples are: file://./lake or s3://lake/
-        #[arg(long, env = "DATA_LAKE")]
-        location: EnvVarExp<Url>,
-
-        /// Delta database
-        #[arg(long, env = "DELTA_DATABASE", default_value = "tansu")]
-        database: Option<String>,
-
-        /// Throttle the maximum number of records per second
-        #[clap(long)]
-        records_per_second: Option<u32>,
-    },
-
-    /// Schema topics are written in Parquet format
-    #[cfg(feature = "parquet")]
-    Parquet {
-        /// Apache Parquet files are written to this location, examples are: file://./lake or s3://lake/
-        #[arg(long, env = "DATA_LAKE")]
-        location: EnvVarExp<Url>,
-    },
-}
-
 fn redact_password(mut url: Url) -> Url {
     if url.password().is_some() {
         _ = url.set_password(None).ok();
@@ -213,65 +149,6 @@ impl Arg {
         let advertised_listener = self.advertised_listener_url.into_inner();
         let listener = self.listener_url.into_inner();
 
-        let schema_registry_url = self
-            .schema_registry
-            .map(|env_var_exp| env_var_exp.into_inner());
-
-        let schema_registry = schema_registry_url
-            .clone()
-            .map(|object_store| {
-                Registry::builder_try_from_url(&object_store).map(|registry| {
-                    registry
-                        .with_cache_expiry_after(self.schema_registry_cache_expiry)
-                        .build()
-                })
-            })
-            .transpose()?;
-
-        #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
-        let lake_house = match self.command {
-            #[cfg(feature = "iceberg")]
-            Some(Lake::Iceberg {
-                location,
-                catalog,
-                namespace,
-                warehouse,
-            }) => Some(
-                tansu_schema::lake::House::iceberg()
-                    .location(location.into_inner())
-                    .catalog(catalog.into_inner())
-                    .schema_registry(schema_registry.clone().unwrap())
-                    .namespace(namespace)
-                    .warehouse(warehouse)
-                    .build()
-                    .await?,
-            ),
-
-            #[cfg(feature = "delta")]
-            Some(Lake::Delta {
-                location,
-                database,
-                records_per_second,
-            }) => Some(
-                tansu_schema::lake::House::delta()
-                    .location(location.into_inner())
-                    .schema_registry(schema_registry.clone().unwrap())
-                    .database(database)
-                    .records_per_second(records_per_second)
-                    .build()?,
-            ),
-
-            #[cfg(feature = "parquet")]
-            Some(Lake::Parquet { location }) => Some(
-                tansu_schema::lake::House::parquet()
-                    .location(location.into_inner())
-                    .schema_registry(schema_registry.clone().unwrap())
-                    .build()?,
-            ),
-
-            None => None,
-        };
-
         let tls_server_config = self
             .cert
             .and_then(|certs| self.key.and_then(|key| server_config(&certs, &key).ok()));
@@ -289,16 +166,12 @@ impl Arg {
             .incarnation_id(incarnation_id)
             .advertised_listener(advertised_listener.clone())
             .otlp_endpoint_url(otlp_endpoint_url)
-            .schema_registry(schema_registry.clone())
             .storage(storage_engine.clone())
             .listener(listener.clone())
             .authentication(self.authentication)
             .tls_server_config(tls_server_config)
             .topic_defaults(topic_defaults)
             .silent(self.silent);
-
-        #[cfg(any(feature = "parquet", feature = "iceberg", feature = "delta"))]
-        let broker = broker.lake_house(lake_house);
 
         if !self.silent {
             let sheet = Sheet::default();
@@ -327,14 +200,6 @@ impl Arg {
                         .if_supports_color(Stream::Stdout, |text| text.style(sheet.storage)))
                     .collect::<Vec<_>>()
             );
-
-            if let Some(schema_registry) = schema_registry_url {
-                println!(
-                    "schema registry: {}",
-                    schema_registry.if_supports_color(Stream::Stdout, |text| text
-                        .style(sheet.schema_registry))
-                );
-            }
         }
 
         broker.build().await.map_err(Into::into)
@@ -345,7 +210,6 @@ struct Sheet {
     advertised_listener: Style,
     headline: Style,
     listener: Style,
-    schema_registry: Style,
     storage: Style,
     version: Style,
 }
@@ -356,7 +220,6 @@ impl Default for Sheet {
             advertised_listener: Style::new().magenta().bold(),
             headline: Style::new().green().bold(),
             listener: Style::new().magenta().bold(),
-            schema_registry: Style::new().magenta().bold(),
             storage: Style::new().magenta().bold(),
             version: Style::new().magenta().bold(),
         }

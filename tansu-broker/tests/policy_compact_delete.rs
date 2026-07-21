@@ -2862,92 +2862,6 @@ where
     Ok(())
 }
 
-#[cfg(feature = "postgres")]
-mod pg {
-    use std::sync::Arc;
-
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String>,
-        node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
-        common::storage_container(
-            StorageType::Postgres,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-            None,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn compact_only() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let sc = storage_container(cluster_id, broker_id).await?;
-        register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-        super::compact_only(sc).await
-    }
-
-    #[tokio::test]
-    async fn delete_only() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let sc = storage_container(cluster_id, broker_id).await?;
-        register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-        super::delete_only(sc).await
-    }
-
-    #[tokio::test]
-    async fn delete_no_retention_ms_only() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let sc = storage_container(cluster_id, broker_id).await?;
-        register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-        super::delete_no_retention_ms_only(sc).await
-    }
-
-    #[tokio::test]
-    async fn compact_delete_001() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let sc = storage_container(cluster_id, broker_id).await?;
-        register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-        super::compact_delete_001(sc).await
-    }
-
-    #[tokio::test]
-    async fn compact_delete_002() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let sc = storage_container(cluster_id, broker_id).await?;
-        register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-        super::compact_delete_002(sc).await
-    }
-}
-
 mod in_memory {
     use std::sync::Arc;
 
@@ -2962,7 +2876,6 @@ mod in_memory {
             cluster,
             node,
             Url::parse("tcp://127.0.0.1/")?,
-            None,
         )
         .await
     }
@@ -3029,92 +2942,6 @@ mod in_memory {
     }
 
     #[ignore]
-    #[tokio::test]
-    async fn compact_delete_002() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let sc = storage_container(cluster_id, broker_id).await?;
-        register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-        super::compact_delete_002(sc).await
-    }
-}
-
-#[cfg(feature = "libsql")]
-mod lite {
-    use std::sync::Arc;
-
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String>,
-        node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
-        common::storage_container(
-            StorageType::Lite,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-            None,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn compact_only() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let sc = storage_container(cluster_id, broker_id).await?;
-        register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-        super::compact_only(sc).await
-    }
-
-    #[tokio::test]
-    async fn delete_only() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let sc = storage_container(cluster_id, broker_id).await?;
-        register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-        super::delete_only(sc).await
-    }
-
-    #[tokio::test]
-    async fn delete_no_retention_ms_only() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let sc = storage_container(cluster_id, broker_id).await?;
-        register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-        super::delete_no_retention_ms_only(sc).await
-    }
-
-    #[tokio::test]
-    async fn compact_delete_001() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let sc = storage_container(cluster_id, broker_id).await?;
-        register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-        super::compact_delete_001(sc).await
-    }
-
     #[tokio::test]
     async fn compact_delete_002() -> Result<()> {
         let _guard = init_tracing()?;

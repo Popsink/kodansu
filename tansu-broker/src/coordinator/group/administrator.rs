@@ -3216,7 +3216,6 @@ mod tests {
             .cluster_id(cluster)
             .node_id(node)
             .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .schema_registry(None)
             .storage(Url::parse("memory://")?)
             .build()
             .await?;
@@ -3866,7 +3865,6 @@ mod tests {
             .cluster_id(cluster)
             .node_id(node)
             .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .schema_registry(None)
             .storage(Url::parse("memory://")?)
             .build()
             .await?;
@@ -4167,7 +4165,6 @@ mod tests {
             .cluster_id(cluster)
             .node_id(node)
             .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .schema_registry(None)
             .storage(Url::parse("memory://")?)
             .build()
             .await?;
@@ -4265,7 +4262,6 @@ mod tests {
             .cluster_id(cluster)
             .node_id(node)
             .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .schema_registry(None)
             .storage(Url::parse("memory://")?)
             .build()
             .await?;
@@ -4388,7 +4384,6 @@ mod tests {
             .cluster_id(cluster)
             .node_id(node)
             .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .schema_registry(None)
             .storage(Url::parse("memory://")?)
             .build()
             .await?;
