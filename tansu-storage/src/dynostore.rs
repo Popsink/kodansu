@@ -345,6 +345,11 @@ struct PrefixCoalesceBuffer {
     pending: Vec<PrefixPending>,
     records: i64,
     bytes: usize,
+    /// Set once any buffered batch is backfill-class (span ≥
+    /// [`DynoStore::PREFIX_BACKFILL_MIN_RECORDS`]): relaxes the flush triggers to
+    /// backfill floors so a folded-in snapshot (#90) coalesces into a few large
+    /// segments instead of one per batch. Reset with the buffer on flush.
+    backfill: bool,
 }
 
 /// The durable per-prefix single-writer lease (#59), stored at
@@ -1308,6 +1313,16 @@ impl DynoStore {
     const COALESCE_BATCHES: usize = 64;
     const COALESCE_BYTES: usize = 1 << 20;
     const COALESCE_MAX_RECORDS: i64 = 100_000;
+
+    /// Byte floor for a flush buffer that has ingested a backfill-class batch
+    /// (span ≥ [`Self::PREFIX_BACKFILL_MIN_RECORDS`]) once the #62 bypass is
+    /// folded into the segment path (#90). A snapshot's large batches must
+    /// coalesce into a few big segments rather than one small segment per batch,
+    /// which would blow up the live segment count `S` (#91) and defeat the
+    /// ~1-PUT-per-large-batch parity the bypass gave. Well above the
+    /// steady-state [`Self::COALESCE_BYTES`], so only a backfill widens the
+    /// window; the [`Self::COALESCE_MAX_RECORDS`] cap still bounds a segment.
+    const BACKFILL_COALESCE_BYTES: usize = 32 << 20;
 
     /// Default prefix-lease term (#59). Renewal happens once ~`2/3 · ttl`
     /// remains, i.e. every ~7s — well under GCS's ~1/s/object mutation cap (#13)
@@ -3352,6 +3367,28 @@ impl DynoStore {
         }
     }
 
+    /// The effective (batch-count, byte) flush triggers for a prefix buffer
+    /// (#90). A buffer that has ingested a backfill-class batch relaxes both to
+    /// backfill floors — the byte trigger to [`Self::BACKFILL_COALESCE_BYTES`]
+    /// and the count trigger past [`Self::COALESCE_MAX_RECORDS`] so it never
+    /// fires first — leaving the record cap as the effective limiter. The
+    /// folded-in snapshot (#90) then coalesces into a few large segments (~1 PUT
+    /// per large batch, bounded `S`, #91) instead of one small segment per
+    /// batch. Steady-state CDC keeps the tight `coalesce_batches` /
+    /// `coalesce_bytes` for low latency. `max` never lowers an operator's
+    /// URL-configured value (#54).
+    fn flush_thresholds(&self, backfill: bool) -> (usize, usize) {
+        if backfill {
+            (
+                self.coalesce_batches
+                    .max(Self::COALESCE_MAX_RECORDS as usize),
+                self.coalesce_bytes.max(Self::BACKFILL_COALESCE_BYTES),
+            )
+        } else {
+            (self.coalesce_batches, self.coalesce_bytes)
+        }
+    }
+
     /// Buffer `deflated` for a prefix-coalesced flush and await its assigned
     /// offset (#57). Like [`Self::enqueue_coalesced`] but keyed by the topition's
     /// connector prefix, so one buffer accumulates batches across every topic
@@ -3388,9 +3425,11 @@ impl DynoStore {
             });
             buffer.records += span;
             buffer.bytes += size;
+            buffer.backfill |= span >= Self::PREFIX_BACKFILL_MIN_RECORDS;
 
-            if buffer.pending.len() >= self.coalesce_batches
-                || buffer.bytes >= self.coalesce_bytes
+            let (batches_threshold, bytes_threshold) = self.flush_thresholds(buffer.backfill);
+            if buffer.pending.len() >= batches_threshold
+                || buffer.bytes >= bytes_threshold
                 || buffer.records >= Self::COALESCE_MAX_RECORDS
             {
                 Action::Flush(std::mem::take(buffer))
@@ -5884,25 +5923,34 @@ impl Storage for DynoStore {
                                 .is_some_and(|value| value.contains("compact"))
                     });
 
-            // Will this batch be buffered into a prefix-coalesced segment
-            // (#57)? Backfill high-throughput bypass (#62): a snapshot streams a
-            // whole table to one partition in large batches that are already
-            // S3-efficient on their own (~thousands of events per PUT) and want
-            // the parallelism single-writer segments cap. A large batch takes
-            // the legacy per-(topic,partition) create path below (lock-free /
-            // parallel, no lease) — BUT only while the sub-stream has no segment
-            // yet, so legacy offsets stay strictly below segment offsets (the
-            // #58 seam the hybrid read path depends on). A large batch arriving
-            // *after* segmentation (e.g. a mid-life add-table snapshot or lag
-            // catch-up) must coalesce, or it would write legacy objects above
-            // segments and break fetch ordering / cold recovery (#60).
-            let prefix_buffer_route = if coalesce_eligible && self.prefix_coalesce {
+            // Will this batch be buffered into a prefix-coalesced segment (#57)?
+            //
+            // Under the leaseless arbiter (#86) the answer is always yes (#90):
+            // the segment CAS is the *single* offset authority, so backfill must
+            // go through it too — a legacy `records/` object would be a second
+            // authority the two create-only name spaces can't reconcile (#78) and
+            // would reintroduce the per-topic LIST/GET the epic removes (#75). A
+            // large backfill batch trips the raised byte threshold (see
+            // `flush_thresholds`) and flushes as ~its own segment, keeping the
+            // 1-PUT parity the bypass gave. The flush is strictly one segment at a
+            // time under the per-prefix lock, so folding backfill in never
+            // pipelines sequences (a failed N after N+1 landed would mint a gap).
+            //
+            // On the lease path (pre-SCOS), keep the #62 backfill high-throughput
+            // bypass: its #70 multi-replica routing can't safely carry the bulk
+            // load, and legacy offsets stay strictly below segment offsets only
+            // while the sub-stream has no segment yet (the #58 seam the hybrid
+            // read path depends on) — so a large batch bypasses only then, and one
+            // arriving after segmentation still coalesces.
+            let prefix_buffer_route = if !(coalesce_eligible && self.prefix_coalesce) {
+                false
+            } else if self.prefix_leaseless {
+                true
+            } else {
                 let records = deflated.last_offset_delta as i64 + 1;
                 let bypass_backfill = records >= Self::PREFIX_BACKFILL_MIN_RECORDS
                     && self.segment_region_start(topition).await?.is_none();
                 !bypass_backfill
-            } else {
-                false
             };
 
             if deflated.is_idempotent() {
