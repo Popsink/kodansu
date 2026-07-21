@@ -20,22 +20,6 @@ services:
         target: /etc/dashboards
       - grafana:/var/lib/grafana
     pull_policy: missing
-  db:
-    image: ${POSTGRES_IMAGE:-postgres:17}
-    environment:
-      PGUSER: postgres
-      POSTGRES_PASSWORD: postgres
-    ports:
-      - 5432:5432
-    volumes:
-      - db:/var/lib/postgresql
-      - ./etc/initdb.d/:/docker-entrypoint-initdb.d/
-    healthcheck:
-      test: /usr/bin/pg_isready
-      interval: 5s
-      timeout: 10s
-      retries: 5
-    pull_policy: missing
   minio:
     image: quay.io/minio/minio
     command: server /data --console-address ":9001"
@@ -63,14 +47,12 @@ services:
       AWS_ENDPOINT: ${AWS_ENDPOINT}
       AWS_ALLOW_HTTP: ${AWS_ALLOW_HTTP}
     volumes:
-      - ./etc/schema/:/schema/
       - ./data:/data/
     command: |
       --kafka-cluster-id ${CLUSTER_ID}
       --kafka-listener-url tcp://0.0.0.0:9092/
       --kafka-advertised-listener-url ${ADVERTISED_LISTENER_URL}
       --storage-engine ${STORAGE_ENGINE}
-      --schema-registry file:///schema
     ports:
       - 9092:9092
       - 9100:9100
@@ -90,47 +72,10 @@ services:
     configs:
       - source: prometheus_yaml
         target: /prometheus/prometheus.yml
-  lakehouse-catalog:
-    image: ${LAKEKEEPER_IMAGE}
-    environment:
-      - LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure!
-      - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@db:5432/postgres
-      - LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://postgres:postgres@db:5432/postgres
-      - RUST_LOG=trace,axum=trace,sqlx=trace,iceberg-catalog=trace
-    command: ["serve"]
-    healthcheck:
-      test: ["CMD", "/home/nonroot/iceberg-catalog", "healthcheck"]
-      interval: 1s
-      timeout: 10s
-      retries: 3
-      start_period: 3s
-    depends_on:
-      lakehouse-migrate:
-        condition: service_completed_successfully
-      db:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
-    ports:
-      - "8181:8181"
-  lakehouse-migrate:
-    image: ${LAKEKEEPER_IMAGE}
-    environment:
-      - LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure!
-      - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@db:5432/postgres
-      - LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://postgres:postgres@db:5432/postgres
-      - RUST_LOG=info
-    restart: "no"
-    command: ["migrate"]
-    depends_on:
-      db:
-        condition: service_healthy
 configs:
   prometheus_yaml:
     file: etc/prometheus.yaml
 volumes:
-  db:
-    driver: local
   minio:
     driver: local
   grafana:
