@@ -37,8 +37,8 @@ use tansu_sans_io::{
 };
 
 use crate::{
-    Error, Result, Storage, Topition, TxnAddPartitionsRequest, dynostore::DynoStore,
-    dynostore::tests::init_tracing,
+    Error, Result, Storage, Topition, TxnAddPartitionsRequest,
+    dynostore::{CoalesceTuning, DynoStore, tests::init_tracing},
 };
 
 const CLUSTER: &str = "tansu";
@@ -385,6 +385,80 @@ async fn aborted_transaction_surfaces_in_offset_stage() -> Result<(), Error> {
     // The aborted transaction now surfaces as (producer_id, first_offset).
     let staged = store.offset_stage(&tp).await?;
     assert_eq!(vec![(producer.id, 0)], staged.aborted().to_vec());
+
+    Ok(())
+}
+
+/// Compaction of a run of v2 segments must carry the idempotent producer
+/// coordinates forward (#107): re-encoding the merged run as v2 re-derives them
+/// from the (byte-identical) merged batches, so log-based dedup (#88) still
+/// observes producers whose batches were compacted. Before the fix the merged
+/// segment was written v1, dropping the coordinates, and a retry of a compacted
+/// batch was silently re-appended as a duplicate record.
+#[tokio::test]
+async fn compaction_carries_producer_coordinates_forward() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    const PREFIX: &str = "org.env.conn";
+    let store = DynoStore::new(CLUSTER, NODE, InMemory::new())
+        .prefix_coalesce(true)
+        .prefix_leaseless(true)
+        .coalesce_tuning(CoalesceTuning {
+            prefix_compact_min_segments: Some(2),
+            // keep_hot = 0 so the whole run — including the retried batch — is
+            // compactable; this is what exposes the dropped-coordinates bug.
+            prefix_compact_keep_hot: Some(0),
+            prefix_compact_target_bytes: Some(1 << 30),
+            ..Default::default()
+        });
+
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let tp = Topition::new(topic, 0);
+    let pid = init_idempotent(&store).await?;
+
+    // Four idempotent batches, each flushed as its own segment (offsets 0..4).
+    for seq in 0..4 {
+        assert_eq!(
+            seq as i64,
+            store
+                .produce(None, &tp, idempotent_batch(pid, 0, seq, 1)?)
+                .await?
+        );
+    }
+
+    // Compact the whole run into one segment.
+    let merged = store.compact_prefix_segments(PREFIX).await?;
+    assert!(
+        merged >= 2,
+        "the run should have been compacted (got {merged})"
+    );
+
+    // The merged segment's footer still carries every batch's producer
+    // coordinates (base sequences 0..4 for this producer) — not dropped.
+    store.refresh_prefix_index(PREFIX).await?;
+    let carried: Vec<i32> = store
+        .valid_substream_segments(PREFIX, topic, 0)?
+        .into_iter()
+        .flat_map(|(_, entry)| entry.producers)
+        .filter(|coord| coord.producer_id == pid)
+        .map(|coord| coord.base_sequence)
+        .collect();
+    assert_eq!(
+        vec![0, 1, 2, 3],
+        carried,
+        "compaction must carry the v2 producer coordinates forward (#107)"
+    );
+
+    // Behavioural acceptance: a retry of a compacted batch is recognized as a
+    // duplicate and acked with its original offset (0), not re-appended.
+    let retry = store
+        .produce(None, &tp, idempotent_batch(pid, 0, 0, 1)?)
+        .await?;
+    assert_eq!(
+        0, retry,
+        "retry of a compacted batch must dedup to its offset"
+    );
 
     Ok(())
 }
