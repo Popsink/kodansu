@@ -2364,3 +2364,117 @@ async fn prefix_index_cold_build_commits_incrementally() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// Maintenance work-set sharding (#126): HRW partitions prefixes across shards —
+/// exactly one owner per prefix, every shard carries a share, a single shard (or
+/// a misconfigured index) owns everything (backward compatible), and scaling the
+/// shard count moves only ~1/N of prefixes (not almost all, as `hash % N` would).
+#[test]
+fn maintenance_sharding_partitions_prefixes_via_hrw() -> Result<(), Error> {
+    fn shard_store(shard: usize, shards: usize) -> DynoStore {
+        DynoStore::new(CLUSTER, NODE, InMemory::new()).coalesce_tuning(CoalesceTuning {
+            maintenance_shard: Some(shard),
+            maintenance_shards: Some(shards),
+            ..Default::default()
+        })
+    }
+
+    let prefixes: Vec<String> = (0..300).map(|i| format!("org.env.c{i:03}")).collect();
+
+    // A single shard — or an unset/misconfigured count — owns everything.
+    let solo = shard_store(0, 1);
+    assert!(prefixes.iter().all(|p| solo.owns_prefix(p)));
+    assert!(prefixes.iter().all(|p| shard_store(5, 3).owns_prefix(p)));
+
+    // N shards partition the prefixes: exactly one owner each, every shard used.
+    const N: usize = 4;
+    let stores: Vec<DynoStore> = (0..N).map(|i| shard_store(i, N)).collect();
+    for p in &prefixes {
+        assert_eq!(
+            1,
+            stores.iter().filter(|s| s.owns_prefix(p)).count(),
+            "prefix {p} must have exactly one owner"
+        );
+    }
+    for (i, s) in stores.iter().enumerate() {
+        assert!(
+            prefixes.iter().any(|p| s.owns_prefix(p)),
+            "shard {i}/{N} owns no prefix"
+        );
+    }
+
+    // HRW stability: growing N -> N+1 moves a prefix only if the new shard wins.
+    let bigger: Vec<DynoStore> = (0..N + 1).map(|i| shard_store(i, N + 1)).collect();
+    let moved = prefixes
+        .iter()
+        .filter(|p| {
+            let old_owner = (0..N).find(|&i| stores[i].owns_prefix(p)).unwrap();
+            !bigger[old_owner].owns_prefix(p)
+        })
+        .count();
+    assert!(
+        moved < prefixes.len() / 2,
+        "HRW moved {moved}/{} on N->N+1 (should be ~1/N)",
+        prefixes.len()
+    );
+
+    Ok(())
+}
+
+/// A maintenance shard that does not own a prefix skips its compaction (#126);
+/// the owning shard compacts it. Ownership gates who works; the lease guards
+/// correctness.
+#[tokio::test]
+async fn compaction_skips_prefixes_not_owned_by_this_shard() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let tuning = |shard: usize| CoalesceTuning {
+        maintenance_shard: Some(shard),
+        maintenance_shards: Some(3),
+        prefix_compact_min_segments: Some(2),
+        prefix_compact_keep_hot: Some(0),
+        prefix_compact_target_bytes: Some(1 << 30),
+        ..Default::default()
+    };
+    let scos = |t: CoalesceTuning| {
+        DynoStore::new(CLUSTER, NODE, bucket.clone())
+            .prefix_coalesce(true)
+            .prefix_leaseless(true)
+            .coalesce_tuning(t)
+    };
+
+    // Write four segments to the prefix (owns-all producer).
+    let writer = scos(CoalesceTuning {
+        prefix_compact_min_segments: Some(2),
+        prefix_compact_keep_hot: Some(0),
+        prefix_compact_target_bytes: Some(1 << 30),
+        ..Default::default()
+    });
+    let topic = "org.env.conn.tab_a";
+    create_topic(&writer, topic).await?;
+    let a = Topition::new(topic, 0);
+    for _ in 0..4 {
+        _ = writer.produce(None, &a, batch(1)?).await?;
+    }
+    assert_eq!(4, segments(&bucket).await.len());
+
+    // Which of 3 shards owns this prefix? Every other shard must skip it.
+    let owner = (0..3)
+        .find(|&s| scos(tuning(s)).owns_prefix(PREFIX))
+        .expect("some shard owns the prefix");
+    let other = (owner + 1) % 3;
+
+    _ = scos(tuning(other)).policy_compact_segments().await?;
+    assert_eq!(
+        4,
+        segments(&bucket).await.len(),
+        "a non-owning shard must not compact the prefix"
+    );
+
+    _ = scos(tuning(owner)).policy_compact_segments().await?;
+    assert!(
+        segments(&bucket).await.len() < 4,
+        "the owning shard must compact the prefix"
+    );
+
+    Ok(())
+}

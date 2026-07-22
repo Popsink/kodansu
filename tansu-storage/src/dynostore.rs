@@ -334,6 +334,16 @@ pub struct DynoStore {
     prefix_compact_target_bytes: usize,
     prefix_compact_keep_hot: usize,
 
+    /// Maintenance work-set sharding across maintainer replicas (#126): this
+    /// replica's shard index and the total shard count. Ownership of a prefix's
+    /// compaction/retention is a rendezvous-hash function of `(prefix,
+    /// shard-set)`, layered purely on top of the per-prefix lease fencing
+    /// (#59/#92/#115) — it decides *who bothers to try*, not correctness.
+    /// `maintenance_shards <= 1` (the default) ⇒ this replica owns every prefix,
+    /// i.e. today's single-owner behaviour, backward compatible.
+    maintenance_shard: usize,
+    maintenance_shards: usize,
+
     object_store: Arc<DynObjectStore>,
 }
 
@@ -485,6 +495,9 @@ pub struct CoalesceTuning {
     pub prefix_compact_min_segments: Option<usize>,
     pub prefix_compact_target_bytes: Option<usize>,
     pub prefix_compact_keep_hot: Option<usize>,
+    /// This replica's maintenance shard index and the total shard count (#126).
+    pub maintenance_shard: Option<usize>,
+    pub maintenance_shards: Option<usize>,
 }
 
 /// Process-wide counter making each [`DynoStore`]'s `writer_id` unique (#59), so
@@ -1102,6 +1115,9 @@ impl DynoStore {
             prefix_compact_min_segments: Self::PREFIX_COMPACT_MIN_SEGMENTS,
             prefix_compact_target_bytes: Self::PREFIX_COMPACT_TARGET_BYTES,
             prefix_compact_keep_hot: Self::PREFIX_COMPACT_KEEP_HOT,
+            // Default: a single shard owning every prefix (today's behaviour).
+            maintenance_shard: 0,
+            maintenance_shards: 1,
             topic_metas: Arc::new(Mutex::new(BTreeMap::new())),
             topic_index: Arc::new(Mutex::new(TopicIndex::default())),
             topic_index_refresh: Arc::new(tokio::sync::Mutex::new(())),
@@ -1192,6 +1208,8 @@ impl DynoStore {
             prefix_compact_keep_hot: tuning
                 .prefix_compact_keep_hot
                 .unwrap_or(self.prefix_compact_keep_hot),
+            maintenance_shard: tuning.maintenance_shard.unwrap_or(self.maintenance_shard),
+            maintenance_shards: tuning.maintenance_shards.unwrap_or(self.maintenance_shards),
             ..self
         }
     }
@@ -5062,6 +5080,42 @@ impl DynoStore {
     }
 
     /// Compact segments across every coalesced prefix (#66).
+    /// Rendezvous (highest-random-weight) weight of `prefix` for maintenance
+    /// shard `shard` (#126): FNV-1a over the prefix bytes then the shard index,
+    /// so the winner is stable per `(prefix, shard-set)` and independent of
+    /// ordering. HRW reshuffles only ~`1/N` of prefixes when the shard count
+    /// changes by one, unlike `hash(prefix) % N`.
+    fn prefix_shard_weight(prefix: &str, shard: usize) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for byte in prefix
+            .as_bytes()
+            .iter()
+            .chain((shard as u64).to_be_bytes().iter())
+        {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+
+    /// Whether this replica owns `prefix`'s maintenance (compaction/retention)
+    /// under work-set sharding (#126). Ownership is the HRW winner over the shard
+    /// set `0..maintenance_shards`; this is a best-effort optimization layered on
+    /// the per-prefix lease fencing (#59/#92/#115), so a stale/overlapping view
+    /// during a membership change at worst transiently contends one prefix (the
+    /// lease fences one) — it can never double-compact or lose a prefix.
+    ///
+    /// `maintenance_shards <= 1` ⇒ own everything (default, backward compatible).
+    /// A misconfigured shard index (`>= maintenance_shards`) also falls back to
+    /// own-everything rather than silently stop all maintenance on this replica.
+    fn owns_prefix(&self, prefix: &str) -> bool {
+        if self.maintenance_shards <= 1 || self.maintenance_shard >= self.maintenance_shards {
+            return true;
+        }
+        (0..self.maintenance_shards).max_by_key(|shard| Self::prefix_shard_weight(prefix, *shard))
+            == Some(self.maintenance_shard)
+    }
+
     async fn policy_compact_segments(&self) -> Result<u64> {
         if !self.prefix_coalesce || self.prefix_compact_min_segments == 0 {
             return Ok(0);
@@ -5100,7 +5154,14 @@ impl DynoStore {
                     .insert(self.prefix_of(&Topition::new(metadata.topic.name.clone(), partition)));
             }
         }
-        let prefixes: Vec<String> = prefix_set.into_iter().collect();
+        // Work-set sharding (#126): only compact the prefixes this replica owns,
+        // so N maintainer replicas parallelize the backlog ~N× and each pays the
+        // discovery/list cost for ~1/N of the prefixes. Ownership is HRW; the
+        // per-prefix compaction lease remains the correctness guard.
+        let prefixes: Vec<String> = prefix_set
+            .into_iter()
+            .filter(|prefix| self.owns_prefix(prefix))
+            .collect();
 
         /// Bounds the drain loop so a pathological prefix can't monopolize a
         /// maintenance tick; far above the runs a real backlog needs.
@@ -5197,6 +5258,15 @@ impl DynoStore {
         let mut deleted = 0;
 
         for (prefix, retention_ms) in retention_by_prefix {
+            // Work-set sharding (#126): only expire prefixes this replica owns
+            // (same HRW ownership as compaction), so retention parallelizes and
+            // the discovery/list cost is split ~1/N — the duplication #115
+            // documented, now removed on the retention side too. The lease in
+            // `expire_prefix_segments` (#115) stays the correctness guard.
+            if !self.owns_prefix(&prefix) {
+                continue;
+            }
+
             let threshold_ms = now_ms.saturating_sub(retention_ms);
 
             if !self.prefix_maybe_expirable(&prefix, threshold_ms)? {

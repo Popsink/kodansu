@@ -112,9 +112,27 @@ under a uniform retention (the longest `retention.ms` among the prefix's topics)
 | `prefix_compact_min_segments` | `256` | Compact a prefix once it holds more than this many live segments (`0` disables). |
 | `prefix_compact_target_bytes` | `64m` | Target size of a merged segment. |
 | `prefix_compact_keep_hot` | `16` | Newest segments never compacted (leaves the active tail alone). |
+| `maintenance_shards` | `1` | Number of maintainer replicas sharing the compaction/retention work-set (`≤1` = this replica owns every prefix). |
+| `maintenance_shard` | `0` | This replica's shard index in `0..maintenance_shards`. |
 
 The linger / batch-count / byte thresholds are shared with `produce_coalesce`
 (`coalesce_linger` / `coalesce_batches` / `coalesce_bytes`, above).
+
+### Scaling maintenance across replicas (`maintenance_shards`)
+
+Compaction and segment retention are sequential per process and every maintainer
+otherwise derives the whole prefix set, so adding maintainer replicas duplicates
+the discovery LIST with no throughput gain. Set `maintenance_shards=N` and give
+each maintainer a distinct `maintenance_shard` in `0..N` (e.g. from a StatefulSet
+ordinal): each replica then compacts/expires only the prefixes it *owns* by
+rendezvous (HRW) hashing over the shard set, so the backlog drains ~`N×` faster
+and each replica lists ~`1/N` of the prefixes. Ownership is a best-effort
+optimization layered on the per-prefix lease (`compaction-lease.json`, and the
+retention lease) — the lease stays the correctness guard, so a stale ownership
+view during a scale event at worst transiently contends one prefix (one replica
+is fenced), never double-compacting or leaving a prefix unowned. HRW moves only
+~`1/N` of prefixes when `N` changes by one. Leave unset (or `1`) for the
+single-maintainer default.
 
 ### Bounding the segment count (linger vs. compaction)
 

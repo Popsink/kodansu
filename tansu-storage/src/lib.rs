@@ -2302,6 +2302,22 @@ fn coalesce_tuning(storage: &Url) -> CoalesceTuning {
                     .inspect_err(|err| warn!(storage = %storage, key = "prefix_compact_keep_hot", value, ?err))
                     .ok();
             }
+            "maintenance_shard" => {
+                tuning.maintenance_shard = value
+                    .parse()
+                    .inspect_err(
+                        |err| warn!(storage = %storage, key = "maintenance_shard", value, ?err),
+                    )
+                    .ok();
+            }
+            "maintenance_shards" => {
+                tuning.maintenance_shards = value
+                    .parse()
+                    .inspect_err(
+                        |err| warn!(storage = %storage, key = "maintenance_shards", value, ?err),
+                    )
+                    .ok();
+            }
             _ => {}
         }
     }
