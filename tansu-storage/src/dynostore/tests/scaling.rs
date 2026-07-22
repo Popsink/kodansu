@@ -32,7 +32,7 @@ use object_store::{
 };
 use std::time::Duration;
 use tansu_sans_io::{
-    IsolationLevel,
+    IsolationLevel, ListOffset,
     create_topics_request::CreatableTopic,
     record::{Record, deflated, inflated},
 };
@@ -722,6 +722,84 @@ async fn cold_prefix_index_reads_one_get_per_small_footer() -> Result<(), Error>
     assert_eq!(
         1, reads.1,
         "one GET for the single small footer (was two before #112 follow-up)"
+    );
+
+    Ok(())
+}
+
+/// The compacted-`cleanup.policy` check `produce` makes on every batch is
+/// memoized (#113): the first check reads the topic config, and repeated checks
+/// within the TTL are served from memory — no per-batch conditional GET of the
+/// `topic-metadata/<name>.json` object on the produce hot path.
+#[tokio::test]
+async fn topic_is_compacted_is_memoized() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+    let (storage, counters) = store();
+    create(&storage, "t", 1).await?;
+
+    // First check reads the topic config once.
+    assert!(!storage.topic_is_compacted("t").await?);
+
+    // Repeated checks within the TTL hit the memo — no object-store requests.
+    counters.reset();
+    for _ in 0..20 {
+        assert!(!storage.topic_is_compacted("t").await?);
+    }
+    let reads = counters.report("20 topic_is_compacted checks");
+    assert_eq!(
+        (0, 0, 0, 0, 0),
+        reads,
+        "the compacted-policy check is memoized — no per-call object-store request (#113)"
+    );
+
+    Ok(())
+}
+
+/// A pure-segment topic's LATEST `list_offsets` (the consumer-lag path) issues
+/// no `records/` LIST per poll (#113): the tail timestamp comes from the footer
+/// index (or is skipped when absent), never the legacy per-topic listing.
+#[tokio::test]
+async fn latest_list_offsets_on_pure_segment_issues_no_records_list() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let counters = Arc::new(Counters::default());
+    let storage = DynoStore::new(
+        CLUSTER,
+        NODE,
+        Counting {
+            inner: InMemory::new(),
+            counters: counters.clone(),
+        },
+    )
+    .prefix_coalesce(true)
+    .prefix_leaseless(true);
+    create(&storage, "org.env.conn.hot", 1).await?;
+    let tp = Topition::new("org.env.conn.hot", 0);
+    _ = storage.produce(None, &tp, batch(b"m")?).await?;
+
+    // Warm the index + the has-legacy-records memo with one LATEST query.
+    _ = storage
+        .list_offsets(
+            IsolationLevel::ReadUncommitted,
+            &[(tp.clone(), ListOffset::Latest)],
+        )
+        .await?;
+
+    // Repeated LATEST polls issue no `records/` LIST on a pure-segment topic.
+    counters.reset();
+    for _ in 0..20 {
+        _ = storage
+            .list_offsets(
+                IsolationLevel::ReadUncommitted,
+                &[(tp.clone(), ListOffset::Latest)],
+            )
+            .await?;
+    }
+    let reads = counters.report("20 LATEST list_offsets (pure-segment)");
+    assert_eq!(
+        (0, 0),
+        (reads.2, reads.3),
+        "no records/ LIST per LATEST poll on a pure-segment topic (#113)"
     );
 
     Ok(())
