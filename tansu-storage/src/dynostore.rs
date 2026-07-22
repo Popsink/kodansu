@@ -5011,7 +5011,22 @@ impl DynoStore {
         let new_seq = if substreams.is_empty() {
             None
         } else {
-            let (payload, footer) = self.encode_segment(&substreams, merged_epoch.max(0))?;
+            // Carry the v2 producer coordinates forward (#107). Re-encoding the
+            // merged run as v2 re-derives each idempotent batch's producer
+            // coordinates from the (byte-identical) merged batches, so log-based
+            // idempotent dedup (#88) still observes producers whose batches were
+            // compacted — a retry of a compacted batch is recognized as a
+            // duplicate and acked with its original offset instead of being
+            // re-appended. A fresh per-segment nonce (#89) is stamped as on any
+            // create. Emitted only under the leaseless arbiter, which is where v2
+            // and log-based dedup live; the lease path keeps the v1 encoder (its
+            // segments carry no coordinates to preserve).
+            let (payload, footer) = if self.prefix_leaseless {
+                let nonce = rng().random::<u64>();
+                self.encode_segment_v2(&substreams, merged_epoch.max(0), nonce)?
+            } else {
+                self.encode_segment(&substreams, merged_epoch.max(0))?
+            };
             let seq = self
                 .assign_and_create_segment(prefix, payload, false)
                 .await?;
