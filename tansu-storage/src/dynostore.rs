@@ -2244,7 +2244,9 @@ impl DynoStore {
         }
 
         error!(?topition, candidate, "offset assignment exhausted retries");
-        Err(Error::Api(ErrorCode::UnknownServerError))
+        // Retriable: exhaustion is contention/backpressure, not a permanent
+        // fault — a fatal code would make the client drop the batch (#6/#129).
+        Err(Error::Api(ErrorCode::KafkaStorageError))
     }
 
     /// Buffer `deflated` for a coalesced flush and await its assigned base offset
@@ -2526,7 +2528,8 @@ impl DynoStore {
         }
 
         error!(prefix, floor, "seq floor CAS exhausted retries");
-        Err(Error::Api(ErrorCode::UnknownServerError))
+        // Retriable: contention exhaustion, not a permanent fault (#6/#129).
+        Err(Error::Api(ErrorCode::KafkaStorageError))
     }
 
     /// The durable era-epoch object for `prefix` (#92).
@@ -2831,7 +2834,8 @@ impl DynoStore {
             prefix,
             candidate, "segment sequence assignment exhausted retries"
         );
-        Err(Error::Api(ErrorCode::UnknownServerError))
+        // Retriable: contention exhaustion, not a permanent fault (#6/#129).
+        Err(Error::Api(ErrorCode::KafkaStorageError))
     }
 
     /// Read a segment's self-describing footer (#58/#64) with at most two ranged
@@ -3274,7 +3278,7 @@ impl DynoStore {
                     Ok(result) => result
                         .bytes()
                         .await
-                        .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
+                        .map_err(Error::from)
                         .and_then(|encoded| self.decode_frame(encoded))?,
 
                     // Deleted between locate and read (compaction #66 / retention
@@ -3292,7 +3296,9 @@ impl DynoStore {
 
                     Err(error) => {
                         error!(?error, location = %location);
-                        return Err(Error::Api(ErrorCode::UnknownServerError));
+                        // Preserve the storage error so it is classified
+                        // retriable rather than fatal `-1` (#6/#129).
+                        return Err(Error::from(error));
                     }
                 };
 
@@ -3365,7 +3371,7 @@ impl DynoStore {
             .next()
             .await
             .transpose()
-            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+            .map_err(Error::from)?
             .is_some();
 
         // A negative result is stable for a topition that is provably
@@ -3507,7 +3513,7 @@ impl DynoStore {
             .inspect(|meta| debug!(?meta))
             .transpose()
             .inspect_err(|error| error!(?error, ?topition, ?offset, ?max_bytes))
-            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+            .map_err(Error::from)?
             && !has_deadline_expired()
         {
             let Some(file_name) = meta.location.parts().next_back() else {
@@ -3534,11 +3540,11 @@ impl DynoStore {
                 .get(&meta.location)
                 .await
                 .inspect_err(|error| error!(?error, ?topition, ?offset, ?max_bytes))
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+                .map_err(Error::from)?
                 .bytes()
                 .await
                 .inspect_err(|error| error!(?error, location = %meta.location))
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
+                .map_err(Error::from)
                 .and_then(|encoded| self.decode_frame(encoded))?;
 
             let mut running = base_offset;
@@ -3582,7 +3588,7 @@ impl DynoStore {
                 .await
                 .transpose()
                 .inspect_err(|error| error!(?error, ?topition))
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+                .map_err(Error::from)?
             {
                 if let Some(name) = meta.location.parts().next_back()
                     && name.as_ref().len() >= 20
@@ -4317,15 +4323,37 @@ impl DynoStore {
                                 )
                                 .await;
                         }
-                        Ok(_) => {
+                        // A *peer* created `candidate` while our PUT was
+                        // failing: we lost the sequence exactly as in the
+                        // AlreadyExists arm (the transport error was moot). Fold
+                        // it and retry the next sequence — cheap, not a fault.
+                        Ok(Some(_)) => {
                             debug!(
                                 prefix,
                                 candidate,
                                 attempt,
                                 ?error,
-                                "ambiguous PUT not ours, re-deriving"
+                                "ambiguous PUT lost to peer, re-deriving"
                             );
                             continue;
+                        }
+                        // Nothing landed at `candidate` (S3 is read-after-write
+                        // consistent, so a durable create would be visible): our
+                        // PUT genuinely failed — a transient S3 throttle /
+                        // transport error, not a lost race. Surface the storage
+                        // error so it is classified *retriable* (#6/#129) and the
+                        // client backs off and retries (log-based dedup #88 makes
+                        // the replay safe), instead of spinning the attempt budget
+                        // against a throttling bucket toward a fatal terminal.
+                        Ok(None) => {
+                            debug!(
+                                prefix,
+                                candidate,
+                                attempt,
+                                ?error,
+                                "ambiguous PUT did not land, failing retriably"
+                            );
+                            return Self::fail_prefix_flush(buffer, error.into(), prefix);
                         }
                         Err(probe_error) => {
                             debug!(
@@ -4343,7 +4371,10 @@ impl DynoStore {
         }
 
         error!(prefix, "leaseless flush exhausted retries");
-        Self::fail_prefix_flush(buffer, Error::Api(ErrorCode::UnknownServerError), prefix)
+        // Retriable: exhaustion here is pure create-CAS contention (a transport
+        // error fails fast retriably above), so tell the client to back off and
+        // retry rather than dropping the batch on a fatal code (#6/#129).
+        Self::fail_prefix_flush(buffer, Error::Api(ErrorCode::KafkaStorageError), prefix)
     }
 
     /// The next offset for `topition` under the leaseless path (#86), derived from
@@ -5123,7 +5154,7 @@ impl DynoStore {
                 .inspect_err(|err| error!(?err, prefix, seq))?
                 .bytes()
                 .await
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?;
+                .map_err(Error::from)?;
             _ = objects.insert(*seq, object);
         }
 
@@ -7181,7 +7212,7 @@ impl Storage for DynoStore {
                 .inspect(|meta| debug!(?meta))
                 .transpose()
                 .inspect_err(|error| error!(?error))
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+                .map_err(Error::from)?
             {
                 if let Some(last) = stable.get(topition)
                     && offset_request == &ListOffset::Latest
@@ -7363,7 +7394,7 @@ impl Storage for DynoStore {
                 .inspect(|meta| debug!(?meta))
                 .transpose()
                 .inspect_err(|error| error!(?error))
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+                .map_err(Error::from)?
             {
                 debug!(?meta);
                 let Some(topic): Option<String> = meta
@@ -7422,14 +7453,15 @@ impl Storage for DynoStore {
                                 .map_err(Error::from)
                         })
                         .map(|commit| commit.offset)
-                        .inspect_err(|error| error!(?error, ?group_id, ?topition))
-                        .map_err(|_| Error::Api(ErrorCode::UnknownServerError)),
+                        .inspect_err(|error| error!(?error, ?group_id, ?topition)),
 
                     Err(object_store::Error::NotFound { .. }) => Ok(-1),
 
                     Err(error) => {
                         error!(?error, ?group_id, ?topition);
-                        Err(Error::Api(ErrorCode::UnknownServerError))
+                        // Preserve the storage error so a transient S3 failure is
+                        // retriable, not fatal `-1` (#6/#129).
+                        Err(Error::from(error))
                     }
                 }?;
 
