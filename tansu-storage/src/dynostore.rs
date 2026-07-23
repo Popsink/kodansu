@@ -29,6 +29,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{
     StreamExt,
+    future::join_all,
     stream::{BoxStream, TryStreamExt},
 };
 use metadata::Cache;
@@ -43,6 +44,7 @@ use opentelemetry::{
 };
 use opticon::OptiCon;
 use rand::{prelude::*, rng};
+use recent::RecentWriteCache;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tansu_sans_io::{
     BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
@@ -66,14 +68,15 @@ use tansu_sans_io::{
     record::{Record, deflated, inflated},
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
 };
-use tokio::sync::oneshot;
-use tokio::time::Duration;
+use tokio::sync::{Notify, oneshot};
+use tokio::time::{Duration, Instant};
 use tracing::{debug, error, info, instrument, warn};
 use url::Url;
 use uuid::Uuid;
 
 mod metadata;
 mod opticon;
+mod recent;
 
 #[cfg(test)]
 mod tests;
@@ -162,6 +165,18 @@ pub struct DynoStore {
     /// checkpoint can only re-accept a bounded tail on replay, never lose data,
     /// since the object never moves backwards).
     producer_checkpoints: Arc<Mutex<BTreeMap<ProducerId, ProducerCheckpoint>>>,
+
+    /// Per-producer *durable-through* idempotent sequences: the highest
+    /// next-sequence per (epoch, topic, partition) whose batch is durably
+    /// written and being acked. The lazy `producers/{id}.json` checkpoint
+    /// persists this view, never the live in-memory advance — which can run
+    /// up to a full coalesce linger ahead of the log while batches sit
+    /// parked. Persisting the live view would let a crash turn a
+    /// never-durable batch's retry into a false `DuplicateSequenceNumber`
+    /// (Kafka clients treat that as delivered: silent loss). In-memory only;
+    /// the checkpoint folds the stored object underneath, so it never
+    /// regresses (#48).
+    durable_idempotent: Arc<Mutex<BTreeMap<ProducerId, ProducerDetail>>>,
 
     /// Per-partition `last_modified` (ms) of the *oldest* surviving batch object,
     /// as observed at the last `delete`-policy scan (#49). Lets the maintenance
@@ -302,6 +317,34 @@ pub struct DynoStore {
     /// the window.
     compacted_topics: Arc<Mutex<BTreeMap<String, (bool, SystemTime)>>>,
 
+    /// LRW (least-recently-written) cache of recently produced object bytes
+    /// (`docs/design-recent-write-cache.md`): the produce path inserts each
+    /// just-written `records/` object / segment verbatim after its create-only
+    /// PUT succeeds, and the fetch data path serves those bytes instead of the
+    /// GET a tailing consumer otherwise pays to re-download data this process
+    /// just uploaded. Immutable, never-reused names make a hit coherent by
+    /// construction (the topic delete + re-create exception is purged in
+    /// [`Storage::delete_topic`]); a miss falls through to the object store.
+    /// Size-bounded by `recent_cache_bytes` — 0 (the default) disables it.
+    recent_writes: Arc<Mutex<RecentWriteCache>>,
+
+    /// Per-topition produce signal (`docs/design-recent-write-cache.md`,
+    /// phase 2): [`Self::set_high`] notifies whenever a topition's
+    /// high-watermark hint advances, and [`Storage::await_produce`] parks
+    /// fetch long-polls on it — wake-on-write instead of blind polling.
+    /// Local-only, like the hint itself: a remote replica's consumers still
+    /// observe writes through the hint/footer TTL refresh.
+    produce_notifies: Arc<Mutex<BTreeMap<Topition, Arc<Notify>>>>,
+
+    /// Topitions with a fetch long-poll currently parked in
+    /// [`Storage::await_produce`] (watcher count per topition). Lets the
+    /// enqueue paths arm a fetch-flush trigger for a batch that arrives
+    /// *after* the fetch already parked — the mirror of
+    /// [`Self::trigger_pending_flushes`], which only covers buffers already
+    /// non-empty at park time. Without it such a batch would wait out the
+    /// full linger instead of the floor.
+    parked_watchers: Arc<Mutex<BTreeMap<Topition, usize>>>,
+
     /// This writer's identity, recorded in the lease `holder` field (#59) for
     /// observability. Unique per process instance so two brokers (or two test
     /// stores) are distinguishable.
@@ -334,6 +377,15 @@ pub struct DynoStore {
     prefix_compact_target_bytes: usize,
     prefix_compact_keep_hot: usize,
 
+    /// How soon a *parked fetch* may flush a pending coalesce buffer (phase 2
+    /// fetch-triggered flush), measured from the buffer's oldest batch. This
+    /// is the demand-side flush cadence: an active consumer forces flushes at
+    /// the floor regardless of `coalesce_linger`, so the linger can be widened
+    /// for unconsumed prefixes without costing consumer latency, while a
+    /// polling consumer still can't push the PUT rate above one flush per
+    /// floor per partition/prefix.
+    fetch_flush_floor: Duration,
+
     object_store: Arc<DynObjectStore>,
 }
 
@@ -352,6 +404,12 @@ struct CoalesceBuffer {
     pending: Vec<Pending>,
     records: i64,
     bytes: usize,
+    /// When the oldest pending batch was enqueued; a fetch-flush trigger fires
+    /// at `fetch_flush_floor` from here, never sooner — the PUT-cadence guard.
+    since: Option<Instant>,
+    /// A fetch-flush trigger task is already scheduled for this buffer, so
+    /// further parked fetches don't spawn duplicates. Reset with the buffer.
+    trigger_armed: bool,
 }
 
 /// A batch parked in the prefix coalescing buffer (#57), carrying the topition
@@ -372,6 +430,12 @@ struct PrefixCoalesceBuffer {
     pending: Vec<PrefixPending>,
     records: i64,
     bytes: usize,
+    /// When the oldest pending batch was enqueued; a fetch-flush trigger fires
+    /// at `fetch_flush_floor` from here, never sooner — the PUT-cadence guard.
+    since: Option<Instant>,
+    /// A fetch-flush trigger task is already scheduled for this buffer, so
+    /// further parked fetches don't spawn duplicates. Reset with the buffer.
+    trigger_armed: bool,
     /// Set once any buffered batch is backfill-class (span ≥
     /// [`DynoStore::PREFIX_BACKFILL_MIN_RECORDS`]): relaxes the flush triggers to
     /// backfill floors so a folded-in snapshot (#90) coalesces into a few large
@@ -485,6 +549,48 @@ pub struct CoalesceTuning {
     pub prefix_compact_min_segments: Option<usize>,
     pub prefix_compact_target_bytes: Option<usize>,
     pub prefix_compact_keep_hot: Option<usize>,
+    pub recent_cache_bytes: Option<usize>,
+    pub fetch_flush_floor: Option<Duration>,
+}
+
+/// RAII registration of a parked fetch in [`DynoStore::parked_watchers`]:
+/// increments each watched topition's count on park, decrements on every exit
+/// path (early return, wake, timeout, error) via `Drop`, pruning zero counts.
+struct ParkedWatchers {
+    watchers: Arc<Mutex<BTreeMap<Topition, usize>>>,
+    topitions: Vec<Topition>,
+}
+
+impl ParkedWatchers {
+    fn park(watchers: &Arc<Mutex<BTreeMap<Topition, usize>>>, watch: &[(Topition, i64)]) -> Self {
+        let topitions: Vec<Topition> = watch.iter().map(|(topition, _)| topition.clone()).collect();
+
+        if let Ok(mut locked) = watchers.lock() {
+            for topition in &topitions {
+                *locked.entry(topition.clone()).or_default() += 1;
+            }
+        }
+
+        Self {
+            watchers: watchers.clone(),
+            topitions,
+        }
+    }
+}
+
+impl Drop for ParkedWatchers {
+    fn drop(&mut self) {
+        if let Ok(mut locked) = self.watchers.lock() {
+            for topition in &self.topitions {
+                if let Entry::Occupied(mut occupied) = locked.entry(topition.clone()) {
+                    *occupied.get_mut() = occupied.get().saturating_sub(1);
+                    if *occupied.get() == 0 {
+                        _ = occupied.remove();
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Process-wide counter making each [`DynoStore`]'s `writer_id` unique (#59), so
@@ -1054,6 +1160,19 @@ impl OptiCon<Watermark> {
     }
 }
 
+/// A footer-described byte range (`byte_start`/`byte_len`, `u64` on the
+/// wire), checked against `available` (the object's actual size) and
+/// `usize`/overflow — used to slice a sub-stream out of a segment object,
+/// cached or freshly read. `None` on truncation, overflow, or a range past
+/// `available` (a torn or stale read); the caller decides how to recover.
+fn checked_byte_range(byte_start: u64, byte_len: u64, available: usize) -> Option<(usize, usize)> {
+    usize::try_from(byte_start)
+        .ok()
+        .zip(usize::try_from(byte_len).ok())
+        .and_then(|(start, len)| start.checked_add(len).map(|end| (start, end)))
+        .filter(|(_, end)| *end <= available)
+}
+
 fn json_content_type() -> Attributes {
     let mut attributes = Attributes::new();
     _ = attributes.insert(
@@ -1073,6 +1192,7 @@ impl DynoStore {
             next_offsets: Arc::new(Mutex::new(BTreeMap::new())),
             producers: Arc::new(Mutex::new(BTreeMap::new())),
             producer_checkpoints: Arc::new(Mutex::new(BTreeMap::new())),
+            durable_idempotent: Arc::new(Mutex::new(BTreeMap::new())),
             oldest_retained: Arc::new(Mutex::new(BTreeMap::new())),
             retention_empty_skip: Arc::new(Mutex::new(BTreeMap::new())),
             oldest_retained_prefix: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1089,6 +1209,10 @@ impl DynoStore {
             era_epochs: Arc::new(Mutex::new(BTreeMap::new())),
             legacy_records_present: Arc::new(Mutex::new(BTreeMap::new())),
             compacted_topics: Arc::new(Mutex::new(BTreeMap::new())),
+            recent_writes: Arc::new(Mutex::new(RecentWriteCache::new(0))),
+            produce_notifies: Arc::new(Mutex::new(BTreeMap::new())),
+            parked_watchers: Arc::new(Mutex::new(BTreeMap::new())),
+            fetch_flush_floor: Self::FETCH_FLUSH_FLOOR,
             writer_id: format!(
                 "{node}-{}",
                 WRITER_INSTANCE.fetch_add(1, atomic::Ordering::Relaxed)
@@ -1192,6 +1316,11 @@ impl DynoStore {
             prefix_compact_keep_hot: tuning
                 .prefix_compact_keep_hot
                 .unwrap_or(self.prefix_compact_keep_hot),
+            recent_writes: tuning
+                .recent_cache_bytes
+                .map(|budget| Arc::new(Mutex::new(RecentWriteCache::new(budget))))
+                .unwrap_or_else(|| self.recent_writes.clone()),
+            fetch_flush_floor: tuning.fetch_flush_floor.unwrap_or(self.fetch_flush_floor),
             ..self
         }
     }
@@ -1351,6 +1480,13 @@ impl DynoStore {
     /// bounds how far back [`Self::fetch`] must probe to find the object
     /// containing a mid-frame offset.
     const COALESCE_LINGER: Duration = Duration::from_millis(50);
+
+    /// Default fetch-triggered flush cadence ([`Self::fetch_flush_floor`]) —
+    /// equal to the default linger, so with both at defaults the trigger only
+    /// ever shaves the enqueue-to-flush tail, and the observable flush rate is
+    /// unchanged. Overridable via `fetch_flush_floor` on the storage URL.
+    const FETCH_FLUSH_FLOOR: Duration = Self::COALESCE_LINGER;
+
     const COALESCE_BATCHES: usize = 64;
     const COALESCE_BYTES: usize = 1 << 20;
     const COALESCE_MAX_RECORDS: i64 = 100_000;
@@ -1762,12 +1898,99 @@ impl DynoStore {
             })
             .await?;
 
-        // The advance succeeded; persist it only when the debounce window is due.
-        if self.producer_checkpoint_due(producer_id)? {
-            producer
-                .checkpoint(&self.object_store, ProducerDetail::reconcile)
+        // The advance is in-memory only; [`Self::note_idempotent_durable`]
+        // writes the durable checkpoint once the batch's object PUT
+        // succeeds. A coalesce-routed batch can park for up to a linger in
+        // between, so persisting the live advance here would risk a crash
+        // turning that window into silent loss (a retry misclassified as a
+        // duplicate).
+        Ok(())
+    }
+
+    /// Unwind the in-memory idempotent advance of a batch whose write
+    /// failed, so the producer's retry classifies as in-order rather than a
+    /// false `DuplicateSequenceNumber` (which Kafka clients treat as
+    /// delivered — silent loss). Conditional on the live sequence still
+    /// matching this batch's advance, so another writer's progress is never
+    /// undone. No durable-side unwind is needed:
+    /// [`Self::note_idempotent_durable`] never ran for a failed batch.
+    async fn rollback_idempotent_sequence(
+        &self,
+        topition: &Topition,
+        batch: &deflated::Batch,
+    ) -> Result<()> {
+        if !batch.is_idempotent() {
+            return Ok(());
+        }
+
+        self.producer(batch.producer_id)?
+            .mutate_cached(&self.object_store, |pd| {
+                if let Some(topics) = pd.sequences.get_mut(&batch.producer_epoch)
+                    && let Some(partitions) = topics.get_mut(topition.topic.as_str())
+                    && let Some(sequence) = partitions.get_mut(&topition.partition)
+                    && *sequence == batch.base_sequence + batch.last_offset_delta + 1
+                {
+                    *sequence = batch.base_sequence;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// [`Self::rollback_idempotent_sequence`] over a failed run, in reverse
+    /// arrival order so chained advances from one producer unwind cleanly
+    /// (the newest advance is the live sequence; unwinding it exposes the
+    /// previous one as the next conditional match).
+    async fn rollback_idempotent_run(&self, pendings: &[(&Topition, &deflated::Batch)]) {
+        for (topition, batch) in pendings.iter().rev() {
+            _ = self
+                .rollback_idempotent_sequence(topition, batch)
+                .await
+                .inspect_err(|err| warn!(?err, ?topition));
+        }
+    }
+
+    /// Record that an idempotent batch is durably in the log (its object PUT
+    /// succeeded; its producer is being acked) and flush the producer's lazy
+    /// `producers/{id}.json` checkpoint when the debounce window is due
+    /// (#48). The checkpoint value comes from [`Self::durable_idempotent`],
+    /// folded under the stored object so it never clobbers an epoch reseed
+    /// or another replica's progress. Regression-pinned by
+    /// `idempotent_retry_after_crash_with_parked_batch_is_admitted`.
+    async fn note_idempotent_durable(
+        &self,
+        topition: &Topition,
+        batch: &deflated::Batch,
+    ) -> Result<()> {
+        if !batch.is_idempotent() {
+            return Ok(());
+        }
+
+        let snapshot = self
+            .durable_idempotent
+            .lock()
+            .map(|mut locked| {
+                let detail = locked.entry(batch.producer_id).or_default();
+                let sequence = detail
+                    .sequences
+                    .entry(batch.producer_epoch)
+                    .or_default()
+                    .entry(topition.topic.clone())
+                    .or_default()
+                    .entry(topition.partition)
+                    .or_default();
+                // Mirrors the gate's advance: next = base + delta + 1; max so
+                // out-of-order acks across topitions can never regress it.
+                *sequence = (*sequence).max(batch.base_sequence + batch.last_offset_delta + 1);
+                detail.clone()
+            })
+            .map_err(Into::<Error>::into)?;
+
+        if self.producer_checkpoint_due(batch.producer_id)? {
+            self.producer(batch.producer_id)?
+                .checkpoint_value(&self.object_store, &snapshot, ProducerDetail::reconcile)
                 .await?;
-            self.producer_checkpoint_reset(producer_id)?;
+            self.producer_checkpoint_reset(batch.producer_id)?;
         }
 
         Ok(())
@@ -1853,13 +2076,32 @@ impl DynoStore {
     /// replica's writes, so the TTL clock that forces cross-replica reconciliation
     /// keeps running.
     fn set_high(&self, topition: &Topition, high: i64) -> Result<()> {
-        self.next_offsets
+        let advanced = self
+            .next_offsets
             .lock()
             .map(|mut locked| {
                 let entry = locked.entry(topition.to_owned()).or_default();
+                let advanced = high > entry.next;
                 entry.next = entry.next.max(high);
+                advanced
             })
-            .map_err(Into::into)
+            .map_err(Into::<Error>::into)?;
+
+        // Wake fetches parked on this topition (phase 2 wake-on-write): a hint
+        // advance means new records became readable here. Ordering is
+        // load-bearing — the hint advances *before* the notify, and
+        // [`Storage::await_produce`] registers its waiter *before* checking
+        // the hint — so a produce can't slip between a parked fetch's check
+        // and its registration. Only existing notifiers are signalled; a
+        // topition nobody is fetching allocates nothing.
+        if advanced
+            && let Ok(notifiers) = self.produce_notifies.lock()
+            && let Some(notify) = notifiers.get(topition)
+        {
+            notify.notify_waiters();
+        }
+
+        Ok(())
     }
 
     /// Advance the hint after an authoritative tail *listing* and mark it fresh.
@@ -2082,7 +2324,230 @@ impl DynoStore {
     /// ~1/s), which is the #13 collapse. Contiguity holds because the resync
     /// reads the real tail, never a speculative reservation — no gaps, no
     /// overlaps.
+    /// Insert a just-written object's verbatim payload into the recent-write
+    /// cache (`docs/design-recent-write-cache.md`). Called only after the
+    /// create-only PUT succeeded — never before durability — so a cached hit
+    /// is always acked, durable data. Lock poisoning degrades to a no-op: the
+    /// cache is an optimization, never an authority.
+    fn recent_write_insert(&self, location: &Path, payload: PutPayload) {
+        _ = self.recent_writes.lock().map(|mut cache| {
+            cache.insert(location.to_owned(), Bytes::from(payload));
+        });
+    }
+
+    /// The recently written payload for `location`, if resident: the whole
+    /// immutable object, exactly what the GET would return.
+    fn recent_write_get(&self, location: &Path) -> Option<Bytes> {
+        self.recent_writes
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.get(location))
+    }
+
+    /// Drop cached objects under `prefix` — the topic delete + re-create path,
+    /// the one place a create-only `records/` name can be reused.
+    fn recent_write_purge(&self, prefix: &Path) {
+        _ = self
+            .recent_writes
+            .lock()
+            .map(|mut cache| cache.purge_prefix(prefix));
+    }
+
+    /// Whether any fetch long-poll is currently parked on `topition`.
+    fn has_parked_watcher(&self, topition: &Topition) -> bool {
+        self.parked_watchers
+            .lock()
+            .map(|locked| locked.contains_key(topition))
+            .unwrap_or_default()
+    }
+
+    /// Whether any fetch long-poll is currently parked on a topition under
+    /// `prefix` — the prefix-buffer analogue of [`Self::has_parked_watcher`]
+    /// (a shared segment window flushes for whichever sub-stream is awaited).
+    fn prefix_has_parked_watcher(&self, prefix: &str) -> bool {
+        self.parked_watchers
+            .lock()
+            .map(|locked| {
+                locked
+                    .keys()
+                    .any(|topition| self.prefix_of(topition) == prefix)
+            })
+            .unwrap_or_default()
+    }
+
+    /// The shared produce signal for `topition` (phase 2 wake-on-write),
+    /// created on first interest. [`Self::set_high`] notifies it whenever the
+    /// topition's high-watermark hint advances.
+    fn produce_notifier(&self, topition: &Topition) -> Result<Arc<Notify>> {
+        self.produce_notifies
+            .lock()
+            .map(|mut locked| locked.entry(topition.to_owned()).or_default().clone())
+            .map_err(Into::into)
+    }
+
+    /// Schedule an early flush of any pending coalesce buffer covering the
+    /// watched topitions (phase 2 fetch-triggered flush): a parked fetch is a
+    /// consumer waiting at the tail, so the buffer flushes at
+    /// [`Self::fetch_flush_floor`] from its oldest batch instead of the full
+    /// `coalesce_linger`. At most one trigger is armed per buffer and it never
+    /// fires before the floor, so a polling consumer can't push the flush
+    /// rate above one per floor per partition/prefix — while an unconsumed
+    /// prefix keeps the wide linger.
+    fn trigger_pending_flushes(&self, watch: &[(Topition, i64)]) -> Result<()> {
+        if self.prefix_coalesce {
+            // Eligible batches buffer per connector prefix; dedupe topitions
+            // sharing one.
+            let mut prefixes: Vec<String> = watch
+                .iter()
+                .map(|(topition, _)| self.prefix_of(topition))
+                .collect();
+            prefixes.sort_unstable();
+            prefixes.dedup();
+
+            for prefix in prefixes {
+                self.arm_prefix_flush_trigger(&prefix)?;
+            }
+        } else if self.produce_coalesce {
+            for (topition, _) in watch {
+                self.arm_coalesce_flush_trigger(topition)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Arm a fetch-flush trigger for `topition`'s per-partition buffer (#50)
+    /// unless it is empty or already armed. The spawned task mirrors the
+    /// linger timer's take-and-flush: if the linger or a threshold flush wins
+    /// the race, the take comes up empty and the task is a no-op.
+    fn arm_coalesce_flush_trigger(&self, topition: &Topition) -> Result<()> {
+        let delay = self
+            .coalesce
+            .lock()
+            .map(|mut buffers| {
+                buffers.get_mut(topition).and_then(|buffer| {
+                    (!buffer.pending.is_empty() && !buffer.trigger_armed).then(|| {
+                        buffer.trigger_armed = true;
+                        let age = buffer
+                            .since
+                            .map(|since| since.elapsed())
+                            .unwrap_or_default();
+                        self.fetch_flush_floor.saturating_sub(age)
+                    })
+                })
+            })
+            .map_err(Into::<Error>::into)?;
+
+        if let Some(delay) = delay {
+            let store = self.clone();
+            let topition = topition.to_owned();
+
+            _ = tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+
+                let buffer = store
+                    .coalesce
+                    .lock()
+                    .ok()
+                    .and_then(|mut buffers| buffers.remove(&topition));
+
+                if let Some(buffer) = buffer.filter(|buffer| !buffer.pending.is_empty()) {
+                    store.flush_coalesced(&topition, buffer).await;
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Arm a fetch-flush trigger for a connector prefix's shared buffer (#57);
+    /// the per-partition analogue is [`Self::arm_coalesce_flush_trigger`].
+    fn arm_prefix_flush_trigger(&self, prefix: &str) -> Result<()> {
+        let delay = self
+            .prefix_coalesce_buffers
+            .lock()
+            .map(|mut buffers| {
+                buffers.get_mut(prefix).and_then(|buffer| {
+                    (!buffer.pending.is_empty() && !buffer.trigger_armed).then(|| {
+                        buffer.trigger_armed = true;
+                        let age = buffer
+                            .since
+                            .map(|since| since.elapsed())
+                            .unwrap_or_default();
+                        self.fetch_flush_floor.saturating_sub(age)
+                    })
+                })
+            })
+            .map_err(Into::<Error>::into)?;
+
+        if let Some(delay) = delay {
+            let store = self.clone();
+            let prefix = prefix.to_owned();
+
+            _ = tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+
+                let buffer = store
+                    .prefix_coalesce_buffers
+                    .lock()
+                    .ok()
+                    .and_then(|mut buffers| buffers.remove(&prefix));
+
+                if let Some(buffer) = buffer.filter(|buffer| !buffer.pending.is_empty()) {
+                    store.flush_prefix_coalesced(&prefix, buffer).await;
+                }
+            });
+        }
+
+        Ok(())
+    }
+
+    /// [`Self::assign_and_create_raw`] plus the idempotent durability
+    /// bookkeeping shared by both its callers (a lone direct produce, one
+    /// coalesced-flush run): on success, advance each batch's
+    /// durable-through watermark ([`Self::note_idempotent_durable`]); on
+    /// failure, unwind each batch's advance ([`Self::rollback_idempotent_run`])
+    /// so the producer's retry is admitted, not misclassified as a
+    /// duplicate. `batches` share `topition` and, together, `payload`.
     async fn assign_and_create(
+        &self,
+        topition: &Topition,
+        batches: &[deflated::Batch],
+        payload: PutPayload,
+    ) -> Result<i64> {
+        let record_count: i64 = batches
+            .iter()
+            .map(|batch| batch.last_offset_delta as i64 + 1)
+            .sum();
+
+        match self
+            .assign_and_create_raw(topition, record_count, payload)
+            .await
+        {
+            Ok(candidate) => {
+                // Independent producer files (no data dependency between
+                // them): run concurrently rather than serializing every
+                // ack in this flush behind whichever batches' debounce
+                // windows happen to be due.
+                _ = join_all(batches.iter().map(|batch| async move {
+                    self.note_idempotent_durable(topition, batch)
+                        .await
+                        .inspect_err(|err| warn!(?err, ?topition))
+                }))
+                .await;
+                Ok(candidate)
+            }
+
+            Err(error) => {
+                let run: Vec<(&Topition, &deflated::Batch)> =
+                    batches.iter().map(|batch| (topition, batch)).collect();
+                self.rollback_idempotent_run(&run).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn assign_and_create_raw(
         &self,
         topition: &Topition,
         record_count: i64,
@@ -2119,10 +2584,12 @@ impl DynoStore {
         };
 
         for attempt in 0..MAX_ATTEMPTS {
+            let location = self.batch_location(topition, candidate);
+
             match self
                 .object_store
                 .put_opts(
-                    &self.batch_location(topition, candidate),
+                    &location,
                     payload.clone(),
                     PutOptions {
                         mode: PutMode::Create,
@@ -2140,6 +2607,7 @@ impl DynoStore {
                     // this process does not serve a stale "no legacy" from the
                     // long negative window (#110).
                     self.note_legacy_records_present(topition)?;
+                    self.recent_write_insert(&location, payload);
                     return Ok(candidate);
                 }
 
@@ -2189,6 +2657,9 @@ impl DynoStore {
             let buffer = buffers.entry(topition.to_owned()).or_default();
 
             let first = buffer.pending.is_empty();
+            if first {
+                buffer.since = Some(Instant::now());
+            }
             buffer.pending.push(Pending {
                 batch: deflated,
                 ack,
@@ -2212,6 +2683,13 @@ impl DynoStore {
             Action::Flush(buffer) => self.flush_coalesced(topition, buffer).await,
 
             Action::StartTimer => {
+                // A fetch is already parked on this topition: the window just
+                // opened under demand, so arm the floor trigger now — the
+                // parked waiter armed nothing (the buffer was empty then).
+                if self.has_parked_watcher(topition) {
+                    self.arm_coalesce_flush_trigger(topition)?;
+                }
+
                 let store = self.clone();
                 let topition = topition.to_owned();
                 let linger = self.jittered_linger();
@@ -2243,7 +2721,9 @@ impl DynoStore {
     /// each parked produce with its assigned base offset (#50). One
     /// `assign_and_create` covers the whole run, so offset assignment stays the
     /// create-only, single-writer authority it is for a lone batch; on failure
-    /// every parked producer gets the error and retries.
+    /// every parked producer gets the error and retries. Durability bookkeeping
+    /// (durable-note on success, rollback on failure) lives inside
+    /// `assign_and_create` itself.
     async fn flush_coalesced(&self, topition: &Topition, buffer: CoalesceBuffer) {
         if buffer.pending.is_empty() {
             return;
@@ -2254,14 +2734,10 @@ impl DynoStore {
             .iter()
             .map(|pending| pending.batch.clone())
             .collect();
-        let total: i64 = batches
-            .iter()
-            .map(|batch| batch.last_offset_delta as i64 + 1)
-            .sum();
 
         let base = match async {
             let payload = self.encode_frame(&batches)?;
-            self.assign_and_create(topition, total, payload).await
+            self.assign_and_create(topition, &batches, payload).await
         }
         .await
         {
@@ -2702,10 +3178,12 @@ impl DynoStore {
         };
 
         for attempt in 0..MAX_ATTEMPTS {
+            let location = self.segment_location(prefix, candidate);
+
             match self
                 .object_store
                 .put_opts(
-                    &self.segment_location(prefix, candidate),
+                    &location,
                     payload.clone(),
                     PutOptions {
                         mode: PutMode::Create,
@@ -2718,6 +3196,14 @@ impl DynoStore {
                 Ok(outcome) => {
                     debug!(?outcome, candidate, prefix);
                     self.set_seq(prefix, candidate + 1)?;
+                    // Only the produce writer (fence_on_conflict) feeds the
+                    // recent-write cache: its segment is the tail a consumer is
+                    // about to fetch. Compaction rewrites cold data — caching a
+                    // merged segment would evict the hot tail for bytes nobody
+                    // is tailing.
+                    if fence_on_conflict {
+                        self.recent_write_insert(&location, payload);
+                    }
                     return Ok(candidate);
                 }
 
@@ -3171,44 +3657,59 @@ impl DynoStore {
                     break;
                 }
 
-                // One ranged GET of exactly this sub-stream's byte span.
+                // One ranged GET of exactly this sub-stream's byte span —
+                // unless this process wrote the segment moments ago, in which
+                // case the recent-write cache serves it: the footer's byte
+                // range slices the cached object exactly as the ranged GET
+                // would (a range that does not fit the cached bytes falls
+                // through to the store rather than serving a torn region).
                 let location = self.segment_location(&prefix, seq);
-                let region = match self
-                    .object_store
-                    .get_opts(
-                        &location,
-                        GetOptions {
-                            range: Some(GetRange::Bounded(
-                                entry.byte_start..entry.byte_start + entry.byte_len,
-                            )),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                {
-                    Ok(result) => result
-                        .bytes()
+
+                let cached_region = self.recent_write_get(&location).and_then(|data| {
+                    checked_byte_range(entry.byte_start, entry.byte_len, data.len())
+                        .map(|(start, end)| data.slice(start..end))
+                });
+
+                let region = match cached_region {
+                    Some(encoded) => self.decode_frame(encoded)?,
+
+                    None => match self
+                        .object_store
+                        .get_opts(
+                            &location,
+                            GetOptions {
+                                range: Some(GetRange::Bounded(
+                                    entry.byte_start..entry.byte_start + entry.byte_len,
+                                )),
+                                ..Default::default()
+                            },
+                        )
                         .await
-                        .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
-                        .and_then(|encoded| self.decode_frame(encoded))?,
+                    {
+                        Ok(result) => result
+                            .bytes()
+                            .await
+                            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
+                            .and_then(|encoded| self.decode_frame(encoded))?,
 
-                    // Deleted between locate and read (compaction #66 / retention
-                    // #61): drop anything gathered so far, evict the stale seq
-                    // (prune-on-404 — the add-only refresh never would), force a
-                    // re-list to pick up the merged/surviving segments, and
-                    // restart clean. The merged segment covers the same offsets
-                    // and wins the overlap (higher seq), so no gap/duplicate.
-                    Err(object_store::Error::NotFound { .. }) => {
-                        self.index_prune(&prefix, &[seq])?;
-                        self.index_invalidate(&prefix)?;
-                        restart = true;
-                        break;
-                    }
+                        // Deleted between locate and read (compaction #66 / retention
+                        // #61): drop anything gathered so far, evict the stale seq
+                        // (prune-on-404 — the add-only refresh never would), force a
+                        // re-list to pick up the merged/surviving segments, and
+                        // restart clean. The merged segment covers the same offsets
+                        // and wins the overlap (higher seq), so no gap/duplicate.
+                        Err(object_store::Error::NotFound { .. }) => {
+                            self.index_prune(&prefix, &[seq])?;
+                            self.index_invalidate(&prefix)?;
+                            restart = true;
+                            break;
+                        }
 
-                    Err(error) => {
-                        error!(?error, location = %location);
-                        return Err(Error::Api(ErrorCode::UnknownServerError));
-                    }
+                        Err(error) => {
+                            error!(?error, location = %location);
+                            return Err(Error::Api(ErrorCode::UnknownServerError));
+                        }
+                    },
                 };
 
                 let mut running = entry.base_offset;
@@ -3444,17 +3945,23 @@ impl DynoStore {
 
             let size = meta.size;
 
-            let frame = self
-                .object_store
-                .get(&meta.location)
-                .await
-                .inspect_err(|error| error!(?error, ?topition, ?offset, ?max_bytes))
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
-                .bytes()
-                .await
-                .inspect_err(|error| error!(?error, location = %meta.location))
-                .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
-                .and_then(|encoded| self.decode_frame(encoded))?;
+            // Recently written on this process: serve the bytes from the
+            // recent-write cache instead of the GET (the listing above stays —
+            // it is the offset index on this path). A miss is always safe.
+            let frame = match self.recent_write_get(&meta.location) {
+                Some(encoded) => self.decode_frame(encoded)?,
+                None => self
+                    .object_store
+                    .get(&meta.location)
+                    .await
+                    .inspect_err(|error| error!(?error, ?topition, ?offset, ?max_bytes))
+                    .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+                    .bytes()
+                    .await
+                    .inspect_err(|error| error!(?error, location = %meta.location))
+                    .map_err(|_| Error::Api(ErrorCode::UnknownServerError))
+                    .and_then(|encoded| self.decode_frame(encoded))?,
+            };
 
             let mut running = base_offset;
             for mut batch in frame {
@@ -3772,6 +4279,9 @@ impl DynoStore {
             let buffer = buffers.entry(prefix.clone()).or_default();
 
             let first = buffer.pending.is_empty();
+            if first {
+                buffer.since = Some(Instant::now());
+            }
             buffer.pending.push(PrefixPending {
                 topition: topition.to_owned(),
                 batch: deflated,
@@ -3798,6 +4308,14 @@ impl DynoStore {
             Action::Flush(buffer) => self.flush_prefix_coalesced(&prefix, buffer).await,
 
             Action::StartTimer => {
+                // A fetch is already parked on a sub-stream of this prefix:
+                // the window just opened under demand, so arm the floor
+                // trigger now — the parked waiter armed nothing (the buffer
+                // was empty then).
+                if self.prefix_has_parked_watcher(&prefix) {
+                    self.arm_prefix_flush_trigger(&prefix)?;
+                }
+
                 let store = self.clone();
                 let prefix = prefix.clone();
                 let linger = self.jittered_linger();
@@ -3850,7 +4368,7 @@ impl DynoStore {
         // concurrently.
         let flush_lock = match self.prefix_flush_lock(prefix) {
             Ok(lock) => lock,
-            Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+            Err(error) => return self.fail_prefix_flush(buffer, error, prefix).await,
         };
         let _flush_guard = flush_lock.lock().await;
 
@@ -3861,7 +4379,7 @@ impl DynoStore {
         // new writer recovers the tail before it writes (the handoff order).
         let epoch = match self.acquire_or_renew_lease(prefix).await {
             Ok(epoch) => epoch,
-            Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+            Err(error) => return self.fail_prefix_flush(buffer, error, prefix).await,
         };
 
         // Group pending batches by topition (arrival order preserved within a
@@ -3904,10 +4422,10 @@ impl DynoStore {
                                 .inspect_err(|err| debug!(?err));
                             high
                         }
-                        Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+                        Err(error) => return self.fail_prefix_flush(buffer, error, prefix).await,
                     }
                 }
-                Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+                Err(error) => return self.fail_prefix_flush(buffer, error, prefix).await,
             };
 
             let mut running = base;
@@ -3933,7 +4451,7 @@ impl DynoStore {
         .await
         {
             Ok(result) => result,
-            Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+            Err(error) => return self.fail_prefix_flush(buffer, error, prefix).await,
         };
 
         self.finalize_prefix_flush(
@@ -3984,6 +4502,17 @@ impl DynoStore {
                 .inspect_err(|err| debug!(?err));
         }
 
+        // The segment is durable: advance each idempotent batch's
+        // durable-through watermark (and flush the lazy checkpoint if due)
+        // before the acks — failure only lags the persisted state. Run
+        // concurrently: independent producer files, no data dependency.
+        _ = join_all(buffer.pending.iter().map(|pending| async {
+            self.note_idempotent_durable(&pending.topition, &pending.batch)
+                .await
+                .inspect_err(|err| warn!(?err, prefix))
+        }))
+        .await;
+
         for (index, pending) in buffer.pending.into_iter().enumerate() {
             let offset = assigned[index];
             _ = pending.ack.send(Ok(offset));
@@ -3991,9 +4520,18 @@ impl DynoStore {
     }
 
     /// Send `error` to every parked producer in a failed prefix flush (#57) so
-    /// each retries; the unflushed batches are never acked.
-    fn fail_prefix_flush(buffer: PrefixCoalesceBuffer, error: Error, prefix: &str) {
+    /// each retries; the unflushed batches are never acked. Idempotent
+    /// advances are unwound first ([`Self::rollback_idempotent_sequence`]) so
+    /// the retries are admitted — a no-op on the leaseless path, whose gate
+    /// never advanced.
+    async fn fail_prefix_flush(&self, buffer: PrefixCoalesceBuffer, error: Error, prefix: &str) {
         error!(?error, prefix, "prefix coalesced flush failed");
+        let run: Vec<(&Topition, &deflated::Batch)> = buffer
+            .pending
+            .iter()
+            .map(|pending| (&pending.topition, &pending.batch))
+            .collect();
+        self.rollback_idempotent_run(&run).await;
         for pending in buffer.pending {
             _ = pending.ack.send(Err(error.clone()));
         }
@@ -4025,7 +4563,7 @@ impl DynoStore {
         // keeps a single pod's buffer order == offset order.
         let flush_lock = match self.prefix_flush_lock(prefix) {
             Ok(lock) => lock,
-            Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+            Err(error) => return self.fail_prefix_flush(buffer, error, prefix).await,
         };
         let _flush_guard = flush_lock.lock().await;
 
@@ -4045,13 +4583,13 @@ impl DynoStore {
             // Fold-before-claim: observe every live segment so the candidate
             // sequence and the derived bases reflect all writers, not a stale view.
             if let Err(error) = self.refresh_prefix_index_forced(prefix).await {
-                return Self::fail_prefix_flush(buffer, error, prefix);
+                return self.fail_prefix_flush(buffer, error, prefix).await;
             }
             // Derive the candidate from the index the forced refresh just folded
             // — no second LIST per attempt (#91).
             let candidate = match self.tail_next_seq_folded(prefix).await {
                 Ok(seq) => seq,
-                Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+                Err(error) => return self.fail_prefix_flush(buffer, error, prefix).await,
             };
 
             // Seed / read the leaseless era epoch stamped into this segment
@@ -4060,7 +4598,7 @@ impl DynoStore {
             // prefix pays the seeding round-trip.
             let era = match self.seed_era_epoch(prefix).await {
                 Ok(era) => era,
-                Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+                Err(error) => return self.fail_prefix_flush(buffer, error, prefix).await,
             };
 
             // Re-derive each sub-stream's base from the folded index, and
@@ -4081,7 +4619,7 @@ impl DynoStore {
             for (topition, indices) in &grouped {
                 let base = match self.leaseless_base(topition).await {
                     Ok(base) => base,
-                    Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+                    Err(error) => return self.fail_prefix_flush(buffer, error, prefix).await,
                 };
 
                 // Working `ProducerTail`s for this sub-stream: seeded from the
@@ -4117,7 +4655,7 @@ impl DynoStore {
                                 ) {
                                     Ok(tail) => tail,
                                     Err(error) => {
-                                        return Self::fail_prefix_flush(buffer, error, prefix);
+                                        return self.fail_prefix_flush(buffer, error, prefix).await;
                                     }
                                 };
                                 vacant.insert(folded)
@@ -4166,14 +4704,16 @@ impl DynoStore {
             // try to create it at `candidate`.
             let (payload, footer) = match self.encode_segment_v2(&substreams, era, nonce) {
                 Ok(encoded) => encoded,
-                Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+                Err(error) => return self.fail_prefix_flush(buffer, error, prefix).await,
             };
+
+            let location = self.segment_location(prefix, candidate);
 
             match self
                 .object_store
                 .put_opts(
-                    &self.segment_location(prefix, candidate),
-                    payload,
+                    &location,
+                    payload.clone(),
                     PutOptions {
                         mode: PutMode::Create,
                         attributes: Attributes::new(),
@@ -4187,6 +4727,7 @@ impl DynoStore {
                     _ = self
                         .set_seq(prefix, candidate + 1)
                         .inspect_err(|err| debug!(?err));
+                    self.recent_write_insert(&location, payload);
                     return self
                         .finalize_prefix_flush_leaseless(
                             prefix, candidate, footer, buffer, outcomes, &advances,
@@ -4210,10 +4751,7 @@ impl DynoStore {
                 // re-derive. A probe error leaves it genuinely unknown → fail for
                 // a client retry (log-based dedup, #88, dedups the replay).
                 Err(error) => {
-                    match self
-                        .read_segment_footer(&self.segment_location(prefix, candidate))
-                        .await
-                    {
+                    match self.read_segment_footer(&location).await {
                         Ok(Some(found)) if found.nonce == nonce => {
                             debug!(
                                 prefix,
@@ -4222,6 +4760,10 @@ impl DynoStore {
                             _ = self
                                 .set_seq(prefix, candidate + 1)
                                 .inspect_err(|err| debug!(?err));
+                            // The nonce proves the object at `candidate` holds
+                            // our payload, so caching it is as sound as on the
+                            // clean-create path.
+                            self.recent_write_insert(&location, payload);
                             return self
                                 .finalize_prefix_flush_leaseless(
                                     prefix, candidate, footer, buffer, outcomes, &advances,
@@ -4246,7 +4788,7 @@ impl DynoStore {
                                 ?probe_error,
                                 "ambiguous PUT unresolved"
                             );
-                            return Self::fail_prefix_flush(buffer, error.into(), prefix);
+                            return self.fail_prefix_flush(buffer, error.into(), prefix).await;
                         }
                     }
                 }
@@ -4254,7 +4796,8 @@ impl DynoStore {
         }
 
         error!(prefix, "leaseless flush exhausted retries");
-        Self::fail_prefix_flush(buffer, Error::Api(ErrorCode::UnknownServerError), prefix)
+        self.fail_prefix_flush(buffer, Error::Api(ErrorCode::UnknownServerError), prefix)
+            .await
     }
 
     /// The next offset for `topition` under the leaseless path (#86), derived from
@@ -4991,11 +5534,11 @@ impl DynoStore {
                 let Some(object) = objects.get(seq) else {
                     continue;
                 };
-                let start = entry.byte_start as usize;
-                let end = start + entry.byte_len as usize;
-                if end > object.len() {
+                let Some((start, end)) =
+                    checked_byte_range(entry.byte_start, entry.byte_len, object.len())
+                else {
                     continue;
-                }
+                };
                 batches.extend(self.decode_frame(object.slice(start..end))?);
                 if let Some(footer) = footers.get(seq) {
                     merged_epoch = merged_epoch.max(footer.writer_epoch);
@@ -6257,6 +6800,11 @@ impl Storage for DynoStore {
                 .try_collect::<Vec<Path>>()
                 .await?;
 
+            // A re-created topic restarts `records/` offsets at 0, re-using
+            // the just-deleted names — the one create-only name reuse, so the
+            // recent-write cache must not serve the old bytes against them.
+            self.recent_write_purge(&prefix);
+
             let prefix = Path::from(format!("clusters/{}/groups/consumers/", self.cluster));
 
             let topic_name = metadata.topic.name.clone();
@@ -6320,6 +6868,59 @@ impl Storage for DynoStore {
                 .port(port)
                 .rack(rack),
         ])
+    }
+
+    /// Wake-on-write long-poll (phase 2,
+    /// `docs/design-recent-write-cache.md`): park until any watched topition's
+    /// high-watermark hint advances past the caller's offset, or `max_wait`
+    /// elapses. Also arms the fetch-flush triggers, so a pending coalesce
+    /// buffer flushes at [`Self::fetch_flush_floor`] instead of waiting out a
+    /// wide linger while a consumer is parked at the tail.
+    async fn await_produce(&self, watch: &[(Topition, i64)], max_wait: Duration) -> Result<()> {
+        if watch.is_empty() {
+            tokio::time::sleep(max_wait).await;
+            return Ok(());
+        }
+
+        // Enable the waiters BEFORE the hint check: `set_high` advances the
+        // hint before it notifies, so a produce landing before this line is
+        // caught by the check below, and one landing after it wakes an
+        // enabled waiter — no missed-wakeup window on either side.
+        let notifiers = watch
+            .iter()
+            .map(|(topition, _)| self.produce_notifier(topition))
+            .collect::<Result<Vec<_>>>()?;
+        let mut notified: Vec<_> = notifiers
+            .iter()
+            .map(|notify| Box::pin(notify.notified()))
+            .collect();
+        for waiter in &mut notified {
+            _ = waiter.as_mut().enable();
+        }
+
+        // Stay registered as a parked watcher for the whole wait, so a window
+        // that opens AFTER this park (buffer empty now, batch arriving later)
+        // is armed from the enqueue side — `trigger_pending_flushes` below
+        // only covers buffers that already exist.
+        let _parked = ParkedWatchers::park(&self.parked_watchers, watch);
+
+        self.trigger_pending_flushes(watch)?;
+
+        for (topition, offset) in watch {
+            if self
+                .cached_high(topition)?
+                .is_some_and(|high| high > *offset)
+            {
+                return Ok(());
+            }
+        }
+
+        tokio::select! {
+            _ = futures::future::select_all(notified) => {}
+            _ = tokio::time::sleep(max_wait) => {}
+        }
+
+        Ok(())
     }
 
     async fn produce(
@@ -6435,8 +7036,10 @@ impl Storage for DynoStore {
                 .encode(deflated.clone())
                 .inspect_err(|err| debug!(?err))?;
 
+            // Durability bookkeeping (durable-note on success, rollback on
+            // failure) lives inside `assign_and_create` itself.
             let offset = self
-                .assign_and_create(topition, deflated.last_offset_delta as i64 + 1, payload)
+                .assign_and_create(topition, std::slice::from_ref(&deflated), payload)
                 .await
                 .inspect(|offset| debug!(offset, transaction_id, ?topition))
                 .inspect_err(|err| error!(?err, transaction_id, ?topition))?;

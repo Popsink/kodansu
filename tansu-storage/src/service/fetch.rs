@@ -25,7 +25,7 @@ use tansu_sans_io::{
     metadata_response::MetadataResponseTopic,
     record::deflated::{Batch, Frame},
 };
-use tokio::time::{Duration, Instant, sleep};
+use tokio::time::{Duration, Instant};
 use tracing::{debug, error, instrument};
 
 use crate::{Error, Result, Storage, Topition};
@@ -137,7 +137,7 @@ impl FetchService {
         isolation: IsolationLevel,
         topic: &str,
         fetch_partition: &FetchPartition,
-    ) -> Result<PartitionData>
+    ) -> Result<(PartitionData, i64)>
     where
         G: Storage,
     {
@@ -203,39 +203,55 @@ impl FetchService {
             .await
             .inspect_err(|error| error!(?error, ?tp))?;
 
-        Ok(PartitionData::default()
-            .partition_index(partition_index)
-            .error_code(ErrorCode::None.into())
-            .high_watermark(offset_stage.high_watermark())
-            .last_stable_offset(Some(offset_stage.last_stable()))
-            .log_start_offset(Some(offset_stage.log_start()))
-            .diverging_epoch(None)
-            .current_leader(None)
-            .snapshot_id(None)
-            // Aborted transactions overlapping the log, so a read-committed
-            // consumer filters out aborted records below the LSO (#81). Only
-            // read-committed fetches receive the list (Kafka's contract); empty
-            // for read-uncommitted and for non-transactional workloads.
-            .aborted_transactions(Some(if isolation == IsolationLevel::ReadCommitted {
-                offset_stage
-                    .aborted()
-                    .iter()
-                    .map(|(producer_id, first_offset)| {
-                        AbortedTransaction::default()
-                            .producer_id(*producer_id)
-                            .first_offset(*first_offset)
-                    })
-                    .collect()
-            } else {
-                Vec::new()
-            }))
-            .preferred_read_replica(Some(-1))
-            .records(if batches.is_empty() {
-                None
-            } else {
-                Some(Frame { batches })
-            }))
-        .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed()))
+        // What the long-poll should watch this partition from: past this
+        // offset means "new records for this fetch". Read-uncommitted watches
+        // the offset the loop drained to. Read-committed drains only to the
+        // last-stable offset, which lags the high watermark under an open
+        // transaction — watching the drained offset there would
+        // wake-and-refetch in a hot loop — so it watches the response high
+        // watermark instead.
+        let watch_from = if isolation == IsolationLevel::ReadUncommitted {
+            offset
+        } else {
+            offset_stage.high_watermark()
+        };
+
+        Ok((
+            PartitionData::default()
+                .partition_index(partition_index)
+                .error_code(ErrorCode::None.into())
+                .high_watermark(offset_stage.high_watermark())
+                .last_stable_offset(Some(offset_stage.last_stable()))
+                .log_start_offset(Some(offset_stage.log_start()))
+                .diverging_epoch(None)
+                .current_leader(None)
+                .snapshot_id(None)
+                // Aborted transactions overlapping the log, so a read-committed
+                // consumer filters out aborted records below the LSO (#81). Only
+                // read-committed fetches receive the list (Kafka's contract); empty
+                // for read-uncommitted and for non-transactional workloads.
+                .aborted_transactions(Some(if isolation == IsolationLevel::ReadCommitted {
+                    offset_stage
+                        .aborted()
+                        .iter()
+                        .map(|(producer_id, first_offset)| {
+                            AbortedTransaction::default()
+                                .producer_id(*producer_id)
+                                .first_offset(*first_offset)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }))
+                .preferred_read_replica(Some(-1))
+                .records(if batches.is_empty() {
+                    None
+                } else {
+                    Some(Frame { batches })
+                }),
+            watch_from,
+        ))
+        .inspect(|(r, watch_from)| debug!(?r, watch_from, elapsed = ?started_at.elapsed()))
     }
 
     fn unknown_topic_response(&self, fetch: &FetchTopic) -> Result<FetchableTopicResponse> {
@@ -311,6 +327,7 @@ impl FetchService {
 
         let started_at = SystemTime::now();
         let mut responses = vec![];
+        let mut watch: Vec<(Topition, i64)> = vec![];
         let mut iteration = 0;
         let mut bytes = 0;
 
@@ -318,6 +335,7 @@ impl FetchService {
             debug!(?bytes, remaining = ?max_wait.saturating_sub(started_at.elapsed()?));
 
             responses.clear();
+            watch.clear();
 
             let fetch_started_at = SystemTime::now();
             for topic in resolved.iter() {
@@ -327,7 +345,7 @@ impl FetchService {
                     for fetch_partition in topic.fetch.partitions.as_ref().unwrap_or(&Vec::new()) {
                         let remaining = max_wait.saturating_sub(started_at.elapsed()?);
 
-                        let partition = self
+                        let (partition, watch_from) = self
                             .fetch_partition(
                                 ctx,
                                 remaining,
@@ -339,6 +357,10 @@ impl FetchService {
                             )
                             .await?;
 
+                        watch.push((
+                            Topition::new(name.as_str(), fetch_partition.partition),
+                            watch_from,
+                        ));
                         partitions.push(partition);
                     }
 
@@ -375,7 +397,13 @@ impl FetchService {
                 }
             }
 
-            sleep(remaining / 2).await;
+            // Park until new records may be readable on a watched partition
+            // (wake-on-write) rather than polling on a blind half-wait sleep;
+            // a storage engine without a produce signal falls back to exactly
+            // that sleep via the trait default. Waking also arms the
+            // fetch-triggered flush, so a pending coalesce buffer flushes at
+            // the fetch-flush floor instead of waiting out a wide linger.
+            ctx.state().await_produce(&watch, remaining).await?;
 
             iteration += 1;
         }

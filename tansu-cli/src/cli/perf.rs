@@ -14,7 +14,7 @@
 
 use clap::{Args, Subcommand};
 use human_units::iec::iec_unit;
-use tansu_perf::Perf;
+use tansu_perf::{ConsumePerf, Perf};
 use tansu_sans_io::ErrorCode;
 use url::Url;
 
@@ -53,7 +53,35 @@ pub(super) enum Command {
         duration: Option<human_units::Duration>,
     },
 
-    Consume,
+    /// Consume messages by long-polling a single partition
+    Consume {
+        /// The partition to consume from
+        #[arg(long, default_value = "0")]
+        partition: i32,
+
+        /// The offset to start consuming from
+        #[arg(long, default_value = "0")]
+        offset: i64,
+
+        /// The maximum time in milliseconds the broker holds a fetch open
+        /// waiting for new data (mirrors a real client's poll long-poll)
+        #[arg(long, default_value = "500")]
+        max_wait_ms: i32,
+
+        /// The maximum bytes fetched per request
+        #[arg(long, default_value = "1m", value_parser=clap::value_parser!(human_units::Size))]
+        max_bytes: human_units::Size,
+
+        /// The number of independent consumers tailing the same partition
+        /// from the same offset (fan-out: N consumer groups reading one hot
+        /// partition)
+        #[arg(long, default_value = "1")]
+        consumers: u32,
+
+        /// Stop consuming after this time
+        #[arg(long, default_value = "1m", value_parser=clap::value_parser!(human_units::Duration))]
+        duration: Option<human_units::Duration>,
+    },
 }
 
 #[iec_unit(symbol = "B/s")]
@@ -100,7 +128,23 @@ impl Arg {
                 .await
                 .map_err(Into::into),
 
-            Command::Consume => todo!(),
+            Command::Consume {
+                partition,
+                offset,
+                max_wait_ms,
+                max_bytes,
+                consumers,
+                duration,
+            } => ConsumePerf::new(self.broker.into_inner(), self.topic)
+                .partition(partition)
+                .offset(offset)
+                .max_wait_ms(max_wait_ms)
+                .max_bytes(max_bytes.0 as i32)
+                .consumers(consumers)
+                .duration(duration.map(|duration| duration.0))
+                .main()
+                .await
+                .map_err(Into::into),
         }
     }
 }

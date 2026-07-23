@@ -49,7 +49,10 @@ use opentelemetry_sdk::{
 use opentelemetry_semantic_conventions::SCHEMA_URL;
 use tansu_client::{Client, ConnectionManager};
 use tansu_sans_io::{
-    ByteSize as _, ErrorCode, ProduceRequest,
+    ByteSize as _, ErrorCode, FetchRequest, IsolationLevel, MetadataRequest, NULL_TOPIC_ID,
+    ProduceRequest,
+    fetch_request::{FetchPartition, FetchTopic},
+    metadata_request::MetadataRequestTopic,
     produce_request::{PartitionProduceData, TopicProduceData},
     record::{Record, deflated, inflated},
 };
@@ -264,22 +267,7 @@ impl Perf {
 
     pub async fn main(self) -> Result<ErrorCode> {
         let token = CancellationToken::new();
-
-        let meter_provider = {
-            let exporter = MetricExporter::new(token.clone());
-            let meter_provider = SdkMeterProvider::builder()
-                .with_periodic_exporter(exporter)
-                .build();
-            global::set_meter_provider(meter_provider.clone());
-
-            meter_provider
-        };
-
-        let mut interrupt_signal = signal(SignalKind::interrupt()).unwrap();
-        debug!(?interrupt_signal);
-
-        let mut terminate_signal = signal(SignalKind::terminate()).unwrap();
-        debug!(?terminate_signal);
+        let meter_provider = install_meter_provider(token.clone());
 
         let rate_limiter = self
             .per_second
@@ -333,63 +321,344 @@ impl Perf {
             });
         }
 
-        let join_all = async {
-            while !set.is_empty() {
-                debug!(len = set.len());
-                _ = set.join_next().await;
-            }
-        };
+        run_to_completion(token, set, self.duration, meter_provider).await
+    }
+}
 
-        let duration = self
-            .duration
-            .map(sleep)
-            .map(Box::pin)
-            .map(|pinned| pinned as Pin<Box<dyn Future<Output = ()>>>)
-            .unwrap_or(Box::pin(std::future::pending()) as Pin<Box<dyn Future<Output = ()>>>);
+/// Drive a fleet of already-spawned producer/consumer tasks to completion:
+/// race the run duration (if any) against the task set finishing on its own
+/// or an interrupt/terminate signal, then flush metrics and abort stragglers.
+/// Shared by [`Perf::main`] and [`ConsumePerf::main`] so the process lifecycle
+/// (signals, timeout grace period, final metrics flush) is identical for
+/// produce and consume runs.
+async fn run_to_completion(
+    token: CancellationToken,
+    mut set: JoinSet<()>,
+    duration: Option<Duration>,
+    meter_provider: SdkMeterProvider,
+) -> Result<ErrorCode> {
+    let mut interrupt_signal = signal(SignalKind::interrupt()).unwrap();
+    debug!(?interrupt_signal);
 
-        let cancellation = tokio::select! {
+    let mut terminate_signal = signal(SignalKind::terminate()).unwrap();
+    debug!(?terminate_signal);
 
-            timeout = duration => {
-                debug!(?timeout);
-                token.cancel();
-                Some(CancelKind::Timeout)
-            }
-
-            completed = join_all => {
-                debug!(?completed);
-                None
-            }
-
-            interrupt = interrupt_signal.recv() => {
-                debug!(?interrupt);
-                Some(CancelKind::Interrupt)
-            }
-
-            terminate = terminate_signal.recv() => {
-                debug!(?terminate);
-                Some(CancelKind::Terminate)
-            }
-
-        };
-
-        debug!(?cancellation);
-
-        meter_provider
-            .shutdown()
-            .inspect(|shutdown| debug!(?shutdown))?;
-
-        if let Some(CancelKind::Timeout) = cancellation {
-            sleep(Duration::from_secs(5)).await;
-        }
-
-        debug!(abort = set.len());
-        set.abort_all();
-
+    let join_all = async {
         while !set.is_empty() {
+            debug!(len = set.len());
             _ = set.join_next().await;
         }
+    };
 
-        Ok(ErrorCode::None)
+    let duration = duration
+        .map(sleep)
+        .map(Box::pin)
+        .map(|pinned| pinned as Pin<Box<dyn Future<Output = ()>>>)
+        .unwrap_or(Box::pin(std::future::pending()) as Pin<Box<dyn Future<Output = ()>>>);
+
+    let cancellation = tokio::select! {
+
+        timeout = duration => {
+            debug!(?timeout);
+            token.cancel();
+            Some(CancelKind::Timeout)
+        }
+
+        completed = join_all => {
+            debug!(?completed);
+            None
+        }
+
+        interrupt = interrupt_signal.recv() => {
+            debug!(?interrupt);
+            Some(CancelKind::Interrupt)
+        }
+
+        terminate = terminate_signal.recv() => {
+            debug!(?terminate);
+            Some(CancelKind::Terminate)
+        }
+
+    };
+
+    debug!(?cancellation);
+
+    meter_provider
+        .shutdown()
+        .inspect(|shutdown| debug!(?shutdown))?;
+
+    if let Some(CancelKind::Timeout) = cancellation {
+        sleep(Duration::from_secs(5)).await;
+    }
+
+    debug!(abort = set.len());
+    set.abort_all();
+
+    while !set.is_empty() {
+        _ = set.join_next().await;
+    }
+
+    Ok(ErrorCode::None)
+}
+
+/// Install the periodic metric exporter used for the live throughput/latency
+/// summary line, tied to `token` so it prints a final line on cancellation.
+fn install_meter_provider(token: CancellationToken) -> SdkMeterProvider {
+    let exporter = MetricExporter::new(token);
+    let meter_provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter)
+        .build();
+    global::set_meter_provider(meter_provider.clone());
+    meter_provider
+}
+
+/// Continuously tail one partition with N independent fetchers, all starting
+/// at the same offset — the fan-out shape the recent-write cache and
+/// wake-on-write long-poll target (N consumer groups tailing one hot
+/// partition). Each fetcher's long-poll `max_wait_ms` mirrors a real client's
+/// poll loop, so an idle tail exercises the broker's wake-on-write path
+/// (and, without it, would sit out the full `max_wait_ms` every empty poll).
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ConsumePerf {
+    broker: Url,
+    topic: String,
+    partition: i32,
+    offset: i64,
+    max_wait_ms: i32,
+    max_bytes: i32,
+    consumers: u32,
+    duration: Option<Duration>,
+}
+
+impl ConsumePerf {
+    /// `broker`/`topic` are mandatory (there's no meaningful default for
+    /// either), so — unlike [`Perf`]'s two-phase [`Builder`] typestate, which
+    /// exists to prevent building without them — they're plain constructor
+    /// arguments: `ConsumePerf` has exactly one call site and it always
+    /// supplies both up front, so the typestate ceremony bought nothing here.
+    pub fn new(broker: impl Into<Url>, topic: impl Into<String>) -> Self {
+        Self {
+            broker: broker.into(),
+            topic: topic.into(),
+            partition: 0,
+            offset: 0,
+            max_wait_ms: 500,
+            max_bytes: 1024 * 1024,
+            consumers: 1,
+            duration: None,
+        }
+    }
+
+    pub fn partition(self, partition: i32) -> Self {
+        Self { partition, ..self }
+    }
+
+    pub fn offset(self, offset: i64) -> Self {
+        Self { offset, ..self }
+    }
+
+    pub fn max_wait_ms(self, max_wait_ms: i32) -> Self {
+        Self {
+            max_wait_ms,
+            ..self
+        }
+    }
+
+    pub fn max_bytes(self, max_bytes: i32) -> Self {
+        Self { max_bytes, ..self }
+    }
+
+    pub fn consumers(self, consumers: u32) -> Self {
+        Self { consumers, ..self }
+    }
+
+    pub fn duration(self, duration: Option<Duration>) -> Self {
+        Self { duration, ..self }
+    }
+}
+
+static CONSUME_RECORD_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("consume_record_count")
+        .with_description("Consumed record count")
+        .build()
+});
+
+static CONSUME_API_DURATION: LazyLock<opentelemetry::metrics::Histogram<u64>> =
+    LazyLock::new(|| {
+        METER
+            .u64_histogram("consume_duration")
+            .with_unit("ms")
+            .with_description("Fetch API latencies in milliseconds")
+            .build()
+    });
+
+impl ConsumePerf {
+    pub async fn main(self) -> Result<ErrorCode> {
+        let token = CancellationToken::new();
+        let meter_provider = install_meter_provider(token.clone());
+
+        let mut set = JoinSet::new();
+
+        let client = ConnectionManager::builder(self.broker)
+            .client_id(Some(env!("CARGO_PKG_NAME").into()))
+            .build()
+            .await
+            .inspect(|pool| debug!(?pool))
+            .map(Client::new)?;
+
+        // At the negotiated (flexible) Fetch version a topic is identified by
+        // its `topic_id` (KIP-516), not by name — `FetchTopic::topic` is only
+        // consulted on old wire versions. Resolve it once via Metadata rather
+        // than re-resolving per fetch call.
+        let topic_id = client
+            .call(
+                MetadataRequest::default()
+                    .allow_auto_topic_creation(Some(true))
+                    .include_cluster_authorized_operations(Some(false))
+                    .include_topic_authorized_operations(Some(false))
+                    .topics(Some(
+                        [MetadataRequestTopic::default()
+                            .name(Some(self.topic.clone()))
+                            .topic_id(Some(NULL_TOPIC_ID))]
+                        .into(),
+                    )),
+            )
+            .await?
+            .topics
+            .unwrap_or_default()
+            .into_iter()
+            .find(|topic| topic.name.as_deref() == Some(self.topic.as_str()))
+            .and_then(|topic| topic.topic_id)
+            .ok_or(Error::Api(ErrorCode::UnknownTopicOrPartition))?;
+
+        for id in 0..self.consumers {
+            let consumer = Consumer {
+                id,
+                topic_id,
+                partition: self.partition,
+                offset: self.offset,
+                max_wait_ms: self.max_wait_ms,
+                max_bytes: self.max_bytes,
+                token: token.clone(),
+                client: client.clone(),
+            };
+
+            _ = set.spawn(async move {
+                _ = consumer.tail().await.inspect_err(|error| debug!(?error));
+            });
+        }
+
+        run_to_completion(token, set, self.duration, meter_provider).await
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Consumer {
+    id: u32,
+    topic_id: [u8; 16],
+    partition: i32,
+    offset: i64,
+    max_wait_ms: i32,
+    max_bytes: i32,
+    token: CancellationToken,
+    client: Client,
+}
+
+impl Consumer {
+    #[instrument(skip_all, fields(offset))]
+    async fn fetch(&self, offset: i64) -> Result<tansu_sans_io::FetchResponse> {
+        let request = FetchRequest::default()
+            .cluster_id(None)
+            .replica_id(None)
+            .replica_state(None)
+            .max_wait_ms(self.max_wait_ms)
+            .min_bytes(1)
+            .max_bytes(Some(self.max_bytes))
+            .isolation_level(Some(i8::from(IsolationLevel::ReadUncommitted)))
+            .session_id(Some(-1))
+            .session_epoch(Some(-1))
+            .topics(Some(
+                [FetchTopic::default()
+                    .topic(None)
+                    .topic_id(Some(self.topic_id))
+                    .partitions(Some(
+                        [FetchPartition::default()
+                            .partition(self.partition)
+                            .current_leader_epoch(Some(0))
+                            .fetch_offset(offset)
+                            .last_fetched_epoch(Some(-1))
+                            .log_start_offset(Some(-1))
+                            .partition_max_bytes(self.max_bytes)
+                            .replica_directory_id(None)]
+                        .into(),
+                    ))]
+                .into(),
+            ))
+            .forgotten_topics_data(Some([].into()))
+            .rack_id(Some(String::new()));
+
+        self.client.call(request).await.map_err(Into::into)
+    }
+
+    /// Long-poll `self.topic`/`self.partition` from `self.offset` onward until
+    /// cancelled: each empty response means the broker held the request open
+    /// for `max_wait_ms` waiting on new data (wake-on-write, if the broker has
+    /// it, or the poll timing out, if it doesn't) — either way the loop just
+    /// re-issues the fetch at the same offset.
+    #[instrument(skip_all, fields(id = self.id))]
+    async fn tail(&self) -> Result<()> {
+        let attributes = [KeyValue::new("consumer", self.id.to_string())];
+        let mut offset = self.offset;
+
+        loop {
+            if self.token.is_cancelled() {
+                return Ok(());
+            }
+
+            let fetch_start = SystemTime::now();
+
+            let response = tokio::select! {
+                _ = self.token.cancelled() => return Ok(()),
+                response = self.fetch(offset) => response?,
+            };
+
+            CONSUME_API_DURATION.record(
+                fetch_start
+                    .elapsed()
+                    .inspect(|duration| debug!(fetch_duration_ms = duration.as_millis()))
+                    .map_or(0, |duration| duration.as_millis() as u64),
+                &attributes,
+            );
+
+            if let Some(code) = response.error_code
+                && code != i16::from(ErrorCode::None)
+            {
+                return Err(ErrorCode::try_from(code)
+                    .map(Error::Api)
+                    .unwrap_or(Error::Api(ErrorCode::UnknownServerError)));
+            }
+
+            for topic_response in response.responses.into_iter().flatten() {
+                for partition in topic_response.partitions.into_iter().flatten() {
+                    if partition.error_code != i16::from(ErrorCode::None) {
+                        return Err(ErrorCode::try_from(partition.error_code)
+                            .map(Error::Api)
+                            .unwrap_or(Error::Api(ErrorCode::UnknownServerError)));
+                    }
+
+                    for batch in partition
+                        .records
+                        .map(|frame| frame.batches)
+                        .into_iter()
+                        .flatten()
+                    {
+                        offset = offset.max(batch.base_offset + batch.last_offset_delta as i64 + 1);
+                        CONSUME_RECORD_COUNT.add(batch.record_count as u64, &attributes);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -590,38 +859,69 @@ impl Info {
                 .unwrap_or_default()
     }
 
+    /// Seconds elapsed since the previous observation, as a float: a metric
+    /// export interval under 1s (a perfectly reasonable
+    /// `OTEL_METRIC_EXPORT_INTERVAL` for a live-tailing perf run) previously
+    /// truncated to whole seconds via `Duration::as_secs()`, which not only
+    /// under/over-stated every rate by however far the tick landed from a
+    /// second boundary, but made `bandwidth()`'s `checked_div` divide by zero
+    /// and panic outright on any sub-second interval.
+    fn elapsed_secs(&self) -> f64 {
+        self.elapsed().as_secs_f64()
+    }
+
     fn records_sent_per_second(&self) -> f64 {
-        self.records_sent() as f64 / self.elapsed().as_secs() as f64
+        let elapsed = self.elapsed_secs();
+        if elapsed > 0.0 {
+            self.records_sent() as f64 / elapsed
+        } else {
+            0.0
+        }
     }
 
     fn bandwidth(&self) -> Byte {
-        self.bytes_sent()
-            .checked_div(self.elapsed().as_secs())
-            .map(|throughput| Byte::with_iec_prefix(throughput, Prefix::None))
-            .expect("throughput")
+        let elapsed = self.elapsed_secs();
+        let throughput = if elapsed > 0.0 {
+            (self.bytes_sent() as f64 / elapsed) as u64
+        } else {
+            0
+        };
+        Byte::with_iec_prefix(throughput, Prefix::None)
     }
 }
 
 impl Display for Info {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // A tick can legitimately have zero completed calls to report a
+        // latency for (a burst of concurrent produces/fetches still in
+        // flight when the periodic export fires, or a quiet idle period) —
+        // that must render as "n/a", not panic the exporter thread and take
+        // the whole run down with it (observed live against a 20ms-RTT
+        // proxy: the very first export tick fired before any of 8
+        // concurrently-launched consumers had completed a fetch).
+        let min = self.current.latency.min.map_or_else(
+            || "n/a".to_string(),
+            |min| min.format_duration().to_string(),
+        );
+
+        let mean = self
+            .current
+            .latency
+            .mean
+            .map_or_else(|| "n/a".to_string(), |mean| format!("{mean:.1}ms"));
+
+        let max = self.current.latency.max.map_or_else(
+            || "n/a".to_string(),
+            |max| max.format_duration().to_string(),
+        );
+
         write!(
             f,
-            "elapsed: {}, {} records sent, {:.1} records/s, ({}/s), latency: {} min, {:.1}ms avg, {} max",
+            "elapsed: {}, {} records sent, {:.1} records/s, ({}/s), latency: {min} min, {mean} avg, {max} max",
             self.elapsed().format_duration(),
             self.records_sent(),
             self.records_sent_per_second(),
             self.bandwidth().format_iec(),
-            self.current
-                .latency
-                .min
-                .map(|min| min.format_duration())
-                .expect("minimum"),
-            self.current.latency.mean.expect("mean"),
-            self.current
-                .latency
-                .max
-                .map(|max| max.format_duration())
-                .expect("max")
         )
     }
 }
@@ -650,7 +950,13 @@ impl From<&Histogram<u64>> for Latency {
         let sum = histogram.data_points().map(|dp| dp.sum()).sum::<u64>() as f64;
         let count = histogram.data_points().map(|dp| dp.count()).sum::<u64>() as f64;
 
-        let mean = Some(sum / count);
+        // A tick with no completed calls yet (a burst of concurrent
+        // fetches/produces still in flight when the first export fires, or
+        // a quiet period between them) leaves the histogram with zero data
+        // points: `min`/`max` above already read as `None` in that case via
+        // `Iterator::min`/`max` on an empty sequence, so `mean` must match
+        // rather than divide 0.0/0.0 into a silent `Some(NaN)`.
+        let mean = (count > 0.0).then(|| sum / count);
 
         Self { min, max, mean }
     }
@@ -684,18 +990,30 @@ impl MetricExporter {
     #[instrument(skip_all, fields(scope = scope.name(), metric = metric.name()))]
     fn info(&self, scope: &InstrumentationScope, metric: &Metric, info: &mut Info) {
         match (scope.name(), metric.name(), metric.data()) {
-            ("tansu-client", "tcp_bytes_sent", AggregatedMetrics::U64(MetricData::Sum(sum))) => {
+            // Wire bytes in either direction: produce mode is dominated by
+            // `tcp_bytes_sent` (record payloads out), consume mode by
+            // `tcp_bytes_received` (record payloads back). Both counters are
+            // always present (every request has a response), so this sums
+            // rather than overwrites — an assignment would have one
+            // direction's small ack/request bytes nondeterministically
+            // clobber the other's dominant value depending on metric
+            // iteration order.
+            (
+                "tansu-client",
+                "tcp_bytes_sent" | "tcp_bytes_received",
+                AggregatedMetrics::U64(MetricData::Sum(sum)),
+            ) => {
                 for (point, data) in sum.data_points().enumerate() {
                     debug!(point, value = ?data.value());
                 }
 
-                info.current.observation.bytes_sent =
+                info.current.observation.bytes_sent +=
                     sum.data_points().map(|sum| sum.value()).sum::<u64>();
             }
 
             (
                 "tansu-perf",
-                "produce_record_count",
+                "produce_record_count" | "consume_record_count",
                 AggregatedMetrics::U64(MetricData::Sum(sum)),
             ) => {
                 for (point, data) in sum.data_points().enumerate() {
@@ -708,7 +1026,7 @@ impl MetricExporter {
 
             (
                 "tansu-perf",
-                "produce_duration",
+                "produce_duration" | "consume_duration",
                 AggregatedMetrics::U64(MetricData::Histogram(histogram)),
             ) => {
                 info.current.latency = Latency::from(histogram);
@@ -856,5 +1174,92 @@ mod tests {
         assert_eq!(elapsed, info.elapsed());
         assert_eq!(16_364, info.bandwidth().0);
         assert_eq!(164f64, info.records_sent_per_second());
+    }
+
+    /// A sub-second gap between observations — an entirely reasonable
+    /// `OTEL_METRIC_EXPORT_INTERVAL` for a live-tailing perf run — used to
+    /// integer-truncate `elapsed().as_secs()` to zero, which not only
+    /// distorted the reported rate but made `bandwidth()`'s `checked_div(0)`
+    /// panic outright (observed live: a 250ms export interval crashed the
+    /// exporter thread and killed the run mid-benchmark).
+    #[test]
+    fn sub_second_elapsed_neither_panics_nor_divides_by_zero() {
+        let now = SystemTime::now();
+        let elapsed = Duration::from_millis(250);
+
+        let mut info = Info::new(now.checked_sub(elapsed).expect("elapsed"));
+
+        info.current = {
+            let observation = Observation {
+                taken_at: now,
+                bytes_sent: 10_000,
+                record_count: 100,
+            };
+
+            ObservationLatency {
+                observation,
+                latency: Default::default(),
+            }
+        };
+
+        assert_eq!(elapsed, info.elapsed());
+        // 10_000 bytes / 0.25s = 40_000 bytes/s, 100 records / 0.25s = 400/s —
+        // both exact, and computing them must not panic.
+        assert_eq!(40_000, info.bandwidth().0);
+        assert_eq!(400f64, info.records_sent_per_second());
+    }
+
+    /// Two observations landing on the identical instant (a spurious
+    /// duplicate tick, or a clock with coarse resolution) must report zero
+    /// rather than dividing by zero.
+    #[test]
+    fn zero_elapsed_reports_zero_not_a_panic() {
+        let now = SystemTime::now();
+        let mut info = Info::new(now);
+
+        info.current = {
+            let observation = Observation {
+                taken_at: now,
+                bytes_sent: 5_000,
+                record_count: 50,
+            };
+
+            ObservationLatency {
+                observation,
+                latency: Default::default(),
+            }
+        };
+
+        assert_eq!(Duration::ZERO, info.elapsed());
+        assert_eq!(0, info.bandwidth().0);
+        assert_eq!(0.0, info.records_sent_per_second());
+    }
+
+    /// A tick with zero completed calls (a burst of concurrent
+    /// produces/fetches still in flight when the periodic export fires, or
+    /// a quiet idle window) leaves `Latency` all-`None` — that must render
+    /// as "n/a", not panic the exporter thread and take the whole run down
+    /// with it (observed live: the first export tick against a 20ms-RTT
+    /// proxy fired before any of 8 concurrently-launched consumers had
+    /// completed a fetch).
+    #[test]
+    fn display_with_no_latency_samples_does_not_panic() {
+        let now = SystemTime::now();
+        let elapsed = Duration::from_millis(500);
+        let mut info = Info::new(now.checked_sub(elapsed).expect("elapsed"));
+
+        info.current = ObservationLatency {
+            observation: Observation {
+                taken_at: now,
+                bytes_sent: 0,
+                record_count: 0,
+            },
+            latency: Latency::default(),
+        };
+
+        let rendered = format!("{info}");
+        assert!(rendered.contains("n/a min"), "{rendered}");
+        assert!(rendered.contains("n/a avg"), "{rendered}");
+        assert!(rendered.contains("n/a max"), "{rendered}");
     }
 }

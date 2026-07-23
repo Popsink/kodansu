@@ -27,9 +27,13 @@ mod latency;
 mod metadata_visibility;
 mod offset_assignment;
 mod prefix_coalesce;
+mod recent_cache;
+mod reliability;
 mod retention;
+mod s3;
 mod scaling;
 mod segment;
+mod tail_wait;
 
 pub(crate) fn init_tracing() -> Result<DefaultGuard, Error> {
     _ = dotenv().ok();

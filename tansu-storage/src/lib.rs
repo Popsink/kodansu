@@ -1323,6 +1323,22 @@ pub trait Storage: Debug + Send + Sync + 'static {
         max_wait: Duration,
     ) -> Result<Vec<deflated::Batch>>;
 
+    /// Park a fetch long-poll until new records may be readable, or `max_wait`
+    /// elapses. `watch` pairs each topition with the offset the caller has
+    /// already read to; an engine with a produce signal returns as soon as any
+    /// watched topition's high watermark passes its offset. Spurious early
+    /// returns are fine — the caller re-fetches and re-parks against its own
+    /// deadline — but an implementation must not park much past `max_wait`.
+    ///
+    /// The default polls: it sleeps half the wait and returns, which is the
+    /// pre-signal long-poll cadence, so engines without a produce signal keep
+    /// their previous behaviour.
+    async fn await_produce(&self, watch: &[(Topition, i64)], max_wait: Duration) -> Result<()> {
+        let _ = watch;
+        tokio::time::sleep(max_wait / 2).await;
+        Ok(())
+    }
+
     /// Query the offset stage for a topic partition.
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage>;
 
@@ -1567,6 +1583,10 @@ where
         self.as_ref()
             .fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
             .await
+    }
+
+    async fn await_produce(&self, watch: &[(Topition, i64)], max_wait: Duration) -> Result<()> {
+        self.as_ref().await_produce(watch, max_wait).await
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
@@ -1838,6 +1858,10 @@ where
         self.as_ref()
             .fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
             .await
+    }
+
+    async fn await_produce(&self, watch: &[(Topition, i64)], max_wait: Duration) -> Result<()> {
+        self.as_ref().await_produce(watch, max_wait).await
     }
 
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
@@ -2302,6 +2326,23 @@ fn coalesce_tuning(storage: &Url) -> CoalesceTuning {
                     .inspect_err(|err| warn!(storage = %storage, key = "prefix_compact_keep_hot", value, ?err))
                     .ok();
             }
+            "recent_cache_bytes" => {
+                tuning.recent_cache_bytes = human_units::Size::from_str(value)
+                    .map(|size| size.0)
+                    .inspect_err(
+                        |err| warn!(storage = %storage, key = "recent_cache_bytes", value, ?err),
+                    )
+                    .ok()
+                    .and_then(|size| usize::try_from(size).ok());
+            }
+            "fetch_flush_floor" => {
+                tuning.fetch_flush_floor = human_units::Duration::from_str(value)
+                    .map(|duration| duration.0)
+                    .inspect_err(
+                        |err| warn!(storage = %storage, key = "fetch_flush_floor", value, ?err),
+                    )
+                    .ok();
+            }
             _ => {}
         }
     }
@@ -2756,6 +2797,18 @@ impl Storage for StorageContainer {
     }
 
     #[instrument(skip_all)]
+    // Forwarded explicitly (despite the trait default) so the engine's
+    // wake-on-write override is reached through the container. No request
+    // metrics: parking is not a storage request.
+    async fn await_produce(&self, watch: &[(Topition, i64)], max_wait: Duration) -> Result<()> {
+        match self {
+            #[cfg(feature = "dynostore")]
+            Self::DynoStore(engine) => engine.await_produce(watch, max_wait).await,
+
+            Self::Null(engine) => engine.await_produce(watch, max_wait).await,
+        }
+    }
+
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
         let attributes = [KeyValue::new("method", "offset_stage")];
 
@@ -3385,6 +3438,27 @@ mod tests {
         // Absent keys stay None (compile-time defaults).
         let empty = coalesce_tuning(&Url::parse("s3://tansu/")?);
         assert_eq!(None, empty.prefix_compact_min_segments);
+        Ok(())
+    }
+
+    #[cfg(feature = "dynostore")]
+    #[test]
+    fn coalesce_tuning_parses_recent_cache_bytes() -> Result<()> {
+        let tuning = coalesce_tuning(&Url::parse("s3://tansu/?recent_cache_bytes=256m")?);
+        assert_eq!(Some(256 * 1024 * 1024), tuning.recent_cache_bytes);
+        // Absent means disabled (the compile-time default of 0).
+        let empty = coalesce_tuning(&Url::parse("s3://tansu/")?);
+        assert_eq!(None, empty.recent_cache_bytes);
+        Ok(())
+    }
+
+    #[cfg(feature = "dynostore")]
+    #[test]
+    fn coalesce_tuning_parses_fetch_flush_floor() -> Result<()> {
+        let tuning = coalesce_tuning(&Url::parse("s3://tansu/?fetch_flush_floor=100ms")?);
+        assert_eq!(Some(Duration::from_millis(100)), tuning.fetch_flush_floor);
+        let empty = coalesce_tuning(&Url::parse("s3://tansu/")?);
+        assert_eq!(None, empty.fetch_flush_floor);
         Ok(())
     }
 

@@ -73,6 +73,54 @@ minio-local-alias: (minio-mc "alias" "set" "local" "http://localhost:9000" "mini
 
 minio-tansu-bucket: (minio-mc "mb" "local/tansu")
 
+# Opt-in latency-injecting proxy in front of minio (see compose.yaml).
+toxiproxy-up:
+    docker compose --profile latency --ansi never --progress plain up --no-color --quiet-pull --wait --detach toxiproxy
+
+toxiproxy-down:
+    docker compose --profile latency down --remove-orphans
+
+# Inject a round-trip latency (ms), split evenly across the proxy's
+# upstream/downstream legs, onto every request the broker makes to minio
+# through the toxiproxy proxy. Idempotent: safe to rerun to change the value
+# (each POST creates-or-replaces the named toxic).
+toxiproxy-latency round_trip_ms="20":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # The image has no shell/healthcheck tooling (distroless), so
+    # toxiproxy-up only waits for "running", not "serving" -- retry until
+    # the control API answers.
+    for _ in $(seq 1 20); do
+      curl -sf http://localhost:18474/version >/dev/null 2>&1 && break
+      sleep 0.25
+    done
+    half=$(( {{round_trip_ms}} / 2 ))
+    curl -sf -X POST http://localhost:18474/proxies/minio/toxics \
+      -H 'Content-Type: application/json' \
+      -d "{\"name\":\"upstream_latency\",\"type\":\"latency\",\"stream\":\"upstream\",\"attributes\":{\"latency\":${half},\"jitter\":2}}" \
+      >/dev/null 2>&1 || curl -sf -X POST "http://localhost:18474/proxies/minio/toxics/upstream_latency" \
+      -X PATCH -H 'Content-Type: application/json' \
+      -d "{\"attributes\":{\"latency\":${half},\"jitter\":2}}" >/dev/null
+    curl -sf -X POST http://localhost:18474/proxies/minio/toxics \
+      -H 'Content-Type: application/json' \
+      -d "{\"name\":\"downstream_latency\",\"type\":\"latency\",\"stream\":\"downstream\",\"attributes\":{\"latency\":${half},\"jitter\":2}}" \
+      >/dev/null 2>&1 || curl -sf -X POST "http://localhost:18474/proxies/minio/toxics/downstream_latency" \
+      -X PATCH -H 'Content-Type: application/json' \
+      -d "{\"attributes\":{\"latency\":${half},\"jitter\":2}}" >/dev/null
+
+# minio fronted by toxiproxy at a realistic round-trip latency (default
+# 20ms, same-region S3 order of magnitude). Point AWS_ENDPOINT at
+# http://localhost:19000 (not minio's own 9000) to route through the proxy —
+# see `broker-s3-latency` and docs/storage-tuning.md.
+s3-latency-up round_trip_ms="20": docker-compose-down minio-up minio-ready-local minio-local-alias minio-tansu-bucket toxiproxy-up (toxiproxy-latency round_trip_ms)
+
+# a debug broker against minio-via-toxiproxy at a realistic round-trip
+# latency (default 20ms) -- for A/B tuning sweeps (recent_cache_bytes,
+# coalesce_linger/coalesce_bytes) against a request cost that approximates
+# real S3, unlike bare localhost minio's near-zero RTT.
+broker-s3-latency round_trip_ms="20" profile="profiling" *args: (build profile "dynostore") (s3-latency-up round_trip_ms)
+    AWS_ENDPOINT=http://localhost:19000 target/{{ replace(profile, "dev", "debug") }}/tansu broker --storage-engine=s3://tansu/ {{ args }}
+
 minio-ready-local: (minio-mc "ready" "local")
 
 tansu-up: (docker-compose-up "tansu")

@@ -407,27 +407,54 @@ where
             .and_then(|mut guard| f(&mut guard.get_or_insert_with(Default::default).data))
     }
 
-    /// Persist the current cached value with an optimistic CAS, flushing the
-    /// advances accumulated by [`Self::mutate_cached`]. On a conflict (a
-    /// concurrent writer, or a lagging cached etag) the winner is re-read and
-    /// our value merged back on top via `reconcile` — which folds the second
-    /// argument into the first — rather than clobbering it, then the PUT is
-    /// retried.
-    ///
-    /// For the idempotent-sequence object (#48) sequences are monotonic, so
-    /// `reconcile` is an element-wise max: a concurrent or lagging checkpoint
-    /// can never lower an already-acked sequence, and the persisted object
-    /// never moves backwards.
-    #[instrument(skip_all, fields(path = %self.path))]
-    pub(super) async fn checkpoint<R>(
+    /// The durably stored value and its version, read directly from the
+    /// object store without consulting or disturbing the in-memory cache
+    /// (which may legitimately run ahead of it between checkpoints, #48). A
+    /// missing object reads as the default value with no version (a
+    /// following conditional write is a `Create`).
+    pub(super) async fn stored(
         &self,
         object_store: &impl ObjectStore,
+    ) -> Result<(D, Option<UpdateVersion>)> {
+        REQUESTS.add(1, &[KeyValue::new("method", "stored")]);
+
+        match object_store.get(&self.path).await {
+            Ok(result) => {
+                let version = UpdateVersion {
+                    e_tag: result.meta.e_tag.clone(),
+                    version: result.meta.version.clone(),
+                };
+                serde_json::from_slice::<D>(&result.bytes().await?)
+                    .map(|data| (data, Some(version)))
+                    .map_err(Into::into)
+            }
+
+            Err(object_store::Error::NotFound { .. }) => Ok((D::default(), None)),
+
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Persist `value` — not the live cached value — with the same optimistic
+    /// CAS and max-merge semantics as a checkpoint. The caller supplies a
+    /// value capped at what is durably flushed and acked, since the live
+    /// cache can run a full coalesce linger ahead of the log (#48).
+    ///
+    /// Every attempt folds the freshly read stored object under `value`
+    /// before writing, so a clean CAS never clobbers keys another writer (or
+    /// an epoch reseed) already persisted. On success the written value is
+    /// folded back under the live cache and the new version adopted.
+    #[instrument(skip_all, fields(path = %self.path))]
+    pub(super) async fn checkpoint_value<R>(
+        &self,
+        object_store: &impl ObjectStore,
+        value: &D,
         reconcile: R,
     ) -> Result<()>
     where
         R: Fn(&mut D, &D),
     {
-        const METHOD: &str = "checkpoint";
+        const METHOD: &str = "checkpoint_value";
         REQUESTS.add(1, &[KeyValue::new("method", METHOD)]);
 
         let on_error = |error: &object_store::Error| {
@@ -443,17 +470,16 @@ where
         let mut retries: u64 = 0;
 
         loop {
-            let dv = self
-                .data_version
-                .lock()
-                .map(|guard| guard.clone().unwrap_or_default())?;
+            let (stored, version) = self.stored(object_store).await?;
+            let mut data = value.clone();
+            reconcile(&mut data, &stored);
 
-            let payload = serde_json::to_vec(&dv.data)
+            let payload = serde_json::to_vec(&data)
                 .map(Bytes::from)
                 .map(PutPayload::from)?;
 
             let opts = PutOptions {
-                mode: PutMode::from(&dv),
+                mode: version.clone().map_or(PutMode::Create, PutMode::Update),
                 tags: self.tags.clone(),
                 attributes: self.attributes.clone(),
                 ..Default::default()
@@ -474,19 +500,11 @@ where
                         .lock()
                         .map_err(Into::into)
                         .map(|mut guard| {
-                            // Advances that landed since the snapshot must survive the
-                            // version stamp: fold what we persisted back over the live
-                            // value (max-merge), then record the new etag.
-                            let mut data = dv.data;
-                            if let Some(existing) = guard.as_ref() {
-                                reconcile(&mut data, &existing.data);
-                            }
-                            _ = guard.replace(DataVersion {
-                                data,
-                                version: Some(UpdateVersion {
-                                    e_tag: put_result.e_tag,
-                                    version: put_result.version,
-                                }),
+                            let entry = guard.get_or_insert_with(Default::default);
+                            reconcile(&mut entry.data, &data);
+                            entry.version = Some(UpdateVersion {
+                                e_tag: put_result.e_tag,
+                                version: put_result.version,
                             });
                         });
                 }
@@ -501,17 +519,12 @@ where
                         warn!(
                             path = %self.path,
                             retries,
-                            "OptiCon checkpoint contending on a hot object (per-object update-rate cap?)"
+                            "OptiCon checkpoint_value contending on a hot object"
                         );
                     }
 
-                    // Load the winner, then merge our advances on top so both the
-                    // concurrent writer's progress and ours survive the retry.
-                    let ours = dv.data;
-                    self.get(object_store).await?;
-                    self.data_version.lock().map(|mut guard| {
-                        reconcile(&mut guard.get_or_insert_with(Default::default).data, &ours);
-                    })?;
+                    // The next attempt re-reads the winner and folds it under
+                    // `value`, so both survive.
                     continue;
                 }
 
@@ -925,7 +938,11 @@ mod tests {
         ));
 
         // A single checkpoint persists the whole accumulated value.
-        o.checkpoint(&object_store, max_merge).await?;
+        let cached = o
+            .mutate_cached(&object_store, |x: &mut X| Ok(x.clone()))
+            .await?;
+        o.checkpoint_value(&object_store, &cached, max_merge)
+            .await?;
         let data = serde_json::from_slice::<X>(&object_store.get(&path).await?.bytes().await?)?;
         assert_eq!(5, data.0);
 
@@ -957,6 +974,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_value_persists_the_supplied_value_not_the_cache() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let path = Path::from("/abc/durable-view.json");
+        let object_store = InMemory::new();
+        let o = OptiCon::path(path.clone());
+
+        // The live cache runs ahead (unacked advances)...
+        o.mutate_cached(&object_store, |x: &mut X| {
+            x.0 = 5;
+            Ok(())
+        })
+        .await?;
+
+        // ...but the checkpoint persists the caller's durable view, not the
+        // cache — the #48 durability-gating property.
+        o.checkpoint_value(&object_store, &X(3), max_merge).await?;
+        let data = serde_json::from_slice::<X>(&object_store.get(&path).await?.bytes().await?)?;
+        assert_eq!(3, data.0);
+
+        // The live cache keeps its (higher) in-memory advance.
+        let live = o.mutate_cached(&object_store, |x: &mut X| Ok(x.0)).await?;
+        assert_eq!(5, live);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn checkpoint_value_folds_the_stored_object_underneath() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let path = Path::from("/abc/no-clobber.json");
+        let object_store = InMemory::new();
+
+        // Another writer (an epoch reseed, a peer replica) persisted X(7).
+        OptiCon::path(path.clone())
+            .with_mut(&object_store, |x: &mut X| {
+                x.0 = 7;
+                Ok(())
+            })
+            .await?;
+
+        // A durable-view checkpoint of a lower value must not clobber it.
+        let o = OptiCon::<X>::path(path.clone());
+        o.checkpoint_value(&object_store, &X(3), max_merge).await?;
+        let data = serde_json::from_slice::<X>(&object_store.get(&path).await?.bytes().await?)?;
+        assert_eq!(7, data.0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn checkpoint_merges_concurrent_write() -> Result<()> {
         let _guard = init_tracing()?;
 
@@ -979,9 +1048,13 @@ mod tests {
             })
             .await?;
 
-        // Our checkpoint collides on Create; it must merge (max) up to the
-        // winner rather than clobber it back down to our stale value.
-        ours.checkpoint(&object_store, max_merge).await?;
+        // Our checkpoint collides with the winner; it must merge (max) up to
+        // it rather than clobber it back down to our stale value.
+        let cached = ours
+            .mutate_cached(&object_store, |x: &mut X| Ok(x.clone()))
+            .await?;
+        ours.checkpoint_value(&object_store, &cached, max_merge)
+            .await?;
         let data = serde_json::from_slice::<X>(&object_store.get(&path).await?.bytes().await?)?;
         assert_eq!(5, data.0);
 

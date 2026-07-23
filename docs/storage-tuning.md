@@ -79,6 +79,43 @@ and reduces checkpoint PUTs, though the gain is small unless you have many
 active idempotent producers (the object count scales with *distinct producers*,
 not partitions).
 
+## Recent-write cache (`recent_cache_bytes`)
+
+With `recent_cache_bytes` set, the broker keeps the bytes of recently written
+`records/` objects and prefix segments in memory and serves fetches from that
+cache instead of re-downloading from the object store — a tailing consumer no
+longer pays a GET for data the same process uploaded moments earlier. The
+cache is coherent by construction (objects are immutable and create-only, so
+a hit can never be stale) and a miss always falls through to the store, so
+multi-replica behaviour is unchanged: a consumer landing on a replica that did
+not write the data simply pays today's GET. See
+`docs/design-recent-write-cache.md`.
+
+| Query param | Default | Meaning |
+|---|---|---|
+| `recent_cache_bytes` | `0` (disabled) | Total bytes of recently produced objects held in memory; evicted oldest-written-first. |
+| `fetch_flush_floor` | `50ms` | How soon a fetch parked at the tail may flush a pending coalesce buffer, from the buffer's oldest batch. |
+
+The consumer side is wake-on-write: a fetch long-poll parks on a per-partition
+produce signal instead of polling, and while parked it arms a flush of any
+pending coalesce buffer at `fetch_flush_floor` instead of the full
+`coalesce_linger`. This makes the linger safe to widen aggressively (seconds):
+a partition/prefix with a waiting consumer still flushes every
+`fetch_flush_floor`, while one nobody is tailing batches for the whole linger
+— PUT cadence follows consumer demand. The floor is also the guard rail: an
+aggressively polling consumer cannot push the flush rate above one per floor
+per partition/prefix, so at the defaults (floor = old default linger) the
+observable flush rate is unchanged.
+
+Sizing: for ~100% tail hits the budget must cover the consumer lag window —
+`budget ≈ ingest_rate × max_tolerated_consumer_lag` (e.g. 10 MB/s and
+consumers within 30 s of the tail → ~300 MiB). The budget is per broker
+process; add it to the pod memory limit. Objects larger than 8 MiB
+(backfill/snapshot class) are never cached. Watch
+`tansu_recent_write_cache_bytes` / `_hits` / `_misses`, and
+`_evicted_unread`: a sustained unread-eviction rate means the budget is too
+small for the lag window (or nothing is tailing).
+
 ## Prefix coalescing — virtual topics (`prefix_coalesce`)
 
 With `prefix_coalesce=true`, the broker coalesces per **connector prefix**
@@ -193,3 +230,43 @@ s3://my-bucket/?produce_coalesce=true&coalesce_linger=300ms&coalesce_batches=128
 
 Coalesces produce with a 300 ms linger (or 128 batches / 4 MiB, whichever comes
 first) and checkpoints idempotent producers at most every 5 s.
+
+## Benchmarking under realistic S3 latency
+
+Localhost minio's GET/PUT round trip is well under a millisecond — two to
+three orders of magnitude faster than same-region S3 (typically ~15-25ms).
+At that scale, `recent_cache_bytes` and `coalesce_*` tuning can look like a
+no-op in a local A/B: both configurations finish inside the same measurement
+tick, because there's no real round-trip cost for either of them to save.
+Every threshold and tradeoff described above is priced in request latency,
+so a local benchmark that eliminates that latency is measuring the wrong
+thing — real S3's dominant cost is network RTT, not disk seek time, and
+localhost minio has none of either.
+
+`just s3-latency-up` starts minio behind a
+[toxiproxy](https://github.com/Shopify/toxiproxy) proxy with a configurable
+injected round-trip latency (default 20ms, split evenly across the proxy's
+upstream/downstream legs), so tuning sweeps run against a request cost that
+approximates production instead of localhost's near-zero RTT:
+
+```shell
+just s3-latency-up            # minio + toxiproxy, 20ms round trip, ready on :19000
+just s3-latency-up 40         # ...or any other round trip in ms
+just toxiproxy-latency 5      # change the injected latency on an already-running proxy
+just broker-s3-latency        # convenience: build + bring up + run a debug broker against it
+```
+
+Point a broker or `tansu perf` run at it via `AWS_ENDPOINT=http://localhost:19000`
+(not minio's own `:9000` — that bypasses the proxy) and `STORAGE_ENGINE=s3://tansu/?...`.
+`tansu perf <topic> consume --consumers=N` (long-polls a partition with `N`
+independent fetchers from the same offset) is the fan-out shape
+`recent_cache_bytes` targets — N consumer groups tailing one hot partition —
+and is the tool to reach for when A/B-ing the cache: produce a burst through
+one broker, then consume it with and without `recent_cache_bytes` set,
+comparing drain time and per-fetch latency, not just aggregate MB/s (which
+saturates within one measurement tick for small bursts even when the
+underlying per-fetch cost differs sharply).
+
+`just toxiproxy-down` / `just docker-compose-down` tear it down. The `latency`
+compose profile keeps it out of the default `just ci` / `just s3-up` path, so
+normal dev and test flows are unaffected.

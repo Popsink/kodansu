@@ -36,6 +36,26 @@ services:
       retries: 1
       start_period: 5s
       timeout: 5s
+  # Latency-injecting proxy in front of minio, opt-in via `--profile latency`
+  # (see `just s3-latency-up`). Real S3's dominant cost is same-region
+  # network RTT (~15-25ms), not disk seek time, which localhost minio has
+  # none of; this simulates that RTT so coalescing / cache tuning can be
+  # benchmarked under realistic request cost instead of localhost's
+  # near-zero latency. The proxy itself adds no delay until toxics are
+  # added (`just toxiproxy-latency`).
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    profiles: ["latency"]
+    depends_on:
+      - minio
+    volumes:
+      - type: bind
+        source: etc/toxiproxy/config.json
+        target: /etc/toxiproxy/config.json
+    command: ["-host=0.0.0.0", "-config=/etc/toxiproxy/config.json"]
+    ports:
+      - 19000:9000
+      - 18474:8474
   tansu:
     image: ${TANSU_IMAGE}
     restart: unless-stopped

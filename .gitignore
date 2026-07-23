@@ -24,3 +24,5 @@ perf.data*
 profile.json*
 target
 .claude/worktrees/
+.claude
+.tokensave
