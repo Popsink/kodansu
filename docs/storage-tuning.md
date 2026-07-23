@@ -176,20 +176,6 @@ bounded:
   it runs on the maintenance workers without holding or fencing the produce
   writer. Set `prefix_compact_min_segments=0` to disable.
 
-  A maintainer also keeps an in-memory, self-healing skip-hint per prefix so it
-  does not re-`LIST` `segments/` for a prefix that is provably still below the
-  trigger: it records the segment count seen at the last `LIST`, projects it
-  forward at a conservative bound on the growth rate, and skips the `LIST` while
-  the projection stays under `prefix_compact_min_segments`. Prefixes near the
-  trigger or visibly growing are re-`LIST`ed early, and every prefix is
-  re-`LIST`ed at least once per staleness window regardless, so an idle→busy
-  prefix is still caught. This retires the residual per-prefix discovery-`LIST`
-  floor — the bulk of prefixes sit bounded and quiet — with no config knob and
-  no correctness impact (skipping only delays discovery; compaction is
-  idempotent and the cap is soft). It is the compaction analogue of the
-  whole-segment-retention skip that keeps the maintainer off the `segments/`
-  `LIST` of a prefix whose oldest segment is still within retention.
-
 **GCS:** safe by construction. The segment data objects are create-only
 (immutable) and the read path is footer-only (no per-flush-mutated manifest), so
 nothing on the produce or fetch hot path mutates a hot object — the ~1/s/object
