@@ -76,6 +76,62 @@ fn cas_conflict_backoff(attempt: u32) -> Duration {
     Duration::from_millis(base_ms + jitter)
 }
 
+/// Two persisted group projections represent the same rebalance state when they
+/// agree on everything except each member's `last_contact` — the liveness
+/// timestamp that `missed_heartbeat` refreshes to `now` on *every* dynamic-member
+/// join/sync (`administrator.rs` `missed_heartbeat`). A waiting member long-polls
+/// join/sync once a second; each poll bumps only its own `last_contact`, so an
+/// unconditional PUT churns the single `{group}.json` etag ~once/sec/member. With
+/// many members that churn structurally starves the one write that matters — the
+/// leader's large SyncGroup assignment CAS — so the group never reaches `Stable`.
+/// The join/sync loops use this to skip the PUT on a no-op poll (mirroring the
+/// heartbeat GET-first skip in #111), leaving the etag still long enough for the
+/// assignment write to land. `members` is a `BTreeMap`, so ordered `zip` is a
+/// valid key/value comparison.
+fn same_rebalance_state(a: &GroupDetail, b: &GroupDetail) -> bool {
+    a.session_timeout_ms == b.session_timeout_ms
+        && a.rebalance_timeout_ms == b.rebalance_timeout_ms
+        && a.generation_id == b.generation_id
+        && a.skip_assignment == b.skip_assignment
+        && a.inception == b.inception
+        && a.state == b.state
+        && a.members.len() == b.members.len()
+        && a.members
+            .iter()
+            .zip(b.members.iter())
+            .all(|((ak, av), (bk, bv))| ak == bk && av.join_response == bv.join_response)
+}
+
+/// Whether `member_id`'s persisted `last_contact` (as seen in the just-read
+/// projection `before`) is stale enough that a no-op poll must still persist a
+/// refreshed timestamp, so a member waiting through a long rebalance is never
+/// spuriously evicted by another replica. Bounded to half the session timeout —
+/// well inside the eviction deadline — this fires at most once per
+/// `session_timeout/2` per member, negligible next to the once-a-second churn it
+/// replaces. An absent member or missing timestamp forces the write.
+fn liveness_renewal_due(
+    before: &GroupDetail,
+    member_id: &str,
+    now: SystemTime,
+    session_timeout_ms: i32,
+) -> bool {
+    if member_id.is_empty() {
+        return false;
+    }
+    match before
+        .members
+        .get(member_id)
+        .and_then(|member| member.last_contact)
+    {
+        Some(last_contact) => {
+            let elapsed = now.duration_since(last_contact).unwrap_or_default();
+            let half = (u64::try_from(session_timeout_ms).unwrap_or(45_000)) / 2;
+            elapsed >= Duration::from_millis(half)
+        }
+        None => true,
+    }
+}
+
 static COORDINATOR_REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_group_coordinator_requests")
@@ -847,7 +903,7 @@ where
 
             let now = SystemTime::now();
 
-            let (mut original, version) = self.wrappers.lock().map(|mut wrappers| {
+            let (mut original, mut version) = self.wrappers.lock().map(|mut wrappers| {
                 wrappers.remove(group_id).unwrap_or_else(|| {
                     debug!(?iteration, ?group_id);
 
@@ -865,6 +921,25 @@ where
                     (Wrapper::Forming(inner), None)
                 })
             })?;
+
+            // GET-first (#111 pattern, extended to join): observe a rebalance
+            // started on another replica via a cheap read rather than learning it
+            // only from a failed CAS, and evaluate this join against current
+            // persisted state. `before` is that state — what an unconditional
+            // loop iteration would otherwise rewrite with only a `last_contact`
+            // bump. `persisted.is_some()` gates the no-op skip below: without a
+            // persisted object there is nothing to be equal to, so the create
+            // must go through.
+            let persisted = self.storage.read_group(group_id).await?;
+            if let Some((current, current_version)) = &persisted
+                && version.as_ref() != Some(current_version)
+            {
+                original =
+                    Wrapper::with_storage_group_detail(self.storage.clone(), current.clone());
+                version = Some(current_version.clone());
+            }
+
+            let before = GroupDetail::from(&original);
 
             if group_instance_id.is_none() {
                 original = original.missed_heartbeat(group_id, member_id, now);
@@ -893,11 +968,57 @@ where
 
             debug!(%updated, ?version, iteration);
 
-            match self
-                .storage
-                .update_group(group_id, GroupDetail::from(&updated), version)
-                .await
+            let after = GroupDetail::from(&updated);
+
+            // No-op long-poll skip: a member waiting through a rebalance re-joins
+            // once a second, and each re-join changes only its own `last_contact`
+            // (via `missed_heartbeat`). Persisting that is a CAS that churns the
+            // `{group}.json` etag for nothing and, at scale, starves the leader's
+            // assignment write so the group never stabilises. When the rebalance
+            // state is otherwise unchanged and this member's liveness does not yet
+            // need renewing, return without touching the object — keeping the etag
+            // still long enough for the assignment CAS to land.
+            if persisted.is_some()
+                && same_rebalance_state(&before, &after)
+                && !liveness_renewal_due(&before, member_id, now, before.session_timeout_ms)
             {
+                COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_noop_skip")]);
+
+                let elapsed_ms = started_at.elapsed().map(|duration| duration.as_millis())?;
+
+                let is_leader = updated.is_leader(&body);
+                let is_assigned = updated.is_assigned(&body);
+                let is_member_id_required = updated.is_member_id_required(&body);
+                let session_timeout_ms = updated.session_timeout_ms() as u128;
+
+                _ = self
+                    .wrappers
+                    .lock()
+                    .map(|mut wrappers| wrappers.insert(group_id.to_owned(), (updated, version)))?;
+
+                if group_instance_id.is_some() && elapsed_ms < PAUSE_MS {
+                    let pause = PAUSE_MS.saturating_sub(elapsed_ms);
+                    COORDINATOR_REQUESTS
+                        .add(1, &[KeyValue::new("method", "join_group_instance_pause")]);
+                    sleep(Duration::from_millis(pause as u64)).await;
+
+                    iteration += 1;
+                    continue;
+                } else if is_leader || is_assigned || is_member_id_required {
+                    return Ok(body);
+                } else if elapsed_ms < session_timeout_ms.div(2) {
+                    COORDINATOR_REQUESTS
+                        .add(1, &[KeyValue::new("method", "join_group_instance_pause")]);
+                    sleep(Duration::from_secs(1)).await;
+
+                    iteration += 1;
+                    continue;
+                } else {
+                    return Ok(body);
+                }
+            }
+
+            match self.storage.update_group(group_id, after, version).await {
                 Ok(version) => {
                     let elapsed_ms = started_at.elapsed().map(|duration| duration.as_millis())?;
 
@@ -1071,11 +1192,27 @@ where
 
             let now = SystemTime::now();
 
-            let (mut original, version) = self.wrappers.lock().map(|mut wrappers| {
+            let (mut original, mut version) = self.wrappers.lock().map(|mut wrappers| {
                 wrappers
                     .remove(group_id)
                     .unwrap_or_else(|| (Wrapper::Forming(Inner::new(self.storage.clone())), None))
             })?;
+
+            // GET-first (#111 pattern, extended to sync): see the join loop — a
+            // waiting non-leader sync re-polls once a second and each poll bumps
+            // only `last_contact`, so persisting it churns the etag and starves
+            // the leader's assignment CAS. Read current state, then skip the PUT
+            // below when nothing but `last_contact` would change.
+            let persisted = self.storage.read_group(group_id).await?;
+            if let Some((current, current_version)) = &persisted
+                && version.as_ref() != Some(current_version)
+            {
+                original =
+                    Wrapper::with_storage_group_detail(self.storage.clone(), current.clone());
+                version = Some(current_version.clone());
+            }
+
+            let before = GroupDetail::from(&original);
 
             let original_members = original.members();
 
@@ -1102,11 +1239,53 @@ where
 
             debug!(group_id, %updated, ?version, iteration);
 
-            match self
-                .storage
-                .update_group(group_id, GroupDetail::from(&updated), version)
-                .await
+            let after = GroupDetail::from(&updated);
+
+            // No-op long-poll skip (see the join loop for the full rationale): a
+            // waiting sync that changes only `last_contact` must not rewrite the
+            // group object. The leader's real Forming->Formed assignment sync
+            // changes `state` + `assignments`, so `same_rebalance_state` is false
+            // for it and it always takes the write path below.
+            if persisted.is_some()
+                && same_rebalance_state(&before, &after)
+                && !liveness_renewal_due(&before, member_id, now, before.session_timeout_ms)
             {
+                COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sync_noop_skip")]);
+
+                let elapsed_ms = started_at.elapsed().map(|duration| duration.as_millis())?;
+
+                let is_forming = updated.is_forming();
+                let is_assigned = updated.is_assigned(&body);
+                let session_timeout_ms = updated.session_timeout_ms() as u128;
+
+                _ = self
+                    .wrappers
+                    .lock()
+                    .map(|mut wrappers| wrappers.insert(group_id.to_owned(), (updated, version)))?;
+
+                if group_instance_id.is_some() && elapsed_ms < PAUSE_MS {
+                    let pause = PAUSE_MS.saturating_sub(elapsed_ms);
+                    COORDINATOR_REQUESTS
+                        .add(1, &[KeyValue::new("method", "sync_group_instance_pause")]);
+                    sleep(Duration::from_millis(pause as u64)).await;
+
+                    iteration += 1;
+                    continue;
+                } else if is_forming || is_assigned {
+                    return Ok(body);
+                } else if elapsed_ms < session_timeout_ms.mul(8).div(10) {
+                    COORDINATOR_REQUESTS
+                        .add(1, &[KeyValue::new("method", "sync_group_instance_pause")]);
+                    sleep(Duration::from_secs(1)).await;
+
+                    iteration += 1;
+                    continue;
+                } else {
+                    return Ok(set_error_code(body, ErrorCode::RebalanceInProgress));
+                }
+            }
+
+            match self.storage.update_group(group_id, after, version).await {
                 Ok(version) => {
                     let elapsed_ms = started_at.elapsed().map(|duration| duration.as_millis())?;
 
@@ -3248,6 +3427,256 @@ mod tests {
                 "attempt {attempt}: {backoff:?}"
             );
         }
+    }
+
+    fn group_detail_with(
+        members: &[(&str, Option<SystemTime>)],
+        state: GroupState,
+        generation_id: i32,
+    ) -> GroupDetail {
+        GroupDetail {
+            session_timeout_ms: 45_000,
+            rebalance_timeout_ms: Some(300_000),
+            members: members
+                .iter()
+                .map(|(id, last_contact)| {
+                    (
+                        (*id).to_owned(),
+                        GroupMember {
+                            join_response: Default::default(),
+                            last_contact: *last_contact,
+                        },
+                    )
+                })
+                .collect(),
+            generation_id,
+            skip_assignment: Some(false),
+            inception: SystemTime::UNIX_EPOCH,
+            state,
+        }
+    }
+
+    #[test]
+    fn same_rebalance_state_ignores_last_contact() {
+        let t0 = SystemTime::UNIX_EPOCH;
+        let t1 = t0 + Duration::from_secs(30);
+
+        let forming = GroupState::Forming {
+            protocol_type: Some("consumer".into()),
+            protocol_name: Some("range".into()),
+            leader: Some("m1".into()),
+        };
+
+        // Same members, same state, same generation — only last_contact differs
+        // (including present vs absent). This is the no-op poll we must skip.
+        let a = group_detail_with(&[("m1", Some(t0)), ("m2", Some(t0))], forming.clone(), 3);
+        let b = group_detail_with(&[("m1", Some(t1)), ("m2", None)], forming.clone(), 3);
+        assert!(same_rebalance_state(&a, &b));
+
+        // A bumped generation is a real rebalance — must not be skipped.
+        let new_gen = group_detail_with(&[("m1", Some(t0)), ("m2", Some(t0))], forming.clone(), 4);
+        assert!(!same_rebalance_state(&a, &new_gen));
+
+        // A changed member set — must not be skipped.
+        let fewer = group_detail_with(&[("m1", Some(t0))], forming.clone(), 3);
+        assert!(!same_rebalance_state(&a, &fewer));
+
+        // The Forming -> Formed assignment write (same members, same generation,
+        // last_contact could even match) MUST be detected as a change, otherwise
+        // the group would never stabilise. This is the write we protect.
+        let formed = GroupState::Formed {
+            protocol_type: "consumer".into(),
+            protocol_name: "range".into(),
+            leader: "m1".into(),
+            assignments: [("m1".to_owned(), Bytes::from_static(b"assignment"))]
+                .into_iter()
+                .collect(),
+        };
+        let assigned = group_detail_with(&[("m1", Some(t0)), ("m2", Some(t0))], formed, 3);
+        assert!(!same_rebalance_state(&a, &assigned));
+    }
+
+    #[test]
+    fn liveness_renewal_due_threshold() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let state = GroupState::default();
+        let session_timeout_ms = 30_000; // half == 15s
+
+        // Just contacted -> not due.
+        let fresh = group_detail_with(&[("m1", Some(now))], state.clone(), 1);
+        assert!(!liveness_renewal_due(&fresh, "m1", now, session_timeout_ms));
+
+        // Under half the session timeout -> still not due.
+        let recent = group_detail_with(
+            &[("m1", Some(now - Duration::from_secs(14)))],
+            state.clone(),
+            1,
+        );
+        assert!(!liveness_renewal_due(
+            &recent,
+            "m1",
+            now,
+            session_timeout_ms
+        ));
+
+        // Past half the session timeout -> a no-op poll must still refresh.
+        let stale = group_detail_with(
+            &[("m1", Some(now - Duration::from_secs(20)))],
+            state.clone(),
+            1,
+        );
+        assert!(liveness_renewal_due(&stale, "m1", now, session_timeout_ms));
+
+        // Member not yet persisted, or persisted without a timestamp -> write.
+        assert!(liveness_renewal_due(
+            &fresh,
+            "ghost",
+            now,
+            session_timeout_ms
+        ));
+        let no_ts = group_detail_with(&[("m1", None)], state, 1);
+        assert!(liveness_renewal_due(&no_ts, "m1", now, session_timeout_ms));
+
+        // Empty member id has nothing to renew.
+        assert!(!liveness_renewal_due(&fresh, "", now, session_timeout_ms));
+    }
+
+    // End-to-end proof of the no-op skip: once a group is Formed and its member
+    // assigned, a re-sync by that member (which only refreshes `last_contact`)
+    // must not rewrite the group object. The persisted version (etag) staying
+    // put is exactly what stops the rebalance-time churn that starves a large
+    // group's assignment write. Without the skip this re-sync bumps the version.
+    #[tokio::test]
+    async fn noop_resync_does_not_bump_persisted_version() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let session_timeout_ms = 45_000;
+        let rebalance_timeout_ms = Some(300_000);
+        let group_instance_id = None;
+        let reason = None;
+
+        const CLIENT_ID: &str = "console-consumer";
+        const GROUP_ID: &str = "noop-resync-group";
+
+        let storage = StorageContainer::builder()
+            .cluster_id("test")
+            .node_id(111)
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
+            .storage(Url::parse("memory://")?)
+            .build()
+            .await?;
+
+        let s = Controller::with_storage(storage.clone())?;
+
+        let range_meta = Bytes::try_from(
+            &MemberMetadata::default().version(3).subscription(
+                ConsumerProtocolSubscription::default()
+                    .generation_id(Some(0))
+                    .owned_partitions(
+                        [TopicPartition::default().topic("a").partitions(0..3)].into_iter(),
+                    ),
+            ),
+        )?;
+
+        let protocols = [JoinGroupRequestProtocol::default()
+            .name(Assignor::RANGE.into())
+            .metadata(range_meta.clone())];
+
+        // First join with an empty member id returns the assigned member id.
+        let member_id = match s
+            .join(
+                Some(CLIENT_ID),
+                GROUP_ID,
+                session_timeout_ms,
+                rebalance_timeout_ms,
+                "",
+                group_instance_id,
+                CONSUMER,
+                Some(&protocols[..]),
+                reason,
+            )
+            .await?
+        {
+            Body::JoinGroupResponse(JoinGroupResponse { member_id, .. }) => member_id,
+            otherwise => panic!("{otherwise:?}"),
+        };
+
+        // Second join with that id makes this the (single) leader.
+        let generation_id = match s
+            .join(
+                Some(CLIENT_ID),
+                GROUP_ID,
+                session_timeout_ms,
+                rebalance_timeout_ms,
+                &member_id,
+                group_instance_id,
+                CONSUMER,
+                Some(&protocols[..]),
+                reason,
+            )
+            .await?
+        {
+            Body::JoinGroupResponse(JoinGroupResponse { generation_id, .. }) => generation_id,
+            otherwise => panic!("{otherwise:?}"),
+        };
+
+        // Sync with an assignment forms the group (Forming -> Formed).
+        let assignment = Bytes::try_from(&MemberAssignment::default().assignment(
+            ConsumerProtocolAssignment::default().assigned_partitions(
+                [TopicPartition::default().topic("a").partitions(0..3)].into_iter(),
+            ),
+        ))?;
+        let assignments = [SyncGroupRequestAssignment::default()
+            .member_id(member_id.clone())
+            .assignment(assignment.clone())];
+
+        _ = s
+            .sync(
+                GROUP_ID,
+                generation_id,
+                &member_id,
+                group_instance_id,
+                Some(CONSUMER),
+                Some(Assignor::RANGE),
+                Some(&assignments[..]),
+            )
+            .await?;
+
+        let (detail, v1) = storage
+            .read_group(GROUP_ID)
+            .await?
+            .expect("group must be persisted after sync");
+        assert!(
+            matches!(detail.state, GroupState::Formed { .. }),
+            "expected Formed, got {:?}",
+            detail.state
+        );
+
+        // No-op re-sync by the assigned member: only `last_contact` would change,
+        // so the object must not be rewritten and its version must be stable.
+        _ = s
+            .sync(
+                GROUP_ID,
+                generation_id,
+                &member_id,
+                group_instance_id,
+                Some(CONSUMER),
+                Some(Assignor::RANGE),
+                Some(&assignments[..]),
+            )
+            .await?;
+
+        let (_, v2) = storage
+            .read_group(GROUP_ID)
+            .await?
+            .expect("group still persisted");
+
+        assert_eq!(
+            v1, v2,
+            "a no-op re-sync must not rewrite the group object (etag must stay stable)"
+        );
+
+        Ok(())
     }
 
     #[ignore]
