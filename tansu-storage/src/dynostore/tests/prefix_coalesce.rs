@@ -2689,3 +2689,15 @@ async fn leaseless_flush_exhaustion_is_retriable_not_fatal() -> Result<(), Error
 
     Ok(())
 }
+
+/// #130 mitigation: the shipped default merged-segment target is 16 MiB, not a
+/// larger size. While compaction writes into the producer tail create-CAS
+/// namespace, a larger target multiplies the S3 write amplification and request
+/// pressure of a lost create race, so the default is kept modest. A deployment
+/// can still raise it via `prefix_compact_target_bytes`. Guards the default
+/// against an accidental bump.
+#[tokio::test]
+async fn default_compaction_target_bytes_is_modest() {
+    let store = DynoStore::new(CLUSTER, NODE, InMemory::new()).prefix_coalesce(true);
+    assert_eq!(16 << 20, store.prefix_compact_target_bytes);
+}
