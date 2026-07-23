@@ -1447,7 +1447,18 @@ impl DynoStore {
 
     /// Target byte size of a merged segment (#66): the oldest eligible run is
     /// merged until it reaches this, then written as one create-only object.
-    const PREFIX_COMPACT_TARGET_BYTES: usize = 64 << 20;
+    ///
+    /// 16 MiB rather than a larger target because the merged create currently
+    /// shares the producer tail create-CAS namespace (#130): a bigger merged PUT
+    /// spends longer in flight, loses the create race to producers more often,
+    /// and re-uploads its whole payload on each retry — so an oversized target
+    /// multiplies the S3 write amplification and request pressure that feeds
+    /// `503 SlowDown`. A smaller target keeps each merged PUT short (less
+    /// re-upload per lost race, a narrower conflict window) while compaction
+    /// still bounds the live segment count, which is driven by
+    /// [`Self::PREFIX_COMPACT_MIN_SEGMENTS`] (a count trigger, independent of the
+    /// target), not by this size. Overridable via `prefix_compact_target_bytes`.
+    const PREFIX_COMPACT_TARGET_BYTES: usize = 16 << 20;
 
     /// Newest segments never compacted (#66): leaves the actively-produced tail
     /// alone so compaction never races the current write point.

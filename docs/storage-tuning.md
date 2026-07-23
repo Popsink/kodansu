@@ -110,7 +110,7 @@ under a uniform retention (the longest `retention.ms` among the prefix's topics)
 |---|---|---|
 | `prefix_coalesce` | `false` | Coalesce per connector prefix into shared segments. |
 | `prefix_compact_min_segments` | `256` | Compact a prefix once it holds more than this many live segments (`0` disables). |
-| `prefix_compact_target_bytes` | `64m` | Target size of a merged segment. |
+| `prefix_compact_target_bytes` | `16m` | Target size of a merged segment. Kept modest because the merged create currently shares the producer tail create-CAS namespace (#130); a larger target lengthens each merged PUT, loses the create race more often, and re-uploads its whole payload on retry, amplifying S3 write cost. The live segment count is bounded by `prefix_compact_min_segments` (a count trigger), not by this size. |
 | `prefix_compact_keep_hot` | `16` | Newest segments never compacted (leaves the active tail alone). |
 | `maintenance_recency` | `9m` | A prefix maintained (compacted/expired) within this window is skipped by other maintainer replicas. Set to ~0.9× your `maintenance_interval`; `0` disables (every maintainer works every prefix). |
 
