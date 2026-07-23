@@ -2302,6 +2302,14 @@ fn coalesce_tuning(storage: &Url) -> CoalesceTuning {
                     .inspect_err(|err| warn!(storage = %storage, key = "prefix_compact_keep_hot", value, ?err))
                     .ok();
             }
+            "maintenance_recency" => {
+                tuning.maintenance_recency = human_units::Duration::from_str(value)
+                    .map(|duration| duration.0)
+                    .inspect_err(
+                        |err| warn!(storage = %storage, key = "maintenance_recency", value, ?err),
+                    )
+                    .ok();
+            }
             _ => {}
         }
     }

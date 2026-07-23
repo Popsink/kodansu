@@ -208,6 +208,7 @@ async fn write_lease(bucket: &InMemory, store: &DynoStore, prefix: &str, epoch: 
             epoch,
             holder: "old".to_owned(),
             expires_at_ms: 0,
+            maintained_at_ms: 0,
         })
         .expect("serialize lease"),
     ));
@@ -951,7 +952,7 @@ async fn maintainer_with_cold_index_compacts() -> Result<(), Error> {
         .prefix_coalesce(true)
         .coalesce_tuning(tuning);
     assert!(
-        maintainer.policy_compact_segments().await? > 0,
+        maintainer.policy_compact_segments(None).await? > 0,
         "maintainer discovered the prefix and compacted"
     );
     assert!(segments(&bucket).await.len() < 4);
@@ -1083,7 +1084,7 @@ async fn compaction_drains_to_min_segments() -> Result<(), Error> {
     }
     assert_eq!(8, segments(&bucket).await.len());
 
-    _ = store.policy_compact_segments().await?;
+    _ = store.policy_compact_segments(None).await?;
     assert!(
         segments(&bucket).await.len() <= 2,
         "drained to <= min_segments in one pass"
@@ -1222,7 +1223,7 @@ async fn large_oldest_segment_does_not_stall_compaction() -> Result<(), Error> {
     // Without the fix this stalls at 7 (the run collapses to length one). With
     // it, the small run behind the big segment merges and the prefix drains to
     // <= min_segments.
-    _ = store.policy_compact_segments().await?;
+    _ = store.policy_compact_segments(None).await?;
     let after_count = segments(&bucket).await.len();
     assert!(
         after_count <= 2,
@@ -1486,7 +1487,7 @@ async fn retention_forever_keeps_segments() -> Result<(), Error> {
     _ = store.produce(None, &a, batch_at(2, 1_000)?).await?;
     assert_eq!(1, segments(&bucket).await.len());
 
-    let deleted = store.policy_delete(SystemTime::now()).await?;
+    let deleted = store.policy_delete(SystemTime::now(), None).await?;
     assert_eq!(0, deleted, "retain-forever deletes nothing");
     assert_eq!(1, segments(&bucket).await.len());
 
@@ -2360,6 +2361,74 @@ async fn prefix_index_cold_build_commits_incrementally() -> Result<(), Error> {
         6,
         cached(&reader),
         "retry completes the index — warms across attempts"
+    );
+
+    Ok(())
+}
+
+/// Stateless maintenance scheduling (#126): a maintainer that claims a prefix
+/// stamps the compaction lease's `maintained_at_ms`; within the recency window
+/// it (and any peer) skips the prefix, and past the window it is claimed again —
+/// no per-replica identity, no membership, coordinator-free.
+#[tokio::test]
+async fn maintenance_claim_recency_skips_then_reclaims() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .prefix_leaseless(true)
+        .coalesce_tuning(CoalesceTuning {
+            maintenance_recency: Some(Duration::from_secs(60)),
+            ..Default::default()
+        });
+    create_topic(&store, "org.env.conn.tab_a").await?;
+
+    let t = now_ms();
+    let first = store.claim_maintenance_prefixes(t).await?;
+    assert!(first.contains(PREFIX), "first claim wins the prefix");
+
+    let again = store.claim_maintenance_prefixes(t).await?;
+    assert!(
+        !again.contains(PREFIX),
+        "a prefix maintained within the recency window is skipped"
+    );
+
+    let later = store.claim_maintenance_prefixes(t + 120_000).await?;
+    assert!(
+        later.contains(PREFIX),
+        "past the recency window the prefix is claimed again"
+    );
+
+    Ok(())
+}
+
+/// Cross-replica: a peer maintainer skips a prefix another replica maintained
+/// within the window, learned purely from the durable lease stamp — no shared
+/// membership, no coordination (#126). This is how N stateless maintainers
+/// partition the work without duplicating it.
+#[tokio::test]
+async fn maintenance_claim_peer_skips_recently_maintained_prefix() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let scheduler = |bucket: InMemory| {
+        DynoStore::new(CLUSTER, NODE, bucket)
+            .prefix_coalesce(true)
+            .prefix_leaseless(true)
+            .coalesce_tuning(CoalesceTuning {
+                maintenance_recency: Some(Duration::from_secs(60)),
+                ..Default::default()
+            })
+    };
+    let a = scheduler(bucket.clone());
+    let b = scheduler(bucket.clone());
+    create_topic(&a, "org.env.conn.tab_a").await?;
+
+    let t = now_ms();
+    assert!(
+        a.claim_maintenance_prefixes(t).await?.contains(PREFIX),
+        "A claims the prefix"
+    );
+    assert!(
+        !b.claim_maintenance_prefixes(t).await?.contains(PREFIX),
+        "B skips it — A maintained it within the window (durable stamp, no coordination)"
     );
 
     Ok(())

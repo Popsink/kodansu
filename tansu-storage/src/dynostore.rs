@@ -334,6 +334,19 @@ pub struct DynoStore {
     prefix_compact_target_bytes: usize,
     prefix_compact_keep_hot: usize,
 
+    /// Recency window for stateless maintenance scheduling (#126): a prefix
+    /// whose compaction lease was last acquired within this window is skipped by
+    /// other maintainers (they neither LIST nor re-work it). Set to ~0.9× the
+    /// `maintenance_interval` so every prefix is still maintained ~once per
+    /// interval by exactly one replica. `0` disables the skip (every maintainer
+    /// works every prefix — the single-maintainer default behaviour).
+    maintenance_recency: Duration,
+
+    /// Per-process random seed for the maintenance traversal shuffle (#126), so
+    /// N stateless maintainers sweep the prefix set in independent orders and
+    /// partition the work by first-arrival rather than all starting at prefix 0.
+    maintenance_seed: u64,
+
     object_store: Arc<DynObjectStore>,
 }
 
@@ -393,6 +406,14 @@ struct PrefixLease {
     epoch: i64,
     holder: String,
     expires_at_ms: i64,
+    /// Wall-clock ms of the last acquire (#126). For the compaction lease this is
+    /// the last time a maintainer *claimed* the prefix, so a peer can skip a
+    /// recently-maintained prefix without doing its work (the recency window).
+    /// `#[serde(default)]` = 0 for old objects and for the produce lease (which
+    /// never reads it). Distinct from `expires_at_ms` so the lease TTL (fencing /
+    /// crash-takeover) stays decoupled from the maintenance recency window.
+    #[serde(default)]
+    maintained_at_ms: i64,
 }
 
 /// Durable lower bound on the next segment sequence for a prefix (#77). Segment
@@ -485,6 +506,8 @@ pub struct CoalesceTuning {
     pub prefix_compact_min_segments: Option<usize>,
     pub prefix_compact_target_bytes: Option<usize>,
     pub prefix_compact_keep_hot: Option<usize>,
+    /// Maintenance recency window (#126); set to ~0.9× `maintenance_interval`.
+    pub maintenance_recency: Option<Duration>,
 }
 
 /// Process-wide counter making each [`DynoStore`]'s `writer_id` unique (#59), so
@@ -1089,8 +1112,15 @@ impl DynoStore {
             era_epochs: Arc::new(Mutex::new(BTreeMap::new())),
             legacy_records_present: Arc::new(Mutex::new(BTreeMap::new())),
             compacted_topics: Arc::new(Mutex::new(BTreeMap::new())),
+            // Per-process random component so two ReplicaSet pods are actually
+            // distinguishable (#126): `node` is always 111 and `WRITER_INSTANCE`
+            // is a per-process counter, so without entropy every pod's first
+            // store is "111-0" — harmless for the lease (the etag is the fence)
+            // but it makes the lease `holder` useless for forensics and would
+            // break any identity-derived scheme.
             writer_id: format!(
-                "{node}-{}",
+                "{node}-{:016x}-{}",
+                rng().random::<u64>(),
                 WRITER_INSTANCE.fetch_add(1, atomic::Ordering::Relaxed)
             ),
             prefix_lease_ttl: Self::PREFIX_LEASE_TTL,
@@ -1102,6 +1132,8 @@ impl DynoStore {
             prefix_compact_min_segments: Self::PREFIX_COMPACT_MIN_SEGMENTS,
             prefix_compact_target_bytes: Self::PREFIX_COMPACT_TARGET_BYTES,
             prefix_compact_keep_hot: Self::PREFIX_COMPACT_KEEP_HOT,
+            maintenance_recency: Self::MAINTENANCE_RECENCY,
+            maintenance_seed: rng().random::<u64>(),
             topic_metas: Arc::new(Mutex::new(BTreeMap::new())),
             topic_index: Arc::new(Mutex::new(TopicIndex::default())),
             topic_index_refresh: Arc::new(tokio::sync::Mutex::new(())),
@@ -1192,6 +1224,9 @@ impl DynoStore {
             prefix_compact_keep_hot: tuning
                 .prefix_compact_keep_hot
                 .unwrap_or(self.prefix_compact_keep_hot),
+            maintenance_recency: tuning
+                .maintenance_recency
+                .unwrap_or(self.maintenance_recency),
             ..self
         }
     }
@@ -1392,6 +1427,13 @@ impl DynoStore {
     /// Newest segments never compacted (#66): leaves the actively-produced tail
     /// alone so compaction never races the current write point.
     const PREFIX_COMPACT_KEEP_HOT: usize = 16;
+
+    /// Default maintenance recency window (#126): ~0.9× the default
+    /// `maintenance_interval` (10 min), so a prefix maintained by one replica is
+    /// skipped by peers for just under an interval and every prefix is still
+    /// maintained ~once per interval. Override with `maintenance_recency` to
+    /// match a non-default interval.
+    const MAINTENANCE_RECENCY: Duration = Duration::from_secs(9 * 60);
 
     /// All topics, served from the in-memory [`TopicIndex`]. Returns the shared
     /// snapshot if fresh; otherwise refreshes it (single-flight) by LISTing the
@@ -2597,6 +2639,7 @@ impl DynoStore {
             // Expired on purpose: the first restarted lease pod re-acquires at
             // once (bumping to `epoch + 1`), rather than waiting out a term.
             expires_at_ms: 0,
+            maintained_at_ms: 0,
         };
         let payload = PutPayload::from(Bytes::from(serde_json::to_vec(&lease)?));
         let mode = match &version {
@@ -3667,6 +3710,10 @@ impl DynoStore {
             epoch,
             holder: self.writer_id.clone(),
             expires_at_ms: Self::now_ms() + self.prefix_lease_ttl.as_millis() as i64,
+            // Stamp the acquire time (#126): for the compaction lease this marks
+            // the prefix as maintained now, so a peer skips it for the recency
+            // window. Harmless for the produce lease (never read).
+            maintained_at_ms: Self::now_ms(),
         };
         let payload = PutPayload::from(Bytes::from(serde_json::to_vec(&lease)?));
         let mode = match &version {
@@ -4492,7 +4539,11 @@ impl DynoStore {
         Ok(expired)
     }
 
-    async fn policy_delete(&self, now: SystemTime) -> Result<u64> {
+    async fn policy_delete(
+        &self,
+        now: SystemTime,
+        owned: Option<&BTreeSet<String>>,
+    ) -> Result<u64> {
         const DEFAULT_RETENTION: Duration = Duration::from_hours(7 * 24);
 
         let now_ms = i64::try_from(
@@ -4567,7 +4618,7 @@ impl DynoStore {
         // per-partition loop above only drains a hybrid topic's legacy region);
         // expire whole segments per prefix (#61).
         if self.prefix_coalesce {
-            deleted += self.policy_delete_segments(now_ms).await?;
+            deleted += self.policy_delete_segments(now_ms, owned).await?;
         }
 
         Ok(deleted)
@@ -5062,7 +5113,97 @@ impl DynoStore {
     }
 
     /// Compact segments across every coalesced prefix (#66).
-    async fn policy_compact_segments(&self) -> Result<u64> {
+    /// Read the compaction lease object for `prefix` without acquiring it, or
+    /// `None` if absent (#126). Used by the maintenance claim to peek the
+    /// recency stamp before deciding whether to work the prefix.
+    async fn read_compaction_lease(&self, prefix: &str) -> Result<Option<PrefixLease>> {
+        let location = self.compaction_lease_location(prefix);
+        match self.object_store.get(&location).await {
+            Ok(result) => {
+                let bytes = result.bytes().await?;
+                Ok(Some(serde_json::from_slice::<PrefixLease>(&bytes)?))
+            }
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Claim this tick's maintenance work-set, stateless and coordinator-free
+    /// (#126). Every maintainer enumerates the full prefix universe (the
+    /// non-compacted topics' prefixes ∪ locally-indexed prefixes), shuffles it
+    /// with a per-process seed so N replicas sweep in independent orders, and for
+    /// each prefix:
+    ///
+    /// - **recency skip** — if the compaction lease shows it was maintained
+    ///   within `maintenance_recency`, a peer (or this replica) just did it, so
+    ///   skip without a `segments/` LIST or any work;
+    /// - **claim** — otherwise acquire the lease (which stamps `maintained_at_ms`
+    ///   and caches the held term, so the two passes' inner acquires are free).
+    ///   A win adds the prefix to the returned set; a fenced/lost claim means a
+    ///   peer is on it right now, so skip.
+    ///
+    /// The returned set is the filter both maintenance passes honour. The
+    /// per-prefix lease stays the correctness guard: a duplicate claim under a
+    /// race is fenced, so this can only over-cover (one wasted lease GET) or
+    /// under-cover (deferred to the next tick), never double-work or corrupt.
+    /// Recency `0` disables the skip → every maintainer claims every prefix
+    /// (single-maintainer behaviour).
+    async fn claim_maintenance_prefixes(&self, now_ms: i64) -> Result<BTreeSet<String>> {
+        let mut universe: BTreeSet<String> = self
+            .prefix_index
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .keys()
+            .cloned()
+            .collect();
+        for metadata in self.topics_index().await?.iter() {
+            let compact = metadata
+                .topic
+                .configs
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|config| {
+                    config.name == "cleanup.policy"
+                        && config
+                            .value
+                            .as_deref()
+                            .is_some_and(|value| value.contains("compact"))
+                });
+            if compact {
+                continue;
+            }
+            for partition in 0..metadata.topic.num_partitions {
+                _ = universe
+                    .insert(self.prefix_of(&Topition::new(metadata.topic.name.clone(), partition)));
+            }
+        }
+
+        let mut prefixes: Vec<String> = universe.into_iter().collect();
+        let mut rng = SmallRng::seed_from_u64(self.maintenance_seed ^ now_ms as u64);
+        prefixes.shuffle(&mut rng);
+
+        let recency_ms = self.maintenance_recency.as_millis() as i64;
+        let mut owned = BTreeSet::new();
+        for prefix in prefixes {
+            if recency_ms > 0
+                && let Some(lease) = self.read_compaction_lease(&prefix).await?
+                && now_ms.saturating_sub(lease.maintained_at_ms) < recency_ms
+            {
+                continue;
+            }
+            match self.acquire_compaction_lease(&prefix).await {
+                Ok(_) => {
+                    _ = owned.insert(prefix);
+                }
+                Err(Error::Api(ErrorCode::NotLeaderOrFollower)) => {}
+                Err(err) => error!(?err, prefix, "maintenance claim"),
+            }
+        }
+        Ok(owned)
+    }
+
+    async fn policy_compact_segments(&self, owned: Option<&BTreeSet<String>>) -> Result<u64> {
         if !self.prefix_coalesce || self.prefix_compact_min_segments == 0 {
             return Ok(0);
         }
@@ -5100,7 +5241,13 @@ impl DynoStore {
                     .insert(self.prefix_of(&Topition::new(metadata.topic.name.clone(), partition)));
             }
         }
-        let prefixes: Vec<String> = prefix_set.into_iter().collect();
+        // Honour this tick's maintenance claim (#126): only compact prefixes this
+        // replica owns. `None` = no sharding (every prefix), the single-maintainer
+        // default and the standalone-test path.
+        let prefixes: Vec<String> = prefix_set
+            .into_iter()
+            .filter(|prefix| owned.is_none_or(|owned| owned.contains(prefix)))
+            .collect();
 
         /// Bounds the drain loop so a pathological prefix can't monopolize a
         /// maintenance tick; far above the runs a real backlog needs.
@@ -5145,7 +5292,11 @@ impl DynoStore {
     /// max — otherwise a sibling's shorter retention could delete its data (#61
     /// review fix). `retention.ms=-1` (retain forever) makes the whole prefix
     /// infinite. Compacted topics never reach segments (legacy path at produce).
-    async fn policy_delete_segments(&self, now_ms: i64) -> Result<u64> {
+    async fn policy_delete_segments(
+        &self,
+        now_ms: i64,
+        owned: Option<&BTreeSet<String>>,
+    ) -> Result<u64> {
         const DEFAULT_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 
         let mut retention_by_prefix: BTreeMap<String, i64> = BTreeMap::new();
@@ -5197,6 +5348,12 @@ impl DynoStore {
         let mut deleted = 0;
 
         for (prefix, retention_ms) in retention_by_prefix {
+            // Honour this tick's maintenance claim (#126): only expire prefixes
+            // this replica owns. `None` = no sharding (every prefix).
+            if owned.is_some_and(|owned| !owned.contains(&prefix)) {
+                continue;
+            }
+
             let threshold_ms = now_ms.saturating_sub(retention_ms);
 
             if !self.prefix_maybe_expirable(&prefix, threshold_ms)? {
@@ -8361,11 +8518,30 @@ impl Storage for DynoStore {
     }
 
     async fn maintain(&self, now: SystemTime) -> Result<()> {
-        let deleted = self.policy_delete(now).await?;
+        // Claim this tick's prefix-segment maintenance work-set once (#126),
+        // stateless and coordinator-free: N maintainer replicas partition the
+        // prefixes by first-arrival on the per-prefix lease + a recency stamp,
+        // so retention and compaction of a prefix run under one claim (one
+        // discovery LIST, not one per pass per replica). `None` when prefix
+        // coalescing is off = today's every-prefix behaviour.
+        let owned = if self.prefix_coalesce {
+            let now_ms = i64::try_from(
+                now.duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+            )
+            .unwrap_or(i64::MAX);
+            Some(self.claim_maintenance_prefixes(now_ms).await?)
+        } else {
+            None
+        };
+        let owned = owned.as_ref();
+
+        let deleted = self.policy_delete(now, owned).await?;
         let compacted = self.policy_compact().await?;
         // Bound the live segment count per prefix (#66): merge old segments after
         // retention has pruned the expired ones.
-        let compacted_segments = self.policy_compact_segments().await?;
+        let compacted_segments = self.policy_compact_segments(owned).await?;
         let expired_groups = self.expire_groups(now).await?;
         debug!(deleted, compacted, compacted_segments, expired_groups);
 
