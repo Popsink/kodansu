@@ -3597,6 +3597,237 @@ impl DynoStore {
             .map(|ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms as u64)))
     }
 
+    /// Resolve one partition's `ListOffsets` entry: the offset (and best-effort
+    /// timestamp) for `offset_request`. `stable` maps a topition to its first
+    /// unstable offset under read-committed isolation (empty for
+    /// read-uncommitted). This is a single entry of [`Storage::list_offsets`],
+    /// split out so a request's partitions can be resolved concurrently —
+    /// `Ok(None)` means "no entry for this partition" (an unparseable batch
+    /// object name), exactly the cases the sequential loop used to `continue`
+    /// past without pushing a response.
+    async fn list_offset_response(
+        &self,
+        topition: &Topition,
+        offset_request: &ListOffset,
+        stable: &BTreeMap<Topition, Offset>,
+    ) -> Result<Option<ListOffsetResponse>> {
+        // LATEST (outside an open read-committed transaction) is the log end
+        // offset == high watermark, derived from the immutable batch objects
+        // (max base offset + that batch's record count). The previous
+        // `last_modified` ordering was wrong under inter-replica clock skew
+        // and `max_base + 1` ignored multi-record batches; `high_watermark`
+        // is correct on both counts. `None` (→ -1 on the wire) only for an
+        // empty log.
+        if *offset_request == ListOffset::Latest && !stable.contains_key(topition) {
+            let high = self.high_watermark(topition).await?;
+
+            // Tail timestamp. For a PURE-segment topic (#73) read it from the
+            // footer index (the newest segment's max record timestamp) rather
+            // than a per-topic `records/` LIST. This is the segment's
+            // record-time (closer to the SQL backends' record `timestamp` than
+            // the legacy object mtime), but the two sources differ, so the
+            // fallback is used whenever a segment isn't the authoritative tail:
+            // `coalesced_latest_timestamp` returns `None` for a non-coalesced
+            // or hybrid topic (a legacy object may sit above the segments), and
+            // we then take the legacy tail's mtime as before.
+            let timestamp = match if self.prefix_coalesce {
+                self.coalesced_latest_timestamp(topition).await?
+            } else {
+                None
+            } {
+                Some(timestamp) => Some(timestamp),
+                // Only the legacy `records/` tail can carry a timestamp when
+                // the segment index has none. For a pure-segment coalesced
+                // topic there are no legacy objects, so that LIST would scan
+                // an empty prefix and return nothing (#113) — skip it (the
+                // memo is cheap, #110) and report no timestamp. A hybrid /
+                // non-coalesced topic still lists for the legacy tail mtime.
+                None if self.prefix_coalesce && !self.has_legacy_records(topition).await? => None,
+                None => self
+                    .list_batch_offsets(topition)
+                    .await?
+                    .last_key_value()
+                    .map(|(_, meta)| meta.last_modified.into()),
+            };
+
+            return Ok(Some(ListOffsetResponse {
+                error_code: ErrorCode::None,
+                offset: Some(high),
+                timestamp,
+            }));
+        }
+
+        // Prefix-coalesced (#60): EARLIEST is the oldest segment's base
+        // offset for this sub-stream, read from the footer index — no
+        // `records/` listing (there is none). LATEST already went through
+        // `high_watermark` above (footer-aware).
+        if self.prefix_coalesce && *offset_request == ListOffset::Earliest {
+            let earliest = self.coalesced_earliest_offset(topition).await?;
+
+            return Ok(Some(ListOffsetResponse {
+                error_code: ErrorCode::None,
+                offset: Some(earliest),
+                timestamp: None,
+            }));
+        }
+
+        // Prefix-coalesced TIMESTAMP / `offsetsForTimes` (#105): resolve from
+        // the footer index — the earliest segment whose newest record
+        // timestamp is at/after the target — instead of the legacy `records/`
+        // scan below, which for a pure-segment topic finds nothing and wrongly
+        // returned offset 0. This is an in-memory scan of the warm index (no
+        // per-segment I/O); `None` (→ -1 on the wire) when no record is at or
+        // after the target, matching Kafka's "no offset" semantics. A hybrid
+        // topic (legacy objects above the segment tail) falls through to the
+        // records/ path so those batches are still considered.
+        if self.prefix_coalesce
+            && let ListOffset::Timestamp(target) = offset_request
+            && !self.has_legacy_records(topition).await?
+        {
+            let prefix = self.prefix_of(topition);
+            self.refresh_prefix_index(&prefix).await?;
+            let target_ms = target
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_millis() as i64)
+                .unwrap_or(0);
+
+            let found = self
+                .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
+                .into_iter()
+                .find(|(_, entry)| entry.max_timestamp >= 0 && entry.max_timestamp >= target_ms);
+
+            return Ok(Some(ListOffsetResponse {
+                error_code: ErrorCode::None,
+                offset: found.as_ref().map(|(_, entry)| entry.base_offset),
+                timestamp: found.as_ref().map(|(_, entry)| {
+                    SystemTime::UNIX_EPOCH + Duration::from_millis(entry.max_timestamp as u64)
+                }),
+            }));
+        }
+
+        let location = Path::from(format!(
+            "clusters/{}/topics/{}/partitions/{:0>10}/records",
+            self.cluster, topition.topic, topition.partition,
+        ));
+
+        let mut list_stream = self.object_store.list(Some(&location));
+
+        let mut candidate: Option<ObjectMeta> = None;
+
+        while let Some(meta) = list_stream
+            .next()
+            .await
+            .inspect(|meta| debug!(?meta))
+            .transpose()
+            .inspect_err(|error| error!(?error))
+            .map_err(Error::from)?
+        {
+            if let Some(last) = stable.get(topition)
+                && offset_request == &ListOffset::Latest
+            {
+                let Some(found_offset) = candidate
+                    .as_ref()
+                    .and_then(|found| found.location.parts().next_back())
+                    .and_then(|offset| i64::from_str(&offset.as_ref()[0..20]).ok())
+                else {
+                    continue;
+                };
+
+                let Some(meta_offset) = meta
+                    .location
+                    .parts()
+                    .next_back()
+                    .and_then(|offset| i64::from_str(&offset.as_ref()[0..20]).ok())
+                else {
+                    continue;
+                };
+
+                if meta_offset >= *last && found_offset > meta_offset {
+                    _ = candidate.replace(meta);
+                }
+            } else {
+                // Selection orders on the immutable base offset encoded in
+                // the object key, never on `last_modified`. Compaction
+                // rewrites surviving batches in place with
+                // `PutMode::Overwrite` (`compact_partition`), which bumps
+                // `last_modified`; ordering on it inverted the mtime↔offset
+                // relation and made EARLIEST/TIMESTAMP return an offset past
+                // retained data, so consumers silently skipped it (see #26).
+                // LATEST was already moved off mtime onto `high_watermark`.
+                let Some(meta_offset) = meta
+                    .location
+                    .parts()
+                    .next_back()
+                    .and_then(|offset| i64::from_str(&offset.as_ref()[0..20]).ok())
+                else {
+                    continue;
+                };
+
+                let found_offset = candidate.as_ref().and_then(|found| {
+                    found
+                        .location
+                        .parts()
+                        .next_back()
+                        .and_then(|offset| i64::from_str(&offset.as_ref()[0..20]).ok())
+                });
+
+                match offset_request {
+                    // EARLIEST: the smallest base offset present == the log
+                    // start (matches the SQL backends' `min(offset_id)`).
+                    ListOffset::Earliest
+                        if found_offset.is_none_or(|found| meta_offset < found) =>
+                    {
+                        _ = candidate.replace(meta);
+                    }
+
+                    ListOffset::Latest if found_offset.is_none_or(|found| meta_offset > found) => {
+                        _ = candidate.replace(meta);
+                    }
+
+                    // TIMESTAMP: earliest offset whose batch is not older than
+                    // the target. The `last_modified` predicate is the batch's
+                    // write time (best effort — a fully correct answer needs
+                    // per-record timestamps), but the candidate is chosen by
+                    // smallest base offset so the result stays monotonic in
+                    // offset rather than in mtime.
+                    ListOffset::Timestamp(system_time)
+                        if SystemTime::from(meta.last_modified) > *system_time
+                            && found_offset.is_none_or(|found| meta_offset < found) =>
+                    {
+                        _ = candidate.replace(meta);
+                    }
+                    _ => continue,
+                }
+            }
+        }
+
+        debug!(?candidate);
+
+        if let Some(ref found) = candidate {
+            let Some(offset) = found.location.parts().next_back() else {
+                return Ok(None);
+            };
+
+            let offset = i64::from_str(&offset.as_ref()[0..20])?;
+            debug!(offset);
+
+            Ok(Some(ListOffsetResponse {
+                error_code: ErrorCode::None,
+                offset: Some(match offset_request {
+                    ListOffset::Latest => offset + 1,
+                    _ => offset,
+                }),
+                timestamp: Some(found.last_modified.into()),
+            }))
+        } else {
+            Ok(Some(ListOffsetResponse {
+                error_code: ErrorCode::None,
+                offset: Some(0),
+                ..Default::default()
+            }))
+        }
+    }
+
     /// The per-prefix flush serialization lock (see [`Self::prefix_flush_locks`]).
     fn prefix_flush_lock(&self, prefix: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
         self.prefix_flush_locks
@@ -6969,255 +7200,47 @@ impl Storage for DynoStore {
             BTreeMap::new()
         };
 
-        let mut responses = vec![];
+        // Resolve the partitions CONCURRENTLY (bounded) instead of awaiting
+        // each in turn. A single ListOffsets can carry a consumer's whole
+        // assignment — `endOffsets` over ~1500 partitions — and one partition
+        // costs at least one object-store round-trip whenever its
+        // high-watermark hint is stale (the conditional GET of
+        // `watermark.json` in `persisted_high`; more for hybrid or
+        // non-coalesced topics, which LIST `records/`). The sequential loop
+        // was O(partitions × RTT) and blew past the Kafka client's request
+        // timeout at scale, so the consumer could never resolve its
+        // positions. Bounded concurrency issues exactly the same
+        // per-partition reads (and returns the same answers) while making
+        // wall-time O(partitions / concurrency); `buffered` — not
+        // `buffer_unordered` — preserves request order in the response, as
+        // the loop did. These per-partition paths already run concurrently
+        // across independent client requests, so no new interleaving is
+        // introduced. The bound matches `FOOTER_FETCH_CONCURRENCY`, keeping a
+        // wide request within the object store's throttling envelope.
+        const LIST_OFFSETS_CONCURRENCY: usize = 32;
 
-        for (topition, offset_request) in offsets {
-            // LATEST (outside an open read-committed transaction) is the log end
-            // offset == high watermark, derived from the immutable batch objects
-            // (max base offset + that batch's record count). The previous
-            // `last_modified` ordering was wrong under inter-replica clock skew
-            // and `max_base + 1` ignored multi-record batches; `high_watermark`
-            // is correct on both counts. `None` (→ -1 on the wire) only for an
-            // empty log.
-            if *offset_request == ListOffset::Latest && !stable.contains_key(topition) {
-                let high = self.high_watermark(topition).await?;
+        let stable = &stable;
 
-                // Tail timestamp. For a PURE-segment topic (#73) read it from the
-                // footer index (the newest segment's max record timestamp) rather
-                // than a per-topic `records/` LIST. This is the segment's
-                // record-time (closer to the SQL backends' record `timestamp` than
-                // the legacy object mtime), but the two sources differ, so the
-                // fallback is used whenever a segment isn't the authoritative tail:
-                // `coalesced_latest_timestamp` returns `None` for a non-coalesced
-                // or hybrid topic (a legacy object may sit above the segments), and
-                // we then take the legacy tail's mtime as before.
-                let timestamp = match if self.prefix_coalesce {
-                    self.coalesced_latest_timestamp(topition).await?
-                } else {
-                    None
-                } {
-                    Some(timestamp) => Some(timestamp),
-                    // Only the legacy `records/` tail can carry a timestamp when
-                    // the segment index has none. For a pure-segment coalesced
-                    // topic there are no legacy objects, so that LIST would scan
-                    // an empty prefix and return nothing (#113) — skip it (the
-                    // memo is cheap, #110) and report no timestamp. A hybrid /
-                    // non-coalesced topic still lists for the legacy tail mtime.
-                    None if self.prefix_coalesce && !self.has_legacy_records(topition).await? => {
-                        None
-                    }
-                    None => self
-                        .list_batch_offsets(topition)
-                        .await?
-                        .last_key_value()
-                        .map(|(_, meta)| meta.last_modified.into()),
-                };
+        // Eagerly collected: a lazily-mapped iterator of async blocks inside
+        // `stream::iter` trips a higher-ranked lifetime inference failure
+        // ("implementation of `FnOnce` is not general enough") under
+        // `async_trait`; the Vec pins every future to the one concrete
+        // lifetime of this call. The futures are inert until polled by
+        // `buffered`, so this allocates, it does not serialize.
+        let resolutions = offsets
+            .iter()
+            .map(|(topition, offset_request)| async move {
+                self.list_offset_response(topition, offset_request, stable)
+                    .await
+                    .map(|response| response.map(|response| (topition.to_owned(), response)))
+            })
+            .collect::<Vec<_>>();
 
-                responses.push((
-                    topition.to_owned(),
-                    ListOffsetResponse {
-                        error_code: ErrorCode::None,
-                        offset: Some(high),
-                        timestamp,
-                    },
-                ));
-
-                continue;
-            }
-
-            // Prefix-coalesced (#60): EARLIEST is the oldest segment's base
-            // offset for this sub-stream, read from the footer index — no
-            // `records/` listing (there is none). LATEST already went through
-            // `high_watermark` above (footer-aware).
-            if self.prefix_coalesce && *offset_request == ListOffset::Earliest {
-                let earliest = self.coalesced_earliest_offset(topition).await?;
-
-                responses.push((
-                    topition.to_owned(),
-                    ListOffsetResponse {
-                        error_code: ErrorCode::None,
-                        offset: Some(earliest),
-                        timestamp: None,
-                    },
-                ));
-
-                continue;
-            }
-
-            // Prefix-coalesced TIMESTAMP / `offsetsForTimes` (#105): resolve from
-            // the footer index — the earliest segment whose newest record
-            // timestamp is at/after the target — instead of the legacy `records/`
-            // scan below, which for a pure-segment topic finds nothing and wrongly
-            // returned offset 0. This is an in-memory scan of the warm index (no
-            // per-segment I/O); `None` (→ -1 on the wire) when no record is at or
-            // after the target, matching Kafka's "no offset" semantics. A hybrid
-            // topic (legacy objects above the segment tail) falls through to the
-            // records/ path so those batches are still considered.
-            if self.prefix_coalesce
-                && let ListOffset::Timestamp(target) = offset_request
-                && !self.has_legacy_records(topition).await?
-            {
-                let prefix = self.prefix_of(topition);
-                self.refresh_prefix_index(&prefix).await?;
-                let target_ms = target
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|elapsed| elapsed.as_millis() as i64)
-                    .unwrap_or(0);
-
-                let found = self
-                    .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
-                    .into_iter()
-                    .find(|(_, entry)| {
-                        entry.max_timestamp >= 0 && entry.max_timestamp >= target_ms
-                    });
-
-                responses.push((
-                    topition.to_owned(),
-                    ListOffsetResponse {
-                        error_code: ErrorCode::None,
-                        offset: found.as_ref().map(|(_, entry)| entry.base_offset),
-                        timestamp: found.as_ref().map(|(_, entry)| {
-                            SystemTime::UNIX_EPOCH
-                                + Duration::from_millis(entry.max_timestamp as u64)
-                        }),
-                    },
-                ));
-
-                continue;
-            }
-
-            let location = Path::from(format!(
-                "clusters/{}/topics/{}/partitions/{:0>10}/records",
-                self.cluster, topition.topic, topition.partition,
-            ));
-
-            let mut list_stream = self.object_store.list(Some(&location));
-
-            let mut candidate: Option<ObjectMeta> = None;
-
-            while let Some(meta) = list_stream
-                .next()
-                .await
-                .inspect(|meta| debug!(?meta))
-                .transpose()
-                .inspect_err(|error| error!(?error))
-                .map_err(Error::from)?
-            {
-                if let Some(last) = stable.get(topition)
-                    && offset_request == &ListOffset::Latest
-                {
-                    let Some(found_offset) = candidate
-                        .as_ref()
-                        .and_then(|found| found.location.parts().next_back())
-                        .and_then(|offset| i64::from_str(&offset.as_ref()[0..20]).ok())
-                    else {
-                        continue;
-                    };
-
-                    let Some(meta_offset) = meta
-                        .location
-                        .parts()
-                        .next_back()
-                        .and_then(|offset| i64::from_str(&offset.as_ref()[0..20]).ok())
-                    else {
-                        continue;
-                    };
-
-                    if meta_offset >= *last && found_offset > meta_offset {
-                        _ = candidate.replace(meta);
-                    }
-                } else {
-                    // Selection orders on the immutable base offset encoded in
-                    // the object key, never on `last_modified`. Compaction
-                    // rewrites surviving batches in place with
-                    // `PutMode::Overwrite` (`compact_partition`), which bumps
-                    // `last_modified`; ordering on it inverted the mtime↔offset
-                    // relation and made EARLIEST/TIMESTAMP return an offset past
-                    // retained data, so consumers silently skipped it (see #26).
-                    // LATEST was already moved off mtime onto `high_watermark`.
-                    let Some(meta_offset) = meta
-                        .location
-                        .parts()
-                        .next_back()
-                        .and_then(|offset| i64::from_str(&offset.as_ref()[0..20]).ok())
-                    else {
-                        continue;
-                    };
-
-                    let found_offset = candidate.as_ref().and_then(|found| {
-                        found
-                            .location
-                            .parts()
-                            .next_back()
-                            .and_then(|offset| i64::from_str(&offset.as_ref()[0..20]).ok())
-                    });
-
-                    match offset_request {
-                        // EARLIEST: the smallest base offset present == the log
-                        // start (matches the SQL backends' `min(offset_id)`).
-                        ListOffset::Earliest
-                            if found_offset.is_none_or(|found| meta_offset < found) =>
-                        {
-                            _ = candidate.replace(meta);
-                        }
-
-                        ListOffset::Latest
-                            if found_offset.is_none_or(|found| meta_offset > found) =>
-                        {
-                            _ = candidate.replace(meta);
-                        }
-
-                        // TIMESTAMP: earliest offset whose batch is not older than
-                        // the target. The `last_modified` predicate is the batch's
-                        // write time (best effort — a fully correct answer needs
-                        // per-record timestamps), but the candidate is chosen by
-                        // smallest base offset so the result stays monotonic in
-                        // offset rather than in mtime.
-                        ListOffset::Timestamp(system_time)
-                            if SystemTime::from(meta.last_modified) > *system_time
-                                && found_offset.is_none_or(|found| meta_offset < found) =>
-                        {
-                            _ = candidate.replace(meta);
-                        }
-                        _ => continue,
-                    }
-                }
-            }
-
-            debug!(?candidate);
-
-            if let Some(ref found) = candidate {
-                let Some(offset) = found.location.parts().next_back() else {
-                    continue;
-                };
-
-                let offset = i64::from_str(&offset.as_ref()[0..20])?;
-                debug!(offset);
-
-                responses.push((
-                    topition.to_owned(),
-                    ListOffsetResponse {
-                        error_code: ErrorCode::None,
-                        offset: Some(match offset_request {
-                            ListOffset::Latest => offset + 1,
-                            _ => offset,
-                        }),
-                        timestamp: Some(found.last_modified.into()),
-                    },
-                ))
-            } else {
-                responses.push((
-                    topition.to_owned(),
-                    ListOffsetResponse {
-                        error_code: ErrorCode::None,
-                        offset: Some(0),
-                        ..Default::default()
-                    },
-                ))
-            }
-        }
-
-        Ok(responses)
+        futures::stream::iter(resolutions)
+            .buffered(LIST_OFFSETS_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await
+            .map(|responses| responses.into_iter().flatten().collect())
     }
 
     async fn offset_commit(
