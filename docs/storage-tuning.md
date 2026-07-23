@@ -112,9 +112,38 @@ under a uniform retention (the longest `retention.ms` among the prefix's topics)
 | `prefix_compact_min_segments` | `256` | Compact a prefix once it holds more than this many live segments (`0` disables). |
 | `prefix_compact_target_bytes` | `64m` | Target size of a merged segment. |
 | `prefix_compact_keep_hot` | `16` | Newest segments never compacted (leaves the active tail alone). |
+| `maintenance_recency` | `9m` | A prefix maintained (compacted/expired) within this window is skipped by other maintainer replicas. Set to ~0.9× your `maintenance_interval`; `0` disables (every maintainer works every prefix). |
 
 The linger / batch-count / byte thresholds are shared with `produce_coalesce`
 (`coalesce_linger` / `coalesce_batches` / `coalesce_bytes`, above).
+
+### Scaling maintenance across stateless replicas (`maintenance_recency`)
+
+Compaction and segment retention run on the maintenance loop of every replica.
+Without coordination each maintainer would re-list and re-work every prefix each
+tick, so N maintainers duplicate the work N× with no throughput gain.
+
+The maintainers coordinate **statelessly and coordinator-free** — no ordinal, no
+StatefulSet, no membership list, exactly like the broker (they can be a plain
+ReplicaSet). Each tick a maintainer enumerates the full prefix set, shuffles it
+with a per-process seed so replicas sweep in independent orders, and for each
+prefix:
+
+- if the per-prefix compaction lease shows it was maintained within
+  `maintenance_recency`, it is skipped (no `segments/` LIST, no work) — a peer
+  just did it;
+- otherwise the maintainer claims the lease (recording the time), does the
+  retention + compaction for that prefix under that one claim, and moves on.
+
+So N maintainers partition the prefixes by first-arrival: aggregate throughput
+scales ~N, each prefix is maintained ~once per interval by ~one replica, and the
+discovery LIST is paid ~once per prefix instead of N×. The per-prefix lease
+remains the correctness guard, so a race only ever wastes one lease GET (the
+loser is fenced) — never double-compacts. Scaling maintainers up or down needs
+no config change and nothing to rebalance. Set `maintenance_recency` to ~0.9× of
+your `maintenance_interval` (a maintained prefix must stay skipped for just under
+one interval, so it is re-maintained exactly once per interval); `0` reverts to
+every-maintainer-works-every-prefix.
 
 ### Bounding the segment count (linger vs. compaction)
 
