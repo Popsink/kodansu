@@ -26,6 +26,7 @@ use rama::{Context, Service};
 use rsasl::config::SASLConfig;
 use rustls::ServerConfig;
 use std::{
+    future::Future,
     io::ErrorKind,
     marker::PhantomData,
     net::{IpAddr, Ipv6Addr, SocketAddr},
@@ -51,6 +52,39 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Level, debug, error, span, warn};
 use url::Url;
 use uuid::Uuid;
+
+/// Releases the maintenance in-flight flag on drop — on normal return, timeout
+/// cancellation, or panic unwind — so a run can never leave it stuck `true` and
+/// disable maintenance pod-wide until restart (#8, #131).
+struct InFlightGuard(Arc<AtomicBool>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Run a maintenance `pass` while holding the in-flight guard, bounded by
+/// `timeout`. On timeout the pass future is dropped (cancelled) and the guard is
+/// released as this returns, so a *hung* run — e.g. one wedged in S3
+/// `DeleteObjects` retry loops during a throttling storm — cannot hold the flag
+/// forever and disable compaction/retention pod-wide until the pod is restarted
+/// (#131). The overlap guard (#8) prevents *concurrent* runs; this is the escape
+/// hatch for a *stuck* one. Cancellation is safe: maintenance is idempotent and
+/// resumes on the next tick.
+async fn run_bounded_maintenance<F>(in_flight: Arc<AtomicBool>, timeout: Duration, pass: F)
+where
+    F: Future<Output = ()>,
+{
+    let _guard = InFlightGuard(in_flight);
+    if time::timeout(timeout, pass).await.is_err() {
+        warn!(
+            ?timeout,
+            "maintenance run exceeded its time budget; cancelling so the next tick retries \
+             (a run wedged in S3 retries would otherwise disable maintenance until restart)"
+        );
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct Broker<G, S> {
@@ -245,6 +279,17 @@ where
 
         let maintenance_period = self.maintenance_interval.unwrap_or(Duration::from_mins(10));
 
+        // Upper bound on a single maintenance run so a *hung* pass cannot hold the
+        // in-flight guard forever and disable maintenance pod-wide until restart
+        // (#131). A generous multiple of the interval, clamped so a "never"
+        // interval (compaction disabled on serving brokers) still yields a finite
+        // bound and a short interval still leaves a busy pass room to finish. A
+        // wedge is unbounded, so any finite bound catches it; cancellation is safe
+        // because maintenance is idempotent and resumes on the next tick.
+        let maintenance_run_timeout = maintenance_period
+            .saturating_mul(6)
+            .clamp(Duration::from_mins(10), Duration::from_mins(60));
+
         // Desynchronise replicas: every broker pod runs `maintain` on the *same*
         // bucket, and without this they fire on near-identical schedules from a
         // shared startup, so N replicas scan+delete the same prefixes at once —
@@ -266,19 +311,6 @@ where
         // can take longer than the interval, and spawning a second concurrent
         // run compounds the memory + S3 pressure (#8).
         let maintenance_in_flight = Arc::new(AtomicBool::new(false));
-
-        // Reset the in-flight flag on drop rather than with a bare `store` at the
-        // end of the run: `maintain` can panic (e.g. a malformed object key), and
-        // a panic in the spawned task would otherwise leave the flag stuck `true`
-        // and disable maintenance for the whole pod until restart. Drop runs on
-        // the unwind path too, so the flag is always released (#8).
-        struct InFlightGuard(Arc<AtomicBool>);
-
-        impl Drop for InFlightGuard {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
-            }
-        }
 
         let mut set = JoinSet::new();
 
@@ -382,19 +414,17 @@ where
                         warn!("skipping maintenance tick: previous run still in flight");
                     } else {
                         let storage = self.storage.clone();
-                        let guard = InFlightGuard(maintenance_in_flight.clone());
+                        let in_flight = maintenance_in_flight.clone();
 
                         let handle = set.spawn(async move {
                             let span = span!(Level::DEBUG, "maintenance");
 
-                            async move {
-                                // Released when this block ends — including on a
-                                // panic unwind — so the flag never sticks (#8).
-                                let _guard = guard;
-
+                            // Bounded so a hung run releases the guard and the next
+                            // tick can retry, rather than wedging maintenance
+                            // pod-wide until restart (#131).
+                            run_bounded_maintenance(in_flight, maintenance_run_timeout, async move {
                                 _ = storage.maintain(SystemTime::now()).await.inspect(|maintain|debug!(?maintain)).inspect_err(|err|debug!(?err)).ok();
-                            }.instrument(span).await
-
+                            }).instrument(span).await
                         });
 
                         debug!(?handle);
@@ -675,5 +705,46 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             topic_defaults: self.topic_defaults,
             cancellation: self.cancellation,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::pending;
+
+    // A run that never completes (modelling a pass wedged in S3 retry loops)
+    // must be cancelled at the timeout and release the in-flight guard, so the
+    // next tick can retry — not stay `true` and disable maintenance pod-wide
+    // until restart (#131). Paused time makes `timeout` fire in virtual time.
+    #[tokio::test(start_paused = true)]
+    async fn bounded_maintenance_cancels_a_hung_pass_and_releases_the_guard() {
+        let in_flight = Arc::new(AtomicBool::new(true));
+
+        run_bounded_maintenance(in_flight.clone(), Duration::from_secs(60), pending::<()>()).await;
+
+        assert!(
+            !in_flight.load(Ordering::Acquire),
+            "guard must be released after a timed-out run"
+        );
+    }
+
+    // The normal path: the pass runs to completion and the guard is released.
+    #[tokio::test]
+    async fn bounded_maintenance_runs_the_pass_and_releases_the_guard() {
+        let in_flight = Arc::new(AtomicBool::new(true));
+        let ran = Arc::new(AtomicBool::new(false));
+
+        let ran_in_pass = ran.clone();
+        run_bounded_maintenance(in_flight.clone(), Duration::from_secs(60), async move {
+            ran_in_pass.store(true, Ordering::Release);
+        })
+        .await;
+
+        assert!(ran.load(Ordering::Acquire), "the pass must have run");
+        assert!(
+            !in_flight.load(Ordering::Acquire),
+            "guard must be released after the run completes"
+        );
     }
 }
