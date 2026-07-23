@@ -91,6 +91,13 @@ const APPLICATION_JSON: &str = "application/json";
 /// with a per-entry TTL (#110). Aliased to keep the field type readable.
 type LegacyRecordsMemo = BTreeMap<Topition, (bool, SystemTime, Duration)>;
 
+/// Per-*prefix* compaction-discovery skip memo: `(live_count, swept_at,
+/// growth_per_sec)` observed at the last real `segments/` LIST (#132). Lets the
+/// maintenance loop project the segment count forward from the last observation
+/// and skip the LIST of a prefix provably still below
+/// `prefix_compact_min_segments`. Aliased to keep the field type readable.
+type CompactBoundedMemo = BTreeMap<String, (usize, SystemTime, f64)>;
+
 #[derive(Clone, Debug)]
 pub struct DynoStore {
     cluster: String,
@@ -346,6 +353,23 @@ pub struct DynoStore {
     /// N stateless maintainers sweep the prefix set in independent orders and
     /// partition the work by first-arrival rather than all starting at prefix 0.
     maintenance_seed: u64,
+
+    /// Compaction-discovery skip hint (#132), the compaction analogue of
+    /// [`Self::oldest_retained_prefix`]. `compact_prefix_segments` records each
+    /// prefix's live segment count (and the growth rate since the previous
+    /// observation) here after every real `segments/` LIST, and consults it
+    /// *before* the next LIST: if a conservative forward projection keeps the
+    /// count below [`Self::prefix_compact_min_segments`], there is provably
+    /// nothing to compact and the LIST is skipped. This retires the residual
+    /// per-prefix maintainer LIST floor — the vast majority of prefixes sit
+    /// bounded at/below the threshold, yet compaction (unlike retention, which
+    /// has [`Self::oldest_retained_prefix`]) re-LISTs them every sweep. Skipping
+    /// only *delays* discovery: compaction is idempotent and the segment cap is
+    /// soft, and a staleness backstop ([`Self::COMPACT_SKIP_MAX_STALENESS`])
+    /// forces a re-LIST so a prefix that turns from idle to busy is still caught.
+    /// In-memory only, rebuilt from the first sweep after a restart, independent
+    /// per maintain node.
+    compact_bounded: Arc<Mutex<CompactBoundedMemo>>,
 
     object_store: Arc<DynObjectStore>,
 }
@@ -1134,6 +1158,7 @@ impl DynoStore {
             prefix_compact_keep_hot: Self::PREFIX_COMPACT_KEEP_HOT,
             maintenance_recency: Self::MAINTENANCE_RECENCY,
             maintenance_seed: rng().random::<u64>(),
+            compact_bounded: Arc::new(Mutex::new(BTreeMap::new())),
             topic_metas: Arc::new(Mutex::new(BTreeMap::new())),
             topic_index: Arc::new(Mutex::new(TopicIndex::default())),
             topic_index_refresh: Arc::new(tokio::sync::Mutex::new(())),
@@ -1434,6 +1459,23 @@ impl DynoStore {
     /// maintained ~once per interval. Override with `maintenance_recency` to
     /// match a non-default interval.
     const MAINTENANCE_RECENCY: Duration = Duration::from_secs(9 * 60);
+
+    /// Safety multiplier applied to the observed per-prefix growth rate when the
+    /// compaction-discovery skip (#132) projects the segment count forward. A
+    /// prefix is only skipped if it stays below `prefix_compact_min_segments`
+    /// even assuming it grows at `COMPACT_SKIP_SAFETY×` its last-observed rate,
+    /// so a prefix accelerating toward the threshold is re-LISTed early rather
+    /// than skipped into an overshoot.
+    const COMPACT_SKIP_SAFETY: f64 = 2.0;
+
+    /// Staleness backstop for the compaction-discovery skip (#132): however low
+    /// the projection, a prefix is re-LISTed at least this often. This self-heals
+    /// the one case the rate projection cannot see on a maintainer that does not
+    /// itself produce — a prefix that was idle (observed rate ~0) then suddenly
+    /// turns busy — bounding the worst-case discovery lag (and thus the transient
+    /// segment overshoot) to this window while still skipping the steady stream
+    /// of quiet, bounded prefixes on every sweep in between.
+    const COMPACT_SKIP_MAX_STALENESS: Duration = Duration::from_secs(30 * 60);
 
     /// All topics, served from the in-memory [`TopicIndex`]. Returns the shared
     /// snapshot if fresh; otherwise refreshes it (single-flight) by LISTing the
@@ -4855,6 +4897,69 @@ impl DynoStore {
         Ok(deleted)
     }
 
+    /// Whether the compaction-discovery `segments/` LIST for `prefix` can be
+    /// skipped this sweep (#132), the compaction analogue of the retention
+    /// `oldest_retained_prefix` hint.
+    ///
+    /// Consults the in-memory memo left by [`Self::record_compact_bounded`] at the
+    /// end of the last sweep that actually LISTed this prefix. That memo holds the
+    /// live segment count then, the instant it was taken, and a conservative
+    /// growth rate. We project the count forward — `count + rate × SAFETY ×
+    /// elapsed` — and skip only if it stays below `prefix_compact_min_segments`:
+    /// nothing can have crossed the trigger, so there is nothing to compact.
+    ///
+    /// Soundness mirrors `oldest_retained_prefix`: the memo is a *lower bound* on
+    /// what a LIST would show only in the sense that skipping merely *delays*
+    /// discovery — compaction is idempotent and the segment cap is soft. A busy
+    /// prefix is drained to the trigger each sweep, so its recorded count sits at
+    /// the trigger and it is never skipped; only genuinely bounded prefixes are.
+    /// The `COMPACT_SKIP_MAX_STALENESS` backstop forces a re-LIST even when the
+    /// projection stays low, self-healing the idle→busy transition (which a
+    /// non-producing maintainer's rate estimate cannot otherwise see). Absent memo
+    /// (cold after restart, or never LISTed) never skips. In-memory, per process.
+    fn compaction_discovery_skip(&self, prefix: &str) -> Result<bool> {
+        let memo = self.compact_bounded.lock().map_err(Into::<Error>::into)?;
+        let Some(&(count, at, rate)) = memo.get(prefix) else {
+            return Ok(false);
+        };
+        let elapsed = SystemTime::now().duration_since(at).unwrap_or_default();
+        if elapsed >= Self::COMPACT_SKIP_MAX_STALENESS {
+            return Ok(false);
+        }
+        let projected = count as f64 + rate * Self::COMPACT_SKIP_SAFETY * elapsed.as_secs_f64();
+        Ok(projected < self.prefix_compact_min_segments as f64)
+    }
+
+    /// Record the live segment count observed for `prefix` at the end of a sweep
+    /// that LISTed it, for the next sweep's [`Self::compaction_discovery_skip`]
+    /// (#132). Derives a conservative growth rate from the delta against the
+    /// previous recorded observation (clamped at zero — a shrink, e.g. from
+    /// retention or a merge, is not growth), so a prefix that is visibly
+    /// accelerating toward the trigger is re-LISTed early rather than skipped.
+    /// Called once per prefix per sweep, at each bounded/no-work return, so
+    /// consecutive records are one sweep apart and the rate reflects real
+    /// cross-sweep growth rather than within-drain churn.
+    fn record_compact_bounded(&self, prefix: &str, count: usize) -> Result<()> {
+        let now = SystemTime::now();
+        let mut memo = self.compact_bounded.lock().map_err(Into::<Error>::into)?;
+        let rate = match memo.get(prefix) {
+            Some(&(prev_count, prev_at, _)) => {
+                let dt = now
+                    .duration_since(prev_at)
+                    .unwrap_or_default()
+                    .as_secs_f64();
+                if dt > 0.0 {
+                    (count as f64 - prev_count as f64).max(0.0) / dt
+                } else {
+                    0.0
+                }
+            }
+            None => 0.0,
+        };
+        _ = memo.insert(prefix.to_owned(), (count, now, rate));
+        Ok(())
+    }
+
     /// Compact a prefix's oldest segments into fewer, larger ones (#66) to bound
     /// the live segment count `S` (otherwise ≈ flush_rate × retention, unbounded)
     /// — keeping the footer index footprint and the per-fetch scan bounded.
@@ -4871,6 +4976,16 @@ impl DynoStore {
     /// refreshed index (see `fetch_prefix_coalesced`).
     async fn compact_prefix_segments(&self, prefix: &str) -> Result<u64> {
         if self.prefix_compact_min_segments == 0 {
+            return Ok(0);
+        }
+
+        // Compaction-discovery skip (#132): if the last observation of this prefix
+        // projects forward to still under the trigger, there is provably nothing
+        // to compact — return without paying the `segments/` LIST. This is the
+        // compaction analogue of the retention `oldest_retained_prefix` hint, and
+        // retires the residual per-prefix maintainer LIST floor for the bulk of
+        // prefixes, which sit bounded at/below the threshold.
+        if self.compaction_discovery_skip(prefix)? {
             return Ok(0);
         }
 
@@ -4908,10 +5023,13 @@ impl DynoStore {
 
         // Only above the trigger, and never touch the hot (newest) tail.
         if segs.len() <= self.prefix_compact_min_segments {
+            // Bounded: record the observation so the next sweep can skip the LIST.
+            self.record_compact_bounded(prefix, segs.len())?;
             return Ok(0);
         }
         let eligible_end = segs.len().saturating_sub(self.prefix_compact_keep_hot);
         if eligible_end < 2 {
+            self.record_compact_bounded(prefix, segs.len())?;
             return Ok(0);
         }
 
@@ -4968,6 +5086,10 @@ impl DynoStore {
             (chosen, chosen_last_modified)
         };
         if run.len() < 2 {
+            // Over the trigger but no mergeable run this pass (eligible segments
+            // already at target size). Record the true count so the skip hint
+            // does not wrongly project this prefix as bounded next sweep.
+            self.record_compact_bounded(prefix, segs.len())?;
             return Ok(0);
         }
 

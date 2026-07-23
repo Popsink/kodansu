@@ -2433,3 +2433,106 @@ async fn maintenance_claim_peer_skips_recently_maintained_prefix() -> Result<(),
 
     Ok(())
 }
+
+/// Compaction-discovery skip (#132): once a sweep records a prefix as bounded,
+/// the next sweep returns without a `segments/` LIST — even if segments have
+/// since piled up — so the maintainer stops paying one LIST per bounded prefix
+/// per sweep (the residual LIST floor). The skip only *delays* discovery: the
+/// piled-up segments are compacted on the next non-skipped sweep.
+#[tokio::test]
+async fn compaction_discovery_skip_avoids_relist_for_bounded_prefix() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .coalesce_tuning(CoalesceTuning {
+            prefix_compact_min_segments: Some(2),
+            prefix_compact_keep_hot: Some(0),
+            prefix_compact_target_bytes: Some(1 << 30),
+            ..Default::default()
+        });
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    // One segment: bounded (<= min_segments). The sweep records the observation.
+    _ = store.produce(None, &a, batch(1)?).await?;
+    assert_eq!(1, segments(&bucket).await.len());
+    assert_eq!(0, store.compact_prefix_segments(PREFIX).await?);
+    assert!(
+        store
+            .compact_bounded
+            .lock()
+            .expect("memo")
+            .contains_key(PREFIX),
+        "a bounded sweep records the skip hint"
+    );
+
+    // Segments pile past the trigger, but the memo still projects bounded.
+    for _ in 0..3 {
+        _ = store.produce(None, &a, batch(1)?).await?;
+    }
+    assert_eq!(4, segments(&bucket).await.len());
+
+    // Next sweep skips: it neither LISTs nor compacts, so all four survive.
+    assert_eq!(0, store.compact_prefix_segments(PREFIX).await?);
+    assert_eq!(
+        4,
+        segments(&bucket).await.len(),
+        "the skip avoided the re-LIST + compaction — segments untouched"
+    );
+
+    Ok(())
+}
+
+/// The skip is bounded on both axes (#132): a prefix visibly growing toward the
+/// trigger is re-LISTed early (forward projection at `SAFETY×` the observed
+/// rate), and any prefix is re-LISTed at least once per `COMPACT_SKIP_MAX_STALENESS`
+/// regardless of projection, so an idle→busy prefix is still caught.
+#[tokio::test]
+async fn compaction_discovery_skip_relists_when_growing_or_stale() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    // Default trigger of 256 segments.
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+
+    // No observation yet: never skip (must LIST to learn the count).
+    assert!(
+        !store.compaction_discovery_skip(PREFIX)?,
+        "absent memo never skips"
+    );
+
+    let set = |count: usize, age: Duration, rate: f64| {
+        _ = store
+            .compact_bounded
+            .lock()
+            .expect("memo")
+            .insert(PREFIX.to_owned(), (count, SystemTime::now() - age, rate));
+    };
+
+    // Comfortably bounded and fresh: skip.
+    set(1, Duration::from_secs(1), 0.0);
+    assert!(store.compaction_discovery_skip(PREFIX)?, "bounded → skip");
+
+    // Near the trigger and growing: the projection crosses it → re-LIST.
+    // 200 + rate(1.0) × SAFETY(2) × 60s = 320 > 256.
+    set(200, Duration::from_secs(60), 1.0);
+    assert!(
+        !store.compaction_discovery_skip(PREFIX)?,
+        "growth projected past the trigger → re-LIST"
+    );
+
+    // Same count, negligible rate: projection stays under the trigger → skip.
+    set(200, Duration::from_secs(60), 0.01);
+    assert!(
+        store.compaction_discovery_skip(PREFIX)?,
+        "flat prefix stays skipped"
+    );
+
+    // Stale beyond the backstop: re-LIST however low the projection.
+    set(1, Duration::from_secs(31 * 60), 0.0);
+    assert!(
+        !store.compaction_discovery_skip(PREFIX)?,
+        "staleness backstop forces a re-LIST"
+    );
+
+    Ok(())
+}
