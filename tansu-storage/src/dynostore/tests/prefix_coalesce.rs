@@ -2536,3 +2536,156 @@ async fn compaction_discovery_skip_relists_when_growing_or_stale() -> Result<(),
 
     Ok(())
 }
+
+/// An `ObjectStore` that, while `armed`, fails every *segment* create-CAS
+/// (`PutMode::Create` on a `*.seg` key) with `AlreadyExists` — modelling a hot
+/// prefix whose tail sequence is perpetually contended (peers winning it, or S3
+/// throttling slowing our PUTs) so a leaseless flush burns its whole retry
+/// budget. Every other operation, and non-segment PUTs (e.g. `era.json`),
+/// delegate to the inner store.
+#[derive(Clone)]
+struct ContendSegmentCreate<O> {
+    inner: O,
+    armed: Arc<AtomicBool>,
+}
+
+impl<O> Debug for ContendSegmentCreate<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ContendSegmentCreate").finish()
+    }
+}
+
+impl<O> Display for ContendSegmentCreate<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ContendSegmentCreate").finish()
+    }
+}
+
+#[async_trait]
+impl<O> ObjectStore for ContendSegmentCreate<O>
+where
+    O: ObjectStore,
+{
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult, object_store::Error> {
+        if self.armed.load(Relaxed)
+            && matches!(opts.mode, PutMode::Create)
+            && seg_seq_of(location).is_some()
+        {
+            return Err(object_store::Error::AlreadyExists {
+                path: location.to_string(),
+                source: "injected create-CAS contention".into(),
+            });
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> Result<GetResult, object_store::Error> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path, object_store::Error>>,
+    ) -> BoxStream<'static, Result<Path, object_store::Error>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> Result<ListResult, object_store::Error> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: CopyOptions,
+    ) -> Result<(), object_store::Error> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+}
+
+/// #129: a leaseless flush that exhausts its create-CAS retry budget (a hot
+/// prefix under perpetual sequence contention / S3 throttling) must fail with a
+/// **retriable** code, so the client backs off and retries — not the fatal
+/// `UnknownServerError` (-1) that makes clients drop the batch and drove the
+/// downstream connector OOM loop. The condition is transient and self-heals.
+#[tokio::test]
+async fn leaseless_flush_exhaustion_is_retriable_not_fatal() -> Result<(), Error> {
+    let inner = InMemory::new();
+    let armed = Arc::new(AtomicBool::new(false));
+    let store = DynoStore::new(
+        CLUSTER,
+        NODE,
+        ContendSegmentCreate {
+            inner: inner.clone(),
+            armed: armed.clone(),
+        },
+    )
+    .prefix_coalesce(true)
+    .prefix_leaseless(true);
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let tp = Topition::new(topic, 0);
+
+    // Baseline: a normal produce succeeds and lays down a segment.
+    _ = store.produce(None, &tp, batch(1)?).await?;
+
+    // Arm perpetual contention on the segment tail → the flush burns all its
+    // create-CAS attempts and hits the exhaustion terminal.
+    armed.store(true, Relaxed);
+    let error = store
+        .produce(None, &tp, batch(1)?)
+        .await
+        .expect_err("flush must fail when the sequence is perpetually contended");
+
+    // The fix: exhaustion is retriable, not fatal `-1`.
+    assert!(
+        matches!(error, Error::Api(ErrorCode::KafkaStorageError)),
+        "exhaustion must be a retriable KafkaStorageError, got {error:?}"
+    );
+    assert!(
+        !matches!(error, Error::Api(ErrorCode::UnknownServerError)),
+        "must not be the fatal UnknownServerError that makes clients drop the batch"
+    );
+
+    // Self-heals: once contention clears, produce succeeds again.
+    armed.store(false, Relaxed);
+    _ = store.produce(None, &tp, batch(1)?).await?;
+
+    Ok(())
+}
