@@ -3929,7 +3929,11 @@ mod tests {
                     JoinGroupResponse::default()
                         .throttle_time_ms(Some(0))
                         .error_code(ErrorCode::None.into())
-                        .generation_id(2)
+                        // The joining member observes the in-progress rebalance's
+                        // generation (1): admitting it moved the group off the
+                        // stable generation 0. It only advances to 2 once the
+                        // leader re-joins with a new subscription further down.
+                        .generation_id(1)
                         .protocol_type(Some(CONSUMER.into()))
                         .protocol_name(Some(Assignor::RANGE.into()))
                         .leader(first_member_id.clone())
