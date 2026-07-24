@@ -55,6 +55,78 @@ async fn metadata(
         .map_err(Into::into)
 }
 
+async fn metadata_many(
+    storage: Arc<Box<dyn Storage>>,
+    names: &[String],
+    allow_auto_topic_creation: bool,
+) -> Result<MetadataResponse, Error> {
+    MapStateLayer::new(|_| storage)
+        .into_layer(MetadataService)
+        .serve(
+            Context::default(),
+            MetadataRequest::default()
+                .allow_auto_topic_creation(Some(allow_auto_topic_creation))
+                .include_cluster_authorized_operations(Some(false))
+                .include_topic_authorized_operations(Some(false))
+                .topics(Some(
+                    names
+                        .iter()
+                        .map(|name| MetadataRequestTopic::default().name(Some(name.into())))
+                        .collect(),
+                )),
+        )
+        .await
+        .map_err(Into::into)
+}
+
+/// A multi-topic metadata request returns exactly one entry per requested
+/// topic, in REQUEST ORDER, each carrying that topic's own status — the
+/// invariant the concurrent (`buffered`) per-topic fetch must preserve. The
+/// request interleaves known and unknown topics and spans several fetch
+/// concurrency windows, so an out-of-order or index-shifted result (the
+/// failure mode a naive `buffer_unordered` or a mis-zipped parallel rewrite
+/// would introduce) is caught.
+#[tokio::test]
+async fn multi_topic_metadata_preserves_order_and_per_topic_status() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = storage("memory://tansu/").await?;
+
+    // Auto-create 100 known topics.
+    for i in 0..100 {
+        let _ = metadata(storage.clone(), &format!("known-{i:03}"), true).await?;
+    }
+
+    // known-000, missing-000, known-001, missing-001, ... (200 topics).
+    let requested = (0..100)
+        .flat_map(|i| [format!("known-{i:03}"), format!("missing-{i:03}")])
+        .collect::<Vec<_>>();
+
+    let response = metadata_many(storage.clone(), &requested, false).await?;
+    let topics = response.topics.as_deref().unwrap_or_default();
+
+    assert_eq!(requested.len(), topics.len());
+    for (index, name) in requested.iter().enumerate() {
+        assert_eq!(
+            Some(name.as_str()),
+            topics[index].name.as_deref(),
+            "response out of request order at {index}"
+        );
+        let expected = if name.starts_with("known-") {
+            ErrorCode::None
+        } else {
+            ErrorCode::UnknownTopicOrPartition
+        };
+        assert_eq!(
+            i16::from(expected),
+            topics[index].error_code,
+            "wrong status for {name}"
+        );
+    }
+
+    Ok(())
+}
+
 /// Default policy is enabled: a request that opts in auto-creates an unknown
 /// topic with a single partition, and the response reflects it as existing.
 #[tokio::test]

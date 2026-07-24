@@ -7684,104 +7684,129 @@ impl Storage for DynoStore {
 
         let responses = match topics {
             Some(topics) if !topics.is_empty() => {
-                let mut responses = vec![];
+                // Fetch each topic's metadata concurrently. `topic_metadata`'s
+                // object-store GET is the only await here; a serial loop is
+                // O(topics × RTT) and, on a high-latency store, blew past the
+                // client's metadata/request timeout at scale — so a consumer
+                // group leader resolving the union of its members' subscriptions
+                // (hundreds–thousands of topics) never completed the fetch,
+                // never sent SyncGroup, and the group stayed `Forming` with zero
+                // partitions assigned. Bounded concurrency issues exactly the
+                // same per-topic reads and returns the same answers, in
+                // O(topics / concurrency) wall time. `buffered` preserves
+                // response order; collecting `Result`s (not `try_collect`) keeps
+                // the per-topic error handling below intact. Same scaling fix as
+                // ListOffsets (#147), same concurrency bound.
+                const METADATA_FETCH_CONCURRENCY: usize = 32;
 
-                for topic in topics {
-                    let response = match self
-                        .topic_metadata(topic)
-                        .await
-                        .inspect_err(|error| error!(?error))
-                    {
-                        Ok(Some(topic_metadata)) => {
-                            let name = Some(topic_metadata.topic.name.to_owned());
-                            let error_code = ErrorCode::None.into();
-                            let topic_id = Some(topic_metadata.id.into_bytes());
-                            let is_internal = Some(false);
-                            let partitions = topic_metadata.topic.num_partitions;
-                            let replication_factor = topic_metadata.topic.replication_factor;
+                // Eagerly collected to pin every future to this call's lifetime
+                // under `async_trait` (see the identical note on ListOffsets);
+                // the futures are inert until polled by `buffered`, so this
+                // allocates, it does not serialize.
+                let fetches = topics
+                    .iter()
+                    .map(|topic| async move { self.topic_metadata(topic).await })
+                    .collect::<Vec<_>>();
 
-                            debug!(
-                                ?error_code,
-                                ?topic_id,
-                                ?name,
-                                ?is_internal,
-                                ?partitions,
-                                ?replication_factor
-                            );
+                let fetched = futures::stream::iter(fetches)
+                    .buffered(METADATA_FETCH_CONCURRENCY)
+                    .collect::<Vec<_>>()
+                    .await;
 
-                            let mut rng = rng();
-                            let mut broker_ids: Vec<_> =
-                                brokers.iter().map(|broker| broker.node_id).collect();
-                            broker_ids.shuffle(&mut rng);
+                topics
+                    .iter()
+                    .zip(fetched)
+                    .map(
+                        |(topic, result)| match result.inspect_err(|error| error!(?error)) {
+                            Ok(Some(topic_metadata)) => {
+                                let name = Some(topic_metadata.topic.name.to_owned());
+                                let error_code = ErrorCode::None.into();
+                                let topic_id = Some(topic_metadata.id.into_bytes());
+                                let is_internal = Some(false);
+                                let partitions = topic_metadata.topic.num_partitions;
+                                let replication_factor = topic_metadata.topic.replication_factor;
 
-                            let mut brokers = broker_ids.into_iter().cycle();
+                                debug!(
+                                    ?error_code,
+                                    ?topic_id,
+                                    ?name,
+                                    ?is_internal,
+                                    ?partitions,
+                                    ?replication_factor
+                                );
 
-                            let partitions = Some(
-                                (0..partitions)
-                                    .map(|partition_index| {
-                                        let leader_id = brokers.next().expect("cycling");
+                                let mut rng = rng();
+                                let mut broker_ids: Vec<_> =
+                                    brokers.iter().map(|broker| broker.node_id).collect();
+                                broker_ids.shuffle(&mut rng);
 
-                                        let replica_nodes = Some(
-                                            (0..replication_factor)
-                                                .map(|_replica| brokers.next().expect("cycling"))
-                                                .collect(),
-                                        );
-                                        let isr_nodes = replica_nodes.clone();
+                                let mut brokers = broker_ids.into_iter().cycle();
 
-                                        MetadataResponsePartition::default()
-                                            .error_code(error_code)
-                                            .partition_index(partition_index)
-                                            .leader_id(leader_id)
-                                            .leader_epoch(Some(0))
-                                            .replica_nodes(replica_nodes)
-                                            .isr_nodes(isr_nodes)
-                                            .offline_replicas(Some([].into()))
-                                    })
-                                    .collect(),
-                            );
+                                let partitions = Some(
+                                    (0..partitions)
+                                        .map(|partition_index| {
+                                            let leader_id = brokers.next().expect("cycling");
 
-                            MetadataResponseTopic::default()
-                                .error_code(error_code)
-                                .name(name)
-                                .topic_id(topic_id)
-                                .is_internal(is_internal)
-                                .partitions(partitions)
-                                .topic_authorized_operations(Some(-2147483648))
-                        }
+                                            let replica_nodes = Some(
+                                                (0..replication_factor)
+                                                    .map(|_replica| {
+                                                        brokers.next().expect("cycling")
+                                                    })
+                                                    .collect(),
+                                            );
+                                            let isr_nodes = replica_nodes.clone();
 
-                        Ok(None) => MetadataResponseTopic::default()
-                            .error_code(ErrorCode::UnknownTopicOrPartition.into())
-                            .name(match topic {
-                                TopicId::Name(name) => Some(name.into()),
-                                TopicId::Id(_) => None,
-                            })
-                            .topic_id(Some(match topic {
-                                TopicId::Name(_) => NULL_TOPIC_ID,
-                                TopicId::Id(id) => id.into_bytes(),
-                            }))
-                            .is_internal(Some(false))
-                            .partitions(Some([].into()))
-                            .topic_authorized_operations(Some(-2147483648)),
+                                            MetadataResponsePartition::default()
+                                                .error_code(error_code)
+                                                .partition_index(partition_index)
+                                                .leader_id(leader_id)
+                                                .leader_epoch(Some(0))
+                                                .replica_nodes(replica_nodes)
+                                                .isr_nodes(isr_nodes)
+                                                .offline_replicas(Some([].into()))
+                                        })
+                                        .collect(),
+                                );
 
-                        Err(_) => MetadataResponseTopic::default()
-                            .error_code(ErrorCode::UnknownServerError.into())
-                            .name(match topic {
-                                TopicId::Name(name) => Some(name.into()),
-                                TopicId::Id(_) => Some("".into()),
-                            })
-                            .topic_id(Some(match topic {
-                                TopicId::Name(_) => NULL_TOPIC_ID,
-                                TopicId::Id(id) => id.into_bytes(),
-                            }))
-                            .is_internal(Some(false))
-                            .partitions(Some([].into()))
-                            .topic_authorized_operations(Some(-2147483648)),
-                    };
+                                MetadataResponseTopic::default()
+                                    .error_code(error_code)
+                                    .name(name)
+                                    .topic_id(topic_id)
+                                    .is_internal(is_internal)
+                                    .partitions(partitions)
+                                    .topic_authorized_operations(Some(-2147483648))
+                            }
 
-                    responses.push(response);
-                }
+                            Ok(None) => MetadataResponseTopic::default()
+                                .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                .name(match topic {
+                                    TopicId::Name(name) => Some(name.into()),
+                                    TopicId::Id(_) => None,
+                                })
+                                .topic_id(Some(match topic {
+                                    TopicId::Name(_) => NULL_TOPIC_ID,
+                                    TopicId::Id(id) => id.into_bytes(),
+                                }))
+                                .is_internal(Some(false))
+                                .partitions(Some([].into()))
+                                .topic_authorized_operations(Some(-2147483648)),
 
-                responses
+                            Err(_) => MetadataResponseTopic::default()
+                                .error_code(ErrorCode::UnknownServerError.into())
+                                .name(match topic {
+                                    TopicId::Name(name) => Some(name.into()),
+                                    TopicId::Id(_) => Some("".into()),
+                                })
+                                .topic_id(Some(match topic {
+                                    TopicId::Name(_) => NULL_TOPIC_ID,
+                                    TopicId::Id(id) => id.into_bytes(),
+                                }))
+                                .is_internal(Some(false))
+                                .partitions(Some([].into()))
+                                .topic_authorized_operations(Some(-2147483648)),
+                        },
+                    )
+                    .collect()
             }
 
             _ => {
