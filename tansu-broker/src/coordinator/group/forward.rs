@@ -29,7 +29,7 @@
 //! rolling restart) degrades at worst to today's CAS-retry behaviour, never
 //! to corruption.
 //!
-//! This module provides the ownership decision only:
+//! This module provides:
 //!
 //! * [`fnv1a_64`] — an inline FNV-1a 64 hash. [`std::hash::DefaultHasher`]
 //!   is deliberately not used: SipHash keys are unstable across processes
@@ -42,23 +42,59 @@
 //! * [`PeerRegistry`] — the peer set, discovered by polling the DNS A/AAAA
 //!   records of a headless-Service hostname, plus this replica's own
 //!   identity (its pod IP).
+//! * [`ForwardingCoordinator`] — a [`Coordinator`] wrapper that forwards
+//!   each group API call to the owner replica's internal listener (the
+//!   forward hop is [`FrameForwarder`]), or processes it locally when this
+//!   replica is the owner. Any forward failure falls back to local
+//!   processing — the etag-CAS path — so every failure mode degrades to
+//!   today's behaviour, never to an outage or corruption.
+//! * [`GroupCoordinator`] — the enum the broker is actually built with
+//!   (mirroring the `StorageContainer` enum-dispatch idiom), keeping
+//!   `Broker<GroupCoordinator<_>, _>` a single concrete type whether
+//!   forwarding is enabled or not. The default is [`GroupCoordinator::Local`],
+//!   bit-for-bit today's behaviour.
 //!
 //! When the peer set is empty — DNS not yet resolved, resolution failing, or
 //! discovery not configured — [`owner`] returns the local replica, i.e. the
 //! broker processes the request itself. That fallback is bit-for-bit today's
 //! local CAS behaviour, so every discovery failure mode degrades to the
 //! status quo rather than to an outage.
-//!
-//! [`Controller`]: super::administrator::Controller
 
-use crate::Result;
+use super::{Coordinator, OffsetCommit, administrator::Controller};
+use crate::{METER, Result};
+use async_trait::async_trait;
+use opentelemetry::{
+    KeyValue,
+    metrics::{Counter, Gauge},
+};
+use rama::{Context, Layer as _, Service as _};
 use std::{
+    collections::HashMap,
+    fmt::Debug,
     net::IpAddr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
+use tansu_client::{
+    BytesConnectionService, ConnectionManager, FrameConnectionLayer, FramePoolLayer, Pool,
+};
+use tansu_sans_io::{
+    ApiKey as _, Body, Frame, Header, HeartbeatRequest, JoinGroupRequest, LeaveGroupRequest,
+    OffsetCommitRequest, OffsetFetchRequest, SyncGroupRequest,
+    join_group_request::JoinGroupRequestProtocol,
+    leave_group_request::MemberIdentity,
+    offset_commit_request::OffsetCommitRequestTopic,
+    offset_fetch_request::{OffsetFetchRequestGroup, OffsetFetchRequestTopic},
+    sync_group_request::SyncGroupRequestAssignment,
+};
+use tansu_service::FrameBytesLayer;
+use tansu_storage::Storage;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
+use url::Url;
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -186,6 +222,8 @@ impl PeerRegistry {
         peers.sort_unstable();
         peers.dedup();
 
+        GROUP_FORWARD_PEERS.record(peers.len() as u64, &[]);
+
         if let Ok(mut guard) = self.peers.lock() {
             *guard = Arc::new(peers);
         }
@@ -254,6 +292,766 @@ impl PeerRegistry {
                 }
             }
         })
+    }
+}
+
+/// Default port of the internal (broker-to-broker) listener that forwarded
+/// group requests are sent to.
+pub const DEFAULT_INTERNAL_PORT: u16 = 9093;
+
+/// Default interval between peer-set DNS refreshes. CoreDNS publishes
+/// headless-Service records with a ~5s TTL, so polling faster buys nothing.
+pub const PEER_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The client id stamped on forwarded frames for the five group APIs whose
+/// [`Coordinator`] method does not receive the caller's client id. Purely
+/// cosmetic there: only `join` derives state (the member id) from the client
+/// id, and `join` forwards the caller's own client id.
+const FORWARD_CLIENT_ID: &str = "tansu-fwd";
+
+/// Explicit upper bound on each per-owner connection pool. The deadpool
+/// default is CPU-derived and far too small under fractional-CPU pod limits,
+/// while a forwarded `join` long-polls up to the whole join window and pins
+/// its pooled connection for the duration.
+const POOL_MAX_SIZE: usize = 64;
+
+/// Slack added to the join window (the rebalance timeout) when bounding a
+/// forwarded `join`: the owner may legitimately hold the request for the
+/// whole window, so only the excess indicates a dead owner.
+const JOIN_TIMEOUT_SLACK: Duration = Duration::from_secs(10);
+
+/// Upper bound on forwarded non-join calls. These are sub-second on a
+/// healthy owner (heartbeat, commit); the bound guards against silent owner
+/// death (node gone, no RST) where the TCP read would hang forever.
+const CALL_TIMEOUT: Duration = Duration::from_secs(15);
+
+static GROUP_FORWARD_TOTAL: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_group_forward_total")
+        .with_description(
+            "group API ownership decisions by api and outcome \
+             (forwarded, local_owner or fallback)",
+        )
+        .build()
+});
+
+static GROUP_FORWARD_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_group_forward_errors")
+        .with_description("forward-to-owner failures by kind")
+        .build()
+});
+
+static GROUP_FORWARD_PEERS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("tansu_group_forward_peers")
+        .with_description("replicas eligible to own consumer groups")
+        .build()
+});
+
+/// The forward hop: deliver one group API request [`Body`] to the owner
+/// replica and return the response [`Body`].
+///
+/// A trait so [`ForwardingCoordinator`] is unit-testable without a live
+/// socket; the production implementation is [`FrameForwarder`].
+#[async_trait]
+pub trait Forward: Debug + Send + Sync + 'static {
+    /// Deliver `body` (a group API request) to `owner`, preserving
+    /// `client_id`, and return the owner's response body.
+    async fn call(
+        &self,
+        owner: IpAddr,
+        api_key: i16,
+        client_id: Option<&str>,
+        body: Body,
+    ) -> Result<Body>;
+
+    /// Drop any per-owner resources for addresses no longer in `owners`
+    /// (peers that left the set during a rolling restart).
+    fn retain(&self, _owners: &[IpAddr]) {}
+}
+
+/// The production [`Forward`]: frame-level forwarding over `tansu-client`'s
+/// pooled proxy stack, one bounded connection pool per owner address.
+///
+/// The hop is frame level — `FramePoolLayer` → `FrameConnectionLayer` →
+/// `FrameBytesLayer` → `BytesConnectionService` — rather than the typed
+/// `Client::call`, because the typed path stamps the *pool's* client id on
+/// every request while `member_id` is derived from the caller's client id on
+/// join. The frame path takes the client id from the frame itself, so a
+/// single pool per owner serves every member.
+#[derive(Debug)]
+pub struct FrameForwarder {
+    internal_port: u16,
+    pools: Mutex<HashMap<IpAddr, Pool>>,
+}
+
+impl FrameForwarder {
+    pub fn new(internal_port: u16) -> Self {
+        Self {
+            internal_port,
+            pools: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// The pool for `owner`, created lazily (pool creation bootstraps the
+    /// supported API versions from the owner, handling a mixed-version fleet
+    /// during rolling upgrades).
+    async fn pool(&self, owner: IpAddr) -> Result<Pool> {
+        if let Some(pool) = self.pools.lock()?.get(&owner) {
+            return Ok(pool.clone());
+        }
+
+        let broker = Url::parse(&match owner {
+            IpAddr::V4(_) => format!("tcp://{owner}:{}", self.internal_port),
+            IpAddr::V6(_) => format!("tcp://[{owner}]:{}", self.internal_port),
+        })?;
+
+        let pool = ConnectionManager::builder(broker)
+            .client_id(Some(FORWARD_CLIENT_ID.into()))
+            .max_size(Some(POOL_MAX_SIZE))
+            .build()
+            .await?;
+
+        // two callers may race the bootstrap; first insert wins, the loser's
+        // pool is dropped.
+        Ok(self
+            .pools
+            .lock()
+            .map(|mut pools| pools.entry(owner).or_insert(pool).clone())?)
+    }
+
+    /// The version to forward at: the negotiated maximum, except for
+    /// `OffsetFetch` in its pre-v8 shape (`group_id` + `topics` fields),
+    /// which only encodes at v7 and below — v8 restructured the request and
+    /// response around a `groups` array, so forwarding a legacy-shaped call
+    /// at v8+ would silently drop the group and return an empty response.
+    fn api_version(pool: &Pool, api_key: i16, body: &Body) -> Result<i16> {
+        let negotiated = pool.manager().api_version(api_key)?;
+
+        if let Body::OffsetFetchRequest(request) = body
+            && request.group_id.is_some()
+        {
+            return Ok(negotiated.min(7));
+        }
+
+        Ok(negotiated)
+    }
+}
+
+#[async_trait]
+impl Forward for FrameForwarder {
+    async fn call(
+        &self,
+        owner: IpAddr,
+        api_key: i16,
+        client_id: Option<&str>,
+        body: Body,
+    ) -> Result<Body> {
+        let pool = self.pool(owner).await?;
+        let api_version = Self::api_version(&pool, api_key, &body)?;
+
+        let frame = Frame {
+            size: 0,
+            header: Header::Request {
+                api_key,
+                api_version,
+                // swapped for the pooled connection's own correlation id by
+                // FrameConnectionService.
+                correlation_id: 0,
+                client_id: client_id.map(ToOwned::to_owned),
+            },
+            body,
+        };
+
+        let stack = (
+            FramePoolLayer::new(pool),
+            FrameConnectionLayer,
+            FrameBytesLayer,
+        )
+            .into_layer(BytesConnectionService);
+
+        stack
+            .serve(Context::default(), frame)
+            .await
+            .map(|response| response.body)
+            .map_err(Into::into)
+    }
+
+    fn retain(&self, owners: &[IpAddr]) {
+        if let Ok(mut pools) = self.pools.lock() {
+            pools.retain(|owner, _| owners.contains(owner));
+        }
+    }
+}
+
+/// A [`Coordinator`] that routes each group API call to the deterministic
+/// owner of its `group_id`: processed locally when this replica is the
+/// owner, forwarded verbatim to the owner's internal listener otherwise.
+///
+/// Correctness never depends on the routing: any forward failure — connect
+/// error, pool exhaustion, protocol error, deadline — falls back to local
+/// processing, which is exactly today's GET-first + etag-CAS path, so
+/// transient double-ownership (peer-view skew during a rolling restart)
+/// degrades at worst to today's CAS-retry behaviour. Persistent fallback is
+/// surfaced by the `tansu_group_forward_total{outcome="fallback"}` counter:
+/// if it climbs, forwarding is silently off and the CAS thrash it prevents
+/// is back.
+#[derive(Clone, Debug)]
+pub struct ForwardingCoordinator<C> {
+    local: C,
+    peers: Arc<PeerRegistry>,
+    forward: Arc<dyn Forward>,
+    join_timeout_slack: Duration,
+    call_timeout: Duration,
+    fallbacks: Arc<AtomicU64>,
+}
+
+impl<C> ForwardingCoordinator<C>
+where
+    C: Coordinator,
+{
+    /// A coordinator forwarding to each owner's `internal_port` over
+    /// [`FrameForwarder`].
+    pub fn new(local: C, peers: Arc<PeerRegistry>, internal_port: u16) -> Self {
+        Self::with_forward(local, peers, Arc::new(FrameForwarder::new(internal_port)))
+    }
+
+    /// A coordinator with an injected forward hop (tests stub this seam).
+    pub fn with_forward(local: C, peers: Arc<PeerRegistry>, forward: Arc<dyn Forward>) -> Self {
+        Self {
+            local,
+            peers,
+            forward,
+            join_timeout_slack: JOIN_TIMEOUT_SLACK,
+            call_timeout: CALL_TIMEOUT,
+            fallbacks: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// How many forwards have fallen back to local processing. Mirrors the
+    /// `outcome="fallback"` counter for in-process observation.
+    pub fn fallbacks(&self) -> u64 {
+        self.fallbacks.load(Ordering::Relaxed)
+    }
+
+    /// Forward `body` to the owner of `group_id` if that owner is another
+    /// replica, bounded by `deadline`.
+    ///
+    /// `None` means the caller must process the request locally: either this
+    /// replica is the owner (`outcome="local_owner"`), or the forward failed
+    /// and local processing is the correctness backstop
+    /// (`outcome="fallback"`).
+    async fn forwarded(
+        &self,
+        api: &'static str,
+        group_id: &str,
+        api_key: i16,
+        client_id: Option<&str>,
+        body: Body,
+        deadline: Duration,
+    ) -> Option<Body> {
+        let owner = self.peers.owner(group_id);
+
+        if owner == self.peers.self_ip() {
+            GROUP_FORWARD_TOTAL.add(
+                1,
+                &[
+                    KeyValue::new("api", api),
+                    KeyValue::new("outcome", "local_owner"),
+                ],
+            );
+
+            return None;
+        }
+
+        self.forward.retain(&self.peers.peers());
+
+        let kind = match tokio::time::timeout(
+            deadline,
+            self.forward.call(owner, api_key, client_id, body),
+        )
+        .await
+        {
+            Ok(Ok(response)) => {
+                GROUP_FORWARD_TOTAL.add(
+                    1,
+                    &[
+                        KeyValue::new("api", api),
+                        KeyValue::new("outcome", "forwarded"),
+                    ],
+                );
+
+                return Some(response);
+            }
+
+            Ok(Err(error)) => {
+                warn!(api, group_id, %owner, %error, "group forward failed; processing locally");
+                "forward"
+            }
+
+            Err(_elapsed) => {
+                warn!(api, group_id, %owner, ?deadline, "group forward timed out; processing locally");
+                "timeout"
+            }
+        };
+
+        GROUP_FORWARD_ERRORS.add(1, &[KeyValue::new("kind", kind)]);
+        GROUP_FORWARD_TOTAL.add(
+            1,
+            &[
+                KeyValue::new("api", api),
+                KeyValue::new("outcome", "fallback"),
+            ],
+        );
+        _ = self.fallbacks.fetch_add(1, Ordering::Relaxed);
+
+        None
+    }
+}
+
+#[async_trait]
+impl<C> Coordinator for ForwardingCoordinator<C>
+where
+    C: Coordinator,
+{
+    #[allow(clippy::too_many_arguments)]
+    async fn join(
+        &self,
+        client_id: Option<&str>,
+        group_id: &str,
+        session_timeout_ms: i32,
+        rebalance_timeout_ms: Option<i32>,
+        member_id: &str,
+        group_instance_id: Option<&str>,
+        protocol_type: &str,
+        protocols: Option<&[JoinGroupRequestProtocol]>,
+        reason: Option<&str>,
+    ) -> Result<Body> {
+        // the owner may hold the join for the whole join window.
+        let deadline = Duration::from_millis(
+            u64::try_from(rebalance_timeout_ms.unwrap_or(session_timeout_ms)).unwrap_or_default(),
+        ) + self.join_timeout_slack;
+
+        let request = JoinGroupRequest::default()
+            .group_id(group_id.into())
+            .session_timeout_ms(session_timeout_ms)
+            .rebalance_timeout_ms(rebalance_timeout_ms)
+            .member_id(member_id.into())
+            .group_instance_id(group_instance_id.map(ToOwned::to_owned))
+            .protocol_type(protocol_type.into())
+            .protocols(protocols.map(<[JoinGroupRequestProtocol]>::to_vec))
+            .reason(reason.map(ToOwned::to_owned));
+
+        // join forwards the caller's own client id: the owner derives the
+        // member id from it.
+        if let Some(response) = self
+            .forwarded(
+                "join",
+                group_id,
+                JoinGroupRequest::KEY,
+                client_id,
+                request.into(),
+                deadline,
+            )
+            .await
+        {
+            return Ok(response);
+        }
+
+        self.local
+            .join(
+                client_id,
+                group_id,
+                session_timeout_ms,
+                rebalance_timeout_ms,
+                member_id,
+                group_instance_id,
+                protocol_type,
+                protocols,
+                reason,
+            )
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn sync(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+        member_id: &str,
+        group_instance_id: Option<&str>,
+        protocol_type: Option<&str>,
+        protocol_name: Option<&str>,
+        assignments: Option<&[SyncGroupRequestAssignment]>,
+    ) -> Result<Body> {
+        let request = SyncGroupRequest::default()
+            .group_id(group_id.into())
+            .generation_id(generation_id)
+            .member_id(member_id.into())
+            .group_instance_id(group_instance_id.map(ToOwned::to_owned))
+            .protocol_type(protocol_type.map(ToOwned::to_owned))
+            .protocol_name(protocol_name.map(ToOwned::to_owned))
+            .assignments(assignments.map(<[SyncGroupRequestAssignment]>::to_vec));
+
+        if let Some(response) = self
+            .forwarded(
+                "sync",
+                group_id,
+                SyncGroupRequest::KEY,
+                Some(FORWARD_CLIENT_ID),
+                request.into(),
+                self.call_timeout,
+            )
+            .await
+        {
+            return Ok(response);
+        }
+
+        self.local
+            .sync(
+                group_id,
+                generation_id,
+                member_id,
+                group_instance_id,
+                protocol_type,
+                protocol_name,
+                assignments,
+            )
+            .await
+    }
+
+    async fn heartbeat(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+        member_id: &str,
+        group_instance_id: Option<&str>,
+    ) -> Result<Body> {
+        let request = HeartbeatRequest::default()
+            .group_id(group_id.into())
+            .generation_id(generation_id)
+            .member_id(member_id.into())
+            .group_instance_id(group_instance_id.map(ToOwned::to_owned));
+
+        if let Some(response) = self
+            .forwarded(
+                "heartbeat",
+                group_id,
+                HeartbeatRequest::KEY,
+                Some(FORWARD_CLIENT_ID),
+                request.into(),
+                self.call_timeout,
+            )
+            .await
+        {
+            return Ok(response);
+        }
+
+        self.local
+            .heartbeat(group_id, generation_id, member_id, group_instance_id)
+            .await
+    }
+
+    async fn leave(
+        &self,
+        group_id: &str,
+        member_id: Option<&str>,
+        members: Option<&[MemberIdentity]>,
+    ) -> Result<Body> {
+        // the forward encodes at the negotiated (v3+) version whose only
+        // member field is `members`; a pre-v3 caller supplies `member_id`
+        // alone, so lift it into `members` to survive the version hop.
+        let forwarded_members = members.map(<[MemberIdentity]>::to_vec).or_else(|| {
+            member_id.map(|member_id| vec![MemberIdentity::default().member_id(member_id.into())])
+        });
+
+        let request = LeaveGroupRequest::default()
+            .group_id(group_id.into())
+            .member_id(member_id.map(ToOwned::to_owned))
+            .members(forwarded_members);
+
+        if let Some(response) = self
+            .forwarded(
+                "leave",
+                group_id,
+                LeaveGroupRequest::KEY,
+                Some(FORWARD_CLIENT_ID),
+                request.into(),
+                self.call_timeout,
+            )
+            .await
+        {
+            return Ok(response);
+        }
+
+        self.local.leave(group_id, member_id, members).await
+    }
+
+    async fn offset_commit(&self, detail: OffsetCommit<'_>) -> Result<Body> {
+        // retention_time_ms (v2-4 only) is not encodable at the negotiated
+        // version; the local coordinator ignores it, so nothing is lost.
+        let request = OffsetCommitRequest::default()
+            .group_id(detail.group_id.into())
+            .generation_id_or_member_epoch(detail.generation_id_or_member_epoch)
+            .member_id(detail.member_id.map(ToOwned::to_owned))
+            .group_instance_id(detail.group_instance_id.map(ToOwned::to_owned))
+            .retention_time_ms(detail.retention_time_ms)
+            .topics(detail.topics.map(<[OffsetCommitRequestTopic]>::to_vec));
+
+        if let Some(response) = self
+            .forwarded(
+                "offset_commit",
+                detail.group_id,
+                OffsetCommitRequest::KEY,
+                Some(FORWARD_CLIENT_ID),
+                request.into(),
+                self.call_timeout,
+            )
+            .await
+        {
+            return Ok(response);
+        }
+
+        self.local.offset_commit(detail).await
+    }
+
+    async fn offset_fetch(
+        &self,
+        group_id: Option<&str>,
+        topics: Option<&[OffsetFetchRequestTopic]>,
+        groups: Option<&[OffsetFetchRequestGroup]>,
+        require_stable: Option<bool>,
+    ) -> Result<Body> {
+        // ownership is per group: forward only when the request names one
+        // group (the pre-v8 `group_id` field, or a single-entry v8+ `groups`
+        // array). A multi-group fetch spans owners, so process it locally —
+        // offset_fetch is read-only, correctness does not need the owner.
+        let target = match (group_id, groups) {
+            (Some(group_id), None) => Some(group_id),
+            (None, Some([group])) => Some(group.group_id.as_str()),
+            _ => None,
+        };
+
+        if let Some(target) = target {
+            let request = OffsetFetchRequest::default()
+                .group_id(group_id.map(ToOwned::to_owned))
+                .topics(topics.map(<[OffsetFetchRequestTopic]>::to_vec))
+                .groups(groups.map(<[OffsetFetchRequestGroup]>::to_vec))
+                .require_stable(require_stable);
+
+            if let Some(response) = self
+                .forwarded(
+                    "offset_fetch",
+                    target,
+                    OffsetFetchRequest::KEY,
+                    Some(FORWARD_CLIENT_ID),
+                    request.into(),
+                    self.call_timeout,
+                )
+                .await
+            {
+                return Ok(response);
+            }
+        }
+
+        self.local
+            .offset_fetch(group_id, topics, groups, require_stable)
+            .await
+    }
+}
+
+/// The group coordinator the broker is built with: pure-local (today's
+/// behaviour, the default) or forward-to-owner. Enum dispatch — mirroring
+/// `StorageContainer` — keeps `Broker<GroupCoordinator<O>, O>` one concrete
+/// type so nothing downstream of `Builder::build` changes with the flag.
+#[derive(Clone, Debug)]
+pub enum GroupCoordinator<O> {
+    Local(Controller<O>),
+    Forwarding(ForwardingCoordinator<Controller<O>>),
+}
+
+impl<O> GroupCoordinator<O>
+where
+    O: Storage + Clone,
+{
+    /// Today's behaviour: every group API call is processed by the local
+    /// [`Controller`].
+    pub fn local(controller: Controller<O>) -> Self {
+        Self::Local(controller)
+    }
+
+    /// Forward-to-owner coordination over `registry`, dialling each owner's
+    /// `internal_port`.
+    pub fn forwarding(
+        controller: Controller<O>,
+        registry: Arc<PeerRegistry>,
+        internal_port: u16,
+    ) -> Self {
+        Self::Forwarding(ForwardingCoordinator::new(
+            controller,
+            registry,
+            internal_port,
+        ))
+    }
+}
+
+#[async_trait]
+impl<O> Coordinator for GroupCoordinator<O>
+where
+    O: Storage + Clone,
+{
+    #[allow(clippy::too_many_arguments)]
+    async fn join(
+        &self,
+        client_id: Option<&str>,
+        group_id: &str,
+        session_timeout_ms: i32,
+        rebalance_timeout_ms: Option<i32>,
+        member_id: &str,
+        group_instance_id: Option<&str>,
+        protocol_type: &str,
+        protocols: Option<&[JoinGroupRequestProtocol]>,
+        reason: Option<&str>,
+    ) -> Result<Body> {
+        match self {
+            Self::Local(controller) => {
+                controller
+                    .join(
+                        client_id,
+                        group_id,
+                        session_timeout_ms,
+                        rebalance_timeout_ms,
+                        member_id,
+                        group_instance_id,
+                        protocol_type,
+                        protocols,
+                        reason,
+                    )
+                    .await
+            }
+
+            Self::Forwarding(forwarding) => {
+                forwarding
+                    .join(
+                        client_id,
+                        group_id,
+                        session_timeout_ms,
+                        rebalance_timeout_ms,
+                        member_id,
+                        group_instance_id,
+                        protocol_type,
+                        protocols,
+                        reason,
+                    )
+                    .await
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn sync(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+        member_id: &str,
+        group_instance_id: Option<&str>,
+        protocol_type: Option<&str>,
+        protocol_name: Option<&str>,
+        assignments: Option<&[SyncGroupRequestAssignment]>,
+    ) -> Result<Body> {
+        match self {
+            Self::Local(controller) => {
+                controller
+                    .sync(
+                        group_id,
+                        generation_id,
+                        member_id,
+                        group_instance_id,
+                        protocol_type,
+                        protocol_name,
+                        assignments,
+                    )
+                    .await
+            }
+
+            Self::Forwarding(forwarding) => {
+                forwarding
+                    .sync(
+                        group_id,
+                        generation_id,
+                        member_id,
+                        group_instance_id,
+                        protocol_type,
+                        protocol_name,
+                        assignments,
+                    )
+                    .await
+            }
+        }
+    }
+
+    async fn heartbeat(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+        member_id: &str,
+        group_instance_id: Option<&str>,
+    ) -> Result<Body> {
+        match self {
+            Self::Local(controller) => {
+                controller
+                    .heartbeat(group_id, generation_id, member_id, group_instance_id)
+                    .await
+            }
+
+            Self::Forwarding(forwarding) => {
+                forwarding
+                    .heartbeat(group_id, generation_id, member_id, group_instance_id)
+                    .await
+            }
+        }
+    }
+
+    async fn leave(
+        &self,
+        group_id: &str,
+        member_id: Option<&str>,
+        members: Option<&[MemberIdentity]>,
+    ) -> Result<Body> {
+        match self {
+            Self::Local(controller) => controller.leave(group_id, member_id, members).await,
+            Self::Forwarding(forwarding) => forwarding.leave(group_id, member_id, members).await,
+        }
+    }
+
+    async fn offset_commit(&self, detail: OffsetCommit<'_>) -> Result<Body> {
+        match self {
+            Self::Local(controller) => controller.offset_commit(detail).await,
+            Self::Forwarding(forwarding) => forwarding.offset_commit(detail).await,
+        }
+    }
+
+    async fn offset_fetch(
+        &self,
+        group_id: Option<&str>,
+        topics: Option<&[OffsetFetchRequestTopic]>,
+        groups: Option<&[OffsetFetchRequestGroup]>,
+        require_stable: Option<bool>,
+    ) -> Result<Body> {
+        match self {
+            Self::Local(controller) => {
+                controller
+                    .offset_fetch(group_id, topics, groups, require_stable)
+                    .await
+            }
+
+            Self::Forwarding(forwarding) => {
+                forwarding
+                    .offset_fetch(group_id, topics, groups, require_stable)
+                    .await
+            }
+        }
     }
 }
 
@@ -499,5 +1297,437 @@ mod tests {
 
         assert!(registry.peers().is_empty());
         assert!(registry.is_local("any-group"));
+    }
+
+    /// Coordinator-level tests need the in-memory object store, which — like
+    /// the existing `tests/cg*.rs` in-memory suites — is only built
+    /// workspace-wide with `--all-features` (the `dynostore` feature of
+    /// `tansu-storage` is enabled through the `tansu` crate).
+    #[cfg(feature = "dynostore")]
+    mod coordination {
+        use super::*;
+        use crate::Error;
+        use bytes::Bytes;
+        use tansu_sans_io::{
+            ErrorCode, HeartbeatResponse, JoinGroupResponse, LeaveGroupResponse,
+            OffsetCommitResponse, OffsetFetchResponse, SyncGroupResponse,
+            create_topics_request::CreatableTopic,
+            offset_commit_request::OffsetCommitRequestPartition,
+        };
+        use tansu_storage::{BrokerRegistrationRequest, StorageContainer};
+        use uuid::Uuid;
+
+        const CLIENT_ID: &str = "console-consumer";
+        const PROTOCOL_TYPE: &str = "consumer";
+        const RANGE: &str = "range";
+        const SESSION_TIMEOUT_MS: i32 = 45_000;
+        const REBALANCE_TIMEOUT_MS: Option<i32> = Some(300_000);
+
+        async fn storage_container() -> Result<Arc<Box<dyn Storage>>> {
+            let cluster_id = Uuid::now_v7().to_string();
+
+            let storage = StorageContainer::builder()
+                .cluster_id(cluster_id.clone())
+                .node_id(111)
+                .advertised_listener(Url::parse("tcp://localhost:9092")?)
+                .storage(Url::parse("memory://")?)
+                .build()
+                .await?;
+
+            storage
+                .register_broker(BrokerRegistrationRequest {
+                    broker_id: 111,
+                    cluster_id,
+                    incarnation_id: Uuid::now_v7(),
+                    rack: None,
+                })
+                .await?;
+
+            Ok(storage)
+        }
+
+        async fn join_as_leader<C>(coordinator: &C, group_id: &str) -> Result<JoinGroupResponse>
+        where
+            C: Coordinator,
+        {
+            let protocols = [JoinGroupRequestProtocol::default()
+                .name(RANGE.into())
+                .metadata(Bytes::from_static(b"range_meta_01"))];
+
+            // a dynamic join without a member id is rejected with the member id
+            // to rejoin with.
+            let required = JoinGroupResponse::try_from(
+                coordinator
+                    .join(
+                        Some(CLIENT_ID),
+                        group_id,
+                        SESSION_TIMEOUT_MS,
+                        REBALANCE_TIMEOUT_MS,
+                        "",
+                        None,
+                        PROTOCOL_TYPE,
+                        Some(&protocols[..]),
+                        None,
+                    )
+                    .await?,
+            )?;
+
+            assert_eq!(
+                ErrorCode::MemberIdRequired,
+                ErrorCode::try_from(required.error_code)?
+            );
+            assert!(required.member_id.starts_with(CLIENT_ID));
+
+            let joined = JoinGroupResponse::try_from(
+                coordinator
+                    .join(
+                        Some(CLIENT_ID),
+                        group_id,
+                        SESSION_TIMEOUT_MS,
+                        REBALANCE_TIMEOUT_MS,
+                        required.member_id.as_str(),
+                        None,
+                        PROTOCOL_TYPE,
+                        Some(&protocols[..]),
+                        None,
+                    )
+                    .await?,
+            )?;
+
+            assert_eq!(ErrorCode::None, ErrorCode::try_from(joined.error_code)?);
+            assert_eq!(joined.member_id, joined.leader);
+
+            Ok(joined)
+        }
+
+        // The Local variant is today's behaviour: the full single-member group
+        // lifecycle — all 6 Coordinator APIs — delegates to the wrapped
+        // Controller unchanged.
+        #[tokio::test]
+        async fn local_group_coordinator_runs_the_full_lifecycle() -> Result<()> {
+            let storage = storage_container().await?;
+
+            let topic = alphanumeric(15);
+            _ = storage
+                .create_topic(
+                    CreatableTopic::default()
+                        .name(topic.clone())
+                        .num_partitions(1)
+                        .replication_factor(0)
+                        .assignments(Some([].into()))
+                        .configs(Some([].into())),
+                    false,
+                )
+                .await?;
+
+            let coordinator = GroupCoordinator::local(Controller::with_storage(storage)?);
+
+            let group_id = alphanumeric(15);
+
+            // join
+            let joined = join_as_leader(&coordinator, group_id.as_str()).await?;
+            let member_id = joined.member_id.clone();
+            let generation_id = joined.generation_id;
+
+            // sync, as leader, with an assignment
+            let assignment = Bytes::from_static(b"assignment_01");
+
+            let synced = SyncGroupResponse::try_from(
+                coordinator
+                    .sync(
+                        group_id.as_str(),
+                        generation_id,
+                        member_id.as_str(),
+                        None,
+                        Some(PROTOCOL_TYPE),
+                        Some(RANGE),
+                        Some(&[SyncGroupRequestAssignment::default()
+                            .member_id(member_id.clone())
+                            .assignment(assignment.clone())]),
+                    )
+                    .await?,
+            )?;
+
+            assert_eq!(ErrorCode::None, ErrorCode::try_from(synced.error_code)?);
+            assert_eq!(assignment, synced.assignment);
+
+            // heartbeat
+            let heartbeat = HeartbeatResponse::try_from(
+                coordinator
+                    .heartbeat(group_id.as_str(), generation_id, member_id.as_str(), None)
+                    .await?,
+            )?;
+
+            assert_eq!(ErrorCode::None, ErrorCode::try_from(heartbeat.error_code)?);
+
+            // offset commit
+            let committed_offset = 32123;
+
+            let committed = OffsetCommitResponse::try_from(
+                coordinator
+                    .offset_commit(OffsetCommit {
+                        group_id: group_id.as_str(),
+                        generation_id_or_member_epoch: Some(generation_id),
+                        member_id: Some(member_id.as_str()),
+                        group_instance_id: None,
+                        retention_time_ms: None,
+                        topics: Some(&[OffsetCommitRequestTopic::default()
+                            .name(topic.clone())
+                            .partitions(Some(vec![
+                                OffsetCommitRequestPartition::default()
+                                    .partition_index(0)
+                                    .committed_offset(committed_offset),
+                            ]))]),
+                    })
+                    .await?,
+            )?;
+
+            let committed_partitions = committed
+                .topics
+                .into_iter()
+                .flatten()
+                .flat_map(|topic| topic.partitions.into_iter().flatten())
+                .collect::<Vec<_>>();
+            assert_eq!(1, committed_partitions.len());
+            assert_eq!(
+                ErrorCode::None,
+                ErrorCode::try_from(committed_partitions[0].error_code)?
+            );
+
+            // offset fetch reads the commit back
+            let fetched = OffsetFetchResponse::try_from(
+                coordinator
+                    .offset_fetch(
+                        Some(group_id.as_str()),
+                        Some(&[OffsetFetchRequestTopic::default()
+                            .name(topic.clone())
+                            .partition_indexes(Some(vec![0]))]),
+                        None,
+                        Some(false),
+                    )
+                    .await?,
+            )?;
+
+            let fetched_partitions = fetched
+                .topics
+                .into_iter()
+                .flatten()
+                .flat_map(|topic| topic.partitions.into_iter().flatten())
+                .collect::<Vec<_>>();
+            assert_eq!(1, fetched_partitions.len());
+            assert_eq!(committed_offset, fetched_partitions[0].committed_offset);
+
+            // leave
+            let left = LeaveGroupResponse::try_from(
+                coordinator
+                    .leave(
+                        group_id.as_str(),
+                        None,
+                        Some(&[MemberIdentity::default()
+                            .member_id(member_id.clone())
+                            .group_instance_id(None)
+                            .reason(Some("the consumer is being closed".into()))]),
+                    )
+                    .await?,
+            )?;
+
+            assert_eq!(ErrorCode::None, ErrorCode::try_from(left.error_code)?);
+
+            Ok(())
+        }
+
+        fn alphanumeric(length: usize) -> String {
+            rand::rng()
+                .sample_iter(&rand::distr::Alphanumeric)
+                .take(length)
+                .map(char::from)
+                .collect()
+        }
+
+        #[derive(Debug)]
+        enum StubBehaviour {
+            Respond(Body),
+            Fail,
+            Hang,
+        }
+
+        /// A [`Forward`] stub: records calls and responds, fails or hangs.
+        #[derive(Debug)]
+        struct StubForward {
+            calls: AtomicU64,
+            behaviour: StubBehaviour,
+        }
+
+        impl StubForward {
+            fn new(behaviour: StubBehaviour) -> Arc<Self> {
+                Arc::new(Self {
+                    calls: AtomicU64::new(0),
+                    behaviour,
+                })
+            }
+
+            fn calls(&self) -> u64 {
+                self.calls.load(Ordering::Relaxed)
+            }
+        }
+
+        #[async_trait]
+        impl Forward for StubForward {
+            async fn call(
+                &self,
+                _owner: IpAddr,
+                _api_key: i16,
+                _client_id: Option<&str>,
+                _body: Body,
+            ) -> Result<Body> {
+                _ = self.calls.fetch_add(1, Ordering::Relaxed);
+
+                match &self.behaviour {
+                    StubBehaviour::Respond(body) => Ok(body.clone()),
+                    StubBehaviour::Fail => Err(Error::Message("stubbed forward failure".into())),
+                    StubBehaviour::Hang => {
+                        std::future::pending::<()>().await;
+                        unreachable!()
+                    }
+                }
+            }
+        }
+
+        /// A registry whose only peer is this replica: every group is local.
+        fn registry_owning_everything(self_ip: IpAddr) -> Arc<PeerRegistry> {
+            let registry = Arc::new(PeerRegistry::new(
+                self_ip,
+                "unused.invalid",
+                Duration::from_secs(5),
+            ));
+            registry.set_peers(vec![self_ip]);
+            registry
+        }
+
+        /// A registry whose only peer is *another* replica: every group is
+        /// owned by that peer.
+        fn registry_owning_nothing(self_ip: IpAddr, owner: IpAddr) -> Arc<PeerRegistry> {
+            let registry = Arc::new(PeerRegistry::new(
+                self_ip,
+                "unused.invalid",
+                Duration::from_secs(5),
+            ));
+            registry.set_peers(vec![owner]);
+            registry
+        }
+
+        // Owner is self: the request is processed by the wrapped Controller and
+        // the forward hop is never attempted.
+        #[tokio::test]
+        async fn forwarding_processes_locally_when_owner_is_self() -> Result<()> {
+            let storage = storage_container().await?;
+            let stub = StubForward::new(StubBehaviour::Fail);
+
+            let coordinator = ForwardingCoordinator::with_forward(
+                Controller::with_storage(storage)?,
+                registry_owning_everything(peer(1)),
+                stub.clone(),
+            );
+
+            let group_id = alphanumeric(15);
+            _ = join_as_leader(&coordinator, group_id.as_str()).await?;
+
+            assert_eq!(0, stub.calls());
+            assert_eq!(0, coordinator.fallbacks());
+
+            Ok(())
+        }
+
+        // Owner is a peer: the request is forwarded and the owner's response is
+        // relayed verbatim, without touching the local Controller.
+        #[tokio::test]
+        async fn forwarding_relays_the_owners_response_when_owner_is_a_peer() -> Result<()> {
+            let storage = storage_container().await?;
+
+            let canned = HeartbeatResponse::default()
+                .throttle_time_ms(Some(0))
+                .error_code(ErrorCode::RebalanceInProgress.into());
+            let stub = StubForward::new(StubBehaviour::Respond(canned.clone().into()));
+
+            let coordinator = ForwardingCoordinator::with_forward(
+                Controller::with_storage(storage)?,
+                registry_owning_nothing(peer(1), peer(2)),
+                stub.clone(),
+            );
+
+            // a heartbeat for a group the local Controller has never seen: only
+            // the stubbed owner can produce RebalanceInProgress.
+            let response = HeartbeatResponse::try_from(
+                coordinator
+                    .heartbeat("some-group", 0, "some-member", None)
+                    .await?,
+            )?;
+
+            assert_eq!(
+                ErrorCode::RebalanceInProgress,
+                ErrorCode::try_from(response.error_code)?
+            );
+            assert_eq!(1, stub.calls());
+            assert_eq!(0, coordinator.fallbacks());
+
+            Ok(())
+        }
+
+        // A failed forward falls back to local processing (the etag-CAS
+        // correctness backstop) and the fallback tally increments.
+        #[tokio::test]
+        async fn forwarding_failure_falls_back_to_local() -> Result<()> {
+            let storage = storage_container().await?;
+            let stub = StubForward::new(StubBehaviour::Fail);
+
+            let coordinator = ForwardingCoordinator::with_forward(
+                Controller::with_storage(storage)?,
+                registry_owning_nothing(peer(1), peer(2)),
+                stub.clone(),
+            );
+
+            // despite the owner being unreachable, the join is served by the
+            // local Controller exactly as today.
+            let group_id = alphanumeric(15);
+            _ = join_as_leader(&coordinator, group_id.as_str()).await?;
+
+            // one forward attempt per join call (member-id-required + rejoin).
+            assert_eq!(2, stub.calls());
+            assert_eq!(2, coordinator.fallbacks());
+
+            Ok(())
+        }
+
+        // A forward that hangs (owner died without RST) is bounded by the call
+        // timeout and falls back to local processing.
+        #[tokio::test(start_paused = true)]
+        async fn forwarding_timeout_falls_back_to_local() -> Result<()> {
+            let storage = storage_container().await?;
+            let stub = StubForward::new(StubBehaviour::Hang);
+
+            let coordinator = ForwardingCoordinator::with_forward(
+                Controller::with_storage(storage)?,
+                registry_owning_nothing(peer(1), peer(2)),
+                stub.clone(),
+            );
+
+            // heartbeat for an unknown group: the local fallback answers with
+            // today's error, proving the deadline fired and local processing
+            // took over.
+            let response = HeartbeatResponse::try_from(
+                coordinator
+                    .heartbeat("some-group", 0, "some-member", None)
+                    .await?,
+            )?;
+
+            assert_ne!(
+                ErrorCode::RebalanceInProgress,
+                ErrorCode::try_from(response.error_code)?
+            );
+            assert_eq!(1, stub.calls());
+            assert_eq!(1, coordinator.fallbacks());
+
+            Ok(())
+        }
     }
 }

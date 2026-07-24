@@ -3863,6 +3863,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tansu-auth",
+ "tansu-client",
  "tansu-model",
  "tansu-sans-io",
  "tansu-service",

@@ -21,6 +21,7 @@ use regex::{Regex, Replacer};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
+    AddrParse(#[from] std::net::AddrParseError),
     Box(#[from] Box<dyn std::error::Error + Send + Sync>),
     Client(Box<tansu_client::Error>),
     DotEnv(#[from] dotenv::Error),
