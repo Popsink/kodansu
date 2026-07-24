@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::{
+    net::IpAddr,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -29,7 +30,7 @@ use rustls::{
         pem::{Error as TlsPkiPemError, PemObject as _},
     },
 };
-use tansu_broker::{NODE_ID, broker::Broker, coordinator::group::administrator::Controller};
+use tansu_broker::{NODE_ID, broker::Broker, coordinator::group::forward::GroupCoordinator};
 use tansu_sans_io::ErrorCode;
 use tansu_storage::{
     ArcDynStorage, DEFAULT_CLEANUP_POLICY, DEFAULT_RETENTION_MS, StorageContainer, TopicDefaults,
@@ -96,6 +97,31 @@ pub(super) struct Arg {
     #[arg(long, env = "DEFAULT_RETENTION", value_parser = humantime::parse_duration, default_value = "7days")]
     default_retention: Duration,
 
+    /// Forward each consumer group's coordination APIs to the group's deterministic owner replica (default: off, pure-local coordination)
+    #[arg(
+        long,
+        env = "GROUP_FORWARDING",
+        action = clap::ArgAction::SetTrue,
+        value_parser = clap::builder::FalseyValueParser::new()
+    )]
+    group_forwarding: bool,
+
+    /// Headless-Service hostname whose A/AAAA records list the peer replicas eligible to own consumer groups
+    #[arg(long, env = "GROUP_FORWARD_PEER_DNS")]
+    group_forward_peer_dns: Option<String>,
+
+    /// The internal (broker-to-broker) listener URL; forwarded group requests are sent to each owner at this port
+    #[arg(
+        long,
+        env = "INTERNAL_LISTENER_URL",
+        default_value = "tcp://0.0.0.0:9093"
+    )]
+    internal_listener_url: EnvVarExp<Url>,
+
+    /// This replica's own IP address (in Kubernetes, the pod IP via the Downward API)
+    #[arg(long, env = "POD_IP")]
+    pod_ip: Option<EnvVarExp<IpAddr>>,
+
     /// Silent
     #[arg(long)]
     silent: bool,
@@ -138,7 +164,7 @@ impl Arg {
             .map_err(Into::into)
     }
 
-    async fn build(self) -> Result<Broker<Controller<ArcDynStorage>, ArcDynStorage>> {
+    async fn build(self) -> Result<Broker<GroupCoordinator<ArcDynStorage>, ArcDynStorage>> {
         let cluster_id = self.cluster_id;
         let incarnation_id = Uuid::now_v7();
         let otlp_endpoint_url = self
@@ -160,7 +186,7 @@ impl Arg {
                 .unwrap_or(DEFAULT_RETENTION_MS),
         };
 
-        let broker = Broker::<Controller<StorageContainer>, StorageContainer>::builder()
+        let broker = Broker::<GroupCoordinator<StorageContainer>, StorageContainer>::builder()
             .node_id(NODE_ID)
             .cluster_id(cluster_id)
             .incarnation_id(incarnation_id)
@@ -171,6 +197,10 @@ impl Arg {
             .authentication(self.authentication)
             .tls_server_config(tls_server_config)
             .topic_defaults(topic_defaults)
+            .group_forwarding(self.group_forwarding)
+            .group_forward_peer_dns(self.group_forward_peer_dns)
+            .internal_listener_url(Some(self.internal_listener_url.into_inner()))
+            .pod_ip(self.pod_ip.map(|env_var_exp| env_var_exp.into_inner()))
             .silent(self.silent);
 
         if !self.silent {

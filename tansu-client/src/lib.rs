@@ -300,6 +300,7 @@ fn status_update(pool: &Pool) {
 pub struct Builder {
     broker: Url,
     client_id: Option<String>,
+    max_size: Option<usize>,
 }
 
 impl Builder {
@@ -308,12 +309,20 @@ impl Builder {
         Self {
             broker,
             client_id: None,
+            max_size: None,
         }
     }
 
     /// Client id used when making requests to the broker
     pub fn client_id(self, client_id: Option<String>) -> Self {
         Self { client_id, ..self }
+    }
+
+    /// Maximum number of pooled connections. Defaults to deadpool's
+    /// CPU-derived sizing when not set, which can be very small on
+    /// CPU-constrained deployments.
+    pub fn max_size(self, max_size: Option<usize>) -> Self {
+        Self { max_size, ..self }
     }
 
     /// Inquire with the broker supported api versions
@@ -360,13 +369,17 @@ impl Builder {
     /// Establish the API versions supported by the broker returning a [`Pool`]
     pub async fn build(self) -> Result<Pool, Error> {
         self.bootstrap().await.and_then(|versions| {
-            Pool::builder(ConnectionManager {
+            let mut builder = Pool::builder(ConnectionManager {
                 broker: self.broker,
                 client_id: self.client_id,
                 versions,
-            })
-            .build()
-            .map_err(Into::into)
+            });
+
+            if let Some(max_size) = self.max_size {
+                builder = builder.max_size(max_size);
+            }
+
+            builder.build().map_err(Into::into)
         })
     }
 }

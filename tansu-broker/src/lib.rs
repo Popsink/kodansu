@@ -73,6 +73,7 @@ pub enum Error {
     AddrParse(#[from] AddrParseError),
     Api(ErrorCode),
     Auth(#[from] tansu_auth::Error),
+    Client(#[from] tansu_client::Error),
     Custom(String),
     DuplicateApiService(i16),
     EmptyCoordinatorWrapper,
