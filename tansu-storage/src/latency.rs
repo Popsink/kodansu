@@ -15,7 +15,10 @@
 use std::{
     collections::BTreeMap,
     ops::Range,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -50,6 +53,11 @@ pub struct LatencyIntroducingStorage<S> {
     storage: S,
     rng: Arc<Mutex<SmallRng>>,
     latency: Range<u64>,
+    /// Count of `update_group` calls that lost the etag CAS (returned
+    /// `UpdateError::Outdated`). Tests use this to assert that per-group
+    /// in-process serialization at the coordinator eliminates concurrent
+    /// read-modify-write contention on the single `{group}.json` object.
+    group_cas_conflicts: Arc<AtomicU64>,
 }
 
 impl<S> LatencyIntroducingStorage<S>
@@ -61,7 +69,15 @@ where
             storage,
             rng: Arc::new(Mutex::new(SmallRng::seed_from_u64(0))),
             latency: 50..150,
+            group_cas_conflicts: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// A shared handle to this store's `update_group` etag-CAS conflict
+    /// counter, cloneable before the store is moved into a coordinator so a
+    /// test can read the count after the run.
+    pub fn cas_conflicts_handle(&self) -> Arc<AtomicU64> {
+        self.group_cas_conflicts.clone()
     }
 
     pub fn with_seed(self, seed: u64) -> Self {
@@ -319,7 +335,11 @@ where
     ) -> Result<Version, UpdateError<GroupDetail>> {
         self.introduce_latency().await?;
 
-        self.storage.update_group(group_id, detail, version).await
+        let result = self.storage.update_group(group_id, detail, version).await;
+        if matches!(result, Err(UpdateError::Outdated { .. })) {
+            _ = self.group_cas_conflicts.fetch_add(1, Ordering::Relaxed);
+        }
+        result
     }
 
     async fn init_producer(
