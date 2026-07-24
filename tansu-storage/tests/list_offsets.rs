@@ -255,3 +255,173 @@ async fn wide_assignment_earliest_and_latest() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// The wide-assignment shape again, under PREFIX COALESCING — the layout the
+/// production `endOffsets(assignment)` timeout was observed on. Topics share
+/// connector prefixes (dotted names), so LATEST/EARLIEST resolve from the
+/// shared segment footer index rather than per-partition objects; the sweep is
+/// repeated so the second pass exercises the warm, index-served path through
+/// the full request stack. Both passes must return each topic's own exact
+/// offsets: EARLIEST == its log start, LATEST == its high watermark (record
+/// counts made distinct per topic so any cross-partition mix-up fails loudly).
+#[tokio::test]
+async fn wide_assignment_earliest_and_latest_prefix_coalesced() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    const HOST: &str = "localhost";
+    const PORT: i32 = 9092;
+    const NODE_ID: i32 = 111;
+    const TOPICS: usize = 64;
+    const PREFIXES: usize = 4;
+
+    let storage = StorageContainer::builder()
+        .cluster_id("tansu")
+        .node_id(NODE_ID)
+        .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
+        .storage(Url::parse("memory://tansu/?prefix_coalesce=true")?)
+        .build()
+        .await?;
+
+    let create_topic = {
+        let storage = storage.clone();
+        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService::default())
+    };
+
+    let produce = {
+        let storage = storage.clone();
+        MapStateLayer::new(|_| storage).into_layer(ProduceService)
+    };
+
+    let list_offsets = MapStateLayer::new(|_| storage).into_layer(ListOffsetsService);
+
+    let records_in = |i: usize| (i % 5) as i64 + 1;
+    // Dotted names: `prefix_of` coalesces on the first three components, so
+    // the 64 topics share PREFIXES connector prefixes.
+    let topic_name = |i: usize| format!("org.env.conn{}.assignment-{i:04}", i % PREFIXES);
+
+    for i in 0..TOPICS {
+        let name = topic_name(i);
+
+        let response = create_topic
+            .serve(
+                Context::default(),
+                CreateTopicsRequest::default()
+                    .validate_only(Some(false))
+                    .topics(Some(
+                        [CreatableTopic::default()
+                            .name(name.clone())
+                            .num_partitions(1)
+                            .replication_factor(1)
+                            .assignments(Some([].into()))
+                            .configs(Some([].into()))]
+                        .into(),
+                    )),
+            )
+            .await?;
+
+        let topics = response.topics.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+
+        let mut builder = Batch::builder().last_offset_delta(records_in(i) as i32 - 1);
+        for record in 0..records_in(i) {
+            builder = builder.record(
+                Record::builder()
+                    .offset_delta(record as i32)
+                    .value(Bytes::from(format!("{name}-{record}").into_bytes()).into()),
+            );
+        }
+        let deflated = builder.build().and_then(deflated::Batch::try_from)?;
+
+        let response = produce
+            .serve(
+                Context::default(),
+                ProduceRequest::default().topic_data(Some(
+                    [TopicProduceData::default()
+                        .name(name.clone())
+                        .partition_data(Some(
+                            [PartitionProduceData::default().index(0).records(Some(
+                                deflated::Frame {
+                                    batches: vec![deflated],
+                                },
+                            ))]
+                            .into(),
+                        ))]
+                    .into(),
+                )),
+            )
+            .await?;
+
+        let topics = response.responses.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+        let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
+        assert_eq!(1, partitions.len());
+        assert_eq!(
+            ErrorCode::None,
+            ErrorCode::try_from(partitions[0].error_code)?
+        );
+        assert_eq!(0, partitions[0].base_offset);
+    }
+
+    for sweep in ["cold", "warm"] {
+        for offset_request in [ListOffset::Earliest, ListOffset::Latest] {
+            let response = list_offsets
+                .serve(
+                    Context::default(),
+                    ListOffsetsRequest::default()
+                        .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
+                        .replica_id(-1)
+                        .topics(Some(
+                            (0..TOPICS)
+                                .map(|i| {
+                                    Ok(ListOffsetsTopic::default().name(topic_name(i)).partitions(
+                                        Some(
+                                            [ListOffsetsPartition::default()
+                                                .current_leader_epoch(Some(-1))
+                                                .partition_index(0)
+                                                .timestamp(offset_request.try_into()?)]
+                                            .into(),
+                                        ),
+                                    ))
+                                })
+                                .collect::<Result<Vec<_>, Error>>()?,
+                        )),
+                )
+                .await?;
+
+            let topics = response.topics.as_deref().unwrap_or_default();
+            assert_eq!(TOPICS, topics.len(), "{sweep}: {offset_request:?}");
+
+            for i in 0..TOPICS {
+                let name = topic_name(i);
+                let topic = topics
+                    .iter()
+                    .find(|topic| topic.name == name)
+                    .unwrap_or_else(|| {
+                        panic!("{sweep}: {offset_request:?}: no response for {name}")
+                    });
+
+                let partitions = topic.partitions.as_deref().unwrap_or_default();
+                assert_eq!(1, partitions.len(), "{sweep}: {offset_request:?}: {name}");
+                assert_eq!(0, partitions[0].partition_index, "{name}");
+                assert_eq!(
+                    ErrorCode::None,
+                    ErrorCode::try_from(partitions[0].error_code)?,
+                    "{sweep}: {offset_request:?}: {name}"
+                );
+
+                let expected = match offset_request {
+                    ListOffset::Earliest => 0,
+                    _ => records_in(i),
+                };
+                assert_eq!(
+                    Some(expected),
+                    partitions[0].offset,
+                    "{sweep}: {offset_request:?}: {name}"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
