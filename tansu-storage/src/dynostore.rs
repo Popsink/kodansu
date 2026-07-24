@@ -142,6 +142,29 @@ pub struct DynoStore {
     /// GCS per-object update-rate cap (#13).
     next_offsets: Arc<Mutex<BTreeMap<Topition, OffsetHint>>>,
 
+    /// Per-partition cache of the persisted `watermark.high` floor for
+    /// prefix-coalesced sub-streams, paired with the certified seq floor under
+    /// which it was read: `topition -> (watermark.high, certified floor)`. An
+    /// entry is valid only while [`Self::certified_seq_floor`] still returns
+    /// the same floor — for coalesced sub-streams `watermark.high` only ever
+    /// advances in an operation that then raises that floor (see
+    /// `certified_seq_floor`), so an unchanged floor certifies the cached
+    /// value. This is what takes the stale-hint LATEST path
+    /// ([`Self::coalesced_high_from_index`]) off the per-partition
+    /// `watermark.json` conditional GET: a wide `endOffsets(assignment)` costs
+    /// O(prefixes), not O(partitions), in object-store round-trips.
+    coalesced_watermark_floors: Arc<Mutex<BTreeMap<Topition, (i64, u64)>>>,
+
+    /// Per-prefix single-flight for the stale-index refresh and the certified
+    /// seq-floor sync. A wide ListOffsets resolves its partitions concurrently
+    /// (32-way), so without this every stale same-prefix partition in flight
+    /// would issue its own duplicate `segments/` LIST and `seq-floor.json`
+    /// GET — re-inflating the per-prefix amortized cost back toward
+    /// per-partition. Losers of the race re-check under the lock and are
+    /// served by the winner's work. Fresh (TTL-served) reads never touch this
+    /// lock.
+    prefix_read_sync_locks: Arc<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+
     /// Per-producer optimistic-concurrency handle on `producers/{id}.json`,
     /// holding that producer's idempotent sequence state. Sharding the sequence
     /// CAS per producer (instead of CASing the single cluster-global `meta`
@@ -469,6 +492,20 @@ struct PrefixIndex {
     /// When the live segment set was last reconciled by a listing; gates the
     /// TTL so a hot prefix lists at most once per [`DynoStore::HIGH_WATERMARK_HINT_TTL`].
     refreshed_at: Option<SystemTime>,
+    /// Monotonic token bumped whenever this process's view of the segment set
+    /// may have *lost* a segment's tail knowledge: a committed real listing
+    /// (which can reflect another replica's deletions) or a prune. The
+    /// certified seq floor below is valid only for the generation it was read
+    /// under — see [`DynoStore::certified_seq_floor`] for the ordering
+    /// argument.
+    generation: u64,
+    /// The persisted next-sequence floor (#77) as last read *after* the
+    /// listing committed under `generation` (`(floor, generation)`), if
+    /// synced. The floor is raised write-ahead of every segment delete, so a
+    /// floor read ordered after a listing certifies every deletion that
+    /// listing could have observed; that is what lets the ListOffsets LATEST
+    /// fast path skip the per-partition `watermark.json` GET.
+    seq_floor: Option<(u64, u64)>,
 }
 
 /// A prefix lease this process currently holds (#59): the in-memory side of
@@ -1094,6 +1131,8 @@ impl DynoStore {
             advertised_listener: Url::parse("tcp://127.0.0.1/").unwrap(),
             watermarks: Arc::new(Mutex::new(BTreeMap::new())),
             next_offsets: Arc::new(Mutex::new(BTreeMap::new())),
+            coalesced_watermark_floors: Arc::new(Mutex::new(BTreeMap::new())),
+            prefix_read_sync_locks: Arc::new(Mutex::new(BTreeMap::new())),
             producers: Arc::new(Mutex::new(BTreeMap::new())),
             producer_checkpoints: Arc::new(Mutex::new(BTreeMap::new())),
             oldest_retained: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2023,6 +2062,36 @@ impl DynoStore {
             .await
     }
 
+    /// The cached `watermark.high` floor for a prefix-coalesced sub-stream,
+    /// valid only when it was read under the still-current certified seq
+    /// `floor` (see [`Self::coalesced_watermark_floors`]). `None` means the
+    /// caller must pay the `watermark.json` GET (once — the slow path caches
+    /// it via [`Self::cache_coalesced_watermark`]).
+    fn cached_coalesced_watermark(&self, topition: &Topition, floor: u64) -> Result<Option<i64>> {
+        self.coalesced_watermark_floors
+            .lock()
+            .map(|locked| {
+                locked
+                    .get(topition)
+                    .and_then(|(high, at)| (*at == floor).then_some(*high))
+            })
+            .map_err(Into::into)
+    }
+
+    /// Cache `high` (a just-read `watermark.high`) for `topition` under the
+    /// certified seq `floor` that was current *at or before* the read. Pairing
+    /// with an older floor is safe: any watermark advance after the read
+    /// raises the floor above `floor`, invalidating this entry; an advance
+    /// before the read is already contained in `high`.
+    fn cache_coalesced_watermark(&self, topition: &Topition, high: i64, floor: u64) -> Result<()> {
+        self.coalesced_watermark_floors
+            .lock()
+            .map(|mut locked| {
+                _ = locked.insert(topition.to_owned(), (high, floor));
+            })
+            .map_err(Into::into)
+    }
+
     /// Reconcile the cached high-watermark hint for `topition` against the
     /// partition's batch objects and return the authoritative next offset.
     async fn refresh_high(&self, topition: &Topition) -> Result<i64> {
@@ -2040,6 +2109,80 @@ impl DynoStore {
         let high = self.tail_next_offset(topition, Some(floor)).await?;
         self.mark_listed(topition, high, listed_at)?;
         Ok(high)
+    }
+
+    /// The stale-hint high watermark of a prefix-coalesced sub-stream served
+    /// from the in-memory segment index alone — no per-partition object-store
+    /// request. `None` means the index is not authoritative for this
+    /// sub-stream and the caller must fall back to the `watermark.json` GET.
+    ///
+    /// Correctness (LATEST must equal the true high watermark exactly):
+    ///
+    /// - **The true high** is `max(tail across live segments + legacy
+    ///   `records/` objects, persisted `watermark.high`)`: segments/batches
+    ///   are the offset-assignment authority, and the only way assigned
+    ///   offsets leave them is retention/compaction, where
+    ///   `expire_prefix_segments` persists each affected sub-stream's tail
+    ///   into `watermark.high` write-ahead of the delete (retention advances
+    ///   the log *start*, never lowers the log *end*).
+    /// - **Legacy objects** can hold offsets above the segment tail (#58 seam
+    ///   / #62 backfill bypass), so a hybrid sub-stream
+    ///   ([`Self::has_legacy_records`], same memo the slow path uses) is not
+    ///   served here.
+    /// - **The index tail** covers every live segment after
+    ///   [`Self::refresh_prefix_index`]: cold builds list the whole prefix,
+    ///   and incremental listings can miss no live segment at/below the known
+    ///   max (sequences are assigned by create-CAS at `folded max + 1`, so a
+    ///   sequence below an observed one can never be created later). Ghost
+    ///   entries (a peer's deletion never re-observed) only ever *equal* the
+    ///   persisted watermark floor, never exceed the true high.
+    /// - **The watermark floor** comes from the per-partition cache certified
+    ///   by [`Self::certified_seq_floor`]: `watermark.high` of a coalesced
+    ///   sub-stream only advances in an operation that then raises the seq
+    ///   floor, so an unchanged certified floor proves the cached value is
+    ///   current; any rise invalidates the cache and the slow path re-reads.
+    /// - **No segments at all** is not served: an empty sub-stream is
+    ///   indistinguishable from a fully drained or lake-sink one, whose only
+    ///   authority is `watermark.json` — and a lake-sink high advances
+    ///   *without* raising the seq floor, so the floor-certified cache must
+    ///   not vouch for it. Those keep today's per-partition GET.
+    async fn coalesced_high_from_index(&self, topition: &Topition) -> Result<Option<i64>> {
+        if self.has_legacy_records(topition).await? {
+            return Ok(None);
+        }
+
+        let prefix = self.prefix_of(topition);
+        self.refresh_prefix_index(&prefix).await?;
+
+        let Some(tail) = self
+            .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
+            .last()
+            .map(|(_, entry)| entry.base_offset + entry.record_count)
+        else {
+            return Ok(None);
+        };
+
+        // Certified after the refresh above, so the floor covers every
+        // watermark advance whose segment deletion that listing could have
+        // reflected. One GET per prefix per listing generation, amortized
+        // across every partition of the prefix — not per partition.
+        let floor = self.certified_seq_floor(&prefix).await?;
+        let Some(watermark_floor) = self.cached_coalesced_watermark(topition, floor)? else {
+            return Ok(None);
+        };
+
+        let high = tail
+            .max(watermark_floor)
+            .max(self.cached_high(topition)?.unwrap_or(0));
+
+        // Anchor the hint to when the segment set was observed, not `now`
+        // (#91), exactly as the slow path does.
+        let as_of = self
+            .prefix_index_refreshed_at(&prefix)
+            .unwrap_or_else(SystemTime::now);
+        self.mark_listed(topition, high, as_of)?;
+
+        Ok(Some(high))
     }
 
     /// The log end offset (high watermark) for `topition`.
@@ -2070,16 +2213,31 @@ impl DynoStore {
             return Ok(hint);
         }
 
-        // Cold/stale hint: read the persisted watermark as the listing floor (and
-        // to fold in lake-sink topics' authoritative high). Only on this slow
-        // path, not on every poll.
-        let from_watermark = self.persisted_high(topition).await?;
-
         // Prefix-coalesced (#60): the tail offset lives in the segment footers,
-        // not in a `records/` listing (there is none). Recover it footer-only
-        // (#58) and refresh the hint so the hot path serves from memory next
-        // time. GCS-safe: no per-flush-mutated manifest is read.
+        // not in a `records/` listing (there is none). The common case — a
+        // pure-segment sub-stream whose watermark floor is certified — is
+        // served entirely from the in-memory index with ZERO per-partition
+        // object requests; that is what takes a wide `endOffsets(assignment)`
+        // (the ~1500-partition ListOffsets that still timed out after being
+        // parallelized) off the per-partition `watermark.json` conditional
+        // GET. GCS-safe: no per-flush-mutated manifest is read.
         if self.prefix_coalesce {
+            if let Some(high) = self.coalesced_high_from_index(topition).await? {
+                return Ok(high);
+            }
+
+            // Index not authoritative for this sub-stream — hybrid (legacy
+            // `records/` objects may sit above the segments), no segment at
+            // all (never produced, fully retention-drained, or a lake-sink
+            // topic whose offset lives only in `watermark.high`), or a cold /
+            // floor-invalidated watermark cache. Pay the `watermark.json` GET
+            // and recover footer-only (#58), caching the watermark under the
+            // certified floor read *before* it so the fast path serves the
+            // next stale-hint resolution.
+            let floor = self.certified_seq_floor(&self.prefix_of(topition)).await?;
+            let from_watermark = self.persisted_high(topition).await?;
+            self.cache_coalesced_watermark(topition, from_watermark, floor)?;
+
             let recovered = self
                 .recover_substream_next_offset(topition, from_watermark)
                 .await?;
@@ -2095,6 +2253,11 @@ impl DynoStore {
             self.mark_listed(topition, high, as_of)?;
             return Ok(high);
         }
+
+        // Cold/stale hint: read the persisted watermark as the listing floor (and
+        // to fold in lake-sink topics' authoritative high). Only on this slow
+        // path, not on every poll.
+        let from_watermark = self.persisted_high(topition).await?;
 
         let cached = self.cached_high(topition)?;
         let was_cold = cached.is_none();
@@ -2437,6 +2600,84 @@ impl DynoStore {
             Err(object_store::Error::NotFound { .. }) => Ok(0),
             Err(err) => Err(err.into()),
         }
+    }
+
+    /// The persisted next-sequence floor for `prefix`, *certified against the
+    /// current index generation*: served from the in-memory prefix index when
+    /// it was read at-or-after the listing the current generation stands for,
+    /// otherwise re-read with one GET (per prefix, not per partition) and
+    /// cached under that generation.
+    ///
+    /// Why this certifies the LATEST fast path: the floor is raised
+    /// write-ahead of *every* segment delete
+    /// ([`Self::raise_seq_floor`] call sites in `expire_prefix_segments` and
+    /// `compact_prefix_segments`), and `expire_prefix_segments` persists each
+    /// affected sub-stream's tail into `watermark.high` *before* that raise.
+    /// So `watermark.high` of a prefix-coalesced sub-stream can only advance
+    /// in an operation that subsequently raises this floor. A floor value read
+    /// after our latest listing therefore covers every watermark advance whose
+    /// segment deletion that listing could have reflected — if the floor has
+    /// not risen since a `watermark.json` read, that read is still the current
+    /// high floor, and no per-partition conditional GET is needed.
+    ///
+    /// Generation-checked commit: the GET is issued after capturing the
+    /// generation, and the result is cached only if no listing/prune committed
+    /// meanwhile — a stale read can never be certified against a newer view.
+    /// The un-cached value is still returned: it is valid for the caller's own
+    /// (older-generation) segment snapshot, whose tails a newer prune can only
+    /// have kept or removed, never advanced.
+    async fn certified_seq_floor(&self, prefix: &str) -> Result<u64> {
+        // Lock-free fast path: a floor already certified for the current
+        // generation is served from memory.
+        if let Some(floor) = self.cached_certified_seq_floor(prefix)? {
+            return Ok(floor);
+        }
+
+        // Single-flight the sync per prefix (same lock as the index refresh):
+        // concurrent stale readers re-check under the lock and are served by
+        // the winner's GET instead of issuing N duplicates.
+        let sync = self.prefix_read_sync_lock(prefix)?;
+        let _guard = sync.lock().await;
+
+        if let Some(floor) = self.cached_certified_seq_floor(prefix)? {
+            return Ok(floor);
+        }
+
+        let generation = self
+            .prefix_index
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .get(prefix)
+            .map(|entry| entry.generation)
+            .unwrap_or_default();
+
+        let floor = self.read_seq_floor(prefix).await?;
+
+        {
+            let mut index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            let entry = index.entry(prefix.to_owned()).or_default();
+            // A prune can bump the generation without taking the single-flight
+            // lock, so commit only if no such loss happened during the GET — a
+            // stale read must never be certified against a newer view. The
+            // value is still returned: it is valid for the caller's own
+            // segment snapshot.
+            if entry.generation == generation {
+                entry.seq_floor = Some((floor, generation));
+            }
+        }
+
+        Ok(floor)
+    }
+
+    /// The certified seq floor for `prefix` iff one is cached for the current
+    /// index generation (see [`Self::certified_seq_floor`]).
+    fn cached_certified_seq_floor(&self, prefix: &str) -> Result<Option<u64>> {
+        let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+        Ok(index.get(prefix).and_then(|entry| {
+            entry
+                .seq_floor
+                .and_then(|(floor, at)| (at == entry.generation).then_some(floor))
+        }))
     }
 
     /// Raise the persisted next-sequence floor for `prefix` to at least `floor`
@@ -2888,22 +3129,46 @@ impl DynoStore {
         self.refresh_prefix_index_inner(prefix, true).await
     }
 
-    async fn refresh_prefix_index_inner(&self, prefix: &str, force: bool) -> Result<()> {
-        let (fresh, start_after) = {
-            let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
-            match index.get(prefix) {
-                Some(entry) => {
-                    let fresh = entry.refreshed_at.is_some_and(|at| {
-                        SystemTime::now()
-                            .duration_since(at)
-                            .is_ok_and(|elapsed| elapsed < Self::HIGH_WATERMARK_HINT_TTL)
-                    });
-                    (fresh, entry.segments.keys().next_back().copied())
-                }
-                None => (false, None),
+    /// Whether the cached prefix index is within its freshness TTL, plus the
+    /// incremental-listing watermark (highest known sequence).
+    fn prefix_index_freshness(&self, prefix: &str) -> Result<(bool, Option<u64>)> {
+        let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+        Ok(match index.get(prefix) {
+            Some(entry) => {
+                let fresh = entry.refreshed_at.is_some_and(|at| {
+                    SystemTime::now()
+                        .duration_since(at)
+                        .is_ok_and(|elapsed| elapsed < Self::HIGH_WATERMARK_HINT_TTL)
+                });
+                (fresh, entry.segments.keys().next_back().copied())
             }
-        };
+            None => (false, None),
+        })
+    }
 
+    /// The per-prefix single-flight lock for the real index refresh and the
+    /// certified seq-floor sync (see [`Self::prefix_read_sync_locks`]).
+    fn prefix_read_sync_lock(&self, prefix: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
+        self.prefix_read_sync_locks
+            .lock()
+            .map_err(Into::into)
+            .map(|mut locks| locks.entry(prefix.to_owned()).or_default().clone())
+    }
+
+    async fn refresh_prefix_index_inner(&self, prefix: &str, force: bool) -> Result<()> {
+        // Lock-free fast path: a fresh index is served without touching the
+        // single-flight lock, so TTL-served readers never contend.
+        if !force && self.prefix_index_freshness(prefix)?.0 {
+            return Ok(());
+        }
+
+        // Single-flight the real listing per prefix: concurrent stale readers
+        // (a wide ListOffsets resolves 32 partitions at once) queue here and
+        // re-check, so one LIST serves them all instead of N duplicates.
+        let sync = self.prefix_read_sync_lock(prefix)?;
+        let _guard = sync.lock().await;
+
+        let (fresh, start_after) = self.prefix_index_freshness(prefix)?;
         if !force && fresh {
             return Ok(());
         }
@@ -2992,12 +3257,16 @@ impl DynoStore {
         }
 
         // Whole live set observed: stamp fresh so the TTL fast-path can serve.
-        self.prefix_index
-            .lock()
-            .map_err(Into::<Error>::into)?
-            .entry(prefix.to_owned())
-            .or_default()
-            .refreshed_at = Some(SystemTime::now());
+        // The listing may reflect another replica's segment deletions (which an
+        // incremental list can never re-observe), so bump the generation: the
+        // certified seq floor must be re-read at least as recently as this
+        // listing before the LATEST fast path may trust the index again.
+        {
+            let mut index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            let entry = index.entry(prefix.to_owned()).or_default();
+            entry.refreshed_at = Some(SystemTime::now());
+            entry.generation += 1;
+        }
         Ok(())
     }
 
@@ -3056,6 +3325,10 @@ impl DynoStore {
     }
 
     /// Drop expired sequences from the index after a retention delete (#61).
+    /// A prune removes tail knowledge from this process's view, so it also
+    /// bumps the generation: the certified seq floor must be re-read before
+    /// the LATEST fast path may trust the index again (see
+    /// [`Self::certified_seq_floor`]).
     fn index_prune(&self, prefix: &str, seqs: &[u64]) -> Result<()> {
         self.prefix_index
             .lock()
@@ -3065,6 +3338,7 @@ impl DynoStore {
                     for seq in seqs {
                         _ = entry.segments.remove(seq);
                     }
+                    entry.generation += 1;
                 }
             })
     }
@@ -6590,9 +6864,16 @@ impl Storage for DynoStore {
 
             // Drop any stale next-offset hint (e.g. a topic of the same
             // name was previously deleted) so the fresh, empty partition
-            // re-derives offset 0 from listing.
+            // re-derives offset 0 from listing. The cached watermark floor
+            // must go with it: the prefix's seq floor is unrelated to topic
+            // lifecycle, so it alone would never invalidate a floor cached
+            // for the deleted incarnation.
             _ = self
                 .next_offsets
+                .lock()
+                .map(|mut locked| locked.remove(&topition))?;
+            _ = self
+                .coalesced_watermark_floors
                 .lock()
                 .map(|mut locked| locked.remove(&topition))?;
         }
@@ -7202,12 +7483,15 @@ impl Storage for DynoStore {
 
         // Resolve the partitions CONCURRENTLY (bounded) instead of awaiting
         // each in turn. A single ListOffsets can carry a consumer's whole
-        // assignment — `endOffsets` over ~1500 partitions — and one partition
-        // costs at least one object-store round-trip whenever its
-        // high-watermark hint is stale (the conditional GET of
-        // `watermark.json` in `persisted_high`; more for hybrid or
-        // non-coalesced topics, which LIST `records/`). The sequential loop
-        // was O(partitions × RTT) and blew past the Kafka client's request
+        // assignment — `endOffsets` over ~1500 partitions. On the warm
+        // prefix-coalesced path a partition now costs ZERO per-partition
+        // object-store round-trips (LATEST and EARLIEST are served from the
+        // segment index, `coalesced_high_from_index` /
+        // `coalesced_earliest_offset`; only per-prefix amortized requests
+        // remain), but the cold, hybrid and non-coalesced paths still pay at
+        // least one round-trip each (the `watermark.json` GET in
+        // `persisted_high`, or a `records/` LIST). The sequential loop was
+        // O(partitions × RTT) there and blew past the Kafka client's request
         // timeout at scale, so the consumer could never resolve its
         // positions. Bounded concurrency issues exactly the same
         // per-partition reads (and returns the same answers) while making

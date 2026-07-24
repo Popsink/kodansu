@@ -30,7 +30,7 @@ use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory, path::Path,
 };
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tansu_sans_io::{
     IsolationLevel, ListOffset,
     create_topics_request::CreatableTopic,
@@ -944,6 +944,279 @@ async fn legacy_records_presence_memo_ttls_and_write_through() -> Result<(), Err
             "the flipped-present memo is served from memory, no LIST"
         );
     }
+
+    Ok(())
+}
+
+/// A wide stale-hint `ListOffsets` sweep over prefix-coalesced topics — the
+/// `endOffsets(assignment)` shape over ~1500 mostly-idle CDC topics — costs
+/// O(prefixes), not O(partitions), in object-store requests: one incremental
+/// `segments/` LIST plus one `seq-floor.json` GET per prefix, and **zero**
+/// per-partition `watermark.json` conditional GETs. Before this fast path the
+/// stale-hint LATEST resolution paid one `watermark.json` round-trip per
+/// partition (`persisted_high`), which at ~1500 partitions blew the client
+/// timeout even after the resolution was parallelized 32-way.
+#[tokio::test]
+async fn coalesced_stale_hint_list_offsets_is_per_prefix_not_per_partition() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    const PREFIXES: usize = 2;
+    const TOPICS_PER_PREFIX: usize = 8;
+
+    let counters = Arc::new(Counters::default());
+    let storage = DynoStore::new(
+        CLUSTER,
+        NODE,
+        Counting {
+            inner: InMemory::new(),
+            counters: counters.clone(),
+        },
+    )
+    .prefix_coalesce(true)
+    .prefix_leaseless(true);
+
+    let topic_name = |p: usize, i: usize| format!("org.env.conn{p}.table{i:02}");
+    // Distinct per topic so a response attributed to the wrong partition
+    // cannot accidentally carry the right high watermark.
+    let records_in = |p: usize, i: usize| ((p * TOPICS_PER_PREFIX + i) % 5) as i64 + 1;
+
+    let mut latest = Vec::new();
+    for p in 0..PREFIXES {
+        for i in 0..TOPICS_PER_PREFIX {
+            let name = topic_name(p, i);
+            create(&storage, &name, 1).await?;
+            let tp = Topition::new(name.as_str(), 0);
+            for n in 0..records_in(p, i) {
+                _ = storage
+                    .produce(None, &tp, batch(format!("m-{n}").as_bytes())?)
+                    .await?;
+            }
+            latest.push((tp, ListOffset::Latest));
+        }
+    }
+    let earliest: Vec<_> = latest
+        .iter()
+        .map(|(tp, _)| (tp.clone(), ListOffset::Earliest))
+        .collect();
+
+    let expected_high = |tp: &Topition| {
+        let topic = tp.topic();
+        let p: usize = topic["org.env.conn".len()..topic.rfind('.').unwrap()]
+            .parse()
+            .unwrap();
+        let i: usize = topic[topic.rfind("table").unwrap() + "table".len()..]
+            .parse()
+            .unwrap();
+        records_in(p, i)
+    };
+
+    // First sweep: warms the per-partition watermark-floor cache (one
+    // `watermark.json` GET each, exactly as before) and the per-prefix
+    // certified seq floor, and asserts correctness cold.
+    let responses = storage
+        .list_offsets(IsolationLevel::ReadUncommitted, &latest)
+        .await?;
+    assert_eq!(latest.len(), responses.len());
+    for (tp, response) in &responses {
+        assert_eq!(
+            Some(expected_high(tp)),
+            response.offset,
+            "cold LATEST: {tp:?}"
+        );
+    }
+
+    // Age every hint and index clock past the TTL without sleeping: the next
+    // sweep takes the stale-hint path, the one that used to pay the
+    // per-partition GET.
+    let age = |storage: &DynoStore| {
+        let past = SystemTime::now() - Duration::from_secs(60);
+        for hint in storage
+            .next_offsets
+            .lock()
+            .expect("next_offsets lock")
+            .values_mut()
+        {
+            hint.listed_at = Some(past);
+        }
+        for entry in storage
+            .prefix_index
+            .lock()
+            .expect("prefix_index lock")
+            .values_mut()
+        {
+            entry.refreshed_at = Some(past);
+        }
+    };
+    age(&storage);
+
+    counters.reset();
+    let responses = storage
+        .list_offsets(IsolationLevel::ReadUncommitted, &latest)
+        .await?;
+    assert_eq!(latest.len(), responses.len());
+    for (tp, response) in &responses {
+        assert_eq!(
+            Some(expected_high(tp)),
+            response.offset,
+            "stale-hint LATEST: {tp:?}"
+        );
+    }
+    let stale = counters.report("stale-hint LATEST sweep (16 partitions, 2 prefixes)");
+    assert_eq!(0, stale.0, "no puts");
+    assert_eq!(0, stale.2, "no full LIST");
+    assert_eq!(
+        PREFIXES as u64, stale.3,
+        "one single-flighted incremental segments LIST per PREFIX, not per partition"
+    );
+    assert_eq!(
+        PREFIXES as u64, stale.1,
+        "one seq-floor GET per PREFIX — and zero per-partition watermark.json GETs"
+    );
+
+    // EARLIEST over the whole assignment within the index TTL: served entirely
+    // from the footer index (log start == oldest segment base), zero requests.
+    counters.reset();
+    let responses = storage
+        .list_offsets(IsolationLevel::ReadUncommitted, &earliest)
+        .await?;
+    assert_eq!(earliest.len(), responses.len());
+    for (tp, response) in &responses {
+        assert_eq!(Some(0), response.offset, "EARLIEST: {tp:?}");
+    }
+    let warm = counters.report("EARLIEST sweep within TTL");
+    assert_eq!(
+        (0, 0, 0, 0, 0),
+        warm,
+        "EARLIEST must resolve from the in-memory segment index"
+    );
+
+    // Freshness is not traded away: a produce after the sweep advances LATEST
+    // through the same fast path on the next stale-hint read.
+    let hot = Topition::new(topic_name(0, 0).as_str(), 0);
+    _ = storage.produce(None, &hot, batch(b"one-more")?).await?;
+    age(&storage);
+    let responses = storage
+        .list_offsets(
+            IsolationLevel::ReadUncommitted,
+            &[(hot.clone(), ListOffset::Latest)],
+        )
+        .await?;
+    assert_eq!(
+        Some(expected_high(&hot) + 1),
+        responses[0].1.offset,
+        "a post-sweep produce must be visible on the next stale-hint LATEST"
+    );
+
+    Ok(())
+}
+
+/// The floor-certified watermark cache never regresses LATEST below an offset
+/// a peer replica acked and then expired. `watermark.high` of a coalesced
+/// sub-stream only advances in `expire_prefix_segments`, which then raises the
+/// prefix seq floor write-ahead of the delete — so a floor rise is exactly the
+/// signal that a cached `watermark.json` value may be stale, and the fast path
+/// steps aside for one re-GET. A floor that has NOT risen certifies the cache
+/// and the stale-hint LATEST costs zero per-partition requests.
+#[tokio::test]
+async fn coalesced_latest_survives_peer_expiry_via_floor_certification() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let counters = Arc::new(Counters::default());
+    let storage = DynoStore::new(
+        CLUSTER,
+        NODE,
+        Counting {
+            inner: bucket.clone(),
+            counters: counters.clone(),
+        },
+    )
+    .prefix_coalesce(true)
+    .prefix_leaseless(true);
+
+    let topic = "org.env.conn.expired";
+    create(&storage, topic, 1).await?;
+    let tp = Topition::new(topic, 0);
+    for n in 0..4 {
+        _ = storage
+            .produce(None, &tp, batch(format!("m-{n}").as_bytes())?)
+            .await?;
+    }
+    let prefix = storage.prefix_of(&tp);
+
+    // Warm the caches (pays the one watermark GET), then age the clocks: the
+    // stale-hint read serves LATEST from the index + certified cache with no
+    // per-partition request — only the per-prefix LIST + floor GET remain.
+    assert_eq!(4, storage.high_watermark(&tp).await?);
+    let age = |storage: &DynoStore| {
+        let past = SystemTime::now() - Duration::from_secs(60);
+        for hint in storage
+            .next_offsets
+            .lock()
+            .expect("next_offsets lock")
+            .values_mut()
+        {
+            hint.listed_at = Some(past);
+        }
+        for entry in storage
+            .prefix_index
+            .lock()
+            .expect("prefix_index lock")
+            .values_mut()
+        {
+            entry.refreshed_at = Some(past);
+        }
+    };
+    age(&storage);
+    counters.reset();
+    assert_eq!(4, storage.high_watermark(&tp).await?);
+    let certified = counters.report("stale-hint LATEST, floor unchanged");
+    assert_eq!(
+        (0, 1, 0, 1, 0),
+        certified,
+        "floor unchanged: one per-prefix floor GET + one incremental LIST, no watermark.json GET"
+    );
+
+    // A peer replica acked offsets this process never listed (segments created
+    // and expired within its blind window), exactly as `expire_prefix_segments`
+    // would leave the store: `watermark.high` persisted to the acked tail, then
+    // the seq floor raised write-ahead of the delete.
+    storage
+        .watermark(&tp)?
+        .with_mut(&storage.object_store, |watermark| {
+            watermark.high = Some(100);
+            Ok(())
+        })
+        .await?;
+    storage.raise_seq_floor(&prefix, 1_000).await?;
+
+    // The floor rise invalidates the cached watermark: the next stale-hint
+    // read re-GETs `watermark.json` once and reports the peer-acked high —
+    // LATEST never regresses below an acked offset.
+    age(&storage);
+    assert_eq!(
+        100,
+        storage.high_watermark(&tp).await?,
+        "a floor rise must force the watermark re-read"
+    );
+
+    // A cold replica (empty caches, same bucket) converges to the same answer:
+    // its index tail (4) never wins over the persisted floor (100).
+    let cold = DynoStore::new(
+        CLUSTER,
+        NODE,
+        Counting {
+            inner: bucket.clone(),
+            counters: Arc::new(Counters::default()),
+        },
+    )
+    .prefix_coalesce(true)
+    .prefix_leaseless(true);
+    assert_eq!(
+        100,
+        cold.high_watermark(&tp).await?,
+        "a cold replica must serve the peer-acked high, not the surviving segment tail"
+    );
 
     Ok(())
 }
