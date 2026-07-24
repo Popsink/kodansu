@@ -201,6 +201,15 @@ pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {
 pub struct Connection {
     stream: TcpStream,
     correlation_id: i32,
+    /// `true` while a request/response round-trip is in flight on `stream`.
+    /// Set before the request is written and cleared only once the full
+    /// response frame has been read. If the driving future is cancelled (e.g.
+    /// a forward deadline elapsing) between those points, the connection is
+    /// dropped back to the pool with unread response bytes still queued in the
+    /// socket; reusing it would decode that leftover as a bogus frame
+    /// (`MessageMaxSizeExceeded` / "maximum tagged fields exceeded"). `recycle`
+    /// discards any connection still flagged dirty. See [`ConnectionManager`].
+    dirty: bool,
 }
 
 /// Manager of supported API versions for a broker
@@ -268,6 +277,7 @@ impl managed::Manager for ConnectionManager {
                 .map(|stream| Connection {
                     stream,
                     correlation_id: 0,
+                    dirty: false,
                 })?)
         })
         .await
@@ -279,7 +289,18 @@ impl managed::Manager for ConnectionManager {
         obj: &mut Self::Type,
         metrics: &managed::Metrics,
     ) -> managed::RecycleResult<Self::Error> {
-        debug!(obj.correlation_id, metrics.recycle_count);
+        debug!(obj.correlation_id, obj.dirty, metrics.recycle_count);
+
+        // A connection whose last round-trip did not complete (cancelled or
+        // errored mid-frame) has an unaligned byte stream: its socket may still
+        // hold part of a previous response. Reusing it would misframe the next
+        // read. Discard it so deadpool creates a fresh connection instead.
+        if obj.dirty {
+            return Err(managed::RecycleError::message(
+                "connection left mid-frame by a cancelled or failed round-trip",
+            ));
+        }
+
         Ok(())
     }
 }
@@ -730,11 +751,23 @@ impl Service<Object<ConnectionManager>, Bytes> for BytesConnectionService {
         let span = span!(Level::DEBUG, "client", local = %local, peer = %peer);
 
         async move {
+            // Mark the connection in-flight: cleared only after the full
+            // response is read below. If this future is cancelled (a forward
+            // deadline elapsing) or the write/read errors in between, the flag
+            // stays set and `ConnectionManager::recycle` discards the
+            // connection rather than handing its unaligned stream to the next
+            // caller.
+            c.dirty = true;
+
             self.write(&mut c.stream, req, &attributes).await?;
 
             c.correlation_id += 1;
 
-            self.read(&mut c.stream, &attributes).await
+            let response = self.read(&mut c.stream, &attributes).await?;
+
+            c.dirty = false;
+
+            Ok(response)
         }
         .instrument(span)
         .await
@@ -958,5 +991,168 @@ mod tests {
         debug!(?joined);
 
         Ok(())
+    }
+
+    // A round-trip cancelled mid-read (as a forward deadline elapsing does)
+    // leaves the pooled connection's byte stream unaligned. It must be
+    // discarded on recycle, not handed to the next caller — otherwise the next
+    // read decodes leftover bytes as a bogus frame. Proven here by the server
+    // seeing a SECOND accept: the poisoned connection was dropped and a fresh
+    // one opened.
+    #[tokio::test]
+    async fn dirty_connection_is_discarded_after_cancelled_round_trip() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let accepts = Arc::new(AtomicU32::new(0));
+
+        {
+            let accepts = accepts.clone();
+            _ = tokio::spawn(async move {
+                let mut n = 0u32;
+                loop {
+                    let (mut sock, _) = listener.accept().await.unwrap();
+                    _ = accepts.fetch_add(1, Ordering::SeqCst);
+                    n += 1;
+                    let first = n == 1;
+
+                    // Handle each connection in its own task so a stalled
+                    // handler never blocks the accept loop from accepting the
+                    // fresh connection the fix must open.
+                    _ = tokio::spawn(async move {
+                        let mut buf = [0u8; 64];
+                        _ = sock.read(&mut buf).await;
+
+                        if first {
+                            // Announce a 100-byte body but send only two bytes
+                            // and withhold the rest: the client blocks in
+                            // read_exact until its caller cancels the round-trip.
+                            _ = sock.write_all(&[0, 0, 0, 100]).await;
+                            _ = sock.write_all(&[1, 2]).await;
+                        } else {
+                            // A well-formed, empty-body frame (4-byte size
+                            // prefix of zero) that the client reads cleanly.
+                            _ = sock.write_all(&[0, 0, 0, 0]).await;
+                        }
+                        _ = sock.flush().await;
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                    });
+                }
+            });
+        }
+
+        let pool: Pool = Pool::builder(ConnectionManager {
+            broker: Url::parse(&format!("tcp://127.0.0.1:{port}")).unwrap(),
+            client_id: None,
+            versions: BTreeMap::new(),
+        })
+        .max_size(1)
+        .build()
+        .unwrap();
+
+        let service = BytesConnectionService;
+        let request = Bytes::from_static(&[0, 0, 0, 4, 9, 9, 9, 9]);
+
+        // First round-trip: cancelled mid-read (server withholds the body).
+        {
+            let object = pool.get().await.unwrap();
+            let (ctx, _) = Context::default().swap_state(object);
+            let outcome = tokio::time::timeout(
+                Duration::from_millis(300),
+                service.serve(ctx, request.clone()),
+            )
+            .await;
+            assert!(
+                outcome.is_err(),
+                "the round-trip should have been cancelled mid-read"
+            );
+        }
+
+        // Second round-trip: the poisoned connection must be discarded on
+        // recycle, forcing a fresh TCP connection that completes cleanly.
+        {
+            let object = pool.get().await.unwrap();
+            let (ctx, _) = Context::default().swap_state(object);
+            let response =
+                tokio::time::timeout(Duration::from_secs(2), service.serve(ctx, request))
+                    .await
+                    .expect("the retry must not hang on a poisoned connection")
+                    .expect("the retry must succeed on a fresh connection");
+            assert_eq!(&response[..], &[0, 0, 0, 0]);
+        }
+
+        assert_eq!(
+            2,
+            accepts.load(Ordering::SeqCst),
+            "the poisoned connection must be discarded and a fresh one opened"
+        );
+    }
+
+    // The counterpart: a connection whose round-trip completed cleanly must be
+    // reused, not reconnected. Three sequential round-trips over a max-size-1
+    // pool must ride ONE connection (a single accept).
+    #[tokio::test]
+    async fn clean_connection_is_reused() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let accepts = Arc::new(AtomicU32::new(0));
+
+        {
+            let accepts = accepts.clone();
+            _ = tokio::spawn(async move {
+                loop {
+                    let (mut sock, _) = listener.accept().await.unwrap();
+                    _ = accepts.fetch_add(1, Ordering::SeqCst);
+                    _ = tokio::spawn(async move {
+                        let mut buf = [0u8; 64];
+                        loop {
+                            match sock.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => {
+                                    _ = sock.write_all(&[0, 0, 0, 0]).await;
+                                    _ = sock.flush().await;
+                                }
+                            }
+                        }
+                    });
+                }
+            });
+        }
+
+        let pool: Pool = Pool::builder(ConnectionManager {
+            broker: Url::parse(&format!("tcp://127.0.0.1:{port}")).unwrap(),
+            client_id: None,
+            versions: BTreeMap::new(),
+        })
+        .max_size(1)
+        .build()
+        .unwrap();
+
+        let service = BytesConnectionService;
+
+        for _ in 0..3 {
+            let object = pool.get().await.unwrap();
+            let (ctx, _) = Context::default().swap_state(object);
+            let response = service
+                .serve(ctx, Bytes::from_static(&[0, 0, 0, 4, 9, 9, 9, 9]))
+                .await
+                .expect("a clean round-trip must succeed");
+            assert_eq!(&response[..], &[0, 0, 0, 0]);
+        }
+
+        assert_eq!(
+            1,
+            accepts.load(Ordering::SeqCst),
+            "a cleanly-returned connection must be reused, not reconnected"
+        );
     }
 }
