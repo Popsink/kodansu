@@ -112,19 +112,26 @@ fn rendezvous_score(group_id: &str, peer: &IpAddr) -> u64 {
     })
 }
 
-/// The owner of `group_id` under rendezvous hashing: the peer maximising
-/// `mix64(fnv1a_64(group_id ‖ peer))`, with ties broken by [`IpAddr`]
+/// The owner of `group_id` under rendezvous hashing: the candidate maximising
+/// `mix64(fnv1a_64(group_id ‖ candidate))`, with ties broken by [`IpAddr`]
 /// ordering so every replica agrees regardless of the order peers were
 /// discovered in.
 ///
-/// An empty `peers` slice yields `self_ip`: with no known peers the replica
-/// treats itself as owner and processes the request locally, which is
-/// exactly today's behaviour.
+/// `self_ip` is ALWAYS one of the candidates, even when it is absent from
+/// `peers`. A replica can always coordinate a group itself, and forcing self
+/// into the candidate set removes a startup/rollout asymmetry: in the window
+/// where the headless Service has published this pod to its *peers'* DNS but
+/// this pod's own resolver has not yet listed itself, a self-excluding view
+/// would forward this replica's own groups elsewhere while peers route those
+/// same groups back to it — transient double-ownership. Including self makes
+/// this replica agree with its peers about the groups it owns. (An empty
+/// `peers` slice therefore still yields `self_ip` = local, today's behaviour.)
 pub fn owner(group_id: &str, self_ip: IpAddr, peers: &[IpAddr]) -> IpAddr {
     peers
         .iter()
         .copied()
-        .max_by_key(|peer| (rendezvous_score(group_id, peer), *peer))
+        .chain(std::iter::once(self_ip))
+        .max_by_key(|candidate| (rendezvous_score(group_id, candidate), *candidate))
         .unwrap_or(self_ip)
 }
 
@@ -322,14 +329,19 @@ mod tests {
 
         for group_id in group_ids(50) {
             let elected = owner(&group_id, self_ip, &peers);
-            assert!(peers.contains(&elected));
+            // self_ip is always a candidate, so the winner may be self even
+            // when it is absent from `peers`.
+            assert!(elected == self_ip || peers.contains(&elected));
         }
     }
 
     #[test]
     fn rendezvous_removal_moves_only_the_removed_peers_groups() {
         let peers = (1..=10).map(peer).collect::<Vec<_>>();
-        let self_ip = peer(200);
+        // self is one of the peers here: this test is about peer
+        // redistribution, not self-candidacy (see
+        // `owner_considers_self_even_when_absent_from_peers`).
+        let self_ip = peer(1);
         let removed = peer(4);
         let survivors = peers
             .iter()
@@ -374,7 +386,8 @@ mod tests {
     #[test]
     fn owners_are_reasonably_distributed() {
         let peers = (1..=10).map(peer).collect::<Vec<_>>();
-        let self_ip = peer(200);
+        // self is one of the peers here (this test measures peer distribution).
+        let self_ip = peer(1);
         let mut per_owner = BTreeMap::<IpAddr, usize>::new();
 
         for group_id in group_ids(2_000) {
@@ -391,6 +404,30 @@ mod tests {
                 "peer {owner} owns {n} of 2000 groups; expected ~200"
             );
         }
+    }
+
+    #[test]
+    fn owner_considers_self_even_when_absent_from_peers() {
+        // Startup/rollout window: the headless Service has published this pod
+        // to its peers' DNS, but this pod's own resolver has not yet listed
+        // itself, so `peers` excludes `self_ip`. Self must still win the groups
+        // that rendezvous to it — otherwise this replica forwards its own
+        // groups away while its peers route them back to it (double-ownership).
+        let self_ip = peer(200); // deliberately NOT in `peers`
+        let peers = (1..=10).map(peer).collect::<Vec<_>>();
+        assert!(!peers.contains(&self_ip));
+
+        let self_owned = group_ids(2_000)
+            .into_iter()
+            .filter(|g| owner(g, self_ip, &peers) == self_ip)
+            .count();
+
+        // self is a genuine 11th candidate: it must win a roughly fair share,
+        // never zero (the pre-fix bug) and never all.
+        assert!(
+            (100..=320).contains(&self_owned),
+            "self owns {self_owned} of 2000 groups; expected ~182 (1/11)"
+        );
     }
 
     #[test]
