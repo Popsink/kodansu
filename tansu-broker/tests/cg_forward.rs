@@ -145,17 +145,24 @@ async fn shared_storage() -> Result<SharedStorage> {
 /// The 10 replicas: independent `Controller`s (each with its own in-memory
 /// wrapper cache, like a real pod) over the one shared store, each behind
 /// deterministically-seeded store latency.
-fn replicas(shared: &SharedStorage) -> Result<Vec<Replica>> {
-    (0..REPLICAS)
-        .map(|index| {
-            Controller::with_storage(
-                LatencyIntroducingStorage::new(shared.clone())
-                    .with_seed(index as u64)
-                    .with_latency(STORE_LATENCY_MS),
-            )
-            .map_err(Into::into)
-        })
-        .collect()
+///
+/// Also returns, aligned by index, a handle to each replica's `update_group`
+/// etag-CAS conflict counter (shared across the `Controller`'s clones), so a
+/// test can assert how much read-modify-write contention the owner replica
+/// actually saw.
+fn replicas(shared: &SharedStorage) -> Result<(Vec<Replica>, Vec<Arc<AtomicU64>>)> {
+    let mut controllers = Vec::with_capacity(REPLICAS);
+    let mut conflicts = Vec::with_capacity(REPLICAS);
+
+    for index in 0..REPLICAS {
+        let storage = LatencyIntroducingStorage::new(shared.clone())
+            .with_seed(index as u64)
+            .with_latency(STORE_LATENCY_MS);
+        conflicts.push(storage.cas_conflicts_handle());
+        controllers.push(Controller::with_storage(storage)?);
+    }
+
+    Ok((controllers, conflicts))
 }
 
 /// The in-process stand-in for the internal-listener hop: given the owner's
@@ -494,7 +501,7 @@ async fn forwarded_sixteen_members_across_ten_replicas_converge() -> Result<()> 
     let _guard = init_tracing()?;
 
     let shared = shared_storage().await?;
-    let replicas = replicas(&shared)?;
+    let (replicas, cas_conflicts) = replicas(&shared)?;
     let peers = (0..REPLICAS).map(peer).collect::<Vec<_>>();
 
     let forward = InProcessForward::new(
@@ -555,6 +562,24 @@ async fn forwarded_sixteen_members_across_ten_replicas_converge() -> Result<()> 
         assert_eq!(0, ingress.fallbacks());
     }
 
+    // The heart of the fix. Every member's group-coordination request is
+    // forwarded to the SAME owner replica, and that owner serializes each
+    // group's read->CAS window in-process (the `Controller` per-group lock).
+    // So the 16 concurrent members never collide on the `{group}.json` etag:
+    // the owner observes ZERO CAS conflicts. Remove the per-group lock and the
+    // same concurrent members thrash the CAS (the pre-fix storm) — this count
+    // climbs into the tens and the assertion fails.
+    let owner_index = peers
+        .iter()
+        .position(|&candidate| candidate == owner_ip)
+        .expect("owner is one of the peers");
+    assert_eq!(
+        0,
+        cas_conflicts[owner_index].load(Ordering::Relaxed),
+        "owner replica saw in-process group-state CAS conflicts despite \
+         per-group serialization"
+    );
+
     // the persisted group is Formed with a non-empty assignment for all 16
     // members, the union of assignments covers the partitions uniquely, and
     // the generation (and object version) is stable.
@@ -579,7 +604,7 @@ async fn scattered_sixteen_members_across_ten_replicas_do_not_converge() -> Resu
     let _guard = init_tracing()?;
 
     let shared = shared_storage().await?;
-    let replicas = replicas(&shared)?;
+    let (replicas, _cas_conflicts) = replicas(&shared)?;
 
     let results = drive_members(&replicas, SCATTERED_WINDOW).await?;
 

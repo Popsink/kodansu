@@ -838,10 +838,30 @@ where
 
 type WrapperMap<O> = Arc<Mutex<BTreeMap<String, (Wrapper<O>, Option<Version>)>>>;
 
+/// Per-group in-process serialization locks. Now that group-coordination
+/// requests are forwarded to a single deterministic owner replica (see
+/// `coordinator::group::forward`), all of a group's members land on the same
+/// `Controller`. Without in-process serialization their read-modify-write
+/// cycles against the single `{group}.json` object interleave and thrash the
+/// etag CAS — 16 members produced a permanent `cas_conflicts` storm and the
+/// group never reached a stable generation. Holding a per-group async lock
+/// across each read->CAS window turns those concurrent RMWs into a sequence of
+/// single successful CAS writes. The lock is *released* before every long poll
+/// / join-window sleep, so a held leader never blocks the very members it is
+/// waiting for. The object-store etag CAS remains the cross-replica correctness
+/// backstop (a forward timeout falls back to local processing on another
+/// replica, which this in-process lock cannot serialize).
+///
+/// The map is keyed by group id and grows with the set of groups this replica
+/// owns; entries are cheap (`Arc<tokio::sync::Mutex<()>>`) and bounded by the
+/// active group population divided across replicas, so it is never pruned.
+type GroupLocks = Arc<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>>;
+
 #[derive(Clone, Debug)]
 pub struct Controller<O> {
     storage: O,
     wrappers: WrapperMap<O>,
+    group_locks: GroupLocks,
 }
 
 impl<O> Controller<O>
@@ -852,7 +872,20 @@ where
         Ok(Self {
             storage,
             wrappers: Arc::new(Mutex::new(BTreeMap::new())),
+            group_locks: Arc::new(Mutex::new(BTreeMap::new())),
         })
+    }
+
+    /// The serialization lock for `group_id`, created on first use. See
+    /// [`GroupLocks`]. Callers hold the returned guard across a single
+    /// read->CAS window and drop it before any long-poll / rebalance sleep.
+    fn group_lock(&self, group_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.group_locks
+            .lock()
+            .expect("group_locks mutex poisoned")
+            .entry(group_id.to_owned())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 }
 
@@ -918,8 +951,15 @@ where
         let mut join_window_members: Option<BTreeSet<String>> = None;
         let mut join_window_changed_at = started_at;
 
+        // Serialize this group's read->CAS window against other in-process
+        // members (see `GroupLocks`). Dropped before every long-poll sleep so
+        // the held leader does not block the members it is waiting for.
+        let group_lock = self.group_lock(group_id);
+
         loop {
             COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_loop")]);
+
+            let permit = group_lock.clone().lock_owned().await;
 
             let now = SystemTime::now();
 
@@ -1046,6 +1086,11 @@ where
                     .lock()
                     .map(|mut wrappers| wrappers.insert(group_id.to_owned(), (updated, version)))?;
 
+                // No storage write happened (no-op skip); the read->CAS window
+                // is closed, so release before any long-poll / join-window
+                // sleep — a held leader must not block the members it awaits.
+                drop(permit);
+
                 if group_instance_id.is_some() && elapsed_ms < PAUSE_MS {
                     let pause = PAUSE_MS.saturating_sub(elapsed_ms);
                     COORDINATOR_REQUESTS
@@ -1109,6 +1154,10 @@ where
                         wrappers.insert(group_id.to_owned(), (updated, Some(version)))
                     })?;
 
+                    // CAS landed; the read->CAS window is closed. Release before
+                    // any long-poll / join-window sleep (see the no-op branch).
+                    drop(permit);
+
                     if group_instance_id.is_some() && elapsed_ms < PAUSE_MS {
                         let pause = PAUSE_MS.saturating_sub(elapsed_ms);
                         debug!(pause);
@@ -1158,6 +1207,12 @@ where
                             ),
                         )
                     });
+
+                    // Release before the CAS-conflict backoff sleep. An
+                    // in-process conflict is now rare (members serialize on the
+                    // group lock); this path mainly catches cross-replica writes
+                    // from a fallback on another owner.
+                    drop(permit);
 
                     cas_conflicts += 1;
                     if cas_conflicts == CAS_CONFLICT_WARN {
@@ -1225,6 +1280,10 @@ where
         let mut iteration = 0;
         let mut cas_conflicts = 0u32;
 
+        // Serialize this group's read->CAS window against other in-process
+        // members (see `GroupLocks`). Dropped before every long-poll sleep.
+        let group_lock = self.group_lock(group_id);
+
         if let Some(assignments) = assignments
             && !assignments.is_empty()
             && !has_unique_elements(
@@ -1263,6 +1322,8 @@ where
 
         loop {
             COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sync_loop")]);
+
+            let permit = group_lock.clone().lock_owned().await;
 
             let now = SystemTime::now();
 
@@ -1337,6 +1398,9 @@ where
                     .lock()
                     .map(|mut wrappers| wrappers.insert(group_id.to_owned(), (updated, version)))?;
 
+                // No-op skip: no write happened; release before the long poll.
+                drop(permit);
+
                 if group_instance_id.is_some() && elapsed_ms < PAUSE_MS {
                     let pause = PAUSE_MS.saturating_sub(elapsed_ms);
                     COORDINATOR_REQUESTS
@@ -1384,6 +1448,9 @@ where
                         wrappers.insert(group_id.to_owned(), (updated, Some(version)))
                     })?;
 
+                    // CAS landed; release before any long-poll sleep.
+                    drop(permit);
+
                     if group_instance_id.is_some() && elapsed_ms < PAUSE_MS {
                         let pause = PAUSE_MS.saturating_sub(elapsed_ms);
                         debug!(pause);
@@ -1421,6 +1488,9 @@ where
                             ),
                         )
                     })?;
+
+                    // Release before the CAS-conflict backoff sleep.
+                    drop(permit);
 
                     cas_conflicts += 1;
                     if cas_conflicts == CAS_CONFLICT_WARN {
@@ -1466,6 +1536,10 @@ where
 
         loop {
             COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "leave_loop")]);
+
+            // Serialize this group's read->CAS window (see `GroupLocks`); no
+            // long-poll sleep here, so held for the whole iteration.
+            let _permit = self.group_lock(group_id).lock_owned().await;
 
             let (wrapper, version) = self.wrappers.lock().map(|mut wrappers| {
                 wrappers
@@ -1538,6 +1612,10 @@ where
 
         loop {
             COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "offset_commit_loop")]);
+
+            // Serialize this group's read->CAS window (see `GroupLocks`); no
+            // long-poll sleep here, so held for the whole iteration.
+            let _permit = self.group_lock(group_id).lock_owned().await;
 
             let (mut wrapper, mut version) = self.wrappers.lock().map(|mut wrappers| {
                 wrappers
@@ -1661,6 +1739,11 @@ where
 
         loop {
             COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "heartbeat_loop")]);
+
+            // Serialize this group's read->CAS window (see `GroupLocks`). This
+            // loop has no long-poll sleep — the guard is held for the whole
+            // iteration and released at scope end (return / continue).
+            let _permit = self.group_lock(group_id).lock_owned().await;
 
             let (mut wrapper, mut version) = self.wrappers.lock().map(|mut wrappers| {
                 wrappers
