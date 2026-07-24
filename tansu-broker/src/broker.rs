@@ -16,7 +16,11 @@ pub mod group;
 
 use crate::{
     CancelKind, Error, Result,
-    coordinator::group::{Coordinator, administrator::Controller},
+    coordinator::group::{
+        Coordinator,
+        administrator::Controller,
+        forward::{DEFAULT_INTERNAL_PORT, GroupCoordinator, PEER_REFRESH_INTERVAL, PeerRegistry},
+    },
     otel,
     service::services,
 };
@@ -466,6 +470,10 @@ pub struct Builder<N, C, I, A, S, L> {
     silent: bool,
     maintenance_interval: Option<Duration>,
     topic_defaults: TopicDefaults,
+    group_forwarding: bool,
+    group_forward_peer_dns: Option<String>,
+    internal_listener_url: Option<Url>,
+    pod_ip: Option<IpAddr>,
 
     cancellation: CancellationToken,
 }
@@ -496,6 +504,10 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             silent: self.silent,
             maintenance_interval: self.maintenance_interval,
             topic_defaults: self.topic_defaults,
+            group_forwarding: self.group_forwarding,
+            group_forward_peer_dns: self.group_forward_peer_dns,
+            internal_listener_url: self.internal_listener_url,
+            pod_ip: self.pod_ip,
 
             cancellation: self.cancellation,
         }
@@ -515,6 +527,10 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             silent: self.silent,
             maintenance_interval: self.maintenance_interval,
             topic_defaults: self.topic_defaults,
+            group_forwarding: self.group_forwarding,
+            group_forward_peer_dns: self.group_forward_peer_dns,
+            internal_listener_url: self.internal_listener_url,
+            pod_ip: self.pod_ip,
 
             cancellation: self.cancellation,
         }
@@ -534,6 +550,10 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             silent: self.silent,
             maintenance_interval: self.maintenance_interval,
             topic_defaults: self.topic_defaults,
+            group_forwarding: self.group_forwarding,
+            group_forward_peer_dns: self.group_forward_peer_dns,
+            internal_listener_url: self.internal_listener_url,
+            pod_ip: self.pod_ip,
 
             cancellation: self.cancellation,
         }
@@ -556,6 +576,10 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             silent: self.silent,
             maintenance_interval: self.maintenance_interval,
             topic_defaults: self.topic_defaults,
+            group_forwarding: self.group_forwarding,
+            group_forward_peer_dns: self.group_forward_peer_dns,
+            internal_listener_url: self.internal_listener_url,
+            pod_ip: self.pod_ip,
 
             cancellation: self.cancellation,
         }
@@ -602,6 +626,10 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             silent: self.silent,
             maintenance_interval,
             topic_defaults: self.topic_defaults,
+            group_forwarding: self.group_forwarding,
+            group_forward_peer_dns: self.group_forward_peer_dns,
+            internal_listener_url: self.internal_listener_url,
+            pod_ip: self.pod_ip,
 
             cancellation: self.cancellation,
         }
@@ -623,6 +651,10 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             silent: self.silent,
             maintenance_interval: self.maintenance_interval,
             topic_defaults: self.topic_defaults,
+            group_forwarding: self.group_forwarding,
+            group_forward_peer_dns: self.group_forward_peer_dns,
+            internal_listener_url: self.internal_listener_url,
+            pod_ip: self.pod_ip,
 
             cancellation: self.cancellation,
         }
@@ -658,10 +690,42 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             ..self
         }
     }
+
+    /// Enable forward-to-owner group coordination (default: off, pure-local).
+    pub fn group_forwarding(self, group_forwarding: bool) -> Self {
+        Self {
+            group_forwarding,
+            ..self
+        }
+    }
+
+    /// Headless-Service hostname whose A/AAAA records are the peer replicas
+    /// eligible to own consumer groups.
+    pub fn group_forward_peer_dns(self, group_forward_peer_dns: Option<String>) -> Self {
+        Self {
+            group_forward_peer_dns,
+            ..self
+        }
+    }
+
+    /// URL of the internal (broker-to-broker) listener; forwarded group
+    /// requests are sent to each owner at this URL's port.
+    pub fn internal_listener_url(self, internal_listener_url: Option<Url>) -> Self {
+        Self {
+            internal_listener_url,
+            ..self
+        }
+    }
+
+    /// This replica's own address (in Kubernetes, the pod IP from the
+    /// Downward API), used to recognise itself in the peer set.
+    pub fn pod_ip(self, pod_ip: Option<IpAddr>) -> Self {
+        Self { pod_ip, ..self }
+    }
 }
 
 impl Builder<i32, String, Uuid, Url, Url, Url> {
-    pub async fn build(self) -> Result<Broker<Controller<ArcDynStorage>, ArcDynStorage>> {
+    pub async fn build(self) -> Result<Broker<GroupCoordinator<ArcDynStorage>, ArcDynStorage>> {
         if let Some(otlp_endpoint_url) = self
             .otlp_endpoint_url
             .clone()
@@ -681,7 +745,45 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             .await
             .map(|storage| Arc::new(storage) as ArcDynStorage)?;
 
-        let groups = Controller::with_storage(storage.clone())?;
+        let controller = Controller::with_storage(storage.clone())?;
+
+        // Local (pure-local group coordination, bit-for-bit today's
+        // behaviour) unless forwarding is explicitly enabled AND the peer
+        // discovery inputs are both present; anything less degrades to
+        // Local, never to a broken half-configuration.
+        let groups = match (
+            self.group_forwarding,
+            self.group_forward_peer_dns.as_deref(),
+            self.pod_ip,
+        ) {
+            (true, Some(peer_dns), Some(pod_ip)) => {
+                let internal_port = self
+                    .internal_listener_url
+                    .as_ref()
+                    .and_then(Url::port)
+                    .unwrap_or(DEFAULT_INTERNAL_PORT);
+
+                debug!(%peer_dns, %pod_ip, internal_port, "group forwarding enabled");
+
+                let registry = Arc::new(PeerRegistry::new(pod_ip, peer_dns, PEER_REFRESH_INTERVAL));
+                _ = registry.clone().spawn_refresh();
+
+                GroupCoordinator::forwarding(controller, registry, internal_port)
+            }
+
+            (true, peer_dns, pod_ip) => {
+                warn!(
+                    ?peer_dns,
+                    ?pod_ip,
+                    "group forwarding enabled without peer dns and pod ip; \
+                     using local group coordination"
+                );
+
+                GroupCoordinator::local(controller)
+            }
+
+            (false, _, _) => GroupCoordinator::local(controller),
+        };
 
         let sasl_config = if self.authentication {
             tansu_auth::configuration(storage.clone()).map(Some)?
@@ -746,5 +848,63 @@ mod tests {
             !in_flight.load(Ordering::Acquire),
             "guard must be released after the run completes"
         );
+    }
+
+    /// Building a broker needs the in-memory object store, which — like the
+    /// existing `tests/cg*.rs` in-memory suites — is only built
+    /// workspace-wide with `--all-features` (the `dynostore` feature of
+    /// `tansu-storage` is enabled through the `tansu` crate).
+    #[cfg(feature = "dynostore")]
+    mod group_coordination {
+        use super::*;
+
+        fn builder() -> Builder<i32, String, Uuid, Url, Url, Url> {
+            Broker::<GroupCoordinator<StorageContainer>, StorageContainer>::builder()
+                .node_id(111)
+                .cluster_id(Uuid::now_v7().to_string())
+                .incarnation_id(Uuid::now_v7())
+                .advertised_listener(Url::parse("tcp://localhost:9092").unwrap())
+                .storage(Url::parse("memory://").unwrap())
+                .listener(Url::parse("tcp://localhost:9092").unwrap())
+                .silent(true)
+        }
+
+        // The default is pure-local group coordination: without the
+        // forwarding flag the broker is built with `GroupCoordinator::Local`,
+        // bit-for-bit today's behaviour.
+        #[tokio::test]
+        async fn build_defaults_to_local_group_coordination() -> Result<()> {
+            let broker = builder().build().await?;
+
+            assert!(matches!(broker.groups, GroupCoordinator::Local(_)));
+
+            Ok(())
+        }
+
+        // Forwarding requires the flag AND both discovery inputs.
+        #[tokio::test]
+        async fn build_with_forwarding_flag_and_discovery_is_forwarding() -> Result<()> {
+            let broker = builder()
+                .group_forwarding(true)
+                .group_forward_peer_dns(Some("peers.example.invalid".into()))
+                .pod_ip(Some(IpAddr::from_str("10.0.0.1")?))
+                .build()
+                .await?;
+
+            assert!(matches!(broker.groups, GroupCoordinator::Forwarding(_)));
+
+            Ok(())
+        }
+
+        // A half-configuration (flag set, discovery inputs missing) degrades
+        // to Local rather than to a broken forwarding setup.
+        #[tokio::test]
+        async fn build_with_forwarding_flag_but_no_discovery_is_local() -> Result<()> {
+            let broker = builder().group_forwarding(true).build().await?;
+
+            assert!(matches!(broker.groups, GroupCoordinator::Local(_)));
+
+            Ok(())
+        }
     }
 }
