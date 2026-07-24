@@ -30,8 +30,8 @@ use rama::{Context, Service};
 use rsasl::config::SASLConfig;
 use rustls::ServerConfig;
 use std::{
-    future::Future,
-    io::ErrorKind,
+    future::{Future, pending},
+    io::{self, ErrorKind},
     marker::PhantomData,
     net::{IpAddr, Ipv6Addr, SocketAddr},
     str::FromStr,
@@ -46,7 +46,7 @@ use tansu_storage::{
     ArcDynStorage, BrokerRegistrationRequest, Storage, StorageContainer, TopicDefaults,
 };
 use tokio::{
-    net::TcpListener,
+    net::{TcpListener, TcpStream},
     signal::unix::{SignalKind, signal},
     task::JoinSet,
     time::{self, Instant, MissedTickBehavior, sleep},
@@ -100,6 +100,16 @@ pub struct Broker<G, S> {
     storage: S,
     groups: G,
 
+    // The receive side of the forward-to-owner hop: when group forwarding is
+    // enabled, `internal_listener` is bound alongside the public listener and
+    // its connections are served with `internal_groups` — always the plain
+    // local coordinator, never the forwarding wrapper — so a forwarded frame
+    // is processed locally by construction and can never be forwarded again
+    // (the structural one-hop guarantee). Both are `None` when forwarding is
+    // off: no extra listener, bit-for-bit today's behaviour.
+    internal_listener: Option<Url>,
+    internal_groups: Option<G>,
+
     sasl_config: Option<Arc<SASLConfig>>,
     tls_server_config: Option<Arc<ServerConfig>>,
     silent: bool,
@@ -132,6 +142,9 @@ where
             advertised_listener,
             storage,
             groups,
+
+            internal_listener: None,
+            internal_groups: None,
 
             sasl_config: None,
             tls_server_config: None,
@@ -258,28 +271,25 @@ where
     pub async fn listen(&self, started: Instant) -> Result<()> {
         debug!(%self.listener, %self.advertised_listener);
 
-        let listener = TcpListener::bind(self.listener.host().map_or_else(
-            || {
-                SocketAddr::from((
-                    IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-                    self.listener.port().unwrap_or(9092),
-                ))
-            },
-            |host| {
-                let port = self.listener.port().unwrap_or(9092);
-                debug!(?host, port);
+        let listener = bind(&self.listener, 9092)
+            .await
+            .inspect_err(|err| error!(?err, %self.advertised_listener))?;
 
-                match host {
-                    url::Host::Domain(domain) => SocketAddr::from_str(&format!("{domain}:{port}"))
-                        .unwrap_or(SocketAddr::from((IpAddr::V6(Ipv6Addr::UNSPECIFIED), port))),
-                    url::Host::Ipv4(ipv4_addr) => SocketAddr::from((IpAddr::V4(ipv4_addr), port)),
-                    url::Host::Ipv6(ipv6_addr) => SocketAddr::from((IpAddr::V6(ipv6_addr), port)),
-                }
-            },
-        ))
-        .await
-        .inspect(|listener| debug!(listener = ?listener.local_addr().ok()))
-        .inspect_err(|err| error!(?err, %self.advertised_listener))?;
+        // The receive side of the forward-to-owner hop. Bound only when group
+        // forwarding is enabled (both fields are populated by the builder in
+        // that case alone); its connections are served with the plain local
+        // coordinator — never the forwarding wrapper — so a forwarded frame is
+        // processed locally by construction and cannot be forwarded again,
+        // even when peer views are skewed mid-rollout (the structural one-hop
+        // guarantee).
+        let internal = match (&self.internal_listener, &self.internal_groups) {
+            (Some(internal_listener), Some(internal_groups)) => Some((
+                bind(internal_listener, DEFAULT_INTERNAL_PORT).await?,
+                internal_groups.clone(),
+            )),
+
+            _ => None,
+        };
 
         let maintenance_period = self.maintenance_interval.unwrap_or(Duration::from_mins(10));
 
@@ -354,56 +364,37 @@ where
 
             tokio::select! {
                 Ok((stream, addr)) = listener.accept() => {
-
-                    let mut c = Context::default();
-
-                    let pb = if self.silent {
-                        None
-                    } else {
-                        let pb = m.add(ProgressBar::new_spinner());
-                        pb.set_style(spinner_style.clone());
-                        pb.set_prefix(format!("[{connections}/{:?}]", addr));
-                        pb.set_message("connected");
-                        pb.tick();
-
-                        _ = c.insert(pb.clone());
-                        Some(pb)
-                    };
-
-
-                    stream.set_nodelay(true)?;
-
-                    let service = services(
-                        self.cluster_id.as_str(),
+                    self.spawn_connection(
+                        &mut set,
+                        &m,
+                        &spinner_style,
+                        connections,
                         self.groups.clone(),
-                        self.storage.clone(),
-                        self.sasl_config.clone(),
-                        self.topic_defaults.clone(),
+                        stream,
+                        addr,
                     )?;
 
-                    let handle = set.spawn(async move {
-                            match service.serve(c, stream).await {
-                                Err(Error::Io(ref io))
-                                    if io.kind() == ErrorKind::UnexpectedEof
-                                        || io.kind() == ErrorKind::BrokenPipe
-                                        || io.kind() == ErrorKind::ConnectionReset => {}
+                    continue;
+                }
 
-                                Err(error) => {
-                                    error!(?error);
-                                },
-
-                                Ok(response) => {
-                                    debug!(?response)
-                                }
-                        }
-
-                        if let Some(ref pb) = pb {
-                            pb.finish_and_clear();
-                        }
-                    });
-
-
-                    debug!(?handle);
+                // A forwarded group request from a peer replica: served with
+                // the plain local coordinator, so it is processed here and
+                // never re-forwarded (one hop by construction). This arm is
+                // inert — `accept_on(None)` never yields — unless forwarding
+                // is enabled; both accept loops share this `select!`, so they
+                // run concurrently and shut down together on cancellation.
+                Ok((stream, addr)) = accept_on(internal.as_ref().map(|(listener, _)| listener)) => {
+                    if let Some((_, internal_groups)) = &internal {
+                        self.spawn_connection(
+                            &mut set,
+                            &m,
+                            &spinner_style,
+                            connections,
+                            internal_groups.clone(),
+                            stream,
+                            addr,
+                        )?;
+                    }
 
                     continue;
                 }
@@ -453,6 +444,114 @@ where
         }
 
         Ok(())
+    }
+
+    /// Serve one accepted connection on `set`, with `groups` as the group
+    /// coordinator for its service stack.
+    ///
+    /// Shared by both accept arms of [`Broker::listen`]: the public listener
+    /// serves with the broker's own coordinator (which may forward to the
+    /// group's owner), the internal listener with the plain local one. The
+    /// stacks are otherwise identical — same storage, SASL and topic
+    /// defaults.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_connection(
+        &self,
+        set: &mut JoinSet<()>,
+        m: &MultiProgress,
+        spinner_style: &ProgressStyle,
+        connections: i32,
+        groups: G,
+        stream: TcpStream,
+        addr: SocketAddr,
+    ) -> Result<()> {
+        let mut c = Context::default();
+
+        let pb = if self.silent {
+            None
+        } else {
+            let pb = m.add(ProgressBar::new_spinner());
+            pb.set_style(spinner_style.clone());
+            pb.set_prefix(format!("[{connections}/{addr:?}]"));
+            pb.set_message("connected");
+            pb.tick();
+
+            _ = c.insert(pb.clone());
+            Some(pb)
+        };
+
+        stream.set_nodelay(true)?;
+
+        let service = services(
+            self.cluster_id.as_str(),
+            groups,
+            self.storage.clone(),
+            self.sasl_config.clone(),
+            self.topic_defaults.clone(),
+        )?;
+
+        let handle = set.spawn(async move {
+            match service.serve(c, stream).await {
+                Err(Error::Io(ref io))
+                    if io.kind() == ErrorKind::UnexpectedEof
+                        || io.kind() == ErrorKind::BrokenPipe
+                        || io.kind() == ErrorKind::ConnectionReset => {}
+
+                Err(error) => {
+                    error!(?error);
+                }
+
+                Ok(response) => {
+                    debug!(?response)
+                }
+            }
+
+            if let Some(ref pb) = pb {
+                pb.finish_and_clear();
+            }
+        });
+
+        debug!(?handle);
+
+        Ok(())
+    }
+}
+
+/// Bind a TCP listener on `url`, falling back to the unspecified address
+/// and/or `default_port` when the URL leaves them out.
+async fn bind(url: &Url, default_port: u16) -> Result<TcpListener> {
+    TcpListener::bind(url.host().map_or_else(
+        || {
+            SocketAddr::from((
+                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                url.port().unwrap_or(default_port),
+            ))
+        },
+        |host| {
+            let port = url.port().unwrap_or(default_port);
+            debug!(?host, port);
+
+            match host {
+                url::Host::Domain(domain) => SocketAddr::from_str(&format!("{domain}:{port}"))
+                    .unwrap_or(SocketAddr::from((IpAddr::V6(Ipv6Addr::UNSPECIFIED), port))),
+                url::Host::Ipv4(ipv4_addr) => SocketAddr::from((IpAddr::V4(ipv4_addr), port)),
+                url::Host::Ipv6(ipv6_addr) => SocketAddr::from((IpAddr::V6(ipv6_addr), port)),
+            }
+        },
+    ))
+    .await
+    .inspect(|listener| debug!(%url, listener = ?listener.local_addr().ok()))
+    .inspect_err(|err| error!(?err, %url))
+    .map_err(Into::into)
+}
+
+/// Accept on `listener` when one is bound; an absent listener never yields,
+/// so the `select!` arm it feeds is simply inert (used for the internal
+/// listener, which only exists when group forwarding is enabled).
+async fn accept_on(listener: Option<&TcpListener>) -> io::Result<(TcpStream, SocketAddr)> {
+    match listener {
+        Some(listener) => listener.accept().await,
+        None => pending().await,
     }
 }
 
@@ -750,25 +849,39 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
         // Local (pure-local group coordination, bit-for-bit today's
         // behaviour) unless forwarding is explicitly enabled AND the peer
         // discovery inputs are both present; anything less degrades to
-        // Local, never to a broken half-configuration.
-        let groups = match (
+        // Local, never to a broken half-configuration. Only the
+        // fully-configured forwarding arm produces the internal listener —
+        // the receive side of the forward hop — and its coordinator is
+        // always the plain local one, so a forwarded frame is served
+        // locally by construction (one hop, no forwarding loop possible).
+        let (groups, internal_listener, internal_groups) = match (
             self.group_forwarding,
             self.group_forward_peer_dns.as_deref(),
             self.pod_ip,
         ) {
             (true, Some(peer_dns), Some(pod_ip)) => {
-                let internal_port = self
-                    .internal_listener_url
-                    .as_ref()
-                    .and_then(Url::port)
-                    .unwrap_or(DEFAULT_INTERNAL_PORT);
+                let internal_listener = match self.internal_listener_url {
+                    Some(internal_listener_url) => internal_listener_url,
+                    None => Url::parse(&format!("tcp://0.0.0.0:{DEFAULT_INTERNAL_PORT}"))?,
+                };
+
+                let internal_port = internal_listener.port().unwrap_or(DEFAULT_INTERNAL_PORT);
 
                 debug!(%peer_dns, %pod_ip, internal_port, "group forwarding enabled");
 
                 let registry = Arc::new(PeerRegistry::new(pod_ip, peer_dns, PEER_REFRESH_INTERVAL));
                 _ = registry.clone().spawn_refresh();
 
-                GroupCoordinator::forwarding(controller, registry, internal_port)
+                // Both coordinators are built from the same `Controller`
+                // (whose clone shares the in-memory group cache), so
+                // owner-local calls arriving on the public listener and
+                // forwarded calls arriving on the internal listener see the
+                // same group state.
+                (
+                    GroupCoordinator::forwarding(controller.clone(), registry, internal_port),
+                    Some(internal_listener),
+                    Some(GroupCoordinator::local(controller)),
+                )
             }
 
             (true, peer_dns, pod_ip) => {
@@ -779,10 +892,10 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
                      using local group coordination"
                 );
 
-                GroupCoordinator::local(controller)
+                (GroupCoordinator::local(controller), None, None)
             }
 
-            (false, _, _) => GroupCoordinator::local(controller),
+            (false, _, _) => (GroupCoordinator::local(controller), None, None),
         };
 
         let sasl_config = if self.authentication {
@@ -799,6 +912,8 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             advertised_listener: self.advertised_listener,
             storage,
             groups,
+            internal_listener,
+            internal_groups,
             sasl_config,
             tls_server_config: self.tls_server_config.map(Arc::new),
 
@@ -857,6 +972,11 @@ mod tests {
     #[cfg(feature = "dynostore")]
     mod group_coordination {
         use super::*;
+        use crate::coordinator::group::forward::{Forward, FrameForwarder};
+        use bytes::Bytes;
+        use tansu_sans_io::{
+            ApiKey as _, Body, JoinGroupRequest, join_group_request::JoinGroupRequestProtocol,
+        };
 
         fn builder() -> Builder<i32, String, Uuid, Url, Url, Url> {
             Broker::<GroupCoordinator<StorageContainer>, StorageContainer>::builder()
@@ -871,17 +991,22 @@ mod tests {
 
         // The default is pure-local group coordination: without the
         // forwarding flag the broker is built with `GroupCoordinator::Local`,
-        // bit-for-bit today's behaviour.
+        // bit-for-bit today's behaviour — and no internal listener.
         #[tokio::test]
         async fn build_defaults_to_local_group_coordination() -> Result<()> {
             let broker = builder().build().await?;
 
             assert!(matches!(broker.groups, GroupCoordinator::Local(_)));
+            assert!(broker.internal_listener.is_none());
+            assert!(broker.internal_groups.is_none());
 
             Ok(())
         }
 
-        // Forwarding requires the flag AND both discovery inputs.
+        // Forwarding requires the flag AND both discovery inputs. Only then
+        // is the internal listener constructed, and its coordinator is the
+        // plain local one — never the forwarding wrapper — so a forwarded
+        // frame is served locally by construction (the one-hop guarantee).
         #[tokio::test]
         async fn build_with_forwarding_flag_and_discovery_is_forwarding() -> Result<()> {
             let broker = builder()
@@ -892,19 +1017,127 @@ mod tests {
                 .await?;
 
             assert!(matches!(broker.groups, GroupCoordinator::Forwarding(_)));
+            assert!(matches!(
+                broker.internal_listener.as_ref().and_then(Url::port),
+                Some(DEFAULT_INTERNAL_PORT)
+            ));
+            assert!(matches!(
+                broker.internal_groups,
+                Some(GroupCoordinator::Local(_))
+            ));
 
             Ok(())
         }
 
         // A half-configuration (flag set, discovery inputs missing) degrades
-        // to Local rather than to a broken forwarding setup.
+        // to Local rather than to a broken forwarding setup — and binds no
+        // internal listener.
         #[tokio::test]
         async fn build_with_forwarding_flag_but_no_discovery_is_local() -> Result<()> {
             let broker = builder().group_forwarding(true).build().await?;
 
             assert!(matches!(broker.groups, GroupCoordinator::Local(_)));
+            assert!(broker.internal_listener.is_none());
+            assert!(broker.internal_groups.is_none());
 
             Ok(())
+        }
+
+        fn free_port() -> Result<u16> {
+            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .and_then(|listener| listener.local_addr())
+                .map(|local_addr| local_addr.port())
+                .map_err(Into::into)
+        }
+
+        // The receive side of the forward hop, end to end: with forwarding
+        // enabled the broker binds the internal listener, and a frame-level
+        // JoinGroup delivered to it — by the production `FrameForwarder`,
+        // exactly what a peer replica sends to the group's owner — is served
+        // locally. The KIP-394 member-id-required response proves both that
+        // the local `Controller` processed the join and that the member's
+        // own client id survived the hop (the member id is derived from it).
+        #[tokio::test]
+        async fn internal_listener_serves_a_forwarded_group_request_locally() -> Result<()> {
+            let main_port = free_port()?;
+            let internal_port = free_port()?;
+
+            let mut broker = builder()
+                .listener(Url::parse(&format!("tcp://127.0.0.1:{main_port}"))?)
+                .group_forwarding(true)
+                // resolution failure leaves the peer set empty; discovery is
+                // not what this test exercises — the internal listener is
+                // dialled directly below.
+                .group_forward_peer_dns(Some("peers.example.invalid".into()))
+                .pod_ip(Some(IpAddr::from_str("127.0.0.1")?))
+                .internal_listener_url(Some(Url::parse(&format!(
+                    "tcp://127.0.0.1:{internal_port}"
+                ))?))
+                .build()
+                .await?;
+
+            assert!(matches!(broker.groups, GroupCoordinator::Forwarding(_)));
+
+            let serving = tokio::spawn(async move { broker.serve(Instant::now()).await });
+
+            let forwarder = FrameForwarder::new(internal_port);
+            let owner = IpAddr::from_str("127.0.0.1")?;
+
+            let request = JoinGroupRequest::default()
+                .group_id("pr3-internal-listener".into())
+                .session_timeout_ms(45_000)
+                .rebalance_timeout_ms(Some(60_000))
+                .member_id("".into())
+                .protocol_type("consumer".into())
+                .protocols(Some(vec![
+                    JoinGroupRequestProtocol::default()
+                        .name("range".into())
+                        .metadata(Bytes::from_static(b"pr3_meta")),
+                ]));
+
+            // retry until the spawned broker is accepting on the internal
+            // listener.
+            let mut response = None;
+
+            for _ in 0..50 {
+                match forwarder
+                    .call(
+                        owner,
+                        JoinGroupRequest::KEY,
+                        Some("pr3-member"),
+                        request.clone().into(),
+                    )
+                    .await
+                {
+                    Ok(body) => {
+                        response = Some(body);
+                        break;
+                    }
+
+                    Err(_) => sleep(Duration::from_millis(100)).await,
+                }
+            }
+
+            serving.abort();
+
+            match response {
+                Some(Body::JoinGroupResponse(join)) => {
+                    assert_eq!(
+                        ErrorCode::MemberIdRequired,
+                        ErrorCode::try_from(join.error_code)?
+                    );
+
+                    assert!(
+                        join.member_id.starts_with("pr3-member-"),
+                        "member id must be derived from the forwarded client id: {}",
+                        join.member_id
+                    );
+
+                    Ok(())
+                }
+
+                otherwise => panic!("expected a join group response, got: {otherwise:?}"),
+            }
         }
     }
 }
