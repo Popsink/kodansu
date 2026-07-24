@@ -1680,15 +1680,26 @@ mod tests {
             let storage = storage_container().await?;
             let stub = StubForward::new(StubBehaviour::Fail);
 
+            let owner_ip = peer(2);
+            let registry = registry_owning_nothing(peer(1), owner_ip);
+
+            // self is always an owner candidate, so a random group could be
+            // self-owned (processed locally, never forwarded). Pick one the
+            // registry routes to the peer, so the forward-then-fail path is
+            // exercised deterministically.
+            let group_id = (0u32..)
+                .map(|i| format!("fallback-group-{i}"))
+                .find(|group_id| registry.owner(group_id) == owner_ip)
+                .expect("a peer-owned group exists");
+
             let coordinator = ForwardingCoordinator::with_forward(
                 Controller::with_storage(storage)?,
-                registry_owning_nothing(peer(1), peer(2)),
+                registry,
                 stub.clone(),
             );
 
             // despite the owner being unreachable, the join is served by the
             // local Controller exactly as today.
-            let group_id = alphanumeric(15);
             _ = join_as_leader(&coordinator, group_id.as_str()).await?;
 
             // one forward attempt per join call (member-id-required + rejoin).
