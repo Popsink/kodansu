@@ -59,6 +59,19 @@ use super::{Coordinator, OffsetCommit};
 
 const PAUSE_MS: u128 = 3_000;
 
+/// Join-window barrier: how long the persisted member set must stay unchanged
+/// before a Forming group's leader is released from `Controller::join` with its
+/// (now complete) member list. Kafka holds every JoinGroup — the leader above
+/// all — inside a rebalance window (`InitialDelayedJoin` / `DelayedJoin`, with
+/// `group.initial.rebalance.delay.ms` defaulting to 3s) so the leader computes
+/// assignments for the full membership. This broker has no timer state, only
+/// the shared group object, so the window is inferred instead: membership is
+/// quiescent once the successive GET-first reads of the join loop have shown
+/// the same member set for this long. Must exceed the CAS conflict backoff cap
+/// (500ms + 50% jitter, see `cas_conflict_backoff`) plus the 1s long-poll
+/// cadence, so a member mid-retry on another replica is not missed.
+const JOIN_QUIESCENCE: Duration = Duration::from_secs(3);
+
 /// After this many consecutive object-store CAS conflicts on a single group's
 /// state object, log a warning: sustained conflicts mean several members of the
 /// same group are landing on different replicas behind a shared endpoint (the
@@ -898,6 +911,13 @@ where
         let mut iteration = 0;
         let mut cas_conflicts = 0u32;
 
+        // Join-window barrier state (see `JOIN_QUIESCENCE`): the member set
+        // last observed by this join call, and when it last changed. Inferred
+        // purely from the per-iteration GET-first reads below — no on-disk
+        // format change.
+        let mut join_window_members: Option<BTreeSet<String>> = None;
+        let mut join_window_changed_at = started_at;
+
         loop {
             COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_loop")]);
 
@@ -970,6 +990,36 @@ where
 
             let after = GroupDetail::from(&updated);
 
+            // Join-window barrier: without it the leader returned as soon as
+            // its own CAS landed, computed assignments for whatever partial
+            // member list it had seen, and every member missing from that list
+            // parked at "stable" with zero partitions — a multi-member group
+            // never converged. Hold the leader (below) until the membership is
+            // quiescent or the rebalance window closes.
+            let members_now = after.members.keys().cloned().collect::<BTreeSet<_>>();
+            if join_window_members.as_ref() != Some(&members_now) {
+                join_window_members = Some(members_now);
+                join_window_changed_at = now;
+            }
+            let membership_quiescent = now
+                .duration_since(join_window_changed_at)
+                .unwrap_or_default()
+                >= JOIN_QUIESCENCE;
+
+            // The rebalance window: `rebalance_timeout_ms` bounds how long the
+            // leader may be held (the Java client allows JoinGroup responses up
+            // to `rebalance_timeout + 5s`), falling back to the session timeout
+            // when unset, as Kafka does for old protocol versions.
+            let join_window_ms = u128::try_from(
+                after
+                    .rebalance_timeout_ms
+                    .or(rebalance_timeout_ms)
+                    .unwrap_or(after.session_timeout_ms),
+            )
+            .unwrap_or_default();
+
+            let is_forming = updated.is_forming();
+
             // No-op long-poll skip: a member waiting through a rebalance re-joins
             // once a second, and each re-join changes only its own `last_contact`
             // (via `missed_heartbeat`). Persisting that is a CAS that churns the
@@ -1004,6 +1054,20 @@ where
 
                     iteration += 1;
                     continue;
+                } else if is_leader
+                    && is_forming
+                    && !membership_quiescent
+                    && elapsed_ms < join_window_ms
+                {
+                    // Join-window barrier: the leader of a still-Forming group
+                    // is held until membership is quiescent (or the window
+                    // closes), so its join response carries the complete
+                    // member list before it computes assignments.
+                    COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_window_hold")]);
+                    sleep(Duration::from_secs(1)).await;
+
+                    iteration += 1;
+                    continue;
                 } else if is_leader || is_assigned || is_member_id_required {
                     return Ok(body);
                 } else if elapsed_ms < session_timeout_ms.div(2) {
@@ -1025,7 +1089,6 @@ where
                     let is_leader = updated.is_leader(&body);
                     let is_assigned = updated.is_assigned(&body);
                     let is_member_id_required = updated.is_member_id_required(&body);
-                    let is_forming = updated.is_forming();
                     let is_ok = updated.is_ok(&body);
 
                     let session_timeout_ms = updated.session_timeout_ms() as u128;
@@ -1053,6 +1116,17 @@ where
                         COORDINATOR_REQUESTS
                             .add(1, &[KeyValue::new("method", "join_group_instance_pause")]);
                         sleep(Duration::from_millis(pause as u64)).await;
+
+                        iteration += 1;
+                        continue;
+                    } else if is_leader
+                        && is_forming
+                        && !membership_quiescent
+                        && elapsed_ms < join_window_ms
+                    {
+                        // Join-window barrier: see the no-op skip branch above.
+                        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_window_hold")]);
+                        sleep(Duration::from_secs(1)).await;
 
                         iteration += 1;
                         continue;
@@ -2275,22 +2349,14 @@ where
                 .protocol_name(Some("".into()))
                 .leader("".into())
                 .skip_assignment(self.skip_assignment)
-                .member_id(member_id.clone())
+                .member_id(member_id)
                 .members(Some([].into()));
 
-            _ = self.members.insert(
-                member_id.clone(),
-                Member {
-                    join_response: JoinGroupResponseMember::default()
-                        .member_id(member_id)
-                        .group_instance_id(group_instance_id.map(|s| s.to_owned()))
-                        .metadata(protocol.metadata.clone()),
-                    last_contact: Some(now),
-                },
-            );
-
-            self.generation_id += 1;
-
+            // KIP-394: reply with the generated member id but leave the group
+            // untouched — the member only registers (and the generation only
+            // moves) when it re-joins with this id. Registering a phantom
+            // member here would rebalance the group for a client that may
+            // never come back.
             return (self, join_group_response.into());
         }
 
@@ -2514,6 +2580,23 @@ where
             })
             .map(|assignment| (assignment.member_id.clone(), assignment.assignment.clone()))
             .collect::<BTreeMap<_, _>>();
+
+        // A sync whose assignments do not cover the syncing member must not
+        // form the group: answering `error=None` with an empty assignment
+        // parks the client at "stable" with zero partitions. Rebalance instead
+        // so the member re-joins and a complete assignment is computed.
+        if !assignments.contains_key(member_id) {
+            debug!(?self.members, sync_outcome = ?ErrorCode::RebalanceInProgress);
+
+            let sync_group_response = SyncGroupResponse::default()
+                .throttle_time_ms(Some(0))
+                .error_code(ErrorCode::RebalanceInProgress.into())
+                .protocol_type(self.state.protocol_type.clone())
+                .protocol_name(self.state.protocol_name.clone())
+                .assignment(Bytes::from_static(b""));
+
+            return (self.into(), sync_group_response.into());
+        }
 
         let sync_group_response = SyncGroupResponse::default()
             .throttle_time_ms(Some(0))
@@ -2835,39 +2918,14 @@ where
                 .protocol_name(Some("".into()))
                 .leader("".into())
                 .skip_assignment(self.skip_assignment)
-                .member_id(member_id.clone())
+                .member_id(member_id)
                 .members(Some([].into()));
 
-            _ = self.members.insert(
-                member_id.clone(),
-                Member {
-                    join_response: JoinGroupResponseMember::default()
-                        .member_id(member_id)
-                        .group_instance_id(group_instance_id.map(|s| s.to_owned()))
-                        .metadata(protocol.metadata.clone()),
-                    last_contact: Some(now),
-                },
-            );
-
-            return (
-                Inner {
-                    generation_id: self.generation_id + 1,
-                    session_timeout_ms: self.session_timeout_ms,
-                    rebalance_timeout_ms: self.rebalance_timeout_ms,
-
-                    members: self.members,
-                    state: Forming {
-                        protocol_type: Some(self.state.protocol_type),
-                        protocol_name: Some(self.state.protocol_name),
-                        leader: Some(self.state.leader),
-                    },
-                    storage: self.storage,
-                    skip_assignment: self.skip_assignment,
-                    inception: self.inception,
-                }
-                .into(),
-                join_group_response.into(),
-            );
+            // KIP-394: reply with the generated member id but leave the group
+            // untouched — no phantom member, no generation bump, and the
+            // group stays Formed. The rebalance only starts when the member
+            // re-joins with this id.
+            return (self.into(), join_group_response.into());
         }
 
         let member_id = group_instance_id.map_or(member_id.to_owned(), |group_instance_id| {
@@ -3134,21 +3192,33 @@ where
             return (self, body);
         }
 
+        // A member of the current generation that is missing from the leader's
+        // assignment must re-join, not park on "stable" with zero partitions:
+        // `error=None` plus an empty assignment reads as a valid (empty)
+        // assignment to the client, which then sits idle forever.
+        let Some(assignment) = self.state.assignments.get(member_id).cloned() else {
+            debug!(?self.state.assignments, sync_outcome = ?ErrorCode::RebalanceInProgress);
+
+            let body = SyncGroupResponse::default()
+                .throttle_time_ms(Some(0))
+                .error_code(ErrorCode::RebalanceInProgress.into())
+                .protocol_type(Some(self.state.protocol_type.clone()))
+                .protocol_name(Some(self.state.protocol_name.clone()))
+                .assignment(Bytes::from_static(b""))
+                .into();
+
+            return (self, body);
+        };
+
         let body = SyncGroupResponse::default()
             .throttle_time_ms(Some(0))
             .error_code(ErrorCode::None.into())
             .protocol_type(Some(self.state.protocol_type.clone()))
             .protocol_name(Some(self.state.protocol_name.clone()))
-            .assignment(
-                self.state
-                    .assignments
-                    .get(member_id)
-                    .cloned()
-                    .unwrap_or(Bytes::from_static(b"")),
-            )
+            .assignment(assignment)
             .into();
 
-        debug!(sync_outcome = ?ErrorCode::None, sync_assignment = self.state.assignments.contains_key(member_id));
+        debug!(sync_outcome = ?ErrorCode::None, sync_assignment = true);
 
         (self, body)
     }
@@ -4718,7 +4788,10 @@ mod tests {
                 assert_eq!("", leader);
                 assert_eq!(Some([].into()), members);
                 assert!(member_id.starts_with(CLIENT_ID));
-                assert_eq!(1, s.members().len());
+                // KIP-394: the MemberIdRequired reply parks the generated id —
+                // the member only registers when it re-joins with that id.
+                assert_eq!(0, s.members().len());
+                assert_eq!(-1, s.generation_id());
             }
 
             otherwise => panic!("{otherwise:?}"),
@@ -4815,13 +4888,32 @@ mod tests {
                 assert_eq!("", leader);
                 assert_eq!(Some([].into()), members);
                 assert!(member_id.starts_with(CLIENT_ID));
-                assert_eq!(1, s.members().len());
+                // KIP-394: the MemberIdRequired reply must not register the
+                // member; it joins for real with the generated id below.
+                assert_eq!(0, s.members().len());
 
                 (s, member_id)
             }
 
             otherwise => panic!("{otherwise:?}"),
         };
+
+        let (s, _) = s
+            .join(
+                now,
+                Some(CLIENT_ID),
+                GROUP_ID,
+                session_timeout_ms,
+                rebalance_timeout_ms,
+                member_id.as_str(),
+                group_instance_id,
+                PROTOCOL_TYPE,
+                Some(&first_member_protocols[..]),
+                reason,
+            )
+            .await;
+
+        assert_eq!(1, s.members().len());
 
         let assignments = [SyncGroupRequestAssignment::default()
             .member_id(member_id.clone())
@@ -5075,6 +5167,439 @@ mod tests {
                 .map(|assignments| assignments.get(second_member_id.as_str()).cloned())
                 .unwrap()
         );
+
+        Ok(())
+    }
+
+    /// Drive one consumer through the join/sync protocol against `controller`
+    /// until it holds a non-empty assignment, the way a Kafka client would:
+    /// first join (empty member id) → MemberIdRequired → re-join with the
+    /// generated id; the leader syncs an assignment covering every member of
+    /// its join response; RebalanceInProgress (or an empty assignment) means
+    /// re-join the next round.
+    async fn drive_member<O>(
+        controller: Controller<O>,
+        group_id: &'static str,
+        index: usize,
+    ) -> Result<(String, Bytes)>
+    where
+        O: Storage + Clone,
+    {
+        const SESSION_TIMEOUT_MS: i32 = 10_000;
+        const REBALANCE_TIMEOUT_MS: Option<i32> = Some(15_000);
+
+        let client_id = format!("member-{index:02}");
+
+        let metadata = Bytes::try_from(
+            &MemberMetadata::default().version(3).subscription(
+                ConsumerProtocolSubscription::default()
+                    .generation_id(Some(0))
+                    .owned_partitions(
+                        [TopicPartition::default().topic("t").partitions(0..3)].into_iter(),
+                    ),
+            ),
+        )?;
+
+        let protocols = [JoinGroupRequestProtocol::default()
+            .name(Assignor::RANGE.into())
+            .metadata(metadata)];
+
+        let mut member_id = String::new();
+
+        loop {
+            let join = match controller
+                .join(
+                    Some(client_id.as_str()),
+                    group_id,
+                    SESSION_TIMEOUT_MS,
+                    REBALANCE_TIMEOUT_MS,
+                    member_id.as_str(),
+                    None,
+                    CONSUMER,
+                    Some(&protocols[..]),
+                    None,
+                )
+                .await?
+            {
+                Body::JoinGroupResponse(join) => join,
+                otherwise => panic!("{otherwise:?}"),
+            };
+
+            if join.error_code == i16::from(ErrorCode::MemberIdRequired) {
+                member_id = join.member_id.clone();
+                continue;
+            }
+
+            assert_eq!(i16::from(ErrorCode::None), join.error_code);
+
+            let assignments = if join.leader == join.member_id {
+                join.members
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|member| {
+                        SyncGroupRequestAssignment::default()
+                            .member_id(member.member_id.clone())
+                            .assignment(Bytes::from(format!("assignment-{}", member.member_id)))
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+
+            let sync = match controller
+                .sync(
+                    group_id,
+                    join.generation_id,
+                    member_id.as_str(),
+                    None,
+                    Some(CONSUMER),
+                    Some(Assignor::RANGE),
+                    Some(&assignments[..]),
+                )
+                .await?
+            {
+                Body::SyncGroupResponse(sync) => sync,
+                otherwise => panic!("{otherwise:?}"),
+            };
+
+            if sync.error_code == i16::from(ErrorCode::None) && !sync.assignment.is_empty() {
+                return Ok((member_id, sync.assignment));
+            }
+        }
+    }
+
+    // Two `Controller`s sharing one `memory://` store model two broker
+    // replicas behind a single load balancer: every join/sync races CAS
+    // updates of the same `{group}.json` object. This is the scenario that
+    // never converged before the join-window barrier — the leader's join
+    // returned as soon as its own CAS landed, it computed assignments for a
+    // partial member list, and everyone missing from that list parked at
+    // "stable" with zero partitions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_member_group_converges_across_replicas() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "convergence-group";
+        const MEMBERS: usize = 8;
+
+        let storage = StorageContainer::builder()
+            .cluster_id("test")
+            .node_id(111)
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
+            .storage(Url::parse("memory://")?)
+            .build()
+            .await?;
+
+        let replicas = [
+            Controller::with_storage(storage.clone())?,
+            Controller::with_storage(storage.clone())?,
+        ];
+
+        let handles = (0..MEMBERS)
+            .map(|index| {
+                let controller = replicas[index % replicas.len()].clone();
+                tokio::spawn(async move {
+                    tokio::time::timeout(
+                        Duration::from_secs(60),
+                        drive_member(controller, GROUP_ID, index),
+                    )
+                    .await
+                    .expect("member timed out before converging")
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut assigned = BTreeMap::new();
+        for handle in handles {
+            let (member_id, assignment) = handle.await.expect("member task panicked")?;
+            assert!(!assignment.is_empty());
+            assert!(assigned.insert(member_id, assignment).is_none());
+        }
+
+        assert_eq!(MEMBERS, assigned.len());
+
+        // The persisted group must be Formed with a non-empty assignment for
+        // every one of the members, at a generation that is now stable.
+        let (detail, version) = storage
+            .read_group(GROUP_ID)
+            .await?
+            .expect("group must be persisted");
+        let GroupState::Formed { assignments, .. } = detail.state else {
+            panic!("expected Formed, got {:?}", detail.state);
+        };
+        for member_id in assigned.keys() {
+            assert!(
+                assignments
+                    .get(member_id)
+                    .is_some_and(|assignment| !assignment.is_empty()),
+                "no assignment for {member_id}: {:?}",
+                assignments.keys().collect::<Vec<_>>()
+            );
+        }
+
+        let (again, version_again) = storage
+            .read_group(GROUP_ID)
+            .await?
+            .expect("group still persisted");
+        assert_eq!(detail.generation_id, again.generation_id);
+        assert_eq!(version, version_again);
+
+        Ok(())
+    }
+
+    // KIP-394 focused test: a first join with an empty member id replies
+    // MemberIdRequired and parks the generated id — it must not register a
+    // phantom member, bump the generation, or rewrite the persisted group.
+    #[tokio::test]
+    async fn member_id_required_join_leaves_persisted_group_unchanged() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let session_timeout_ms = 45_000;
+        let rebalance_timeout_ms = Some(300_000);
+        let group_instance_id = None;
+        let reason = None;
+
+        const CLIENT_ID: &str = "console-consumer";
+        const GROUP_ID: &str = "member-id-required-group";
+
+        let storage = StorageContainer::builder()
+            .cluster_id("test")
+            .node_id(111)
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
+            .storage(Url::parse("memory://")?)
+            .build()
+            .await?;
+
+        let s = Controller::with_storage(storage.clone())?;
+
+        let range_meta = Bytes::try_from(
+            &MemberMetadata::default().version(3).subscription(
+                ConsumerProtocolSubscription::default()
+                    .generation_id(Some(0))
+                    .owned_partitions(
+                        [TopicPartition::default().topic("a").partitions(0..3)].into_iter(),
+                    ),
+            ),
+        )?;
+
+        let protocols = [JoinGroupRequestProtocol::default()
+            .name(Assignor::RANGE.into())
+            .metadata(range_meta.clone())];
+
+        // Establish a single-member Formed group.
+        let member_id = match s
+            .join(
+                Some(CLIENT_ID),
+                GROUP_ID,
+                session_timeout_ms,
+                rebalance_timeout_ms,
+                "",
+                group_instance_id,
+                CONSUMER,
+                Some(&protocols[..]),
+                reason,
+            )
+            .await?
+        {
+            Body::JoinGroupResponse(JoinGroupResponse { member_id, .. }) => member_id,
+            otherwise => panic!("{otherwise:?}"),
+        };
+
+        let generation_id = match s
+            .join(
+                Some(CLIENT_ID),
+                GROUP_ID,
+                session_timeout_ms,
+                rebalance_timeout_ms,
+                &member_id,
+                group_instance_id,
+                CONSUMER,
+                Some(&protocols[..]),
+                reason,
+            )
+            .await?
+        {
+            Body::JoinGroupResponse(JoinGroupResponse { generation_id, .. }) => generation_id,
+            otherwise => panic!("{otherwise:?}"),
+        };
+
+        let assignments = [SyncGroupRequestAssignment::default()
+            .member_id(member_id.clone())
+            .assignment(Bytes::from_static(b"assignment_01"))];
+
+        _ = s
+            .sync(
+                GROUP_ID,
+                generation_id,
+                &member_id,
+                group_instance_id,
+                Some(CONSUMER),
+                Some(Assignor::RANGE),
+                Some(&assignments[..]),
+            )
+            .await?;
+
+        let (before, v1) = storage
+            .read_group(GROUP_ID)
+            .await?
+            .expect("group must be persisted after sync");
+        assert!(matches!(before.state, GroupState::Formed { .. }));
+
+        // A second client's first join (empty member id) replies with a
+        // generated id but must leave the persisted group untouched.
+        match s
+            .join(
+                Some("other-client"),
+                GROUP_ID,
+                session_timeout_ms,
+                rebalance_timeout_ms,
+                "",
+                group_instance_id,
+                CONSUMER,
+                Some(&protocols[..]),
+                reason,
+            )
+            .await?
+        {
+            Body::JoinGroupResponse(JoinGroupResponse {
+                error_code,
+                member_id,
+                ..
+            }) => {
+                assert_eq!(i16::from(ErrorCode::MemberIdRequired), error_code);
+                assert!(member_id.starts_with("other-client"));
+            }
+            otherwise => panic!("{otherwise:?}"),
+        }
+
+        let (after, v2) = storage
+            .read_group(GROUP_ID)
+            .await?
+            .expect("group still persisted");
+
+        assert_eq!(before.generation_id, after.generation_id);
+        assert_eq!(
+            before.members.keys().collect::<Vec<_>>(),
+            after.members.keys().collect::<Vec<_>>()
+        );
+        assert!(matches!(after.state, GroupState::Formed { .. }));
+        assert_eq!(
+            v1, v2,
+            "a MemberIdRequired reply must not rewrite the group object"
+        );
+
+        Ok(())
+    }
+
+    // A member of the current generation that is missing from the assignments
+    // map must be sent RebalanceInProgress so it re-joins — answering
+    // `error=None` with an empty assignment parks the client at "stable" with
+    // zero partitions.
+    #[tokio::test]
+    async fn sync_missing_from_assignments_is_rebalance_in_progress() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "missing-assignment-group";
+        const RANGE: &str = "range";
+        const PROTOCOL_TYPE: &str = "consumer";
+
+        let now = SystemTime::now();
+
+        let storage = StorageContainer::builder()
+            .cluster_id("test")
+            .node_id(111)
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
+            .storage(Url::parse("memory://")?)
+            .build()
+            .await?;
+
+        // Formed group where the assignments cover m1 but not m2.
+        let formed = GroupState::Formed {
+            protocol_type: PROTOCOL_TYPE.into(),
+            protocol_name: RANGE.into(),
+            leader: "m1".into(),
+            assignments: [("m1".to_owned(), Bytes::from_static(b"assignment-m1"))]
+                .into_iter()
+                .collect(),
+        };
+        let s = Wrapper::with_storage_group_detail(
+            storage.clone(),
+            group_detail_with(&[("m1", Some(now)), ("m2", Some(now))], formed, 5),
+        );
+
+        let (s, body) = s
+            .sync(
+                now,
+                GROUP_ID,
+                5,
+                "m2",
+                None,
+                Some(PROTOCOL_TYPE),
+                Some(RANGE),
+                Some(&[]),
+            )
+            .await;
+
+        match body {
+            Body::SyncGroupResponse(SyncGroupResponse {
+                error_code,
+                assignment,
+                ..
+            }) => {
+                assert_eq!(i16::from(ErrorCode::RebalanceInProgress), error_code);
+                assert!(assignment.is_empty());
+            }
+            otherwise => panic!("{otherwise:?}"),
+        }
+
+        // The group itself is untouched: still Formed at the same generation.
+        assert!(matches!(s, Wrapper::Formed(_)));
+        assert_eq!(5, s.generation_id());
+
+        // While Forming, a leader sync whose assignments miss the syncing
+        // member must not form the group either.
+        let forming = GroupState::Forming {
+            protocol_type: Some(PROTOCOL_TYPE.into()),
+            protocol_name: Some(RANGE.into()),
+            leader: Some("m1".into()),
+        };
+        let s = Wrapper::with_storage_group_detail(
+            storage,
+            group_detail_with(&[("m1", Some(now)), ("m2", Some(now))], forming, 6),
+        );
+
+        let assignments = [SyncGroupRequestAssignment::default()
+            .member_id("m2".into())
+            .assignment(Bytes::from_static(b"assignment-m2"))];
+
+        let (s, body) = s
+            .sync(
+                now,
+                GROUP_ID,
+                6,
+                "m1",
+                None,
+                Some(PROTOCOL_TYPE),
+                Some(RANGE),
+                Some(&assignments[..]),
+            )
+            .await;
+
+        match body {
+            Body::SyncGroupResponse(SyncGroupResponse {
+                error_code,
+                assignment,
+                ..
+            }) => {
+                assert_eq!(i16::from(ErrorCode::RebalanceInProgress), error_code);
+                assert!(assignment.is_empty());
+            }
+            otherwise => panic!("{otherwise:?}"),
+        }
+
+        assert!(s.is_forming());
+        assert_eq!(6, s.generation_id());
 
         Ok(())
     }

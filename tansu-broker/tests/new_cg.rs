@@ -692,10 +692,34 @@ pub async fn two_consumer_interleave_join() -> Result<()> {
     );
     assert!(!c1_next_action.member_id.is_empty());
 
-    // c1: join with member id
+    // KIP-394: the empty joins above only parked the generated member ids —
+    // neither consumer is registered yet (previously each empty join
+    // registered a phantom member and bumped the generation). For both
+    // consumers to land in the same generation, their real joins must overlap
+    // inside the same rebalance window: the join-window barrier holds the
+    // leader's JoinGroup response until membership is quiescent, so it
+    // carries the complete member list.
     //
-    let c1_next_action = join(&c1, Some(c1_next_action))
-        .await
+    // c1: join with member id, in flight first so that c1 registers first
+    // and becomes the leader
+    //
+    let c1_join = {
+        let c1 = c1.clone();
+        tokio::spawn(async move { join(&c1, Some(c1_next_action)).await })
+    };
+
+    // give c1 a head start (well past the maximum introduced latency), then
+    // join c0 while c1 is still held inside the rebalance window
+    //
+    sleep(Duration::from_millis(500)).await;
+
+    let c0_join = {
+        let c0 = c0.clone();
+        tokio::spawn(async move { join(&c0, Some(c0_next_action)).await })
+    };
+
+    let c1_next_action = c1_join
+        .await?
         .inspect(|c1_next_action| debug!(?c1_next_action))?;
 
     assert_eq!(i16::from(ErrorCode::None), c1_next_action.error_code);
@@ -718,10 +742,12 @@ pub async fn two_consumer_interleave_join() -> Result<()> {
     assert!(!c1_next_action.assignment.is_empty());
     assert_eq!(i16::from(ErrorCode::None), c1_next_action.error_code);
 
-    // c0: join with member id
+    // c0: join with member id — a follower of generation 1, released from
+    // the join long-poll once the leader's assignment lands (or at the
+    // long-poll cap; either way the response below is the same)
     //
-    let c0_next_action = join(&c0, Some(c0_next_action))
-        .await
+    let c0_next_action = c0_join
+        .await?
         .inspect(|c0_next_action| debug!(?c0_next_action))?;
 
     assert_eq!(i16::from(ErrorCode::None), c0_next_action.error_code);
