@@ -3180,6 +3180,105 @@ async fn compaction_resyncs_when_its_target_sequence_is_taken() -> Result<(), Er
     Ok(())
 }
 
+/// #117 measurement: consumers of *different* topics under one connector prefix
+/// read **disjoint** byte ranges of the same shared segment object. That is the
+/// duplication a `(prefix, seq, range)`-keyed block cache — the design proposed in
+/// #117 — cannot serve at all: the ranges never match. Only caching the object
+/// would collapse these into one GET. Pins the read pattern the metric classifies
+/// as `other_range`.
+#[tokio::test]
+async fn co_prefix_consumers_read_disjoint_ranges_of_one_segment() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+
+    let topic_a = "org.env.conn.tab_a";
+    let topic_b = "org.env.conn.tab_b";
+    create_topic(&store, topic_a).await?;
+    create_topic(&store, topic_b).await?;
+    let a = Topition::new(topic_a, 0);
+    let b = Topition::new(topic_b, 0);
+
+    // Both sub-streams in one segment (one shared linger window).
+    let (produced_a, produced_b) = tokio::join!(
+        store.produce(None, &a, batch(2)?),
+        store.produce(None, &b, batch(2)?),
+    );
+    assert_eq!(0, produced_a?);
+    assert_eq!(0, produced_b?);
+    assert_eq!(1, segments(&bucket).await.len());
+
+    assert!(!fetch_from(&store, &a, 0).await?.is_empty());
+    assert!(!fetch_from(&store, &b, 0).await?.is_empty());
+
+    let traces = store.segment_reads.lock().expect("segment_reads").clone();
+    let trace = traces
+        .get(&(PREFIX.to_owned(), 0))
+        .expect("both consumers read segment 0");
+
+    assert_eq!(
+        2,
+        trace.ranges.len(),
+        "two disjoint ranges of one object, not one shared range: {:?}",
+        trace.ranges
+    );
+    let (first_start, first_len) = trace.ranges[0];
+    let (second_start, second_len) = trace.ranges[1];
+    assert!(
+        first_start + first_len <= second_start || second_start + second_len <= first_start,
+        "ranges must not overlap: {:?}",
+        trace.ranges
+    );
+
+    Ok(())
+}
+
+/// #117 measurement, the other half: one consumer re-reading its own sub-stream
+/// asks for the **identical** span, which is what the proposed block cache would
+/// serve. Classified `same_range`, so it is not conflated with the co-prefix
+/// pattern above — the split between the two is what decides the design.
+#[tokio::test]
+async fn re_reading_one_substream_repeats_the_same_range() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let tp = Topition::new(topic, 0);
+
+    _ = store.produce(None, &tp, batch(2)?).await?;
+
+    assert!(!fetch_from(&store, &tp, 0).await?.is_empty());
+    assert!(!fetch_from(&store, &tp, 0).await?.is_empty());
+
+    let traces = store.segment_reads.lock().expect("segment_reads").clone();
+    let trace = traces
+        .get(&(PREFIX.to_owned(), 0))
+        .expect("the sub-stream was read");
+
+    assert_eq!(
+        1,
+        trace.ranges.len(),
+        "a re-read of the same sub-stream is the same span: {:?}",
+        trace.ranges
+    );
+
+    Ok(())
+}
+
+/// The #117 trace is a measurement device on the fetch hot path, so it must stay
+/// bounded whatever the read pattern: an unbounded map keyed by every segment ever
+/// read would turn an observability aid into a leak.
+#[tokio::test]
+async fn segment_read_trace_stays_bounded() {
+    let store = DynoStore::new(CLUSTER, NODE, InMemory::new()).prefix_coalesce(true);
+
+    for seq in 0..(4 * 1_024u64) {
+        store.note_segment_data_read(PREFIX, seq, 0, 64);
+    }
+
+    let traced = store.segment_reads.lock().expect("segment_reads").len();
+    assert!(traced <= 1_024, "trace grew to {traced} objects");
+}
+
 /// An `ObjectStore` that counts `segments/` listings, so a test can assert a
 /// refresh was served **without** a `ListObjectsV2` (#112).
 #[derive(Clone)]
