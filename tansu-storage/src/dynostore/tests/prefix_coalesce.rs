@@ -3108,3 +3108,74 @@ async fn maintenance_visits_the_largest_prefix_first() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// #130: compaction claims the merged segment's name from the **same** tail
+/// sequence namespace as live producers, so a producer can take the sequence the
+/// compactor targeted. It must then resync to the next free sequence and re-PUT
+/// the merged payload — the write amplification `tansu_prefix_segment_create_*`
+/// now measures, and the reason a separate `compacted/` namespace is on the table.
+/// Squatting the compactor's target sequence models the lost race.
+#[tokio::test]
+async fn compaction_resyncs_when_its_target_sequence_is_taken() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .coalesce_tuning(CoalesceTuning {
+            prefix_compact_min_segments: Some(2),
+            prefix_compact_keep_hot: Some(0),
+            prefix_compact_target_bytes: Some(4096),
+            ..Default::default()
+        });
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let tp = Topition::new(topic, 0);
+
+    for _ in 0..4 {
+        _ = store.produce(None, &tp, batch(1)?).await?;
+    }
+    let before = segments(&bucket).await;
+    assert_eq!(4, before.len());
+
+    let offsets: Vec<i64> = fetch_from(&store, &tp, 0)
+        .await?
+        .iter()
+        .map(|batch| batch.base_offset)
+        .collect();
+
+    // A producer wins sequence 4 — the tail the compactor is about to claim.
+    let taken = Path::from(format!(
+        "clusters/{CLUSTER}/prefixes/{PREFIX}/segments/{:0>20}.seg",
+        4
+    ));
+    _ = bucket
+        .put(&taken, PutPayload::from_static(b"taken by a producer"))
+        .await?;
+
+    // Compaction loses that create, resyncs past it, and still merges.
+    assert!(
+        store.drain_compact_prefix(PREFIX).await > 0,
+        "compaction merged despite losing its target sequence"
+    );
+
+    let after = segments(&bucket).await;
+    assert!(
+        after.contains(&taken),
+        "the producer's segment is untouched: {after:?}"
+    );
+    assert!(
+        after.len() < before.len() + 1,
+        "the merged run replaced its originals: {after:?}"
+    );
+
+    // Reads are unchanged across the resynced merge.
+    assert_eq!(
+        offsets,
+        fetch_from(&store, &tp, 0)
+            .await?
+            .iter()
+            .map(|batch| batch.base_offset)
+            .collect::<Vec<_>>()
+    );
+
+    Ok(())
+}
