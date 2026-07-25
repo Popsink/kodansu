@@ -900,9 +900,14 @@ async fn legacy_records_presence_memo_ttls_and_write_through() -> Result<(), Err
         );
     }
 
-    // Contrast: a topition that is NOT yet segment-routed (no segment) keeps the
-    // SHORT TTL, so a drain / first segment / legacy write is still picked up
-    // within seconds — the long window is confined to the provably-safe case.
+    // Contrast: a coalesced topition that is NOT yet segment-routed gets the
+    // MIDDLE window (#166), not the seconds-long one this test originally
+    // asserted. Confining the long window to already-segmented sub-streams left
+    // every idle stream — and every partition with a cold memo after a restart —
+    // re-listing `records/` per poll, which measured as the dominant tier-1
+    // request source in production. It is still not given the full hour: this is
+    // the case we have the least evidence about, and the failure it bounds (a
+    // stream that reads as empty) is more visible than a lagging tail.
     {
         let (storage, _counters) = coalesce_store();
         create(&storage, "org.env.conn.cold", 1).await?;
@@ -910,9 +915,9 @@ async fn legacy_records_presence_memo_ttls_and_write_through() -> Result<(), Err
 
         assert!(!storage.has_legacy_records(&topition).await?);
         assert_eq!(
-            Some(DynoStore::HIGH_WATERMARK_HINT_TTL),
+            Some(DynoStore::LEGACY_ABSENCE_UNSEGMENTED_TTL),
             memo_ttl(&storage, &topition),
-            "a topition without a segment keeps the short TTL"
+            "a coalesced topition without a segment holds its negative for minutes"
         );
     }
 
@@ -1292,4 +1297,74 @@ fn every_listing_is_attributed_to_a_call_site() {
          DynoStore::scan/scan_from/scan_delimited is invisible to \
          tansu_object_store_list_scans (#165)"
     );
+}
+
+/// #166: a prefix-coalesced partition with no segment yet must not re-list
+/// `records/` on the read path every few seconds. That short TTL applied to every
+/// idle stream and to every partition whose memo was cold after a restart, which
+/// made the legacy probe the dominant tier-1 request source in production
+/// (~1,200 LIST/s metered, ~85% of the bill, stepping up on each consumer
+/// restart). The write-through still has to win over the longer window, or a
+/// legacy batch written here would be invisible to our own next read.
+#[tokio::test]
+async fn legacy_probe_is_not_relisted_for_a_segmentless_coalesced_partition() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let counters = Arc::new(Counters::default());
+    let storage = DynoStore::new(
+        CLUSTER,
+        NODE,
+        Counting {
+            inner: InMemory::new(),
+            counters: counters.clone(),
+        },
+    )
+    .prefix_coalesce(true)
+    .prefix_leaseless(true);
+
+    let topic = "org.env.conn.idle";
+    create(&storage, topic, 1).await?;
+    let tp = Topition::new(topic, 0);
+
+    // No produce: the sub-stream owns no segment, which is the population that
+    // used to re-list every `HIGH_WATERMARK_HINT_TTL`.
+    counters.reset();
+    assert!(!storage.has_legacy_records(&tp).await?);
+    let first = counters.report("first legacy probe");
+    assert!(
+        first.2 >= 1,
+        "the first probe lists records/ once: {first:?}"
+    );
+
+    // Repeated polls are served from the memo: no further listing at all.
+    counters.reset();
+    for _ in 0..8 {
+        assert!(!storage.has_legacy_records(&tp).await?);
+    }
+    let repeated = counters.report("8 further legacy probes");
+    assert_eq!(
+        (0, 0, 0, 0, 0),
+        repeated,
+        "a segment-less coalesced partition must not re-list records/ per poll"
+    );
+
+    // A legacy write on this process is visible immediately — the longer window
+    // must never outrank the write-through.
+    storage.note_legacy_records_present(&tp)?;
+    assert!(
+        storage.has_legacy_records(&tp).await?,
+        "a legacy write here must flip the memo at once"
+    );
+
+    Ok(())
+}
+
+/// #166 companion: the graduated windows are ordered as intended — a segment-less
+/// coalesced partition is held for minutes, a segment-routed one for the full
+/// hour, and anything outside prefix coalescing keeps the seconds-long window
+/// where a first legacy write is expected.
+#[test]
+fn legacy_absence_windows_are_graduated() {
+    assert!(DynoStore::HIGH_WATERMARK_HINT_TTL < DynoStore::LEGACY_ABSENCE_UNSEGMENTED_TTL);
+    assert!(DynoStore::LEGACY_ABSENCE_UNSEGMENTED_TTL < DynoStore::LEGACY_ABSENCE_TTL);
 }
