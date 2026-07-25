@@ -577,6 +577,37 @@ static PREFIX_TAIL_PROBES: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Who is claiming a segment's tail sequence (#130). Both roles create into the
+/// *same* `segments/{seq}` namespace and therefore contend with each other, but
+/// they react differently to losing the race, and their contention is worth
+/// telling apart in the metrics: the compactor's share is what a separate
+/// `compacted/` namespace would remove.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SegmentCreateRole {
+    /// The produce path under a prefix lease (#59). A seq conflict means another
+    /// broker took the sequence — i.e. a lease takeover — so the lease must be
+    /// re-validated before resyncing, or a fenced writer would append the next
+    /// sequence with stale offsets and split-brain the log.
+    LeasedProduce,
+
+    /// Segment compaction (#66). It does not hold the produce lease, so a conflict
+    /// just means a producer claimed that tail seq: resync and retry, no fencing.
+    Compaction,
+}
+
+impl SegmentCreateRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LeasedProduce => "leased_produce",
+            Self::Compaction => "compaction",
+        }
+    }
+
+    fn fences_on_conflict(self) -> bool {
+        matches!(self, Self::LeasedProduce)
+    }
+}
+
 /// A prefix lease this process currently holds (#59): the in-memory side of
 /// [`PrefixLease`]. `version` is the etag the next renewal CASes against;
 /// `expires_at` gates the no-write fast path so a live term is reused without
@@ -663,6 +694,40 @@ static LEASE_FENCED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Segment objects created at an assigned tail sequence, by `role` (#130) — the
+/// denominator for the two counters below, so a conflict count reads as a rate
+/// rather than an absolute.
+static SEGMENT_CREATES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_segment_creates")
+        .with_description("segment objects created at an assigned tail sequence")
+        .build()
+});
+
+/// Tail-sequence create-CAS rounds lost to a concurrent writer of the same
+/// prefix, by `role` (#130). Compaction claims the merged segment's name from the
+/// *same* sequence namespace as live producers, so on a busy prefix it contends
+/// with them — and each loss re-lists and re-uploads the whole merged payload.
+static SEGMENT_CREATE_CONFLICTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_segment_create_conflicts")
+        .with_description("segment tail-sequence create-CAS rounds lost to another writer")
+        .build()
+});
+
+/// Payload bytes re-uploaded because a segment create-CAS was lost, by `role`
+/// (#130). This is the write amplification a separate `compacted/` namespace would
+/// remove: a merged payload is up to `prefix_compact_target_bytes`, and a losing
+/// compactor PUTs all of it again every round. Measured before committing to that
+/// split, whose correctness surface is large — the theorized worst case
+/// (`MAX_ATTEMPTS × target_bytes` per pass) has never been observed, only derived.
+static SEGMENT_CREATE_BYTES_REWRITTEN: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_segment_create_bytes_rewritten")
+        .with_description("payload bytes re-uploaded after losing a segment create-CAS")
+        .build()
+});
+
 /// Create-CAS rounds a leaseless flush lost to another writer of the same
 /// prefix (#157) — `AlreadyExists`, or an ambiguous PUT resolved to a peer's
 /// footer. A rate here is normal multi-writer arbitration; a rate approaching
@@ -707,16 +772,19 @@ const SEGMENT_MAGIC: u32 = 0x5453_4547;
 /// coordinates for log-based idempotent dedup (#88). Versioned so footer fields
 /// stay forward-compatible.
 ///
-/// This is the version the writer currently *emits*. Readers accept `1` and `2`
-/// (see [`Self::decode_segment_footer`]); v2 fields are only serialized when this
-/// is bumped, which is gated on the leaseless-writer cutover (#86) and the
-/// external S3-direct reader accepting v2 (kotatsu#82) — writing v2 before then
-/// would break a v1-only reader.
+/// This is the version the **lease-mode** writer (#59) emits. Readers accept `1`
+/// and `2` (see [`Self::decode_segment_footer`]); the version is chosen by the
+/// write path, not by a global switch — see [`SEGMENT_FORMAT_VERSION_V2`].
 const SEGMENT_FORMAT_VERSION: u16 = 1;
 
 /// Segment format version carrying the v2 footer additions (#87): a per-flush
-/// nonce and per-(idempotent-)batch producer coordinates. Accepted by the reader
-/// today; emitted once [`SEGMENT_FORMAT_VERSION`] is bumped to it.
+/// nonce and per-(idempotent-)batch producer coordinates.
+///
+/// Emitted by the **leaseless** writer (#86) — which is what production runs — and
+/// by compaction on a leaseless prefix, so v2 is the version an external S3-direct
+/// reader must expect (`docs/virtual-topics-format.md`, kotatsu#82). Not gated on
+/// bumping [`SEGMENT_FORMAT_VERSION`]: the two versions coexist per prefix
+/// according to the writer regime, and both stay readable.
 const SEGMENT_FORMAT_VERSION_V2: u16 = 2;
 
 /// Fixed-size trailer at the very end of every multi-topic segment (#64):
@@ -3097,10 +3165,18 @@ impl DynoStore {
         &self,
         prefix: &str,
         payload: PutPayload,
-        fence_on_conflict: bool,
+        role: SegmentCreateRole,
     ) -> Result<u64> {
         /// Bounds the conflict-resync loop; far above any real contention.
         const MAX_ATTEMPTS: usize = 64;
+
+        let attributes = [KeyValue::new("role", role.as_str())];
+        let payload_len = payload.content_length() as u64;
+
+        // Conflict accounting for the exhaustion terminal and for #130: how often
+        // this role loses the shared tail-sequence race, and how many payload
+        // bytes that costs in re-uploads.
+        let mut conflicts = 0u64;
 
         let mut candidate = match self.cached_seq(prefix)? {
             Some(seq) => seq,
@@ -3123,6 +3199,7 @@ impl DynoStore {
             {
                 Ok(outcome) => {
                     debug!(?outcome, candidate, prefix);
+                    SEGMENT_CREATES.add(1, &attributes);
                     self.set_seq(prefix, candidate + 1)?;
                     return Ok(candidate);
                 }
@@ -3137,9 +3214,16 @@ impl DynoStore {
                     // still-valid holder resyncs and retries. Compaction
                     // (fence_on_conflict=false) is not the produce writer, so a
                     // conflict is just the producer taking that seq — resync only.
-                    if fence_on_conflict {
+                    if role.fences_on_conflict() {
                         _ = self.acquire_or_renew_lease(prefix).await?;
                     }
+
+                    // Every loss costs a re-LIST and a re-upload of the whole
+                    // payload into the same key prefix (#130).
+                    conflicts += 1;
+                    SEGMENT_CREATE_CONFLICTS.add(1, &attributes);
+                    SEGMENT_CREATE_BYTES_REWRITTEN.add(payload_len, &attributes);
+
                     debug!(candidate, attempt, prefix, "segment seq taken, resyncing");
                     candidate = self.tail_next_seq(prefix).await?;
                 }
@@ -3150,7 +3234,12 @@ impl DynoStore {
 
         error!(
             prefix,
-            candidate, "segment sequence assignment exhausted retries"
+            candidate,
+            role = role.as_str(),
+            conflicts,
+            payload_len,
+            bytes_rewritten = conflicts * payload_len,
+            "segment sequence assignment exhausted retries"
         );
         // Retriable: contention exhaustion, not a permanent fault (#6/#129).
         Err(Error::Api(ErrorCode::KafkaStorageError))
@@ -4837,7 +4926,7 @@ impl DynoStore {
         let (seq, footer) = match async {
             let (payload, footer) = self.encode_segment(&substreams, epoch)?;
             let seq = self
-                .assign_and_create_segment(prefix, payload, true)
+                .assign_and_create_segment(prefix, payload, SegmentCreateRole::LeasedProduce)
                 .await?;
             Ok::<_, Error>((seq, footer))
         }
@@ -6016,7 +6105,7 @@ impl DynoStore {
                 self.encode_segment(&substreams, merged_epoch.max(0))?
             };
             let seq = self
-                .assign_and_create_segment(prefix, payload, false)
+                .assign_and_create_segment(prefix, payload, SegmentCreateRole::Compaction)
                 .await?;
             self.index_insert(prefix, seq, footer, max_last_modified)?;
             Some(seq)
@@ -6988,10 +7077,13 @@ impl DynoStore {
     }
 
     /// Serialize a [`SegmentFooter`] index (#64/#59). Header: `writer_epoch
-    /// (i64)`. Then each entry: `topic_len (u16) + topic (utf8) +
-    /// partition (i32) + base_offset (i64) + record_count (i64) +
-    /// byte_start (u64) + byte_len (u64) + max_timestamp (i64)`, all big-endian.
-    /// Paired with [`Self::decode_footer`].
+    /// (i64)`, plus `nonce (u64)` at v2. Then each entry: `topic_len (u16) +
+    /// topic (utf8) + partition (i32) + base_offset (i64) + record_count (i64) +
+    /// byte_start (u64) + byte_len (u64) + max_timestamp (i64)`, plus at v2
+    /// `pcoord_count (u16)` and that many `producer_id (i64) + producer_epoch
+    /// (i16) + base_sequence (i32) + last_sequence (i32) + offset_delta (u32)` —
+    /// all big-endian. Paired with [`Self::decode_footer`]; the external contract
+    /// is `docs/virtual-topics-format.md`.
     fn encode_footer(footer: &SegmentFooter, version: u16) -> Vec<u8> {
         let v2 = version >= SEGMENT_FORMAT_VERSION_V2;
         let mut buf = Vec::new();
