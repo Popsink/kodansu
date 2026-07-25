@@ -19,6 +19,7 @@
 //! `(topic, partition)` sub-stream keeps its own independent offset sequence.
 
 use std::{
+    collections::BTreeMap,
     fmt::{self, Debug, Display},
     str::FromStr,
     sync::{
@@ -2659,6 +2660,164 @@ async fn default_compaction_target_bytes_is_modest() {
     assert_eq!(16 << 20, store.prefix_compact_target_bytes);
 }
 
+/// One footer entry as an external reader coded from the doc would recover it:
+/// `(topic, partition, base_offset, record_count, byte_start, byte_len,
+/// pcoord_count)`.
+type DocEntry = (String, i32, i64, i64, u64, u64, usize);
+
+/// Decode a segment object's footer using **only** what
+/// `docs/virtual-topics-format.md` states — the external-reader contract, with no
+/// access to the storage crate's own decoder. Returns
+/// `(version, entries, trailing_footer_bytes)`; a non-zero `trailing_footer_bytes`
+/// means the documented layout left the cursor short of the footer's end, i.e. a
+/// reader built from the doc would desync (#138).
+fn decode_per_the_doc(object: &[u8]) -> (u16, Vec<DocEntry>, usize) {
+    fn u16_at(b: &[u8], at: usize) -> u16 {
+        u16::from_be_bytes(b[at..at + 2].try_into().expect("u16"))
+    }
+    fn u32_at(b: &[u8], at: usize) -> u32 {
+        u32::from_be_bytes(b[at..at + 4].try_into().expect("u32"))
+    }
+    fn u64_at(b: &[u8], at: usize) -> u64 {
+        u64::from_be_bytes(b[at..at + 8].try_into().expect("u64"))
+    }
+    fn i64_at(b: &[u8], at: usize) -> i64 {
+        i64::from_be_bytes(b[at..at + 8].try_into().expect("i64"))
+    }
+
+    // Trailer: fixed 18 bytes at the very end.
+    let trailer = &object[object.len() - 18..];
+    let footer_len = u64_at(trailer, 0) as usize;
+    let entry_count = u32_at(trailer, 8) as usize;
+    let version = u16_at(trailer, 12);
+    assert_eq!(0x5453_4547, u32_at(trailer, 14), "TSEG magic");
+
+    // Footer: the `footer_len` bytes immediately before the trailer.
+    let footer_end = object.len() - 18;
+    let footer = &object[footer_end - footer_len..footer_end];
+
+    // Header: writer_epoch (i64), plus nonce (u64) at v2.
+    let mut at = 8;
+    if version >= 2 {
+        at += 8;
+    }
+
+    let mut entries = Vec::with_capacity(entry_count);
+    for _ in 0..entry_count {
+        let topic_len = u16_at(footer, at) as usize;
+        at += 2;
+        let topic = String::from_utf8(footer[at..at + topic_len].to_vec()).expect("utf8 topic");
+        at += topic_len;
+        let partition = u32_at(footer, at) as i32;
+        at += 4;
+        let base_offset = i64_at(footer, at);
+        at += 8;
+        let record_count = i64_at(footer, at);
+        at += 8;
+        let byte_start = u64_at(footer, at);
+        at += 8;
+        let byte_len = u64_at(footer, at);
+        at += 8;
+        let _max_timestamp = i64_at(footer, at);
+        at += 8;
+
+        // v2 ONLY: pcoord_count (u16) then that many 22-byte producer coordinates.
+        let mut pcoord_count = 0;
+        if version >= 2 {
+            pcoord_count = u16_at(footer, at) as usize;
+            at += 2;
+            at += pcoord_count * (8 + 2 + 4 + 4 + 4);
+        }
+
+        entries.push((
+            topic,
+            partition,
+            base_offset,
+            record_count,
+            byte_start,
+            byte_len,
+            pcoord_count,
+        ));
+    }
+
+    (version, entries, footer.len() - at)
+}
+
+/// #138: a reader implemented from `docs/virtual-topics-format.md` must decode a
+/// segment this build actually writes. The doc used to describe footer v1 and the
+/// `lease.json` regime while the leaseless writer emitted v2, so a reader coded
+/// from it desynced its cursor on every production segment — the failure this
+/// pins. The decoder above is deliberately independent of the storage crate's own
+/// footer code: it is what an external S3-direct reader (kotatsu#82) would write.
+#[tokio::test]
+async fn documented_layout_decodes_a_segment_this_build_writes() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        // The regime production runs, and the one that emits footer v2.
+        .prefix_leaseless(true);
+
+    let topic_a = "org.env.conn.tab_a";
+    let topic_b = "org.env.conn.tab_b";
+    create_topic(&store, topic_a).await?;
+    create_topic(&store, topic_b).await?;
+    let a = Topition::new(topic_a, 0);
+    let b = Topition::new(topic_b, 0);
+
+    // Two sub-streams in one segment (produced concurrently so they share one
+    // linger window), one of them idempotent so the v2 `producers` block is
+    // non-empty — the block a v1-shaped reader skips.
+    let (produced_a, produced_b) = tokio::join!(
+        store.produce(None, &a, idempotent_batch(4_242, 0, 0, 2)?),
+        store.produce(None, &b, batch(3)?),
+    );
+    assert_eq!(0, produced_a?);
+    assert_eq!(0, produced_b?);
+
+    let locations = segments(&bucket).await;
+    assert_eq!(1, locations.len(), "one shared segment");
+    let object = bucket
+        .get(&locations[0])
+        .await
+        .expect("get segment")
+        .bytes()
+        .await
+        .expect("segment bytes");
+
+    let (version, entries, trailing) = decode_per_the_doc(&object);
+
+    assert_eq!(2, version, "the leaseless writer emits footer v2");
+    assert_eq!(
+        0, trailing,
+        "the documented layout must consume the footer exactly — {trailing} bytes left over \
+         means an external reader desyncs"
+    );
+
+    let by_topic: BTreeMap<&str, &DocEntry> = entries.iter().map(|e| (e.0.as_str(), e)).collect();
+    assert_eq!(2, by_topic.len(), "both sub-streams indexed: {entries:?}");
+
+    let entry_a = by_topic.get(topic_a).expect("tab_a entry");
+    assert_eq!((0, 0, 2), (entry_a.1, entry_a.2, entry_a.3));
+    assert!(entry_a.6 > 0, "idempotent sub-stream carries producers");
+
+    let entry_b = by_topic.get(topic_b).expect("tab_b entry");
+    assert_eq!((0, 0, 3), (entry_b.1, entry_b.2, entry_b.3));
+    assert_eq!(0, entry_b.6, "non-idempotent sub-stream carries none");
+
+    // The documented byte extents address real records: each region must be a
+    // batch concatenation, and the regions must not overlap.
+    for entry in &entries {
+        let region = &object[entry.4 as usize..(entry.4 + entry.5) as usize];
+        assert!(!region.is_empty(), "region bytes present for {}", entry.0);
+    }
+    assert!(
+        entry_a.4 + entry_a.5 <= entry_b.4 || entry_b.4 + entry_b.5 <= entry_a.4,
+        "sub-stream regions must not overlap: {entries:?}"
+    );
+
+    Ok(())
+}
+
 /// An `ObjectStore` that records the order in which segment objects are created
 /// and `segments/` prefixes listed, and fails every delete of keys under one
 /// chosen prefix — enough to observe the per-prefix maintenance driver's ordering
@@ -2945,6 +3104,77 @@ async fn maintenance_visits_the_largest_prefix_first() -> Result<(), Error> {
     assert!(
         matches!((first_large, first_small), (Some(large), Some(small)) if large < small),
         "the larger prefix must be maintained first: {observed:?}"
+    );
+
+    Ok(())
+}
+
+/// #130: compaction claims the merged segment's name from the **same** tail
+/// sequence namespace as live producers, so a producer can take the sequence the
+/// compactor targeted. It must then resync to the next free sequence and re-PUT
+/// the merged payload — the write amplification `tansu_prefix_segment_create_*`
+/// now measures, and the reason a separate `compacted/` namespace is on the table.
+/// Squatting the compactor's target sequence models the lost race.
+#[tokio::test]
+async fn compaction_resyncs_when_its_target_sequence_is_taken() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .coalesce_tuning(CoalesceTuning {
+            prefix_compact_min_segments: Some(2),
+            prefix_compact_keep_hot: Some(0),
+            prefix_compact_target_bytes: Some(4096),
+            ..Default::default()
+        });
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let tp = Topition::new(topic, 0);
+
+    for _ in 0..4 {
+        _ = store.produce(None, &tp, batch(1)?).await?;
+    }
+    let before = segments(&bucket).await;
+    assert_eq!(4, before.len());
+
+    let offsets: Vec<i64> = fetch_from(&store, &tp, 0)
+        .await?
+        .iter()
+        .map(|batch| batch.base_offset)
+        .collect();
+
+    // A producer wins sequence 4 — the tail the compactor is about to claim.
+    let taken = Path::from(format!(
+        "clusters/{CLUSTER}/prefixes/{PREFIX}/segments/{:0>20}.seg",
+        4
+    ));
+    _ = bucket
+        .put(&taken, PutPayload::from_static(b"taken by a producer"))
+        .await?;
+
+    // Compaction loses that create, resyncs past it, and still merges.
+    assert!(
+        store.drain_compact_prefix(PREFIX).await > 0,
+        "compaction merged despite losing its target sequence"
+    );
+
+    let after = segments(&bucket).await;
+    assert!(
+        after.contains(&taken),
+        "the producer's segment is untouched: {after:?}"
+    );
+    assert!(
+        after.len() < before.len() + 1,
+        "the merged run replaced its originals: {after:?}"
+    );
+
+    // Reads are unchanged across the resynced merge.
+    assert_eq!(
+        offsets,
+        fetch_from(&store, &tp, 0)
+            .await?
+            .iter()
+            .map(|batch| batch.base_offset)
+            .collect::<Vec<_>>()
     );
 
     Ok(())

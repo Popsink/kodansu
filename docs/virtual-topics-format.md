@@ -17,7 +17,7 @@ from the footer, never from the name. A segment multiplexes the batches of every
 reader (e.g. kotatsu, kotatsu#82) locates and decodes any sub-stream from the
 object alone, with no external index — resolving `(topic, partition, offset)`
 through the footer's offset ranges (on the rare overlap left by a
-compaction/failover, the higher `writer_epoch` wins).
+compaction/failover, see [Resolving overlaps](#resolving-overlaps)).
 
 This document is the **wire contract**. All integers are **big-endian**.
 
@@ -35,9 +35,13 @@ This document is the **wire contract**. All integers are **big-endian**.
 +-----------------------------------------------------------+
 ```
 
-A reader recovers the index with two ranged GETs of the tail: the last 18 bytes
-(the trailer) give `footer_len`, then the preceding `footer_len` bytes are the
-footer. The record body is never downloaded to locate a sub-stream.
+A reader recovers the index with **one** ranged GET of a fixed-size suffix
+(64 KiB), which for almost every segment already covers both the trailer and the
+whole footer: read `footer_len` from the last 18 bytes, then slice the
+`footer_len` bytes immediately before them out of the same buffer. Any leading
+record bytes in the over-read are ignored. Only a footer *larger* than the
+over-read needs a second, exact GET of the last `18 + footer_len` bytes. The
+record body is never downloaded to locate a sub-stream.
 
 ### Sub-stream region
 
@@ -49,8 +53,14 @@ Absolute offsets come from the footer, **not** from the batch headers.
 
 ### Footer
 
+Two versions exist. **v2 is what production writes** — the leaseless writer
+(#86) emits it, and so does compaction on a leaseless prefix. v1 is emitted only
+by the lease-mode writer (#59) and remains readable. A reader MUST accept both,
+and MUST reject any other version.
+
 ```
-writer_epoch      i64          # lease epoch of the writer (#59); 0 if unleased
+writer_epoch      i64          # see "writer_epoch" below
+nonce             u64          # v2 ONLY — per-flush write identity (#89)
 entries[entry_count]:
     topic_len     u16
     topic         [topic_len]  # UTF-8
@@ -60,40 +70,96 @@ entries[entry_count]:
     byte_start    u64          # region offset within the segment
     byte_len      u64          # region length in bytes
     max_timestamp i64          # greatest record timestamp in the sub-stream
+    # ---- the following block is v2 ONLY ----
+    pcoord_count  u16          # producer coordinates for this sub-stream
+    producers[pcoord_count]:
+        producer_id     i64
+        producer_epoch  i16
+        base_sequence   i32
+        last_sequence   i32    # base_sequence + last_offset_delta (wrapping)
+        offset_delta    u32    # batch's first offset - entry base_offset
 ```
+
+`entry_count` comes from the trailer, not from a count inside the footer.
+
+**A v2 reader MUST parse (or skip by `pcoord_count`) the `producers` block even
+if it ignores its contents**: a reader that stops at `max_timestamp` — i.e. one
+written against the v1 layout — leaves its cursor mid-entry and mis-decodes every
+following entry. This is the single most likely way to get v2 wrong.
+
+The `producers` block exists so idempotent-producer dedup is derivable from the
+log itself (#88): it records, per idempotent batch, which producer/epoch/sequence
+range landed at which offset. An external reader that only serves records can
+skip it; one that wants to recognise duplicates does not have to keep separate
+state.
 
 To read `(topic, partition)` from `offset`: find its entry, ranged-GET
 `[byte_start, byte_start + byte_len)`, decode the region, and assign offsets
 running from `base_offset`.
+
+#### `writer_epoch`
+
+The field is present in both versions and is the overlap tie-break in both, but
+the two writer regimes stamp it differently:
+
+- **v1, lease mode (#59):** the epoch of the lease the writer held, `0` if none.
+- **v2, leaseless mode (#86, what production runs):** the prefix's **era epoch**,
+  read from `prefixes/{prefix}/era.json` (`{"era_epoch": i64}`). It is a constant
+  per prefix, not per writer: seeded once as
+  `max(last lease epoch, highest footer epoch) + 1`, so it is `>= 1` and every
+  leaseless segment out-epochs every pre-cutover lease-era segment on the same
+  prefix (#92).
+- **compaction:** the merged segment carries the maximum `writer_epoch` of the
+  segments it merged (floored at 0), and is written v2 on a leaseless prefix and
+  v1 otherwise.
 
 ### Trailer (fixed 18 bytes, at the very end)
 
 ```
 footer_len    u64
 entry_count   u32
-version       u16              # format version, currently 1
-magic         u32             # 0x5453_4547  ("TSEG")
+version       u16              # 1 or 2 (2 is what production writes)
+magic         u32              # 0x5453_4547  ("TSEG")
 ```
 
 ## Versioning & backward compatibility
 
-- `version = 1` is the first self-describing multi-topic segment.
+- `version = 1` is the first self-describing multi-topic segment; `version = 2`
+  adds the footer `nonce` and the per-entry `producers` block described above.
+  A reader MUST accept `{1, 2}` and MUST reject any other version rather than
+  guessing.
 - A **legacy** single-topic coalesced object (#50) has **no trailer**: its last
   bytes are record data, so the trailing `magic` will not equal `TSEG`. A reader
   MUST treat "magic absent" as the v0 case and decode the whole object as a bare
   `RecordBatch` concatenation. This is how coalesced and legacy objects coexist
   in one bucket during migration.
-- Readers MUST reject a segment whose `version` they do not understand rather
-  than guessing.
+
+## Resolving overlaps
+
+Compaction and writer failover can leave two segments claiming the same offset
+range for one sub-stream. Sort the candidate entries by ascending `base_offset`,
+breaking ties by **higher `writer_epoch` first, then higher `seq` first**, then
+sweep in that order and drop any entry whose `base_offset` falls below the range
+already covered. The higher-sequence tie-break is what makes a merged segment win
+over the originals it merged: they carry the same epoch, and the merged segment's
+sequence is always higher.
 
 ## Notes for readers
 
 - **Retention** is whole-segment, per prefix: a segment is deleted only once
   every sub-stream in it is past retention (`max_timestamp`), so a live topic
   never loses a shared segment.
-- **Single writer** per prefix is enforced by an S3 conditional-write lease
-  (`prefixes/{prefix}/lease.json`); `writer_epoch` in the footer identifies the
-  writer that produced the segment.
+- **Segments are immutable but not permanent.** Compaction deletes the originals
+  once the merged segment exists, and retention deletes whole segments, so a GET
+  of a segment a reader learned about earlier can `404` at any time. Re-list the
+  prefix and resolve the offset again rather than treating the `404` as data loss
+  — the records are in the merged segment, or genuinely past retention.
+- **Single writer per prefix is no longer the production regime.** Lease mode
+  (`prefixes/{prefix}/lease.json`, #59) still exists in the code, but production
+  runs **leaseless** (#86): any replica may append to any prefix, arbitrated by
+  the create-only segment-sequence CAS, and the per-prefix marker object is
+  `era.json` (above), not `lease.json`. Either way the reader contract is the
+  same — decode the footer, and use the overlap rule above.
 - **Hybrid topics:** a topic opted into segments mid-life keeps its earlier
   `records/{offset}.batch` objects for `[0, C)` and writes segments for
   `[C, ∞)`; a reader serves the legacy region from `records/` and the rest from
