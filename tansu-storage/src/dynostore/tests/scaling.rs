@@ -1223,3 +1223,193 @@ async fn coalesced_latest_survives_peer_expiry_via_floor_certification() -> Resu
 
     Ok(())
 }
+
+/// An `ObjectStore` counting GETs of the per-partition `watermark.json` object,
+/// so a test can pin that a read path does not touch it (#161).
+#[derive(Clone)]
+struct CountWatermarkGets<O> {
+    inner: O,
+    gets: Arc<AtomicU64>,
+}
+
+impl<O> Debug for CountWatermarkGets<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CountWatermarkGets").finish()
+    }
+}
+
+impl<O> Display for CountWatermarkGets<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CountWatermarkGets").finish()
+    }
+}
+
+#[async_trait]
+impl<O> ObjectStore for CountWatermarkGets<O>
+where
+    O: ObjectStore,
+{
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult, object_store::Error> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> Result<GetResult, object_store::Error> {
+        if location.as_ref().ends_with("watermark.json") {
+            _ = self.gets.fetch_add(1, Relaxed);
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path, object_store::Error>>,
+    ) -> BoxStream<'static, Result<Path, object_store::Error>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> Result<ListResult, object_store::Error> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: CopyOptions,
+    ) -> Result<(), object_store::Error> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+}
+
+/// #161: read-committed polling of a pure-segment sub-stream must not GET
+/// `watermark.json`. It is authoritatively silent about the log start there —
+/// only the legacy `records/` retention paths ever advance `watermark.low` — and
+/// polling it measured ~1490 GET/s returning `404 NoSuchKey` at ~1,600
+/// subscriptions: round-trips that resolve nothing, add fetch latency, and are
+/// billable on a store that charges 4xx. The reported offsets must not change.
+#[tokio::test]
+async fn read_committed_polling_does_not_get_watermark_json() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let gets = Arc::new(AtomicU64::new(0));
+    let storage = DynoStore::new(
+        CLUSTER,
+        NODE,
+        CountWatermarkGets {
+            inner: InMemory::new(),
+            gets: gets.clone(),
+        },
+    )
+    .prefix_coalesce(true)
+    .prefix_leaseless(true);
+
+    let topic = "org.env.conn.committed";
+    create(&storage, topic, 1).await?;
+    let tp = Topition::new(topic, 0);
+
+    for n in 0..4 {
+        _ = storage
+            .produce(None, &tp, batch(format!("m-{n}").as_bytes())?)
+            .await?;
+    }
+
+    // Read-uncommitted was already off this object (#109) — the baseline.
+    let uncommitted = storage
+        .offset_stage_at(&tp, IsolationLevel::ReadUncommitted)
+        .await?;
+
+    gets.store(0, Relaxed);
+
+    for _ in 0..16 {
+        let committed = storage
+            .offset_stage_at(&tp, IsolationLevel::ReadCommitted)
+            .await?;
+
+        assert_eq!(4, committed.high_watermark);
+        assert_eq!(4, committed.last_stable, "no open transaction");
+        assert_eq!(
+            uncommitted.log_start, committed.log_start,
+            "the log start must not change with the isolation level"
+        );
+        assert!(committed.aborted.is_empty());
+    }
+
+    assert_eq!(
+        0,
+        gets.load(Relaxed),
+        "16 read-committed polls must not GET watermark.json (#161)"
+    );
+
+    Ok(())
+}
+
+/// #161: the fallback stays where `watermark.low` really does carry the log
+/// start. A legacy sub-stream's log start is advanced by the `records/` retention
+/// path, and read-committed must keep reporting it — skipping the read there would
+/// report a log start below the oldest surviving record.
+#[tokio::test]
+async fn legacy_log_start_still_comes_from_the_watermark() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let (storage, _counters) = store();
+
+    let topic = "legacy-topic";
+    create(&storage, topic, 1).await?;
+    let tp = Topition::new(topic, 0);
+    for n in 0..4 {
+        _ = storage
+            .produce(None, &tp, batch(format!("m-{n}").as_bytes())?)
+            .await?;
+    }
+
+    // What the legacy retention path records once it has drained the oldest
+    // batches.
+    storage.advance_low_watermark(&tp, Some(2)).await?;
+
+    let stage = storage
+        .offset_stage_at(&tp, IsolationLevel::ReadCommitted)
+        .await?;
+
+    assert_eq!(4, stage.high_watermark);
+    assert_eq!(
+        2, stage.log_start,
+        "a legacy sub-stream reports the drained log start from watermark.low"
+    );
+
+    Ok(())
+}
