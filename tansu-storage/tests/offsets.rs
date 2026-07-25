@@ -96,7 +96,10 @@ async fn concurrent_offset_commit_fetch_round_trip() -> Result<(), Error> {
     // One entry per request, in request order, with per-topition status.
     assert_eq!(offsets.len(), committed.len());
     for (index, (topition, code)) in committed.iter().enumerate() {
-        assert_eq!(&offsets[index].0, topition, "commit out of order at {index}");
+        assert_eq!(
+            &offsets[index].0, topition,
+            "commit out of order at {index}"
+        );
         let expected = if topition.topic() == known {
             ErrorCode::None
         } else {
@@ -111,7 +114,9 @@ async fn concurrent_offset_commit_fetch_round_trip() -> Result<(), Error> {
         .collect::<Vec<_>>();
     fetch.push(Topition::new(known, PARTITIONS + 1)); // never committed -> -1
 
-    let fetched = storage.offset_fetch(Some(group), &fetch, Some(false)).await?;
+    let fetched = storage
+        .offset_fetch(Some(group), &fetch, Some(false))
+        .await?;
 
     for p in 0..PARTITIONS {
         assert_eq!(
