@@ -2587,6 +2587,54 @@ async fn leaseless_flush_exhaustion_is_retriable_not_fatal() -> Result<(), Error
     Ok(())
 }
 
+/// #157: an object squatting a segment sequence with **no decodable footer**
+/// (shorter than the trailer, or a tail whose magic is not `TSEG`) must not wedge
+/// the leaseless arbiter. The candidate is derived from the *resolved* sequences —
+/// decoded segments and undecodable names alike — so the writer steps over the
+/// squatter. Deriving it from the readable set alone re-picks the same occupied
+/// sequence on every attempt, burning the whole create-CAS budget on every flush,
+/// on every replica, at any produce rate — the deterministic livelock behind the
+/// "leaseless flush exhausted retries" spam on a low-rate prefix.
+#[tokio::test]
+async fn leaseless_steps_over_footerless_segment_object() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .prefix_leaseless(true);
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let tp = Topition::new(topic, 0);
+
+    // A first produce lays down segment 0, so the next free sequence is 1.
+    assert_eq!(0, store.produce(None, &tp, batch(1)?).await?);
+
+    // Squat sequence 1 with an object that carries no `TSEG` trailer — the shape
+    // a foreign/truncated write leaves in the create-only namespace.
+    _ = bucket
+        .put(
+            &Path::from(format!(
+                "clusters/{CLUSTER}/prefixes/{PREFIX}/segments/{:0>20}.seg",
+                1
+            )),
+            PutPayload::from_static(b"not a segment"),
+        )
+        .await?;
+
+    // The flush must step over sequence 1 and keep the sub-stream contiguous
+    // rather than exhaust its budget on an occupied candidate.
+    assert_eq!(1, store.produce(None, &tp, batch(1)?).await?);
+    assert_eq!(2, store.produce(None, &tp, batch(1)?).await?);
+
+    // And the records are readable across the skipped sequence.
+    let fetched = fetch_from(&store, &tp, 0).await?;
+    assert!(
+        !fetched.is_empty(),
+        "records written around the squatted sequence must still be served"
+    );
+
+    Ok(())
+}
+
 /// #130 mitigation: the shipped default merged-segment target is 16 MiB, not a
 /// larger size. While compaction writes into the producer tail create-CAS
 /// namespace, a larger target multiplies the S3 write amplification and request
