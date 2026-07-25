@@ -859,6 +859,8 @@ enum Scan {
     Group,
     /// The topic-metadata index refresh.
     TopicMetadata,
+    /// Deleting a topic or a consumer group.
+    AdminDelete,
     /// Connectivity check.
     Ping,
 }
@@ -873,6 +875,7 @@ impl Scan {
             Self::ListOffsets => "list_offsets",
             Self::Group => "group",
             Self::TopicMetadata => "topic_metadata",
+            Self::AdminDelete => "admin_delete",
             Self::Ping => "ping",
         }
     }
@@ -4273,8 +4276,7 @@ impl DynoStore {
             self.cluster, topition.topic, topition.partition
         ));
         let present = self
-            .object_store
-            .list(Some(&prefix))
+            .scan(Scan::LegacyProbe, &prefix)
             .next()
             .await
             .transpose()
@@ -7778,8 +7780,7 @@ impl Storage for DynoStore {
             ));
 
             let locations = self
-                .object_store
-                .list(Some(&prefix))
+                .scan(Scan::AdminDelete, &prefix)
                 .map_ok(|m| m.location)
                 .boxed();
 
@@ -7794,8 +7795,7 @@ impl Storage for DynoStore {
             let topic_name = metadata.topic.name.clone();
             let prefix_clone = prefix.clone();
             let locations = self
-                .object_store
-                .list(Some(&prefix))
+                .scan(Scan::AdminDelete, &prefix)
                 .filter_map(move |m| {
                     let prefix = prefix_clone.clone();
                     let topic_name = topic_name.clone();
@@ -8938,8 +8938,7 @@ impl Storage for DynoStore {
                 ));
 
                 let locations = self
-                    .object_store
-                    .list(Some(&prefix))
+                    .scan(Scan::AdminDelete, &prefix)
                     .map_ok(|m| m.location)
                     .boxed();
 
