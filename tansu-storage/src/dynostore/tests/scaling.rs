@@ -1065,12 +1065,14 @@ async fn coalesced_stale_hint_list_offsets_is_per_prefix_not_per_partition() -> 
     assert_eq!(0, stale.0, "no puts");
     assert_eq!(0, stale.2, "no full LIST");
     assert_eq!(
-        PREFIXES as u64, stale.3,
-        "one single-flighted incremental segments LIST per PREFIX, not per partition"
+        0, stale.3,
+        "no incremental segments LIST either: the tail probe proves the tail instead (#112)"
     );
     assert_eq!(
-        PREFIXES as u64, stale.1,
-        "one seq-floor GET per PREFIX — and zero per-partition watermark.json GETs"
+        2 * PREFIXES as u64,
+        stale.1,
+        "two tier-2 GETs per PREFIX — the tail probe and the seq-floor read that proves it — \
+         replacing the tier-1 LIST, and still zero per-partition watermark.json GETs"
     );
 
     // EARLIEST over the whole assignment within the index TTL: served entirely
@@ -1172,9 +1174,10 @@ async fn coalesced_latest_survives_peer_expiry_via_floor_certification() -> Resu
     assert_eq!(4, storage.high_watermark(&tp).await?);
     let certified = counters.report("stale-hint LATEST, floor unchanged");
     assert_eq!(
-        (0, 1, 0, 1, 0),
+        (0, 2, 0, 0, 0),
         certified,
-        "floor unchanged: one per-prefix floor GET + one incremental LIST, no watermark.json GET"
+        "floor unchanged: the refresh is served by the tail probe (#112) — one probe GET plus \
+         the floor GET that proves it, no LIST and no watermark.json GET"
     );
 
     // A peer replica acked offsets this process never listed (segments created
