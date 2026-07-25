@@ -2598,3 +2598,222 @@ async fn default_compaction_target_bytes_is_modest() {
     let store = DynoStore::new(CLUSTER, NODE, InMemory::new()).prefix_coalesce(true);
     assert_eq!(16 << 20, store.prefix_compact_target_bytes);
 }
+
+/// An `ObjectStore` that counts `segments/` listings, so a test can assert a
+/// refresh was served **without** a `ListObjectsV2` (#112).
+#[derive(Clone)]
+struct CountSegmentLists<O> {
+    inner: O,
+    lists: Arc<AtomicU64>,
+}
+
+impl<O> CountSegmentLists<O> {
+    fn note(&self, prefix: Option<&Path>) {
+        if prefix.is_some_and(|prefix| prefix.as_ref().contains("/segments")) {
+            _ = self.lists.fetch_add(1, Relaxed);
+        }
+    }
+}
+
+impl<O> Debug for CountSegmentLists<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CountSegmentLists").finish()
+    }
+}
+
+impl<O> Display for CountSegmentLists<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CountSegmentLists").finish()
+    }
+}
+
+#[async_trait]
+impl<O> ObjectStore for CountSegmentLists<O>
+where
+    O: ObjectStore,
+{
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult, object_store::Error> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> Result<GetResult, object_store::Error> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path, object_store::Error>>,
+    ) -> BoxStream<'static, Result<Path, object_store::Error>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.note(prefix);
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.note(prefix);
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> Result<ListResult, object_store::Error> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: CopyOptions,
+    ) -> Result<(), object_store::Error> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+}
+
+/// #112: a reader following the tail of a prefix another replica is writing must
+/// not issue a `ListObjectsV2` per refresh. The tail probe folds the peer's new
+/// segment from the same ranged GET that discovers it, and proves there is nothing
+/// beyond it — so a caught-up refresh costs two tier-2 GETs instead of a tier-1
+/// LIST, and a refresh that finds a new segment costs no more than the footer GET
+/// it would have paid anyway.
+#[tokio::test]
+async fn tail_probe_follows_a_peer_without_listing() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let lists = Arc::new(AtomicU64::new(0));
+
+    let writer = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .prefix_leaseless(true);
+    let reader = DynoStore::new(
+        CLUSTER,
+        NODE,
+        CountSegmentLists {
+            inner: bucket.clone(),
+            lists: lists.clone(),
+        },
+    )
+    .prefix_coalesce(true)
+    .prefix_leaseless(true);
+
+    let topic = "org.env.conn.tab_a";
+    create_topic(&writer, topic).await?;
+    let tp = Topition::new(topic, 0);
+
+    _ = writer.produce(None, &tp, batch(1)?).await?;
+
+    // Cold index: one listing, unavoidable (there is no cursor to probe from).
+    reader.refresh_prefix_index_forced(PREFIX).await?;
+    let after_cold = lists.load(Relaxed);
+    assert_eq!(1, after_cold, "the cold build lists once");
+
+    // Nothing new: proven by probe, no listing.
+    reader.refresh_prefix_index_forced(PREFIX).await?;
+    assert_eq!(
+        after_cold,
+        lists.load(Relaxed),
+        "a caught-up refresh must not list"
+    );
+
+    // A peer appends: folded from the probe GET, still no listing.
+    _ = writer.produce(None, &tp, batch(1)?).await?;
+    reader.refresh_prefix_index_forced(PREFIX).await?;
+    assert_eq!(
+        after_cold,
+        lists.load(Relaxed),
+        "folding a peer's new segment must not list"
+    );
+
+    assert_eq!(
+        Some(1),
+        reader
+            .prefix_index
+            .lock()
+            .expect("prefix_index")
+            .get(PREFIX)
+            .and_then(|index| index.segments.keys().next_back().copied()),
+        "the peer's segment 1 is in the index"
+    );
+
+    // And the reader serves the peer's records from it.
+    assert_eq!(
+        vec![0, 1],
+        fetch_from(&reader, &tp, 0)
+            .await?
+            .iter()
+            .map(|batch| batch.base_offset)
+            .collect::<Vec<_>>()
+    );
+
+    Ok(())
+}
+
+/// #112: the probe's proof rests on the seq floor not being ahead of the absent
+/// sequence. A floor above it means names past our cursor were freed by retention
+/// or compaction, so a 404 there proves nothing — the refresh must fall back to a
+/// listing rather than conclude the tail is where it last saw it.
+#[tokio::test]
+async fn tail_probe_defers_to_a_listing_when_the_floor_is_ahead() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let lists = Arc::new(AtomicU64::new(0));
+    let store = DynoStore::new(
+        CLUSTER,
+        NODE,
+        CountSegmentLists {
+            inner: bucket.clone(),
+            lists: lists.clone(),
+        },
+    )
+    .prefix_coalesce(true)
+    .prefix_leaseless(true);
+
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let tp = Topition::new(topic, 0);
+    _ = store.produce(None, &tp, batch(1)?).await?;
+
+    store.refresh_prefix_index_forced(PREFIX).await?;
+    let baseline = lists.load(Relaxed);
+
+    // Sanity: with the floor at the tail the probe answers on its own.
+    store.refresh_prefix_index_forced(PREFIX).await?;
+    assert_eq!(baseline, lists.load(Relaxed));
+
+    // A drain elsewhere raised the floor past the tail: absence is no longer proof.
+    store.raise_seq_floor(PREFIX, 9).await?;
+    store.refresh_prefix_index_forced(PREFIX).await?;
+    assert_eq!(
+        baseline + 1,
+        lists.load(Relaxed),
+        "a floor ahead of the cursor must force a listing"
+    );
+
+    Ok(())
+}

@@ -508,6 +508,40 @@ struct PrefixIndex {
     seq_floor: Option<(u64, u64)>,
 }
 
+/// Outcome of following a prefix's segment tail with ranged GETs instead of a
+/// `ListObjectsV2` (#112). See [`DynoStore::probe_prefix_tail`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TailProbe {
+    /// The tail is proven and anything new is folded — no LIST needed.
+    Resolved,
+
+    /// The proof does not hold; the caller must LIST. Carries why, for the
+    /// fallback-rate metric.
+    Inconclusive(&'static str),
+}
+
+/// `segments/` listings issued to refresh a prefix index (#112), by `path`
+/// (`forced` = the produce-path fold, `ttl` = a read-path refresh) and `reason`
+/// (why the cheaper tail probe could not answer). Tier-1 requests, ~12x the price
+/// of the GET the probe replaces them with, so the ratio of this to
+/// [`PREFIX_TAIL_PROBES`] is the saving.
+static PREFIX_INDEX_LISTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_index_lists")
+        .with_description("segments/ listings issued to refresh a prefix index")
+        .build()
+});
+
+/// Prefix-index refreshes answered by the tail probe instead of a listing (#112),
+/// by `path` and `outcome` (`up_to_date` = nothing new was there, `extended` = new
+/// segments were folded from their probe GETs).
+static PREFIX_TAIL_PROBES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_tail_probes")
+        .with_description("prefix-index refreshes served by a tail probe, not a listing")
+        .build()
+});
+
 /// A prefix lease this process currently holds (#59): the in-memory side of
 /// [`PrefixLease`]. `version` is the etag the next renewal CASes against;
 /// `expires_at` gates the no-write fast path so a live term is reused without
@@ -3155,6 +3189,185 @@ impl DynoStore {
             .map(|mut locks| locks.entry(prefix.to_owned()).or_default().clone())
     }
 
+    /// Follow a prefix's segment tail with ranged GETs instead of a
+    /// `ListObjectsV2` (#112), proving there is nothing left to discover rather
+    /// than guessing.
+    ///
+    /// **The proof.** A segment is only ever created at
+    /// `max(known tail + 1, seq floor)` — by the leaseless arbiter
+    /// ([`Self::tail_next_seq_folded`]), by the lease-mode writer and by compaction
+    /// ([`Self::tail_next_seq`]). So created names are contiguous except where the
+    /// durable floor jumps (#77, raised write-ahead of every delete) or where a
+    /// name is occupied but unresolvable. Therefore, if `segments/{cursor + 1}` is
+    /// **absent** and the floor read *after* observing that absence is
+    /// `<= cursor + 1`, no segment can exist above `cursor`:
+    ///
+    /// - a segment at `S > cursor + 1` would have been created either at
+    ///   `tail + 1` — which forces a segment at every seq down to `cursor + 1`,
+    ///   contradicting the absence — or at a floor `>= S > cursor + 1`, which
+    ///   (the floor being monotonic) our later read could not have seen as
+    ///   `<= cursor + 1`;
+    /// - an occupied-but-unresolvable name would answer the probe with an object,
+    ///   not a 404.
+    ///
+    /// Object stores are read-after-write consistent, so the 404 is authoritative
+    /// at that instant. Reading the floor *after* the absence is what makes the
+    /// argument work, hence the ordering below. A segment created *after* both
+    /// reads is not missed by this any more than by a LIST — that staleness window
+    /// is the same one the TTL and the create-CAS already cover.
+    ///
+    /// Anything the proof does not cover returns [`TailProbe::Inconclusive`] and
+    /// the caller LISTs: a cold index (no cursor), a floor ahead of the tail (which
+    /// is exactly the "segments above our cursor were deleted" case), an
+    /// unresolvable footer, an oversized footer, more new segments than the probe
+    /// window, or any non-404 error.
+    async fn probe_prefix_tail(&self, prefix: &str, cursor: u64, path: &'static str) -> TailProbe {
+        /// Consecutive new segments the probe will fold before deferring to a
+        /// LIST. A reader this far behind is better served by one tier-1 request
+        /// than by a growing chain of tier-2 ones.
+        const PROBE_WINDOW: u64 = 4;
+
+        let mut folded = 0;
+
+        for seq in (cursor + 1)..=(cursor + PROBE_WINDOW) {
+            let location = self.segment_location(prefix, seq);
+
+            let (bytes, last_modified_ms) = match self
+                .object_store
+                .get_opts(
+                    &location,
+                    GetOptions {
+                        range: Some(GetRange::Suffix(
+                            SEGMENT_FOOTER_OVER_READ.max(SEGMENT_TRAILER_LEN) as u64,
+                        )),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(result) => {
+                    let last_modified_ms = result.meta.last_modified.timestamp_millis();
+                    match result.bytes().await {
+                        Ok(bytes) => (bytes, last_modified_ms),
+                        Err(error) => {
+                            debug!(?error, prefix, seq, "tail probe body");
+                            return TailProbe::Inconclusive("probe_error");
+                        }
+                    }
+                }
+
+                // Absent: the tail is at `cursor` if the floor agrees. The floor is
+                // read *after* the absence, and fresh — see the proof above and
+                // [`Self::probe_seq_floor`].
+                Err(object_store::Error::NotFound { .. }) => {
+                    let floor = match self.probe_seq_floor(prefix).await {
+                        Ok(floor) => floor,
+                        Err(error) => {
+                            debug!(?error, prefix, seq, "tail probe floor");
+                            return TailProbe::Inconclusive("probe_error");
+                        }
+                    };
+
+                    if floor > seq {
+                        // Names above our cursor were freed by retention or
+                        // compaction, so absence proves nothing — LIST.
+                        return TailProbe::Inconclusive("floor_ahead");
+                    }
+
+                    let outcome = if folded == 0 {
+                        "up_to_date"
+                    } else {
+                        "extended"
+                    };
+                    PREFIX_TAIL_PROBES.add(
+                        1,
+                        &[
+                            KeyValue::new("path", path),
+                            KeyValue::new("outcome", outcome),
+                        ],
+                    );
+
+                    // Only `refreshed_at` is stamped: unlike a listing, a probe can
+                    // only *add* segments, never reflect a peer's deletion, so the
+                    // index generation — and with it the certified seq floor that
+                    // keeps the LATEST fast path off `watermark.json` — stays valid.
+                    if let Ok(mut index) = self.prefix_index.lock() {
+                        index.entry(prefix.to_owned()).or_default().refreshed_at =
+                            Some(SystemTime::now());
+                    }
+
+                    return TailProbe::Resolved;
+                }
+
+                Err(error) => {
+                    debug!(?error, prefix, seq, "tail probe");
+                    return TailProbe::Inconclusive("probe_error");
+                }
+            };
+
+            // The over-read carries the footer for all but a pathologically wide
+            // prefix; anything else is the LIST path's business.
+            match self.decode_segment_footer(&bytes) {
+                Ok(Some(footer)) => {
+                    if let Ok(mut index) = self.prefix_index.lock() {
+                        _ = index.entry(prefix.to_owned()).or_default().segments.insert(
+                            seq,
+                            CachedSegment {
+                                footer,
+                                last_modified_ms,
+                            },
+                        );
+                    }
+                    folded += 1;
+                }
+
+                Ok(None) => return TailProbe::Inconclusive("undecodable"),
+                Err(error) => {
+                    debug!(?error, prefix, seq, "tail probe footer");
+                    return TailProbe::Inconclusive("oversized_footer");
+                }
+            }
+        }
+
+        TailProbe::Inconclusive("window_exhausted")
+    }
+
+    /// The seq floor for the tail proof (#112), **always read fresh** — the one
+    /// place the certified cache ([`Self::certified_seq_floor`]) must not be used.
+    /// A peer can raise the durable floor without bumping our index generation, so
+    /// a certified value can be stale-low; everywhere else that only *understates*
+    /// a watermark (delaying visibility, never corrupting), but here it would make
+    /// `floor <= seq` hold when it does not, which is precisely the direction that
+    /// would let the probe miss a segment created at a raised floor. The proof
+    /// needs a floor read ordered *after* the observed absence, and only a live GET
+    /// gives that.
+    ///
+    /// The fresh value is certified under the current generation on the way out, so
+    /// the read also serves the LATEST fast path rather than being pure overhead.
+    /// Inlined rather than calling `certified_seq_floor` because the probe already
+    /// holds the per-prefix single-flight lock that method takes.
+    async fn probe_seq_floor(&self, prefix: &str) -> Result<u64> {
+        let generation = self
+            .prefix_index
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .get(prefix)
+            .map(|entry| entry.generation)
+            .unwrap_or_default();
+
+        let floor = self.read_seq_floor(prefix).await?;
+
+        {
+            let mut index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            let entry = index.entry(prefix.to_owned()).or_default();
+            if entry.generation == generation {
+                entry.seq_floor = Some((floor, generation));
+            }
+        }
+
+        Ok(floor)
+    }
+
     async fn refresh_prefix_index_inner(&self, prefix: &str, force: bool) -> Result<()> {
         // Lock-free fast path: a fresh index is served without touching the
         // single-flight lock, so TTL-served readers never contend.
@@ -3171,6 +3384,33 @@ impl DynoStore {
         let (fresh, start_after) = self.prefix_index_freshness(prefix)?;
         if !force && fresh {
             return Ok(());
+        }
+
+        let path = if force { "forced" } else { "ttl" };
+
+        // Try to follow the tail with ranged GETs instead of a LIST (#112): a
+        // `ListObjectsV2` is a tier-1 request, ~12x the price of the tier-2 GET
+        // that both proves the tail *and* returns the new segment's footer. Falls
+        // through to the LIST whenever the proof does not hold.
+        if let Some(cursor) = start_after {
+            match self.probe_prefix_tail(prefix, cursor, path).await {
+                // The tail is proven (and anything new is folded): the index is
+                // current, with no LIST issued.
+                TailProbe::Resolved => return Ok(()),
+
+                // The proof does not hold — fall through to the authoritative LIST.
+                TailProbe::Inconclusive(reason) => {
+                    PREFIX_INDEX_LISTS.add(
+                        1,
+                        &[KeyValue::new("path", path), KeyValue::new("reason", reason)],
+                    );
+                }
+            }
+        } else {
+            PREFIX_INDEX_LISTS.add(
+                1,
+                &[KeyValue::new("path", path), KeyValue::new("reason", "cold")],
+            );
         }
 
         let listing = self.segment_prefix(prefix);
