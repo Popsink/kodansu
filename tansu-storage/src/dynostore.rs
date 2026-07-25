@@ -673,16 +673,19 @@ const SEGMENT_MAGIC: u32 = 0x5453_4547;
 /// coordinates for log-based idempotent dedup (#88). Versioned so footer fields
 /// stay forward-compatible.
 ///
-/// This is the version the writer currently *emits*. Readers accept `1` and `2`
-/// (see [`Self::decode_segment_footer`]); v2 fields are only serialized when this
-/// is bumped, which is gated on the leaseless-writer cutover (#86) and the
-/// external S3-direct reader accepting v2 (kotatsu#82) — writing v2 before then
-/// would break a v1-only reader.
+/// This is the version the **lease-mode** writer (#59) emits. Readers accept `1`
+/// and `2` (see [`Self::decode_segment_footer`]); the version is chosen by the
+/// write path, not by a global switch — see [`SEGMENT_FORMAT_VERSION_V2`].
 const SEGMENT_FORMAT_VERSION: u16 = 1;
 
 /// Segment format version carrying the v2 footer additions (#87): a per-flush
-/// nonce and per-(idempotent-)batch producer coordinates. Accepted by the reader
-/// today; emitted once [`SEGMENT_FORMAT_VERSION`] is bumped to it.
+/// nonce and per-(idempotent-)batch producer coordinates.
+///
+/// Emitted by the **leaseless** writer (#86) — which is what production runs — and
+/// by compaction on a leaseless prefix, so v2 is the version an external S3-direct
+/// reader must expect (`docs/virtual-topics-format.md`, kotatsu#82). Not gated on
+/// bumping [`SEGMENT_FORMAT_VERSION`]: the two versions coexist per prefix
+/// according to the writer regime, and both stay readable.
 const SEGMENT_FORMAT_VERSION_V2: u16 = 2;
 
 /// Fixed-size trailer at the very end of every multi-topic segment (#64):
@@ -6748,10 +6751,13 @@ impl DynoStore {
     }
 
     /// Serialize a [`SegmentFooter`] index (#64/#59). Header: `writer_epoch
-    /// (i64)`. Then each entry: `topic_len (u16) + topic (utf8) +
-    /// partition (i32) + base_offset (i64) + record_count (i64) +
-    /// byte_start (u64) + byte_len (u64) + max_timestamp (i64)`, all big-endian.
-    /// Paired with [`Self::decode_footer`].
+    /// (i64)`, plus `nonce (u64)` at v2. Then each entry: `topic_len (u16) +
+    /// topic (utf8) + partition (i32) + base_offset (i64) + record_count (i64) +
+    /// byte_start (u64) + byte_len (u64) + max_timestamp (i64)`, plus at v2
+    /// `pcoord_count (u16)` and that many `producer_id (i64) + producer_epoch
+    /// (i16) + base_sequence (i32) + last_sequence (i32) + offset_delta (u32)` —
+    /// all big-endian. Paired with [`Self::decode_footer`]; the external contract
+    /// is `docs/virtual-topics-format.md`.
     fn encode_footer(footer: &SegmentFooter, version: u16) -> Vec<u8> {
         let v2 = version >= SEGMENT_FORMAT_VERSION_V2;
         let mut buf = Vec::new();
