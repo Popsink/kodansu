@@ -15,6 +15,7 @@
 //! Dynamic Object Storage engine (S3, memory, ...)
 
 use std::{
+    cmp::Reverse,
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fmt::{Debug, Display},
     str::FromStr,
@@ -5086,11 +5087,13 @@ impl DynoStore {
         Ok(expired)
     }
 
-    async fn policy_delete(
-        &self,
-        now: SystemTime,
-        owned: Option<&BTreeSet<String>>,
-    ) -> Result<u64> {
+    /// Retention over the legacy per-partition `records/` objects (#49/#71).
+    /// Prefix-coalesced data lives in shared segments, not `records/` (this only
+    /// drains a hybrid topic's legacy region); the segment half is driven per
+    /// prefix, interleaved with compaction under one lease, by
+    /// [`Self::maintain_prefix_segments`] (#140) — it used to be a whole pass
+    /// appended here, which had to complete before compaction could start.
+    async fn policy_delete_records(&self, now: SystemTime) -> Result<u64> {
         const DEFAULT_RETENTION: Duration = Duration::from_hours(7 * 24);
 
         let now_ms = i64::try_from(
@@ -5159,13 +5162,6 @@ impl DynoStore {
                     .await
                     .inspect_err(|err| error!(?err, ?topition))?;
             }
-        }
-
-        // Prefix-coalesced data lives in shared segments, not `records/` (the
-        // per-partition loop above only drains a hybrid topic's legacy region);
-        // expire whole segments per prefix (#61).
-        if self.prefix_coalesce {
-            deleted += self.policy_delete_segments(now_ms, owned).await?;
         }
 
         Ok(deleted)
@@ -5750,9 +5746,14 @@ impl DynoStore {
         Ok(owned)
     }
 
-    async fn policy_compact_segments(&self, owned: Option<&BTreeSet<String>>) -> Result<u64> {
+    /// The prefixes whose segments this replica should compact this tick (#66):
+    /// every non-compacted topic's prefix, restricted to this tick's maintenance
+    /// claim (#126). Empty when prefix coalescing or compaction is off. Paired
+    /// with [`Self::drain_compact_prefix`] by
+    /// [`Self::maintain_prefix_segments`].
+    async fn compactable_prefixes(&self, owned: Option<&BTreeSet<String>>) -> Result<Vec<String>> {
         if !self.prefix_coalesce || self.prefix_compact_min_segments == 0 {
-            return Ok(0);
+            return Ok(Vec::new());
         }
 
         // Derive the prefixes from the topic metadata (#66 review fix), NOT just
@@ -5791,41 +5792,145 @@ impl DynoStore {
         // Honour this tick's maintenance claim (#126): only compact prefixes this
         // replica owns. `None` = no sharding (every prefix), the single-maintainer
         // default and the standalone-test path.
-        let prefixes: Vec<String> = prefix_set
+        Ok(prefix_set
             .into_iter()
             .filter(|prefix| owned.is_none_or(|owned| owned.contains(prefix)))
-            .collect();
+            .collect())
+    }
 
+    /// Drain one prefix to `<= prefix_compact_min_segments` (#66 review fix): a
+    /// single run per tick cannot keep up with a high flush rate, so loop until
+    /// compaction finds nothing more to merge. Each call re-lists, so `S`
+    /// converges to the trigger threshold within the tick. Errors are logged and
+    /// end this prefix's drain only — one bad prefix must never abort the others'
+    /// maintenance (#140).
+    async fn drain_compact_prefix(&self, prefix: &str) -> u64 {
         /// Bounds the drain loop so a pathological prefix can't monopolize a
         /// maintenance tick; far above the runs a real backlog needs.
         const MAX_RUNS_PER_PREFIX: usize = 4_096;
 
         let mut compacted = 0;
-        for prefix in prefixes {
-            // Drain the prefix to <= min_segments in one tick (#66 review fix):
-            // a single run per tick can't keep up with a high flush rate, so loop
-            // until compaction finds nothing more to merge. Each call re-lists,
-            // so `S` converges to the trigger threshold within the tick.
-            for _ in 0..MAX_RUNS_PER_PREFIX {
-                match self
-                    .compact_prefix_segments(&prefix)
-                    .await
-                    .inspect_err(|err| error!(?err, prefix))
-                {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => compacted += n,
-                }
-            }
 
-            // Report the live segment count so runaway `S` is observable even if
-            // the drain can't keep up.
-            if let Ok(index) = self.prefix_index.lock()
-                && let Some(entry) = index.get(&prefix)
+        for _ in 0..MAX_RUNS_PER_PREFIX {
+            match self
+                .compact_prefix_segments(prefix)
+                .await
+                .inspect_err(|err| error!(?err, prefix))
             {
-                SEGMENTS_LIVE.record(entry.segments.len() as u64, &[]);
+                Ok(0) | Err(_) => break,
+                Ok(n) => compacted += n,
             }
         }
-        Ok(compacted)
+
+        // Report the live segment count so runaway `S` is observable even if the
+        // drain can't keep up.
+        if let Ok(index) = self.prefix_index.lock()
+            && let Some(entry) = index.get(prefix)
+        {
+            SEGMENTS_LIVE.record(entry.segments.len() as u64, &[]);
+        }
+
+        compacted
+    }
+
+    /// Per-prefix segment maintenance — retention **then** compaction for each
+    /// prefix, several prefixes at a time (#140). Replaces running the two as
+    /// whole sequential passes, which had three compounding failure modes on a
+    /// high-fan-out workload:
+    ///
+    /// - **Retention starved compaction.** `policy_delete` ran to completion
+    ///   before `policy_compact_segments` started, so a large delete backlog
+    ///   (~100k delete-ops after a restart) consumed the whole run budget and
+    ///   compaction never executed — the bounded run (#131) cancelled the tick
+    ///   first (observed: run-timeout fired 18×, zero completions). Interleaving
+    ///   per prefix means a cancelled run has done *both* for a subset of
+    ///   prefixes instead of *one* for none of them.
+    /// - **Per-maintainer throughput was one prefix at a time.** A prefix is
+    ///   compacted only by the replica holding its lease, so adding maintainer
+    ///   pods cannot help a prefix that is already owned (3 → 8 replicas did not
+    ///   drain the busiest prefixes). Concurrency *within* a maintainer is the
+    ///   lever that does.
+    /// - **Traversal order starved the prefixes that needed it most.** Ordered
+    ///   largest-known-`S` first, so the prefixes furthest over the trigger are
+    ///   drained before a timeout can cut the run, instead of by prefix name.
+    ///
+    /// Retention and compaction of one prefix stay strictly sequential: both
+    /// mutate that prefix's segment set and are serialized by the same compaction
+    /// lease (#115), so running them concurrently would make each yield to the
+    /// other. Different prefixes hold different leases, so the fan-out is safe.
+    /// A per-prefix error is logged and skips that prefix only.
+    async fn maintain_prefix_segments(
+        &self,
+        now_ms: i64,
+        owned: Option<&BTreeSet<String>>,
+    ) -> Result<(u64, u64)> {
+        /// Prefixes maintained concurrently per maintainer. Deliberately small:
+        /// each in-flight prefix can hold a merged payload of up to
+        /// `prefix_compact_target_bytes` (16 MiB) plus the segments being merged,
+        /// and a maintainer runs in a modest memory budget. Raises per-maintainer
+        /// drain throughput ~K× without more pods.
+        const PREFIX_MAINTENANCE_CONCURRENCY: usize = 4;
+
+        if !self.prefix_coalesce {
+            return Ok((0, 0));
+        }
+
+        let thresholds = self.segment_retention_thresholds(now_ms, owned).await?;
+        let compactable: BTreeSet<String> = self
+            .compactable_prefixes(owned)
+            .await?
+            .into_iter()
+            .collect();
+
+        // Largest known live-segment count first (free: it is what this process
+        // already has cached, no extra request). A prefix this maintainer has
+        // never indexed sorts last — it has no known backlog.
+        let live_counts: BTreeMap<String, usize> = self
+            .prefix_index
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .iter()
+            .map(|(prefix, entry)| (prefix.clone(), entry.segments.len()))
+            .collect();
+
+        let mut prefixes: Vec<String> = thresholds
+            .keys()
+            .chain(compactable.iter())
+            .cloned()
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect();
+        prefixes.sort_by_key(|prefix| Reverse(live_counts.get(prefix).copied().unwrap_or(0)));
+
+        let outcomes = futures::stream::iter(prefixes.into_iter().map(|prefix| {
+            let thresholds = &thresholds;
+            let compactable = &compactable;
+
+            async move {
+                let deleted = match thresholds.get(&prefix) {
+                    Some(&threshold_ms) => self
+                        .expire_prefix_segments_if_due(&prefix, threshold_ms)
+                        .await
+                        .unwrap_or(0),
+                    None => 0,
+                };
+
+                let compacted = if compactable.contains(&prefix) {
+                    self.drain_compact_prefix(&prefix).await
+                } else {
+                    0
+                };
+
+                (deleted, compacted)
+            }
+        }))
+        .buffer_unordered(PREFIX_MAINTENANCE_CONCURRENCY)
+        .fold((0, 0), |(deleted, compacted), (d, c)| async move {
+            (deleted + d, compacted + c)
+        })
+        .await;
+
+        Ok(outcomes)
     }
 
     /// Whole-segment retention across all coalesced prefixes (#61). Groups the
@@ -5839,11 +5944,15 @@ impl DynoStore {
     /// max — otherwise a sibling's shorter retention could delete its data (#61
     /// review fix). `retention.ms=-1` (retain forever) makes the whole prefix
     /// infinite. Compacted topics never reach segments (legacy path at produce).
-    async fn policy_delete_segments(
+    ///
+    /// Restricted to this tick's maintenance claim (#126), and paired with
+    /// [`Self::expire_prefix_segments_if_due`] by
+    /// [`Self::maintain_prefix_segments`].
+    async fn segment_retention_thresholds(
         &self,
         now_ms: i64,
         owned: Option<&BTreeSet<String>>,
-    ) -> Result<u64> {
+    ) -> Result<BTreeMap<String, i64>> {
         const DEFAULT_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 
         let mut retention_by_prefix: BTreeMap<String, i64> = BTreeMap::new();
@@ -5892,28 +6001,26 @@ impl DynoStore {
             }
         }
 
-        let mut deleted = 0;
-
-        for (prefix, retention_ms) in retention_by_prefix {
+        Ok(retention_by_prefix
+            .into_iter()
             // Honour this tick's maintenance claim (#126): only expire prefixes
             // this replica owns. `None` = no sharding (every prefix).
-            if owned.is_some_and(|owned| !owned.contains(&prefix)) {
-                continue;
-            }
+            .filter(|(prefix, _)| owned.is_none_or(|owned| owned.contains(prefix)))
+            .map(|(prefix, retention_ms)| (prefix, now_ms.saturating_sub(retention_ms)))
+            .collect())
+    }
 
-            let threshold_ms = now_ms.saturating_sub(retention_ms);
-
-            if !self.prefix_maybe_expirable(&prefix, threshold_ms)? {
-                continue;
-            }
-
-            deleted += self
-                .expire_prefix_segments(&prefix, threshold_ms)
-                .await
-                .inspect_err(|err| error!(?err, prefix))?;
+    /// Expire `prefix`'s segments older than `threshold_ms`, skipping the work
+    /// entirely when the oldest-retained hint proves nothing can be past the
+    /// threshold yet (#49) — no LIST, no lease round-trip.
+    async fn expire_prefix_segments_if_due(&self, prefix: &str, threshold_ms: i64) -> Result<u64> {
+        if !self.prefix_maybe_expirable(prefix, threshold_ms)? {
+            return Ok(0);
         }
 
-        Ok(deleted)
+        self.expire_prefix_segments(prefix, threshold_ms)
+            .await
+            .inspect_err(|err| error!(?err, prefix))
     }
 
     /// List the batch files of `topition` as a map of base offset to its object
@@ -8930,6 +9037,13 @@ impl Storage for DynoStore {
     }
 
     async fn maintain(&self, now: SystemTime) -> Result<()> {
+        let now_ms = i64::try_from(
+            now.duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
+
         // Claim this tick's prefix-segment maintenance work-set once (#126),
         // stateless and coordinator-free: N maintainer replicas partition the
         // prefixes by first-arrival on the per-prefix lease + a recency stamp,
@@ -8937,25 +9051,24 @@ impl Storage for DynoStore {
         // discovery LIST, not one per pass per replica). `None` when prefix
         // coalescing is off = today's every-prefix behaviour.
         let owned = if self.prefix_coalesce {
-            let now_ms = i64::try_from(
-                now.duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis(),
-            )
-            .unwrap_or(i64::MAX);
             Some(self.claim_maintenance_prefixes(now_ms).await?)
         } else {
             None
         };
         let owned = owned.as_ref();
 
-        let deleted = self.policy_delete(now, owned).await?;
+        let deleted = self.policy_delete_records(now).await?;
         let compacted = self.policy_compact().await?;
-        // Bound the live segment count per prefix (#66): merge old segments after
-        // retention has pruned the expired ones.
-        let compacted_segments = self.policy_compact_segments(owned).await?;
+        // Retention and segment compaction per prefix, interleaved and
+        // concurrent (#140) — not two whole sequential passes, where a delete
+        // backlog consumed the bounded run (#131) before compaction ever ran.
+        let (deleted_segments, compacted_segments) =
+            self.maintain_prefix_segments(now_ms, owned).await?;
         let expired_groups = self.expire_groups(now).await?;
-        debug!(deleted, compacted, compacted_segments, expired_groups);
+        debug!(
+            deleted,
+            compacted, deleted_segments, compacted_segments, expired_groups
+        );
 
         Ok(())
     }

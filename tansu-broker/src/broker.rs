@@ -300,9 +300,17 @@ where
         // bound and a short interval still leaves a busy pass room to finish. A
         // wedge is unbounded, so any finite bound catches it; cancellation is safe
         // because maintenance is idempotent and resumes on the next tick.
+        //
+        // The floor is 30 min because the previous 10 min was cutting *legitimate*
+        // runs: at a 2 min interval it bounded a run to 12 min, and a maintainer
+        // draining a real backlog (~100k retention deletes plus thousands of
+        // segments to merge on the busiest prefixes) was cancelled mid-drain,
+        // every tick, so the hottest prefixes never converged (#140). A genuine
+        // wedge is unbounded and is still caught 30 min in — far below the
+        // multi-hour stall #131 was created to prevent.
         let maintenance_run_timeout = maintenance_period
             .saturating_mul(6)
-            .clamp(Duration::from_mins(10), Duration::from_mins(60));
+            .clamp(Duration::from_mins(30), Duration::from_mins(60));
 
         // Desynchronise replicas: every broker pod runs `maintain` on the *same*
         // bucket, and without this they fire on near-identical schedules from a
