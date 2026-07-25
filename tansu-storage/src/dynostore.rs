@@ -7533,42 +7533,60 @@ impl Storage for DynoStore {
         _retention_time_ms: Option<Duration>,
         offsets: &[(Topition, OffsetCommitRequest)],
     ) -> Result<Vec<(Topition, ErrorCode)>> {
-        let mut responses = vec![];
+        // Commit each partition's offset concurrently (bounded): the same
+        // O(N) -> O(N / concurrency) scaling fix as ListOffsets (#147) and
+        // Metadata (#154). A large formed group commits offsets for
+        // hundreds-to-thousands of partitions at once, and two serial
+        // object-store round trips per partition (a metadata GET plus the
+        // offset PUT) blew past the client's commit/rebalance timeout at scale,
+        // stalling every rebalance. `try_collect` keeps the fail-fast semantics
+        // of the `?` below (a metadata read error aborts the commit); the
+        // per-partition PUT error is still reported as `UnknownServerError` in
+        // the response, and `buffered` preserves response order.
+        const OFFSET_COMMIT_CONCURRENCY: usize = 32;
 
-        for (topition, offset_commit) in offsets {
-            if self
-                .topic_metadata(&TopicId::from(topition))
-                .await?
-                .is_some()
-            {
-                let location = Path::from(format!(
-                    "clusters/{}/groups/consumers/{}/offsets/{}/partitions/{:0>10}.json",
-                    self.cluster, group_id, topition.topic, topition.partition,
-                ));
+        // Eagerly collected to pin lifetimes under `async_trait` (see #147).
+        let commits = offsets
+            .iter()
+            .map(|(topition, offset_commit)| async move {
+                let error_code = if self
+                    .topic_metadata(&TopicId::from(topition))
+                    .await?
+                    .is_some()
+                {
+                    let location = Path::from(format!(
+                        "clusters/{}/groups/consumers/{}/offsets/{}/partitions/{:0>10}.json",
+                        self.cluster, group_id, topition.topic, topition.partition,
+                    ));
 
-                let payload = serde_json::to_vec(&offset_commit)
-                    .map(Bytes::from)
-                    .map(PutPayload::from)?;
+                    let payload = serde_json::to_vec(&offset_commit)
+                        .map(Bytes::from)
+                        .map(PutPayload::from)?;
 
-                let options = PutOptions {
-                    mode: PutMode::Overwrite,
-                    attributes: json_content_type(),
-                    ..Default::default()
+                    let options = PutOptions {
+                        mode: PutMode::Overwrite,
+                        attributes: json_content_type(),
+                        ..Default::default()
+                    };
+
+                    self.object_store
+                        .put_opts(&location, payload, options)
+                        .await
+                        .inspect_err(|err| error!(?err))
+                        .inspect(|outcome| debug!(?outcome))
+                        .map_or(ErrorCode::UnknownServerError, |_| ErrorCode::None)
+                } else {
+                    ErrorCode::UnknownTopicOrPartition
                 };
 
-                let error_code = self
-                    .object_store
-                    .put_opts(&location, payload, options)
-                    .await
-                    .inspect_err(|err| error!(?err))
-                    .inspect(|outcome| debug!(?outcome))
-                    .map_or(ErrorCode::UnknownServerError, |_| ErrorCode::None);
+                Ok::<_, Error>((topition.to_owned(), error_code))
+            })
+            .collect::<Vec<_>>();
 
-                responses.push((topition.to_owned(), error_code));
-            } else {
-                responses.push((topition.to_owned(), ErrorCode::UnknownTopicOrPartition));
-            }
-        }
+        let responses = futures::stream::iter(commits)
+            .buffered(OFFSET_COMMIT_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
 
         Ok(responses)
     }
@@ -7633,36 +7651,55 @@ impl Storage for DynoStore {
         let mut responses = BTreeMap::new();
 
         if let Some(group_id) = group_id {
-            for topition in topics {
-                let location = Path::from(format!(
-                    "clusters/{}/groups/consumers/{}/offsets/{}/partitions/{:0>10}.json",
-                    self.cluster, group_id, topition.topic, topition.partition,
-                ));
+            // Fetch each partition's committed offset concurrently (bounded):
+            // the same O(N) -> O(N / concurrency) scaling fix as ListOffsets
+            // (#147) and Metadata (#154). A large formed group (and the
+            // rebalance-callback `committed()` lookups) reads offsets for
+            // hundreds-to-thousands of partitions at once; a serial GET per
+            // partition blew past the client timeout at scale. `try_collect`
+            // preserves the fail-fast semantics of the `?` below (a transient
+            // store error stays retriable, not a fatal `-1`, #6/#129).
+            const OFFSET_FETCH_CONCURRENCY: usize = 32;
 
-                let offset = match self.object_store.get(&location).await {
-                    Ok(get_result) => get_result
-                        .bytes()
-                        .await
-                        .map_err(Error::from)
-                        .and_then(|encoded| {
-                            serde_json::from_slice::<OffsetCommitRequest>(&encoded[..])
-                                .map_err(Error::from)
-                        })
-                        .map(|commit| commit.offset)
-                        .inspect_err(|error| error!(?error, ?group_id, ?topition)),
+            // Eagerly collected to pin lifetimes under `async_trait` (see #147).
+            let fetches = topics
+                .iter()
+                .map(|topition| async move {
+                    let location = Path::from(format!(
+                        "clusters/{}/groups/consumers/{}/offsets/{}/partitions/{:0>10}.json",
+                        self.cluster, group_id, topition.topic, topition.partition,
+                    ));
 
-                    Err(object_store::Error::NotFound { .. }) => Ok(-1),
+                    let offset = match self.object_store.get(&location).await {
+                        Ok(get_result) => get_result
+                            .bytes()
+                            .await
+                            .map_err(Error::from)
+                            .and_then(|encoded| {
+                                serde_json::from_slice::<OffsetCommitRequest>(&encoded[..])
+                                    .map_err(Error::from)
+                            })
+                            .map(|commit| commit.offset)
+                            .inspect_err(|error| error!(?error, ?group_id, ?topition)),
 
-                    Err(error) => {
-                        error!(?error, ?group_id, ?topition);
-                        // Preserve the storage error so a transient S3 failure is
-                        // retriable, not fatal `-1` (#6/#129).
-                        Err(Error::from(error))
-                    }
-                }?;
+                        Err(object_store::Error::NotFound { .. }) => Ok(-1),
 
-                _ = responses.insert(topition.to_owned(), offset);
-            }
+                        Err(error) => {
+                            error!(?error, ?group_id, ?topition);
+                            // Preserve the storage error so a transient S3
+                            // failure is retriable, not fatal `-1` (#6/#129).
+                            Err(Error::from(error))
+                        }
+                    }?;
+
+                    Ok::<_, Error>((topition.to_owned(), offset))
+                })
+                .collect::<Vec<_>>();
+
+            responses = futures::stream::iter(fetches)
+                .buffered(OFFSET_FETCH_CONCURRENCY)
+                .try_collect()
+                .await?;
         }
 
         Ok(responses)
