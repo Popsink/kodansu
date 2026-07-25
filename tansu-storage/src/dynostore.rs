@@ -15,6 +15,7 @@
 //! Dynamic Object Storage engine (S3, memory, ...)
 
 use std::{
+    cmp::Reverse,
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
     fmt::{Debug, Display},
     str::FromStr,
@@ -506,6 +507,40 @@ struct PrefixIndex {
     /// listing could have observed; that is what lets the ListOffsets LATEST
     /// fast path skip the per-partition `watermark.json` GET.
     seq_floor: Option<(u64, u64)>,
+    /// Sequences whose segment object was listed but carries **no decodable
+    /// footer** (`read_segment_footer` → `None`: shorter than the trailer, or a
+    /// tail whose magic is not `TSEG`). They can never enter `segments`, yet
+    /// they *own* their name in the create-only namespace, so the leaseless
+    /// arbiter must still step over them (#157): deriving the candidate from
+    /// `segments` alone re-picks an occupied sequence on every attempt, so the
+    /// create-CAS budget is burned deterministically — on every replica, at any
+    /// produce rate — and the prefix wedges until retention raises the floor
+    /// past it. Kept out of `segments` so no fetch/high-watermark/retention path
+    /// can ever see a segment it cannot decode; kept here (rather than
+    /// discarded) so both the arbiter and the incremental listing cursor treat
+    /// the name as resolved, which also stops every forced refresh re-GETting
+    /// its footer.
+    ///
+    /// Expected to stay empty: a nonzero
+    /// `tansu_prefix_segment_footer_undecodable` means a foreign or truncated
+    /// object is squatting the segment namespace.
+    opaque: BTreeSet<u64>,
+}
+
+impl PrefixIndex {
+    /// The highest sequence this process has *resolved* by a listing — decoded
+    /// into `segments` or recorded as [`Self::opaque`]. Both the leaseless
+    /// candidate derivation and the incremental-listing cursor use this, so an
+    /// undecodable object neither wedges the arbiter (#157) nor is re-GET on
+    /// every refresh. Committed in ascending order with the footers, so it stays
+    /// a contiguous watermark even after a partial (cancelled) build (#105).
+    fn resolved_max(&self) -> Option<u64> {
+        self.segments
+            .keys()
+            .next_back()
+            .copied()
+            .max(self.opaque.iter().next_back().copied())
+    }
 }
 
 /// Who is claiming a segment's tail sequence (#130). Both roles create into the
@@ -656,6 +691,38 @@ static SEGMENT_CREATE_BYTES_REWRITTEN: LazyLock<Counter<u64>> = LazyLock::new(||
     METER
         .u64_counter("tansu_prefix_segment_create_bytes_rewritten")
         .with_description("payload bytes re-uploaded after losing a segment create-CAS")
+        .build()
+});
+
+/// Create-CAS rounds a leaseless flush lost to another writer of the same
+/// prefix (#157) — `AlreadyExists`, or an ambiguous PUT resolved to a peer's
+/// footer. A rate here is normal multi-writer arbitration; a rate approaching
+/// `MAX_ATTEMPTS ×` the flush rate is the contention that exhausts a budget.
+static FLUSH_CAS_CONFLICTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_flush_cas_conflicts")
+        .with_description("leaseless flush segment create-CAS rounds lost to another writer")
+        .build()
+});
+
+/// Leaseless flushes that gave up their create-CAS budget (attempts or elapsed)
+/// and returned a retriable error to the producer (#157). Every increment is a
+/// failed produce round-trip, so this is the alerting signal for the
+/// contention/wedge class.
+static FLUSH_CAS_EXHAUSTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_flush_cas_exhausted")
+        .with_description("leaseless flushes that exhausted their segment create-CAS budget")
+        .build()
+});
+
+/// Segment objects listed under a prefix whose footer could not be decoded
+/// (#157). Expected to be zero: nonzero means something is squatting the
+/// create-only segment namespace, and the arbiter is stepping over those names.
+static SEGMENT_FOOTER_UNDECODABLE: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_segment_footer_undecodable")
+        .with_description("listed segment objects carrying no decodable footer")
         .build()
 });
 
@@ -3028,13 +3095,20 @@ impl DynoStore {
     /// `tail_next_seq` LIST per conflict attempt was therefore redundant: it
     /// re-read what the forced refresh had just listed. Still folds the persisted
     /// seq floor (#77) so a name freed by retention/compaction is never reused.
+    ///
+    /// Derived from every sequence the listing *resolved* — decoded segments and
+    /// undecodable objects alike ([`PrefixIndex::resolved_max`]) — because a
+    /// candidate must be free in the **namespace**, not merely absent from the
+    /// readable set: an occupied-but-undecodable name would otherwise be re-picked
+    /// on every attempt and burn the whole create-CAS budget (#157). This matches
+    /// the name-derived [`Self::tail_next_seq`] the leased/compaction path uses.
     async fn tail_next_seq_folded(&self, prefix: &str) -> Result<u64> {
         let listed_max = self
             .prefix_index
             .lock()
             .map_err(Into::<Error>::into)?
             .get(prefix)
-            .and_then(|index| index.segments.keys().next_back().copied());
+            .and_then(PrefixIndex::resolved_max);
         let floor = self.read_seq_floor(prefix).await?;
         Ok(listed_max.map_or(0, |m| m + 1).max(floor))
     }
@@ -3226,7 +3300,7 @@ impl DynoStore {
                         .duration_since(at)
                         .is_ok_and(|elapsed| elapsed < Self::HIGH_WATERMARK_HINT_TTL)
                 });
-                (fresh, entry.segments.keys().next_back().copied())
+                (fresh, entry.resolved_max())
             }
             None => (false, None),
         })
@@ -3307,12 +3381,22 @@ impl DynoStore {
         //   correct even after a partial build.
         const FOOTER_FETCH_CONCURRENCY: usize = 32;
 
+        // Already resolved: decoded segments *and* the undecodable names (#157) —
+        // re-GETting a footer that will not decode again costs a request per
+        // refresh (per flush, on the forced path) and never makes progress.
         let cached: BTreeSet<u64> = self
             .prefix_index
             .lock()
             .map_err(Into::<Error>::into)?
             .get(prefix)
-            .map(|entry| entry.segments.keys().copied().collect())
+            .map(|entry| {
+                entry
+                    .segments
+                    .keys()
+                    .copied()
+                    .chain(entry.opaque.iter().copied())
+                    .collect()
+            })
             .unwrap_or_default();
 
         let mut footers = futures::stream::iter(
@@ -3329,16 +3413,34 @@ impl DynoStore {
 
         while let Some(result) = footers.next().await {
             let (seq, last_modified_ms, footer) = result?;
-            if let Some(footer) = footer {
-                let mut index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
-                let entry = index.entry(prefix.to_owned()).or_default();
-                _ = entry.segments.insert(
-                    seq,
-                    CachedSegment {
-                        footer,
-                        last_modified_ms,
-                    },
-                );
+            let mut index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            let entry = index.entry(prefix.to_owned()).or_default();
+            match footer {
+                Some(footer) => {
+                    _ = entry.segments.insert(
+                        seq,
+                        CachedSegment {
+                            footer,
+                            last_modified_ms,
+                        },
+                    );
+                }
+
+                // The object holds a sequence but carries no decodable footer, so
+                // it can never join the readable set — record the *name* as
+                // resolved (#157) so the leaseless arbiter steps over it instead
+                // of re-deriving an occupied candidate until its budget is gone,
+                // and so the next refresh does not re-GET this footer.
+                None => {
+                    if entry.opaque.insert(seq) {
+                        SEGMENT_FOOTER_UNDECODABLE.add(1, &[]);
+                        warn!(
+                            prefix,
+                            seq,
+                            "segment object has no decodable footer; stepping over the sequence"
+                        );
+                    }
+                }
             }
         }
 
@@ -4675,6 +4777,14 @@ impl DynoStore {
         /// Bounds the conflict-correction loop; far above any real concurrency.
         const MAX_ATTEMPTS: usize = 64;
 
+        /// Wall-clock ceiling on the whole conflict-correction loop (#157). A
+        /// writer still losing the create-CAS after this long is amplifying
+        /// LIST+PUT against a contended prefix with no sign of winning: yield to
+        /// the producer's own retry (the terminal is retriable, and log-based
+        /// dedup #88 makes the replay safe) rather than spend the rest of the
+        /// budget on the bucket.
+        const MAX_ELAPSED: Duration = Duration::from_secs(10);
+
         // Per-partition FIFO across two concurrent local flushes of this prefix:
         // the seq-CAS is the cross-writer offset authority, but this lock still
         // keeps a single pod's buffer order == offset order.
@@ -4696,7 +4806,22 @@ impl DynoStore {
         // Per-flush nonce, stamped into the footer (#89 self-recognition).
         let nonce = rng().random::<u64>();
 
+        // Arm attribution for the exhaustion terminal (#157). Production runs at
+        // warn level, where the per-attempt `debug!`s below are invisible, so the
+        // give-up log must itself say which race was lost — and whether the
+        // candidate ever moved: an advancing candidate is genuine multi-writer
+        // contention, a stalled one is a sequence this writer cannot see as taken.
+        let started = tokio::time::Instant::now();
+        let mut conflicts = 0usize;
+        let mut ambiguous_lost = 0usize;
+        let mut stalled = 0usize;
+        let mut last_candidate: Option<u64> = None;
+
         for attempt in 0..MAX_ATTEMPTS {
+            if started.elapsed() >= MAX_ELAPSED {
+                break;
+            }
+
             // Fold-before-claim: observe every live segment so the candidate
             // sequence and the derived bases reflect all writers, not a stale view.
             if let Err(error) = self.refresh_prefix_index_forced(prefix).await {
@@ -4708,6 +4833,11 @@ impl DynoStore {
                 Ok(seq) => seq,
                 Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
             };
+
+            if last_candidate == Some(candidate) {
+                stalled += 1;
+            }
+            last_candidate = Some(candidate);
 
             // Seed / read the leaseless era epoch stamped into this segment
             // (#92). Computed after the fold above, so it out-epochs every
@@ -4853,6 +4983,13 @@ impl DynoStore {
                 // sequence with re-derived bases.
                 Err(object_store::Error::AlreadyExists { .. }) => {
                     debug!(prefix, candidate, attempt, "segment seq taken, re-deriving");
+                    conflicts += 1;
+                    FLUSH_CAS_CONFLICTS.add(1, &[]);
+                    // Yield briefly, jittered (#157): N replicas flushing this
+                    // prefix would otherwise re-LIST and re-PUT in lockstep, both
+                    // amplifying requests on the busiest prefix and letting one
+                    // writer lose every attempt of its budget to the same peers.
+                    tokio::time::sleep(cas_conflict_backoff(attempt)).await;
                     continue;
                 }
 
@@ -4895,6 +5032,9 @@ impl DynoStore {
                                 ?error,
                                 "ambiguous PUT lost to peer, re-deriving"
                             );
+                            ambiguous_lost += 1;
+                            FLUSH_CAS_CONFLICTS.add(1, &[]);
+                            tokio::time::sleep(cas_conflict_backoff(attempt)).await;
                             continue;
                         }
                         // Nothing landed at `candidate` (S3 is read-after-write
@@ -4930,7 +5070,22 @@ impl DynoStore {
             }
         }
 
-        error!(prefix, "leaseless flush exhausted retries");
+        FLUSH_CAS_EXHAUSTED.add(1, &[]);
+        // Arm-attributed at error level so production (warn) can tell the modes
+        // apart without a debug bump (#157): `conflicts` = peers won the create,
+        // `ambiguous_lost` = the PUT was ambiguous and a peer's footer was there,
+        // `stalled` = the re-derived candidate did not move (a sequence taken by
+        // an object this writer cannot resolve), `elapsed_ms` ≥ `MAX_ELAPSED` =
+        // gave up on the clock rather than the attempt budget.
+        error!(
+            prefix,
+            conflicts,
+            ambiguous_lost,
+            stalled,
+            ?last_candidate,
+            elapsed_ms = started.elapsed().as_millis(),
+            "leaseless flush exhausted retries"
+        );
         // Retriable: exhaustion here is pure create-CAS contention (a transport
         // error fails fast retriably above), so tell the client to back off and
         // retry rather than dropping the batch on a fatal code (#6/#129).
@@ -5172,11 +5327,13 @@ impl DynoStore {
         Ok(expired)
     }
 
-    async fn policy_delete(
-        &self,
-        now: SystemTime,
-        owned: Option<&BTreeSet<String>>,
-    ) -> Result<u64> {
+    /// Retention over the legacy per-partition `records/` objects (#49/#71).
+    /// Prefix-coalesced data lives in shared segments, not `records/` (this only
+    /// drains a hybrid topic's legacy region); the segment half is driven per
+    /// prefix, interleaved with compaction under one lease, by
+    /// [`Self::maintain_prefix_segments`] (#140) — it used to be a whole pass
+    /// appended here, which had to complete before compaction could start.
+    async fn policy_delete_records(&self, now: SystemTime) -> Result<u64> {
         const DEFAULT_RETENTION: Duration = Duration::from_hours(7 * 24);
 
         let now_ms = i64::try_from(
@@ -5245,13 +5402,6 @@ impl DynoStore {
                     .await
                     .inspect_err(|err| error!(?err, ?topition))?;
             }
-        }
-
-        // Prefix-coalesced data lives in shared segments, not `records/` (the
-        // per-partition loop above only drains a hybrid topic's legacy region);
-        // expire whole segments per prefix (#61).
-        if self.prefix_coalesce {
-            deleted += self.policy_delete_segments(now_ms, owned).await?;
         }
 
         Ok(deleted)
@@ -5836,9 +5986,14 @@ impl DynoStore {
         Ok(owned)
     }
 
-    async fn policy_compact_segments(&self, owned: Option<&BTreeSet<String>>) -> Result<u64> {
+    /// The prefixes whose segments this replica should compact this tick (#66):
+    /// every non-compacted topic's prefix, restricted to this tick's maintenance
+    /// claim (#126). Empty when prefix coalescing or compaction is off. Paired
+    /// with [`Self::drain_compact_prefix`] by
+    /// [`Self::maintain_prefix_segments`].
+    async fn compactable_prefixes(&self, owned: Option<&BTreeSet<String>>) -> Result<Vec<String>> {
         if !self.prefix_coalesce || self.prefix_compact_min_segments == 0 {
-            return Ok(0);
+            return Ok(Vec::new());
         }
 
         // Derive the prefixes from the topic metadata (#66 review fix), NOT just
@@ -5877,41 +6032,145 @@ impl DynoStore {
         // Honour this tick's maintenance claim (#126): only compact prefixes this
         // replica owns. `None` = no sharding (every prefix), the single-maintainer
         // default and the standalone-test path.
-        let prefixes: Vec<String> = prefix_set
+        Ok(prefix_set
             .into_iter()
             .filter(|prefix| owned.is_none_or(|owned| owned.contains(prefix)))
-            .collect();
+            .collect())
+    }
 
+    /// Drain one prefix to `<= prefix_compact_min_segments` (#66 review fix): a
+    /// single run per tick cannot keep up with a high flush rate, so loop until
+    /// compaction finds nothing more to merge. Each call re-lists, so `S`
+    /// converges to the trigger threshold within the tick. Errors are logged and
+    /// end this prefix's drain only — one bad prefix must never abort the others'
+    /// maintenance (#140).
+    async fn drain_compact_prefix(&self, prefix: &str) -> u64 {
         /// Bounds the drain loop so a pathological prefix can't monopolize a
         /// maintenance tick; far above the runs a real backlog needs.
         const MAX_RUNS_PER_PREFIX: usize = 4_096;
 
         let mut compacted = 0;
-        for prefix in prefixes {
-            // Drain the prefix to <= min_segments in one tick (#66 review fix):
-            // a single run per tick can't keep up with a high flush rate, so loop
-            // until compaction finds nothing more to merge. Each call re-lists,
-            // so `S` converges to the trigger threshold within the tick.
-            for _ in 0..MAX_RUNS_PER_PREFIX {
-                match self
-                    .compact_prefix_segments(&prefix)
-                    .await
-                    .inspect_err(|err| error!(?err, prefix))
-                {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => compacted += n,
-                }
-            }
 
-            // Report the live segment count so runaway `S` is observable even if
-            // the drain can't keep up.
-            if let Ok(index) = self.prefix_index.lock()
-                && let Some(entry) = index.get(&prefix)
+        for _ in 0..MAX_RUNS_PER_PREFIX {
+            match self
+                .compact_prefix_segments(prefix)
+                .await
+                .inspect_err(|err| error!(?err, prefix))
             {
-                SEGMENTS_LIVE.record(entry.segments.len() as u64, &[]);
+                Ok(0) | Err(_) => break,
+                Ok(n) => compacted += n,
             }
         }
-        Ok(compacted)
+
+        // Report the live segment count so runaway `S` is observable even if the
+        // drain can't keep up.
+        if let Ok(index) = self.prefix_index.lock()
+            && let Some(entry) = index.get(prefix)
+        {
+            SEGMENTS_LIVE.record(entry.segments.len() as u64, &[]);
+        }
+
+        compacted
+    }
+
+    /// Per-prefix segment maintenance — retention **then** compaction for each
+    /// prefix, several prefixes at a time (#140). Replaces running the two as
+    /// whole sequential passes, which had three compounding failure modes on a
+    /// high-fan-out workload:
+    ///
+    /// - **Retention starved compaction.** `policy_delete` ran to completion
+    ///   before `policy_compact_segments` started, so a large delete backlog
+    ///   (~100k delete-ops after a restart) consumed the whole run budget and
+    ///   compaction never executed — the bounded run (#131) cancelled the tick
+    ///   first (observed: run-timeout fired 18×, zero completions). Interleaving
+    ///   per prefix means a cancelled run has done *both* for a subset of
+    ///   prefixes instead of *one* for none of them.
+    /// - **Per-maintainer throughput was one prefix at a time.** A prefix is
+    ///   compacted only by the replica holding its lease, so adding maintainer
+    ///   pods cannot help a prefix that is already owned (3 → 8 replicas did not
+    ///   drain the busiest prefixes). Concurrency *within* a maintainer is the
+    ///   lever that does.
+    /// - **Traversal order starved the prefixes that needed it most.** Ordered
+    ///   largest-known-`S` first, so the prefixes furthest over the trigger are
+    ///   drained before a timeout can cut the run, instead of by prefix name.
+    ///
+    /// Retention and compaction of one prefix stay strictly sequential: both
+    /// mutate that prefix's segment set and are serialized by the same compaction
+    /// lease (#115), so running them concurrently would make each yield to the
+    /// other. Different prefixes hold different leases, so the fan-out is safe.
+    /// A per-prefix error is logged and skips that prefix only.
+    async fn maintain_prefix_segments(
+        &self,
+        now_ms: i64,
+        owned: Option<&BTreeSet<String>>,
+    ) -> Result<(u64, u64)> {
+        /// Prefixes maintained concurrently per maintainer. Deliberately small:
+        /// each in-flight prefix can hold a merged payload of up to
+        /// `prefix_compact_target_bytes` (16 MiB) plus the segments being merged,
+        /// and a maintainer runs in a modest memory budget. Raises per-maintainer
+        /// drain throughput ~K× without more pods.
+        const PREFIX_MAINTENANCE_CONCURRENCY: usize = 4;
+
+        if !self.prefix_coalesce {
+            return Ok((0, 0));
+        }
+
+        let thresholds = self.segment_retention_thresholds(now_ms, owned).await?;
+        let compactable: BTreeSet<String> = self
+            .compactable_prefixes(owned)
+            .await?
+            .into_iter()
+            .collect();
+
+        // Largest known live-segment count first (free: it is what this process
+        // already has cached, no extra request). A prefix this maintainer has
+        // never indexed sorts last — it has no known backlog.
+        let live_counts: BTreeMap<String, usize> = self
+            .prefix_index
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .iter()
+            .map(|(prefix, entry)| (prefix.clone(), entry.segments.len()))
+            .collect();
+
+        let mut prefixes: Vec<String> = thresholds
+            .keys()
+            .chain(compactable.iter())
+            .cloned()
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect();
+        prefixes.sort_by_key(|prefix| Reverse(live_counts.get(prefix).copied().unwrap_or(0)));
+
+        let outcomes = futures::stream::iter(prefixes.into_iter().map(|prefix| {
+            let thresholds = &thresholds;
+            let compactable = &compactable;
+
+            async move {
+                let deleted = match thresholds.get(&prefix) {
+                    Some(&threshold_ms) => self
+                        .expire_prefix_segments_if_due(&prefix, threshold_ms)
+                        .await
+                        .unwrap_or(0),
+                    None => 0,
+                };
+
+                let compacted = if compactable.contains(&prefix) {
+                    self.drain_compact_prefix(&prefix).await
+                } else {
+                    0
+                };
+
+                (deleted, compacted)
+            }
+        }))
+        .buffer_unordered(PREFIX_MAINTENANCE_CONCURRENCY)
+        .fold((0, 0), |(deleted, compacted), (d, c)| async move {
+            (deleted + d, compacted + c)
+        })
+        .await;
+
+        Ok(outcomes)
     }
 
     /// Whole-segment retention across all coalesced prefixes (#61). Groups the
@@ -5925,11 +6184,15 @@ impl DynoStore {
     /// max — otherwise a sibling's shorter retention could delete its data (#61
     /// review fix). `retention.ms=-1` (retain forever) makes the whole prefix
     /// infinite. Compacted topics never reach segments (legacy path at produce).
-    async fn policy_delete_segments(
+    ///
+    /// Restricted to this tick's maintenance claim (#126), and paired with
+    /// [`Self::expire_prefix_segments_if_due`] by
+    /// [`Self::maintain_prefix_segments`].
+    async fn segment_retention_thresholds(
         &self,
         now_ms: i64,
         owned: Option<&BTreeSet<String>>,
-    ) -> Result<u64> {
+    ) -> Result<BTreeMap<String, i64>> {
         const DEFAULT_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 
         let mut retention_by_prefix: BTreeMap<String, i64> = BTreeMap::new();
@@ -5978,28 +6241,26 @@ impl DynoStore {
             }
         }
 
-        let mut deleted = 0;
-
-        for (prefix, retention_ms) in retention_by_prefix {
+        Ok(retention_by_prefix
+            .into_iter()
             // Honour this tick's maintenance claim (#126): only expire prefixes
             // this replica owns. `None` = no sharding (every prefix).
-            if owned.is_some_and(|owned| !owned.contains(&prefix)) {
-                continue;
-            }
+            .filter(|(prefix, _)| owned.is_none_or(|owned| owned.contains(prefix)))
+            .map(|(prefix, retention_ms)| (prefix, now_ms.saturating_sub(retention_ms)))
+            .collect())
+    }
 
-            let threshold_ms = now_ms.saturating_sub(retention_ms);
-
-            if !self.prefix_maybe_expirable(&prefix, threshold_ms)? {
-                continue;
-            }
-
-            deleted += self
-                .expire_prefix_segments(&prefix, threshold_ms)
-                .await
-                .inspect_err(|err| error!(?err, prefix))?;
+    /// Expire `prefix`'s segments older than `threshold_ms`, skipping the work
+    /// entirely when the oldest-retained hint proves nothing can be past the
+    /// threshold yet (#49) — no LIST, no lease round-trip.
+    async fn expire_prefix_segments_if_due(&self, prefix: &str, threshold_ms: i64) -> Result<u64> {
+        if !self.prefix_maybe_expirable(prefix, threshold_ms)? {
+            return Ok(0);
         }
 
-        Ok(deleted)
+        self.expire_prefix_segments(prefix, threshold_ms)
+            .await
+            .inspect_err(|err| error!(?err, prefix))
     }
 
     /// List the batch files of `topition` as a map of base offset to its object
@@ -9016,6 +9277,13 @@ impl Storage for DynoStore {
     }
 
     async fn maintain(&self, now: SystemTime) -> Result<()> {
+        let now_ms = i64::try_from(
+            now.duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
+
         // Claim this tick's prefix-segment maintenance work-set once (#126),
         // stateless and coordinator-free: N maintainer replicas partition the
         // prefixes by first-arrival on the per-prefix lease + a recency stamp,
@@ -9023,25 +9291,24 @@ impl Storage for DynoStore {
         // discovery LIST, not one per pass per replica). `None` when prefix
         // coalescing is off = today's every-prefix behaviour.
         let owned = if self.prefix_coalesce {
-            let now_ms = i64::try_from(
-                now.duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_millis(),
-            )
-            .unwrap_or(i64::MAX);
             Some(self.claim_maintenance_prefixes(now_ms).await?)
         } else {
             None
         };
         let owned = owned.as_ref();
 
-        let deleted = self.policy_delete(now, owned).await?;
+        let deleted = self.policy_delete_records(now).await?;
         let compacted = self.policy_compact().await?;
-        // Bound the live segment count per prefix (#66): merge old segments after
-        // retention has pruned the expired ones.
-        let compacted_segments = self.policy_compact_segments(owned).await?;
+        // Retention and segment compaction per prefix, interleaved and
+        // concurrent (#140) — not two whole sequential passes, where a delete
+        // backlog consumed the bounded run (#131) before compaction ever ran.
+        let (deleted_segments, compacted_segments) =
+            self.maintain_prefix_segments(now_ms, owned).await?;
         let expired_groups = self.expire_groups(now).await?;
-        debug!(deleted, compacted, compacted_segments, expired_groups);
+        debug!(
+            deleted,
+            compacted, deleted_segments, compacted_segments, expired_groups
+        );
 
         Ok(())
     }
@@ -9098,6 +9365,22 @@ impl Storage for DynoStore {
 fn throttle_backoff(attempt: u32) -> Duration {
     let base_ms = 500u64.saturating_mul(1 << attempt.min(6)).min(30_000);
     let jitter = rng().random_range(0..=base_ms / 2);
+    Duration::from_millis(base_ms + jitter)
+}
+
+/// Backoff before re-deriving a segment sequence whose create-CAS was lost to a
+/// peer writer (#157). N stateless replicas flush the same prefix concurrently;
+/// without this every loser immediately re-LISTs and re-PUTs in lockstep, which
+/// both amplifies requests on the busiest prefix and lets one writer lose its
+/// whole attempt budget to the same peers. Deliberately short and heavily
+/// jittered — 1ms, 2ms, 4ms, 8ms, 16ms (capped) plus up to 100% jitter, so the
+/// whole 64-attempt budget adds well under a second of produce latency while the
+/// jitter desynchronises the racers. Orders of magnitude below
+/// [`throttle_backoff`]: this is arbitration between peers, not a throttled
+/// bucket.
+fn cas_conflict_backoff(attempt: usize) -> Duration {
+    let base_ms = 1u64 << attempt.min(4);
+    let jitter = rng().random_range(0..=base_ms);
     Duration::from_millis(base_ms + jitter)
 }
 
@@ -9413,7 +9696,7 @@ where
 
 #[cfg(test)]
 mod throttle_tests {
-    use super::{is_s3_throttle, throttle_backoff};
+    use super::{Duration, cas_conflict_backoff, is_s3_throttle, throttle_backoff};
 
     fn generic_s3(source: &'static str) -> object_store::Error {
         object_store::Error::Generic {
@@ -9457,5 +9740,24 @@ mod throttle_tests {
         // large attempt: base capped at 30s + up to 50% jitter => [30s, 45s]
         let capped = throttle_backoff(20).as_millis();
         assert!((30_000..=45_000).contains(&capped), "{capped}");
+    }
+
+    /// #157: the create-CAS conflict yield must stay in the millisecond band —
+    /// its job is to desynchronise peer writers, not to wait out a throttle — so
+    /// the whole 64-attempt budget costs well under a second of produce latency.
+    #[test]
+    fn cas_conflict_backoff_is_short_capped_and_jittered() {
+        // attempt 0: base 1ms + up to 100% jitter => [1, 2]ms
+        let first = cas_conflict_backoff(0).as_millis();
+        assert!((1..=2).contains(&first), "{first}");
+
+        // capped from attempt 4 on: base 16ms + up to 100% jitter => [16, 32]ms
+        for attempt in [4, 5, 64, 1_000] {
+            let capped = cas_conflict_backoff(attempt).as_millis();
+            assert!((16..=32).contains(&capped), "attempt {attempt}: {capped}");
+        }
+
+        // The whole budget, at the cap, stays sub-second.
+        assert!(64 * cas_conflict_backoff(64) < Duration::from_secs(3));
     }
 }

@@ -22,7 +22,7 @@ use std::{
     fmt::{self, Debug, Display},
     str::FromStr,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
     },
     time::{Duration, SystemTime},
@@ -30,7 +30,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::{TryStreamExt as _, stream::BoxStream};
+use futures::{StreamExt as _, TryStreamExt as _, stream::BoxStream};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
@@ -163,6 +163,18 @@ fn entry(topic: &str, base: i64, count: i64) -> SubstreamEntry {
 /// The segment objects under a connector prefix.
 async fn segments(bucket: &InMemory) -> Vec<Path> {
     let listing = Path::from(format!("clusters/{CLUSTER}/prefixes/{PREFIX}/segments/"));
+    bucket
+        .list(Some(&listing))
+        .map_ok(|meta| meta.location)
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("list segments")
+}
+
+/// The live segments of an arbitrary connector prefix (for the multi-prefix
+/// maintenance tests, which span more than [`PREFIX`]).
+async fn segments_of(bucket: &InMemory, prefix: &str) -> Vec<Path> {
+    let listing = Path::from(format!("clusters/{CLUSTER}/prefixes/{prefix}/segments/"));
     bucket
         .list(Some(&listing))
         .map_ok(|meta| meta.location)
@@ -952,7 +964,7 @@ async fn maintainer_with_cold_index_compacts() -> Result<(), Error> {
         .prefix_coalesce(true)
         .coalesce_tuning(tuning);
     assert!(
-        maintainer.policy_compact_segments(None).await? > 0,
+        maintainer.maintain_prefix_segments(now_ms(), None).await?.1 > 0,
         "maintainer discovered the prefix and compacted"
     );
     assert!(segments(&bucket).await.len() < 4);
@@ -1084,7 +1096,7 @@ async fn compaction_drains_to_min_segments() -> Result<(), Error> {
     }
     assert_eq!(8, segments(&bucket).await.len());
 
-    _ = store.policy_compact_segments(None).await?;
+    _ = store.maintain_prefix_segments(now_ms(), None).await?;
     assert!(
         segments(&bucket).await.len() <= 2,
         "drained to <= min_segments in one pass"
@@ -1223,7 +1235,7 @@ async fn large_oldest_segment_does_not_stall_compaction() -> Result<(), Error> {
     // Without the fix this stalls at 7 (the run collapses to length one). With
     // it, the small run behind the big segment merges and the prefix drains to
     // <= min_segments.
-    _ = store.policy_compact_segments(None).await?;
+    _ = store.maintain_prefix_segments(now_ms(), None).await?;
     let after_count = segments(&bucket).await.len();
     assert!(
         after_count <= 2,
@@ -1487,7 +1499,7 @@ async fn retention_forever_keeps_segments() -> Result<(), Error> {
     _ = store.produce(None, &a, batch_at(2, 1_000)?).await?;
     assert_eq!(1, segments(&bucket).await.len());
 
-    let deleted = store.policy_delete(SystemTime::now(), None).await?;
+    let (deleted, _) = store.maintain_prefix_segments(now_ms(), None).await?;
     assert_eq!(0, deleted, "retain-forever deletes nothing");
     assert_eq!(1, segments(&bucket).await.len());
 
@@ -2587,6 +2599,54 @@ async fn leaseless_flush_exhaustion_is_retriable_not_fatal() -> Result<(), Error
     Ok(())
 }
 
+/// #157: an object squatting a segment sequence with **no decodable footer**
+/// (shorter than the trailer, or a tail whose magic is not `TSEG`) must not wedge
+/// the leaseless arbiter. The candidate is derived from the *resolved* sequences —
+/// decoded segments and undecodable names alike — so the writer steps over the
+/// squatter. Deriving it from the readable set alone re-picks the same occupied
+/// sequence on every attempt, burning the whole create-CAS budget on every flush,
+/// on every replica, at any produce rate — the deterministic livelock behind the
+/// "leaseless flush exhausted retries" spam on a low-rate prefix.
+#[tokio::test]
+async fn leaseless_steps_over_footerless_segment_object() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .prefix_leaseless(true);
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let tp = Topition::new(topic, 0);
+
+    // A first produce lays down segment 0, so the next free sequence is 1.
+    assert_eq!(0, store.produce(None, &tp, batch(1)?).await?);
+
+    // Squat sequence 1 with an object that carries no `TSEG` trailer — the shape
+    // a foreign/truncated write leaves in the create-only namespace.
+    _ = bucket
+        .put(
+            &Path::from(format!(
+                "clusters/{CLUSTER}/prefixes/{PREFIX}/segments/{:0>20}.seg",
+                1
+            )),
+            PutPayload::from_static(b"not a segment"),
+        )
+        .await?;
+
+    // The flush must step over sequence 1 and keep the sub-stream contiguous
+    // rather than exhaust its budget on an occupied candidate.
+    assert_eq!(1, store.produce(None, &tp, batch(1)?).await?);
+    assert_eq!(2, store.produce(None, &tp, batch(1)?).await?);
+
+    // And the records are readable across the skipped sequence.
+    let fetched = fetch_from(&store, &tp, 0).await?;
+    assert!(
+        !fetched.is_empty(),
+        "records written around the squatted sequence must still be served"
+    );
+
+    Ok(())
+}
+
 /// #130 mitigation: the shipped default merged-segment target is 16 MiB, not a
 /// larger size. While compaction writes into the producer tail create-CAS
 /// namespace, a larger target multiplies the S3 write amplification and request
@@ -2597,6 +2657,297 @@ async fn leaseless_flush_exhaustion_is_retriable_not_fatal() -> Result<(), Error
 async fn default_compaction_target_bytes_is_modest() {
     let store = DynoStore::new(CLUSTER, NODE, InMemory::new()).prefix_coalesce(true);
     assert_eq!(16 << 20, store.prefix_compact_target_bytes);
+}
+
+/// An `ObjectStore` that records the order in which segment objects are created
+/// and `segments/` prefixes listed, and fails every delete of keys under one
+/// chosen prefix — enough to observe the per-prefix maintenance driver's ordering
+/// and error isolation (#140). Everything else delegates to the inner store.
+#[derive(Clone)]
+struct MaintenanceProbe<O> {
+    inner: O,
+    observed: Arc<Mutex<Vec<String>>>,
+    fail_delete_under: Option<String>,
+}
+
+impl<O> MaintenanceProbe<O> {
+    fn note(&self, path: &Path) {
+        if let Ok(mut observed) = self.observed.lock() {
+            observed.push(path.to_string());
+        }
+    }
+
+    fn note_listing(&self, prefix: Option<&Path>) {
+        if let Some(prefix) = prefix
+            && prefix.as_ref().contains("/segments")
+        {
+            self.note(prefix);
+        }
+    }
+}
+
+impl<O> Debug for MaintenanceProbe<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MaintenanceProbe").finish()
+    }
+}
+
+impl<O> Display for MaintenanceProbe<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MaintenanceProbe").finish()
+    }
+}
+
+#[async_trait]
+impl<O> ObjectStore for MaintenanceProbe<O>
+where
+    O: ObjectStore,
+{
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult, object_store::Error> {
+        if seg_seq_of(location).is_some() {
+            self.note(location);
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> Result<GetResult, object_store::Error> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path, object_store::Error>>,
+    ) -> BoxStream<'static, Result<Path, object_store::Error>> {
+        let Some(under) = self.fail_delete_under.clone() else {
+            return self.inner.delete_stream(locations);
+        };
+
+        // A matching key never reaches the inner store, so it survives — and the
+        // error surfaces to the caller exactly as a failed `DeleteObjects` would.
+        self.inner.delete_stream(
+            locations
+                .map(move |location| match location {
+                    Ok(path) if path.as_ref().contains(under.as_str()) => {
+                        Err(object_store::Error::Generic {
+                            store: "S3",
+                            source: "injected delete failure".into(),
+                        })
+                    }
+                    other => other,
+                })
+                .boxed(),
+        )
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.note_listing(prefix);
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.note_listing(prefix);
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> Result<ListResult, object_store::Error> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: CopyOptions,
+    ) -> Result<(), object_store::Error> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+}
+
+/// #140: retention and compaction are interleaved **per prefix** — one
+/// maintenance pass expires a prefix's aged segments *and then* merges what
+/// survives. Asserting `deleted` also pins the order: were compaction to run
+/// first, it would merge the aged segments into a fresh-stamped one and nothing
+/// would expire at all.
+#[tokio::test]
+async fn maintenance_expires_then_compacts_each_prefix() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .coalesce_tuning(CoalesceTuning {
+            prefix_compact_min_segments: Some(2),
+            prefix_compact_keep_hot: Some(0),
+            prefix_compact_target_bytes: Some(4096),
+            ..Default::default()
+        });
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let tp = Topition::new(topic, 0);
+
+    // Four ancient segments (past the default 7-day retention) …
+    for _ in 0..4 {
+        _ = store.produce(None, &tp, batch_at(1, 1_000)?).await?;
+    }
+    // … then four current ones, which retention must keep and compaction merge.
+    for _ in 0..4 {
+        _ = store.produce(None, &tp, batch(1)?).await?;
+    }
+    assert_eq!(8, segments(&bucket).await.len());
+
+    let (deleted, compacted) = store.maintain_prefix_segments(now_ms(), None).await?;
+
+    assert_eq!(4, deleted, "the aged segments expired in this same pass");
+    assert!(compacted > 0, "and the survivors were merged");
+    assert!(
+        segments(&bucket).await.len() <= 2,
+        "prefix converged to <= min_segments"
+    );
+
+    Ok(())
+}
+
+/// #140: one prefix whose retention fails must not cost every other prefix its
+/// compaction. Retention used to be a whole pass ahead of compaction that
+/// propagated the first per-prefix error, so a single failing prefix aborted the
+/// tick before compaction ran at all — on any prefix.
+#[tokio::test]
+async fn a_failing_prefix_does_not_stop_the_others() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(
+        CLUSTER,
+        NODE,
+        MaintenanceProbe {
+            inner: bucket.clone(),
+            observed: Arc::new(Mutex::new(Vec::new())),
+            fail_delete_under: Some("prefixes/org.env.aaa/".into()),
+        },
+    )
+    .prefix_coalesce(true)
+    .coalesce_tuning(CoalesceTuning {
+        prefix_compact_min_segments: Some(2),
+        prefix_compact_keep_hot: Some(0),
+        prefix_compact_target_bytes: Some(4096),
+        ..Default::default()
+    });
+
+    // Prefix `aaa`: aged segments whose expiry delete is injected to fail.
+    let doomed = "org.env.aaa.tab_a";
+    create_topic(&store, doomed).await?;
+    let doomed_tp = Topition::new(doomed, 0);
+    for _ in 0..2 {
+        _ = store.produce(None, &doomed_tp, batch_at(1, 1_000)?).await?;
+    }
+
+    // Prefix `zzz`: current segments over the compaction trigger.
+    let healthy = "org.env.zzz.tab_a";
+    create_topic(&store, healthy).await?;
+    let healthy_tp = Topition::new(healthy, 0);
+    for _ in 0..8 {
+        _ = store.produce(None, &healthy_tp, batch(1)?).await?;
+    }
+
+    let (deleted, compacted) = store.maintain_prefix_segments(now_ms(), None).await?;
+
+    assert_eq!(0, deleted, "the injected delete failure expired nothing");
+    assert_eq!(
+        2,
+        segments_of(&bucket, "org.env.aaa").await.len(),
+        "the failing prefix kept its segments"
+    );
+    assert!(compacted > 0, "the healthy prefix was still compacted");
+    assert!(
+        segments_of(&bucket, "org.env.zzz").await.len() <= 2,
+        "and drained to <= min_segments despite the other prefix failing"
+    );
+
+    Ok(())
+}
+
+/// #140: the prefix with the largest known backlog is maintained first, so a run
+/// cut short by the maintenance timeout has drained the prefixes furthest over
+/// the trigger — not whichever ones sort first by name.
+#[tokio::test]
+async fn maintenance_visits_the_largest_prefix_first() -> Result<(), Error> {
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let bucket = InMemory::new();
+    let store = DynoStore::new(
+        CLUSTER,
+        NODE,
+        MaintenanceProbe {
+            inner: bucket.clone(),
+            observed: observed.clone(),
+            fail_delete_under: None,
+        },
+    )
+    .prefix_coalesce(true)
+    .coalesce_tuning(CoalesceTuning {
+        prefix_compact_min_segments: Some(2),
+        prefix_compact_keep_hot: Some(0),
+        prefix_compact_target_bytes: Some(4096),
+        ..Default::default()
+    });
+
+    // `aaa` sorts first by name but holds the smaller backlog; `zzz` sorts last
+    // and holds the larger one. Both are over the compaction trigger, so both
+    // will write a merged segment — the order of those writes is the observation.
+    let small = "org.env.aaa.tab_a";
+    create_topic(&store, small).await?;
+    let small_tp = Topition::new(small, 0);
+    for _ in 0..3 {
+        _ = store.produce(None, &small_tp, batch(1)?).await?;
+    }
+
+    let large = "org.env.zzz.tab_a";
+    create_topic(&store, large).await?;
+    let large_tp = Topition::new(large, 0);
+    for _ in 0..8 {
+        _ = store.produce(None, &large_tp, batch(1)?).await?;
+    }
+
+    observed.lock().expect("observed").clear();
+    let (_, compacted) = store.maintain_prefix_segments(now_ms(), None).await?;
+    assert!(compacted > 0, "both prefixes were over the trigger");
+
+    let observed = observed.lock().expect("observed").clone();
+    let first_large = observed
+        .iter()
+        .position(|path| path.contains("org.env.zzz"));
+    let first_small = observed
+        .iter()
+        .position(|path| path.contains("org.env.aaa"));
+
+    assert!(
+        matches!((first_large, first_small), (Some(large), Some(small)) if large < small),
+        "the larger prefix must be maintained first: {observed:?}"
+    );
+
+    Ok(())
 }
 
 /// #130: compaction claims the merged segment's name from the **same** tail
@@ -2643,7 +2994,7 @@ async fn compaction_resyncs_when_its_target_sequence_is_taken() -> Result<(), Er
 
     // Compaction loses that create, resyncs past it, and still merges.
     assert!(
-        store.policy_compact_segments(None).await? > 0,
+        store.drain_compact_prefix(PREFIX).await > 0,
         "compaction merged despite losing its target sequence"
     );
 
