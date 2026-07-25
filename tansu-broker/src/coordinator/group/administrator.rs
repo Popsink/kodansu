@@ -115,6 +115,38 @@ fn same_rebalance_state(a: &GroupDetail, b: &GroupDetail) -> bool {
             .all(|((ak, av), (bk, bv))| ak == bk && av.join_response == bv.join_response)
 }
 
+/// Whether two encoded member subscriptions request the SAME set of topics.
+///
+/// A cooperative consumer (kafka-clients, KIP-792) re-encodes its subscription
+/// on every rejoin with a fresh `generationId` and `ownedPartitions` (and, for
+/// the sticky assignor, `userData`), so the raw metadata bytes differ every
+/// time even when the member still subscribes to exactly the same topics.
+/// Bumping the group generation on such a no-op rejoin invalidates any
+/// in-flight leader SyncGroup (its generation is now stale) and stretches — or,
+/// with 16 members churning, prevents — convergence. Comparing the decoded
+/// topic set instead of the raw bytes lets a known member's KIP-792-only rejoin
+/// be treated as a no-op update.
+///
+/// Conservative on uncertainty: if either side cannot be decoded as a consumer
+/// subscription, returns `false` so the caller keeps its safe,
+/// rebalance-triggering path — an undecodable or genuinely changed subscription
+/// never silently skips a rebalance.
+fn same_subscription_topics(a: &Bytes, b: &Bytes) -> bool {
+    match (
+        MemberMetadata::try_from(a.clone()),
+        MemberMetadata::try_from(b.clone()),
+    ) {
+        (Ok(a), Ok(b)) => {
+            let mut at = a.subscription.topics;
+            let mut bt = b.subscription.topics;
+            at.sort();
+            bt.sort();
+            at == bt
+        }
+        _ => false,
+    }
+}
+
 /// Whether `member_id`'s persisted `last_contact` (as seen in the just-read
 /// projection `before`) is stale enough that a no-op poll must still persist a
 /// refreshed timestamp, so a member waiting through a long rebalance is never
@@ -2467,11 +2499,21 @@ where
                     generation_id = self.generation_id
                 );
                 member.last_contact = Some(now);
-            } else if group_instance_id.is_some() {
+            } else if group_instance_id.is_some()
+                || same_subscription_topics(&member.join_response.metadata, &protocol.metadata)
+            {
+                // The encoded metadata changed but the subscribed topic set did
+                // not: a static member's soft update, or a cooperative
+                // consumer's KIP-792-only rejoin (fresh generationId /
+                // ownedPartitions / sticky userData, same topics). Record the
+                // new metadata as the leader's sticky input WITHOUT bumping the
+                // generation — bumping here would invalidate any in-flight
+                // SyncGroup and, with many members re-joining, keep the group
+                // from ever converging.
                 debug!(
                     member_metadata = "soft_update",
                     member_id,
-                    group_instance_id,
+                    ?group_instance_id,
                     updated = ?protocol.metadata,
                     existing = ?member.join_response.metadata,
                     generation_id = self.generation_id
@@ -3530,6 +3572,47 @@ mod tests {
     use tansu_storage::StorageContainer;
     use tracing::subscriber::DefaultGuard;
     use url::Url;
+
+    fn encode_subscription(topics: &[&str], generation_id: Option<i32>) -> Bytes {
+        Bytes::try_from(
+            &MemberMetadata::default().version(3).subscription(
+                ConsumerProtocolSubscription::default()
+                    .topics(topics.iter().map(|topic| topic.to_string()))
+                    .generation_id(generation_id),
+            ),
+        )
+        .expect("encode member metadata")
+    }
+
+    // A cooperative consumer (KIP-792) re-encodes its subscription on every
+    // rejoin with a fresh generationId, so the raw bytes differ while the topic
+    // set is unchanged. `same_subscription_topics` must see through that churn
+    // (else the group generation bumps on every rejoin and never converges),
+    // yet still flag a genuine topic change and stay conservative on garbage.
+    #[test]
+    fn same_subscription_topics_ignores_kip792_churn() {
+        let a = encode_subscription(&["t.a", "t.b"], Some(41));
+        let b = encode_subscription(&["t.a", "t.b"], Some(42));
+        assert_ne!(a, b, "raw metadata must differ (KIP-792 generationId)");
+        assert!(same_subscription_topics(&a, &b), "same topics -> no-op");
+
+        let c = encode_subscription(&["t.b", "t.a"], None);
+        assert!(
+            same_subscription_topics(&a, &c),
+            "topic order must not matter"
+        );
+
+        let d = encode_subscription(&["t.a", "t.b", "t.c"], Some(42));
+        assert!(
+            !same_subscription_topics(&a, &d),
+            "a real topic change must NOT be treated as a no-op"
+        );
+
+        assert!(
+            !same_subscription_topics(&a, &Bytes::from_static(b"garbage")),
+            "undecodable metadata must be conservatively treated as changed"
+        );
+    }
 
     #[cfg(miri)]
     fn init_tracing() -> Result<()> {
