@@ -281,6 +281,16 @@ pub struct DynoStore {
     /// GET.
     prefix_index: Arc<Mutex<BTreeMap<String, PrefixIndex>>>,
 
+    /// Measurement-only trace of which segment objects this pod has recently read
+    /// record bytes from, and over which byte ranges (#117). Not a cache — it
+    /// holds no data and nothing reads through it; it exists to answer the one
+    /// question that decides #117's design: when a segment object is read more
+    /// than once on a pod, is it the *same* range (what a `(prefix, seq, range)`
+    /// block cache would serve) or a *different* one (co-prefix sub-streams
+    /// reading disjoint slices of the same object, which only a whole-object cache
+    /// would serve)? See [`SegmentReadTrace`].
+    segment_reads: Arc<Mutex<BTreeMap<(String, u64), SegmentReadTrace>>>,
+
     /// Per-prefix single-writer leases this process currently holds (#59). The
     /// durable side is `prefixes/{prefix}/lease.json`; this caches the held
     /// epoch, its etag (for the next CAS) and its expiry (the no-write fast
@@ -507,6 +517,73 @@ struct PrefixIndex {
     /// fast path skip the per-partition `watermark.json` GET.
     seq_floor: Option<(u64, u64)>,
 }
+
+/// What one pod has recently read out of a single segment object (#117):
+/// the distinct `(byte_start, byte_len)` ranges it fetched record bytes over, and
+/// when it last did. Measurement only — no record bytes are held here.
+///
+/// The distinct-range list is capped ([`SEGMENT_READ_TRACE_RANGES`]): past the cap
+/// a range that is not already listed still counts as a different-range repeat, it
+/// just stops being remembered, which can only *under*-count the same-range class.
+/// That is the conservative direction: it never invents evidence for the cheaper
+/// design.
+#[derive(Clone, Debug)]
+struct SegmentReadTrace {
+    ranges: Vec<(u64, u64)>,
+    last_read: SystemTime,
+}
+
+/// Distinct byte ranges remembered per segment object (#117).
+const SEGMENT_READ_TRACE_RANGES: usize = 8;
+
+/// Segment objects traced at once (#117). A read of an untraced object past this
+/// cap prunes entries older than [`SEGMENT_READ_TRACE_TTL`] first, and clears the
+/// trace outright if that frees nothing — a measurement device must never be the
+/// thing that grows without bound.
+const SEGMENT_READ_TRACE_OBJECTS: usize = 1_024;
+
+/// How long a segment read stays interesting for overlap accounting (#117).
+/// Bounds what "read more than once" means: a cache only collapses reads close
+/// enough together to still be resident, so counting a repeat hours later would
+/// overstate what any cache could serve.
+const SEGMENT_READ_TRACE_TTL: Duration = Duration::from_secs(60);
+
+/// Ranged GETs of segment *record* bytes on the fetch path (#117) — the
+/// tier-2 requests a consumer-side cache would target. Footer GETs are already
+/// served from the in-memory index and are not counted here.
+static SEGMENT_DATA_GETS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_segment_data_gets")
+        .with_description("ranged GETs of segment record bytes served to consumers")
+        .build()
+});
+
+/// Bytes requested by those GETs (#117), so the request/byte trade of caching
+/// whole objects instead of ranges can be costed rather than guessed.
+static SEGMENT_DATA_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_segment_data_bytes")
+        .with_description("bytes requested by ranged GETs of segment record bytes")
+        .build()
+});
+
+/// Segment-data GETs of an object this pod already read within
+/// [`SEGMENT_READ_TRACE_TTL`] (#117), labelled `overlap`:
+///
+/// - `same_range` — the identical span was fetched again: what the block cache
+///   proposed in #117 would have served.
+/// - `other_range` — a different span of the same object: co-prefix sub-streams
+///   reading disjoint slices, which a range-keyed cache **cannot** serve and only
+///   a whole-object cache could.
+///
+/// The split between these two is the number #117's design hinges on; a low total
+/// closes the issue instead.
+static SEGMENT_DATA_GET_REPEATS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_segment_data_get_repeats")
+        .with_description("segment-data GETs of a recently-read object, by range overlap")
+        .build()
+});
 
 /// A prefix lease this process currently holds (#59): the in-memory side of
 /// [`PrefixLease`]. `version` is the etag the next renewal CASes against;
@@ -1146,6 +1223,7 @@ impl DynoStore {
             segment_seqs: Arc::new(Mutex::new(BTreeMap::new())),
             prefix_flush_locks: Arc::new(Mutex::new(BTreeMap::new())),
             prefix_index: Arc::new(Mutex::new(BTreeMap::new())),
+            segment_reads: Arc::new(Mutex::new(BTreeMap::new())),
             prefix_leases: Arc::new(Mutex::new(BTreeMap::new())),
             compaction_leases: Arc::new(Mutex::new(BTreeMap::new())),
             era_epochs: Arc::new(Mutex::new(BTreeMap::new())),
@@ -3457,6 +3535,72 @@ impl DynoStore {
     /// (zombie) segment is skipped. A segment deleted by retention mid-fetch (a
     /// 404 on the data GET) is pruned and skipped. Bounded by `max_bytes` and by
     /// `max_wait` from `started_at`.
+    /// Record one segment-data ranged GET and classify it against what this pod
+    /// has recently read from the same object (#117). Measurement only: it never
+    /// changes what is fetched, and a poisoned lock or a full trace degrades the
+    /// numbers, never the read.
+    fn note_segment_data_read(&self, prefix: &str, seq: u64, byte_start: u64, byte_len: u64) {
+        SEGMENT_DATA_GETS.add(1, &[]);
+        SEGMENT_DATA_BYTES.add(byte_len, &[]);
+
+        let Ok(mut traces) = self.segment_reads.lock() else {
+            return;
+        };
+
+        let now = SystemTime::now();
+        let fresh = |trace: &SegmentReadTrace| {
+            now.duration_since(trace.last_read)
+                .is_ok_and(|elapsed| elapsed < SEGMENT_READ_TRACE_TTL)
+        };
+        let range = (byte_start, byte_len);
+        let key = (prefix.to_owned(), seq);
+
+        match traces.get_mut(&key) {
+            // Read again while still resident-ish: this is the repeat a cache
+            // could have served — but only the block cache #117 proposes if the
+            // span is identical.
+            Some(trace) if fresh(trace) => {
+                let overlap = if trace.ranges.contains(&range) {
+                    "same_range"
+                } else {
+                    if trace.ranges.len() < SEGMENT_READ_TRACE_RANGES {
+                        trace.ranges.push(range);
+                    }
+                    "other_range"
+                };
+
+                SEGMENT_DATA_GET_REPEATS.add(1, &[KeyValue::new("overlap", overlap)]);
+                trace.last_read = now;
+            }
+
+            // Stale entry: too long ago to credit a cache with, so restart the
+            // object's trace rather than count it as a repeat.
+            Some(trace) => {
+                trace.ranges.clear();
+                trace.ranges.push(range);
+                trace.last_read = now;
+            }
+
+            None => {
+                if traces.len() >= SEGMENT_READ_TRACE_OBJECTS {
+                    traces.retain(|_, trace| fresh(trace));
+
+                    if traces.len() >= SEGMENT_READ_TRACE_OBJECTS {
+                        traces.clear();
+                    }
+                }
+
+                _ = traces.insert(
+                    key,
+                    SegmentReadTrace {
+                        ranges: vec![range],
+                        last_read: now,
+                    },
+                );
+            }
+        }
+    }
+
     async fn fetch_prefix_coalesced(
         &self,
         topition: &Topition,
@@ -3505,6 +3649,7 @@ impl DynoStore {
 
                 // One ranged GET of exactly this sub-stream's byte span.
                 let location = self.segment_location(&prefix, seq);
+                self.note_segment_data_read(&prefix, seq, entry.byte_start, entry.byte_len);
                 let region = match self
                     .object_store
                     .get_opts(
