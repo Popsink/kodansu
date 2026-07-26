@@ -2086,6 +2086,37 @@ impl DynoStore {
         Ok(self.watermark(topition)?.cached().and_then(|w| w.low))
     }
 
+    /// The log start offset for `topition` (#161).
+    ///
+    /// `watermark.low` is advanced **only** by the legacy `records/` retention
+    /// paths ([`Self::expire_partition`] and the compaction drain); segment
+    /// retention never writes it. So for a pure-segment sub-stream the object is
+    /// authoritatively silent about the log start — and usually absent entirely —
+    /// yet read-committed `offset_stage` used to read it on **every poll**, which
+    /// measured as ~1490 GET/s returning `404 NoSuchKey` at ~1,600 subscriptions:
+    /// round-trips that resolve nothing, add fetch latency, and are billable on a
+    /// store that charges 4xx (GCS). Read-uncommitted already avoids it (#109);
+    /// this closes the read-committed and cold-path gap.
+    ///
+    /// For a pure-segment sub-stream the log start comes from the footer index —
+    /// the lowest surviving segment base, which is what `list_offsets` EARLIEST
+    /// already reports and is *more* accurate than `watermark.low`, since nothing
+    /// advances that field after a segment expiry. A hybrid or legacy sub-stream
+    /// still reads the object: there the legacy region owns the log start, and
+    /// retention does record it.
+    async fn log_start(&self, topition: &Topition) -> Result<i64> {
+        if self.prefix_coalesce && !self.has_legacy_records(topition).await? {
+            return Ok(self.segment_region_start(topition).await?.unwrap_or(0));
+        }
+
+        self.watermark(topition)?
+            .with(&self.object_store, |watermark| {
+                debug!(?watermark);
+                Ok(watermark.low.unwrap_or(0))
+            })
+            .await
+    }
+
     /// Optimistic-concurrency handle on the per-producer `producers/{id}.json`
     /// object holding `producer_id`'s idempotent sequence state.
     fn producer(&self, producer_id: ProducerId) -> Result<OptiCon<ProducerDetail>> {
@@ -8262,37 +8293,25 @@ impl Storage for DynoStore {
         // `high_watermark`).
         let high_watermark = self.high_watermark(topition).await?;
 
-        let watermark = self.watermarks.lock().map(|mut locked| {
-            locked
-                .entry(topition.to_owned())
-                .or_insert(OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
-                .to_owned()
-        })?;
+        let log_start = self.log_start(topition).await?;
+        let last_stable = stable.get(topition).copied().unwrap_or(high_watermark);
 
-        watermark
-            .with(&self.object_store, |watermark| {
-                debug!(?watermark);
-                let log_start = watermark.low.unwrap_or(0);
-                let last_stable = stable.get(topition).copied().unwrap_or(high_watermark);
+        // Keep aborted transactions whose records are still in the log (last
+        // offset at/after the log start), as `(producer_id, first_offset)` sorted
+        // by first offset (#81).
+        let mut aborted: Vec<(i64, i64)> = aborted_raw
+            .iter()
+            .filter(|(_, _, offset_end)| *offset_end >= log_start)
+            .map(|(producer_id, offset_start, _)| (*producer_id, *offset_start))
+            .collect();
+        aborted.sort_by_key(|(_, first_offset)| *first_offset);
 
-                // Keep aborted transactions whose records are still in the log
-                // (last offset at/after the log start), as `(producer_id,
-                // first_offset)` sorted by first offset (#81).
-                let mut aborted: Vec<(i64, i64)> = aborted_raw
-                    .iter()
-                    .filter(|(_, _, offset_end)| *offset_end >= log_start)
-                    .map(|(producer_id, offset_start, _)| (*producer_id, *offset_start))
-                    .collect();
-                aborted.sort_by_key(|(_, first_offset)| *first_offset);
-
-                Ok(OffsetStage {
-                    last_stable,
-                    high_watermark,
-                    log_start,
-                    aborted,
-                })
-            })
-            .await
+        Ok(OffsetStage {
+            last_stable,
+            high_watermark,
+            log_start,
+            aborted,
+        })
     }
 
     async fn list_offsets(
