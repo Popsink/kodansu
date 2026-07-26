@@ -837,6 +837,61 @@ static SEGMENT_FOOTER_UNDECODABLE: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Why a listing was issued (#165). A per-method LIST total says the tier-1
+/// plane is large; it does not say which of the ~20 scan sites is spending it,
+/// which is the question an aggregate cannot answer and the one that matters when
+/// LIST is ~85% of the bill (#166).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Scan {
+    /// Refreshing a prefix's segment index, or deriving its tail sequence. The
+    /// read path and maintenance (compaction, segment retention) both discover
+    /// segments through that one refresh, so they share this purpose.
+    SegmentIndex,
+    /// Retention/expiry scanning what is past its threshold.
+    Retention,
+    /// Probing whether a partition has legacy `records/` objects.
+    LegacyProbe,
+    /// Reading the legacy `records/` region: offsets, batches, fetch.
+    LegacyRecords,
+    /// Resolving `list_offsets` for a partition.
+    ListOffsets,
+    /// Consumer-group bookkeeping.
+    Group,
+    /// The topic-metadata index refresh.
+    TopicMetadata,
+    /// Deleting a topic or a consumer group.
+    AdminDelete,
+    /// Connectivity check.
+    Ping,
+}
+
+impl Scan {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SegmentIndex => "segment_index",
+            Self::Retention => "retention",
+            Self::LegacyProbe => "legacy_probe",
+            Self::LegacyRecords => "legacy_records",
+            Self::ListOffsets => "list_offsets",
+            Self::Group => "group",
+            Self::TopicMetadata => "topic_metadata",
+            Self::AdminDelete => "admin_delete",
+            Self::Ping => "ping",
+        }
+    }
+}
+
+/// Listings issued, by `purpose` (#165). Pairs with the per-method request metric
+/// [`Metron::instrument_listing`] restores: that one counts requests (pages), this
+/// one attributes calls to the code that asked for them. A purpose whose rate
+/// tracks the metered LIST rate is the one to optimise.
+static LIST_SCANS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_object_store_list_scans")
+        .with_description("object store listings issued, by call site")
+        .build()
+});
+
 /// Magic trailer word marking a prefix-coalesced multi-topic segment object
 /// (#64), distinguishing a `.seg` from a legacy single-topic coalesced object
 /// (#50), which carries no trailer. ASCII `TSEG`.
@@ -1765,7 +1820,7 @@ impl DynoStore {
     /// is unchanged, GET only the new/changed objects, and drop deleted ones.
     async fn refresh_topic_index(&self) -> Result<Arc<Vec<TopicMetadata>>> {
         let prefix = Path::from(format!("clusters/{}/topic-metadata/", self.cluster));
-        let listed = self.object_store.list_with_delimiter(Some(&prefix)).await?;
+        let listed = self.scan_delimited(Scan::TopicMetadata, &prefix).await?;
 
         let mut entries: BTreeMap<Topic, (Option<String>, TopicMetadata)> = BTreeMap::new();
         let mut stale = Vec::new();
@@ -2247,10 +2302,9 @@ impl DynoStore {
                     self.cluster, topition.topic, topition.partition, floor,
                 ));
 
-                self.object_store
-                    .list_with_offset(Some(&prefix), &start_after)
+                self.scan_from(Scan::LegacyRecords, &prefix, &start_after)
             }
-            None => self.object_store.list(Some(&prefix)),
+            None => self.scan(Scan::LegacyRecords, &prefix),
         };
 
         while let Some(meta) = list_stream
@@ -2775,6 +2829,41 @@ impl DynoStore {
         prefix
     }
 
+    /// List `prefix`, attributing the call to the code that asked for it (#165).
+    /// Every listing in this engine goes through here or [`Self::scan_from`], so
+    /// the tier-1 plane can be broken down by purpose rather than guessed at.
+    fn scan(
+        &self,
+        purpose: Scan,
+        prefix: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        LIST_SCANS.add(1, &[KeyValue::new("purpose", purpose.as_str())]);
+        self.object_store.list(Some(prefix))
+    }
+
+    /// As [`Self::scan`], but resuming after `start_after` (S3 `start-after`) so
+    /// only the tail beyond a known point is read.
+    fn scan_from(
+        &self,
+        purpose: Scan,
+        prefix: &Path,
+        start_after: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        LIST_SCANS.add(1, &[KeyValue::new("purpose", purpose.as_str())]);
+        self.object_store
+            .list_with_offset(Some(prefix), start_after)
+    }
+
+    /// As [`Self::scan`], but delimited (S3 `delimiter=/`, common prefixes only).
+    async fn scan_delimited(
+        &self,
+        purpose: Scan,
+        prefix: &Path,
+    ) -> Result<ListResult, object_store::Error> {
+        LIST_SCANS.add(1, &[KeyValue::new("purpose", purpose.as_str())]);
+        self.object_store.list_with_delimiter(Some(prefix)).await
+    }
+
     /// The `segments/` listing prefix for a connector prefix (#57).
     fn segment_prefix(&self, prefix: &str) -> Path {
         Path::from(format!(
@@ -3170,7 +3259,7 @@ impl DynoStore {
     /// cold and to resync after a `Create` conflict.
     async fn tail_next_seq(&self, prefix: &str) -> Result<u64> {
         let listing = self.segment_prefix(prefix);
-        let mut list_stream = self.object_store.list(Some(&listing));
+        let mut list_stream = self.scan(Scan::SegmentIndex, &listing);
         let mut max: Option<u64> = None;
 
         while let Some(meta) = list_stream
@@ -3656,10 +3745,12 @@ impl DynoStore {
 
         let listing = self.segment_prefix(prefix);
         let mut stream = match start_after {
-            Some(seq) => self
-                .object_store
-                .list_with_offset(Some(&listing), &self.segment_location(prefix, seq)),
-            None => self.object_store.list(Some(&listing)),
+            Some(seq) => self.scan_from(
+                Scan::SegmentIndex,
+                &listing,
+                &self.segment_location(prefix, seq),
+            ),
+            None => self.scan(Scan::SegmentIndex, &listing),
         };
 
         let mut discovered: Vec<(u64, Path, i64)> = Vec::new();
@@ -4185,8 +4276,7 @@ impl DynoStore {
             self.cluster, topition.topic, topition.partition
         ));
         let present = self
-            .object_store
-            .list(Some(&prefix))
+            .scan(Scan::LegacyProbe, &prefix)
             .next()
             .await
             .transpose()
@@ -4320,9 +4410,7 @@ impl DynoStore {
             self.cluster, topition.topic, topition.partition, start_offset,
         ));
 
-        let mut list_stream = self
-            .object_store
-            .list_with_offset(Some(&prefix), &start_after);
+        let mut list_stream = self.scan_from(Scan::LegacyRecords, &prefix, &start_after);
 
         let mut bytes = max_bytes as u64;
 
@@ -4401,7 +4489,7 @@ impl DynoStore {
                 "clusters/{}/topics/{}/partitions/{:0>10}/records/",
                 self.cluster, topition.topic, topition.partition,
             ));
-            let mut stream = self.object_store.list(Some(&records));
+            let mut stream = self.scan(Scan::LegacyProbe, &records);
             while let Some(meta) = stream
                 .next()
                 .await
@@ -4560,7 +4648,7 @@ impl DynoStore {
             self.cluster, topition.topic, topition.partition,
         ));
 
-        let mut list_stream = self.object_store.list(Some(&location));
+        let mut list_stream = self.scan(Scan::ListOffsets, &location);
 
         let mut candidate: Option<ObjectMeta> = None;
 
@@ -5601,9 +5689,7 @@ impl DynoStore {
             self.cluster, topition.topic, topition.partition, floor,
         ));
 
-        let mut list_stream = self
-            .object_store
-            .list_with_offset(Some(&prefix), &start_after);
+        let mut list_stream = self.scan_from(Scan::LegacyRecords, &prefix, &start_after);
         let mut container = None;
 
         while let Some(meta) = list_stream
@@ -5664,8 +5750,7 @@ impl DynoStore {
         let prefix = Path::from(format!("clusters/{}/groups/consumers/", self.cluster));
 
         let listed = self
-            .object_store
-            .list_with_delimiter(Some(&prefix))
+            .scan_delimited(Scan::Group, &prefix)
             .await
             .inspect_err(|err| error!(?err, cluster = self.cluster))?;
 
@@ -6657,7 +6742,7 @@ impl DynoStore {
         let prefix = self.records_prefix(topition);
 
         let mut offsets = BTreeMap::new();
-        let mut list_stream = self.object_store.list(Some(&prefix));
+        let mut list_stream = self.scan(Scan::LegacyRecords, &prefix);
 
         while let Some(meta) = list_stream
             .next()
@@ -6688,7 +6773,7 @@ impl DynoStore {
         let prefix = self.records_prefix(topition);
 
         let mut offsets = Vec::new();
-        let mut list_stream = self.object_store.list(Some(&prefix));
+        let mut list_stream = self.scan(Scan::LegacyRecords, &prefix);
 
         while let Some(meta) = list_stream
             .next()
@@ -6822,7 +6907,7 @@ impl DynoStore {
         const EXPIRE_DELETE_CHUNK: usize = 1_000;
 
         let prefix = self.records_prefix(topition);
-        let mut list_stream = self.object_store.list(Some(&prefix));
+        let mut list_stream = self.scan(Scan::Retention, &prefix);
 
         let mut surviving_low: Option<i64> = None;
         let mut surviving_oldest_ms: Option<i64> = None;
@@ -7695,8 +7780,7 @@ impl Storage for DynoStore {
             ));
 
             let locations = self
-                .object_store
-                .list(Some(&prefix))
+                .scan(Scan::AdminDelete, &prefix)
                 .map_ok(|m| m.location)
                 .boxed();
 
@@ -7711,8 +7795,7 @@ impl Storage for DynoStore {
             let topic_name = metadata.topic.name.clone();
             let prefix_clone = prefix.clone();
             let locations = self
-                .object_store
-                .list(Some(&prefix))
+                .scan(Scan::AdminDelete, &prefix)
                 .filter_map(move |m| {
                     let prefix = prefix_clone.clone();
                     let topic_name = topic_name.clone();
@@ -8338,7 +8421,7 @@ impl Storage for DynoStore {
                 self.cluster, group_id,
             ));
 
-            let mut list_stream = self.object_store.list(Some(&location));
+            let mut list_stream = self.scan(Scan::Group, &location);
 
             while let Some(meta) = list_stream
                 .next()
@@ -8804,8 +8887,7 @@ impl Storage for DynoStore {
     async fn list_groups(&self, _states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
         let location = Path::from(format!("clusters/{}/groups/consumers/", self.cluster,));
         let list_result = self
-            .object_store
-            .list_with_delimiter(Some(&location))
+            .scan_delimited(Scan::Group, &location)
             .await
             .inspect(|list_result| debug!(?list_result))
             .inspect_err(|error| error!(?error, cluster = self.cluster))?;
@@ -8856,8 +8938,7 @@ impl Storage for DynoStore {
                 ));
 
                 let locations = self
-                    .object_store
-                    .list(Some(&prefix))
+                    .scan(Scan::AdminDelete, &prefix)
                     .map_ok(|m| m.location)
                     .boxed();
 
@@ -9745,7 +9826,7 @@ impl Storage for DynoStore {
     #[instrument(skip_all)]
     async fn ping(&self) -> Result<()> {
         // Verify connectivity by listing objects at the root
-        let _ = self.object_store.list(Some(&Path::from("/"))).next().await;
+        let _ = self.scan(Scan::Ping, &Path::from("/")).next().await;
         Ok(())
     }
 }
@@ -9850,6 +9931,70 @@ where
 
             object_store,
         }
+    }
+
+    /// Make a listing stream visible to the request metrics (#165).
+    ///
+    /// The two streaming list methods were forwarded uninstrumented, so the
+    /// per-method request metric reported ~0.5 LIST/s while the bucket meter
+    /// showed ~1,200/s — the tier-1 plane that dominates the bill was invisible,
+    /// and every LIST reduction claimed from this counter was unverified.
+    ///
+    /// A listing is not one request: the store pages it, returning at most
+    /// [`LIST_PAGE_KEYS`] keys per `ListObjectsV2`, and the meter counts pages.
+    /// So one sample is recorded for the call itself — including a listing that
+    /// yields nothing, which is still a metered request, and is exactly the shape
+    /// the legacy-records probe issues (#166) — and one more each time the objects
+    /// streamed past cross a page boundary. That makes the sample *count* line up
+    /// with the meter, which is the point of the metric.
+    ///
+    /// Only the page-boundary samples carry a real latency (time since the
+    /// previous page); the call sample records `0`, since a stream's first request
+    /// is still in flight when it is handed back. `delete_stream` already reports
+    /// its per-object samples the same way.
+    fn instrument_listing(
+        &self,
+        method: &'static str,
+        inner: BoxStream<'static, Result<ObjectMeta, object_store::Error>>,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        /// Keys per `ListObjectsV2` response, i.e. per metered LIST request.
+        const LIST_PAGE_KEYS: u64 = 1_000;
+
+        let attributes = vec![
+            KeyValue::new("method", method),
+            KeyValue::new("cluster", self.cluster.clone()),
+        ];
+        let request_duration = self.request_duration.clone();
+        let request_error = self.request_error.clone();
+
+        request_duration.record(0, attributes.as_ref());
+
+        let mut yielded = 0u64;
+        let mut page_started = SystemTime::now();
+
+        Box::pin(inner.inspect(move |result| match result {
+            Ok(_) => {
+                yielded += 1;
+
+                if yielded.is_multiple_of(LIST_PAGE_KEYS) {
+                    request_duration.record(
+                        page_started
+                            .elapsed()
+                            .map_or(0, |elapsed| elapsed.as_millis() as u64),
+                        attributes.as_ref(),
+                    );
+                    page_started = SystemTime::now();
+                }
+            }
+
+            Err(err) => {
+                debug!(?err, method);
+
+                let mut additional = vec![KeyValue::new("reason", object_store_error_name(err))];
+                additional.extend(attributes.iter().cloned());
+                request_error.add(1, &additional[..]);
+            }
+        }))
     }
 }
 
@@ -9995,7 +10140,7 @@ where
     ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
         debug!(?prefix);
 
-        self.object_store.list(prefix)
+        self.instrument_listing("list", self.object_store.list(prefix))
     }
 
     // Forward `list_with_offset` (S3 `start-after`) so a tail-offset scan reads
@@ -10007,7 +10152,10 @@ where
     ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
         debug!(?prefix, ?offset);
 
-        self.object_store.list_with_offset(prefix, offset)
+        self.instrument_listing(
+            "list_with_offset",
+            self.object_store.list_with_offset(prefix, offset),
+        )
     }
 
     async fn list_with_delimiter(
