@@ -17,6 +17,7 @@
 //! timed. Run under nextest like any test.
 
 use std::{
+    collections::BTreeSet,
     fmt::{self, Debug, Display},
     sync::{
         Arc,
@@ -1222,6 +1223,75 @@ async fn coalesced_latest_survives_peer_expiry_via_floor_certification() -> Resu
     );
 
     Ok(())
+}
+
+/// #165: every listing this engine issues must go through the attributed helpers
+/// (`DynoStore::scan` / `scan_from` / `scan_delimited`), so the tier-1 plane can be
+/// broken down by call site. The metric was blind for ~20 scan sites — reporting
+/// 0.48 LIST/s against ~1,200/s metered — because `Metron` forwarded the two
+/// streaming list methods uninstrumented, and every LIST reduction claimed from
+/// that counter was therefore unverified.
+///
+/// A source-level guard is what catches the *next* direct call before it ships: an
+/// operation test cannot, since an unattributed listing still returns the right
+/// objects. Continuation lines are joined first — a builder-style
+/// `self\n.object_store\n.list(..)` is the form that slipped through the first
+/// conversion of this very issue, including the legacy probe #166 is about.
+#[test]
+fn every_listing_is_attributed_to_a_call_site() {
+    let source = include_str!("../../dynostore.rs");
+
+    // The attributed helpers, and the `Metron` wrapper that records the
+    // per-method request metric, are the only places allowed to touch the raw
+    // list methods.
+    let allowed = BTreeSet::from([
+        "scan",
+        "scan_from",
+        "scan_delimited",
+        "list",
+        "list_with_offset",
+        "list_with_delimiter",
+    ]);
+
+    // Fold each `.method()` continuation onto the statement it belongs to, so a
+    // call split across lines is seen as one.
+    let mut statements: Vec<String> = Vec::new();
+    for line in source.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with('.') && !statements.is_empty() {
+            let last = statements.len() - 1;
+            statements[last].push_str(trimmed);
+        } else {
+            statements.push(trimmed.to_owned());
+        }
+    }
+
+    let mut enclosing = "<none>";
+    let mut offenders = BTreeSet::new();
+
+    for statement in &statements {
+        if let Some((_, rest)) = statement.split_once("fn ")
+            && let Some((name, _)) = rest.split_once('(')
+        {
+            enclosing = name;
+        }
+
+        let lists = statement.contains("object_store.list(")
+            || statement.contains("object_store.list_with_offset(")
+            || statement.contains("object_store.list_with_delimiter(");
+
+        if lists && !allowed.contains(enclosing) {
+            _ = offenders.insert(enclosing);
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "{offenders:?} list the object store directly — a listing that does not go through \
+         DynoStore::scan/scan_from/scan_delimited is invisible to \
+         tansu_object_store_list_scans (#165)"
+    );
 }
 
 /// An `ObjectStore` counting GETs of the per-partition `watermark.json` object,
