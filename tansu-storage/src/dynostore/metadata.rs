@@ -76,9 +76,52 @@ impl From<&GetResult> for CacheEntry {
     }
 }
 
+/// Coarse key class for the cache metrics (#167). A revalidation rate is only
+/// actionable if it says *which* keys are buying "unchanged" from the object
+/// store: the fix for a single hot cluster-wide key (collapse the concurrent
+/// burst) is not the fix for thousands of per-partition keys (stop needing them
+/// per partition), and the aggregate cannot tell them apart.
+fn key_class(path: &Path) -> &'static str {
+    let path = path.as_ref();
+
+    if path.ends_with(".seg") {
+        "segment"
+    } else if path.ends_with(".batch") {
+        "records"
+    } else if path.ends_with("/meta.json") {
+        "meta"
+    } else if path.ends_with("/watermark.json") {
+        "watermark"
+    } else if path.ends_with("/seq-floor.json") {
+        "seq_floor"
+    } else if path.ends_with("/era.json") {
+        "era"
+    } else if path.ends_with("/lease.json") {
+        "lease"
+    } else if path.contains("/producers/") {
+        "producer"
+    } else if path.contains("/groups/") {
+        "group"
+    } else if path.contains("/topic-metadata/") || path.contains("/topic-ids/") {
+        "topic_metadata"
+    } else {
+        "other"
+    }
+}
+
+/// Single-flight stripes for revalidation (#167). Striped rather than per-key so
+/// the map cannot grow with the key space — the object store holds one entry per
+/// partition and per producer, and a lock per key read would be an unbounded map
+/// on the read path. Two keys sharing a stripe serialise for one round trip,
+/// which is what a revalidation costs anyway.
+const REVALIDATION_STRIPES: usize = 256;
+
 #[derive(Clone)]
 pub(super) struct Cache<O> {
     entries: Arc<Mutex<ExpiringSizedCache<Path, CacheEntry>>>,
+    /// Serialises concurrent revalidations of the same key so a burst of callers
+    /// costs one conditional GET instead of one each (#167).
+    revalidations: Arc<Vec<tokio::sync::Mutex<()>>>,
     object_store: O,
     retention: Duration,
 }
@@ -106,9 +149,38 @@ where
 
         Self {
             entries,
+            revalidations: Arc::new(
+                (0..REVALIDATION_STRIPES)
+                    .map(|_| tokio::sync::Mutex::new(()))
+                    .collect(),
+            ),
             object_store,
             retention,
         }
+    }
+
+    /// The single-flight stripe guarding revalidations of `path`.
+    fn revalidation_stripe(&self, path: &Path) -> &tokio::sync::Mutex<()> {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+
+        for byte in path.as_ref().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+
+        &self.revalidations[(hash as usize) % REVALIDATION_STRIPES]
+    }
+
+    /// Whether the cached etag for `path` matches `presented` — i.e. whether a
+    /// caller's conditional GET can be answered `NotModified` without a request.
+    fn etag_matches(&self, path: &Path, presented: &str) -> bool {
+        self.entries.lock().is_ok_and(|mut guard| {
+            guard
+                .deref_mut()
+                .get(path)
+                .and_then(|entry| entry.version.e_tag.as_deref())
+                .is_some_and(|cached| cached == presented)
+        })
     }
 
     #[cfg(test)]
@@ -220,8 +292,9 @@ where
         debug!(?options);
 
         let method = KeyValue::new("method", "get_opts");
+        let class = KeyValue::new("class", key_class(location));
 
-        REQUESTS.add(1, from_ref(&method));
+        REQUESTS.add(1, &[method.clone(), class.clone()]);
 
         if let Ok(mut guard) = self.entries.lock() {
             if let Some(entry) = guard.deref_mut().get(location) {
@@ -236,7 +309,7 @@ where
                         if cached_e_tag == presented {
                             let outcome = "hit";
 
-                            OUTCOMES.add(1, &[method, KeyValue::new("outcome", outcome)]);
+                            OUTCOMES.add(1, &[method, class, KeyValue::new("outcome", outcome)]);
                             debug!(outcome);
 
                             return Err(object_store::Error::NotModified {
@@ -247,27 +320,96 @@ where
                             let outcome = "no_match";
                             debug!(outcome);
 
-                            OUTCOMES.add(1, &[method.clone(), KeyValue::new("outcome", outcome)]);
+                            OUTCOMES.add(
+                                1,
+                                &[
+                                    method.clone(),
+                                    class.clone(),
+                                    KeyValue::new("outcome", outcome),
+                                ],
+                            );
                         }
                     } else {
                         let outcome = "miss";
 
                         debug!(outcome);
-                        OUTCOMES.add(1, &[method.clone(), KeyValue::new("outcome", outcome)]);
+                        OUTCOMES.add(
+                            1,
+                            &[
+                                method.clone(),
+                                class.clone(),
+                                KeyValue::new("outcome", outcome),
+                            ],
+                        );
                     }
                 } else {
                     let outcome = "miss";
 
                     debug!(outcome);
-                    OUTCOMES.add(1, &[method.clone(), KeyValue::new("outcome", outcome)]);
+                    OUTCOMES.add(
+                        1,
+                        &[
+                            method.clone(),
+                            class.clone(),
+                            KeyValue::new("outcome", outcome),
+                        ],
+                    );
                 }
             } else {
                 let outcome = "miss";
 
                 debug!(outcome);
-                OUTCOMES.add(1, &[method.clone(), KeyValue::new("outcome", outcome)]);
+                OUTCOMES.add(
+                    1,
+                    &[
+                        method.clone(),
+                        class.clone(),
+                        KeyValue::new("outcome", outcome),
+                    ],
+                );
             }
         }
+
+        // Single-flight the revalidation (#167): `OptiCon::with` carries no TTL of
+        // its own — it revalidates on every call — so this etag memo is what turns
+        // "every call" into "once per key per window". Concurrent callers arriving
+        // after the entry expired each paid their own conditional GET, which the
+        // store answers `304` for all of them. A wide `endOffsets(assignment)`
+        // resolves 32 partitions at once, and every read-committed consumer reads
+        // the same cluster `meta.json`, so that burst is the common case.
+        //
+        // Only a *revalidation* is serialised — a caller presenting an etag. A body
+        // read (a ranged segment GET carries no `if_none_match`) must never queue
+        // behind anything.
+        let _revalidation = if options.if_none_match.is_some() {
+            let guard = self.revalidation_stripe(location).lock().await;
+
+            // The winner refreshed the memo while we waited: answer from it instead
+            // of repeating its request. Same shape as the prefix-index
+            // single-flight, and the staleness it admits is one round trip rather
+            // than a window.
+            if let Some(presented) = options.if_none_match.as_deref()
+                && self.etag_matches(location, presented)
+            {
+                OUTCOMES.add(
+                    1,
+                    &[
+                        method.clone(),
+                        class.clone(),
+                        KeyValue::new("outcome", "coalesced"),
+                    ],
+                );
+
+                return Err(object_store::Error::NotModified {
+                    path: location.to_string(),
+                    source: Box::new(Error::PhantomCached()),
+                });
+            }
+
+            Some(guard)
+        } else {
+            None
+        };
 
         self.object_store
             .get_opts(location, options.clone())
@@ -739,6 +881,96 @@ mod tests {
             Err(object_store::Error::NotFound { .. })
         ));
         assert_eq!(1, cache.inner().get_opts()?);
+
+        Ok(())
+    }
+
+    /// #167: `OptiCon::with` has no TTL of its own — it revalidates on every call —
+    /// so after the etag memo expires, a burst of callers each paid their own
+    /// conditional GET that the store answers `304`. Measured on the fleet:
+    /// ~1,313 such round trips/s, ~83% of tier-2 volume. Concurrent revalidations
+    /// of one key must collapse to a single request, which is what the read path
+    /// generates: a wide `endOffsets(assignment)` resolves 32 partitions at once,
+    /// and every read-committed consumer reads the same cluster `meta.json`.
+    #[tokio::test]
+    async fn concurrent_revalidations_of_one_key_cost_one_request() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let path = Path::from("/abc/meta.json");
+
+        let cache = Cache::new(Counter::new(InMemory::new()), Duration::from_millis(100));
+
+        let put_result = cache
+            .put(
+                &path,
+                serde_json::to_vec(&X(6))
+                    .map(Bytes::from)
+                    .map(PutPayload::from)?,
+            )
+            .await?;
+
+        // Let the memo expire, which is the state the burst arrives in: every
+        // caller believes it must revalidate.
+        sleep(Duration::from_millis(150)).await;
+        assert_eq!(0, cache.inner().get_opts()?);
+
+        let options = GetOptions {
+            if_none_match: put_result.e_tag,
+            ..Default::default()
+        };
+
+        let outcomes =
+            futures::future::join_all((0..16).map(|_| cache.get_opts(&path, options.clone())))
+                .await;
+
+        // Every caller is told "unchanged" …
+        for outcome in &outcomes {
+            assert!(
+                matches!(outcome, Err(object_store::Error::NotModified { .. })),
+                "expected NotModified, got {outcome:?}"
+            );
+        }
+
+        // … at the cost of one round trip, not sixteen.
+        assert_eq!(
+            1,
+            cache.inner().get_opts()?,
+            "concurrent revalidations must be single-flighted (#167)"
+        );
+
+        Ok(())
+    }
+
+    /// A body read must never queue behind a revalidation: a ranged segment GET
+    /// carries no `if_none_match`, and serialising those would put the fetch path
+    /// behind unrelated metadata traffic.
+    #[tokio::test]
+    async fn body_reads_are_not_single_flighted() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let path = Path::from("/abc/00000000000000000001.seg");
+        let cache = Cache::new(Counter::new(InMemory::new()), Duration::from_millis(100));
+
+        _ = cache
+            .put(
+                &path,
+                PutPayload::from(Bytes::from_static(b"segment bytes")),
+            )
+            .await?;
+
+        let reads =
+            futures::future::join_all((0..8).map(|_| cache.get_opts(&path, GetOptions::default())))
+                .await;
+
+        for read in &reads {
+            assert!(read.is_ok(), "body read failed: {read:?}");
+        }
+
+        assert_eq!(
+            8,
+            cache.inner().get_opts()?,
+            "a body read is not a revalidation and must not be collapsed"
+        );
 
         Ok(())
     }
