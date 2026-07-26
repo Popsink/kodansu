@@ -1400,10 +1400,28 @@ struct TopicIndex {
     refreshed_at: Option<SystemTime>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+/// The per-topition durable watermark object (`watermark.json`).
+///
+/// `rest` is a catch-all for fields this binary does not model: the object is
+/// round-tripped through [`OptiCon::with_mut`] on the maintainer path every
+/// maintenance interval ([`DynoStore::expire_prefix_segments`] persists `high`,
+/// [`DynoStore::advance_low_watermark`] persists `low`), so without it a
+/// rolling deploy would let an old process silently erase any field a newer
+/// one had just written — for the upcoming truncation floor (#176) that means
+/// resurrecting records a user deleted. An empty map flattens to no bytes at
+/// all, so existing objects are not rewritten on first touch; the guard test
+/// `watermark_with_mut_preserves_unknown_fields` pins both properties.
+///
+/// (`Hash`/`Ord`/`PartialOrd` were dropped with the catch-all —
+/// [`serde_json::Value`] does not implement them — which is free: the only
+/// consumer is the [`OptiCon`] payload bound, `Clone + Debug + Default +
+/// DeserializeOwned + PartialEq + Serialize`.)
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 struct Watermark {
     low: Option<i64>,
     high: Option<i64>,
+    #[serde(flatten)]
+    rest: BTreeMap<String, serde_json::Value>,
 }
 
 impl OptiCon<Watermark> {
