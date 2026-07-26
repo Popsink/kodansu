@@ -900,9 +900,14 @@ async fn legacy_records_presence_memo_ttls_and_write_through() -> Result<(), Err
         );
     }
 
-    // Contrast: a topition that is NOT yet segment-routed (no segment) keeps the
-    // SHORT TTL, so a drain / first segment / legacy write is still picked up
-    // within seconds — the long window is confined to the provably-safe case.
+    // Contrast: a coalesced topition that is NOT yet segment-routed gets the
+    // MIDDLE window (#166), not the seconds-long one this test originally
+    // asserted. Confining the long window to already-segmented sub-streams left
+    // every idle stream — and every partition with a cold memo after a restart —
+    // re-listing `records/` per poll, which measured as the dominant tier-1
+    // request source in production. It is still not given the full hour: this is
+    // the case we have the least evidence about, and the failure it bounds (a
+    // stream that reads as empty) is more visible than a lagging tail.
     {
         let (storage, _counters) = coalesce_store();
         create(&storage, "org.env.conn.cold", 1).await?;
@@ -910,9 +915,9 @@ async fn legacy_records_presence_memo_ttls_and_write_through() -> Result<(), Err
 
         assert!(!storage.has_legacy_records(&topition).await?);
         assert_eq!(
-            Some(DynoStore::HIGH_WATERMARK_HINT_TTL),
+            Some(DynoStore::LEGACY_ABSENCE_UNSEGMENTED_TTL),
             memo_ttl(&storage, &topition),
-            "a topition without a segment keeps the short TTL"
+            "a coalesced topition without a segment holds its negative for minutes"
         );
     }
 
@@ -1292,4 +1297,264 @@ fn every_listing_is_attributed_to_a_call_site() {
          DynoStore::scan/scan_from/scan_delimited is invisible to \
          tansu_object_store_list_scans (#165)"
     );
+}
+
+/// #166: a prefix-coalesced partition with no segment yet must not re-list
+/// `records/` on the read path every few seconds. That short TTL applied to every
+/// idle stream and to every partition whose memo was cold after a restart, which
+/// made the legacy probe the dominant tier-1 request source in production
+/// (~1,200 LIST/s metered, ~85% of the bill, stepping up on each consumer
+/// restart). The write-through still has to win over the longer window, or a
+/// legacy batch written here would be invisible to our own next read.
+#[tokio::test]
+async fn legacy_probe_is_not_relisted_for_a_segmentless_coalesced_partition() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let counters = Arc::new(Counters::default());
+    let storage = DynoStore::new(
+        CLUSTER,
+        NODE,
+        Counting {
+            inner: InMemory::new(),
+            counters: counters.clone(),
+        },
+    )
+    .prefix_coalesce(true)
+    .prefix_leaseless(true);
+
+    let topic = "org.env.conn.idle";
+    create(&storage, topic, 1).await?;
+    let tp = Topition::new(topic, 0);
+
+    // No produce: the sub-stream owns no segment, which is the population that
+    // used to re-list every `HIGH_WATERMARK_HINT_TTL`.
+    counters.reset();
+    assert!(!storage.has_legacy_records(&tp).await?);
+    let first = counters.report("first legacy probe");
+    assert!(
+        first.2 >= 1,
+        "the first probe lists records/ once: {first:?}"
+    );
+
+    // Repeated polls are served from the memo: no further listing at all.
+    counters.reset();
+    for _ in 0..8 {
+        assert!(!storage.has_legacy_records(&tp).await?);
+    }
+    let repeated = counters.report("8 further legacy probes");
+    assert_eq!(
+        (0, 0, 0, 0, 0),
+        repeated,
+        "a segment-less coalesced partition must not re-list records/ per poll"
+    );
+
+    // A legacy write on this process is visible immediately — the longer window
+    // must never outrank the write-through.
+    storage.note_legacy_records_present(&tp)?;
+    assert!(
+        storage.has_legacy_records(&tp).await?,
+        "a legacy write here must flip the memo at once"
+    );
+
+    Ok(())
+}
+
+/// #166 companion: the graduated windows are ordered as intended — a segment-less
+/// coalesced partition is held for minutes, a segment-routed one for the full
+/// hour, and anything outside prefix coalescing keeps the seconds-long window
+/// where a first legacy write is expected.
+#[test]
+fn legacy_absence_windows_are_graduated() {
+    assert!(DynoStore::HIGH_WATERMARK_HINT_TTL < DynoStore::LEGACY_ABSENCE_UNSEGMENTED_TTL);
+    assert!(DynoStore::LEGACY_ABSENCE_UNSEGMENTED_TTL < DynoStore::LEGACY_ABSENCE_TTL);
+}
+
+/// An `ObjectStore` counting GETs of the per-partition `watermark.json` object,
+/// so a test can pin that a read path does not touch it (#161).
+#[derive(Clone)]
+struct CountWatermarkGets<O> {
+    inner: O,
+    gets: Arc<AtomicU64>,
+}
+
+impl<O> Debug for CountWatermarkGets<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CountWatermarkGets").finish()
+    }
+}
+
+impl<O> Display for CountWatermarkGets<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CountWatermarkGets").finish()
+    }
+}
+
+#[async_trait]
+impl<O> ObjectStore for CountWatermarkGets<O>
+where
+    O: ObjectStore,
+{
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult, object_store::Error> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> Result<GetResult, object_store::Error> {
+        if location.as_ref().ends_with("watermark.json") {
+            _ = self.gets.fetch_add(1, Relaxed);
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path, object_store::Error>>,
+    ) -> BoxStream<'static, Result<Path, object_store::Error>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> Result<ListResult, object_store::Error> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: CopyOptions,
+    ) -> Result<(), object_store::Error> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+}
+
+/// #161: read-committed polling of a pure-segment sub-stream must not GET
+/// `watermark.json`. It is authoritatively silent about the log start there —
+/// only the legacy `records/` retention paths ever advance `watermark.low` — and
+/// polling it measured ~1490 GET/s returning `404 NoSuchKey` at ~1,600
+/// subscriptions: round-trips that resolve nothing, add fetch latency, and are
+/// billable on a store that charges 4xx. The reported offsets must not change.
+#[tokio::test]
+async fn read_committed_polling_does_not_get_watermark_json() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let gets = Arc::new(AtomicU64::new(0));
+    let storage = DynoStore::new(
+        CLUSTER,
+        NODE,
+        CountWatermarkGets {
+            inner: InMemory::new(),
+            gets: gets.clone(),
+        },
+    )
+    .prefix_coalesce(true)
+    .prefix_leaseless(true);
+
+    let topic = "org.env.conn.committed";
+    create(&storage, topic, 1).await?;
+    let tp = Topition::new(topic, 0);
+
+    for n in 0..4 {
+        _ = storage
+            .produce(None, &tp, batch(format!("m-{n}").as_bytes())?)
+            .await?;
+    }
+
+    // Read-uncommitted was already off this object (#109) — the baseline.
+    let uncommitted = storage
+        .offset_stage_at(&tp, IsolationLevel::ReadUncommitted)
+        .await?;
+
+    gets.store(0, Relaxed);
+
+    for _ in 0..16 {
+        let committed = storage
+            .offset_stage_at(&tp, IsolationLevel::ReadCommitted)
+            .await?;
+
+        assert_eq!(4, committed.high_watermark);
+        assert_eq!(4, committed.last_stable, "no open transaction");
+        assert_eq!(
+            uncommitted.log_start, committed.log_start,
+            "the log start must not change with the isolation level"
+        );
+        assert!(committed.aborted.is_empty());
+    }
+
+    assert_eq!(
+        0,
+        gets.load(Relaxed),
+        "16 read-committed polls must not GET watermark.json (#161)"
+    );
+
+    Ok(())
+}
+
+/// #161: the fallback stays where `watermark.low` really does carry the log
+/// start. A legacy sub-stream's log start is advanced by the `records/` retention
+/// path, and read-committed must keep reporting it — skipping the read there would
+/// report a log start below the oldest surviving record.
+#[tokio::test]
+async fn legacy_log_start_still_comes_from_the_watermark() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let (storage, _counters) = store();
+
+    let topic = "legacy-topic";
+    create(&storage, topic, 1).await?;
+    let tp = Topition::new(topic, 0);
+    for n in 0..4 {
+        _ = storage
+            .produce(None, &tp, batch(format!("m-{n}").as_bytes())?)
+            .await?;
+    }
+
+    // What the legacy retention path records once it has drained the oldest
+    // batches.
+    storage.advance_low_watermark(&tp, Some(2)).await?;
+
+    let stage = storage
+        .offset_stage_at(&tp, IsolationLevel::ReadCommitted)
+        .await?;
+
+    assert_eq!(4, stage.high_watermark);
+    assert_eq!(
+        2, stage.log_start,
+        "a legacy sub-stream reports the drained log start from watermark.low"
+    );
+
+    Ok(())
 }

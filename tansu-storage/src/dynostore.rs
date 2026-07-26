@@ -1707,6 +1707,34 @@ impl DynoStore {
     /// symmetric to [`Self::RETENTION_EMPTY_SKIP_TTL`].
     const LEGACY_ABSENCE_TTL: Duration = Duration::from_secs(60 * 60);
 
+    /// How long a *negative* `has_legacy_records` result is served for a
+    /// prefix-coalesced topition that does **not** yet own a segment (#166).
+    ///
+    /// [`Self::LEGACY_ABSENCE_TTL`] was made conditional on already owning a
+    /// segment, so everything else — every idle stream not yet flushed into a
+    /// prefix segment, and every partition whose memo is cold after a restart —
+    /// fell back to [`Self::HIGH_WATERMARK_HINT_TTL`] and re-listed `records/`
+    /// every few seconds on the read path. At a large subscription count that was
+    /// the dominant tier-1 request source: LIST metered ~1,200/s, ~85% of the
+    /// bill, and it stepped up exactly when consumer targets restarted.
+    ///
+    /// A segment-less coalesced sub-stream has no more reason to hold legacy
+    /// objects than a segment-routed one — the segment write path never creates
+    /// them either — so the short window bought very little. It is not given the
+    /// full hour, though: for a stream we have never seen a segment for, the
+    /// "only a txn/control/backfill batch on another replica can flip this"
+    /// argument behind the hour is the least evidenced, and the failure it bounds
+    /// is more visible (a stream that reads as *empty*, rather than a tail that
+    /// lags). Minutes cut the LIST rate ~60x while keeping that worst case short;
+    /// a legacy write on this process still flips the memo at once
+    /// ([`Self::note_legacy_records_present`]).
+    ///
+    /// The remaining cross-replica window is inherent to a per-process memo. The
+    /// durable fix is to seal the legacy region per prefix so an invalidation is
+    /// visible to every replica (#166), which also retires the per-partition probe
+    /// entirely.
+    const LEGACY_ABSENCE_UNSEGMENTED_TTL: Duration = Duration::from_secs(5 * 60);
+
     /// Default debounce window for persisting a producer's `producers/{id}.json`
     /// (#48): the durable object is checkpointed after at most this many
     /// idempotent batches have advanced its in-memory sequence. Overridable per
@@ -4318,15 +4346,24 @@ impl DynoStore {
         // segment-routed (prefix-coalesced and already owning a segment): its
         // only legacy objects are the `[0, C)` seam, which retention only
         // shrinks and the segment write path never re-creates. Hold that for the
-        // long window; everything else (any positive, or a topition without a
-        // segment yet) keeps the short TTL so a change is seen within seconds.
-        let ttl = if !present
-            && self.prefix_coalesce
-            && self.segment_region_start(topition).await?.is_some()
-        {
+        // long window.
+        //
+        // A coalesced topition with no segment yet gets the middle window (#166):
+        // it has no more reason to hold legacy objects, but it is the case we have
+        // the least evidence about, so its staleness is bounded in minutes rather
+        // than the hour. Re-listing it every few seconds — which is what it used
+        // to do, for every idle stream and after every restart — was the dominant
+        // tier-1 request source in production.
+        //
+        // A positive result, or a topition outside prefix coalescing, keeps the
+        // short TTL: there a drain (`true`->`false`) or a first legacy write is
+        // expected, and must be seen within seconds.
+        let ttl = if present || !self.prefix_coalesce {
+            Self::HIGH_WATERMARK_HINT_TTL
+        } else if self.segment_region_start(topition).await?.is_some() {
             Self::LEGACY_ABSENCE_TTL
         } else {
-            Self::HIGH_WATERMARK_HINT_TTL
+            Self::LEGACY_ABSENCE_UNSEGMENTED_TTL
         };
 
         _ = self.legacy_records_present.lock().map(|mut cache| {
