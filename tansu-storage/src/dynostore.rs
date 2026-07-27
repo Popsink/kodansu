@@ -904,9 +904,10 @@ const SEGMENT_MAGIC: u32 = 0x5453_4547;
 /// coordinates for log-based idempotent dedup (#88). Versioned so footer fields
 /// stay forward-compatible.
 ///
-/// This is the version the **lease-mode** writer (#59) emits. Readers accept `1`
-/// and `2` (see [`Self::decode_segment_footer`]); the version is chosen by the
-/// write path, not by a global switch — see [`SEGMENT_FORMAT_VERSION_V2`].
+/// This is the version the **lease-mode** writer (#59) emits. Readers accept
+/// `1`, `2` and `3` (see [`Self::decode_segment_footer`]); the version is
+/// chosen by the write path, not by a global switch — see
+/// [`SEGMENT_FORMAT_VERSION_V2`] and [`SEGMENT_FORMAT_VERSION_V3`].
 const SEGMENT_FORMAT_VERSION: u16 = 1;
 
 /// Segment format version carrying the v2 footer additions (#87): a per-flush
@@ -918,6 +919,25 @@ const SEGMENT_FORMAT_VERSION: u16 = 1;
 /// bumping [`SEGMENT_FORMAT_VERSION`]: the two versions coexist per prefix
 /// according to the writer regime, and both stay readable.
 const SEGMENT_FORMAT_VERSION_V2: u16 = 2;
+
+/// Segment format version adding a per-coordinate `flags: u8` (#174): bit 0 =
+/// transactional, bit 1 = control, bits 2-7 written 0 and ignored on read. The
+/// flags let the footer index transactional data batches and transaction
+/// markers (control batches) once those are routed into segments.
+///
+/// **Accepted on read, not yet emitted** — reader-first, in two releases, like
+/// the watermark field-erasure fix (#182). [`Self::decode_segment_footer`]
+/// hard-errors on an unknown version, and that error propagates through the
+/// index refresh into fetch: a broker meeting a segment version it does not
+/// know suffers a partition-wide read outage, not a graceful skip. Nor is the
+/// blast radius confined to this fleet — external S3-direct readers
+/// (kotatsu#82) decode these segments with the same version rejection, which
+/// the contract requires of them (`docs/virtual-topics-format.md`). So every
+/// reader must accept v3 before any writer emits it. The writer flip
+/// ([`Self::encode_segment_v2`] and the compaction re-encode, together with
+/// the transactional routing change) is release B of #174 and lands only once
+/// the v3-reading fleet — internal and external — is fully rolled.
+const SEGMENT_FORMAT_VERSION_V3: u16 = 3;
 
 /// Fixed-size trailer at the very end of every multi-topic segment (#64):
 /// `footer_len (u64) + entry_count (u32) + version (u16) + magic (u32)`. A
@@ -967,11 +987,11 @@ struct SubstreamEntry {
     producers: Vec<ProducerCoord>,
 }
 
-/// One idempotent/transactional batch's producer coordinates as carried in a v2
-/// segment footer (#87). `offset_delta` is the batch's base offset *relative to
-/// its sub-stream's* `base_offset` (so it survives the offset re-derivation on a
-/// conflict-correction re-encode); `last_sequence` is `base_sequence +
-/// (record_count - 1)`.
+/// One idempotent/transactional batch's producer coordinates as carried in a
+/// v2 segment footer (#87), plus a `flags` byte at v3 (#174). `offset_delta`
+/// is the batch's base offset *relative to its sub-stream's* `base_offset` (so
+/// it survives the offset re-derivation on a conflict-correction re-encode);
+/// `last_sequence` is `base_sequence + (record_count - 1)`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ProducerCoord {
     producer_id: i64,
@@ -979,6 +999,16 @@ struct ProducerCoord {
     base_sequence: i32,
     last_sequence: i32,
     offset_delta: u32,
+    /// Batch classification flags, carried on disk from footer v3 (#174):
+    /// bit 0 = transactional (wire-batch attribute bit 4), bit 1 = control
+    /// (attribute bit 5, a transaction marker); bits 2-7 are written 0 and
+    /// ignored on read. Always `0` when decoded from a v1/v2 footer — those
+    /// layouts carry no flags byte — and `0` on everything the current v2
+    /// writer encodes, so existing code paths see exactly the pre-v3 value.
+    /// Re-derivable from the batch attribute bits, so the compaction re-encode
+    /// carries flags forward for free once the writer flips to v3 (release B
+    /// of #174).
+    flags: u8,
 }
 
 /// Kafka's per-producer duplicate window: the last five batches are retained so
@@ -7358,6 +7388,11 @@ impl DynoStore {
                         base_sequence: batch.base_sequence,
                         last_sequence: batch.base_sequence.wrapping_add(batch.last_offset_delta),
                         offset_delta,
+                        // v2 carries no flags byte; deriving flags from the
+                        // batch attribute bits (and widening the emission rule
+                        // to control batches) comes with the v3 writer,
+                        // release B of #174.
+                        flags: 0,
                     });
                 }
                 record_count += batch.last_offset_delta as i64 + 1;
@@ -7397,11 +7432,16 @@ impl DynoStore {
     /// topic (utf8) + partition (i32) + base_offset (i64) + record_count (i64) +
     /// byte_start (u64) + byte_len (u64) + max_timestamp (i64)`, plus at v2
     /// `pcoord_count (u16)` and that many `producer_id (i64) + producer_epoch
-    /// (i16) + base_sequence (i32) + last_sequence (i32) + offset_delta (u32)` —
-    /// all big-endian. Paired with [`Self::decode_footer`]; the external contract
-    /// is `docs/virtual-topics-format.md`.
+    /// (i16) + base_sequence (i32) + last_sequence (i32) + offset_delta (u32)`,
+    /// plus at v3 a per-coordinate `flags (u8)` (#174) — all big-endian. Asked
+    /// for v2, this MUST keep emitting the exact pre-v3 bytes (`flags` is
+    /// dropped, not zero-filled): deployed readers, internal and S3-direct
+    /// external, decode v2 by that byte layout. Paired with
+    /// [`Self::decode_footer`]; the external contract is
+    /// `docs/virtual-topics-format.md`.
     fn encode_footer(footer: &SegmentFooter, version: u16) -> Vec<u8> {
         let v2 = version >= SEGMENT_FORMAT_VERSION_V2;
+        let v3 = version >= SEGMENT_FORMAT_VERSION_V3;
         let mut buf = Vec::new();
         buf.extend_from_slice(&footer.writer_epoch.to_be_bytes());
         if v2 {
@@ -7425,6 +7465,9 @@ impl DynoStore {
                     buf.extend_from_slice(&pc.base_sequence.to_be_bytes());
                     buf.extend_from_slice(&pc.last_sequence.to_be_bytes());
                     buf.extend_from_slice(&pc.offset_delta.to_be_bytes());
+                    if v3 {
+                        buf.push(pc.flags);
+                    }
                 }
             }
         }
@@ -7440,6 +7483,7 @@ impl DynoStore {
         version: u16,
     ) -> Result<SegmentFooter> {
         let v2 = version >= SEGMENT_FORMAT_VERSION_V2;
+        let v3 = version >= SEGMENT_FORMAT_VERSION_V3;
         let mut entries = Vec::with_capacity(entry_count);
         let mut cursor = footer_bytes;
 
@@ -7480,6 +7524,10 @@ impl DynoStore {
                         base_sequence: i32::from_be_bytes(take(&mut cursor, 4)?.try_into()?),
                         last_sequence: i32::from_be_bytes(take(&mut cursor, 4)?.try_into()?),
                         offset_delta: u32::from_be_bytes(take(&mut cursor, 4)?.try_into()?),
+                        // v3 appends one flags byte per coordinate (#174); a
+                        // v1/v2 footer has no such byte and decodes to 0, the
+                        // exact value pre-v3 code observed.
+                        flags: if v3 { take(&mut cursor, 1)?[0] } else { 0 },
                     });
                 }
                 producers
@@ -7526,7 +7574,17 @@ impl DynoStore {
         let footer_len = u64::from_be_bytes(trailer[0..8].try_into()?) as usize;
         let entry_count = u32::from_be_bytes(trailer[8..12].try_into()?) as usize;
         let version = u16::from_be_bytes(trailer[12..14].try_into()?);
-        if version != SEGMENT_FORMAT_VERSION && version != SEGMENT_FORMAT_VERSION_V2 {
+        // v3 is accepted one release before anything writes it (#174): this
+        // rejection is a hard error that propagates through the index refresh
+        // into fetch, so a reader that lacks a version suffers a partition-wide
+        // read outage the moment a writer emits it — see
+        // [`SEGMENT_FORMAT_VERSION_V3`]. Rejecting every *other* version stays:
+        // it is the external contract's MUST (`docs/virtual-topics-format.md`),
+        // and guessing at an unknown layout would mis-decode, not degrade.
+        if version != SEGMENT_FORMAT_VERSION
+            && version != SEGMENT_FORMAT_VERSION_V2
+            && version != SEGMENT_FORMAT_VERSION_V3
+        {
             return Err(Error::Message(format!(
                 "unsupported segment format version {version}"
             )));

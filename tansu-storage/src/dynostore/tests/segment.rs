@@ -30,8 +30,8 @@ use crate::{
     Error, Result, Topition,
     dynostore::{
         CoalesceTuning, DynoStore, IdempotentClass, ProducerCoord, ProducerTail,
-        SEGMENT_FORMAT_VERSION_V2, SEGMENT_MAGIC, SEGMENT_TRAILER_LEN, SegmentFooter,
-        SubstreamEntry,
+        SEGMENT_FORMAT_VERSION_V2, SEGMENT_FORMAT_VERSION_V3, SEGMENT_MAGIC, SEGMENT_TRAILER_LEN,
+        SegmentFooter, SubstreamEntry,
     },
 };
 
@@ -210,6 +210,7 @@ fn footer_v2_round_trips_producer_coords_and_nonce() -> Result<(), Error> {
                         base_sequence: 0,
                         last_sequence: 2,
                         offset_delta: 0,
+                        flags: 0,
                     },
                     ProducerCoord {
                         producer_id: 7,
@@ -217,6 +218,7 @@ fn footer_v2_round_trips_producer_coords_and_nonce() -> Result<(), Error> {
                         base_sequence: 3,
                         last_sequence: 4,
                         offset_delta: 3,
+                        flags: 0,
                     },
                 ],
             },
@@ -247,6 +249,190 @@ fn footer_v2_round_trips_producer_coords_and_nonce() -> Result<(), Error> {
         .decode_segment_footer(&tail)?
         .expect("v2 footer must decode");
     assert_eq!(footer, decoded);
+
+    Ok(())
+}
+
+/// A v2 footer encodes to the exact bytes of the published v2 contract
+/// (`docs/virtual-topics-format.md`), pinned as a golden vector — even when
+/// the in-memory [`ProducerCoord`] carries nonzero v3 `flags` (#174), which
+/// v2 must drop, not zero-fill. Without this, a change to `ProducerCoord` or
+/// `encode_footer` (such as the v3 `flags` field) could silently alter the
+/// bytes of v2 objects — which every deployed reader, including S3-direct
+/// external ones (kotatsu#82), decodes by this layout. The golden bytes were
+/// captured from the encoder *before* the v3 change landed, so passing here is
+/// byte-identity with what production has always written, not with whatever
+/// the encoder currently does.
+#[test]
+fn footer_v2_encoding_is_byte_identical_to_golden() -> Result<(), Error> {
+    let store = store();
+
+    let footer = SegmentFooter {
+        writer_epoch: 1,
+        nonce: 2,
+        entries: vec![SubstreamEntry {
+            topic: "t".into(),
+            partition: 3,
+            base_offset: 4,
+            record_count: 5,
+            byte_start: 6,
+            byte_len: 7,
+            max_timestamp: 8,
+            producers: vec![ProducerCoord {
+                producer_id: 9,
+                producer_epoch: 10,
+                base_sequence: 11,
+                last_sequence: 12,
+                offset_delta: 13,
+                // Nonzero on purpose: a v2 encode must not let flags reach the
+                // bytes at all.
+                flags: 0b11,
+            }],
+        }],
+    };
+
+    #[rustfmt::skip]
+    const GOLDEN_V2: [u8; 87] = [
+        0, 0, 0, 0, 0, 0, 0, 1,     // writer_epoch i64
+        0, 0, 0, 0, 0, 0, 0, 2,     // nonce u64 (v2)
+        0, 1,                       // topic_len u16
+        b't',                       // topic
+        0, 0, 0, 3,                 // partition i32
+        0, 0, 0, 0, 0, 0, 0, 4,     // base_offset i64
+        0, 0, 0, 0, 0, 0, 0, 5,     // record_count i64
+        0, 0, 0, 0, 0, 0, 0, 6,     // byte_start u64
+        0, 0, 0, 0, 0, 0, 0, 7,     // byte_len u64
+        0, 0, 0, 0, 0, 0, 0, 8,     // max_timestamp i64
+        0, 1,                       // pcoord_count u16 (v2)
+        0, 0, 0, 0, 0, 0, 0, 9,     // producer_id i64
+        0, 10,                      // producer_epoch i16
+        0, 0, 0, 11,                // base_sequence i32
+        0, 0, 0, 12,                // last_sequence i32
+        0, 0, 0, 13,                // offset_delta u32
+    ];
+
+    let encoded = DynoStore::encode_footer(&footer, SEGMENT_FORMAT_VERSION_V2);
+    assert_eq!(GOLDEN_V2.as_slice(), encoded.as_slice());
+
+    // And a v2 decode observes flags = 0 — the layout has no flags byte, so
+    // pre-v3 behaviour is bit-for-bit unchanged on existing objects.
+    let mut tail = encoded.clone();
+    tail.extend_from_slice(&(encoded.len() as u64).to_be_bytes());
+    tail.extend_from_slice(&(footer.entries.len() as u32).to_be_bytes());
+    tail.extend_from_slice(&SEGMENT_FORMAT_VERSION_V2.to_be_bytes());
+    tail.extend_from_slice(&SEGMENT_MAGIC.to_be_bytes());
+
+    let decoded = store
+        .decode_segment_footer(&tail)?
+        .expect("v2 footer must decode");
+    assert_eq!(0, decoded.entries[0].producers[0].flags);
+
+    Ok(())
+}
+
+/// A v3 footer (per-coordinate `flags` byte, #174) round-trips through
+/// `encode_footer` / `decode_segment_footer` with the flags preserved, and the
+/// reader accepts version 3 alongside 1 and 2. Without this, the reader-first
+/// release of #174 ships nothing: the whole point of release A is that every
+/// broker accepts v3 *before* any writer emits it, because an unaccepted
+/// version is a hard `decode_segment_footer` error that turns into a
+/// partition-wide read outage. (The writer still emits v2 until release B;
+/// this pins the v3 layout so those segments are readable once it flips.)
+#[test]
+fn footer_v3_round_trips_producer_coords_with_flags() -> Result<(), Error> {
+    let store = store();
+
+    let footer = SegmentFooter {
+        writer_epoch: 9,
+        nonce: 0x0123_4567_89ab_cdef,
+        entries: vec![SubstreamEntry {
+            topic: "org.env.conn.tab_a".into(),
+            partition: 0,
+            base_offset: 100,
+            record_count: 6,
+            byte_start: 0,
+            byte_len: 42,
+            max_timestamp: 1_700_000_000_000,
+            producers: vec![
+                // A plain idempotent batch: no flags set.
+                ProducerCoord {
+                    producer_id: 7,
+                    producer_epoch: 3,
+                    base_sequence: 0,
+                    last_sequence: 2,
+                    offset_delta: 0,
+                    flags: 0,
+                },
+                // A transactional data batch: bit 0.
+                ProducerCoord {
+                    producer_id: 7,
+                    producer_epoch: 3,
+                    base_sequence: 3,
+                    last_sequence: 4,
+                    offset_delta: 3,
+                    flags: 0b01,
+                },
+                // A transaction marker (control batch): bits 0 and 1, and the
+                // non-idempotent -1 sequences a marker carries.
+                ProducerCoord {
+                    producer_id: 7,
+                    producer_epoch: 3,
+                    base_sequence: -1,
+                    last_sequence: -1,
+                    offset_delta: 5,
+                    flags: 0b11,
+                },
+            ],
+        }],
+    };
+
+    let footer_bytes = DynoStore::encode_footer(&footer, SEGMENT_FORMAT_VERSION_V3);
+    let mut tail = footer_bytes.clone();
+    tail.extend_from_slice(&(footer_bytes.len() as u64).to_be_bytes());
+    tail.extend_from_slice(&(footer.entries.len() as u32).to_be_bytes());
+    tail.extend_from_slice(&SEGMENT_FORMAT_VERSION_V3.to_be_bytes());
+    tail.extend_from_slice(&SEGMENT_MAGIC.to_be_bytes());
+
+    let decoded = store
+        .decode_segment_footer(&tail)?
+        .expect("v3 footer must decode");
+    assert_eq!(footer, decoded);
+
+    Ok(())
+}
+
+/// A trailer carrying an unknown version (4) is still rejected, loudly. The
+/// external contract (`docs/virtual-topics-format.md`) says a reader MUST
+/// accept {1, 2, 3} and MUST reject anything else rather than guessing — an
+/// unknown layout would mis-decode, not degrade. Without this, widening the
+/// accepted set for v3 (#174) could accidentally have become "accept
+/// anything", silently discarding the contract's rejection MUST.
+#[test]
+fn footer_rejects_unknown_version() -> Result<(), Error> {
+    let store = store();
+
+    let footer = SegmentFooter {
+        writer_epoch: 1,
+        nonce: 2,
+        entries: vec![],
+    };
+
+    let footer_bytes = DynoStore::encode_footer(&footer, SEGMENT_FORMAT_VERSION_V3);
+    let mut tail = footer_bytes.clone();
+    tail.extend_from_slice(&(footer_bytes.len() as u64).to_be_bytes());
+    tail.extend_from_slice(&0u32.to_be_bytes());
+    tail.extend_from_slice(&4u16.to_be_bytes());
+    tail.extend_from_slice(&SEGMENT_MAGIC.to_be_bytes());
+
+    let error = store
+        .decode_segment_footer(&tail)
+        .expect_err("version 4 must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("unsupported segment format version 4"),
+        "unexpected error: {error}"
+    );
 
     Ok(())
 }
