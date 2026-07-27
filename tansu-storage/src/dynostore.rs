@@ -1041,6 +1041,13 @@ struct SubstreamEntry {
     producers: Vec<ProducerCoord>,
 }
 
+/// [`ProducerCoord::flags`] bit 1 (#174): the batch is a control batch — a
+/// transaction marker (wire-batch attribute bit 5). A marker coordinate is
+/// placement metadata, not an idempotent sequence: it carries
+/// `base_sequence = last_sequence = -1` and MUST NOT fold into a
+/// [`ProducerTail`] (see [`DynoStore::producer_tail_folded`]).
+const FLAG_CONTROL: u8 = 0b10;
+
 /// One idempotent/transactional batch's producer coordinates as carried in a
 /// v2 segment footer (#87), plus a `flags` byte at v3 (#174). `offset_delta`
 /// is the batch's base offset *relative to its sub-stream's* `base_offset` (so
@@ -6003,6 +6010,15 @@ impl DynoStore {
     /// function of the folded footer set, two replicas that have observed the
     /// same segments derive an identical tail — the property that makes the
     /// dedup state converge across a connection migration.
+    ///
+    /// Transaction-marker (control) coordinates are skipped (#174): a marker
+    /// carries `base_sequence = last_sequence = -1`, so folding it would set
+    /// `next_sequence` to `seq_increment(-1) = 0` and mark the tail seen —
+    /// misclassifying the producer's genuine next in-order data batch as
+    /// `OutOfOrder`. Markers are placement metadata in the footer, never part
+    /// of the idempotent sequence stream. Transactional *data* coordinates
+    /// carry real sequences and fold normally — they are the dedup authority
+    /// for those batches.
     fn producer_tail_folded(
         &self,
         prefix: &str,
@@ -6014,6 +6030,12 @@ impl DynoStore {
             self.valid_substream_segments(prefix, topition.topic(), topition.partition())?
         {
             for pc in &entry.producers {
+                // Belt and braces: `base_sequence == -1` also catches any
+                // future non-sequenced coordinate that lacks the flag (a v2
+                // footer decodes with `flags == 0`).
+                if pc.flags & FLAG_CONTROL != 0 || pc.base_sequence == -1 {
+                    continue;
+                }
                 if pc.producer_id == producer_id {
                     tail.fold(
                         pc.producer_epoch,

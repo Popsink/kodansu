@@ -520,6 +520,83 @@ async fn tail_next_seq_folded_derives_from_index_and_floor() -> Result<(), Error
     Ok(())
 }
 
+/// #174: a transaction-marker (control) coordinate in a v3 footer must NOT
+/// fold into the producer tail. A marker carries `base_sequence =
+/// last_sequence = -1`; folding it would set `next_sequence` to
+/// `seq_increment(-1) = 0` and mark the tail seen, so the producer's genuine
+/// next in-order data batch (at sequence N) would classify `OutOfOrder` and
+/// the produce would be rejected — dedup corrupted by placement metadata.
+/// Transactional *data* coordinates carry real sequences and must keep
+/// folding: they are the dedup authority for those batches.
+#[tokio::test]
+async fn control_coordinate_does_not_fold_into_producer_tail() -> Result<(), Error> {
+    let store = store();
+    let prefix = "org.env.conn";
+    let topic = "org.env.conn.tab_a";
+    let tp = Topition::new(topic, 0);
+
+    // One segment: two idempotent data batches (seq 0, then 1..=2 — the second
+    // transactional) followed by the producer's commit marker, as the v3
+    // writer indexes them.
+    store.index_insert(
+        prefix,
+        0,
+        SegmentFooter {
+            writer_epoch: 1,
+            nonce: 42,
+            entries: vec![SubstreamEntry {
+                topic: topic.into(),
+                partition: 0,
+                base_offset: 0,
+                record_count: 4,
+                byte_start: 0,
+                byte_len: 64,
+                max_timestamp: 0,
+                producers: vec![
+                    ProducerCoord {
+                        producer_id: 7,
+                        producer_epoch: 0,
+                        base_sequence: 0,
+                        last_sequence: 0,
+                        offset_delta: 0,
+                        flags: 0,
+                    },
+                    ProducerCoord {
+                        producer_id: 7,
+                        producer_epoch: 0,
+                        base_sequence: 1,
+                        last_sequence: 2,
+                        offset_delta: 1,
+                        flags: 0b01,
+                    },
+                    // The commit marker: control + transactional, no sequence.
+                    ProducerCoord {
+                        producer_id: 7,
+                        producer_epoch: 0,
+                        base_sequence: -1,
+                        last_sequence: -1,
+                        offset_delta: 3,
+                        flags: 0b11,
+                    },
+                ],
+            }],
+        },
+        0,
+    )?;
+
+    let tail = store.producer_tail_folded(prefix, &tp, 7)?;
+
+    // The tail reflects the data batches only: next in order is sequence 3.
+    // Had the marker folded, expected() would be seq_increment(-1) = 0 and
+    // sequence 3 would classify OutOfOrder.
+    assert_eq!(IdempotentClass::Admit, tail.classify(0, 3));
+    // The transactional data batch folded normally: its retry is a duplicate
+    // acked with the original offset.
+    assert_eq!(IdempotentClass::Duplicate(1), tail.classify(0, 1));
+
+    Ok(())
+}
+
 /// #91: the coalesce linger is jittered ±20% per flush so independent pods
 /// de-phase and stop racing the create of the same next segment name. Every
 /// draw stays within the band, and across many draws we actually observe spread
