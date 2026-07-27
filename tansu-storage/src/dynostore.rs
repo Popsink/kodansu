@@ -251,6 +251,21 @@ pub struct DynoStore {
     /// this on fleet-wide. See `docs/design-multiwriter-segments.md`.
     prefix_leaseless: bool,
 
+    /// When set (with `prefix_coalesce`), a compacted topic (`cleanup.policy`
+    /// containing `compact`) is segment-routed like any other topic, but under
+    /// its **own** dedicated prefix — the full topic name — instead of
+    /// [`Self::prefix_of`]'s first-three-components connector prefix (#175). A
+    /// dedicated prefix is what keeps whole-segment expiry (#61) away from a
+    /// compacted topic's old-but-latest keys: a shared segment is deleted on
+    /// the *prefix's* retention, which would erase a compacted sibling's only
+    /// copy of a key. Off by default: with the flag off, compacted topics keep
+    /// the legacy `records/` produce path and every routing decision is
+    /// byte-identical to today — the property a mixed-version fleet depends on
+    /// (an old pod resolving a different prefix than a new one is the #78-class
+    /// dual-offset-authority hazard), so the flag is flipped only on a uniform
+    /// fleet.
+    compacted_segments: bool,
+
     /// Per-prefix coalescing buffer (#57), used only when
     /// [`Self::prefix_coalesce`] is set. Like [`Self::coalesce`] but keyed by
     /// prefix, so one buffer accumulates `PrefixPending` batches across many
@@ -367,6 +382,14 @@ pub struct DynoStore {
     prefix_compact_min_segments: usize,
     prefix_compact_target_bytes: usize,
     prefix_compact_keep_hot: usize,
+
+    /// Bound on the per-key pass's `seen` key set for one partition (#175). The
+    /// set is O(distinct keys per partition) — identical to the legacy
+    /// compactor's — but a pathological keyspace could balloon a maintainer's
+    /// memory; past the cap the pass aborts that partition for this tick
+    /// (removing nothing — never corrupting), rather than growing unbounded. A
+    /// Kafka-style dirty map is the follow-up if a real workload hits this.
+    prefix_compact_seen_keys: usize,
 
     /// Recency window for stateless maintenance scheduling (#126): a prefix
     /// whose compaction lease was last acquired within this window is skipped by
@@ -720,6 +743,8 @@ pub struct CoalesceTuning {
     pub prefix_compact_min_segments: Option<usize>,
     pub prefix_compact_target_bytes: Option<usize>,
     pub prefix_compact_keep_hot: Option<usize>,
+    /// Per-partition `seen` key-set cap for the per-key compaction pass (#175).
+    pub prefix_compact_seen_keys: Option<usize>,
     /// Maintenance recency window (#126); set to ~0.9× `maintenance_interval`.
     pub maintenance_recency: Option<Duration>,
 }
@@ -742,6 +767,17 @@ static SEGMENT_COMPACTIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_prefix_segment_compactions")
         .with_description("segments merged away by prefix compaction")
+        .build()
+});
+
+/// Records removed by the per-key compaction pass over a compacted topic's
+/// dedicated prefix (#175) — the signal that key-based cleanup is actually
+/// reclaiming superseded values, which `SEGMENT_COMPACTIONS` (a byte-identical
+/// merge) cannot show.
+static SEGMENT_RECORDS_COMPACTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_segment_records_compacted")
+        .with_description("records removed by per-key compaction over segments")
         .build()
 });
 
@@ -1491,6 +1527,7 @@ impl DynoStore {
             coalesce: Arc::new(Mutex::new(BTreeMap::new())),
             prefix_coalesce: false,
             prefix_leaseless: false,
+            compacted_segments: false,
             prefix_coalesce_buffers: Arc::new(Mutex::new(BTreeMap::new())),
             segment_seqs: Arc::new(Mutex::new(BTreeMap::new())),
             prefix_flush_locks: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1521,6 +1558,7 @@ impl DynoStore {
             prefix_compact_min_segments: Self::PREFIX_COMPACT_MIN_SEGMENTS,
             prefix_compact_target_bytes: Self::PREFIX_COMPACT_TARGET_BYTES,
             prefix_compact_keep_hot: Self::PREFIX_COMPACT_KEEP_HOT,
+            prefix_compact_seen_keys: Self::PREFIX_COMPACT_SEEN_KEYS,
             maintenance_recency: Self::MAINTENANCE_RECENCY,
             maintenance_seed: rng().random::<u64>(),
             topic_metas: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1579,6 +1617,17 @@ impl DynoStore {
         }
     }
 
+    /// Route compacted topics into segments under a dedicated per-topic prefix
+    /// and per-key-compact them there (#175). Off by default; a no-op unless
+    /// [`Self::prefix_coalesce`] is also set (there is no segment routing to
+    /// override without it). See the `compacted_segments` field.
+    pub fn compacted_segments(self, compacted_segments: bool) -> Self {
+        Self {
+            compacted_segments,
+            ..self
+        }
+    }
+
     /// Override the prefix single-writer lease term (#59). Kept above ~1s in
     /// production so lease renewal stays under GCS's per-object mutation cap
     /// (#13); lowered only in tests to exercise failover/fencing quickly.
@@ -1613,6 +1662,9 @@ impl DynoStore {
             prefix_compact_keep_hot: tuning
                 .prefix_compact_keep_hot
                 .unwrap_or(self.prefix_compact_keep_hot),
+            prefix_compact_seen_keys: tuning
+                .prefix_compact_seen_keys
+                .unwrap_or(self.prefix_compact_seen_keys),
             maintenance_recency: tuning
                 .maintenance_recency
                 .unwrap_or(self.maintenance_recency),
@@ -1862,6 +1914,12 @@ impl DynoStore {
     /// maintained ~once per interval. Override with `maintenance_recency` to
     /// match a non-default interval.
     const MAINTENANCE_RECENCY: Duration = Duration::from_secs(9 * 60);
+
+    /// Default cap on the per-key pass's `seen` key set per partition (#175).
+    /// Far above any real compacted topic here (connector config/status/offsets
+    /// topics hold hundreds of keys); a partition exceeding it skips removal
+    /// for the tick instead of ballooning maintainer memory.
+    const PREFIX_COMPACT_SEEN_KEYS: usize = 1_000_000;
 
     /// All topics, served from the in-memory [`TopicIndex`]. Returns the shared
     /// snapshot if fresh; otherwise refreshes it (single-flight) by LISTing the
@@ -2559,7 +2617,7 @@ impl DynoStore {
             return Ok(None);
         }
 
-        let prefix = self.prefix_of(topition);
+        let prefix = self.routed_prefix_of(topition).await?;
         self.refresh_prefix_index(&prefix).await?;
 
         let Some(tail) = self
@@ -2642,7 +2700,8 @@ impl DynoStore {
             // and recover footer-only (#58), caching the watermark under the
             // certified floor read *before* it so the fast path serves the
             // next stale-hint resolution.
-            let floor = self.certified_seq_floor(&self.prefix_of(topition)).await?;
+            let prefix = self.routed_prefix_of(topition).await?;
+            let floor = self.certified_seq_floor(&prefix).await?;
             let from_watermark = self.persisted_high(topition).await?;
             self.cache_coalesced_watermark(topition, from_watermark, floor)?;
 
@@ -2656,7 +2715,7 @@ impl DynoStore {
             // (#91). Fall back to `now` only if the index has no timestamp (it was
             // just refreshed above, so this is the safe degenerate case).
             let as_of = self
-                .prefix_index_refreshed_at(&self.prefix_of(topition))
+                .prefix_index_refreshed_at(&prefix)
                 .unwrap_or_else(SystemTime::now);
             self.mark_listed(topition, high, as_of)?;
             return Ok(high);
@@ -2729,7 +2788,7 @@ impl DynoStore {
         // function. `None` on the non-coalesce path leaves behaviour unchanged.
         let _flush_guard = if self.prefix_coalesce {
             Some(
-                self.prefix_flush_lock(&self.prefix_of(topition))?
+                self.prefix_flush_lock(&self.routed_prefix_of(topition).await?)?
                     .lock_owned()
                     .await,
             )
@@ -2934,6 +2993,53 @@ impl DynoStore {
         }
 
         prefix
+    }
+
+    /// Whether compacted topics are segment-routed to dedicated prefixes
+    /// (#175): both flags, because without `prefix_coalesce` there is no
+    /// segment routing to override — a compacted topic would otherwise start
+    /// coalescing into per-partition `records/` objects (#50), which the legacy
+    /// compactor cannot rewrite.
+    fn compacted_topics_in_segments(&self) -> bool {
+        self.prefix_coalesce && self.compacted_segments
+    }
+
+    /// The prefix a topition's records are segment-routed under, given a
+    /// `compacted` verdict the caller already holds (#175): a compacted topic's
+    /// dedicated prefix is its **full topic name**, so its segments never share
+    /// an object with a sibling topic whose whole-segment retention (#61) would
+    /// delete the compacted topic's old-but-latest keys. Everything else — and
+    /// everything, when the flag is off — is [`Self::prefix_of`], byte-identical
+    /// to today.
+    fn routed_prefix(&self, topition: &Topition, compacted: bool) -> String {
+        if compacted && self.compacted_topics_in_segments() {
+            topition.topic().to_owned()
+        } else {
+            self.prefix_of(topition)
+        }
+    }
+
+    /// [`Self::routed_prefix`] when the caller has no `compacted` verdict in
+    /// hand. `prefix_of` is synchronous and on many paths, but every segment
+    /// routing consumer is an async fn — so rather than guessing from a cold
+    /// cache (a wrong guess would route a compacted topic's segments into the
+    /// shared prefix, where a sibling's retention could delete them), this
+    /// awaits the memoized [`Self::topic_is_compacted`] (#113): a warm memo is
+    /// one map lookup, a cold one is the same conditional metadata GET the
+    /// produce gate already pays once per TTL. Topics whose connector prefix
+    /// already equals their name (≤ 3 dotted components) skip even that — the
+    /// override cannot change their routing.
+    async fn routed_prefix_of(&self, topition: &Topition) -> Result<String> {
+        let prefix = self.prefix_of(topition);
+        if !self.compacted_topics_in_segments() || prefix == topition.topic() {
+            return Ok(prefix);
+        }
+
+        if self.topic_is_compacted(topition.topic()).await? {
+            Ok(topition.topic().to_owned())
+        } else {
+            Ok(prefix)
+        }
     }
 
     /// List `prefix`, attributing the call to the code that asked for it (#165).
@@ -4123,7 +4229,7 @@ impl DynoStore {
         topition: &Topition,
         persisted_floor: i64,
     ) -> Result<i64> {
-        let prefix = self.prefix_of(topition);
+        let prefix = self.routed_prefix_of(topition).await?;
         self.refresh_prefix_index(&prefix).await?;
 
         let segment_tail = self
@@ -4251,7 +4357,7 @@ impl DynoStore {
         /// restart cleanly. Bounded so a genuinely missing object can't loop.
         const MAX_ATTEMPTS: usize = 3;
 
-        let prefix = self.prefix_of(topition);
+        let prefix = self.routed_prefix_of(topition).await?;
 
         for _ in 0..MAX_ATTEMPTS {
             self.refresh_prefix_index(&prefix).await?;
@@ -4349,7 +4455,7 @@ impl DynoStore {
     /// start of the segment region (`C` in the hybrid layout). `None` when the
     /// sub-stream has no segment yet.
     async fn segment_region_start(&self, topition: &Topition) -> Result<Option<i64>> {
-        let prefix = self.prefix_of(topition);
+        let prefix = self.routed_prefix_of(topition).await?;
         self.refresh_prefix_index(&prefix).await?;
         Ok(self
             .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
@@ -4641,7 +4747,7 @@ impl DynoStore {
             return Ok(None);
         }
 
-        let prefix = self.prefix_of(topition);
+        let prefix = self.routed_prefix_of(topition).await?;
         self.refresh_prefix_index(&prefix).await?;
         Ok(self
             .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
@@ -4738,7 +4844,7 @@ impl DynoStore {
             && let ListOffset::Timestamp(target) = offset_request
             && !self.has_legacy_records(topition).await?
         {
-            let prefix = self.prefix_of(topition);
+            let prefix = self.routed_prefix_of(topition).await?;
             self.refresh_prefix_index(&prefix).await?;
             let target_ms = target
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -5102,7 +5208,12 @@ impl DynoStore {
         topition: &Topition,
         deflated: deflated::Batch,
     ) -> Result<i64> {
-        let prefix = self.prefix_of(topition);
+        // Routed, not `prefix_of` (#175): a compacted topic's batches buffer —
+        // and flush — under its dedicated prefix. This is where the `#113` memo
+        // is first consulted when the flag is on (`produce`'s eligibility gate
+        // short-circuits past `topic_is_compacted` in that case), so the cost is
+        // the same one conditional metadata GET per TTL — just paid here.
+        let prefix = self.routed_prefix_of(topition).await?;
         let (ack, offset) = oneshot::channel();
         let span = deflated.last_offset_delta as i64 + 1;
         let size = size_of::<i64>() + size_of::<i32>() + deflated.batch_length.max(0) as usize;
@@ -5456,7 +5567,7 @@ impl DynoStore {
             let mut advances: Vec<(Topition, i64)> = Vec::with_capacity(grouped.len());
 
             for (topition, indices) in &grouped {
-                let base = match self.leaseless_base(topition).await {
+                let base = match self.leaseless_base(prefix, topition).await {
                     Ok(base) => base,
                     Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
                 };
@@ -5688,10 +5799,12 @@ impl DynoStore {
     /// the already force-folded prefix index: the epoch-fenced segment tail folded
     /// with this process's hint, and — only for a cold/drained sub-stream — the
     /// legacy `records/` tail and persisted floor, so an offset is never reused.
-    async fn leaseless_base(&self, topition: &Topition) -> Result<i64> {
-        let prefix = self.prefix_of(topition);
+    /// `prefix` is the flush's (routed, #175) buffer key, threaded through
+    /// rather than re-derived so the base is read from exactly the segment set
+    /// the flush is about to append to.
+    async fn leaseless_base(&self, prefix: &str, topition: &Topition) -> Result<i64> {
         let segment_tail = self
-            .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
+            .valid_substream_segments(prefix, topition.topic(), topition.partition())?
             .last()
             .map(|(_, entry)| entry.base_offset + entry.record_count)
             .unwrap_or(0);
@@ -6484,6 +6597,241 @@ impl DynoStore {
         Ok(run.len() as u64)
     }
 
+    /// Enforce `cleanup.policy=compact` over a compacted topic's dedicated
+    /// segment prefix (#175): walking each sub-stream's batches newest first,
+    /// drop every record whose key reappears later (and earlier duplicates
+    /// within a batch), exactly as the legacy [`Self::compact_partition`] does
+    /// over `records/` objects. Returns the number of records removed.
+    ///
+    /// Deliberately NOT part of [`Self::compact_prefix_segments`]'s run
+    /// selection: its `min_segments` (256) / `keep_hot` (16) trigger exists to
+    /// bound rewrite amplification on high-flush CDC prefixes and would simply
+    /// never fire for a compacted topic holding a handful of segments — the
+    /// topic would grow stale versions forever. This pass instead considers
+    /// **all** of the prefix's segments every tick, with no size gate and no
+    /// hot-tail exemption (the newest segment can hold within-batch
+    /// duplicates), and relies on a **dirty-only rewrite guard** for cheap
+    /// steady state: a segment is rewritten (create new seq + delete old, under
+    /// the compaction lease) only when the transform removed at least one
+    /// record — the segment analogue of legacy's `records > 0` in-place guard —
+    /// so a clean prefix costs a bounded read walk and zero writes per tick.
+    ///
+    /// Offsets are load-bearing: a rewritten segment carries the SAME
+    /// sub-stream `base_offset`s, and an emptied batch is kept as a header
+    /// (records stripped, `last_offset_delta` preserved) rather than dropped,
+    /// so the footer's `record_count` — accumulated from `last_offset_delta +
+    /// 1` per batch — remains the sub-stream's exact offset span. Both
+    /// [`Self::recover_substream_next_offset`] and the overlap resolver's
+    /// `covered_to = base + record_count` depend on that: a shrunken span would
+    /// admit a not-yet-deleted original alongside its rewrite (duplicates) and
+    /// would regress the recovered tail (offset reuse). Kept batch headers also
+    /// keep their `max_timestamp` (so `compact,delete` expiry stays
+    /// conservative) and their producer coordinates (#88 dedup still observes
+    /// producers whose batches were fully compacted).
+    ///
+    /// Memory: the prefix's segments are held decoded for the walk — bounded by
+    /// the size merge's `prefix_compact_target_bytes` fold of the same prefix,
+    /// and by O(distinct keys per partition) for `seen`, capped by
+    /// `prefix_compact_seen_keys` (over the cap the partition is skipped for
+    /// the tick — removal deferred, never corrupted).
+    async fn compact_prefix_per_key(&self, prefix: &str) -> Result<u64> {
+        self.refresh_prefix_index(prefix).await?;
+
+        // Snapshot `(writer_epoch, last_modified_ms)` per segment and the
+        // sub-stream key set from the cached footers — no object requests.
+        let mut segments_meta: BTreeMap<u64, (i64, i64)> = BTreeMap::new();
+        let mut substream_keys: BTreeSet<(String, i32)> = BTreeSet::new();
+        {
+            let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            if let Some(entry) = index.get(prefix) {
+                for (seq, cached) in &entry.segments {
+                    _ = segments_meta
+                        .insert(*seq, (cached.footer.writer_epoch, cached.last_modified_ms));
+                    for e in &cached.footer.entries {
+                        _ = substream_keys.insert((e.topic.clone(), e.partition));
+                    }
+                }
+            }
+        }
+
+        if segments_meta.is_empty() {
+            return Ok(0);
+        }
+
+        // Single writer per prefix: serialized against retention and the size
+        // merge by the same compaction lease (#115). Taken before the read walk
+        // so N maintainers do not duplicate the GETs; under the #126 claim the
+        // term is already held and this acquire is free.
+        if self.acquire_compaction_lease(prefix).await.is_err() {
+            debug!(prefix, "yielding per-key compaction to the lease holder");
+            return Ok(0);
+        }
+
+        // GET each segment once; every byte belongs to the compacted topic
+        // (dedicated prefix), so whole objects beat per-sub-stream ranged GETs
+        // once the topic has more than one partition.
+        let mut objects: BTreeMap<u64, Bytes> = BTreeMap::new();
+        for seq in segments_meta.keys() {
+            let object = self
+                .object_store
+                .get(&self.segment_location(prefix, *seq))
+                .await
+                .inspect_err(|err| error!(?err, prefix, seq))?
+                .bytes()
+                .await
+                .map_err(Error::from)?;
+            _ = objects.insert(*seq, object);
+        }
+
+        // Per-key transform over the EPOCH-FENCED view (as the size merge): a
+        // zombie/overlap region is dropped from any rewrite, never fused in.
+        // `outputs[seq]` accumulates every fenced sub-stream's (possibly
+        // compacted) region so a dirty segment can be rebuilt whole.
+        let mut outputs: BTreeMap<u64, Vec<(Topition, i64, Vec<deflated::Batch>)>> =
+            BTreeMap::new();
+        let mut dirty: BTreeSet<u64> = BTreeSet::new();
+        let mut removed_total: u64 = 0;
+
+        for (topic, partition) in substream_keys {
+            let fenced = self.valid_substream_segments(prefix, &topic, partition)?;
+
+            // Decode every fenced region once, newest first — a key kept in a
+            // newer region supersedes older copies.
+            let mut regions: Vec<(u64, i64, Vec<deflated::Batch>)> =
+                Vec::with_capacity(fenced.len());
+            for (seq, entry) in fenced.iter().rev() {
+                let Some(object) = objects.get(seq) else {
+                    continue;
+                };
+                let start = entry.byte_start as usize;
+                let end = start + entry.byte_len as usize;
+                if end > object.len() {
+                    continue;
+                }
+                regions.push((
+                    *seq,
+                    entry.base_offset,
+                    self.decode_frame(object.slice(start..end))?,
+                ));
+            }
+
+            let mut seen: BTreeSet<Bytes> = BTreeSet::new();
+            let mut staged: Vec<(u64, i64, Vec<deflated::Batch>, u64)> =
+                Vec::with_capacity(regions.len());
+            let mut aborted = false;
+
+            'transform: for (seq, base, region) in &regions {
+                // Newest batch first within the region too.
+                let mut out: Vec<deflated::Batch> = Vec::with_capacity(region.len());
+                let mut removed: u64 = 0;
+                for batch in region.iter().rev() {
+                    let compaction = inflated::Batch::try_from(batch)?.compact(&seen)?;
+                    seen.extend(compaction.batch.keys());
+                    if seen.len() > self.prefix_compact_seen_keys {
+                        warn!(
+                            prefix,
+                            topic,
+                            partition,
+                            keys = seen.len(),
+                            "per-key compaction seen set over cap; skipping this partition for the tick"
+                        );
+                        aborted = true;
+                        break 'transform;
+                    }
+                    if compaction.records > 0 {
+                        removed += compaction.records as u64;
+                        out.push(deflated::Batch::try_from(compaction.batch)?);
+                    } else {
+                        // Untouched: carry the ORIGINAL batch, not a re-encode.
+                        out.push(batch.clone());
+                    }
+                }
+                out.reverse();
+                staged.push((*seq, *base, out, removed));
+            }
+
+            if aborted {
+                // Removal is deferred for this partition, but a rewrite dirtied
+                // by a SIBLING partition still needs this sub-stream's content:
+                // contribute the originals, untouched.
+                for (seq, base, region) in regions {
+                    outputs.entry(seq).or_default().push((
+                        Topition::new(topic.clone(), partition),
+                        base,
+                        region,
+                    ));
+                }
+                continue;
+            }
+
+            for (seq, base, out, removed) in staged {
+                if removed > 0 {
+                    _ = dirty.insert(seq);
+                    removed_total += removed;
+                }
+                outputs.entry(seq).or_default().push((
+                    Topition::new(topic.clone(), partition),
+                    base,
+                    out,
+                ));
+            }
+        }
+
+        // The dirty-only guard: a clean prefix ends here, having written and
+        // deleted nothing — the steady state every tick after convergence.
+        if dirty.is_empty() {
+            return Ok(0);
+        }
+
+        // Rewrite each dirty segment as a new create-only object (create, then
+        // delete — never mutate), carrying the original's writer epoch: with an
+        // identical offset span the overlap resolver's same-epoch/higher-seq
+        // tie-break makes the rewrite win during the write→delete window,
+        // exactly as for a #66 merge. `index_insert` keeps the original append
+        // time so `compact,delete` retention is not reset by the rewrite.
+        for seq in &dirty {
+            let Some(substreams) = outputs.get(seq) else {
+                continue;
+            };
+            let (epoch, last_modified) = segments_meta.get(seq).copied().unwrap_or((0, i64::MIN));
+
+            let (payload, footer) = if self.prefix_leaseless {
+                let nonce = rng().random::<u64>();
+                self.encode_segment_v2(substreams, epoch.max(0), nonce)?
+            } else {
+                self.encode_segment(substreams, epoch.max(0))?
+            };
+            let new_seq = self
+                .assign_and_create_segment(prefix, payload, SegmentCreateRole::Compaction)
+                .await?;
+            self.index_insert(prefix, new_seq, footer, last_modified)?;
+        }
+
+        // Raise the durable sequence floor past every rewritten seq, write-ahead
+        // of the delete (#77): a freed sequence name must never be reused.
+        if let Some(max_dirty) = dirty.iter().copied().max() {
+            self.raise_seq_floor(prefix, max_dirty + 1).await?;
+        }
+
+        let locations: Vec<Path> = dirty
+            .iter()
+            .map(|seq| self.segment_location(prefix, *seq))
+            .collect();
+        self.delete_batches(locations).await?;
+        let pruned: Vec<u64> = dirty.iter().copied().collect();
+        self.index_prune(prefix, &pruned)?;
+
+        SEGMENT_RECORDS_COMPACTED.add(removed_total, &[]);
+        debug!(
+            prefix,
+            removed = removed_total,
+            rewritten = dirty.len(),
+            "per-key compacted prefix segments"
+        );
+
+        Ok(removed_total)
+    }
+
     /// Compact segments across every coalesced prefix (#66).
     /// Read the compaction lease object for `prefix` without acquiring it, or
     /// `None` if absent (#126). Used by the maintenance claim to peek the
@@ -6542,12 +6890,18 @@ impl DynoStore {
                             .as_deref()
                             .is_some_and(|value| value.contains("compact"))
                 });
-            if compact {
+            // Compacted topics reach segments only when segment-routed (#175);
+            // until then they hold no prefix to maintain. Routed, their
+            // dedicated prefix joins the universe so the per-key pass runs
+            // under the same claim as every other prefix's maintenance.
+            if compact && !self.compacted_topics_in_segments() {
                 continue;
             }
             for partition in 0..metadata.topic.num_partitions {
-                _ = universe
-                    .insert(self.prefix_of(&Topition::new(metadata.topic.name.clone(), partition)));
+                _ = universe.insert(self.routed_prefix(
+                    &Topition::new(metadata.topic.name.clone(), partition),
+                    compact,
+                ));
             }
         }
 
@@ -6575,10 +6929,11 @@ impl DynoStore {
         Ok(owned)
     }
 
-    /// The prefixes whose segments this replica should compact this tick (#66):
-    /// every non-compacted topic's prefix, restricted to this tick's maintenance
-    /// claim (#126). Empty when prefix coalescing or compaction is off. Paired
-    /// with [`Self::drain_compact_prefix`] by
+    /// The prefixes whose segments this replica should size-merge this tick
+    /// (#66): every non-compacted topic's prefix — plus every segment-routed
+    /// compacted topic's dedicated prefix (#175) — restricted to this tick's
+    /// maintenance claim (#126). Empty when prefix coalescing or compaction is
+    /// off. Paired with [`Self::drain_compact_prefix`] by
     /// [`Self::maintain_prefix_segments`].
     async fn compactable_prefixes(&self, owned: Option<&BTreeSet<String>>) -> Result<Vec<String>> {
         if !self.prefix_coalesce || self.prefix_compact_min_segments == 0 {
@@ -6610,18 +6965,71 @@ impl DynoStore {
                             .as_deref()
                             .is_some_and(|value| value.contains("compact"))
                 });
-            if compact {
+            // Segment-routed compacted topics (#175) are size-merge candidates
+            // too: the per-key pass leaves cleaned small segments and header
+            // residues behind, and the byte-identical merge (#66) is what
+            // bounds their count. Unrouted compacted topics have no segments —
+            // skip, exactly as before.
+            if compact && !self.compacted_topics_in_segments() {
                 continue;
             }
             for partition in 0..metadata.topic.num_partitions {
-                _ = prefix_set
-                    .insert(self.prefix_of(&Topition::new(metadata.topic.name.clone(), partition)));
+                _ = prefix_set.insert(self.routed_prefix(
+                    &Topition::new(metadata.topic.name.clone(), partition),
+                    compact,
+                ));
             }
         }
         // Honour this tick's maintenance claim (#126): only compact prefixes this
         // replica owns. `None` = no sharding (every prefix), the single-maintainer
         // default and the standalone-test path.
         Ok(prefix_set
+            .into_iter()
+            .filter(|prefix| owned.is_none_or(|owned| owned.contains(prefix)))
+            .collect())
+    }
+
+    /// The dedicated prefixes of segment-routed compacted topics (#175),
+    /// restricted to this tick's maintenance claim — the set
+    /// [`Self::maintain_prefix_segments`] runs [`Self::compact_prefix_per_key`]
+    /// on every tick. Derived from the topic metadata like the other
+    /// maintenance universes (a dedicated maintainer's in-memory index is
+    /// empty). Empty unless compacted topics are segment-routed.
+    async fn per_key_compact_prefixes(
+        &self,
+        owned: Option<&BTreeSet<String>>,
+    ) -> Result<BTreeSet<String>> {
+        if !self.compacted_topics_in_segments() {
+            return Ok(BTreeSet::new());
+        }
+
+        let mut prefixes = BTreeSet::new();
+        for metadata in self.topics_index().await?.iter() {
+            let compact = metadata
+                .topic
+                .configs
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|config| {
+                    config.name == "cleanup.policy"
+                        && config
+                            .value
+                            .as_deref()
+                            .is_some_and(|value| value.contains("compact"))
+                });
+            if !compact {
+                continue;
+            }
+            for partition in 0..metadata.topic.num_partitions {
+                _ =
+                    prefixes.insert(self.routed_prefix(
+                        &Topition::new(metadata.topic.name.clone(), partition),
+                        true,
+                    ));
+            }
+        }
+        Ok(prefixes
             .into_iter()
             .filter(|prefix| owned.is_none_or(|owned| owned.contains(prefix)))
             .collect())
@@ -6710,6 +7118,7 @@ impl DynoStore {
             .await?
             .into_iter()
             .collect();
+        let per_key = self.per_key_compact_prefixes(owned).await?;
 
         // Largest known live-segment count first (free: it is what this process
         // already has cached, no extra request). A prefix this maintainer has
@@ -6725,6 +7134,7 @@ impl DynoStore {
         let mut prefixes: Vec<String> = thresholds
             .keys()
             .chain(compactable.iter())
+            .chain(per_key.iter())
             .cloned()
             .collect::<BTreeSet<String>>()
             .into_iter()
@@ -6734,6 +7144,7 @@ impl DynoStore {
         let outcomes = futures::stream::iter(prefixes.into_iter().map(|prefix| {
             let thresholds = &thresholds;
             let compactable = &compactable;
+            let per_key = &per_key;
 
             async move {
                 let deleted = match thresholds.get(&prefix) {
@@ -6743,6 +7154,20 @@ impl DynoStore {
                         .unwrap_or(0),
                     None => 0,
                 };
+
+                // Per-key compaction of a compacted topic's dedicated prefix
+                // (#175), every tick, BEFORE the size merge so the merge folds
+                // the cleaned small residues rather than stale versions. Its
+                // count is records removed (reported via the counter), not
+                // segments merged, so it is not folded into `compacted`. A
+                // per-prefix error is logged and skips this prefix only, as
+                // for the drain (#140).
+                if per_key.contains(&prefix) {
+                    _ = self
+                        .compact_prefix_per_key(&prefix)
+                        .await
+                        .inspect_err(|err| error!(?err, prefix));
+                }
 
                 let compacted = if compactable.contains(&prefix) {
                     self.drain_compact_prefix(&prefix).await
@@ -6772,7 +7197,9 @@ impl DynoStore {
     /// still coalesces into the shared segments, so it must be included in the
     /// max — otherwise a sibling's shorter retention could delete its data (#61
     /// review fix). `retention.ms=-1` (retain forever) makes the whole prefix
-    /// infinite. Compacted topics never reach segments (legacy path at produce).
+    /// infinite. Compacted topics never reach segments (legacy path at produce)
+    /// unless segment-routed (#175): a compact-only topic's dedicated prefix
+    /// gets no threshold at all, `compact,delete` gets the topic's own.
     ///
     /// Restricted to this tick's maintenance claim (#126), and paired with
     /// [`Self::expire_prefix_segments_if_due`] by
@@ -6789,16 +7216,25 @@ impl DynoStore {
         for metadata in self.topics_index().await?.iter() {
             let configs = metadata.topic.configs.as_deref().unwrap_or_default();
 
-            let compact = configs.iter().any(|config| {
-                config.name == "cleanup.policy"
-                    && config
-                        .value
-                        .as_deref()
-                        .is_some_and(|value| value.contains("compact"))
-            });
+            // Parse the policy once: `compact` decides both routing (#175) and
+            // whether time-based expiry applies at all.
+            let policy = configs
+                .iter()
+                .find(|config| config.name == "cleanup.policy")
+                .and_then(|config| config.value.as_deref())
+                .unwrap_or_default();
+            let compact = policy.contains("compact");
 
-            // Compacted topics stay on the legacy path — never in segments.
-            if compact {
+            // Compact-only topics yield NO threshold: their prefix is never
+            // time-expired — the latest value of a key must survive
+            // indefinitely, and `expire_prefix_segments` is driven purely by
+            // this map. `compact,delete` keeps a threshold from the topic's OWN
+            // `retention.ms` (its routed prefix is dedicated, #175, so there is
+            // no sibling max to fold): whole-segment expiry on the max footer
+            // timestamp deleting old latest-values is exactly Kafka's
+            // `compact,delete` semantics. Unrouted compacted topics have no
+            // segments — skip, exactly as before.
+            if compact && !(self.compacted_topics_in_segments() && policy.contains("delete")) {
                 continue;
             }
 
@@ -6817,7 +7253,10 @@ impl DynoStore {
             };
 
             for partition in 0..metadata.topic.num_partitions {
-                let prefix = self.prefix_of(&Topition::new(metadata.topic.name.clone(), partition));
+                let prefix = self.routed_prefix(
+                    &Topition::new(metadata.topic.name.clone(), partition),
+                    compact,
+                );
 
                 _ = retention_by_prefix
                     .entry(prefix)
@@ -8011,16 +8450,22 @@ impl Storage for DynoStore {
             // Server-side coalescing: buffer the batch and flush a run as one
             // object per linger window — per connector prefix into a shared
             // segment (#57) when prefix mode is on, else per partition (#50).
-            // Transactional, control and compacted batches bypass both paths
-            // (offset/txn-marker/compaction semantics must stay one batch per
-            // object, and a compacted topic can't share a whole-segment-expiry
-            // segment, #61). The compacted-policy check is memoized (#113) so a
-            // steady-state produce does not read the topic metadata object per
-            // batch.
+            // Transactional and control batches bypass both paths
+            // (offset/txn-marker semantics must stay one batch per object).
+            // Compacted batches bypass too — a compacted topic can't share a
+            // whole-segment-expiry segment (#61) — UNLESS compacted topics are
+            // segment-routed (#175), which sidesteps that objection by giving
+            // each compacted topic a dedicated prefix (`routed_prefix`); with
+            // the flag off, the gate is exactly today's. The compacted-policy
+            // check is memoized (#113) so a steady-state produce does not read
+            // the topic metadata object per batch; with the flag on the `||`
+            // short-circuits it away entirely here, and `routed_prefix_of`
+            // consults the same memo at enqueue instead.
             let coalesce_eligible = transaction_id.is_none()
                 && !attributes.transaction
                 && !attributes.control
-                && !self.topic_is_compacted(topition.topic()).await?;
+                && (self.compacted_topics_in_segments()
+                    || !self.topic_is_compacted(topition.topic()).await?);
 
             // Will this batch be buffered into a prefix-coalesced segment (#57)?
             //
