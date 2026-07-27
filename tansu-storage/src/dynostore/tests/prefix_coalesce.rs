@@ -40,6 +40,7 @@ use object_store::{
 use tansu_sans_io::{
     ErrorCode, IsolationLevel, ListOffset,
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
+    delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic},
     record::{Record, deflated, inflated},
 };
 
@@ -3494,6 +3495,391 @@ async fn tail_probe_defers_to_a_listing_when_the_floor_is_ahead() -> Result<(), 
         lists.load(Relaxed),
         "a floor ahead of the cursor must force a listing"
     );
+
+    Ok(())
+}
+
+/// Truncate `tp` below `offset` via the `Storage::delete_records` API,
+/// returning the reported low watermark (#176).
+async fn delete_before(store: &DynoStore, tp: &Topition, offset: i64) -> Result<i64> {
+    let responses = store
+        .delete_records(&[DeleteRecordsTopic::default()
+            .name(tp.topic().into())
+            .partitions(Some(vec![
+                DeleteRecordsPartition::default()
+                    .partition_index(tp.partition())
+                    .offset(offset),
+            ]))])
+        .await?;
+
+    let partition = responses
+        .first()
+        .and_then(|topic| topic.partitions.as_deref())
+        .and_then(|partitions| partitions.first())
+        .expect("delete_records partition result")
+        .clone();
+
+    assert_eq!(i16::from(ErrorCode::None), partition.error_code);
+
+    Ok(partition.low_watermark)
+}
+
+/// The EARLIEST list-offsets entry for `tp`.
+async fn earliest(store: &DynoStore, tp: &Topition) -> Result<i64> {
+    store
+        .list_offsets(
+            IsolationLevel::ReadUncommitted,
+            &[(tp.clone(), ListOffset::Earliest)],
+        )
+        .await
+        .map(|responses| responses[0].1.offset.expect("earliest offset"))
+}
+
+/// The record count carried by `batches`.
+fn record_count(batches: &[deflated::Batch]) -> i64 {
+    batches
+        .iter()
+        .map(|batch| batch.last_offset_delta as i64 + 1)
+        .sum()
+}
+
+/// DeleteRecords on a pure-segment sub-stream advances the log start (#176):
+/// the response, EARLIEST, both offset-stage isolation paths, and fetch all
+/// honour the truncation floor — while the shared segment objects are
+/// physically untouched (truncation is logical).
+#[tokio::test]
+async fn delete_records_pure_segment_advances_log_start() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    // Two windows -> two segments: [0,3) and [3,5).
+    assert_eq!(0, store.produce(None, &a, batch(3)?).await?);
+    assert_eq!(3, store.produce(None, &a, batch(2)?).await?);
+    assert_eq!(2, segments(&bucket).await.len());
+
+    assert_eq!(3, delete_before(&store, &a, 3).await?);
+
+    // Physical layout untouched: segments are shared, truncation is logical.
+    assert_eq!(2, segments(&bucket).await.len());
+
+    assert_eq!(3, earliest(&store, &a).await?);
+
+    // Read-uncommitted (cache-served, zero requests warm) and read-committed
+    // (log_start over the footer index) agree on the log start.
+    let ru = store
+        .offset_stage_at(&a, IsolationLevel::ReadUncommitted)
+        .await?;
+    assert_eq!(3, ru.log_start());
+    assert_eq!(5, ru.high_watermark());
+
+    let rc = store
+        .offset_stage_at(&a, IsolationLevel::ReadCommitted)
+        .await?;
+    assert_eq!(3, rc.log_start());
+
+    // A fetch from 0 is clamped to the floor: the fully-truncated first
+    // segment is skipped whole, and no returned batch ends at/below it.
+    let fetched = fetch_from(&store, &a, 0).await?;
+    assert_eq!(Some(3), fetched.first().map(|batch| batch.base_offset));
+    assert_eq!(2, record_count(&fetched));
+    assert!(
+        fetched
+            .iter()
+            .all(|batch| batch.base_offset + batch.last_offset_delta as i64 + 1 > 3),
+        "no batch entirely below the floor is served"
+    );
+
+    Ok(())
+}
+
+/// DeleteRecords is per sub-stream (#176): truncating topic A must not move
+/// topic B's log start or records, even when both live in the same shared
+/// segment — and the shared segment survives while B is live.
+#[tokio::test]
+async fn delete_records_shared_segment_isolates_substreams() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+
+    let topic_a = "org.env.conn.tab_a";
+    let topic_b = "org.env.conn.tab_b";
+    create_topic(&store, topic_a).await?;
+    create_topic(&store, topic_b).await?;
+    let a = Topition::new(topic_a, 0);
+    let b = Topition::new(topic_b, 0);
+
+    // One window, one shared segment: A=[0,2), B=[0,2).
+    let (ra, rb) = tokio::join!(
+        store.produce(None, &a, batch(2)?),
+        store.produce(None, &b, batch(2)?),
+    );
+    _ = ra?;
+    _ = rb?;
+    assert_eq!(1, segments(&bucket).await.len());
+
+    // Truncate all of A.
+    assert_eq!(2, delete_before(&store, &a, -1).await?);
+
+    // A is empty to readers; the shared segment object survives for B.
+    assert_eq!(1, segments(&bucket).await.len());
+    assert_eq!(2, earliest(&store, &a).await?);
+    assert!(fetch_from(&store, &a, 0).await?.is_empty());
+
+    // B is untouched.
+    assert_eq!(0, earliest(&store, &b).await?);
+    let fb = fetch_from(&store, &b, 0).await?;
+    assert_eq!(Some(0), fb.first().map(|batch| batch.base_offset));
+    assert_eq!(2, record_count(&fb));
+
+    Ok(())
+}
+
+/// The truncation floor is durable (#176): a fresh process on the same bucket
+/// — cold caches, nothing in memory — serves the truncated log start on
+/// EARLIEST (the accessor's own cold `watermark.json` read resolves it),
+/// offset-stage, and fetch.
+#[tokio::test]
+async fn delete_records_floor_survives_restart() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.tab_a";
+    let a = Topition::new(topic, 0);
+
+    {
+        let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+        create_topic(&store, topic).await?;
+        assert_eq!(0, store.produce(None, &a, batch(3)?).await?);
+        assert_eq!(3, store.produce(None, &a, batch(2)?).await?);
+        assert_eq!(3, delete_before(&store, &a, 3).await?);
+    }
+
+    // Fresh process. EARLIEST first, before anything else warms the
+    // watermark cache: this pins the floor accessor's cold read.
+    let restarted = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    assert_eq!(3, earliest(&restarted, &a).await?);
+
+    let stage = restarted
+        .offset_stage_at(&a, IsolationLevel::ReadCommitted)
+        .await?;
+    assert_eq!(3, stage.log_start());
+    assert_eq!(5, stage.high_watermark());
+
+    let fetched = fetch_from(&restarted, &a, 0).await?;
+    assert_eq!(Some(3), fetched.first().map(|batch| batch.base_offset));
+    assert_eq!(2, record_count(&fetched));
+
+    Ok(())
+}
+
+/// The truncation floor is monotonic (#176): a second DeleteRecords with a
+/// LOWER offset must not regress the log start, and — because the fold is a
+/// `max` under the watermark CAS — the response must report the floor that
+/// actually holds, not echo the requested offset.
+#[tokio::test]
+async fn delete_records_is_monotonic() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    assert_eq!(0, store.produce(None, &a, batch(3)?).await?);
+    assert_eq!(3, store.produce(None, &a, batch(2)?).await?);
+
+    assert_eq!(3, delete_before(&store, &a, 3).await?);
+
+    // Lower offset: the post-fold floor (3) is reported, nothing regresses.
+    assert_eq!(
+        3,
+        delete_before(&store, &a, 1).await?,
+        "the response is the held floor, not the requested offset"
+    );
+    assert_eq!(3, earliest(&store, &a).await?);
+    assert_eq!(
+        3,
+        store
+            .offset_stage_at(&a, IsolationLevel::ReadUncommitted)
+            .await?
+            .log_start()
+    );
+
+    // A higher offset still advances it.
+    assert_eq!(4, delete_before(&store, &a, 4).await?);
+    assert_eq!(4, earliest(&store, &a).await?);
+
+    Ok(())
+}
+
+/// DeleteRecords of the whole log (`offset = -1`, #176): EARLIEST == the high
+/// watermark, fetch is empty, and the next produce continues at the old end —
+/// offsets are never reused.
+#[tokio::test]
+async fn delete_records_all_then_produce() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    assert_eq!(0, store.produce(None, &a, batch(3)?).await?);
+
+    assert_eq!(3, delete_before(&store, &a, -1).await?);
+
+    let stage = store
+        .offset_stage_at(&a, IsolationLevel::ReadUncommitted)
+        .await?;
+    assert_eq!(3, stage.log_start());
+    assert_eq!(3, stage.high_watermark());
+    assert_eq!(3, earliest(&store, &a).await?);
+    assert!(fetch_from(&store, &a, 0).await?.is_empty());
+
+    // The next produce continues at the old end, and only it is served.
+    assert_eq!(3, store.produce(None, &a, batch(2)?).await?);
+    assert_eq!(3, earliest(&store, &a).await?);
+    let fetched = fetch_from(&store, &a, 0).await?;
+    assert_eq!(Some(3), fetched.first().map(|batch| batch.base_offset));
+    assert_eq!(2, record_count(&fetched));
+
+    Ok(())
+}
+
+/// A segment whose every sub-stream slice ends at/below its truncation floor
+/// is reclaimed by segment expiry regardless of age (#176); a partially
+/// truncated one is not; and the freed offsets and sequence names are never
+/// reused after the reclaim (#77).
+#[tokio::test]
+async fn fully_truncated_segment_expires() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.tab_a";
+    let a = Topition::new(topic, 0);
+
+    {
+        let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+            .prefix_coalesce(true)
+            .prefix_lease_ttl(Duration::from_millis(80));
+        create_topic(&store, topic).await?;
+
+        let recent = now_ms();
+        // Two recent segments: [0,2) at seq 0 and [2,4) at seq 1 — age-based
+        // retention alone (threshold below the record age) must reclaim
+        // neither.
+        assert_eq!(0, store.produce(None, &a, batch_at(2, recent)?).await?);
+        assert_eq!(2, store.produce(None, &a, batch_at(2, recent)?).await?);
+        assert_eq!(0, store.expire_prefix_segments(PREFIX, 1_000).await?);
+        assert_eq!(2, segments(&bucket).await.len());
+
+        // Floor 3: seq 0 (ends at 2) is fully truncated, seq 1 (ends at 4)
+        // only partially — expiry reclaims exactly the fully-truncated one.
+        assert_eq!(3, delete_before(&store, &a, 3).await?);
+        assert_eq!(1, store.expire_prefix_segments(PREFIX, 1_000).await?);
+        assert_eq!(vec![segment_path(1)], segments(&bucket).await);
+
+        // Records above the floor are still served after the reclaim
+        // (batch-granular: the surviving batch starts below the floor).
+        let fetched = fetch_from(&store, &a, 0).await?;
+        assert_eq!(Some(2), fetched.first().map(|batch| batch.base_offset));
+        assert_eq!(2, record_count(&fetched));
+
+        // Truncate the rest: the last segment becomes reclaimable too.
+        assert_eq!(4, delete_before(&store, &a, -1).await?);
+        assert_eq!(1, store.expire_prefix_segments(PREFIX, 1_000).await?);
+        assert!(segments(&bucket).await.is_empty());
+    }
+
+    // Let the writer's lease lapse so the restart can take over.
+    tokio::time::sleep(Duration::from_millis(160)).await;
+
+    // Fresh process on the fully-drained prefix: the next produce resumes at
+    // offset 4 (the persisted watermark floor) in a segment named by the
+    // raised sequence floor (seq 2) — never a freed offset or seq name.
+    let restarted = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    assert_eq!(4, restarted.produce(None, &a, batch(1)?).await?);
+    assert_eq!(vec![segment_path(2)], segments(&bucket).await);
+
+    Ok(())
+}
+
+/// Truncation-driven reclaim is best-effort and floor-warmth-gated (#176): a
+/// maintainer that does not know a sub-stream's floor must DEFER the reclaim
+/// (a missing floor never means "reclaim anyway"), and performs it once a
+/// read has warmed the floor from `watermark.json`.
+#[tokio::test]
+async fn unknown_floor_defers_reclaim_until_warmed() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.tab_a";
+    let a = Topition::new(topic, 0);
+
+    {
+        let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+        create_topic(&store, topic).await?;
+        let recent = now_ms();
+        assert_eq!(0, store.produce(None, &a, batch_at(2, recent)?).await?);
+        assert_eq!(2, delete_before(&store, &a, -1).await?);
+    }
+
+    // A fresh maintainer holds no floor for the partition: the fully
+    // truncated (but recent) segment must survive its pass.
+    let maintainer = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    assert_eq!(0, maintainer.expire_prefix_segments(PREFIX, 1_000).await?);
+    assert_eq!(1, segments(&bucket).await.len());
+
+    // Any read that warms the watermark (here EARLIEST) resolves the floor;
+    // the next maintenance pass reclaims.
+    assert_eq!(2, earliest(&maintainer, &a).await?);
+    assert_eq!(1, maintainer.expire_prefix_segments(PREFIX, 1_000).await?);
+    assert!(segments(&bucket).await.is_empty());
+
+    Ok(())
+}
+
+/// DeleteRecords on a hybrid topic (#176): legacy `records/` objects below
+/// the offset are physically deleted (per-partition objects, safe to remove),
+/// while segment-resident records above the seam are hidden by the floor —
+/// one call, both regions correct.
+#[tokio::test]
+async fn delete_records_hybrid_topic() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.tab_a";
+    let a = Topition::new(topic, 0);
+
+    // A legacy life first: [0,3) and [3,5) as `records/` objects.
+    {
+        let legacy = DynoStore::new(CLUSTER, NODE, bucket.clone());
+        create_topic(&legacy, topic).await?;
+        assert_eq!(0, legacy.produce(None, &a, batch(3)?).await?);
+        assert_eq!(3, legacy.produce(None, &a, batch(2)?).await?);
+    }
+
+    // Flipped to prefix mode mid-life: a segment carries [5,7).
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    assert_eq!(5, store.produce(None, &a, batch(2)?).await?);
+    assert_eq!(2, legacy_records(&bucket, topic).await.len());
+    assert_eq!(1, segments(&bucket).await.len());
+
+    // Truncate below 6: both legacy objects go physically; the shared
+    // segment (ending at 7) survives, floor-hidden below 6.
+    assert_eq!(6, delete_before(&store, &a, 6).await?);
+    assert!(legacy_records(&bucket, topic).await.is_empty());
+    assert_eq!(1, segments(&bucket).await.len());
+
+    assert_eq!(6, earliest(&store, &a).await?);
+    assert_eq!(
+        6,
+        store
+            .offset_stage_at(&a, IsolationLevel::ReadCommitted)
+            .await?
+            .log_start()
+    );
+
+    // The fetch clamp is batch-granular: the surviving segment batch [5,7)
+    // straddles the floor and is served whole.
+    let fetched = fetch_from(&store, &a, 0).await?;
+    assert_eq!(Some(5), fetched.first().map(|batch| batch.base_offset));
+    assert_eq!(2, record_count(&fetched));
 
     Ok(())
 }

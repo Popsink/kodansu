@@ -110,19 +110,23 @@ fn schema_change() -> Result<()> {
 /// persists `high`, `advance_low_watermark` persists `low`), so a binary
 /// whose [`Watermark`] does not model a field would silently erase it on
 /// that round-trip: during a rolling deploy, an old maintainer would drop
-/// what a newer process had just written. For the upcoming truncation floor
-/// (#176) that erasure would resurrect records a user deleted — which is why
-/// the `#[serde(flatten)]` catch-all must be fleet-wide **before** any new
-/// field carries meaning. This pins the mechanism: an unknown key seeded
-/// into the raw object survives a `with_mut` that touches `high`, and a
+/// what a newer process had just written. For the truncation floor (#176)
+/// that erasure would resurrect records a user deleted — which is why the
+/// `#[serde(flatten)]` catch-all had to be fleet-wide **before** the field
+/// carried meaning. This pins the mechanism: keys seeded into the raw object
+/// survive a `with_mut` that touches `high` — `truncate`, now a modeled
+/// field, and `future`, standing in for whatever comes after #176 — and a
 /// watermark with no extra fields still serialises byte-identically to the
-/// pre-catch-all layout, so the change does not rewrite every existing
-/// object on first touch.
+/// pre-catch-all layout (`truncate` is `skip_serializing_if`), so the change
+/// does not rewrite every existing object on first touch.
 #[tokio::test]
 async fn watermark_with_mut_preserves_unknown_fields() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    // Byte identity first: an empty catch-all map must flatten to nothing.
+    // Byte identity first: an empty catch-all map must flatten to nothing,
+    // and an absent truncation floor must serialise to nothing (#176) — a
+    // fleet with no floors must not have every watermark object rewritten
+    // with a `"truncate":null` key (etag churn across the whole cost plane).
     assert_eq!(
         r#"{"low":null,"high":5}"#,
         serde_json::to_string(&Watermark {
@@ -131,8 +135,18 @@ async fn watermark_with_mut_preserves_unknown_fields() -> Result<(), Error> {
         })?
     );
 
-    // Seed the raw object with a key this binary does not model, exactly as
-    // a newer release would have written it.
+    // A held floor serialises as the named field, after `high`.
+    assert_eq!(
+        r#"{"low":null,"high":5,"truncate":3}"#,
+        serde_json::to_string(&Watermark {
+            high: Some(5),
+            truncate: Some(3),
+            ..Default::default()
+        })?
+    );
+
+    // Seed the raw object with the truncation floor plus a key this binary
+    // does not model, exactly as a newer release would have written them.
     let bucket = InMemory::new();
     let topition = Topition::new("unknown-fields", 0);
     let path = Path::from(format!(
@@ -142,7 +156,7 @@ async fn watermark_with_mut_preserves_unknown_fields() -> Result<(), Error> {
     _ = bucket
         .put(
             &path,
-            PutPayload::from_static(br#"{"low":null,"high":5,"truncate":42}"#),
+            PutPayload::from_static(br#"{"low":null,"high":5,"truncate":42,"future":17}"#),
         )
         .await?;
 
@@ -156,12 +170,31 @@ async fn watermark_with_mut_preserves_unknown_fields() -> Result<(), Error> {
         .await?;
 
     // Read the raw bytes back from the bucket, bypassing the store: the
-    // mutation must have landed and the unknown key must have survived it
-    // with its value intact.
+    // mutation must have landed and both extra keys must have survived it
+    // with their values intact.
     let raw = bucket.get(&path).await?.bytes().await?;
     let object = serde_json::from_slice::<serde_json::Value>(&raw)?;
     assert_eq!(Some(7), object["high"].as_i64());
     assert_eq!(Some(42), object["truncate"].as_i64());
+    assert_eq!(Some(17), object["future"].as_i64());
+
+    Ok(())
+}
+
+/// A `watermark.json` carrying a truncation floor — written by a #176-aware
+/// pod, possibly round-tripped through a beta.23 pod's catch-all in between —
+/// deserialises into the **named** `truncate` field (serde routes a named key
+/// to the field, never to the `#[serde(flatten)]` catch-all) and
+/// re-serialises byte-identically, so mixed-version round-trips are stable.
+#[test]
+fn watermark_truncate_round_trips_as_a_named_field() -> Result<()> {
+    let raw = r#"{"low":null,"high":5,"truncate":42}"#;
+
+    let watermark = serde_json::from_str::<Watermark>(raw)?;
+    assert_eq!(Some(42), watermark.truncate);
+    assert!(watermark.rest.is_empty(), "named key must not land in rest");
+
+    assert_eq!(raw, serde_json::to_string(&watermark)?);
 
     Ok(())
 }
