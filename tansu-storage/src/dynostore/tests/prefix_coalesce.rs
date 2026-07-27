@@ -38,15 +38,19 @@ use object_store::{
     memory::InMemory, path::Path,
 };
 use tansu_sans_io::{
-    ErrorCode, IsolationLevel, ListOffset,
+    BatchAttribute, ErrorCode, IsolationLevel, ListOffset,
+    add_partitions_to_txn_request::AddPartitionsToTxnTopic,
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
     delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic},
     record::{Record, deflated, inflated},
 };
 
 use crate::{
-    Error, Result, Storage, Topition,
-    dynostore::{CoalesceTuning, DynoStore, Era, PrefixLease, SegmentFooter, SubstreamEntry},
+    Error, Result, Storage, Topition, TxnAddPartitionsRequest,
+    dynostore::{
+        CoalesceTuning, DynoStore, Era, PrefixLease, SegmentFooter, SubstreamEntry,
+        TxnProduceOffset,
+    },
 };
 
 const CLUSTER: &str = "tansu";
@@ -1511,7 +1515,7 @@ async fn retention_forever_keeps_segments() -> Result<(), Error> {
 /// Leaseless (#86): with no lease, two replicas append to the SAME sub-stream by
 /// alternating, and the fold-before-claim step makes each observe the other's
 /// segment before deriving its base — so offsets stay dense and contiguous with
-/// no reuse. Segments are written v2 and read back correctly.
+/// no reuse. Segments are written v3 and read back correctly.
 #[tokio::test]
 async fn leaseless_alternating_writers_stay_contiguous() -> Result<(), Error> {
     let bucket = InMemory::new();
@@ -2722,12 +2726,14 @@ fn decode_per_the_doc(object: &[u8]) -> (u16, Vec<DocEntry>, usize) {
         let _max_timestamp = i64_at(footer, at);
         at += 8;
 
-        // v2 ONLY: pcoord_count (u16) then that many 22-byte producer coordinates.
+        // v2+ ONLY: pcoord_count (u16) then that many producer coordinates —
+        // 22 bytes each at v2, 23 at v3 (the extra `flags` byte; the exact
+        // stride trap the format doc calls out).
         let mut pcoord_count = 0;
         if version >= 2 {
             pcoord_count = u16_at(footer, at) as usize;
             at += 2;
-            at += pcoord_count * (8 + 2 + 4 + 4 + 4);
+            at += pcoord_count * (8 + 2 + 4 + 4 + 4 + usize::from(version >= 3));
         }
 
         entries.push((
@@ -2755,7 +2761,7 @@ async fn documented_layout_decodes_a_segment_this_build_writes() -> Result<(), E
     let bucket = InMemory::new();
     let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
         .prefix_coalesce(true)
-        // The regime production runs, and the one that emits footer v2.
+        // The regime production runs, and the one that emits footer v3.
         .prefix_leaseless(true);
 
     let topic_a = "org.env.conn.tab_a";
@@ -2766,7 +2772,7 @@ async fn documented_layout_decodes_a_segment_this_build_writes() -> Result<(), E
     let b = Topition::new(topic_b, 0);
 
     // Two sub-streams in one segment (produced concurrently so they share one
-    // linger window), one of them idempotent so the v2 `producers` block is
+    // linger window), one of them idempotent so the `producers` block is
     // non-empty — the block a v1-shaped reader skips.
     let (produced_a, produced_b) = tokio::join!(
         store.produce(None, &a, idempotent_batch(4_242, 0, 0, 2)?),
@@ -2787,7 +2793,10 @@ async fn documented_layout_decodes_a_segment_this_build_writes() -> Result<(), E
 
     let (version, entries, trailing) = decode_per_the_doc(&object);
 
-    assert_eq!(2, version, "the leaseless writer emits footer v2");
+    assert_eq!(
+        3, version,
+        "the leaseless writer emits footer v3 (#174 release B)"
+    );
     assert_eq!(
         0, trailing,
         "the documented layout must consume the footer exactly — {trailing} bytes left over \
@@ -3880,6 +3889,535 @@ async fn delete_records_hybrid_topic() -> Result<(), Error> {
     let fetched = fetch_from(&store, &a, 0).await?;
     assert_eq!(Some(5), fetched.first().map(|batch| batch.base_offset));
     assert_eq!(2, record_count(&fetched));
+
+    Ok(())
+}
+
+/// A transactional data batch for `producer_id`/`epoch` at `base_sequence`.
+fn txn_batch(
+    producer_id: i64,
+    epoch: i16,
+    base_sequence: i32,
+    records: usize,
+) -> Result<deflated::Batch> {
+    let mut builder = inflated::Batch::builder()
+        .attributes(BatchAttribute::default().transaction(true).into())
+        .producer_id(producer_id)
+        .producer_epoch(epoch)
+        .base_sequence(base_sequence)
+        .last_offset_delta(records as i32 - 1);
+
+    for i in 0..records {
+        builder = builder.record(Record::builder().value(Some(Bytes::copy_from_slice(
+            format!("txn-record-{i}").as_bytes(),
+        ))));
+    }
+
+    builder
+        .build()
+        .and_then(deflated::Batch::try_from)
+        .map_err(Into::into)
+}
+
+/// Register a transactional producer and add `topics`' partition 0 to the
+/// transaction; returns `(producer_id, producer_epoch)`.
+async fn begin_txn(store: &DynoStore, txn: &str, topics: &[&str]) -> Result<(i64, i16)> {
+    let producer = store
+        .init_producer(Some(txn), 60_000, Some(-1), Some(-1))
+        .await?;
+    assert_eq!(ErrorCode::None, producer.error);
+
+    _ = store
+        .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
+            transaction_id: txn.into(),
+            producer_id: producer.id,
+            producer_epoch: producer.epoch,
+            topics: topics
+                .iter()
+                .map(|topic| {
+                    AddPartitionsToTxnTopic::default()
+                        .name((*topic).into())
+                        .partitions(Some([0].into()))
+                })
+                .collect(),
+        })
+        .await?;
+
+    Ok((producer.id, producer.epoch))
+}
+
+/// The transaction's registered produce range for `tp` at `epoch`, straight
+/// from `meta.json` — the ledger `txn_end` and `offset_stage` read.
+async fn produced_range(
+    store: &DynoStore,
+    txn: &str,
+    epoch: i16,
+    tp: &Topition,
+) -> Result<Option<TxnProduceOffset>> {
+    store
+        .meta
+        .with(&store.object_store, |meta| {
+            Ok(meta
+                .transactions
+                .get(txn)
+                .and_then(|transaction| transaction.epochs.get(&epoch))
+                .and_then(|detail| detail.produces.get(tp.topic()))
+                .and_then(|partitions| partitions.get(&tp.partition()))
+                .copied()
+                .flatten())
+        })
+        .await
+}
+
+/// #174 release B: transactional data batches coalesce into the shared
+/// segment like any other batch (no legacy per-batch objects), the commit
+/// marker lands in a segment too, the v3 footer indexes both with
+/// attribute-derived flags, and after the commit the last stable offset
+/// catches up to the high watermark.
+#[tokio::test]
+async fn txn_commit_marker_lands_in_segment() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .prefix_leaseless(true);
+
+    let topic_a = "org.env.conn.tab_a";
+    let topic_b = "org.env.conn.tab_b";
+    create_topic(&store, topic_a).await?;
+    create_topic(&store, topic_b).await?;
+    let a = Topition::new(topic_a, 0);
+    let b = Topition::new(topic_b, 0);
+
+    let txn = "txn-commit";
+    let (pid, epoch) = begin_txn(&store, txn, &[topic_a, topic_b]).await?;
+
+    // Transactional data on two topitions of one prefix, produced concurrently
+    // so they share one linger window: ONE shared segment, no legacy objects.
+    let (produced_a, produced_b) = tokio::join!(
+        store.produce(Some(txn), &a, txn_batch(pid, epoch, 0, 2)?),
+        store.produce(Some(txn), &b, txn_batch(pid, epoch, 0, 3)?),
+    );
+    assert_eq!(0, produced_a?);
+    assert_eq!(0, produced_b?);
+    assert_eq!(
+        1,
+        segments(&bucket).await.len(),
+        "transactional data coalesces into one shared segment"
+    );
+    assert!(legacy_records(&bucket, topic_a).await.is_empty());
+    assert!(legacy_records(&bucket, topic_b).await.is_empty());
+
+    // Commit: each partition's marker is an ordinary batch in an ordinary
+    // (immediately flushed) segment — still no legacy objects.
+    assert_eq!(ErrorCode::None, store.txn_end(txn, pid, epoch, true).await?);
+    assert!(legacy_records(&bucket, topic_a).await.is_empty());
+    assert!(legacy_records(&bucket, topic_b).await.is_empty());
+    let locations = segments(&bucket).await;
+    assert_eq!(
+        3,
+        locations.len(),
+        "one data segment + one immediately-flushed segment per marker"
+    );
+
+    // Every segment is stamped v3 and decodes exactly by the documented
+    // 23-byte-coordinate stride; the coordinates carry the attribute-derived
+    // flags: 0b01 per transactional data batch, 0b11 per marker with the -1
+    // sequences a marker carries.
+    let mut data_coords = 0;
+    let mut marker_coords = 0;
+    for location in &locations {
+        let object = bucket
+            .get(location)
+            .await
+            .expect("get segment")
+            .bytes()
+            .await
+            .expect("segment bytes");
+        let (version, _, trailing) = decode_per_the_doc(&object);
+        assert_eq!(3, version, "the leaseless writer stamps v3 unconditionally");
+        assert_eq!(0, trailing, "documented v3 stride must consume the footer");
+
+        let footer = footer_of(&bucket, &store, location).await;
+        for coord in footer.entries.iter().flat_map(|entry| &entry.producers) {
+            assert_eq!(pid, coord.producer_id);
+            match coord.flags {
+                0b01 => {
+                    assert_eq!(0, coord.base_sequence);
+                    data_coords += 1;
+                }
+                0b11 => {
+                    assert_eq!(-1, coord.base_sequence);
+                    assert_eq!(-1, coord.last_sequence);
+                    marker_coords += 1;
+                }
+                flags => panic!("unexpected coordinate flags {flags:#04b}"),
+            }
+        }
+    }
+    assert_eq!(2, data_coords, "one 0b01 coordinate per data batch");
+    assert_eq!(2, marker_coords, "one 0b11 coordinate per marker");
+
+    // Fetch delivers the marker as a batch at the expected offset with the
+    // control+transaction attributes intact (the client filters it; it still
+    // occupies one offset).
+    let fetched = fetch_from(&store, &a, 0).await?;
+    assert_eq!(2, fetched.len());
+    assert_eq!(0, fetched[0].base_offset);
+    assert!(!fetched[0].is_control());
+    let marker = &fetched[1];
+    assert_eq!(2, marker.base_offset);
+    assert!(marker.is_control() && marker.is_transactional());
+    assert_eq!(1, marker.record_count);
+
+    // Committed: the last stable offset equals the high watermark on both
+    // topitions, and nothing is aborted.
+    for (tp, high) in [(&a, 3), (&b, 4)] {
+        let stage = store.offset_stage(tp).await?;
+        assert_eq!(high, stage.high_watermark());
+        assert_eq!(high, stage.last_stable());
+        assert!(stage.aborted().is_empty());
+    }
+
+    Ok(())
+}
+
+/// The read-committed contract over shared segments (#174 release B): an
+/// aborted transaction interleaved with committed data from another producer
+/// in the SAME segment must leave a read-committed consumer seeing only the
+/// committed records. The broker never body-filters — it serves the batches
+/// byte-preserved and bounds the consumer with the last stable offset and the
+/// aborted-transaction list, both pure `meta.json` functions (`offset_stage`);
+/// no footer read and no extra request decide abortedness. This test plays
+/// the client's role exactly: stop at the LSO, drop aborted producers' ranges,
+/// skip markers.
+#[tokio::test]
+async fn read_committed_sees_only_committed_records_from_shared_segment() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .prefix_leaseless(true);
+
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    let txn = "txn-abort";
+    let (pid, epoch) = begin_txn(&store, txn, &[topic]).await?;
+
+    // One linger window, one shared segment: a transactional batch (2 records,
+    // will be aborted) interleaved with a plain committed batch (2 records)
+    // from another producer. Enqueue order inside the window is not
+    // deterministic — derive both offsets from the acks.
+    let (produced_txn, produced_plain) = tokio::join!(
+        store.produce(Some(txn), &a, txn_batch(pid, epoch, 0, 2)?),
+        store.produce(None, &a, batch(2)?),
+    );
+    let (txn_offset, plain_offset) = (produced_txn?, produced_plain?);
+    assert_eq!(1, segments(&bucket).await.len(), "one shared segment");
+
+    // While the transaction is open the LSO pins at its first offset: a
+    // read-committed fetch never serves the open range.
+    let open = store.offset_stage(&a).await?;
+    assert_eq!(4, open.high_watermark());
+    assert_eq!(txn_offset, open.last_stable());
+    assert!(open.aborted().is_empty());
+
+    // Abort. The marker occupies offset 4; nothing is open anymore, so the
+    // LSO catches up to the high watermark and the aborted range surfaces as
+    // (producer_id, first_offset).
+    assert_eq!(
+        ErrorCode::None,
+        store.txn_end(txn, pid, epoch, false).await?
+    );
+    let stage = store
+        .offset_stage_at(&a, IsolationLevel::ReadCommitted)
+        .await?;
+    assert_eq!(5, stage.high_watermark());
+    assert_eq!(5, stage.last_stable());
+    assert_eq!(vec![(pid, txn_offset)], stage.aborted().to_vec());
+
+    // The broker delivers everything below the LSO — aborted data and the
+    // marker included, byte-preserved (attributes and producer fields intact).
+    let fetched = store
+        .fetch(
+            &a,
+            0,
+            0,
+            100_000,
+            IsolationLevel::ReadCommitted,
+            Duration::from_millis(200),
+        )
+        .await?;
+    assert_eq!(3, fetched.len(), "plain data, aborted data, abort marker");
+
+    // Kafka's client-side read-committed filter: stop at the LSO; a marker
+    // closes its producer's aborted range and is never counted as data; a
+    // transactional batch from a producer with an open aborted range at/after
+    // first_offset is dropped.
+    let mut aborted: BTreeMap<i64, i64> = stage.aborted().iter().copied().collect();
+    let mut visible = Vec::new();
+    for batch in &fetched {
+        if batch.base_offset >= stage.last_stable() {
+            break;
+        }
+        if batch.is_control() {
+            _ = aborted.remove(&batch.producer_id);
+            continue;
+        }
+        if batch.is_transactional()
+            && aborted
+                .get(&batch.producer_id)
+                .is_some_and(|first| batch.base_offset >= *first)
+        {
+            continue;
+        }
+        visible.push(batch);
+    }
+
+    // Only the committed plain batch survives.
+    assert_eq!(1, visible.len());
+    assert_eq!(plain_offset, visible[0].base_offset);
+    assert_eq!(2, visible[0].record_count);
+    assert!(!visible[0].is_transactional());
+
+    Ok(())
+}
+
+/// The same produce/abort script on a legacy-mode store and a segment-mode
+/// store yields identical `offset_stage` output (#174 release B): moving the
+/// bytes into segments must not change the LSO/aborted derivation, which is a
+/// pure `meta.json` function of the registered ranges.
+#[tokio::test]
+async fn txn_abort_lso_and_aborted_match_legacy() -> Result<(), Error> {
+    async fn script(store: &DynoStore) -> Result<(i64, [i64; 3], [i64; 3], Vec<(i64, i64)>)> {
+        let topic = "org.env.conn.tab_a";
+        create_topic(store, topic).await?;
+        let tp = Topition::new(topic, 0);
+
+        let txn = "txn-parity";
+        let (pid, epoch) = begin_txn(store, txn, &[topic]).await?;
+
+        assert_eq!(
+            0,
+            store
+                .produce(Some(txn), &tp, txn_batch(pid, epoch, 0, 3)?)
+                .await?
+        );
+
+        let open = store.offset_stage(&tp).await?;
+        assert!(open.aborted().is_empty());
+
+        assert_eq!(
+            ErrorCode::None,
+            store.txn_end(txn, pid, epoch, false).await?
+        );
+        let after = store.offset_stage(&tp).await?;
+
+        Ok((
+            pid,
+            [open.last_stable(), open.high_watermark(), open.log_start()],
+            [
+                after.last_stable(),
+                after.high_watermark(),
+                after.log_start(),
+            ],
+            after.aborted().to_vec(),
+        ))
+    }
+
+    let legacy = DynoStore::new(CLUSTER, NODE, InMemory::new());
+    let segment = DynoStore::new(CLUSTER, NODE, InMemory::new())
+        .prefix_coalesce(true)
+        .prefix_leaseless(true);
+
+    let (legacy_pid, legacy_open, legacy_after, legacy_aborted) = script(&legacy).await?;
+    let (segment_pid, segment_open, segment_after, segment_aborted) = script(&segment).await?;
+
+    assert_eq!(legacy_open, segment_open, "open-transaction stage differs");
+    assert_eq!(legacy_after, segment_after, "post-abort stage differs");
+    assert_eq!(vec![(legacy_pid, 0)], legacy_aborted);
+    assert_eq!(vec![(segment_pid, 0)], segment_aborted);
+
+    Ok(())
+}
+
+/// Behavioural guard for the control-coordinate fold filter: after a commit
+/// marker lands in a segment, the SAME producer's next in-order batch is
+/// still admitted. Without the filter, `producer_tail_folded` would fold the
+/// marker's `-1` sequences (`next_sequence = 0`) and reject the batch as
+/// `OutOfOrderSequenceNumber`.
+#[tokio::test]
+async fn control_coordinate_not_folded_into_producer_tail() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .prefix_leaseless(true);
+
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    let txn = "txn-fold";
+    let (pid, epoch) = begin_txn(&store, txn, &[topic]).await?;
+
+    // Sequences 0..=1 committed; the marker occupies offset 2.
+    assert_eq!(
+        0,
+        store
+            .produce(Some(txn), &a, txn_batch(pid, epoch, 0, 2)?)
+            .await?
+    );
+    assert_eq!(ErrorCode::None, store.txn_end(txn, pid, epoch, true).await?);
+
+    // The producer's genuine next in-order batch (sequence 2) must be
+    // admitted at the next offset — the marker's coordinate never folds.
+    assert_eq!(
+        3,
+        store
+            .produce(None, &a, idempotent_batch(pid, epoch, 2, 1)?)
+            .await?
+    );
+
+    Ok(())
+}
+
+/// A control batch flushes the coalesce buffer immediately (#174 release B) —
+/// `txn_end` writes markers sequentially per partition, so parking each on
+/// the linger would cost an N-partition commit N × linger — while a
+/// transactional DATA batch must NOT: it coalesces like any other batch, or a
+/// transactional workload would degrade to one object per batch.
+#[tokio::test]
+async fn control_batch_triggers_immediate_flush() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    // A linger far beyond the test's patience: only a non-linger trigger can
+    // flush. Data flushes on the 2-batch count; a marker must flush by itself.
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .prefix_leaseless(true)
+        .coalesce_tuning(CoalesceTuning {
+            coalesce_linger: Some(Duration::from_secs(30)),
+            coalesce_batches: Some(2),
+            ..Default::default()
+        });
+
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    let txn = "txn-flush";
+    let (pid, epoch) = begin_txn(&store, txn, &[topic]).await?;
+
+    // A lone transactional data batch parks in the buffer: no per-batch flush.
+    let parked = {
+        let store = store.clone();
+        let a = a.clone();
+        let batch = txn_batch(pid, epoch, 0, 1)?;
+        tokio::spawn(async move { store.produce(Some(txn), &a, batch).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        segments(&bucket).await.is_empty(),
+        "a transactional data batch must not force a per-batch flush"
+    );
+
+    // The second batch trips the count threshold; both resolve.
+    assert_eq!(
+        1,
+        store
+            .produce(Some(txn), &a, txn_batch(pid, epoch, 1, 1)?)
+            .await?
+    );
+    assert_eq!(0, parked.await.expect("join")?);
+    assert_eq!(1, segments(&bucket).await.len());
+
+    // The commit's marker must flush immediately — well inside the 30s
+    // linger, which is the only other trigger left.
+    let ended = tokio::time::timeout(Duration::from_secs(5), store.txn_end(txn, pid, epoch, true))
+        .await
+        .expect("txn_end must not park the marker on the linger")?;
+    assert_eq!(ErrorCode::None, ended);
+    assert_eq!(2, segments(&bucket).await.len());
+
+    Ok(())
+}
+
+/// A retried transactional data batch is acked `Duplicate` with its original
+/// offset, and its re-registration must not widen the transaction's produced
+/// range (#174 release B): `offset_start` never moves, `offset_end` only ever
+/// grows with genuinely new produces (and finally the marker).
+#[tokio::test]
+async fn transactional_duplicate_reregistration_is_idempotent() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .prefix_coalesce(true)
+        .prefix_leaseless(true);
+
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    let txn = "txn-dup";
+    let (pid, epoch) = begin_txn(&store, txn, &[topic]).await?;
+
+    assert_eq!(
+        0,
+        store
+            .produce(Some(txn), &a, txn_batch(pid, epoch, 0, 2)?)
+            .await?
+    );
+    assert_eq!(
+        Some(TxnProduceOffset {
+            offset_start: 0,
+            offset_end: 1,
+        }),
+        produced_range(&store, txn, epoch, &a).await?
+    );
+
+    // The retry dedups against the folded footer coordinates: acked with the
+    // ORIGINAL offset, and the registered range is untouched.
+    assert_eq!(
+        0,
+        store
+            .produce(Some(txn), &a, txn_batch(pid, epoch, 0, 2)?)
+            .await?
+    );
+    assert_eq!(
+        Some(TxnProduceOffset {
+            offset_start: 0,
+            offset_end: 1,
+        }),
+        produced_range(&store, txn, epoch, &a).await?
+    );
+
+    // A genuinely new produce extends the range...
+    assert_eq!(
+        2,
+        store
+            .produce(Some(txn), &a, txn_batch(pid, epoch, 2, 1)?)
+            .await?
+    );
+    assert_eq!(
+        Some(TxnProduceOffset {
+            offset_start: 0,
+            offset_end: 2,
+        }),
+        produced_range(&store, txn, epoch, &a).await?
+    );
+
+    // ...and committing drops the range entirely: `txn_end` clears a
+    // *committed* transaction's produces (only an ABORTED one keeps them, so a
+    // read-committed fetch can still report its aborted offsets, #81). So the
+    // marker's own offset extending the range is not observable here — that
+    // property is asserted on the abort path, in
+    // `txn_abort_lso_and_aborted_match_legacy`, where the range survives.
+    // Segment routing does not change this: it is the same `meta.transactions`
+    // bookkeeping as the legacy path.
+    assert_eq!(ErrorCode::None, store.txn_end(txn, pid, epoch, true).await?);
+    assert_eq!(None, produced_range(&store, txn, epoch, &a).await?);
+
+    let stage = store.offset_stage(&a).await?;
+    assert_eq!(4, stage.high_watermark());
+    assert_eq!(4, stage.last_stable());
 
     Ok(())
 }

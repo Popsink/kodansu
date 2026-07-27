@@ -967,30 +967,35 @@ const SEGMENT_FORMAT_VERSION: u16 = 1;
 /// Segment format version carrying the v2 footer additions (#87): a per-flush
 /// nonce and per-(idempotent-)batch producer coordinates.
 ///
-/// Emitted by the **leaseless** writer (#86) — which is what production runs — and
-/// by compaction on a leaseless prefix, so v2 is the version an external S3-direct
-/// reader must expect (`docs/virtual-topics-format.md`, kotatsu#82). Not gated on
-/// bumping [`SEGMENT_FORMAT_VERSION`]: the two versions coexist per prefix
-/// according to the writer regime, and both stay readable.
+/// Emitted by the **leaseless** writer (#86) and by compaction on a leaseless
+/// prefix **until release B of #174**, when the leaseless write version became
+/// [`SEGMENT_FORMAT_VERSION_V3`]. No writer emits v2 anymore, but v2 segments
+/// remain in the buckets until compaction/retention turns them over, so
+/// external S3-direct readers must keep decoding it
+/// (`docs/virtual-topics-format.md`, kotatsu#82). Not gated on bumping
+/// [`SEGMENT_FORMAT_VERSION`]: the versions coexist per prefix according to
+/// the writer regime, and all stay readable.
 const SEGMENT_FORMAT_VERSION_V2: u16 = 2;
 
 /// Segment format version adding a per-coordinate `flags: u8` (#174): bit 0 =
 /// transactional, bit 1 = control, bits 2-7 written 0 and ignored on read. The
 /// flags let the footer index transactional data batches and transaction
-/// markers (control batches) once those are routed into segments.
+/// markers (control batches), which release B of #174 routes into segments.
 ///
-/// **Accepted on read, not yet emitted** — reader-first, in two releases, like
-/// the watermark field-erasure fix (#182). [`Self::decode_segment_footer`]
+/// **What every leaseless write emits** ([`Self::encode_segment_v3`]: the
+/// leaseless flush, merge compaction, and the per-key compaction rewrite) —
+/// unconditionally: the version follows the writer regime, never the
+/// segment's content. Shipped reader-first, in two releases, like the
+/// watermark field-erasure fix (#182): [`Self::decode_segment_footer`]
 /// hard-errors on an unknown version, and that error propagates through the
-/// index refresh into fetch: a broker meeting a segment version it does not
+/// index refresh into fetch — a broker meeting a segment version it does not
 /// know suffers a partition-wide read outage, not a graceful skip. Nor is the
 /// blast radius confined to this fleet — external S3-direct readers
 /// (kotatsu#82) decode these segments with the same version rejection, which
 /// the contract requires of them (`docs/virtual-topics-format.md`). So every
-/// reader must accept v3 before any writer emits it. The writer flip
-/// ([`Self::encode_segment_v2`] and the compaction re-encode, together with
-/// the transactional routing change) is release B of #174 and lands only once
-/// the v3-reading fleet — internal and external — is fully rolled.
+/// reader — internal and external, broker and maintain deployments alike —
+/// had to accept v3 (release A, beta.23; kotatsu#87, chart 0.9.0) before this
+/// writer flip could land.
 const SEGMENT_FORMAT_VERSION_V3: u16 = 3;
 
 /// Fixed-size trailer at the very end of every multi-topic segment (#64):
@@ -1041,6 +1046,13 @@ struct SubstreamEntry {
     producers: Vec<ProducerCoord>,
 }
 
+/// [`ProducerCoord::flags`] bit 0 (#174): the batch is transactional
+/// (wire-batch attribute bit 4). Derived from the batch attributes by the v3
+/// writer ([`DynoStore::encode_segment_v3`]); transactional *data*
+/// coordinates carry real sequences and fold into the [`ProducerTail`] like
+/// any idempotent batch.
+const FLAG_TRANSACTIONAL: u8 = 0b01;
+
 /// [`ProducerCoord::flags`] bit 1 (#174): the batch is a control batch — a
 /// transaction marker (wire-batch attribute bit 5). A marker coordinate is
 /// placement metadata, not an idempotent sequence: it carries
@@ -1061,14 +1073,14 @@ struct ProducerCoord {
     last_sequence: i32,
     offset_delta: u32,
     /// Batch classification flags, carried on disk from footer v3 (#174):
-    /// bit 0 = transactional (wire-batch attribute bit 4), bit 1 = control
-    /// (attribute bit 5, a transaction marker); bits 2-7 are written 0 and
-    /// ignored on read. Always `0` when decoded from a v1/v2 footer — those
-    /// layouts carry no flags byte — and `0` on everything the current v2
-    /// writer encodes, so existing code paths see exactly the pre-v3 value.
-    /// Re-derivable from the batch attribute bits, so the compaction re-encode
-    /// carries flags forward for free once the writer flips to v3 (release B
-    /// of #174).
+    /// bit 0 = transactional ([`FLAG_TRANSACTIONAL`], wire-batch attribute
+    /// bit 4), bit 1 = control ([`FLAG_CONTROL`], attribute bit 5, a
+    /// transaction marker); bits 2-7 are written 0 and ignored on read.
+    /// Always `0` when decoded from a v1/v2 footer — those layouts carry no
+    /// flags byte. Derived from the batch attribute bits by the v3 writer
+    /// ([`DynoStore::encode_segment_v3`]), so every re-encode — conflict
+    /// correction, merge compaction, the per-key rewrite — carries flags
+    /// forward for free.
     flags: u8,
 }
 
@@ -5391,6 +5403,14 @@ impl DynoStore {
         let (ack, offset) = oneshot::channel();
         let span = deflated.last_offset_delta as i64 + 1;
         let size = size_of::<i64>() + size_of::<i32>() + deflated.batch_length.max(0) as usize;
+        // A transaction marker flushes the buffer immediately (#174 release B):
+        // `txn_end` writes markers sequentially per partition, so parking each
+        // on the linger would cost an N-partition commit N × linger; flushing
+        // now also shrinks the durable-but-unregistered window. Control-only —
+        // transactional *data* batches coalesce normally, or a transactional
+        // workload would degrade to one object per batch, the very cost the
+        // coalescing exists to avoid. Cheap: commit/abort rate ≪ data rate.
+        let control = deflated.is_control();
 
         enum Action {
             Flush(PrefixCoalesceBuffer),
@@ -5419,6 +5439,7 @@ impl DynoStore {
             if buffer.pending.len() >= batches_threshold
                 || buffer.bytes >= bytes_threshold
                 || buffer.records >= Self::COALESCE_MAX_RECORDS
+                || control
             {
                 Action::Flush(std::mem::take(buffer))
             } else if first {
@@ -5824,9 +5845,9 @@ impl DynoStore {
                 return Self::ack_leaseless_outcomes(buffer, outcomes);
             }
 
-            // Encode a v2 segment stamped with the leaseless era epoch (#92) and
+            // Encode a v3 segment stamped with the leaseless era epoch (#92) and
             // try to create it at `candidate`.
-            let (payload, footer) = match self.encode_segment_v2(&substreams, era, nonce) {
+            let (payload, footer) = match self.encode_segment_v3(&substreams, era, nonce) {
                 Ok(encoded) => encoded,
                 Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
             };
@@ -6781,19 +6802,20 @@ impl DynoStore {
         let new_seq = if substreams.is_empty() {
             None
         } else {
-            // Carry the v2 producer coordinates forward (#107). Re-encoding the
-            // merged run as v2 re-derives each idempotent batch's producer
-            // coordinates from the (byte-identical) merged batches, so log-based
-            // idempotent dedup (#88) still observes producers whose batches were
-            // compacted — a retry of a compacted batch is recognized as a
-            // duplicate and acked with its original offset instead of being
-            // re-appended. A fresh per-segment nonce (#89) is stamped as on any
-            // create. Emitted only under the leaseless arbiter, which is where v2
-            // and log-based dedup live; the lease path keeps the v1 encoder (its
-            // segments carry no coordinates to preserve).
+            // Carry the producer coordinates forward (#107). Re-encoding the
+            // merged run as v3 re-derives each batch's producer coordinates —
+            // flags included (#174) — from the (byte-identical) merged batches,
+            // so log-based idempotent dedup (#88) still observes producers
+            // whose batches were compacted — a retry of a compacted batch is
+            // recognized as a duplicate and acked with its original offset
+            // instead of being re-appended. A fresh per-segment nonce (#89) is
+            // stamped as on any create. Emitted only under the leaseless
+            // arbiter, which is where the coordinates and log-based dedup
+            // live; the lease path keeps the v1 encoder (its segments carry
+            // no coordinates to preserve).
             let (payload, footer) = if self.prefix_leaseless {
                 let nonce = rng().random::<u64>();
-                self.encode_segment_v2(&substreams, merged_epoch.max(0), nonce)?
+                self.encode_segment_v3(&substreams, merged_epoch.max(0), nonce)?
             } else {
                 self.encode_segment(&substreams, merged_epoch.max(0))?
             };
@@ -6959,6 +6981,24 @@ impl DynoStore {
                 let mut out: Vec<deflated::Batch> = Vec::with_capacity(region.len());
                 let mut removed: u64 = 0;
                 for batch in region.iter().rev() {
+                    // Transaction markers and transactional data are exempt
+                    // from the per-key transform (#174 release B routes them
+                    // into segments; this pass predates that). A marker's
+                    // "key" is its ControlBatch bytes — every commit marker
+                    // shares it — so key-dedup would strip older markers,
+                    // leaving a read-committed consumer's aborted ranges
+                    // unbounded. And this cleaner is abort-unaware: letting an
+                    // aborted (or still-open) transactional record's key into
+                    // `seen` could remove the only *committed* copy of that
+                    // key beneath it — data loss for read-committed readers.
+                    // Carry them whole and withhold their keys from `seen`:
+                    // conservative (committed transactional data is never
+                    // compacted) but safe until the cleaner is
+                    // transaction-aware.
+                    if batch.is_control() || batch.is_transactional() {
+                        out.push(batch.clone());
+                        continue;
+                    }
                     let compaction = inflated::Batch::try_from(batch)?.compact(&seen)?;
                     seen.extend(compaction.batch.keys());
                     if seen.len() > self.prefix_compact_seen_keys {
@@ -7031,7 +7071,7 @@ impl DynoStore {
 
             let (payload, footer) = if self.prefix_leaseless {
                 let nonce = rng().random::<u64>();
-                self.encode_segment_v2(substreams, epoch.max(0), nonce)?
+                self.encode_segment_v3(substreams, epoch.max(0), nonce)?
             } else {
                 self.encode_segment(substreams, epoch.max(0))?
             };
@@ -8066,13 +8106,20 @@ impl DynoStore {
         Ok((PutPayload::from(Bytes::from(body)), footer))
     }
 
-    /// Like [`Self::encode_segment`] but emits a **v2** footer (#87): a per-flush
-    /// `nonce` plus, per sub-stream, the producer coordinates of its idempotent
-    /// batches (in region/offset order). Used by the leaseless write path (#86);
-    /// the coordinates back log-based idempotent dedup (#88) and the nonce backs
-    /// ambiguous-PUT adoption (#89). `offset_delta` is the batch's offset within
-    /// its sub-stream so it survives the conflict-correction re-encode.
-    fn encode_segment_v2(
+    /// Like [`Self::encode_segment`] but emits a **v3** footer (#87/#174): a
+    /// per-flush `nonce` plus, per sub-stream, the producer coordinates — with
+    /// an attribute-derived `flags` byte — of its idempotent, transactional
+    /// and control batches (in region/offset order). Used by every leaseless
+    /// write path (#86): the flush, merge compaction (#66) and the per-key
+    /// compaction rewrite (#175). The coordinates back log-based idempotent
+    /// dedup (#88), the nonce backs ambiguous-PUT adoption (#89), and the
+    /// flags make transaction markers and transactional data locatable from
+    /// the footer alone (#174) — placement metadata, not commit authority:
+    /// LSO/aborted derivation stays a pure `meta.json` function. `offset_delta`
+    /// is the batch's offset within its sub-stream so it survives the
+    /// conflict-correction re-encode. v3 is stamped unconditionally — the
+    /// version follows the writer regime, never the segment's content.
+    fn encode_segment_v3(
         &self,
         substreams: &[(Topition, i64, Vec<deflated::Batch>)],
         writer_epoch: i64,
@@ -8095,18 +8142,27 @@ impl DynoStore {
                 // Offset of this batch within the sub-stream, before it is added.
                 let offset_delta = record_count as u32;
                 body.extend_from_slice(&Bytes::from(batch.clone()));
-                if batch.is_idempotent() {
+                // v3 emission rule (#174): a coordinate per idempotent,
+                // transactional or control batch. A transaction marker is not
+                // idempotent (`base_sequence == -1`) yet must be indexed: its
+                // coordinate carries its real producer_id/epoch, the -1
+                // sequences, and `flags = 0b11` — and is never folded into
+                // the producer tail (see `producer_tail_folded`).
+                if batch.is_idempotent() || batch.is_transactional() || batch.is_control() {
+                    let mut flags = 0u8;
+                    if batch.is_transactional() {
+                        flags |= FLAG_TRANSACTIONAL;
+                    }
+                    if batch.is_control() {
+                        flags |= FLAG_CONTROL;
+                    }
                     producers.push(ProducerCoord {
                         producer_id: batch.producer_id,
                         producer_epoch: batch.producer_epoch,
                         base_sequence: batch.base_sequence,
                         last_sequence: batch.base_sequence.wrapping_add(batch.last_offset_delta),
                         offset_delta,
-                        // v2 carries no flags byte; deriving flags from the
-                        // batch attribute bits (and widening the emission rule
-                        // to control batches) comes with the v3 writer,
-                        // release B of #174.
-                        flags: 0,
+                        flags,
                     });
                 }
                 record_count += batch.last_offset_delta as i64 + 1;
@@ -8130,12 +8186,12 @@ impl DynoStore {
             nonce,
             entries,
         };
-        let footer_bytes = Self::encode_footer(&footer, SEGMENT_FORMAT_VERSION_V2);
+        let footer_bytes = Self::encode_footer(&footer, SEGMENT_FORMAT_VERSION_V3);
 
         body.extend_from_slice(&footer_bytes);
         body.extend_from_slice(&(footer_bytes.len() as u64).to_be_bytes());
         body.extend_from_slice(&(footer.entries.len() as u32).to_be_bytes());
-        body.extend_from_slice(&SEGMENT_FORMAT_VERSION_V2.to_be_bytes());
+        body.extend_from_slice(&SEGMENT_FORMAT_VERSION_V3.to_be_bytes());
         body.extend_from_slice(&SEGMENT_MAGIC.to_be_bytes());
 
         Ok((PutPayload::from(Bytes::from(body)), footer))
@@ -8732,9 +8788,12 @@ impl Storage for DynoStore {
             // Server-side coalescing: buffer the batch and flush a run as one
             // object per linger window — per connector prefix into a shared
             // segment (#57) when prefix mode is on, else per partition (#50).
-            // Transactional and control batches bypass both paths
-            // (offset/txn-marker semantics must stay one batch per object).
-            // Compacted batches bypass too — a compacted topic can't share a
+            // Transactional and control batches route into segments on the
+            // leaseless prefix path since release B of #174 (footer v3 indexes
+            // them; `meta.json` stays the commit authority); they still bypass
+            // the lease-mode prefix path and the per-partition coalescer,
+            // neither of which has a footer/transaction story. Compacted
+            // batches bypass both paths — a compacted topic can't share a
             // whole-segment-expiry segment (#61) — UNLESS compacted topics are
             // segment-routed (#175), which sidesteps that objection by giving
             // each compacted topic a dedicated prefix (`routed_prefix`); with
@@ -8743,11 +8802,10 @@ impl Storage for DynoStore {
             // the topic metadata object per batch; with the flag on the `||`
             // short-circuits it away entirely here, and `routed_prefix_of`
             // consults the same memo at enqueue instead.
-            let coalesce_eligible = transaction_id.is_none()
-                && !attributes.transaction
-                && !attributes.control
-                && (self.compacted_topics_in_segments()
-                    || !self.topic_is_compacted(topition.topic()).await?);
+            let txn_free =
+                transaction_id.is_none() && !attributes.transaction && !attributes.control;
+            let coalesce_eligible = self.compacted_topics_in_segments()
+                || !self.topic_is_compacted(topition.topic()).await?;
 
             // Will this batch be buffered into a prefix-coalesced segment (#57)?
             //
@@ -8772,7 +8830,15 @@ impl Storage for DynoStore {
             let prefix_buffer_route = if !(coalesce_eligible && self.prefix_coalesce) {
                 false
             } else if self.prefix_leaseless {
+                // Transactional and control batches included (#174 release B):
+                // the segment CAS is the single offset authority, so they must
+                // go through it like everything else.
                 true
+            } else if !txn_free {
+                // Lease mode keeps the transactional/control bypass — it is
+                // dying with the make-segments-mandatory work and gets no
+                // footer/transaction story.
+                false
             } else {
                 let records = deflated.last_offset_delta as i64 + 1;
                 let bypass_backfill = records >= Self::PREFIX_BACKFILL_MIN_RECORDS
@@ -8787,8 +8853,11 @@ impl Storage for DynoStore {
                 // also cannot advance before the batch is durable. So the per-pod
                 // `producers/{id}.json` gate is *skipped* for batches taking that
                 // route, since it diverges across a connection migration (#79)
-                // and mishandles i32 sequence wraparound (#80). Every other path
-                // (non-leaseless, transactional/control/compacted, backfill
+                // and mishandles i32 sequence wraparound (#80). Transactional
+                // data batches carry real sequences and shift to the same folded
+                // authority now that they take the route (#174 release B);
+                // control markers are not idempotent and never reach this block.
+                // Every other path (non-leaseless, compacted-unrouted, backfill
                 // bypass, legacy create) keeps the gate: validate (and advance)
                 // the idempotent sequence on the producer's own
                 // `producers/{id}.json` object rather than the cluster-global
@@ -8821,29 +8890,52 @@ impl Storage for DynoStore {
                 }
             }
 
-            if prefix_buffer_route {
-                return self.enqueue_prefix_coalesced(topition, deflated).await;
-            }
-            if coalesce_eligible && !self.prefix_coalesce && self.produce_coalesce {
+            // The per-partition coalescer (#50) keeps the transactional/control
+            // bypass: it has no footer to index them. Non-transactional by
+            // construction, so returning before the registration below is fine.
+            if coalesce_eligible && txn_free && !self.prefix_coalesce && self.produce_coalesce {
                 return self.enqueue_coalesced(topition, deflated).await;
             }
 
-            // Assign the offset by *creating* the immutable batch object (its
-            // name encodes the base offset), rather than by updating a hot
-            // per-partition `watermark` object on every batch. The create is the
-            // authority; the watermark stays a write-behind cache only. This is
-            // the #13 fix: the produce hot path no longer hammers a single
-            // object capped at ~1 write/s on GCS.
-            let payload = self
-                .encode(deflated.clone())
-                .inspect_err(|err| debug!(?err))?;
+            // Captured before `deflated` is moved into the prefix buffer; the
+            // transaction registration below needs both.
+            let last_offset_delta = deflated.last_offset_delta;
+            let producer_epoch = deflated.producer_epoch;
 
-            let offset = self
-                .assign_and_create(topition, deflated.last_offset_delta as i64 + 1, payload)
-                .await
-                .inspect(|offset| debug!(offset, transaction_id, ?topition))
-                .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
+            let offset = if prefix_buffer_route {
+                // Buffered into a prefix-coalesced segment (#57/#174): the
+                // offset resolves only once the segment PUT is durable and the
+                // parked producer is acked, so the transaction registration
+                // below still runs durable-then-register, exactly like the
+                // legacy arm. Deliberately NOT an early return: a transactional
+                // produce that skipped the registration would leave its range
+                // out of `meta.transactions`, `txn_end` would find nothing to
+                // mark, and a read-committed consumer would read aborted data
+                // as committed (the #81 bug class).
+                self.enqueue_prefix_coalesced(topition, deflated).await?
+            } else {
+                // Assign the offset by *creating* the immutable batch object
+                // (its name encodes the base offset), rather than by updating a
+                // hot per-partition `watermark` object on every batch. The
+                // create is the authority; the watermark stays a write-behind
+                // cache only. This is the #13 fix: the produce hot path no
+                // longer hammers a single object capped at ~1 write/s on GCS.
+                let payload = self
+                    .encode(deflated.clone())
+                    .inspect_err(|err| debug!(?err))?;
 
+                self.assign_and_create(topition, last_offset_delta as i64 + 1, payload)
+                    .await
+                    .inspect(|offset| debug!(offset, transaction_id, ?topition))
+                    .inspect_err(|err| error!(?err, transaction_id, ?topition))?
+            };
+
+            // Register the produced range on the open transaction. Covers the
+            // end-transaction marker too (`txn_end` produces it with the
+            // transaction id and the transactional attribute), extending
+            // `offset_end` over the marker's offset. Idempotent under retries:
+            // a leaseless `Duplicate` ack returns the *original* offset, and
+            // the `and_modify` below only ever widens `offset_end`.
             if let Some(transaction_id) = transaction_id
                 && attributes.transaction
             {
@@ -8852,12 +8944,10 @@ impl Storage for DynoStore {
                         if let Some(transaction) = meta.transactions.get_mut(transaction_id) {
                             debug!(?transaction);
 
-                            if let Some(txn_detail) =
-                                transaction.epochs.get_mut(&deflated.producer_epoch)
-                            {
+                            if let Some(txn_detail) = transaction.epochs.get_mut(&producer_epoch) {
                                 debug!(?txn_detail);
 
-                                let offset_end = offset + deflated.last_offset_delta as i64;
+                                let offset_end = offset + last_offset_delta as i64;
 
                                 _ = txn_detail
                                     .produces
