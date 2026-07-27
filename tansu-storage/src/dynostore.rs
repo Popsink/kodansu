@@ -92,6 +92,11 @@ const APPLICATION_JSON: &str = "application/json";
 /// with a per-entry TTL (#110). Aliased to keep the field type readable.
 type LegacyRecordsMemo = BTreeMap<Topition, (bool, SystemTime, Duration)>;
 
+/// One cached segment's expiry-decision inputs (#61/#176): `(seq, age_ms,
+/// [(topic, partition, end_offset)])`, snapshotted under the `prefix_index`
+/// lock so the truncation floors can be evaluated outside it.
+type SegmentExpirySnapshot = (u64, i64, Vec<(String, i32, i64)>);
+
 #[derive(Clone, Debug)]
 pub struct DynoStore {
     cluster: String,
@@ -155,6 +160,19 @@ pub struct DynoStore {
     /// `watermark.json` conditional GET: a wide `endOffsets(assignment)` costs
     /// O(prefixes), not O(partitions), in object-store round-trips.
     coalesced_watermark_floors: Arc<Mutex<BTreeMap<Topition, (i64, u64)>>>,
+
+    /// Per-partition memo of the resolved truncation floor (#176), including
+    /// the **absence** of one (memoized as `0`). Read paths that do not pass
+    /// through the watermark slow path (EARLIEST on a fresh process, the
+    /// fetch clamp) resolve the floor via [`Self::truncate_floor`], which
+    /// pays at most one `watermark.json` GET per process per partition and
+    /// then serves from here — never a per-call 404 on floor-less partitions
+    /// (the #161 pathology). Entries are max-folded (the floor is monotonic)
+    /// and evicted on `create_topic` so a re-created topic does not inherit
+    /// a dead incarnation's floor. The OptiCon watermark cache, when
+    /// populated, takes precedence over this memo: it is refreshed by the
+    /// cold/slow watermark reads, while the memo is not.
+    truncate_floors: Arc<Mutex<BTreeMap<Topition, i64>>>,
 
     /// Per-prefix single-flight for the stale-index refresh and the certified
     /// seq-floor sync. A wide ListOffsets resolves its partitions concurrently
@@ -1473,10 +1491,11 @@ struct TopicIndex {
 /// maintenance interval ([`DynoStore::expire_prefix_segments`] persists `high`,
 /// [`DynoStore::advance_low_watermark`] persists `low`), so without it a
 /// rolling deploy would let an old process silently erase any field a newer
-/// one had just written — for the upcoming truncation floor (#176) that means
-/// resurrecting records a user deleted. An empty map flattens to no bytes at
-/// all, so existing objects are not rewritten on first touch; the guard test
-/// `watermark_with_mut_preserves_unknown_fields` pins both properties.
+/// one had just written — for the truncation floor (`truncate`, #176) that
+/// means resurrecting records a user deleted. An empty map flattens to no
+/// bytes at all, so existing objects are not rewritten on first touch; the
+/// guard test `watermark_with_mut_preserves_unknown_fields` pins both
+/// properties.
 ///
 /// (`Hash`/`Ord`/`PartialOrd` were dropped with the catch-all —
 /// [`serde_json::Value`] does not implement them — which is free: the only
@@ -1486,6 +1505,24 @@ struct TopicIndex {
 struct Watermark {
     low: Option<i64>,
     high: Option<i64>,
+    /// Truncation floor (#176): the offset below which `DeleteRecords` has
+    /// logically truncated this sub-stream (records survive physically in
+    /// shared segments; read paths hide them below this floor). Monotonic:
+    /// only ever max-folded under the watermark CAS
+    /// ([`DynoStore::delete_records_before`]).
+    ///
+    /// The `skip_serializing_if` is load-bearing, not stylistic: a floor-less
+    /// watermark must keep its pre-#176 byte layout (`{"low":…,"high":…}`) —
+    /// the #182 guard test pins that byte identity, and emitting
+    /// `"truncate":null` would rewrite (and etag-churn) every watermark
+    /// object across a fleet that has no floors.
+    ///
+    /// Release ordering: writing this field requires the whole fleet at
+    /// ≥ 0.7.0-beta.23 — a pre-#182 binary does not model unknown watermark
+    /// fields and would erase the floor on its next `watermark.json`
+    /// maintenance round-trip, silently un-deleting records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    truncate: Option<i64>,
     #[serde(flatten)]
     rest: BTreeMap<String, serde_json::Value>,
 }
@@ -1517,6 +1554,7 @@ impl DynoStore {
             watermarks: Arc::new(Mutex::new(BTreeMap::new())),
             next_offsets: Arc::new(Mutex::new(BTreeMap::new())),
             coalesced_watermark_floors: Arc::new(Mutex::new(BTreeMap::new())),
+            truncate_floors: Arc::new(Mutex::new(BTreeMap::new())),
             prefix_read_sync_locks: Arc::new(Mutex::new(BTreeMap::new())),
             producers: Arc::new(Mutex::new(BTreeMap::new())),
             producer_checkpoints: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2192,6 +2230,102 @@ impl DynoStore {
         Ok(self.watermark(topition)?.cached().and_then(|w| w.low))
     }
 
+    /// The truncation floor (#176) for `topition` from in-process caches only
+    /// — the OptiCon watermark cache first (it is refreshed by the cold/slow
+    /// watermark reads), else the [`Self::truncate_floors`] memo — **without
+    /// any object-store request**. `None` when neither holds the partition.
+    /// Callers on request-free paths treat `None` as "no floor known": for
+    /// read-uncommitted `offset_stage_at` that degrades to the pre-truncation
+    /// log start (self-correcting, like `cached_low`); for the segment-expiry
+    /// loop the direction is mandatory — an unknown floor must defer reclaim,
+    /// never force it.
+    fn cached_truncate(&self, topition: &Topition) -> Result<Option<i64>> {
+        // Deliberately non-inserting (unlike `self.watermark(...)`) so the
+        // expiry loop's sweep over every footer entry does not populate an
+        // OptiCon handle per sub-stream it will never serve.
+        let from_watermark = self
+            .watermarks
+            .lock()
+            .map(|locked| {
+                locked
+                    .get(topition)
+                    .and_then(|watermark| watermark.cached())
+                    .map(|watermark| watermark.truncate.unwrap_or(0))
+            })
+            .map_err(Into::<Error>::into)?;
+
+        if from_watermark.is_some() {
+            return Ok(from_watermark);
+        }
+
+        self.truncate_floors
+            .lock()
+            .map(|locked| locked.get(topition).copied())
+            .map_err(Into::into)
+    }
+
+    /// The truncation floor (#176) for `topition`: the offset below which
+    /// `DeleteRecords` has logically truncated this sub-stream, `0` when it
+    /// never was.
+    ///
+    /// Zero object-store requests in steady state: served from
+    /// [`Self::cached_truncate`] (the OptiCon watermark cache, populated
+    /// wherever the cold path already reads `watermark.json`, or the memo).
+    /// Only a fully-cold call — neither cache holds the partition — pays one
+    /// `watermark.json` GET, and the result **including absence** (memoized
+    /// as `0`) is retained, so a watermark-less partition is asked once per
+    /// process, never per call — the #161 404-storm shape.
+    ///
+    /// Cross-replica staleness contract: the pod that served the
+    /// `DeleteRecords` is exact immediately (`with_mut` leaves the written
+    /// value in the OptiCon cache). A peer pod serves the floor it last
+    /// observed, refreshed whenever its slow high-watermark path re-reads
+    /// `watermark.json`: for a legacy/hybrid sub-stream that is every
+    /// stale-hint slow poll (≈ the high-watermark hint TTL), but for a
+    /// **pure-segment** sub-stream the watermark is re-read only when the
+    /// certified seq-floor generation changes (segment expiry/compaction),
+    /// on a cold start, or on this accessor's own first touch — there is
+    /// **no TTL bound**, so on a quiet prefix a peer can honour a stale
+    /// (lower) floor until restart. Accepted for a rare admin operation; a
+    /// stale floor only ever under-hides (a peer serves records another pod
+    /// already truncated), it never loses data.
+    ///
+    /// Release ordering: requires the whole fleet at ≥ 0.7.0-beta.23 — a
+    /// pre-#182 pod would erase the floor on its next `watermark.json`
+    /// round-trip (see [`Watermark::truncate`]).
+    async fn truncate_floor(&self, topition: &Topition) -> Result<i64> {
+        if let Some(floor) = self.cached_truncate(topition)? {
+            return Ok(floor);
+        }
+
+        // Fully cold: pay the watermark GET once. `with` serves the
+        // `Default` (no floor -> 0) when the object is absent, and that is
+        // memoized too, so absence costs one 404 per process per partition,
+        // not one per call (#161).
+        let floor = self
+            .watermark(topition)?
+            .with(&self.object_store, |watermark| {
+                Ok(watermark.truncate.unwrap_or(0))
+            })
+            .await?;
+
+        self.memo_truncate_floor(topition, floor)?;
+
+        Ok(floor)
+    }
+
+    /// Max-fold `floor` into the [`Self::truncate_floors`] memo (the floor is
+    /// monotonic, so a racing older resolution can never regress it).
+    fn memo_truncate_floor(&self, topition: &Topition, floor: i64) -> Result<()> {
+        self.truncate_floors
+            .lock()
+            .map(|mut locked| {
+                let entry = locked.entry(topition.to_owned()).or_insert(floor);
+                *entry = (*entry).max(floor);
+            })
+            .map_err(Into::into)
+    }
+
     /// The log start offset for `topition` (#161).
     ///
     /// `watermark.low` is advanced **only** by the legacy `records/` retention
@@ -2210,15 +2344,24 @@ impl DynoStore {
     /// advances that field after a segment expiry. A hybrid or legacy sub-stream
     /// still reads the object: there the legacy region owns the log start, and
     /// retention does record it.
+    ///
+    /// Either way the result is clamped to the truncation floor (#176):
+    /// `DeleteRecords` hides segment-resident records without touching the
+    /// shared segments, so the physical region start can sit below the
+    /// logical log start.
     async fn log_start(&self, topition: &Topition) -> Result<i64> {
         if self.prefix_coalesce && !self.has_legacy_records(topition).await? {
-            return Ok(self.segment_region_start(topition).await?.unwrap_or(0));
+            let start = self.segment_region_start(topition).await?.unwrap_or(0);
+            return Ok(start.max(self.truncate_floor(topition).await?));
         }
 
         self.watermark(topition)?
             .with(&self.object_store, |watermark| {
                 debug!(?watermark);
-                Ok(watermark.low.unwrap_or(0))
+                Ok(watermark
+                    .low
+                    .unwrap_or(0)
+                    .max(watermark.truncate.unwrap_or(0)))
             })
             .await
     }
@@ -4698,8 +4841,18 @@ impl DynoStore {
     /// the base offset of the oldest legacy `records/` object if any survive
     /// (they hold the lowest offsets until retention drains them, #60 hybrid),
     /// otherwise the base offset in the oldest segment (lowest sequence) that
-    /// carries the sub-stream. `0` when neither exists yet.
+    /// carries the sub-stream. `0` when neither exists yet. Clamped to the
+    /// truncation floor (#176) in both arms: truncated records survive
+    /// physically (in shared segments always; in the legacy region on a
+    /// replica that has not observed the physical delete), so the oldest
+    /// physical base can sit below the logical log start.
     async fn coalesced_earliest_offset(&self, topition: &Topition) -> Result<i64> {
+        // `truncate_floor` (not `cached_truncate`): EARLIEST does not pass
+        // through the high-watermark slow path that warms the watermark
+        // cache, so on a fresh process this is the read that resolves the
+        // floor (once — absence is memoized, #161).
+        let floor = self.truncate_floor(topition).await?;
+
         // Hybrid topic: the legacy region holds the lowest offsets (below the #58
         // seam), so the smallest base offset present in `records/` is the log
         // start (listing is ascending, so the first parseable name is the min).
@@ -4723,13 +4876,17 @@ impl DynoStore {
                     && name.as_ref().len() >= 20
                     && let Ok(base) = i64::from_str(&name.as_ref()[0..20])
                 {
-                    return Ok(base);
+                    return Ok(base.max(floor));
                 }
             }
         }
 
         // Otherwise the oldest segment's base for this sub-stream, from the index.
-        Ok(self.segment_region_start(topition).await?.unwrap_or(0))
+        Ok(self
+            .segment_region_start(topition)
+            .await?
+            .unwrap_or(0)
+            .max(floor))
     }
 
     /// The newest record timestamp for a PURE-segment sub-stream (#73), from the
@@ -4856,9 +5013,19 @@ impl DynoStore {
                 .into_iter()
                 .find(|(_, entry)| entry.max_timestamp >= 0 && entry.max_timestamp >= target_ms);
 
+            // A truncated segment survives physically (#176), so the located
+            // base offset can sit below the truncation floor — clamp, exactly
+            // as EARLIEST does.
+            let offset = match &found {
+                Some((_, entry)) => {
+                    Some(entry.base_offset.max(self.truncate_floor(topition).await?))
+                }
+                None => None,
+            };
+
             return Ok(Some(ListOffsetResponse {
                 error_code: ErrorCode::None,
-                offset: found.as_ref().map(|(_, entry)| entry.base_offset),
+                offset,
                 timestamp: found.as_ref().map(|(_, entry)| {
                     SystemTime::UNIX_EPOCH + Duration::from_millis(entry.max_timestamp as u64)
                 }),
@@ -6209,8 +6376,11 @@ impl DynoStore {
     /// record across **every** sub-stream (the max footer timestamp, falling back
     /// to the object's append time when record timestamps are unset) is past the
     /// threshold — never dropping a segment while any topic in it is still live.
-    /// Deletes in bounded `DeleteObjects` chunks and refreshes the per-prefix
-    /// skip hint from what survived.
+    /// A segment is also expirable, regardless of age, when every sub-stream
+    /// slice in it ends at/below that sub-stream's truncation floor (#176) —
+    /// best-effort, from in-process-cached floors only (an unknown floor
+    /// defers, never forces, the reclaim). Deletes in bounded `DeleteObjects`
+    /// chunks and refreshes the per-prefix skip hint from what survived.
     async fn expire_prefix_segments(&self, prefix: &str, threshold_ms: i64) -> Result<u64> {
         /// Matches the S3 `DeleteObjects` per-request key cap.
         const EXPIRE_DELETE_CHUNK: usize = 1_000;
@@ -6218,47 +6388,89 @@ impl DynoStore {
         self.refresh_prefix_index(prefix).await?;
 
         // Decide from the cached footers (no per-segment footer GET). A segment
-        // is expirable only when its newest record across every sub-stream (max
+        // is expirable when its newest record across every sub-stream (max
         // footer timestamp, or the object append time when record timestamps are
         // unset) is past the threshold — so a live topic never loses a shared
-        // segment.
-        let (expirable, affected, surviving_oldest_ms): (
-            Vec<u64>,
-            BTreeSet<(String, i32)>,
-            Option<i64>,
-        ) = {
+        // segment — OR when every sub-stream slice in it ends at/below that
+        // sub-stream's truncation floor (#176, fully-truncated reclaim).
+        //
+        // Snapshot the decision inputs under the index lock, then evaluate
+        // the floors OUTSIDE it: `cached_truncate` takes the `watermarks` /
+        // `truncate_floors` locks, and nesting those under `prefix_index`
+        // would set up a lock-order hazard for no benefit.
+        let segments_snapshot: Vec<SegmentExpirySnapshot> = {
             let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
-            let mut expirable = Vec::new();
-            let mut affected = BTreeSet::new();
-            let mut surviving: Option<i64> = None;
 
-            if let Some(entry) = index.get(prefix) {
-                for (seq, cached) in &entry.segments {
-                    let newest = cached
-                        .footer
-                        .entries
+            index
+                .get(prefix)
+                .map(|entry| {
+                    entry
+                        .segments
                         .iter()
-                        .map(|e| e.max_timestamp)
-                        .max()
-                        .unwrap_or(i64::MIN);
-                    let age_ms = if newest > 0 {
-                        newest
-                    } else {
-                        cached.last_modified_ms
-                    };
+                        .map(|(seq, cached)| {
+                            let newest = cached
+                                .footer
+                                .entries
+                                .iter()
+                                .map(|e| e.max_timestamp)
+                                .max()
+                                .unwrap_or(i64::MIN);
+                            let age_ms = if newest > 0 {
+                                newest
+                            } else {
+                                cached.last_modified_ms
+                            };
+                            let ends = cached
+                                .footer
+                                .entries
+                                .iter()
+                                .map(|e| {
+                                    (e.topic.clone(), e.partition, e.base_offset + e.record_count)
+                                })
+                                .collect();
 
-                    if age_ms < threshold_ms {
-                        expirable.push(*seq);
-                        for e in &cached.footer.entries {
-                            _ = affected.insert((e.topic.clone(), e.partition));
-                        }
-                    } else {
-                        surviving = Some(surviving.map_or(age_ms, |o: i64| o.min(age_ms)));
-                    }
+                            (*seq, age_ms, ends)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        let mut expirable: Vec<u64> = Vec::new();
+        let mut affected: BTreeSet<(String, i32)> = BTreeSet::new();
+        let mut surviving_oldest_ms: Option<i64> = None;
+
+        for (seq, age_ms, ends) in &segments_snapshot {
+            // Fully truncated (#176): every sub-stream slice ends at/below its
+            // truncation floor, so the segment holds only logically-deleted
+            // records — reclaimable regardless of age. Floors come from
+            // in-process caches ONLY (`cached_truncate`: zero object requests
+            // on this maintain path — re-reading N per-partition watermark
+            // objects here is the request class this design exists to kill).
+            // Reclaim is best-effort: an unknown floor makes the slice look
+            // live and DEFERS reclaim — the safe direction — until this
+            // process warms that partition's watermark (its own cold read, or
+            // it served the DeleteRecords itself); age-based retention still
+            // bounds the physical debt.
+            let mut fully_truncated = !ends.is_empty();
+            for (topic, partition, end) in ends {
+                let tp = Topition::new(topic.as_str(), *partition);
+                if self.cached_truncate(&tp)?.is_none_or(|floor| floor < *end) {
+                    fully_truncated = false;
+                    break;
                 }
             }
-            (expirable, affected, surviving)
-        };
+
+            if *age_ms < threshold_ms || fully_truncated {
+                expirable.push(*seq);
+                for (topic, partition, _) in ends {
+                    _ = affected.insert((topic.clone(), *partition));
+                }
+            } else {
+                surviving_oldest_ms =
+                    Some(surviving_oldest_ms.map_or(*age_ms, |o: i64| o.min(*age_ms)));
+            }
+        }
 
         self.record_prefix_oldest_retained(prefix, surviving_oldest_ms)?;
 
@@ -7534,9 +7746,21 @@ impl DynoStore {
         Ok(deleted)
     }
 
-    /// Delete every batch of `topition` whose base offset is below `before` and
-    /// set the log start offset to `before`. `before` of `-1` means the log end
-    /// offset (delete everything). Returns the new log start offset.
+    /// Truncate `topition` below `before`: physically delete the legacy
+    /// `records/` batch objects whose base offset is below `before` (they are
+    /// per-partition objects, safe to remove), and persist the offset as the
+    /// sub-stream's durable truncation floor (`watermark.truncate`, #176).
+    /// Segment-resident records are NOT rewritten — segments are shared
+    /// across sub-streams — they are hidden at read time by the floor and
+    /// reclaimed by [`Self::expire_prefix_segments`] once every sub-stream in
+    /// a segment is past its floor. `before` of `-1` means the log end offset
+    /// (delete everything).
+    ///
+    /// The floor is **monotonic**: max-folded against any existing floor
+    /// inside the watermark CAS (`with_mut` re-applies the closure on
+    /// conflict), so a later call with a lower offset cannot regress it — and
+    /// the returned log start is the post-fold floor that actually holds, not
+    /// the requested `before`.
     async fn delete_records_before(&self, topition: &Topition, before: i64) -> Result<i64> {
         // The log end offset comes from the immutable batch objects (the
         // authority), not the write-behind `watermark` object, which is no
@@ -7554,9 +7778,38 @@ impl DynoStore {
             .collect::<Vec<_>>();
 
         self.delete_batches(removed).await?;
-        self.advance_low_watermark(topition, Some(before)).await?;
 
-        Ok(before)
+        // One CAS carries both the truncation floor and the legacy log start
+        // (`low`, kept in lockstep for pre-floor readers), replacing the
+        // previous separate `advance_low_watermark` PUT. Both are max-folded:
+        // `low` may already sit above `before` (legacy retention advances it
+        // independently) and must not regress.
+        let floor = self
+            .watermark(topition)?
+            .with_mut(&self.object_store, |watermark| {
+                let floor = watermark
+                    .truncate
+                    .map_or(before, |truncate| truncate.max(before));
+                watermark.truncate = Some(floor);
+                watermark.low = Some(watermark.low.unwrap_or(0).max(floor));
+                Ok(floor)
+            })
+            .await?;
+
+        self.memo_truncate_floor(topition, floor)?;
+
+        // Wake the next maintenance pass for this prefix: the whole-segment
+        // reclaim gate (`prefix_maybe_expirable`) is age-based, so without
+        // dropping the hint a prefix whose segments are young but now fully
+        // truncated (#176) would not be re-examined until age retention fired
+        // anyway. Best-effort like the reclaim itself — a peer maintainer
+        // keeps its own hint and converges via its normal age-based rescan.
+        if self.prefix_coalesce {
+            let prefix = self.routed_prefix_of(topition).await?;
+            self.record_prefix_oldest_retained(&prefix, None)?;
+        }
+
+        Ok(floor)
     }
 
     /// Enforce the `compact` cleanup policy: for every topic configured with
@@ -8263,6 +8516,7 @@ impl Storage for DynoStore {
                 .with_mut(&self.object_store, |watermark| {
                     _ = watermark.high.take();
                     _ = watermark.low.take();
+                    _ = watermark.truncate.take();
 
                     Ok(())
                 })
@@ -8273,13 +8527,19 @@ impl Storage for DynoStore {
             // re-derives offset 0 from listing. The cached watermark floor
             // must go with it: the prefix's seq floor is unrelated to topic
             // lifecycle, so it alone would never invalidate a floor cached
-            // for the deleted incarnation.
+            // for the deleted incarnation. Same for the truncation-floor
+            // memo (#176): a re-created topic must not inherit a dead
+            // incarnation's floor.
             _ = self
                 .next_offsets
                 .lock()
                 .map(|mut locked| locked.remove(&topition))?;
             _ = self
                 .coalesced_watermark_floors
+                .lock()
+                .map(|mut locked| locked.remove(&topition))?;
+            _ = self
+                .truncate_floors
                 .lock()
                 .map(|mut locked| locked.remove(&topition))?;
         }
@@ -8646,6 +8906,17 @@ impl Storage for DynoStore {
                 // Legacy offsets are all below segment offsets (the #58 seam), so
                 // legacy-then-segment preserves order and a single fetch with
                 // budget to spare stitches across the seam.
+                //
+                // Nothing below the truncation floor is served (#176):
+                // truncated records survive physically in shared segments, so
+                // the floor is enforced by clamping the requested offset —
+                // skip, not error, and batch-granular by construction via the
+                // whole-batch skip in `fetch_prefix_coalesced`. Served from
+                // in-process caches on a warm poll (`truncate_floor` memoizes
+                // absence, so floor-less partitions add no request, #161).
+                // The non-coalesced branch below is untouched: there
+                // DeleteRecords deletes the per-partition objects physically.
+                let offset = offset.max(self.truncate_floor(topition).await?);
                 let mut from = offset;
                 let hybrid = self.has_legacy_records(topition).await?;
 
@@ -8728,11 +8999,15 @@ impl Storage for DynoStore {
         // aborted transactions to surface, so `meta.json` — the single, hot,
         // cluster-wide key — is never read. The high watermark comes from the
         // in-memory hint (#40) and the log start from the cached watermark
-        // (#109), so a warm, caught-up consumer resolves its fetch-response
-        // offsets with zero object-store requests, off the meta-object throttle
-        // ceiling entirely.
+        // (#109) clamped to the cached truncation floor (#176) — both
+        // request-free — so a warm, caught-up consumer resolves its
+        // fetch-response offsets with zero object-store requests, off the
+        // meta-object throttle ceiling entirely.
         let high_watermark = self.high_watermark(topition).await?;
-        let log_start = self.cached_low(topition)?.unwrap_or(0);
+        let log_start = self
+            .cached_low(topition)?
+            .unwrap_or(0)
+            .max(self.cached_truncate(topition)?.unwrap_or(0));
 
         Ok(OffsetStage {
             last_stable: high_watermark,

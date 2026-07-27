@@ -200,11 +200,20 @@ sequence is always higher.
 - **Retention** is whole-segment, per prefix: a segment is deleted only once
   every sub-stream in it is past retention (`max_timestamp`), so a live topic
   never loses a shared segment.
+- **Truncation (`DeleteRecords`) is logical, not physical.** A sub-stream's
+  truncation floor lives in its per-partition
+  `clusters/{cluster}/topics/{topic}/partitions/{partition}/watermark.json`
+  (field `truncate`), outside this format: segments are never rewritten, so an
+  S3-direct reader working from segments alone may see records below the
+  broker's log start. A segment every one of whose sub-stream slices ends
+  at/below its floor becomes reclaimable ahead of age-based retention — the
+  deletion/`404` contract below applies unchanged.
 - **Segments are immutable but not permanent.** Compaction deletes the originals
-  once the merged segment exists, and retention deletes whole segments, so a GET
-  of a segment a reader learned about earlier can `404` at any time. Re-list the
-  prefix and resolve the offset again rather than treating the `404` as data loss
-  — the records are in the merged segment, or genuinely past retention.
+  once the merged segment exists, and retention deletes whole segments (by age,
+  or fully-truncated per the previous note), so a GET of a segment a reader
+  learned about earlier can `404` at any time. Re-list the prefix and resolve
+  the offset again rather than treating the `404` as data loss — the records
+  are in the merged segment, or genuinely past retention.
 - **Single writer per prefix is no longer the production regime.** Lease mode
   (`prefixes/{prefix}/lease.json`, #59) still exists in the code, but production
   runs **leaseless** (#86): any replica may append to any prefix, arbitrated by
