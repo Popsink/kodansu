@@ -13,6 +13,13 @@
 // limitations under the License.
 
 //! `cleanup.policy=compact` for the dynostore (object store) backend.
+//!
+//! Every scenario runs twice: against the legacy `records/` layout (the
+//! in-place `policy_compact` rewrite) and in segment mode
+//! (`prefix_coalesce` + `prefix_leaseless` + `compacted_segments`, #175),
+//! where the per-key pass rewrites whole create-only segments. The pair pins
+//! that flipping the routing flag changes WHERE compaction happens, never its
+//! observable outcome — the invariant the #175 rollout depends on.
 
 use std::{sync::Arc, time::Duration};
 
@@ -30,15 +37,26 @@ mod common;
 
 type Sc = Arc<Box<dyn Storage>>;
 
-async fn memory_storage() -> Result<Sc, Error> {
+async fn storage_at(url: &str) -> Result<Sc, Error> {
     StorageContainer::builder()
         .cluster_id("tansu")
         .node_id(111)
         .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(Url::parse("memory://tansu/")?)
+        .storage(Url::parse(url)?)
         .build()
         .await
         .map_err(Into::into)
+}
+
+async fn memory_storage() -> Result<Sc, Error> {
+    storage_at("memory://tansu/").await
+}
+
+/// Segment mode (#175): compacted topics are prefix-coalesced into segments
+/// under their own dedicated prefix and per-key compacted there.
+async fn segment_storage() -> Result<Sc, Error> {
+    storage_at("memory://tansu/?prefix_coalesce=true&prefix_leaseless=true&compacted_segments=true")
+        .await
 }
 
 async fn create_topic(
@@ -114,12 +132,9 @@ async fn fetched_records(
     Ok(records)
 }
 
-#[tokio::test]
-async fn keeps_latest_per_key() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let storage = memory_storage().await?;
-
+/// Without this, a repeatedly-updated key retains every stale version forever
+/// and a `connect.*`-class topic replays obsolete state on restart.
+async fn keeps_latest_per_key(storage: Sc) -> Result<(), Error> {
     create_topic(&storage, "kv", cleanup_compact()).await?;
 
     let topition = Topition::new("kv", 0);
@@ -150,11 +165,20 @@ async fn keeps_latest_per_key() -> Result<(), Error> {
 }
 
 #[tokio::test]
-async fn distinct_keys_are_retained() -> Result<(), Error> {
+async fn keeps_latest_per_key_legacy() -> Result<(), Error> {
     let _guard = init_tracing()?;
+    keeps_latest_per_key(memory_storage().await?).await
+}
 
-    let storage = memory_storage().await?;
+#[tokio::test]
+async fn keeps_latest_per_key_segments() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+    keeps_latest_per_key(segment_storage().await?).await
+}
 
+/// Without this, an over-eager compactor could treat "same topic" as "same
+/// key" and delete live data that merely shares a partition.
+async fn distinct_keys_are_retained(storage: Sc) -> Result<(), Error> {
     create_topic(&storage, "kv", cleanup_compact()).await?;
 
     let topition = Topition::new("kv", 0);
@@ -175,11 +199,22 @@ async fn distinct_keys_are_retained() -> Result<(), Error> {
 }
 
 #[tokio::test]
-async fn compacts_within_a_multi_record_batch() -> Result<(), Error> {
+async fn distinct_keys_are_retained_legacy() -> Result<(), Error> {
     let _guard = init_tracing()?;
+    distinct_keys_are_retained(memory_storage().await?).await
+}
 
-    let storage = memory_storage().await?;
+#[tokio::test]
+async fn distinct_keys_are_retained_segments() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+    distinct_keys_are_retained(segment_storage().await?).await
+}
 
+/// Without this, duplicates inside a single batch survive forever — and in
+/// segment mode (#175) it also pins that the per-key pass has NO hot-tail
+/// exemption: everything here lives in the one newest segment, which a
+/// `keep_hot`-style guard would never touch.
+async fn compacts_within_a_multi_record_batch(storage: Sc) -> Result<(), Error> {
     create_topic(&storage, "kv", cleanup_compact()).await?;
 
     let topition = Topition::new("kv", 0);
@@ -236,11 +271,21 @@ async fn compacts_within_a_multi_record_batch() -> Result<(), Error> {
 }
 
 #[tokio::test]
-async fn without_compact_policy_nothing_is_removed() -> Result<(), Error> {
+async fn compacts_within_a_multi_record_batch_legacy() -> Result<(), Error> {
     let _guard = init_tracing()?;
+    compacts_within_a_multi_record_batch(memory_storage().await?).await
+}
 
-    let storage = memory_storage().await?;
+#[tokio::test]
+async fn compacts_within_a_multi_record_batch_segments() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+    compacts_within_a_multi_record_batch(segment_storage().await?).await
+}
 
+/// Without this, key-based removal could leak onto `delete`-policy topics —
+/// in segment mode (#175) that would be the per-key pass rewriting a shared
+/// CDC prefix it must never touch.
+async fn without_compact_policy_nothing_is_removed(storage: Sc) -> Result<(), Error> {
     create_topic(&storage, "plain", vec![]).await?;
 
     let topition = Topition::new("plain", 0);
@@ -258,6 +303,18 @@ async fn without_compact_policy_nothing_is_removed() -> Result<(), Error> {
     Ok(())
 }
 
+#[tokio::test]
+async fn without_compact_policy_nothing_is_removed_legacy() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+    without_compact_policy_nothing_is_removed(memory_storage().await?).await
+}
+
+#[tokio::test]
+async fn without_compact_policy_nothing_is_removed_segments() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+    without_compact_policy_nothing_is_removed(segment_storage().await?).await
+}
+
 /// Compaction must not corrupt `ListOffsets(EARLIEST)`.
 ///
 /// Selection used to order candidate objects by their `last_modified`. Compaction
@@ -269,12 +326,11 @@ async fn without_compact_policy_nothing_is_removed() -> Result<(), Error> {
 /// Here a multi-record batch at offset 0 survives compaction (rewritten in place),
 /// while the newer single-record batch at offset 2 is not rewritten — inverting the
 /// mtime order. EARLIEST must still report 0, the smallest surviving base offset.
-#[tokio::test]
-async fn earliest_after_compaction_is_the_log_start_not_the_newest_mtime() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let storage = memory_storage().await?;
-
+/// In segment mode (#175) the same shape pins Earliest=0/Latest=3 because the
+/// rewritten segment's header residue keeps base offset 0 in the footer.
+async fn earliest_after_compaction_is_the_log_start_not_the_newest_mtime(
+    storage: Sc,
+) -> Result<(), Error> {
     create_topic(&storage, "kv", cleanup_compact()).await?;
 
     let topition = Topition::new("kv", 0);
@@ -339,6 +395,111 @@ async fn earliest_after_compaction_is_the_log_start_not_the_newest_mtime() -> Re
     assert_eq!(Some(0), responses[0].1.offset);
     // LATEST (high watermark) is unchanged by compaction.
     assert_eq!(Some(3), responses[1].1.offset);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn earliest_after_compaction_is_the_log_start_not_the_newest_mtime_legacy()
+-> Result<(), Error> {
+    let _guard = init_tracing()?;
+    earliest_after_compaction_is_the_log_start_not_the_newest_mtime(memory_storage().await?).await
+}
+
+#[tokio::test]
+async fn earliest_after_compaction_is_the_log_start_not_the_newest_mtime_segments()
+-> Result<(), Error> {
+    let _guard = init_tracing()?;
+    earliest_after_compaction_is_the_log_start_not_the_newest_mtime(segment_storage().await?).await
+}
+
+/// Multi-key, multi-window per-key compaction over segments (#175): survivors
+/// keep their ORIGINAL absolute offsets and a superseded record leaves a gap,
+/// not a shift. Without this, a consumer's committed offset would point at a
+/// different record after compaction — silent misdelivery.
+#[tokio::test]
+async fn offsets_survive_segment_compaction() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = segment_storage().await?;
+
+    create_topic(&storage, "kv", cleanup_compact()).await?;
+
+    let topition = Topition::new("kv", 0);
+
+    // k1@0, k2@1, k1@2 across three flush windows — k1@0 is superseded.
+    _ = storage
+        .produce(None, &topition, keyed_batch(b"k1", b"v1")?)
+        .await?;
+    _ = storage
+        .produce(None, &topition, keyed_batch(b"k2", b"v1")?)
+        .await?;
+    _ = storage
+        .produce(None, &topition, keyed_batch(b"k1", b"v2")?)
+        .await?;
+
+    storage.maintain(std::time::SystemTime::now()).await?;
+
+    // Fetch from 0: the survivors at their original offsets, a gap at 0.
+    let records = fetched_records(&storage, &topition).await?;
+    assert_eq!(
+        vec![
+            (
+                Some(Bytes::from_static(b"k2")),
+                Some(Bytes::from_static(b"v1")),
+                1,
+            ),
+            (
+                Some(Bytes::from_static(b"k1")),
+                Some(Bytes::from_static(b"v2")),
+                2,
+            ),
+        ],
+        records
+    );
+
+    Ok(())
+}
+
+/// The offset span survives a per-key rewrite (#175): emptied batches are kept
+/// as headers so the footer's `record_count` stays the sub-stream's span.
+/// Without this the recovered tail would regress and the next produce would
+/// REUSE an offset — the corruption class the whole emptied-header design
+/// exists to prevent.
+#[tokio::test]
+async fn compaction_preserves_offset_span() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = segment_storage().await?;
+
+    create_topic(&storage, "kv", cleanup_compact()).await?;
+
+    let topition = Topition::new("kv", 0);
+
+    // Three versions of one key: after compaction the first two batches are
+    // fully emptied — only their headers remain to carry the span.
+    for value in [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()] {
+        _ = storage
+            .produce(None, &topition, keyed_batch(b"alpha", value)?)
+            .await?;
+    }
+
+    storage.maintain(std::time::SystemTime::now()).await?;
+
+    // LATEST is still the pre-compaction tail...
+    let responses = storage
+        .list_offsets(
+            IsolationLevel::ReadUncommitted,
+            &[(topition.clone(), ListOffset::Latest)],
+        )
+        .await?;
+    assert_eq!(Some(3), responses[0].1.offset);
+
+    // ...and the next produce continues from it rather than reusing an offset.
+    let next = storage
+        .produce(None, &topition, keyed_batch(b"alpha", b"four")?)
+        .await?;
+    assert_eq!(3, next);
 
     Ok(())
 }

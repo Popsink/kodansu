@@ -2302,6 +2302,12 @@ fn coalesce_tuning(storage: &Url) -> CoalesceTuning {
                     .inspect_err(|err| warn!(storage = %storage, key = "prefix_compact_keep_hot", value, ?err))
                     .ok();
             }
+            "prefix_compact_seen_keys" => {
+                tuning.prefix_compact_seen_keys = value
+                    .parse()
+                    .inspect_err(|err| warn!(storage = %storage, key = "prefix_compact_seen_keys", value, ?err))
+                    .ok();
+            }
             "maintenance_recency" => {
                 tuning.maintenance_recency = human_units::Duration::from_str(value)
                     .map(|duration| duration.0)
@@ -2365,12 +2371,17 @@ impl Builder<i32, String, Url, Url> {
                 // batches.
                 let prefix_coalesce = url_flag(&self.storage, "prefix_coalesce");
                 let prefix_leaseless = url_flag(&self.storage, "prefix_leaseless");
+                // Compacted topics segment-routed to dedicated prefixes with a
+                // per-key compaction pass (#175). Off by default; flipped only
+                // on a uniform fleet (see `DynoStore::compacted_segments`).
+                let compacted_segments = url_flag(&self.storage, "compacted_segments");
 
                 debug!(
                     ?minimum_size,
                     ?maximum_delay,
                     produce_coalesce,
-                    prefix_coalesce
+                    prefix_coalesce,
+                    compacted_segments
                 );
 
                 AmazonS3Builder::from_env()
@@ -2400,6 +2411,7 @@ impl Builder<i32, String, Url, Url> {
                             .produce_coalesce(produce_coalesce)
                             .prefix_coalesce(prefix_coalesce)
                             .prefix_leaseless(prefix_leaseless)
+                            .compacted_segments(compacted_segments)
                             .coalesce_tuning(coalesce_tuning(&self.storage))
                     })
                     .map(|storage| {
@@ -2458,6 +2470,7 @@ impl Builder<i32, String, Url, Url> {
                 // ~1/s/object mutation cap (#13) by construction.
                 let prefix_coalesce = url_flag(&self.storage, "prefix_coalesce");
                 let prefix_leaseless = url_flag(&self.storage, "prefix_leaseless");
+                let compacted_segments = url_flag(&self.storage, "compacted_segments");
 
                 GoogleCloudStorageBuilder::from_env()
                     .with_bucket_name(bucket_name)
@@ -2491,6 +2504,7 @@ impl Builder<i32, String, Url, Url> {
                             .produce_coalesce(produce_coalesce)
                             .prefix_coalesce(prefix_coalesce)
                             .prefix_leaseless(prefix_leaseless)
+                            .compacted_segments(compacted_segments)
                             .coalesce_tuning(coalesce_tuning(&self.storage))
                     })
                     .map(|storage| {
@@ -2513,6 +2527,7 @@ impl Builder<i32, String, Url, Url> {
                     }))
                     .prefix_coalesce(url_flag(&self.storage, "prefix_coalesce"))
                     .prefix_leaseless(url_flag(&self.storage, "prefix_leaseless"))
+                    .compacted_segments(url_flag(&self.storage, "compacted_segments"))
                     .coalesce_tuning(coalesce_tuning(&self.storage)),
             )
             .map(|storage| Box::new(storage) as Box<dyn Storage>)
