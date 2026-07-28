@@ -2343,6 +2343,14 @@ fn coalesce_tuning(storage: &Url) -> CoalesceTuning {
                     )
                     .ok();
             }
+            "flush_max_elapsed" => {
+                tuning.flush_max_elapsed = human_units::Duration::from_str(value)
+                    .map(|duration| duration.0)
+                    .inspect_err(
+                        |err| warn!(storage = %storage, key = "flush_max_elapsed", value, ?err),
+                    )
+                    .ok();
+            }
             _ => {}
         }
     }

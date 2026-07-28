@@ -2480,6 +2480,198 @@ async fn leaseless_flush_exhaustion_is_retriable_not_fatal() -> Result<(), Error
     Ok(())
 }
 
+/// A create-CAS contender that also makes each segment PUT *slow*, and counts
+/// the attempts, so a latency-bound flush can be told apart from a
+/// contention-bound one (#192).
+#[derive(Clone)]
+struct SlowContendSegmentCreate<O> {
+    inner: O,
+    delay: Duration,
+    attempts: Arc<AtomicU64>,
+}
+
+impl<O> Debug for SlowContendSegmentCreate<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SlowContendSegmentCreate").finish()
+    }
+}
+
+impl<O> Display for SlowContendSegmentCreate<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SlowContendSegmentCreate").finish()
+    }
+}
+
+#[async_trait]
+impl<O> ObjectStore for SlowContendSegmentCreate<O>
+where
+    O: ObjectStore,
+{
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult, object_store::Error> {
+        if matches!(opts.mode, PutMode::Create) && seg_seq_of(location).is_some() {
+            _ = self.attempts.fetch_add(1, Relaxed);
+            tokio::time::sleep(self.delay).await;
+            return Err(object_store::Error::AlreadyExists {
+                path: location.to_string(),
+                source: "injected create-CAS contention".into(),
+            });
+        }
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> Result<GetResult, object_store::Error> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path, object_store::Error>>,
+    ) -> BoxStream<'static, Result<Path, object_store::Error>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> Result<ListResult, object_store::Error> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: CopyOptions,
+    ) -> Result<(), object_store::Error> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+}
+
+/// The wall-clock budget never ends the flush before `MIN_FLUSH_ATTEMPTS` real
+/// attempts (#192).
+///
+/// Before this, the loop checked `elapsed >= budget` at the top of every
+/// iteration, so a budget already spent by *one* slow PUT ended the flush after
+/// a single attempt — surrendering to a competitor that, at `conflicts == 1`,
+/// need not exist. Production saw exactly that: exhaustion reported at one or
+/// two conflicts with `stalled=0`, i.e. no contention to yield to, while the
+/// produce was rejected. A rejected produce is retriable, but the clients here
+/// treat it as an engine failure and restart the whole connector.
+///
+/// The budget is 1 ms against a 20 ms PUT, so it is exhausted during the first
+/// attempt and every subsequent check fails. Attempts must still reach the floor.
+#[tokio::test]
+async fn flush_budget_never_surrenders_before_the_attempt_floor() -> Result<(), Error> {
+    let attempts = Arc::new(AtomicU64::new(0));
+    let store = DynoStore::new(
+        CLUSTER,
+        NODE,
+        SlowContendSegmentCreate {
+            inner: InMemory::new(),
+            delay: Duration::from_millis(20),
+            attempts: attempts.clone(),
+        },
+    )
+    .coalesce_tuning(CoalesceTuning {
+        coalesce_batches: Some(1),
+        flush_max_elapsed: Some(Duration::from_millis(1)),
+        ..Default::default()
+    });
+
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let tp = Topition::new(topic, 0);
+
+    let error = store
+        .produce(None, &tp, batch(1)?)
+        .await
+        .expect_err("perpetual contention must exhaust the flush");
+    assert!(
+        matches!(error, Error::Api(ErrorCode::KafkaStorageError)),
+        "exhaustion stays retriable, got {error:?}"
+    );
+
+    let made = attempts.load(Relaxed);
+    assert_eq!(
+        3, made,
+        "the floor must be honoured exactly: fewer means the clock cut it short, \
+         more means the clock stopped bounding it",
+    );
+
+    Ok(())
+}
+
+/// A generous budget lets the same flush keep going past the floor, so the floor
+/// is a minimum rather than a cap (#192): the clock still governs, it just no
+/// longer fires before the loop has learned anything.
+#[tokio::test]
+async fn flush_budget_admits_more_attempts_when_it_can_afford_them() -> Result<(), Error> {
+    let attempts = Arc::new(AtomicU64::new(0));
+    let store = DynoStore::new(
+        CLUSTER,
+        NODE,
+        SlowContendSegmentCreate {
+            inner: InMemory::new(),
+            delay: Duration::from_millis(5),
+            attempts: attempts.clone(),
+        },
+    )
+    .coalesce_tuning(CoalesceTuning {
+        coalesce_batches: Some(1),
+        flush_max_elapsed: Some(Duration::from_millis(400)),
+        ..Default::default()
+    });
+
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let tp = Topition::new(topic, 0);
+
+    _ = store
+        .produce(None, &tp, batch(1)?)
+        .await
+        .expect_err("perpetual contention must exhaust the flush");
+
+    let made = attempts.load(Relaxed);
+    assert!(
+        made > 3,
+        "a budget that can afford more attempts must make them, got {made}",
+    );
+
+    Ok(())
+}
+
 /// #157: an object squatting a segment sequence with **no decodable footer**
 /// (shorter than the trailer, or a tail whose magic is not `TSEG`) must not wedge
 /// the leaseless arbiter. The candidate is derived from the *resolved* sequences —

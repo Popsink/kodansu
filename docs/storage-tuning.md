@@ -119,6 +119,7 @@ prefix's topics).
 | `prefix_compact_target_bytes` | `16m` | Target size of a merged segment. Kept modest because the merged create currently shares the producer tail create-CAS namespace (#130); a larger target lengthens each merged PUT, loses the create race more often, and re-uploads its whole payload on retry, amplifying S3 write cost. The live segment count is bounded by `prefix_compact_min_segments` (a count trigger), not by this size. |
 | `prefix_compact_keep_hot` | `16` | Newest segments never compacted (leaves the active tail alone). |
 | `maintenance_recency` | `9m` | A prefix maintained (compacted/expired) within this window is skipped by other maintainer replicas. Set to ~0.9× your `maintenance_interval`; `0` disables (every maintainer works every prefix). |
+| `flush_max_elapsed` | `10s` | Wall-clock budget for a flush's create-CAS conflict-correction loop. When it runs out the flush yields to the competing writer and the produce is rejected *retriably*. It is a floor on attempts, not a hard deadline: the loop always makes at least 3 real attempts, and will not start an attempt it expects to overshoot. Raise it if you see `leaseless flush exhausted retries` with a small `attempts` and a large `put_ms` — that is a slow bucket, not contention. |
 
 The linger / batch-count / byte thresholds are the `coalesce_linger` /
 `coalesce_batches` / `coalesce_bytes` keys documented above.
