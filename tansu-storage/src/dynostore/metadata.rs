@@ -230,8 +230,15 @@ where
         opts: PutOptions,
     ) -> Result<PutResult, object_store::Error> {
         let method = KeyValue::new("method", "put_opts");
+        // Class the write as well as the read (#167 labelled `get_opts` only).
+        // Without this there is no PUT-side `class="records"` series, so
+        // "nothing writes the legacy layout any more" (#178's writer-absence
+        // proof) can only be inferred from the absence of a signal that was
+        // never emitted. With it, the claim is a query: the `records` class on
+        // `put_opts` must be flat zero.
+        let class = KeyValue::new("class", key_class(location));
 
-        REQUESTS.add(1, from_ref(&method));
+        REQUESTS.add(1, &[method.clone(), class]);
 
         self.object_store
             .put_opts(location, payload, opts)

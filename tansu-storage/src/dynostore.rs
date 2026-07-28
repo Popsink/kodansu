@@ -5170,9 +5170,10 @@ impl DynoStore {
     }
 
     /// Buffer `deflated` for a prefix-coalesced flush and await its assigned
-    /// offset (#57). Like [`Self::enqueue_coalesced`] but keyed by the topition's
-    /// connector prefix, so one buffer accumulates batches across every topic
-    /// under the prefix and flushes them into one shared segment object. The
+    /// offset (#57). Keyed by the topition's connector prefix, so one buffer
+    /// accumulates batches across every topic under the prefix and flushes them
+    /// into one shared segment object. (It replaced a per-partition buffer,
+    /// deleted with the rest of #50 in #177.) The
     /// idempotent sequence and schema were already validated by `produce`.
     async fn enqueue_prefix_coalesced(
         &self,
