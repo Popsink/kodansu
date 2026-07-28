@@ -2300,6 +2300,21 @@ impl DynoStore {
     /// as `0`) is retained, so a watermark-less partition is asked once per
     /// process, never per call — the #161 404-storm shape.
     ///
+    /// Measured, after #194 questioned this claim and #203 made it checkable
+    /// (0.7.0-beta.26, production fleet): the steady-state cost is **zero
+    /// 404s**, and so is the cold cost. `class="watermark"` reads run at
+    /// ~1,160/s through the cache and **not one of them** answers `not_found`,
+    /// across a window spanning a rolling restart — so neither the "one 404 per
+    /// process per partition" warm-up this comment described, nor the
+    /// first-touch tail #194 hypothesised, is observable. The floor is cheaper
+    /// than #186 claimed, not more expensive.
+    ///
+    /// #194's elevated `not_found` rate is real and persists (~34/s), but it is
+    /// not this: 74% of it is the #112 tail probe (`class="segment"`, correlated
+    /// 1:1 with `tansu_prefix_tail_probes`), which speculatively GETs the next
+    /// sequence to avoid a listing and predates the floor by two releases. The
+    /// attribution to #176 was coincident timing.
+    ///
     /// Cross-replica staleness contract: the pod that served the
     /// `DeleteRecords` is exact immediately (`with_mut` leaves the written
     /// value in the OptiCon cache). A peer pod serves the floor it last
