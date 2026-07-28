@@ -284,6 +284,25 @@ pub struct DynoStore {
     /// fleet.
     compacted_segments: bool,
 
+    /// When set (with [`Self::compacted_segments`]), maintenance re-encodes a
+    /// segment-routed compacted topic's legacy `records/` objects into segments
+    /// under its dedicated prefix and deletes them (#175 release 2:
+    /// [`Self::carry_over_legacy`]). Off by default, and meaningless without
+    /// `compacted_segments` — there is no segment route for the carried data
+    /// without it, so a carried segment would be invisible to every reader and
+    /// deleting the legacy objects after it would be immediate data loss.
+    ///
+    /// Kept a **separate** flag so the two behaviour changes are two config
+    /// deploys: the carry-over must not start while a flag-off writer can still
+    /// exist, since a rolling-restart pod still producing to legacy `records/`
+    /// is a second offset authority over the region being drained (the
+    /// #78-class hazard). Deploy `compacted_segments=true` fleet-wide first,
+    /// verify the hybrid steady state, then flip this to drain the now-frozen
+    /// legacy regions. Left on permanently afterwards: a drained topic degrades
+    /// to a memoized no-op probe, so the pass becomes the standing
+    /// reconciliation for any future straggler.
+    compacted_carryover: bool,
+
     /// Per-prefix coalescing buffer (#57), used only when
     /// [`Self::prefix_coalesce`] is set. Like [`Self::coalesce`] but keyed by
     /// prefix, so one buffer accumulates `PrefixPending` batches across many
@@ -796,6 +815,17 @@ static SEGMENT_RECORDS_COMPACTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_prefix_segment_records_compacted")
         .with_description("records removed by per-key compaction over segments")
+        .build()
+});
+
+/// Legacy `records/` objects retired by the carry-over (#175 release 2) — the
+/// drain progress signal, and the one that tells when the backlog is gone: it
+/// stops moving because every compacted topic is drained, not because the pass
+/// stopped running.
+static SEGMENT_CARRYOVER_OBJECTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_segment_carryover_objects")
+        .with_description("legacy records/ objects carried into segments and deleted")
         .build()
 });
 
@@ -1585,6 +1615,7 @@ impl DynoStore {
             prefix_coalesce: false,
             prefix_leaseless: false,
             compacted_segments: false,
+            compacted_carryover: false,
             prefix_coalesce_buffers: Arc::new(Mutex::new(BTreeMap::new())),
             segment_seqs: Arc::new(Mutex::new(BTreeMap::new())),
             prefix_flush_locks: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1681,6 +1712,21 @@ impl DynoStore {
     pub fn compacted_segments(self, compacted_segments: bool) -> Self {
         Self {
             compacted_segments,
+            ..self
+        }
+    }
+
+    /// Enable the legacy carry-over for segment-routed compacted topics (#175
+    /// release 2): maintenance re-encodes each such topic's legacy `records/`
+    /// objects verbatim into segments under its dedicated prefix and deletes
+    /// them, newest chunk first. Off by default; a no-op unless
+    /// [`Self::compacted_segments`] (with [`Self::prefix_coalesce`]) is also
+    /// set. Flipped only after `compacted_segments` is live on a **uniform**
+    /// fleet — see the `compacted_carryover` field for why the two flips are
+    /// separate deploys.
+    pub fn compacted_carryover(self, compacted_carryover: bool) -> Self {
+        Self {
+            compacted_carryover,
             ..self
         }
     }
@@ -3164,6 +3210,17 @@ impl DynoStore {
     /// compactor cannot rewrite.
     fn compacted_topics_in_segments(&self) -> bool {
         self.prefix_coalesce && self.compacted_segments
+    }
+
+    /// Whether maintenance may drain a segment-routed compacted topic's legacy
+    /// `records/` regions into segments (#175 release 2): the carry-over flag on
+    /// top of [`Self::compacted_topics_in_segments`], because without segment
+    /// routing a carried segment would be invisible to every reader
+    /// (`routed_prefix_of` would resolve the shared prefix) — carrying under a
+    /// flag-off fleet is immediate data loss, so the flags are flipped as two
+    /// config deploys: routing first, carry-over second.
+    fn compacted_carryover_enabled(&self) -> bool {
+        self.compacted_topics_in_segments() && self.compacted_carryover
     }
 
     /// The prefix a topition's records are segment-routed under, given a
@@ -7106,6 +7163,183 @@ impl DynoStore {
         Ok(removed_total)
     }
 
+    /// Bytes of legacy batches folded into one carried segment (#175 release 2).
+    /// Matches the size merge's target so a carried object is no larger than one
+    /// the compactor would produce, and bounds the decoded working set.
+    const CARRYOVER_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+
+    /// Drain one segment-routed compacted topic-partition's legacy `records/`
+    /// region into segments under its dedicated prefix (#175 release 2), so the
+    /// latest-value-per-key state survives the removal of the legacy read paths
+    /// (#179). Returns the number of legacy objects retired; decrements `budget`
+    /// so one maintenance tick cannot spend an unbounded number of requests.
+    ///
+    /// **Tail-first, and that is the safety property.** The legacy region is the
+    /// hybrid seam `[0, C)`: the read path serves `records/` below `C` and
+    /// segments at/above it ([`Self::segment_region_start`]). Carrying the
+    /// **highest** offsets first makes the new segment's base the new `C`, so the
+    /// surviving legacy region is still `[0, C')` — contiguous from zero. Leftover
+    /// objects inside the carried span sit at/above `C'` and are simply ignored.
+    /// Carrying the head first would instead leave a gap in the middle of the
+    /// legacy region, and [`Self::fetch`] reads a gap as "compacted away" — it
+    /// would silently skip live keys rather than error, which for a connector
+    /// offsets topic means re-snapshotting its source. Same reason the deletes
+    /// below run **descending and serially** instead of through
+    /// [`Self::delete_batches`]: every intermediate state must still be a
+    /// contiguous `[0, x)`.
+    ///
+    /// **Verbatim, not compacted.** The batches are re-encoded exactly as they
+    /// were. Computing latest-per-key here would be wrong, not merely wasteful:
+    /// once routing is on, segment writes may already supersede a legacy key, so
+    /// folding the legacy region alone could resurrect a stale value. Release 1's
+    /// [`Self::compact_prefix_per_key`] cleans the carried segment on a later
+    /// tick, with the full picture.
+    ///
+    /// **Create before delete, and only what is covered.** The legacy objects go
+    /// only after the carried segment is durable *and* the fenced footer proves it
+    /// spans them. This is the single path that can lose data, so it is the one
+    /// with an assertion rather than a comment. `raise_seq_floor` is deliberately
+    /// NOT called: it protects freed *segment sequence names* (#77), and a legacy
+    /// delete frees none.
+    ///
+    /// Idempotent: a re-run after a crash between create and delete finds the span
+    /// already covered and takes the delete-only path, so it neither duplicates
+    /// nor strands.
+    async fn carry_over_legacy(&self, topition: &Topition, budget: &mut usize) -> Result<u64> {
+        if !self.compacted_carryover_enabled() || *budget == 0 {
+            return Ok(0);
+        }
+
+        // Memoized (#166): a drained partition costs no request per tick.
+        if !self.has_legacy_records(topition).await? {
+            return Ok(0);
+        }
+
+        let legacy = self.list_batch_offsets(topition).await?;
+        if legacy.is_empty() {
+            return Ok(0);
+        }
+
+        let prefix = self.routed_prefix_of(topition).await?;
+
+        // Serialize against the per-key pass and the size merge over the same
+        // prefix, and against peer maintainers, with the existing lease (#115).
+        if self.acquire_compaction_lease(&prefix).await.is_err() {
+            debug!(prefix, ?topition, "yielding carry-over to the lease holder");
+            return Ok(0);
+        }
+
+        // Tail-first chunk: highest offsets, bounded by bytes and by the tick's
+        // remaining object budget.
+        let mut chunk: Vec<(i64, ObjectMeta)> = Vec::new();
+        let mut bytes = 0usize;
+        for (offset, meta) in legacy.iter().rev() {
+            if !chunk.is_empty()
+                && (bytes + meta.size as usize > Self::CARRYOVER_CHUNK_BYTES
+                    || chunk.len() >= *budget)
+            {
+                break;
+            }
+            bytes += meta.size as usize;
+            chunk.push((*offset, meta.clone()));
+        }
+        chunk.reverse();
+
+        let Some(&(base_offset, _)) = chunk.first() else {
+            return Ok(0);
+        };
+
+        // Decode the chunk in offset order; the batches are carried untouched.
+        let mut batches: Vec<deflated::Batch> = Vec::with_capacity(chunk.len());
+        for (offset, meta) in &chunk {
+            let bytes = self
+                .object_store
+                .get(&meta.location)
+                .await
+                .inspect_err(|err| error!(?err, ?topition, offset))?
+                .bytes()
+                .await
+                .map_err(Error::from)?;
+            batches.extend(self.decode_frame(bytes)?);
+        }
+
+        let span: i64 = batches
+            .iter()
+            .map(|batch| batch.last_offset_delta as i64 + 1)
+            .sum();
+
+        let substreams = vec![(topition.to_owned(), base_offset, batches)];
+        // The era epoch matters: `valid_substream_segments` fences by epoch, so a
+        // carried segment stamped below the prefix's current era would be
+        // invisible — the coverage gate below would (correctly) refuse to delete,
+        // and the carry could never complete. Read it the same way the leaseless
+        // flush does.
+        let (payload, footer) = if self.prefix_leaseless {
+            let era = self.seed_era_epoch(&prefix).await?;
+            self.encode_segment_v3(&substreams, era.max(0), rng().random::<u64>())?
+        } else {
+            self.encode_segment(&substreams, 0)?
+        };
+
+        let seq = self
+            .assign_and_create_segment(&prefix, payload, SegmentCreateRole::Compaction)
+            .await?;
+
+        // `now`, not the legacy objects' age: a carried segment must not be
+        // instantly expirable by a `compact,delete` prefix's threshold.
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis() as i64)
+            .unwrap_or(0);
+        self.index_insert(&prefix, seq, footer, now_ms)?;
+
+        // Coverage gate: the fenced view must show a segment spanning the whole
+        // chunk before a single legacy object is removed. A failure here leaves
+        // the carried segment in place and the legacy region intact — the next
+        // tick retries, and the overlap resolver keeps exactly one copy readable.
+        let covered = self
+            .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
+            .iter()
+            .any(|(_, entry)| {
+                entry.base_offset <= base_offset
+                    && entry.base_offset + entry.record_count >= base_offset + span
+            });
+        if !covered {
+            error!(
+                ?topition,
+                prefix,
+                seq,
+                base_offset,
+                span,
+                "carried segment does not cover the chunk; deferring deletes"
+            );
+            return Ok(0);
+        }
+
+        // Descending and serial: every intermediate state stays a contiguous
+        // `[0, x)` legacy region.
+        let mut retired = 0u64;
+        for (offset, meta) in chunk.iter().rev() {
+            self.object_store
+                .delete(&meta.location)
+                .await
+                .inspect_err(|err| error!(?err, ?topition, offset))?;
+            retired += 1;
+            *budget = budget.saturating_sub(1);
+        }
+
+        // No memo invalidation needed: a positive `has_legacy_records` entry is
+        // held only briefly, so a fully drained partition re-probes on its own and
+        // then memoizes the absence for the long TTL (#166).
+        SEGMENT_CARRYOVER_OBJECTS.add(retired, &[]);
+        debug!(
+            ?topition,
+            prefix, seq, base_offset, span, retired, "carried legacy region into a segment"
+        );
+
+        Ok(retired)
+    }
+
     /// Compact segments across every coalesced prefix (#66).
     /// Read the compaction lease object for `prefix` without acquiring it, or
     /// `None` if absent (#126). Used by the maintenance claim to peek the
@@ -7309,6 +7543,76 @@ impl DynoStore {
             .collect())
     }
 
+    /// Legacy `records/` objects one maintenance tick may retire across all
+    /// compacted topics (#175 release 2). Budgeted by **objects**, not by topics:
+    /// the production backlog spans 1 to 898 objects per topic, so "N topics per
+    /// tick" bounds nothing. At this budget the measured ~3k-object backlog drains
+    /// in one or two ticks while a tick's added request cost stays comparable to
+    /// the retention pass it runs beside.
+    const CARRYOVER_OBJECT_BUDGET: usize = 2_048;
+
+    /// Run [`Self::carry_over_legacy`] across every segment-routed compacted
+    /// topic-partition this replica owns this tick (#175 release 2), under one
+    /// shared object budget. Returns the objects retired.
+    ///
+    /// Sequential on purpose: the budget is per tick, so concurrent workers would
+    /// have to share it under a lock, and this is one-shot backlog drainage rather
+    /// than steady-state work — there is nothing to parallelise for. Per-partition
+    /// errors are logged and skip that partition only, as elsewhere in maintenance
+    /// (#140): one unreadable object must not strand every other topic's drain.
+    async fn carry_over_legacy_topitions(&self, owned: Option<&BTreeSet<String>>) -> Result<u64> {
+        if !self.compacted_carryover_enabled() {
+            return Ok(0);
+        }
+
+        let mut budget = Self::CARRYOVER_OBJECT_BUDGET;
+        let mut retired = 0u64;
+
+        for metadata in self.topics_index().await?.iter() {
+            let compact = metadata
+                .topic
+                .configs
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .any(|config| {
+                    config.name == "cleanup.policy"
+                        && config
+                            .value
+                            .as_deref()
+                            .is_some_and(|value| value.contains("compact"))
+                });
+            if !compact {
+                continue;
+            }
+
+            for partition in 0..metadata.topic.num_partitions {
+                if budget == 0 {
+                    debug!(retired, "carry-over budget spent for this tick");
+                    return Ok(retired);
+                }
+
+                let topition = Topition::new(metadata.topic.name.clone(), partition);
+
+                // Honour the maintenance claim (#126) on the topic's dedicated
+                // prefix, so N maintainers split the backlog instead of racing on
+                // the same partition's compaction lease.
+                if let Some(owned) = owned
+                    && !owned.contains(&self.routed_prefix(&topition, true))
+                {
+                    continue;
+                }
+
+                match self.carry_over_legacy(&topition, &mut budget).await {
+                    Ok(count) => retired += count,
+                    Err(err) => error!(?err, ?topition, "legacy carry-over"),
+                }
+            }
+        }
+
+        Ok(retired)
+    }
+
     /// Drain one prefix to `<= prefix_compact_min_segments` (#66 review fix): a
     /// single run per tick cannot keep up with a high flush rate, so loop until
     /// compaction finds nothing more to merge. Each call re-lists, so `S`
@@ -7393,6 +7697,16 @@ impl DynoStore {
             .into_iter()
             .collect();
         let per_key = self.per_key_compact_prefixes(owned).await?;
+
+        // Drain frozen legacy regions before the per-prefix work (#175 release 2).
+        // Sequential and separately budgeted rather than folded into the
+        // concurrent per-prefix jobs below: the budget is per *tick*, and sharing
+        // a counter across concurrent tasks would need a lock for no benefit —
+        // the carry-over is a one-shot backlog, not steady-state work.
+        _ = self
+            .carry_over_legacy_topitions(owned)
+            .await
+            .inspect_err(|err| error!(?err, "legacy carry-over"));
 
         // Largest known live-segment count first (free: it is what this process
         // already has cached, no extra request). A prefix this maintainer has
@@ -7880,6 +8194,27 @@ impl DynoStore {
     /// preserved. Returns the number of records removed.
     #[instrument(skip(self), ret)]
     async fn policy_compact(&self) -> Result<u64> {
+        // Segment-routed compacted topics are off-limits to the legacy in-place
+        // compactor (#175 release 2). Gated on *routing*, not on the carry-over
+        // flag, and deliberately so:
+        //
+        // - Once a compacted topic's new writes go to segments, its legacy
+        //   region is frozen — no new duplicate keys land there — so rewriting
+        //   it in place buys nothing.
+        // - It would race the carry-over over the same objects: this path
+        //   mutates with `PutMode::Overwrite`, so a rewrite interleaved between
+        //   the carry-over's read and its delete would be silently dropped.
+        // - It also writes `watermark.low` via `advance_low_watermark`, which
+        //   sets rather than folds; leaving it to run alongside #176's
+        //   truncation floor is more state to reason about for no gain.
+        //
+        // The per-key pass over the dedicated prefix
+        // ([`Self::compact_prefix_per_key`], release 1) is what enforces
+        // `cleanup.policy=compact` for these topics instead.
+        if self.compacted_topics_in_segments() {
+            return Ok(0);
+        }
+
         let topics = self
             .topics_index()
             .await?

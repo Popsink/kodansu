@@ -2375,13 +2375,19 @@ impl Builder<i32, String, Url, Url> {
                 // per-key compaction pass (#175). Off by default; flipped only
                 // on a uniform fleet (see `DynoStore::compacted_segments`).
                 let compacted_segments = url_flag(&self.storage, "compacted_segments");
+                // Drain those topics' legacy `records/` regions into segments
+                // (#175 release 2). A separate flag on purpose: flipped only
+                // once `compacted_segments` is live fleet-wide, so no flag-off
+                // writer can still be appending to the region being drained.
+                let compacted_carryover = url_flag(&self.storage, "compacted_carryover");
 
                 debug!(
                     ?minimum_size,
                     ?maximum_delay,
                     produce_coalesce,
                     prefix_coalesce,
-                    compacted_segments
+                    compacted_segments,
+                    compacted_carryover
                 );
 
                 AmazonS3Builder::from_env()
@@ -2412,6 +2418,7 @@ impl Builder<i32, String, Url, Url> {
                             .prefix_coalesce(prefix_coalesce)
                             .prefix_leaseless(prefix_leaseless)
                             .compacted_segments(compacted_segments)
+                            .compacted_carryover(compacted_carryover)
                             .coalesce_tuning(coalesce_tuning(&self.storage))
                     })
                     .map(|storage| {
@@ -2471,6 +2478,7 @@ impl Builder<i32, String, Url, Url> {
                 let prefix_coalesce = url_flag(&self.storage, "prefix_coalesce");
                 let prefix_leaseless = url_flag(&self.storage, "prefix_leaseless");
                 let compacted_segments = url_flag(&self.storage, "compacted_segments");
+                let compacted_carryover = url_flag(&self.storage, "compacted_carryover");
 
                 GoogleCloudStorageBuilder::from_env()
                     .with_bucket_name(bucket_name)
@@ -2505,6 +2513,7 @@ impl Builder<i32, String, Url, Url> {
                             .prefix_coalesce(prefix_coalesce)
                             .prefix_leaseless(prefix_leaseless)
                             .compacted_segments(compacted_segments)
+                            .compacted_carryover(compacted_carryover)
                             .coalesce_tuning(coalesce_tuning(&self.storage))
                     })
                     .map(|storage| {
@@ -2528,6 +2537,7 @@ impl Builder<i32, String, Url, Url> {
                     .prefix_coalesce(url_flag(&self.storage, "prefix_coalesce"))
                     .prefix_leaseless(url_flag(&self.storage, "prefix_leaseless"))
                     .compacted_segments(url_flag(&self.storage, "compacted_segments"))
+                    .compacted_carryover(url_flag(&self.storage, "compacted_carryover"))
                     .coalesce_tuning(coalesce_tuning(&self.storage)),
             )
             .map(|storage| Box::new(storage) as Box<dyn Storage>)
