@@ -2480,6 +2480,175 @@ async fn leaseless_flush_exhaustion_is_retriable_not_fatal() -> Result<(), Error
     Ok(())
 }
 
+/// A store that still *lists* a segment but answers its GET with `NotFound` —
+/// the state of the world between a discovery listing and the footer read when
+/// compaction (#66) or retention (#61) reclaims the object in between (#191).
+#[derive(Clone)]
+struct VanishOnGet<O> {
+    inner: O,
+    vanished: Path,
+}
+
+impl<O> Debug for VanishOnGet<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VanishOnGet").finish()
+    }
+}
+
+impl<O> Display for VanishOnGet<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VanishOnGet").finish()
+    }
+}
+
+#[async_trait]
+impl<O> ObjectStore for VanishOnGet<O>
+where
+    O: ObjectStore,
+{
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult, object_store::Error> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> Result<GetResult, object_store::Error> {
+        if *location == self.vanished {
+            return Err(object_store::Error::NotFound {
+                path: location.to_string(),
+                source: "reclaimed between the listing and this GET".into(),
+            });
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path, object_store::Error>>,
+    ) -> BoxStream<'static, Result<Path, object_store::Error>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> Result<ListResult, object_store::Error> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: CopyOptions,
+    ) -> Result<(), object_store::Error> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+}
+
+/// #191: a segment a discovery listing found, but which is gone by the time its
+/// footer is read, must not fail the read.
+///
+/// Compaction (#66) merges segments away and retention (#61) reclaims them, both
+/// concurrently with readers, so a LIST can legitimately name an object a
+/// following GET no longer finds. Before this the `?` in the refresh loop turned
+/// that race into a failed index refresh, and the raw `ObjectStore(NotFound)`
+/// escaped `ListOffsets` through the connection error path — three layers logged
+/// it, none handled it, and one reclaimed segment made a topic's offsets
+/// unresolvable while its producer was still healthy.
+///
+/// The store here lists both segments and 404s the GET of one, which is exactly
+/// the window the race opens.
+#[tokio::test]
+async fn a_segment_reclaimed_before_its_footer_is_read_does_not_fail_the_read() -> Result<(), Error>
+{
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.tab_a";
+    let a = Topition::new(topic, 0);
+
+    // A writer lays down two segments: [0,2) then [2,5).
+    {
+        let writer =
+            DynoStore::new(CLUSTER, NODE, bucket.clone()).coalesce_tuning(CoalesceTuning {
+                coalesce_batches: Some(1),
+                ..Default::default()
+            });
+        create_topic(&writer, topic).await?;
+        assert_eq!(0, writer.produce(None, &a, batch(2)?).await?);
+        assert_eq!(2, writer.produce(None, &a, batch(3)?).await?);
+    }
+
+    let live = segments(&bucket).await;
+    assert_eq!(2, live.len());
+    let vanished = live.last().expect("a newest segment").clone();
+
+    // Cold reader whose index has never seen either sequence: it lists both and
+    // GETs both footers, and one of those GETs 404s.
+    let reader = DynoStore::new(
+        CLUSTER,
+        NODE,
+        VanishOnGet {
+            inner: bucket.clone(),
+            vanished,
+        },
+    );
+
+    // The whole point: these resolve instead of propagating `NotFound`.
+    assert_eq!(
+        0,
+        earliest(&reader, &a).await?,
+        "the surviving segment still answers EARLIEST",
+    );
+
+    let latest = reader
+        .list_offsets(
+            IsolationLevel::ReadUncommitted,
+            &[(a.clone(), ListOffset::Latest)],
+        )
+        .await?;
+    assert!(
+        latest[0].1.offset.is_some(),
+        "LATEST must resolve, got {:?}",
+        latest[0].1,
+    );
+
+    // And the surviving segment's records are served.
+    let fetched = fetch_from(&reader, &a, 0).await?;
+    assert_eq!(2, record_count(&fetched), "the surviving segment is served");
+
+    Ok(())
+}
+
 /// A create-CAS contender that also makes each segment PUT *slow*, and counts
 /// the attempts, so a latency-bound flush can be told apart from a
 /// contention-bound one (#192).

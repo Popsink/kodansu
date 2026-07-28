@@ -866,6 +866,18 @@ static SEGMENT_FOOTER_UNDECODABLE: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Segments discovered by a listing that were gone by the time their footer was
+/// read (#191): concurrent compaction (#66) merged them away, or retention (#61)
+/// reclaimed them. A normal consequence of maintenance running against live
+/// readers, so nonzero is expected — but it is worth a series, because it used to
+/// abort the whole index refresh and surface as a raw `NotFound` on `ListOffsets`.
+static SEGMENT_VANISHED_BEFORE_READ: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_segment_vanished_before_read")
+        .with_description("segments deleted between the discovery listing and the footer read")
+        .build()
+});
+
 /// Why a listing was issued (#165). A per-method LIST total says the tier-1
 /// plane is large; it does not say which of the ~20 scan sites is spending it,
 /// which is the question an aggregate cannot answer and the one that matters when
@@ -1160,6 +1172,20 @@ impl ProducerTail {
             sequence + 1
         }
     }
+}
+
+/// What resolving one discovered segment's footer produced during an index
+/// refresh.
+///
+/// Three states rather than `Option`, because "the object is not readable" and
+/// "the object is not there" want different logs: the first is #157's squatter
+/// and should be zero, the second is a benign race with maintenance (#191). Both
+/// mark the sequence resolved so the arbiter steps over it.
+#[derive(Debug)]
+enum FooterOutcome {
+    Decoded(SegmentFooter),
+    Undecodable,
+    Vanished,
 }
 
 /// The self-describing footer index of a prefix-coalesced segment (#64): one
@@ -4016,9 +4042,22 @@ impl DynoStore {
                 .filter(|(seq, _, _)| !cached.contains(seq)),
         )
         .map(|(seq, location, last_modified_ms)| async move {
-            self.read_segment_footer(&location)
-                .await
-                .map(|footer| (seq, last_modified_ms, footer))
+            match self.read_segment_footer(&location).await {
+                Ok(Some(footer)) => Ok((seq, last_modified_ms, FooterOutcome::Decoded(footer))),
+                Ok(None) => Ok((seq, last_modified_ms, FooterOutcome::Undecodable)),
+                // Gone between the LIST that discovered it and this GET:
+                // concurrent compaction (#66) merged it away, or retention (#61)
+                // reclaimed it. Not an integrity fault and not this reader's
+                // problem — before #191 the `?` below turned it into a failed
+                // index refresh and a raw `ObjectStore(NotFound)` escaping
+                // `ListOffsets` all the way to the connection error path.
+                Err(Error::ObjectStore(ref inner))
+                    if matches!(**inner, object_store::Error::NotFound { .. }) =>
+                {
+                    Ok((seq, last_modified_ms, FooterOutcome::Vanished))
+                }
+                Err(error) => Err(error),
+            }
         })
         .buffered(FOOTER_FETCH_CONCURRENCY);
 
@@ -4027,7 +4066,7 @@ impl DynoStore {
             let mut index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
             let entry = index.entry(prefix.to_owned()).or_default();
             match footer {
-                Some(footer) => {
+                FooterOutcome::Decoded(footer) => {
                     _ = entry.segments.insert(
                         seq,
                         CachedSegment {
@@ -4042,13 +4081,29 @@ impl DynoStore {
                 // resolved (#157) so the leaseless arbiter steps over it instead
                 // of re-deriving an occupied candidate until its budget is gone,
                 // and so the next refresh does not re-GET this footer.
-                None => {
+                FooterOutcome::Undecodable => {
                     if entry.opaque.insert(seq) {
                         SEGMENT_FOOTER_UNDECODABLE.add(1, &[]);
                         warn!(
                             prefix,
                             seq,
                             "segment object has no decodable footer; stepping over the sequence"
+                        );
+                    }
+                }
+
+                // Deleted under us (#191). Same bookkeeping as an undecodable
+                // name — resolved, unreadable, stepped over — but logged
+                // separately: an operator seeing "no decodable footer" for an
+                // object that maintenance simply reclaimed would go looking for
+                // corruption that is not there. Sequences are never reused
+                // (#77), so caching it as resolved is permanent and correct.
+                FooterOutcome::Vanished => {
+                    if entry.opaque.insert(seq) {
+                        SEGMENT_VANISHED_BEFORE_READ.add(1, &[]);
+                        debug!(
+                            prefix,
+                            seq, "segment deleted before its footer could be read; stepping over"
                         );
                     }
                 }
