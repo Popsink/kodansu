@@ -342,11 +342,11 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
     assert_eq!(Some(0), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
+    // EARLIEST carries no record timestamp (#177), so the wire value is the
+    // Kafka "unknown" sentinel, -1. The legacy `records/` path reported the tail
+    // object's mtime here instead — an object-store artifact, not a record
+    // timestamp, and not something Kafka answers an offset query with.
+    assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
@@ -642,8 +642,12 @@ where
 
     assert!(!items.is_empty());
 
+    // An empty topic has no record at or after any timestamp, so
+    // `offsetsForTimes` reports none rather than 0 (#177). The legacy `records/`
+    // scan answered 0, pointing a seeking consumer at the start of an empty log
+    // instead of telling it there was nothing to seek to.
     for (_toptition, response) in items {
-        assert_eq!(Some(0), response.offset);
+        assert_eq!(None, response.offset);
         assert_eq!(None, response.timestamp);
     }
 
@@ -737,8 +741,12 @@ where
         .list_offsets(IsolationLevel::ReadUncommitted, &offsets[..])
         .await?;
 
+    // A timestamp past every record has no offset at or after it, so the answer
+    // is none — Kafka's `offsetsForTimes` contract (#177). The `before` case
+    // above still resolves to 0, so the footer index is answering timestamp
+    // queries; only the "nothing at or after" case changed.
     assert_eq!(1, responses.len());
-    assert_eq!(Some(0), responses[0].1.offset);
+    assert_eq!(None, responses[0].1.offset);
 
     Ok(())
 }

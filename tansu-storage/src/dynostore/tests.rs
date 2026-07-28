@@ -23,7 +23,6 @@ use crate::{Error, Result, Topition};
 
 use super::{DynoStore, Watermark};
 
-mod coalesce;
 mod compact_segments;
 mod group_expiry;
 mod idempotent;

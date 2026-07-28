@@ -311,72 +311,6 @@ fn batch(value: &[u8]) -> Result<deflated::Batch> {
         .map_err(Into::into)
 }
 
-/// High-watermark never does a full prefix `list`: it always scans forward from
-/// a floor via `list_with_offset` (S3 `start-after`). A cold reader whose floor
-/// was persisted by an earlier reader scans *zero* batches — instead of the
-/// whole partition (the cold-LIST storm at scale, the deferred #13 bottleneck).
-#[tokio::test]
-async fn cold_high_watermark_uses_persisted_floor() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let bucket = InMemory::new();
-
-    // Producer replica: create + produce many batches.
-    let writer = DynoStore::new(
-        CLUSTER,
-        NODE,
-        Counting {
-            inner: bucket.clone(),
-            counters: Arc::new(Counters::default()),
-        },
-    );
-    create(&writer, "hot", 1).await?;
-    let topition = Topition::new("hot", 0);
-    const BATCHES: usize = 64;
-    for n in 0..BATCHES {
-        _ = writer
-            .produce(None, &topition, batch(format!("value-{n}").as_bytes())?)
-            .await?;
-    }
-
-    // First cold reader: no persisted floor yet, so it scans the batches once —
-    // but via `list_with_offset`, never a full `list` — and persists the high.
-    let first_counters = Arc::new(Counters::default());
-    let first = DynoStore::new(
-        CLUSTER,
-        NODE,
-        Counting {
-            inner: bucket.clone(),
-            counters: first_counters.clone(),
-        },
-    );
-    assert_eq!(BATCHES as i64, first.high_watermark(&topition).await?);
-    let first = first_counters.report("first cold high_watermark");
-    assert_eq!(0, first.2, "must never do a full-prefix list");
-    assert!(first.3 >= 1, "scans forward via list_with_offset");
-
-    // Second cold reader (fresh process) now floors its scan at the persisted
-    // watermark: it lists ZERO batch objects.
-    let second_counters = Arc::new(Counters::default());
-    let second = DynoStore::new(
-        CLUSTER,
-        NODE,
-        Counting {
-            inner: bucket.clone(),
-            counters: second_counters.clone(),
-        },
-    );
-    assert_eq!(BATCHES as i64, second.high_watermark(&topition).await?);
-    let second = second_counters.report("second cold high_watermark (persisted floor)");
-    assert_eq!(0, second.2, "must never do a full-prefix list");
-    assert_eq!(
-        0, second.4,
-        "persisted floor must skip every batch object on a cold read"
-    );
-
-    Ok(())
-}
-
 /// Steady-state (warm) produce assigns offsets from the in-memory hint and just
 /// creates the batch object — no listing of the growing partition.
 #[tokio::test]
@@ -407,65 +341,6 @@ async fn warm_produce_does_not_list() -> Result<(), Error> {
     assert_eq!(
         PRODUCES as u64, produced.0,
         "one batch object create per produce"
-    );
-    Ok(())
-}
-
-/// A consumer fetch scans only from its offset forward (bounded `list_with_offset`,
-/// never a full `list`) and reads only the batches in range — so fetch cost
-/// tracks the bytes consumed, not the partition size.
-#[tokio::test]
-async fn consume_scans_only_from_offset() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-    let (storage, counters) = store();
-
-    create(&storage, "hot", 1).await?;
-    let topition = Topition::new("hot", 0);
-    const BATCHES: usize = 64;
-    for n in 0..BATCHES {
-        _ = storage
-            .produce(None, &topition, batch(format!("m-{n}").as_bytes())?)
-            .await?;
-    }
-
-    // Consume the whole log from the start.
-    counters.reset();
-    let fetched = storage
-        .fetch(
-            &topition,
-            0,
-            1,
-            8 * 1024 * 1024,
-            IsolationLevel::ReadUncommitted,
-            Duration::from_secs(5),
-        )
-        .await?;
-    let consume = counters.report("fetch from offset 0");
-
-    assert!(!fetched.is_empty(), "fetch returned batches");
-    assert_eq!(0, consume.2, "fetch must not full-list the partition");
-    assert!(
-        consume.3 >= 1,
-        "fetch scans the partition via bounded list_with_offset"
-    );
-
-    // Fetch from near the tail reads far fewer objects than from the start.
-    counters.reset();
-    _ = storage
-        .fetch(
-            &topition,
-            (BATCHES - 2) as i64,
-            1,
-            8 * 1024 * 1024,
-            IsolationLevel::ReadUncommitted,
-            Duration::from_secs(5),
-        )
-        .await?;
-    let tail = counters.report("fetch near tail");
-    assert_eq!(0, tail.2, "fetch must not full-list the partition");
-    assert!(
-        tail.4 < consume.4,
-        "fetching near the tail lists fewer objects than from the start"
     );
     Ok(())
 }
@@ -572,59 +447,6 @@ async fn caught_up_consumer_does_not_list_per_poll_on_segments() -> Result<(), E
         "caught-up poll must not list the tail (served from the warm hint)"
     );
     assert_eq!(0, polled.4, "caught-up poll lists no objects at all");
-
-    Ok(())
-}
-
-/// A fresh reader (a consumer connecting to a replica that did not produce the
-/// data) collapses repeated `high_watermark` reads to a single tail listing
-/// within the TTL (#40): the first read lists the tail cold, the rest are served
-/// from the now-warm hint. This is the path every read-uncommitted fetch,
-/// `offset_stage`, and `list_offsets` LATEST funnels through.
-#[tokio::test]
-async fn repeated_high_watermark_on_fresh_reader_lists_once() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let bucket = InMemory::new();
-
-    // Producer replica writes the batches (separate process / hint).
-    let writer = DynoStore::new(
-        CLUSTER,
-        NODE,
-        Counting {
-            inner: bucket.clone(),
-            counters: Arc::new(Counters::default()),
-        },
-    );
-    create(&writer, "hot", 1).await?;
-    let topition = Topition::new("hot", 0);
-    for n in 0..4 {
-        _ = writer
-            .produce(None, &topition, batch(format!("m-{n}").as_bytes())?)
-            .await?;
-    }
-
-    // Fresh reader replica (empty hint) on the same bucket.
-    let reader_counters = Arc::new(Counters::default());
-    let reader = DynoStore::new(
-        CLUSTER,
-        NODE,
-        Counting {
-            inner: bucket.clone(),
-            counters: reader_counters.clone(),
-        },
-    );
-
-    for _ in 0..20 {
-        assert_eq!(4, reader.high_watermark(&topition).await?);
-    }
-    let reads = reader_counters.report("20 high_watermark reads (fresh reader)");
-
-    assert_eq!(0, reads.2, "high_watermark must not full-list");
-    assert_eq!(
-        1, reads.3,
-        "first read lists the tail cold, the rest are served from the warm hint"
-    );
 
     Ok(())
 }
@@ -1599,42 +1421,6 @@ async fn read_committed_polling_does_not_get_watermark_json() -> Result<(), Erro
         0,
         gets.load(Relaxed),
         "16 read-committed polls must not GET watermark.json (#161)"
-    );
-
-    Ok(())
-}
-
-/// #161: the fallback stays where `watermark.low` really does carry the log
-/// start. A legacy sub-stream's log start is advanced by the `records/` retention
-/// path, and read-committed must keep reporting it — skipping the read there would
-/// report a log start below the oldest surviving record.
-#[tokio::test]
-async fn legacy_log_start_still_comes_from_the_watermark() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let (storage, _counters) = store();
-
-    let topic = "legacy-topic";
-    create(&storage, topic, 1).await?;
-    let tp = Topition::new(topic, 0);
-    for n in 0..4 {
-        _ = storage
-            .produce(None, &tp, batch(format!("m-{n}").as_bytes())?)
-            .await?;
-    }
-
-    // What the legacy retention path records once it has drained the oldest
-    // batches.
-    storage.advance_low_watermark(&tp, Some(2)).await?;
-
-    let stage = storage
-        .offset_stage_at(&tp, IsolationLevel::ReadCommitted)
-        .await?;
-
-    assert_eq!(4, stage.high_watermark);
-    assert_eq!(
-        2, stage.log_start,
-        "a legacy sub-stream reports the drained log start from watermark.low"
     );
 
     Ok(())

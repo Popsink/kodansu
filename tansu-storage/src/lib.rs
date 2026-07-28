@@ -2230,13 +2230,40 @@ fn auto_topic_create(storage: &Url) -> AutoTopicCreate {
 /// key reproduces today's behaviour.
 /// Parse a boolean feature flag from the storage URL query string: `true` iff
 /// `key` is present and parses as `true` (an absent or unparseable value is
-/// `false`). Shared by the per-backend `produce_coalesce` / `prefix_coalesce`
+/// `false`). Shared by the per-backend `compacted_segments` / `compacted_carryover`
 /// switches.
 #[cfg(feature = "dynostore")]
 fn url_flag(storage: &Url, key: &str) -> bool {
     storage
         .query_pairs()
         .any(|(k, v)| k == key && v.as_ref().parse().unwrap_or(false))
+}
+
+/// Warn once, at store build, for storage-URL keys that selected the pre-#177
+/// layout.
+///
+/// Prefix-coalesced segments under the leaseless arbiter are the only layout
+/// now, so `prefix_coalesce`, `prefix_leaseless` and `produce_coalesce` no
+/// longer select anything. They are *ignored*, not rejected: production URLs
+/// pass them explicitly, and failing the build on an unknown key would turn a
+/// no-op config line into a failed rollout. The warning exists so an operator
+/// finds out from a log line rather than from a behaviour change that never
+/// comes.
+#[cfg(feature = "dynostore")]
+fn warn_deprecated_layout_flags(storage: &Url) {
+    const DEPRECATED: [&str; 3] = ["prefix_coalesce", "prefix_leaseless", "produce_coalesce"];
+
+    let present: Vec<&str> = DEPRECATED
+        .into_iter()
+        .filter(|key| storage.query_pairs().any(|(k, _)| k == *key))
+        .collect();
+
+    if !present.is_empty() {
+        warn!(
+            keys = ?present,
+            "ignoring deprecated storage URL keys: prefix-coalesced segments are the only layout (#177)"
+        );
+    }
 }
 
 #[cfg(feature = "dynostore")]
@@ -2356,21 +2383,8 @@ impl Builder<i32, String, Url, Url> {
                     }
                 });
 
-                // Server-side produce coalescing (#50): flush a run of batches as
-                // one object per linger window, in DynoStore. Independent of the
-                // `batch_*` ProduceRequestBatcher above (which merges per producer);
-                // enable one or the other, not both.
-                let produce_coalesce = self
-                    .storage
-                    .query_pairs()
-                    .any(|(k, v)| k == "produce_coalesce" && v.as_ref().parse().unwrap_or(false));
+                warn_deprecated_layout_flags(&self.storage);
 
-                // Prefix-coalesced "virtual topics" (#56/#63): coalesce per
-                // connector prefix into shared segments. Opt-in, off by default,
-                // and takes precedence over `produce_coalesce` for eligible
-                // batches.
-                let prefix_coalesce = url_flag(&self.storage, "prefix_coalesce");
-                let prefix_leaseless = url_flag(&self.storage, "prefix_leaseless");
                 // Compacted topics segment-routed to dedicated prefixes with a
                 // per-key compaction pass (#175). Off by default; flipped only
                 // on a uniform fleet (see `DynoStore::compacted_segments`).
@@ -2384,8 +2398,6 @@ impl Builder<i32, String, Url, Url> {
                 debug!(
                     ?minimum_size,
                     ?maximum_delay,
-                    produce_coalesce,
-                    prefix_coalesce,
                     compacted_segments,
                     compacted_carryover
                 );
@@ -2414,9 +2426,6 @@ impl Builder<i32, String, Url, Url> {
                         DynoStore::new(self.cluster_id.as_str(), self.node_id, object_store)
                             .advertised_listener(self.advertised_listener.clone())
                             .auto_create(auto_topic_create(&self.storage))
-                            .produce_coalesce(produce_coalesce)
-                            .prefix_coalesce(prefix_coalesce)
-                            .prefix_leaseless(prefix_leaseless)
                             .compacted_segments(compacted_segments)
                             .compacted_carryover(compacted_carryover)
                             .coalesce_tuning(coalesce_tuning(&self.storage))
@@ -2464,19 +2473,8 @@ impl Builder<i32, String, Url, Url> {
                     }
                 });
 
-                // See the s3 arm: DynoStore-level produce coalescing (#50),
-                // independent of the batch_* ProduceRequestBatcher.
-                let produce_coalesce = self
-                    .storage
-                    .query_pairs()
-                    .any(|(k, v)| k == "produce_coalesce" && v.as_ref().parse().unwrap_or(false));
+                warn_deprecated_layout_flags(&self.storage);
 
-                // Prefix-coalesced "virtual topics" (#56/#63). On GCS the read
-                // path is footer-only (no per-flush-mutated manifest) and the
-                // segment data objects are create-only, so this stays under the
-                // ~1/s/object mutation cap (#13) by construction.
-                let prefix_coalesce = url_flag(&self.storage, "prefix_coalesce");
-                let prefix_leaseless = url_flag(&self.storage, "prefix_leaseless");
                 let compacted_segments = url_flag(&self.storage, "compacted_segments");
                 let compacted_carryover = url_flag(&self.storage, "compacted_carryover");
 
@@ -2509,9 +2507,6 @@ impl Builder<i32, String, Url, Url> {
                         DynoStore::new(self.cluster_id.as_str(), self.node_id, object_store)
                             .advertised_listener(self.advertised_listener.clone())
                             .auto_create(auto_topic_create(&self.storage))
-                            .produce_coalesce(produce_coalesce)
-                            .prefix_coalesce(prefix_coalesce)
-                            .prefix_leaseless(prefix_leaseless)
                             .compacted_segments(compacted_segments)
                             .compacted_carryover(compacted_carryover)
                             .coalesce_tuning(coalesce_tuning(&self.storage))
@@ -2531,11 +2526,6 @@ impl Builder<i32, String, Url, Url> {
                 DynoStore::new(self.cluster_id.as_str(), self.node_id, InMemory::new())
                     .advertised_listener(self.advertised_listener.clone())
                     .auto_create(auto_topic_create(&self.storage))
-                    .produce_coalesce(self.storage.query_pairs().any(|(k, v)| {
-                        k == "produce_coalesce" && v.as_ref().parse().unwrap_or(false)
-                    }))
-                    .prefix_coalesce(url_flag(&self.storage, "prefix_coalesce"))
-                    .prefix_leaseless(url_flag(&self.storage, "prefix_leaseless"))
                     .compacted_segments(url_flag(&self.storage, "compacted_segments"))
                     .compacted_carryover(url_flag(&self.storage, "compacted_carryover"))
                     .coalesce_tuning(coalesce_tuning(&self.storage)),
@@ -3385,24 +3375,65 @@ mod tests {
 
     #[cfg(feature = "dynostore")]
     #[test]
-    fn url_flag_parses_prefix_coalesce() -> Result<()> {
+    fn url_flag_parses_compacted_segments() -> Result<()> {
         assert!(url_flag(
-            &Url::parse("memory://tansu/?prefix_coalesce=true")?,
-            "prefix_coalesce"
+            &Url::parse("memory://tansu/?compacted_segments=true")?,
+            "compacted_segments"
         ));
         assert!(!url_flag(
-            &Url::parse("memory://tansu/?prefix_coalesce=false")?,
-            "prefix_coalesce"
+            &Url::parse("memory://tansu/?compacted_segments=false")?,
+            "compacted_segments"
         ));
         // Absent and unparseable both read as off, so default is off.
         assert!(!url_flag(
             &Url::parse("memory://tansu/")?,
-            "prefix_coalesce"
+            "compacted_segments"
         ));
         assert!(!url_flag(
-            &Url::parse("memory://tansu/?prefix_coalesce=notabool")?,
-            "prefix_coalesce"
+            &Url::parse("memory://tansu/?compacted_segments=notabool")?,
+            "compacted_segments"
         ));
+        Ok(())
+    }
+
+    /// The pre-#177 layout keys are inert, not rejected: production URLs pass
+    /// them explicitly, so failing the build on one would turn a no-op config
+    /// line into a failed rollout. They are warned about once at store build.
+    /// `memory://` with no host is the URL the broker's in-memory tests use;
+    /// it must resolve to the in-memory store rather than falling through to
+    /// `UnsupportedStorageUrl`.
+    #[cfg(feature = "dynostore")]
+    #[tokio::test]
+    async fn hostless_memory_url_builds() -> Result<()> {
+        let storage = StorageContainer::builder()
+            .cluster_id("tansu")
+            .node_id(111)
+            .advertised_listener(Url::parse("tcp://localhost:9092")?)
+            .storage(Url::parse("memory://")?)
+            .build()
+            .await;
+        assert!(
+            storage.is_ok(),
+            "hostless memory:// must build: {storage:?}"
+        );
+        Ok(())
+    }
+
+    #[cfg(feature = "dynostore")]
+    #[tokio::test]
+    async fn deprecated_layout_flags_still_build() -> Result<()> {
+        let storage = StorageContainer::builder()
+            .cluster_id("tansu")
+            .node_id(111)
+            .advertised_listener(Url::parse("tcp://localhost:9092")?)
+            .storage(Url::parse(
+                "memory://tansu/\
+                 ?prefix_coalesce=true&prefix_leaseless=true&produce_coalesce=false",
+            )?)
+            .build()
+            .await;
+
+        assert!(storage.is_ok(), "deprecated keys must not fail the build");
         Ok(())
     }
 

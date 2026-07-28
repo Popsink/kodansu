@@ -42,9 +42,10 @@ guarantees.
    after the last old pod exits, so no old process can still have a PUT in
    flight. Lease *expiry* is **not** the gate — a straggler PUT can land after
    the lease lapses.
-3. **Start leaseless.** Bring up the new pods with the leaseless flag on
-   (`prefix_leaseless`). The first flush of each prefix seeds and stamps the era
-   automatically (step above). No produce routing is involved — any replica may
+3. **Start leaseless.** Bring up the new pods. Leaseless is unconditional since
+   #177 — there is no flag to set, and `prefix_leaseless` in a storage URL is
+   accepted but ignored (warned once at startup). The first flush of each prefix
+   seeds and stamps the era automatically (step above). No produce routing is involved — any replica may
    append to any prefix (this tree never wired a multi-broker routing layer, so
    there is no routing config to remove).
 

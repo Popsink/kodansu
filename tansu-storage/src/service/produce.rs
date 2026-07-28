@@ -416,8 +416,13 @@ mod tests {
             .map_err(Into::into)
     }
 
+    /// A producer with no coordinate in the log is admitted as new (#88), not
+    /// answered with `UnknownProducerId`. See
+    /// `dynostore::tests::idempotent::an_unknown_producer_is_admitted_as_new`
+    /// for why the registry that used to reject it is gone, and for the
+    /// deliberate Kafka divergence this records.
     #[tokio::test]
-    async fn non_txn_idempotent_unknown_producer_id() -> Result<()> {
+    async fn non_txn_idempotent_unknown_producer_is_admitted() -> Result<()> {
         let _guard = init_tracing()?;
 
         let cluster = "abc";
@@ -442,8 +447,8 @@ mod tests {
                         .partition_responses(Some(vec![
                             PartitionProduceResponse::default()
                                 .index(index)
-                                .error_code(ErrorCode::UnknownProducerId.into())
-                                .base_offset(-1)
+                                .error_code(ErrorCode::None.into())
+                                .base_offset(0)
                                 .log_append_time_ms(Some(-1))
                                 .log_start_offset(Some(0))
                                 .record_errors(Some(vec![]))
@@ -635,8 +640,12 @@ mod tests {
         Ok(())
     }
 
+    /// A duplicate is acked with the offset the original landed at (#88),
+    /// rather than raising `DuplicateSequenceNumber` as the per-pod registry
+    /// did. That is the Kafka-conformant answer: a retry after an ack the
+    /// client never saw becomes idempotent instead of fatal.
     #[tokio::test]
-    async fn non_txn_idempotent_duplicate_sequence() -> Result<()> {
+    async fn non_txn_idempotent_duplicate_is_acked_with_the_original_offset() -> Result<()> {
         let _guard = init_tracing()?;
 
         let cluster = "abc";
@@ -713,8 +722,8 @@ mod tests {
                         .partition_responses(Some(vec![
                             PartitionProduceResponse::default()
                                 .index(index)
-                                .error_code(ErrorCode::DuplicateSequenceNumber.into())
-                                .base_offset(-1)
+                                .error_code(ErrorCode::None.into())
+                                .base_offset(0)
                                 .log_append_time_ms(Some(-1))
                                 .log_start_offset(Some(0))
                                 .record_errors(Some(vec![]))

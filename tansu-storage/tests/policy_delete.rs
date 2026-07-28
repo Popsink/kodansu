@@ -186,14 +186,65 @@ async fn default_retention_keeps_recent_records() -> Result<(), Error> {
     Ok(())
 }
 
+/// An absent `cleanup.policy` is Kafka's default — `delete` at the default
+/// retention — so maintenance expires the records (#177).
+///
+/// This test previously asserted the opposite, that a policy-less topic is
+/// retained forever. That promise was only ever kept by the legacy
+/// `records/` path: `segment_retention_thresholds` has always applied the
+/// 7-day default to a policy-less topic, so on any segment-backed deployment
+/// the data expired regardless. #177 makes segments the only layout, so the
+/// two readings were reconciled in favour of the segment one, which is also
+/// the Kafka-conformant one. Retain-forever is still expressible, and now has
+/// exactly one spelling: `retention.ms=-1`, covered by
+/// `retention_ms_minus_one_retains_forever` below.
 #[tokio::test]
-async fn without_delete_policy_records_are_retained() -> Result<(), Error> {
+async fn without_cleanup_policy_kafka_defaults_apply() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
     let storage = memory_storage().await?;
 
-    // no cleanup.policy: maintenance must never drop records
-    create_topic(&storage, "forever", vec![]).await?;
+    // No cleanup.policy at all: the Kafka default (`delete`) applies.
+    create_topic(&storage, "no-policy", vec![]).await?;
+
+    let topition = Topition::new("no-policy", 0);
+
+    produce_three(&storage, &topition).await?;
+
+    assert_eq!(3, fetch_len(&storage, &topition).await?);
+
+    let later = SystemTime::now()
+        .checked_add(Duration::from_hours(100 * 24))
+        .expect("a hundred days ahead");
+    storage.maintain(later).await?;
+
+    assert_eq!(
+        0,
+        fetch_len(&storage, &topition).await?,
+        "a policy-less topic expires at the default retention, as Kafka does",
+    );
+
+    Ok(())
+}
+
+/// `retention.ms=-1` is the one spelling of retain-forever, and it holds even
+/// with no `cleanup.policy` (where the default `delete` would otherwise apply).
+#[tokio::test]
+async fn retention_ms_minus_one_retains_forever() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = memory_storage().await?;
+
+    create_topic(
+        &storage,
+        "forever",
+        vec![
+            CreatableTopicConfig::default()
+                .name("retention.ms".into())
+                .value(Some("-1".into())),
+        ],
+    )
+    .await?;
 
     let topition = Topition::new("forever", 0);
 

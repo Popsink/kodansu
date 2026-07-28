@@ -27,8 +27,6 @@
 //! stick to one replica; cross-replica dedup is eventually consistent, bounded
 //! by the checkpoint window. These tests pin both halves of that contract.
 
-use std::time::Duration;
-
 use bytes::Bytes;
 use object_store::memory::InMemory;
 use tansu_sans_io::{
@@ -86,6 +84,16 @@ async fn create_topic(storage: &DynoStore, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// A store flushing on every enqueue, so an awaited produce returns without
+/// parking on the coalesce linger — these tests are written as straight-line
+/// sequential produces and each one's outcome is the assertion.
+fn segment_store() -> DynoStore {
+    DynoStore::new(CLUSTER, NODE, InMemory::new()).coalesce_tuning(CoalesceTuning {
+        coalesce_batches: Some(1),
+        ..Default::default()
+    })
+}
+
 async fn init_idempotent(storage: &DynoStore) -> Result<i64> {
     let response = storage.init_producer(None, 0, Some(-1), Some(-1)).await?;
     assert_eq!(ErrorCode::None, response.error);
@@ -103,7 +111,7 @@ fn api_error(result: Result<i64>) -> ErrorCode {
 async fn producers_validate_independently() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let store = DynoStore::new(CLUSTER, NODE, InMemory::new());
+    let store = segment_store();
 
     let topic = "shared-partition";
     create_topic(&store, topic).await?;
@@ -135,14 +143,17 @@ async fn producers_validate_independently() -> Result<(), Error> {
     );
 
     // Re-sending p2's first batch is a duplicate for p2 — unaffected by p1's
-    // progress on the same partition.
+    // progress on the same partition. The log-based authority (#88) acks it
+    // with the offset the original landed at rather than raising
+    // `DuplicateSequenceNumber`; that is the Kafka-conformant answer, and it is
+    // what makes a retry after an ack the client never saw idempotent instead
+    // of fatal.
     assert_eq!(
-        ErrorCode::DuplicateSequenceNumber,
-        api_error(
-            store
-                .produce(None, &topition, idempotent_batch(p2, 0, 0, 1)?)
-                .await
-        )
+        2,
+        store
+            .produce(None, &topition, idempotent_batch(p2, 0, 0, 1)?)
+            .await?,
+        "a duplicate is acked with its original offset",
     );
 
     // A gap for p1 is out-of-order; again independent of p2.
@@ -158,100 +169,25 @@ async fn producers_validate_independently() -> Result<(), Error> {
     Ok(())
 }
 
+/// A producer with no coordinate in the log is admitted as new, at sequence 0
+/// (#88) — it is not rejected with `UnknownProducerId`.
+///
+/// The per-pod `producers/{id}.json` registry that used to reject it is gone:
+/// it diverged across a connection migration (#79) and mishandled i32 sequence
+/// wraparound (#80), so #88 replaced it with coordinates folded from the log
+/// itself. There is no registry left to miss, and a producer absent from the
+/// log is indistinguishable from a genuinely new one.
+///
+/// This is a **deliberate divergence from Kafka**, which answers
+/// `UNKNOWN_PRODUCER_ID` so the client knows to reset. It is pre-existing
+/// rather than introduced here — every leaseless deployment has behaved this
+/// way since #86 — and #177 only makes it the single behaviour. Tracked in
+/// #198; pinned here so it is a decision on record rather than a silent gap.
 #[tokio::test]
-async fn idempotent_advance_is_local_until_checkpoint() -> Result<(), Error> {
+async fn an_unknown_producer_is_admitted_as_new() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    // Two stores over ONE bucket == two stateless replicas.
-    let bucket = InMemory::new();
-    let replica_a = DynoStore::new(CLUSTER, NODE, bucket.clone());
-    let replica_b = DynoStore::new(CLUSTER, NODE, bucket.clone());
-
-    let topic = "cross-replica-local";
-    create_topic(&replica_a, topic).await?;
-    let topition = Topition::new(topic, 0);
-
-    // Registered on A (seeds producers/{id}.json in the shared bucket).
-    let producer = init_idempotent(&replica_a).await?;
-
-    // First batch on B advances B's in-memory sequence but is not yet
-    // checkpointed to the shared object (below the debounce window, #48).
-    assert_eq!(
-        0,
-        replica_b
-            .produce(None, &topition, idempotent_batch(producer, 0, 0, 2)?)
-            .await?
-    );
-
-    // A replays seq 0 before B's checkpoint. Because the advance is still local
-    // to B, A does NOT see it and re-accepts the batch (at the next offset)
-    // rather than rejecting it as a duplicate: idempotency is per-replica
-    // between checkpoints, the accepted #48 tradeoff.
-    assert_eq!(
-        2,
-        replica_a
-            .produce(None, &topition, idempotent_batch(producer, 0, 0, 2)?)
-            .await?
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn idempotent_advance_visible_across_replicas_after_checkpoint() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    // Stores over ONE bucket == stateless replicas.
-    let bucket = InMemory::new();
-    let replica_a = DynoStore::new(CLUSTER, NODE, bucket.clone());
-
-    let topic = "cross-replica-checkpoint";
-    create_topic(&replica_a, topic).await?;
-    let topition = Topition::new(topic, 0);
-
-    let producer = init_idempotent(&replica_a).await?;
-
-    // A produces seq 0 (in-memory only), then — after the debounce interval has
-    // elapsed — a contiguous seq 2, which triggers A's lazy checkpoint and
-    // persists the advance (through seq 3) to the shared object.
-    assert_eq!(
-        0,
-        replica_a
-            .produce(None, &topition, idempotent_batch(producer, 0, 0, 2)?)
-            .await?
-    );
-    tokio::time::sleep(DynoStore::PRODUCER_CHECKPOINT_INTERVAL + Duration::from_millis(50)).await;
-    assert_eq!(
-        2,
-        replica_a
-            .produce(None, &topition, idempotent_batch(producer, 0, 2, 1)?)
-            .await?
-    );
-
-    // A replica that is *cold* for this producer (the migration target) reads the
-    // checkpointed object and correctly rejects a replay of the already-acked
-    // sequence: cross-replica dedup is restored once the source replica
-    // checkpoints. (A replica already holding the producer in memory validates
-    // against its own authority and would not re-read — hence the eventual, not
-    // immediate, cross-replica contract.)
-    let replica_cold = DynoStore::new(CLUSTER, NODE, bucket.clone());
-    assert_eq!(
-        ErrorCode::DuplicateSequenceNumber,
-        api_error(
-            replica_cold
-                .produce(None, &topition, idempotent_batch(producer, 0, 0, 2)?)
-                .await
-        )
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn unregistered_producer_is_rejected() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let store = DynoStore::new(CLUSTER, NODE, InMemory::new());
+    let store = segment_store();
 
     let topic = "unregistered";
     create_topic(&store, topic).await?;
@@ -259,47 +195,68 @@ async fn unregistered_producer_is_rejected() -> Result<(), Error> {
 
     // Never registered via InitProducerId.
     assert_eq!(
-        ErrorCode::UnknownProducerId,
-        api_error(
-            store
-                .produce(None, &topition, idempotent_batch(42, 0, 0, 1)?)
-                .await
-        )
+        0,
+        store
+            .produce(None, &topition, idempotent_batch(42, 0, 0, 1)?)
+            .await?,
+    );
+
+    // And it is tracked from there like any other producer: the retry dedupes.
+    assert_eq!(
+        0,
+        store
+            .produce(None, &topition, idempotent_batch(42, 0, 0, 1)?)
+            .await?,
     );
 
     Ok(())
 }
 
+/// Epoch fencing over the log-folded authority (#88): a **lower** epoch than
+/// the one already in the log is fenced, and a **higher** one resets the
+/// stream.
+///
+/// The registry this replaced fenced any epoch that differed from the
+/// registered one, including a higher one. That was backwards: in Kafka a
+/// higher epoch is a new incarnation of the producer and is what *does* the
+/// fencing, while a lower epoch is the zombie to reject. `classify` folds the
+/// epoch out of the log and gets this the Kafka way round.
 #[tokio::test]
-async fn stale_epoch_is_fenced() -> Result<(), Error> {
+async fn a_lower_epoch_is_fenced_and_a_higher_one_resets() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let store = DynoStore::new(CLUSTER, NODE, InMemory::new());
+    let store = segment_store();
 
     let topic = "fenced";
     create_topic(&store, topic).await?;
     let topition = Topition::new(topic, 0);
 
-    // Registered at epoch 0.
     let producer = init_idempotent(&store).await?;
 
-    // A batch claiming a different (here, higher) epoch than the one the
-    // producer object knows about is fenced — the sharded object preserves the
-    // exact ProducerFenced semantics of the old global-meta check.
+    // Epoch 1 writes first, so that is what the log carries.
+    assert_eq!(
+        0,
+        store
+            .produce(None, &topition, idempotent_batch(producer, 1, 0, 1)?)
+            .await?
+    );
+
+    // A zombie still on epoch 0 is fenced.
     assert_eq!(
         ErrorCode::ProducerFenced,
         api_error(
             store
-                .produce(None, &topition, idempotent_batch(producer, 1, 0, 1)?)
+                .produce(None, &topition, idempotent_batch(producer, 0, 5, 1)?)
                 .await
         )
     );
 
-    // The correct epoch still works.
+    // Epoch 2 is a new incarnation: the stream resets, so sequence 0 is in
+    // order again even though epoch 1 had already reached sequence 1.
     assert_eq!(
-        0,
+        1,
         store
-            .produce(None, &topition, idempotent_batch(producer, 0, 0, 1)?)
+            .produce(None, &topition, idempotent_batch(producer, 2, 0, 1)?)
             .await?
     );
 
