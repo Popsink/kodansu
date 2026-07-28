@@ -799,6 +799,71 @@ async fn expires_aged_segments_keeps_recent_ones() -> Result<(), Error> {
     Ok(())
 }
 
+/// Lowering `retention.ms` must re-arm a prefix the oldest-retained hint had
+/// marked skippable (#61, #49) — the segment analogue of
+/// `retention.rs::lowered_retention_rebascules_to_scan`, which pins this only
+/// for the legacy per-partition path.
+///
+/// The hint exists so a tick that cannot possibly find anything expirable skips
+/// the LIST entirely. If it were a one-way ratchet, a prefix once judged "all
+/// records newer than the threshold" would stay skipped for as long as it kept
+/// being asked the same question — and *tightening* `retention.ms` would
+/// silently stop reclaiming, with no error and no metric. The guard is a
+/// comparison against the threshold, not a sticky flag, and this is what says
+/// so.
+#[tokio::test]
+async fn lowered_retention_rescans_a_skipped_prefix() -> Result<(), Error> {
+    const HOUR_MS: i64 = 60 * 60 * 1_000;
+
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    let written = now_ms();
+    assert_eq!(0, store.produce(None, &a, batch_at(2, written)?).await?);
+    assert_eq!(1, segments(&bucket).await.len());
+
+    // A generous retention: the record is newer than the threshold, so the scan
+    // reclaims nothing — and records the oldest-retained hint on its way out.
+    let generous = written - HOUR_MS;
+    assert_eq!(
+        0,
+        store
+            .expire_prefix_segments_if_due(PREFIX, generous)
+            .await?,
+    );
+
+    // The hint now short-circuits the next tick at that same threshold.
+    assert!(
+        !store.prefix_maybe_expirable(PREFIX, generous)?,
+        "a prefix whose oldest record is newer than the threshold must be skipped",
+    );
+
+    // Retention is lowered, so the threshold rises past the hint. The guard has
+    // to flip back to scanning — and the scan must actually reclaim, not merely
+    // be permitted to run.
+    let tightened = written + HOUR_MS;
+    assert!(
+        store.prefix_maybe_expirable(PREFIX, tightened)?,
+        "a threshold past the hint must re-arm the scan",
+    );
+    assert_eq!(
+        1,
+        store
+            .expire_prefix_segments_if_due(PREFIX, tightened)
+            .await?,
+    );
+    assert!(
+        segments(&bucket).await.is_empty(),
+        "the re-armed scan must delete the now-expirable segment",
+    );
+
+    Ok(())
+}
+
 /// A shared segment is kept while *any* of its sub-streams is still live (#61):
 /// whole-segment expiry never drops a segment a live topic still needs.
 #[tokio::test]

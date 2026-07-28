@@ -40,7 +40,7 @@ use tansu_sans_io::{
 
 use crate::{
     Error, Result, Storage, Topition,
-    dynostore::{DynoStore, tests::init_tracing},
+    dynostore::{CoalesceTuning, DynoStore, tests::init_tracing},
 };
 
 const CLUSTER: &str = "tansu";
@@ -200,6 +200,30 @@ fn store() -> (DynoStore, Arc<Counters>) {
         counters: counters.clone(),
     };
     (DynoStore::new(CLUSTER, NODE, store), counters)
+}
+
+/// The same counting store in prefix-coalesced segment mode under the leaseless
+/// arbiter (#57/#86) — the layout the epic (#171) is making the only one.
+///
+/// `coalesce_batches: Some(1)` flushes on every enqueue, so an awaited produce
+/// returns without parking on the linger. That keeps the op-profile tests
+/// written as straight-line sequential produces, which is what they measure.
+fn segment_store() -> (DynoStore, Arc<Counters>) {
+    let counters = Arc::new(Counters::default());
+    let store = Counting {
+        inner: InMemory::new(),
+        counters: counters.clone(),
+    };
+    (
+        DynoStore::new(CLUSTER, NODE, store)
+            .prefix_coalesce(true)
+            .prefix_leaseless(true)
+            .coalesce_tuning(CoalesceTuning {
+                coalesce_batches: Some(1),
+                ..Default::default()
+            }),
+        counters,
+    )
 }
 
 async fn create(storage: &DynoStore, name: &str, partitions: i32) -> Result<()> {
@@ -484,6 +508,63 @@ async fn caught_up_consumer_does_not_list_per_poll() -> Result<(), Error> {
         assert!(fetched.is_empty(), "caught-up poll returns no batches");
     }
     let polled = counters.report("50 caught-up polls");
+
+    assert_eq!(0, polled.2, "caught-up poll must not full-list");
+    assert_eq!(
+        0, polled.3,
+        "caught-up poll must not list the tail (served from the warm hint)"
+    );
+    assert_eq!(0, polled.4, "caught-up poll lists no objects at all");
+
+    Ok(())
+}
+
+/// The same zero-LIST idle-poll property on a **pure-segment** topic (#171).
+///
+/// `caught_up_consumer_does_not_list_per_poll` above pins it for the legacy
+/// layout only, and the segment tail-probe tests
+/// (`tail_probe_follows_a_peer_without_listing` and its floor-ahead twin) pin
+/// the *writer* side. Nothing pins the reader side: what an idle consumer costs
+/// per poll once segments are the only layout. Since #171 deletes the legacy
+/// test with the layout it covers, leaving this unpinned would drop the
+/// property silently — and an idle-consumer LIST is charged per poll per
+/// topic-partition, which is exactly the tier-1 cost the epic exists to remove.
+#[tokio::test]
+async fn caught_up_consumer_does_not_list_per_poll_on_segments() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+    let (storage, counters) = segment_store();
+
+    // Dotted name: `prefix_of` coalesces on the first three components.
+    let topic = "org.env.conn.hot";
+    create(&storage, topic, 1).await?;
+    let topition = Topition::new(topic, 0);
+    const BATCHES: usize = 8;
+    for n in 0..BATCHES {
+        _ = storage
+            .produce(None, &topition, batch(format!("m-{n}").as_bytes())?)
+            .await?;
+    }
+
+    // Cold read once to warm the prefix index from the footers.
+    assert_eq!(BATCHES as i64, storage.high_watermark(&topition).await?);
+
+    // Steady state: 50 polls at the tail (offset == high watermark). No LISTs.
+    counters.reset();
+    const POLLS: usize = 50;
+    for _ in 0..POLLS {
+        let fetched = storage
+            .fetch(
+                &topition,
+                BATCHES as i64,
+                1,
+                8 * 1024 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_secs(0),
+            )
+            .await?;
+        assert!(fetched.is_empty(), "caught-up poll returns no batches");
+    }
+    let polled = counters.report("50 caught-up polls (segments)");
 
     assert_eq!(0, polled.2, "caught-up poll must not full-list");
     assert_eq!(

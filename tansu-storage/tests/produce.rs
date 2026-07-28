@@ -31,7 +31,7 @@ use tansu_sans_io::{
 };
 use tansu_storage::{
     CreateTopicsService, DeleteTopicsService, InitProducerIdService, ListOffsetsService,
-    ProduceService, StorageContainer,
+    ProduceService, Storage as _, StorageContainer, Topition,
 };
 use tracing::debug;
 use url::Url;
@@ -833,6 +833,84 @@ async fn list_offsets() -> Result<(), Error> {
     let topics = response.responses.as_deref().unwrap_or_default();
     assert_eq!(1, topics.len());
     assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+
+    Ok(())
+}
+
+/// A `coalesce_batches` threshold supplied in the **storage URL** reaches the
+/// prefix-coalesced leaseless flush, not only the legacy produce buffer
+/// (#54, #86, #171).
+///
+/// `coalesce_tuning` is unit-tested at the parser (`lib.rs`) and the leaseless
+/// flush is tested with tuning injected through the *builder*, but nothing
+/// joins the two: whether a value written in the URL an operator actually
+/// deploys survives `StorageContainer::build` and reaches
+/// `flush_prefix_coalesced_leaseless`. `coalesce::tuned_batch_count_flushes_
+/// before_the_linger_elapses` pins that wiring for the legacy buffer only, and
+/// #171 deletes it along with the buffer.
+///
+/// The linger is an hour out, so the tuned count trigger firing on the third
+/// enqueue is the *only* way these produces can be acked inside the test. If
+/// the URL value were dropped in transit the default (64) would apply and the
+/// `join!` would park on the linger — so the test cannot pass for the wrong
+/// reason.
+#[tokio::test]
+async fn url_coalesce_batches_reaches_the_leaseless_flush() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    const HOST: &str = "localhost";
+    const PORT: i32 = 9092;
+    const NODE_ID: i32 = 111;
+
+    let storage = StorageContainer::builder()
+        .cluster_id("tansu")
+        .node_id(NODE_ID)
+        .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
+        .storage(Url::parse(
+            "memory://tansu/\
+             ?prefix_coalesce=true&prefix_leaseless=true\
+             &coalesce_linger=1h&coalesce_batches=3",
+        )?)
+        .build()
+        .await?;
+
+    // Dotted name: `prefix_of` coalesces on the first three components.
+    let topic = "org.env.conn.tuned";
+    _ = storage
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic.into())
+                .num_partitions(1)
+                .replication_factor(1)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+    let topition = Topition::new(topic, 0);
+
+    let batch = || {
+        inflated::Batch::builder()
+            .record(Record::builder().value(Some(Bytes::from_static(b"a"))))
+            .record(Record::builder().value(Some(Bytes::from_static(b"b"))))
+            .last_offset_delta(1)
+            .build()
+            .and_then(deflated::Batch::try_from)
+    };
+
+    let (a, b, c) = tokio::join!(
+        storage.produce(None, &topition, batch()?),
+        storage.produce(None, &topition, batch()?),
+        storage.produce(None, &topition, batch()?),
+    );
+
+    let mut offsets = vec![a?, b?, c?];
+    offsets.sort_unstable();
+    assert_eq!(
+        vec![0, 2, 4],
+        offsets,
+        "the three batches tile one segment contiguously"
+    );
 
     Ok(())
 }
