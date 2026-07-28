@@ -15,7 +15,6 @@
 use std::{
     fmt::{Debug, Display},
     ops::DerefMut,
-    slice::from_ref,
     sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
@@ -116,6 +115,37 @@ fn key_class(path: &Path) -> &'static str {
 /// which is what a revalidation costs anyway.
 const REVALIDATION_STRIPES: usize = 256;
 
+/// Whether an object-store error is the engine getting an answer rather than
+/// hitting a fault (#203).
+///
+/// All four are asked for deliberately: `NotFound` by the watermark, seq-floor,
+/// era, truncation-floor and legacy-presence probes; `AlreadyExists` by the
+/// create-CAS that assigns offsets (#13, #86); `Precondition` by a conditional
+/// update whose etag moved; `NotModified` by a revalidation. None of them means
+/// the object store is unhealthy.
+fn is_control_outcome(error: &object_store::Error) -> bool {
+    matches!(
+        error,
+        object_store::Error::NotFound { .. }
+            | object_store::Error::AlreadyExists { .. }
+            | object_store::Error::Precondition { .. }
+            | object_store::Error::NotModified { .. }
+    )
+}
+
+/// Route one object-store error to [`EXPECTED`] or [`ERRORS`], labelled by key
+/// class (#203). The class is what makes the 404 population attributable — #167
+/// added that label to the request counters and not to these.
+fn record_outcome(method: &KeyValue, class: KeyValue, error: &object_store::Error) {
+    let name = object_store_error_name(error);
+
+    if is_control_outcome(error) {
+        EXPECTED.add(1, &[method.clone(), class, KeyValue::new("outcome", name)]);
+    } else {
+        ERRORS.add(1, &[method.clone(), class, KeyValue::new("error", name)]);
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct Cache<O> {
     entries: Arc<Mutex<ExpiringSizedCache<Path, CacheEntry>>>,
@@ -203,6 +233,23 @@ static ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Object-store responses that are part of normal control flow rather than
+/// faults (#203): an absence probe answered 404, a create-CAS that lost its
+/// race, a conditional write whose precondition moved, a revalidation answered
+/// 304.
+///
+/// Split out of [`ERRORS`] because they dominated it — ~41/s against ~0 genuine
+/// faults on the production fleet — leaving no threshold that fires on a 5xx or
+/// a throttle without firing constantly on the engine asking a question and
+/// getting its answer. Counted rather than dropped: the 404 rate is a real cost
+/// signal, and #194 needs it attributable by key class.
+static EXPECTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_objectstore_cache_expected")
+        .with_description("object_store responses that are control flow, not faults")
+        .build()
+});
+
 static OUTCOMES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_objectstore_cache_outcomes")
@@ -238,7 +285,7 @@ where
         // `put_opts` must be flat zero.
         let class = KeyValue::new("class", key_class(location));
 
-        REQUESTS.add(1, &[method.clone(), class]);
+        REQUESTS.add(1, &[method.clone(), class.clone()]);
 
         self.object_store
             .put_opts(location, payload, opts)
@@ -251,15 +298,7 @@ where
                     _ = guard.insert_evict(location.to_owned(), CacheEntry::from(put_result), true);
                 }
             })
-            .inspect_err(|error| {
-                ERRORS.add(
-                    1,
-                    &[
-                        method,
-                        KeyValue::new("error", object_store_error_name(error)),
-                    ],
-                );
-            })
+            .inspect_err(|error| record_outcome(&method, class, error))
     }
 
     #[instrument(skip_all, fields(location = %location))]
@@ -271,8 +310,9 @@ where
         debug!(%location, ?opts);
 
         let method = KeyValue::new("method", "put_multipart_opts");
+        let class = KeyValue::new("class", key_class(location));
 
-        REQUESTS.add(1, from_ref(&method));
+        REQUESTS.add(1, &[method.clone(), class.clone()]);
 
         self.object_store
             .put_multipart_opts(location, opts)
@@ -280,13 +320,7 @@ where
             .inspect_err(|error| {
                 debug!(%location, ?error);
 
-                ERRORS.add(
-                    1,
-                    &[
-                        method,
-                        KeyValue::new("error", object_store_error_name(error)),
-                    ],
-                );
+                record_outcome(&method, class, error);
             })
     }
 
@@ -473,13 +507,7 @@ where
                         ENTRIES.add(1, &[method.clone(), KeyValue::new("outcome", outcome)]);
                     }
                 } else {
-                    ERRORS.add(
-                        1,
-                        &[
-                            method,
-                            KeyValue::new("error", object_store_error_name(error)),
-                        ],
-                    );
+                    record_outcome(&method, class, error);
                 }
             })
     }
@@ -533,20 +561,20 @@ where
         prefix: Option<&Path>,
     ) -> Result<ListResult, object_store::Error> {
         debug!(?prefix);
-        REQUESTS.add(1, &[KeyValue::new("method", "list_with_delimiter")]);
+        let method = KeyValue::new("method", "list_with_delimiter");
+        // A listing is over a prefix, not a key, so there is no single class to
+        // attribute it to.
+        let class = KeyValue::new("class", "prefix");
+
+        REQUESTS.add(1, &[method.clone(), class.clone()]);
+
         self.object_store
             .list_with_delimiter(prefix)
             .await
             .inspect_err(|error| {
                 debug!(?prefix, ?error);
 
-                ERRORS.add(
-                    1,
-                    &[
-                        KeyValue::new("method", "list_with_delimiter"),
-                        KeyValue::new("error", object_store_error_name(error)),
-                    ],
-                );
+                record_outcome(&method, class, error);
             })
     }
 
@@ -558,20 +586,18 @@ where
         opts: CopyOptions,
     ) -> Result<(), object_store::Error> {
         debug!(%from, %to, ?opts);
-        REQUESTS.add(1, &[KeyValue::new("method", "copy_opts")]);
+        let method = KeyValue::new("method", "copy_opts");
+        let class = KeyValue::new("class", key_class(from));
+
+        REQUESTS.add(1, &[method.clone(), class.clone()]);
+
         self.object_store
             .copy_opts(from, to, opts)
             .await
             .inspect_err(|error| {
                 debug!(%from, %to, ?error);
 
-                ERRORS.add(
-                    1,
-                    &[
-                        KeyValue::new("method", "copy_opts"),
-                        KeyValue::new("error", object_store_error_name(error)),
-                    ],
-                );
+                record_outcome(&method, class, error);
             })
     }
 }
@@ -587,6 +613,79 @@ mod tests {
     use tracing_subscriber::EnvFilter;
 
     use super::*;
+
+    /// The four responses the engine asks for are control flow, not faults
+    /// (#203).
+    ///
+    /// Pinned because the split is the whole point of that issue: with these on
+    /// `cache_errors` the counter sat at ~41/s of normal traffic on production,
+    /// so a 5xx or a throttle could not be alerted on. Reclassifying any of them
+    /// back as an error silently restores that, and nothing else would notice.
+    #[test]
+    fn asked_for_responses_are_not_faults() {
+        for error in [
+            object_store::Error::NotFound {
+                path: "p".into(),
+                source: "probe".into(),
+            },
+            object_store::Error::AlreadyExists {
+                path: "p".into(),
+                source: "create-CAS lost the race".into(),
+            },
+            object_store::Error::Precondition {
+                path: "p".into(),
+                source: "etag moved".into(),
+            },
+            object_store::Error::NotModified {
+                path: "p".into(),
+                source: "revalidated".into(),
+            },
+        ] {
+            assert!(
+                is_control_outcome(&error),
+                "{} must not count as a fault",
+                object_store_error_name(&error),
+            );
+        }
+    }
+
+    /// Anything else is a fault and must stay on `cache_errors`, which is what
+    /// leaves that counter alertable (#203).
+    #[test]
+    fn a_genuine_failure_is_still_a_fault() {
+        let error = object_store::Error::Generic {
+            store: "S3",
+            source: "503 SlowDown".into(),
+        };
+
+        assert!(!is_control_outcome(&error));
+        assert_eq!("otherwise", object_store_error_name(&error));
+    }
+
+    /// Every classed counter must be able to name the key (#203): the 404
+    /// population is only actionable if #194 can tell a truncation floor from a
+    /// legacy probe.
+    #[test]
+    fn key_class_names_the_planes_the_404s_come_from() {
+        for (path, expected) in [
+            (
+                "clusters/c/topics/t/partitions/0000000000/records/0.batch",
+                "records",
+            ),
+            (
+                "clusters/c/prefixes/p/segments/00000000000000000001.seg",
+                "segment",
+            ),
+            (
+                "clusters/c/topics/t/partitions/0000000000/watermark.json",
+                "watermark",
+            ),
+            ("clusters/c/prefixes/p/seq-floor.json", "seq_floor"),
+            ("clusters/c/prefixes/p/era.json", "era"),
+        ] {
+            assert_eq!(expected, key_class(&Path::from(path)), "for {path}");
+        }
+    }
 
     #[derive(
         Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
