@@ -215,13 +215,10 @@ fn segment_store() -> (DynoStore, Arc<Counters>) {
         counters: counters.clone(),
     };
     (
-        DynoStore::new(CLUSTER, NODE, store)
-            .prefix_coalesce(true)
-            .prefix_leaseless(true)
-            .coalesce_tuning(CoalesceTuning {
-                coalesce_batches: Some(1),
-                ..Default::default()
-            }),
+        DynoStore::new(CLUSTER, NODE, store).coalesce_tuning(CoalesceTuning {
+            coalesce_batches: Some(1),
+            ..Default::default()
+        }),
         counters,
     )
 }
@@ -594,9 +591,7 @@ async fn cold_prefix_index_reads_one_get_per_small_footer() -> Result<(), Error>
             inner: bucket.clone(),
             counters: Arc::new(Counters::default()),
         },
-    )
-    .prefix_coalesce(true)
-    .prefix_leaseless(true);
+    );
     create(&writer, "org.env.conn.hot", 1).await?;
     let topition = Topition::new("org.env.conn.hot", 0);
     _ = writer.produce(None, &topition, batch(b"m")?).await?;
@@ -611,9 +606,7 @@ async fn cold_prefix_index_reads_one_get_per_small_footer() -> Result<(), Error>
             inner: bucket.clone(),
             counters: reader_counters.clone(),
         },
-    )
-    .prefix_coalesce(true)
-    .prefix_leaseless(true);
+    );
 
     let region_start = reader.segment_region_start(&topition).await?;
     let reads = reader_counters.report("cold segment_region_start (1 segment)");
@@ -674,9 +667,7 @@ async fn latest_list_offsets_on_pure_segment_issues_no_records_list() -> Result<
             inner: InMemory::new(),
             counters: counters.clone(),
         },
-    )
-    .prefix_coalesce(true)
-    .prefix_leaseless(true);
+    );
     create(&storage, "org.env.conn.hot", 1).await?;
     let tp = Topition::new("org.env.conn.hot", 0);
     _ = storage.produce(None, &tp, batch(b"m")?).await?;
@@ -736,9 +727,7 @@ async fn legacy_records_presence_memo_ttls_and_write_through() -> Result<(), Err
                 inner: InMemory::new(),
                 counters: counters.clone(),
             },
-        )
-        .prefix_coalesce(true)
-        .prefix_leaseless(true);
+        );
         (storage, counters)
     };
 
@@ -761,9 +750,7 @@ async fn legacy_records_presence_memo_ttls_and_write_through() -> Result<(), Err
                 inner: bucket.clone(),
                 counters: Arc::new(Counters::default()),
             },
-        )
-        .prefix_coalesce(true)
-        .prefix_leaseless(true);
+        );
         create(&writer, "org.env.conn.hot", 1).await?;
         let topition = Topition::new("org.env.conn.hot", 0);
         for n in 0..4 {
@@ -780,9 +767,7 @@ async fn legacy_records_presence_memo_ttls_and_write_through() -> Result<(), Err
                 inner: bucket.clone(),
                 counters: reader_counters.clone(),
             },
-        )
-        .prefix_coalesce(true)
-        .prefix_leaseless(true);
+        );
 
         assert!(!reader.has_legacy_records(&topition).await?);
         assert_eq!(
@@ -880,9 +865,7 @@ async fn coalesced_stale_hint_list_offsets_is_per_prefix_not_per_partition() -> 
             inner: InMemory::new(),
             counters: counters.clone(),
         },
-    )
-    .prefix_coalesce(true)
-    .prefix_leaseless(true);
+    );
 
     let topic_name = |p: usize, i: usize| format!("org.env.conn{p}.table{i:02}");
     // Distinct per topic so a response attributed to the wrong partition
@@ -1041,9 +1024,7 @@ async fn coalesced_latest_survives_peer_expiry_via_floor_certification() -> Resu
             inner: bucket.clone(),
             counters: counters.clone(),
         },
-    )
-    .prefix_coalesce(true)
-    .prefix_leaseless(true);
+    );
 
     let topic = "org.env.conn.expired";
     create(&storage, topic, 1).await?;
@@ -1121,9 +1102,7 @@ async fn coalesced_latest_survives_peer_expiry_via_floor_certification() -> Resu
             inner: bucket.clone(),
             counters: Arc::new(Counters::default()),
         },
-    )
-    .prefix_coalesce(true)
-    .prefix_leaseless(true);
+    );
     assert_eq!(
         100,
         cold.high_watermark(&tp).await?,
@@ -1221,9 +1200,7 @@ async fn legacy_probe_is_not_relisted_for_a_segmentless_coalesced_partition() ->
             inner: InMemory::new(),
             counters: counters.clone(),
         },
-    )
-    .prefix_coalesce(true)
-    .prefix_leaseless(true);
+    );
 
     let topic = "org.env.conn.idle";
     create(&storage, topic, 1).await?;
@@ -1382,9 +1359,7 @@ async fn read_committed_polling_does_not_get_watermark_json() -> Result<(), Erro
             inner: InMemory::new(),
             gets: gets.clone(),
         },
-    )
-    .prefix_coalesce(true)
-    .prefix_leaseless(true);
+    );
 
     let topic = "org.env.conn.committed";
     create(&storage, topic, 1).await?;

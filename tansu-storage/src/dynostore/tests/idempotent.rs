@@ -357,17 +357,14 @@ async fn compaction_carries_producer_coordinates_forward() -> Result<(), Error> 
     let _guard = init_tracing()?;
 
     const PREFIX: &str = "org.env.conn";
-    let store = DynoStore::new(CLUSTER, NODE, InMemory::new())
-        .prefix_coalesce(true)
-        .prefix_leaseless(true)
-        .coalesce_tuning(CoalesceTuning {
-            prefix_compact_min_segments: Some(2),
-            // keep_hot = 0 so the whole run — including the retried batch — is
-            // compactable; this is what exposes the dropped-coordinates bug.
-            prefix_compact_keep_hot: Some(0),
-            prefix_compact_target_bytes: Some(1 << 30),
-            ..Default::default()
-        });
+    let store = DynoStore::new(CLUSTER, NODE, InMemory::new()).coalesce_tuning(CoalesceTuning {
+        prefix_compact_min_segments: Some(2),
+        // keep_hot = 0 so the whole run — including the retried batch — is
+        // compactable; this is what exposes the dropped-coordinates bug.
+        prefix_compact_keep_hot: Some(0),
+        prefix_compact_target_bytes: Some(1 << 30),
+        ..Default::default()
+    });
 
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;

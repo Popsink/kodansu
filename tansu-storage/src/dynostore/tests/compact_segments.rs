@@ -43,17 +43,12 @@ const NODE: i32 = 111;
 
 /// Segment mode with compacted-topic routing on (#175).
 fn routed_store(bucket: &InMemory) -> DynoStore {
-    DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .prefix_leaseless(true)
-        .compacted_segments(true)
+    DynoStore::new(CLUSTER, NODE, bucket.clone()).compacted_segments(true)
 }
 
 /// Segment mode with the routing flag OFF — today's shipped behaviour.
 fn unrouted_store(bucket: &InMemory) -> DynoStore {
     DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .prefix_leaseless(true)
 }
 
 async fn create_topic_with_configs(
