@@ -12,7 +12,7 @@ version.workspace = true
 
 [features]
 default = ["dynostore"]
-dynostore = ["dep:object_store"]
+dynostore = ["dep:object_store", "tansu-storage/dynostore"]
 
 [lints]
 workspace = true
