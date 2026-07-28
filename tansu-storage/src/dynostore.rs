@@ -396,6 +396,14 @@ pub struct DynoStore {
     /// works every prefix — the single-maintainer default behaviour).
     maintenance_recency: Duration,
 
+    /// Wall-clock budget for the leaseless prefix flush's conflict-correction
+    /// loop (#157/#192). The loop yields to a competing writer rather than
+    /// amplifying LIST+PUT against a contended prefix — but only once it has
+    /// made [`Self::MIN_FLUSH_ATTEMPTS`] real attempts, because surrendering
+    /// rejects the produce and a rejected produce costs a connector restart
+    /// downstream. Overridable via `flush_max_elapsed`.
+    flush_max_elapsed: Duration,
+
     /// Per-process random seed for the maintenance traversal shuffle (#126), so
     /// N stateless maintainers sweep the prefix set in independent orders and
     /// partition the work by first-arrival rather than all starting at prefix 0.
@@ -717,6 +725,10 @@ pub struct CoalesceTuning {
     pub prefix_compact_seen_keys: Option<usize>,
     /// Maintenance recency window (#126); set to ~0.9× `maintenance_interval`.
     pub maintenance_recency: Option<Duration>,
+    /// Wall-clock budget for the leaseless flush's conflict-correction loop
+    /// (#192). Hard-coded at 10s before that issue, which is too small to admit
+    /// a useful number of attempts once one attempt costs seconds.
+    pub flush_max_elapsed: Option<Duration>,
 }
 
 /// Process-wide counter making each [`DynoStore`]'s `writer_id` unique (#59), so
@@ -1576,6 +1588,7 @@ impl DynoStore {
             prefix_compact_keep_hot: Self::PREFIX_COMPACT_KEEP_HOT,
             prefix_compact_seen_keys: Self::PREFIX_COMPACT_SEEN_KEYS,
             maintenance_recency: Self::MAINTENANCE_RECENCY,
+            flush_max_elapsed: Self::FLUSH_MAX_ELAPSED,
             maintenance_seed: rng().random::<u64>(),
             topic_metas: Arc::new(Mutex::new(BTreeMap::new())),
             topic_index: Arc::new(Mutex::new(TopicIndex::default())),
@@ -1670,6 +1683,7 @@ impl DynoStore {
             maintenance_recency: tuning
                 .maintenance_recency
                 .unwrap_or(self.maintenance_recency),
+            flush_max_elapsed: tuning.flush_max_elapsed.unwrap_or(self.flush_max_elapsed),
             ..self
         }
     }
@@ -1916,6 +1930,26 @@ impl DynoStore {
     /// maintained ~once per interval. Override with `maintenance_recency` to
     /// match a non-default interval.
     const MAINTENANCE_RECENCY: Duration = Duration::from_secs(9 * 60);
+
+    /// Default wall-clock budget for the leaseless flush loop (#157/#192).
+    ///
+    /// Unchanged from the value #157 introduced, but it is now a floor on
+    /// *attempts* rather than a hard deadline: see `MIN_FLUSH_ATTEMPTS`. A
+    /// budget this size admits only two or three attempts once a flush's
+    /// segment PUT costs seconds, which is why #192 saw exhaustion at one
+    /// conflict.
+    const FLUSH_MAX_ELAPSED: Duration = Duration::from_secs(10);
+
+    /// Attempts the leaseless flush always makes before the clock may end it
+    /// (#192).
+    ///
+    /// The budget exists to stop amplifying LIST+PUT against a prefix this
+    /// writer keeps losing. Applied from the first attempt it does something
+    /// else: it converts a *slow* bucket into a rejected produce, and the
+    /// clients here treat a retriable rejection as an engine failure and
+    /// restart the whole connector. Three attempts is enough to distinguish
+    /// "losing a race" from "one slow PUT" while still bounding the work.
+    const MIN_FLUSH_ATTEMPTS: usize = 3;
 
     /// Default cap on the per-key pass's `seen` key set per partition (#175).
     /// Far above any real compacted topic here (connector config/status/offsets
@@ -5291,13 +5325,13 @@ impl DynoStore {
         /// Bounds the conflict-correction loop; far above any real concurrency.
         const MAX_ATTEMPTS: usize = 64;
 
-        /// Wall-clock ceiling on the whole conflict-correction loop (#157). A
-        /// writer still losing the create-CAS after this long is amplifying
-        /// LIST+PUT against a contended prefix with no sign of winning: yield to
-        /// the producer's own retry (the terminal is retriable, and log-based
-        /// dedup #88 makes the replay safe) rather than spend the rest of the
-        /// budget on the bucket.
-        const MAX_ELAPSED: Duration = Duration::from_secs(10);
+        // Wall-clock budget for the conflict-correction loop (#157), overridable
+        // via `flush_max_elapsed`. A writer still losing the create-CAS after
+        // this long is amplifying LIST+PUT against a contended prefix with no
+        // sign of winning: yield to the producer's own retry (the terminal is
+        // retriable, and log-based dedup #88 makes the replay safe) rather than
+        // spend the rest of the budget on the bucket.
+        let max_elapsed = self.flush_max_elapsed;
 
         // Per-partition FIFO across two concurrent local flushes of this prefix:
         // the seq-CAS is the cross-writer offset authority, but this lock still
@@ -5331,10 +5365,39 @@ impl DynoStore {
         let mut stalled = 0usize;
         let mut last_candidate: Option<u64> = None;
 
+        // Where the budget actually went (#192). `conflicts`/`ambiguous_lost`/
+        // `stalled` say why the loop *retried*; without these, a flush starved by
+        // one slow PUT and a flush losing races look identical in the log, which
+        // is what made #192 read as contention when contention was near zero.
+        let mut attempts_made = 0usize;
+        let mut slowest_attempt = Duration::ZERO;
+        let mut put_elapsed = Duration::ZERO;
+        let mut put_bytes = 0u64;
+        let mut backoff_elapsed = Duration::ZERO;
+
         for attempt in 0..MAX_ATTEMPTS {
-            if started.elapsed() >= MAX_ELAPSED {
-                break;
+            // Two departures from a plain `elapsed >= budget` (#192):
+            //
+            // - Never end the loop before `MIN_FLUSH_ATTEMPTS` real attempts.
+            //   Surrendering rejects the produce, and with one attempt costing
+            //   seconds a 10s budget otherwise gives up after a single lost race
+            //   — yielding to a competitor that, at `conflicts == 1`, may not
+            //   exist.
+            // - Do not *start* an attempt the slowest observed attempt says
+            //   cannot finish inside the budget. Checking only between attempts
+            //   let a single attempt overshoot by ~90% (18.4s against 10s), so
+            //   the budget bounded nothing. Deliberately not a timeout around the
+            //   attempt: cancelling mid-PUT manufactures the ambiguous-create
+            //   case the arms below exist to resolve.
+            if attempts_made >= Self::MIN_FLUSH_ATTEMPTS {
+                let elapsed = started.elapsed();
+                if elapsed >= max_elapsed || elapsed + slowest_attempt > max_elapsed {
+                    break;
+                }
             }
+
+            let attempt_started = tokio::time::Instant::now();
+            attempts_made += 1;
 
             // Fold-before-claim: observe every live segment so the candidate
             // sequence and the derived bases reflect all writers, not a stale view.
@@ -5468,7 +5531,9 @@ impl DynoStore {
                 Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
             };
 
-            match self
+            let put_started = tokio::time::Instant::now();
+            put_bytes += payload.content_length() as u64;
+            let put_result = self
                 .object_store
                 .put_opts(
                     &self.segment_location(prefix, candidate),
@@ -5479,8 +5544,10 @@ impl DynoStore {
                         ..Default::default()
                     },
                 )
-                .await
-            {
+                .await;
+            put_elapsed += put_started.elapsed();
+
+            match put_result {
                 // Won the sequence — this create is the linearization point.
                 Ok(_) => {
                     _ = self
@@ -5498,12 +5565,15 @@ impl DynoStore {
                 Err(object_store::Error::AlreadyExists { .. }) => {
                     debug!(prefix, candidate, attempt, "segment seq taken, re-deriving");
                     conflicts += 1;
+                    slowest_attempt = slowest_attempt.max(attempt_started.elapsed());
                     FLUSH_CAS_CONFLICTS.add(1, &[]);
                     // Yield briefly, jittered (#157): N replicas flushing this
                     // prefix would otherwise re-LIST and re-PUT in lockstep, both
                     // amplifying requests on the busiest prefix and letting one
                     // writer lose every attempt of its budget to the same peers.
-                    tokio::time::sleep(cas_conflict_backoff(attempt)).await;
+                    let backoff = cas_conflict_backoff(attempt);
+                    backoff_elapsed += backoff;
+                    tokio::time::sleep(backoff).await;
                     continue;
                 }
 
@@ -5547,8 +5617,11 @@ impl DynoStore {
                                 "ambiguous PUT lost to peer, re-deriving"
                             );
                             ambiguous_lost += 1;
+                            slowest_attempt = slowest_attempt.max(attempt_started.elapsed());
                             FLUSH_CAS_CONFLICTS.add(1, &[]);
-                            tokio::time::sleep(cas_conflict_backoff(attempt)).await;
+                            let backoff = cas_conflict_backoff(attempt);
+                            backoff_elapsed += backoff;
+                            tokio::time::sleep(backoff).await;
                             continue;
                         }
                         // Nothing landed at `candidate` (S3 is read-after-write
@@ -5589,8 +5662,15 @@ impl DynoStore {
         // apart without a debug bump (#157): `conflicts` = peers won the create,
         // `ambiguous_lost` = the PUT was ambiguous and a peer's footer was there,
         // `stalled` = the re-derived candidate did not move (a sequence taken by
-        // an object this writer cannot resolve), `elapsed_ms` ≥ `MAX_ELAPSED` =
-        // gave up on the clock rather than the attempt budget.
+        // an object this writer cannot resolve).
+        //
+        // The second group says where the *time* went (#192), which the first
+        // cannot: compare `put_ms` against `elapsed_ms` to separate a flush
+        // starved by slow PUTs from one losing races, and `slowest_attempt_ms`
+        // against `budget_ms` to see whether the budget could ever have admitted
+        // another attempt. `attempts` bounds both — the loop cannot iterate
+        // without incrementing one of the three counters above, so a small
+        // `attempts` with a large `elapsed_ms` is latency, not contention.
         error!(
             prefix,
             conflicts,
@@ -5598,6 +5678,12 @@ impl DynoStore {
             stalled,
             ?last_candidate,
             elapsed_ms = started.elapsed().as_millis(),
+            attempts = attempts_made,
+            put_ms = put_elapsed.as_millis(),
+            put_bytes,
+            backoff_ms = backoff_elapsed.as_millis(),
+            slowest_attempt_ms = slowest_attempt.as_millis(),
+            budget_ms = max_elapsed.as_millis(),
             "leaseless flush exhausted retries"
         );
         // Retriable: exhaustion here is pure create-CAS contention (a transport
