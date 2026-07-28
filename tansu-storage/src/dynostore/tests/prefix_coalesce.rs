@@ -189,6 +189,33 @@ async fn segments_of(bucket: &InMemory, prefix: &str) -> Vec<Path> {
         .expect("list segments")
 }
 
+/// Seed a legacy `records/{offset:020}.batch` object directly into the bucket.
+///
+/// Since #177 no code path *writes* this layout — segments are the only
+/// writer — but production buckets are full of these objects and the hybrid
+/// read path must keep serving them until #179 deletes it. Seeding through a
+/// flag-off `DynoStore` used to do this; that store now writes segments, so a
+/// hybrid test built that way would quietly become a segment-only test that
+/// still passes. Writing the object is the only honest way to keep the seam
+/// covered.
+async fn seed_legacy_batch(
+    store: &DynoStore,
+    bucket: &InMemory,
+    topition: &Topition,
+    base_offset: i64,
+    batch: deflated::Batch,
+) -> Result<()> {
+    let location = Path::from(format!(
+        "clusters/{CLUSTER}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
+        topition.topic(),
+        topition.partition(),
+        base_offset,
+    ));
+    let payload = store.encode_frame(&[batch])?;
+    _ = bucket.put(&location, payload).await?;
+    Ok(())
+}
+
 /// The legacy per-`(topic, partition)` `records/` objects for partition 0.
 async fn legacy_records(bucket: &InMemory, topic: &str) -> Vec<Path> {
     let listing = Path::from(format!(
@@ -334,40 +361,6 @@ async fn a_later_window_continues_offsets_in_a_new_segment() -> Result<(), Error
     Ok(())
 }
 
-/// With prefix mode off, produce is byte-for-byte the legacy per-partition
-/// layout: no segment objects, records land under `topics/.../records/`.
-#[tokio::test]
-async fn prefix_mode_off_uses_legacy_layout() -> Result<(), Error> {
-    let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
-
-    let topic_a = "org.env.conn.tab_a";
-    create_topic(&store, topic_a).await?;
-    let a = Topition::new(topic_a, 0);
-
-    let offset = store.produce(None, &a, batch(2)?).await?;
-    assert_eq!(0, offset);
-
-    assert!(
-        segments(&bucket).await.is_empty(),
-        "no segments in legacy mode"
-    );
-
-    let records = Path::from(format!(
-        "clusters/{CLUSTER}/topics/{topic_a}/partitions/{:0>10}/records/",
-        0
-    ));
-    let count = bucket
-        .list(Some(&records))
-        .try_collect::<Vec<_>>()
-        .await
-        .expect("list records")
-        .len();
-    assert_eq!(1, count, "one legacy batch object");
-
-    Ok(())
-}
-
 /// After a cold restart — a fresh process on the same bucket, so the in-memory
 /// offset counter is empty — each sub-stream resumes at the exact next offset,
 /// recovered from the tail segment footer (#58): no gap, no reuse. The new
@@ -400,74 +393,6 @@ async fn cold_restart_recovers_offsets_from_the_footer() -> Result<(), Error> {
     let resumed = restarted.produce(None, &a, batch(1)?).await?;
     assert_eq!(5, resumed, "resume past the footer end offset, no reuse");
     assert_eq!(3, segments(&bucket).await.len());
-
-    Ok(())
-}
-
-/// Two writers contending for the same prefix: exactly one acquires the lease
-/// and appends; the other is fenced (NotLeaderOrFollower) and its produce fails
-/// (#59) — at most one writer per prefix, no coordinator.
-#[tokio::test]
-async fn two_writers_contend_one_is_fenced() -> Result<(), Error> {
-    let bucket = InMemory::new();
-    let topic = "org.env.conn.tab_a";
-    let a = Topition::new(topic, 0);
-
-    let store1 = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
-    create_topic(&store1, topic).await?;
-    let store2 = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
-
-    let (r1, r2) = tokio::join!(
-        store1.produce(None, &a, batch(1)?),
-        store2.produce(None, &a, batch(1)?),
-    );
-
-    let winners = [r1.is_ok(), r2.is_ok()]
-        .into_iter()
-        .filter(|ok| *ok)
-        .count();
-    assert_eq!(
-        1, winners,
-        "exactly one writer appends, the other is fenced"
-    );
-    assert_eq!(1, segments(&bucket).await.len(), "one segment written");
-
-    Ok(())
-}
-
-/// After a lease expires and a new writer takes it over (bumping the epoch), the
-/// old writer is a zombie: its next append is fenced by the etag CAS and never
-/// reaches storage (#59).
-#[tokio::test]
-async fn a_zombie_writer_is_fenced_after_takeover() -> Result<(), Error> {
-    let ttl = Duration::from_millis(80);
-    let bucket = InMemory::new();
-    let topic = "org.env.conn.tab_a";
-    let a = Topition::new(topic, 0);
-
-    let old = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .prefix_lease_ttl(ttl);
-    create_topic(&old, topic).await?;
-    assert_eq!(0, old.produce(None, &a, batch(1)?).await?);
-
-    // The lease lapses.
-    tokio::time::sleep(Duration::from_millis(160)).await;
-
-    // A new writer takes over (epoch bumped), recovers offset 1 from the footer.
-    let new = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .prefix_lease_ttl(ttl);
-    assert_eq!(1, new.produce(None, &a, batch(1)?).await?);
-
-    // The old writer, now holding a stale lease, is fenced and cannot append.
-    let zombie = old.produce(None, &a, batch(1)?).await;
-    assert!(zombie.is_err(), "fenced zombie must not append");
-    assert_eq!(
-        2,
-        segments(&bucket).await.len(),
-        "only old+new segments, no zombie"
-    );
 
     Ok(())
 }
@@ -666,10 +591,10 @@ async fn first_segment_continues_from_the_legacy_tail() -> Result<(), Error> {
 
     // Legacy phase (prefix mode off): per-batch records/ objects, tail -> 5.
     {
-        let legacy = DynoStore::new(CLUSTER, NODE, bucket.clone());
-        create_topic(&legacy, topic).await?;
-        assert_eq!(0, legacy.produce(None, &a, batch(3)?).await?);
-        assert_eq!(3, legacy.produce(None, &a, batch(2)?).await?);
+        let seeder = DynoStore::new(CLUSTER, NODE, bucket.clone());
+        create_topic(&seeder, topic).await?;
+        seed_legacy_batch(&seeder, &bucket, &a, 0, batch(3)?).await?;
+        seed_legacy_batch(&seeder, &bucket, &a, 3, batch(2)?).await?;
     }
 
     // Cutover to segment mode: the first segment must start at the legacy tail.
@@ -694,10 +619,10 @@ async fn hybrid_fetch_stitches_legacy_and_segment() -> Result<(), Error> {
 
     // Legacy [0, 5): batch(3)@0, batch(2)@3.
     {
-        let legacy = DynoStore::new(CLUSTER, NODE, bucket.clone());
-        create_topic(&legacy, topic).await?;
-        assert_eq!(0, legacy.produce(None, &a, batch(3)?).await?);
-        assert_eq!(3, legacy.produce(None, &a, batch(2)?).await?);
+        let seeder = DynoStore::new(CLUSTER, NODE, bucket.clone());
+        create_topic(&seeder, topic).await?;
+        seed_legacy_batch(&seeder, &bucket, &a, 0, batch(3)?).await?;
+        seed_legacy_batch(&seeder, &bucket, &a, 3, batch(2)?).await?;
     }
 
     // Segment [5, 9): batch(4)@5 (continues from the seam).
@@ -935,61 +860,38 @@ async fn segment_expiry_yields_to_the_lease_holder() -> Result<(), Error> {
     Ok(())
 }
 
-/// A large backfill batch bypasses the segment buffer and takes the legacy
-/// per-object path (#62): already S3-efficient, and parallel (no lease).
-#[tokio::test]
-async fn a_large_backfill_batch_bypasses_coalescing() -> Result<(), Error> {
-    let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
-
-    let topic = "org.env.conn.tab_a";
-    create_topic(&store, topic).await?;
-    let a = Topition::new(topic, 0);
-
-    // 1000 records >= the backfill threshold -> bypass to a records/ object.
-    let offset = store.produce(None, &a, batch(1_000)?).await?;
-    assert_eq!(0, offset);
-
-    assert!(
-        segments(&bucket).await.is_empty(),
-        "backfill must not write a segment"
-    );
-
-    let records = Path::from(format!(
-        "clusters/{CLUSTER}/topics/{topic}/partitions/{:0>10}/records/",
-        0
-    ));
-    let count = bucket
-        .list(Some(&records))
-        .try_collect::<Vec<_>>()
-        .await
-        .expect("list records")
-        .len();
-    assert_eq!(1, count, "one backfill batch object");
-
-    Ok(())
-}
-
 /// Snapshot → streaming: a backfill (legacy objects) followed by CDC (segments)
 /// keeps one continuous offset sequence with no gap/duplicate, and a fetch
 /// stitches both (#62 handoff over #58 seam / #60 hybrid).
 #[tokio::test]
 async fn backfill_then_cdc_is_continuous() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).coalesce_tuning(CoalesceTuning {
+        coalesce_batches: Some(1),
+        ..Default::default()
+    });
 
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
     let a = Topition::new(topic, 0);
 
-    // Backfill: one bulk batch of 1000 records -> legacy object, offsets [0, 1000).
+    // Backfill: one bulk batch of 1000 records, offsets [0, 1000). Since #177
+    // it goes through the segment CAS like everything else — the #62 bypass
+    // that sent it to a legacy `records/` object is gone (#90 widened the
+    // byte threshold instead, so a bulk batch still flushes as ~its own
+    // segment and keeps the 1-PUT parity the bypass gave).
     assert_eq!(0, store.produce(None, &a, batch(1_000)?).await?);
 
-    // CDC steady state resumes: a small batch coalesces into a segment, and it
-    // must continue at 1000 (no gap/overlap at the snapshot→streaming seam).
+    // CDC steady state resumes: the small batch must continue at 1000 (no
+    // gap/overlap at the snapshot→streaming seam). That seam is the property
+    // this test exists for, and it is unchanged by both sides now being
+    // segments.
     let cdc = store.produce(None, &a, batch(3)?).await?;
     assert_eq!(1000, cdc, "streaming continues from the backfill tail");
-    assert_eq!(1, segments(&bucket).await.len());
+    assert!(
+        legacy_records(&bucket, topic).await.is_empty(),
+        "backfill no longer mints a legacy object",
+    );
 
     // A fetch from 0 stitches backfill + CDC: 1003 records, continuous.
     let fetched = fetch_from(&store, &a, 0).await?;
@@ -1522,10 +1424,10 @@ async fn hybrid_fetch_budget_limited_does_not_skip_legacy() -> Result<(), Error>
 
     // Legacy [0,5): two batches. Then a segment at [5,9).
     {
-        let legacy = DynoStore::new(CLUSTER, NODE, bucket.clone());
-        create_topic(&legacy, topic).await?;
-        assert_eq!(0, legacy.produce(None, &a, batch(3)?).await?);
-        assert_eq!(3, legacy.produce(None, &a, batch(2)?).await?);
+        let seeder = DynoStore::new(CLUSTER, NODE, bucket.clone());
+        create_topic(&seeder, topic).await?;
+        seed_legacy_batch(&seeder, &bucket, &a, 0, batch(3)?).await?;
+        seed_legacy_batch(&seeder, &bucket, &a, 3, batch(2)?).await?;
     }
     let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
     assert_eq!(5, store.produce(None, &a, batch(4)?).await?);
@@ -2021,33 +1923,6 @@ async fn leaseless_backfill_folds_into_segments() -> Result<(), Error> {
     assert_eq!(
         1000, total,
         "all backfill records are readable from the segment"
-    );
-
-    Ok(())
-}
-
-/// #90 gating: on the pre-SCOS *lease* path the #62 backfill bypass is preserved
-/// (single-broker only — a multi-replica lease deployment hits the #70 fence
-/// storm), so a backfill-class batch on a fresh sub-stream still takes the
-/// legacy per-topic create path — no segment.
-#[tokio::test]
-async fn lease_backfill_keeps_legacy_bypass() -> Result<(), Error> {
-    let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
-    let topic = "org.env.conn.tab_a";
-    create_topic(&store, topic).await?;
-    let tp = Topition::new(topic, 0);
-
-    assert_eq!(0, store.produce(None, &tp, batch(1000)?).await?);
-
-    assert!(
-        segments(&bucket).await.is_empty(),
-        "the lease-path bypass writes no segment"
-    );
-    assert_eq!(
-        1,
-        legacy_records(&bucket, topic).await.len(),
-        "the lease-path bypass writes a legacy records/ object"
     );
 
     Ok(())
@@ -3922,10 +3797,10 @@ async fn delete_records_hybrid_topic() -> Result<(), Error> {
 
     // A legacy life first: [0,3) and [3,5) as `records/` objects.
     {
-        let legacy = DynoStore::new(CLUSTER, NODE, bucket.clone());
-        create_topic(&legacy, topic).await?;
-        assert_eq!(0, legacy.produce(None, &a, batch(3)?).await?);
-        assert_eq!(3, legacy.produce(None, &a, batch(2)?).await?);
+        let seeder = DynoStore::new(CLUSTER, NODE, bucket.clone());
+        create_topic(&seeder, topic).await?;
+        seed_legacy_batch(&seeder, &bucket, &a, 0, batch(3)?).await?;
+        seed_legacy_batch(&seeder, &bucket, &a, 3, batch(2)?).await?;
     }
 
     // Flipped to prefix mode mid-life: a segment carries [5,7).

@@ -6,13 +6,15 @@ URL query string, so you can adapt them to your workload without recompiling.
 
 Omitting every key below reproduces the shipped defaults.
 
-## Produce coalescing (`produce_coalesce`)
+## Produce coalescing
 
-With `produce_coalesce=true`, the broker buffers the batches produced to a
-partition within a *linger window* and flushes them as a single `records/`
-object, instead of one object per batch (#50). This cuts both the `PutObject`
-count on produce and the matching `GetObject` count on fetch. Transactional,
-lake-sink and compacted topics always bypass the buffer.
+The broker buffers produced batches within a *linger window* and flushes them as
+one object instead of one object per batch. This cuts both the `PutObject` count
+on produce and the matching `GetObject` count on fetch.
+
+Coalescing is always **per connector prefix** into a shared segment (see
+[Prefix coalescing](#prefix-coalescing--virtual-topics) below) — that is the only
+layout the broker writes. It is not a mode you turn on.
 
 A buffer flushes on whichever trigger fires first:
 
@@ -79,43 +81,47 @@ and reduces checkpoint PUTs, though the gain is small unless you have many
 active idempotent producers (the object count scales with *distinct producers*,
 not partitions).
 
-## Prefix coalescing — virtual topics (`prefix_coalesce`)
+## Prefix coalescing — virtual topics
 
-With `prefix_coalesce=true`, the broker coalesces per **connector prefix**
-(`org.env.conn` — the first three dotted components of a topic) rather than per
-partition (#56). The batches produced across *every* topic under a prefix within
-a linger window are flushed into one shared, immutable segment object:
+The broker coalesces per **connector prefix** (`org.env.conn` — the first three
+dotted components of a topic) rather than per partition (#56). The batches
+produced across *every* topic under a prefix within a linger window are flushed
+into one shared, immutable segment object:
 
 ```
 clusters/{cluster}/prefixes/{org.env.conn}/segments/{seq:020}.seg
 ```
 
 This is for **high topic fan-out** CDC (thousands of topics, a handful of events
-each per poll), where per-partition coalescing (`produce_coalesce`) still leaves
-one PUT per topic. Prefix coalescing collapses PUTs from ~`(topics × flushes)`
-to ~`(connectors × flushes)`, and serves fetch from the segment footer + a
-ranged GET, retiring the per-fetch `records/` LIST. Off by default; when on it
-takes precedence over `produce_coalesce` for eligible batches. Transactional,
-control and compacted batches always stay on the legacy per-object path, as do
-large **backfill/snapshot** batches (already S3-efficient and parallel, #62).
+each per poll), where coalescing per partition still leaves one PUT per topic.
+Prefix coalescing collapses PUTs from ~`(topics × flushes)` to
+~`(connectors × flushes)`, and serves fetch from the segment footer + a ranged
+GET, retiring the per-fetch `records/` LIST.
+
+Transactional and control batches share segments like everything else (#174),
+and so do large **backfill/snapshot** batches: a bulk batch trips a widened byte
+threshold and flushes as roughly its own segment (#90), keeping the 1-PUT parity
+the old bypass gave. Compacted topics (`cleanup.policy` containing `compact`)
+are the one exception — they keep the legacy `records/` path until
+`compacted_segments` is enabled (#175).
 
 Segments are keyed by a monotonic sequence, not by offset; each carries a
 self-describing footer with every `(topic, partition)` sub-stream's offset
-range, byte range and max timestamp. A single writer per prefix is enforced
-coordinator-free by an S3 conditional-write lease
-(`prefixes/{prefix}/lease.json`), and retention is whole-segment, per-prefix,
-under a uniform retention (the longest `retention.ms` among the prefix's topics).
+range, byte range and max timestamp. Any replica may append to any prefix: the
+create-only segment-sequence CAS is the offset arbiter (#86), so there is no
+lease and no cross-broker produce routing. Retention is whole-segment,
+per-prefix, under a uniform retention (the longest `retention.ms` among the
+prefix's topics).
 
 | Query param | Default | Meaning |
 |---|---|---|
-| `prefix_coalesce` | `false` | Coalesce per connector prefix into shared segments. |
 | `prefix_compact_min_segments` | `256` | Compact a prefix once it holds more than this many live segments (`0` disables). |
 | `prefix_compact_target_bytes` | `16m` | Target size of a merged segment. Kept modest because the merged create currently shares the producer tail create-CAS namespace (#130); a larger target lengthens each merged PUT, loses the create race more often, and re-uploads its whole payload on retry, amplifying S3 write cost. The live segment count is bounded by `prefix_compact_min_segments` (a count trigger), not by this size. |
 | `prefix_compact_keep_hot` | `16` | Newest segments never compacted (leaves the active tail alone). |
 | `maintenance_recency` | `9m` | A prefix maintained (compacted/expired) within this window is skipped by other maintainer replicas. Set to ~0.9× your `maintenance_interval`; `0` disables (every maintainer works every prefix). |
 
-The linger / batch-count / byte thresholds are shared with `produce_coalesce`
-(`coalesce_linger` / `coalesce_batches` / `coalesce_bytes`, above).
+The linger / batch-count / byte thresholds are the `coalesce_linger` /
+`coalesce_batches` / `coalesce_bytes` keys documented above.
 
 ### Scaling maintenance across stateless replicas (`maintenance_recency`)
 
@@ -179,23 +185,18 @@ bounded:
 **GCS:** safe by construction. The segment data objects are create-only
 (immutable) and the read path is footer-only (no per-flush-mutated manifest), so
 nothing on the produce or fetch hot path mutates a hot object — the ~1/s/object
-mutation cap (#13) is never approached. The only mutated control object is the
-per-prefix lease, which renews about once per lease term (≫ 1 s), never per
-flush.
+mutation cap (#13) is never approached.
 
-**Migration / coexistence:** a topic created before the flag keeps its per-topic
-`records/` objects; once opted in, new data goes to segments and the old objects
-stay readable until retention drains them. A fetch spanning the cutover stitches
-the legacy region and the segment region into one continuous offset sequence.
-Default off is byte-for-byte the current behaviour.
+**Coexistence with pre-segment data:** a topic that predates segments keeps its
+per-topic `records/` objects; new data goes to segments and the old objects stay
+readable until retention drains them. A fetch spanning the cutover stitches the
+legacy region and the segment region into one continuous offset sequence.
 
-**Multi-broker.** On the lease path, single-writer-per-prefix is enforced by the
-S3 lease, so `prefix_coalesce` alone is single-broker: on multiple brokers a
-producer landing on a non-owner is fenced persistently (no produce-routing layer
-exists to forward it). The multi-replica answer is the leaseless seq-CAS arbiter
-(`prefix_leaseless`, #86): the create-only segment-sequence CAS assigns offsets
-directly, so any replica may append to any prefix with no lease and no routing.
-See `docs/migration-scos.md` for the quiesce-and-flip cutover.
+**Multi-broker.** Any replica may append to any prefix: the create-only
+segment-sequence CAS assigns offsets directly (#86), so there is no lease, no
+fencing epoch and no cross-broker produce routing. A writer that loses the
+create race folds the winner's footer, re-derives its sub-stream bases and
+retries at the next sequence.
 
 **External S3-direct readers** must understand the segment frame + footer to read
 a coalesced prefix; the format is the published contract (see
@@ -204,20 +205,20 @@ kotatsu#82.
 
 ## Coalescing vs the `batch_*` request batcher
 
-There are two independent write-batching paths; **enable one or the other, not
-both**:
+There are two independent write-batching paths:
 
-- `produce_coalesce` (above) — coalesces **per partition**, inside the
-  object-store layer. This is the supported path for **high topic/partition
-  fan-out** workloads and the one the thresholds above tune.
+- Prefix coalescing (above) — always on, inside the object-store layer. This is
+  the path for **high topic/partition fan-out** workloads and the one the
+  thresholds above tune.
 - `batch_min_size` / `batch_max_delay` — the `ProduceRequestBatcher`, which
   merges **per producer** before the storage layer (see #53 for the
-  same-base-offset ack fix on this path). Better suited to few busy producers.
+  same-base-offset ack fix on this path). Better suited to few busy producers,
+  and stacks on top of prefix coalescing rather than replacing it.
 
 ## Example
 
 ```
-s3://my-bucket/?produce_coalesce=true&coalesce_linger=300ms&coalesce_batches=128&coalesce_bytes=4m&producer_checkpoint_interval=5s
+s3://my-bucket/?coalesce_linger=300ms&coalesce_batches=128&coalesce_bytes=4m&producer_checkpoint_interval=5s
 ```
 
 Coalesces produce with a 300 ms linger (or 128 batches / 4 MiB, whichever comes

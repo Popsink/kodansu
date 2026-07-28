@@ -236,40 +236,7 @@ pub struct DynoStore {
     /// soundness as the per-partition hint. In-memory only.
     oldest_retained_prefix: Arc<Mutex<BTreeMap<String, i64>>>,
 
-    /// When set, the produce path buffers batches per partition and flushes them
-    /// as one coalesced `records/` object per linger window (#50), cutting the
-    /// PUT (and matching fetch GET) count on small-batch workloads. Off by
-    /// default — each batch is its own object, exactly as before. Transactional,
-    /// lake-sink and compacted topics always bypass the buffer.
-    produce_coalesce: bool,
-
-    /// Per-partition coalescing buffer (#50), used only when
-    /// [`Self::produce_coalesce`] is set. Holds batches awaiting a flush plus the
-    /// one-shot ack channels their produce calls are parked on; the map is
-    /// drained (never held across an await) on a threshold or linger-timer flush.
-    coalesce: Arc<Mutex<BTreeMap<Topition, CoalesceBuffer>>>,
-
-    /// When set, eligible batches are coalesced per *connector prefix* rather
-    /// than per `(topic, partition)`: one shared, immutable segment object holds
-    /// interleaved batches from every topition under the prefix produced in one
-    /// flush window (the #56 "virtual topics" write path, #57). This collapses
-    /// PUTs from ~`(topics × flushes)` to ~`(connectors × flushes)`. Off by
-    /// default; takes precedence over [`Self::produce_coalesce`] for eligible
-    /// batches when both are set. The URL flag that drives it is wired by #63.
-    prefix_coalesce: bool,
-
-    /// When set (with `prefix_coalesce`), prefix flushes use the leaseless
-    /// seq-CAS offset arbiter (#86): the create-only segment-sequence CAS assigns
-    /// offsets directly (no `lease.json`, no fencing epoch, no cross-broker
-    /// produce forwarding), so any replica may append to any prefix. On a create
-    /// conflict the writer folds
-    /// the winner's footer, re-derives the sub-stream bases and re-encodes, then
-    /// retries the next sequence. Off by default: production keeps the
-    /// single-writer lease path until the quiesce-and-flip migration (#92) turns
-    /// this on fleet-wide. See `docs/design-multiwriter-segments.md`.
-    prefix_leaseless: bool,
-
-    /// When set (with `prefix_coalesce`), a compacted topic (`cleanup.policy`
+    /// When set, a compacted topic (`cleanup.policy`
     /// containing `compact`) is segment-routed like any other topic, but under
     /// its **own** dedicated prefix — the full topic name — instead of
     /// [`Self::prefix_of`]'s first-three-components connector prefix (#175). A
@@ -344,15 +311,9 @@ pub struct DynoStore {
     /// would serve)? See [`SegmentReadTrace`].
     segment_reads: Arc<Mutex<BTreeMap<(String, u64), SegmentReadTrace>>>,
 
-    /// Per-prefix single-writer leases this process currently holds (#59). The
-    /// durable side is `prefixes/{prefix}/lease.json`; this caches the held
-    /// epoch, its etag (for the next CAS) and its expiry (the no-write fast
-    /// path). Consulted before every prefix flush to fence a stale writer.
-    prefix_leases: Arc<Mutex<BTreeMap<String, HeldLease>>>,
-
     /// Per-prefix compaction leases this process holds (#66) — the maintenance
-    /// side of the single-writer fence, kept separate from `prefix_leases` so
-    /// compaction on a maintenance worker never touches the produce lease.
+    /// side of the single-writer fence. The produce lease is gone with #177;
+    /// this is the only remaining lease.
     compaction_leases: Arc<Mutex<BTreeMap<String, HeldLease>>>,
 
     /// Per-prefix leaseless *era* epoch (#92), the durable side being
@@ -442,23 +403,6 @@ pub struct DynoStore {
     maintenance_seed: u64,
 
     object_store: Arc<DynObjectStore>,
-}
-
-/// A batch parked in the coalescing buffer (#50) with the one-shot the producing
-/// `produce` call awaits its assigned base offset on.
-#[derive(Debug)]
-struct Pending {
-    batch: deflated::Batch,
-    ack: oneshot::Sender<Result<i64>>,
-}
-
-/// Per-partition accumulator for coalesced produce (#50): batches awaiting a
-/// flush plus the running offset span and byte size used for the flush triggers.
-#[derive(Debug, Default)]
-struct CoalesceBuffer {
-    pending: Vec<Pending>,
-    records: i64,
-    bytes: usize,
 }
 
 /// A batch parked in the prefix coalescing buffer (#57), carrying the topition
@@ -721,27 +665,17 @@ static SEGMENT_DATA_GET_REPEATS: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// `compacted/` namespace would remove.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SegmentCreateRole {
-    /// The produce path under a prefix lease (#59). A seq conflict means another
-    /// broker took the sequence — i.e. a lease takeover — so the lease must be
-    /// re-validated before resyncing, or a fenced writer would append the next
-    /// sequence with stale offsets and split-brain the log.
-    LeasedProduce,
-
-    /// Segment compaction (#66). It does not hold the produce lease, so a conflict
-    /// just means a producer claimed that tail seq: resync and retry, no fencing.
+    /// Segment compaction (#66). Since #177 this is the only role that creates
+    /// a segment out of band: the produce path goes through the leaseless
+    /// arbiter (#86), which resyncs on conflict and has no lease to fence.
     Compaction,
 }
 
 impl SegmentCreateRole {
     fn as_str(self) -> &'static str {
         match self {
-            Self::LeasedProduce => "leased_produce",
             Self::Compaction => "compaction",
         }
-    }
-
-    fn fences_on_conflict(self) -> bool {
-        matches!(self, Self::LeasedProduce)
     }
 }
 
@@ -1610,10 +1544,6 @@ impl DynoStore {
             oldest_retained: Arc::new(Mutex::new(BTreeMap::new())),
             retention_empty_skip: Arc::new(Mutex::new(BTreeMap::new())),
             oldest_retained_prefix: Arc::new(Mutex::new(BTreeMap::new())),
-            produce_coalesce: false,
-            coalesce: Arc::new(Mutex::new(BTreeMap::new())),
-            prefix_coalesce: false,
-            prefix_leaseless: false,
             compacted_segments: false,
             compacted_carryover: false,
             prefix_coalesce_buffers: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1621,7 +1551,6 @@ impl DynoStore {
             prefix_flush_locks: Arc::new(Mutex::new(BTreeMap::new())),
             prefix_index: Arc::new(Mutex::new(BTreeMap::new())),
             segment_reads: Arc::new(Mutex::new(BTreeMap::new())),
-            prefix_leases: Arc::new(Mutex::new(BTreeMap::new())),
             compaction_leases: Arc::new(Mutex::new(BTreeMap::new())),
             era_epochs: Arc::new(Mutex::new(BTreeMap::new())),
             legacy_records_present: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1676,33 +1605,26 @@ impl DynoStore {
         }
     }
 
-    /// Enable server-side produce coalescing (#50): buffer batches per partition
-    /// and flush them as one `records/` object per linger window. Off by default.
-    pub fn produce_coalesce(self, produce_coalesce: bool) -> Self {
-        Self {
-            produce_coalesce,
-            ..self
-        }
+    /// No-op since #177: server-side produce coalescing per partition (#50) no
+    /// longer exists — every eligible batch is coalesced per connector prefix
+    /// into a shared segment. Retained so the existing call sites still
+    /// compile; deleted with them in #181.
+    pub fn produce_coalesce(self, _produce_coalesce: bool) -> Self {
+        self
     }
 
-    /// Enable prefix-coalesced "virtual topics" produce (#56/#57): buffer
-    /// eligible batches per connector prefix and flush them as one shared,
-    /// immutable segment object per linger window, collapsing the PUT count from
-    /// ~`(topics × flushes)` to ~`(connectors × flushes)`. Off by default; takes
-    /// precedence over [`Self::produce_coalesce`] for eligible batches. The URL
-    /// flag driving this is wired by #63.
-    pub fn prefix_leaseless(self, prefix_leaseless: bool) -> Self {
-        Self {
-            prefix_leaseless,
-            ..self
-        }
+    /// No-op since #177: the leaseless seq-CAS arbiter (#86) is the only prefix
+    /// flush path. Retained so the existing call sites still compile; deleted
+    /// with them in #181.
+    pub fn prefix_leaseless(self, _prefix_leaseless: bool) -> Self {
+        self
     }
 
-    pub fn prefix_coalesce(self, prefix_coalesce: bool) -> Self {
-        Self {
-            prefix_coalesce,
-            ..self
-        }
+    /// No-op since #177: prefix-coalesced segments (#56/#57) are the only
+    /// layout, so there is nothing left to switch. Retained so the existing
+    /// call sites still compile; deleted with them in #181.
+    pub fn prefix_coalesce(self, _prefix_coalesce: bool) -> Self {
+        self
     }
 
     /// Route compacted topics into segments under a dedicated per-topic prefix
@@ -2415,7 +2337,7 @@ impl DynoStore {
     /// shared segments, so the physical region start can sit below the
     /// logical log start.
     async fn log_start(&self, topition: &Topition) -> Result<i64> {
-        if self.prefix_coalesce && !self.has_legacy_records(topition).await? {
+        if !self.has_legacy_records(topition).await? {
             let start = self.segment_region_start(topition).await?.unwrap_or(0);
             return Ok(start.max(self.truncate_floor(topition).await?));
         }
@@ -2895,68 +2817,36 @@ impl DynoStore {
         // (the ~1500-partition ListOffsets that still timed out after being
         // parallelized) off the per-partition `watermark.json` conditional
         // GET. GCS-safe: no per-flush-mutated manifest is read.
-        if self.prefix_coalesce {
-            if let Some(high) = self.coalesced_high_from_index(topition).await? {
-                return Ok(high);
-            }
-
-            // Index not authoritative for this sub-stream — hybrid (legacy
-            // `records/` objects may sit above the segments), no segment at
-            // all (never produced, fully retention-drained, or a lake-sink
-            // topic whose offset lives only in `watermark.high`), or a cold /
-            // floor-invalidated watermark cache. Pay the `watermark.json` GET
-            // and recover footer-only (#58), caching the watermark under the
-            // certified floor read *before* it so the fast path serves the
-            // next stale-hint resolution.
-            let prefix = self.routed_prefix_of(topition).await?;
-            let floor = self.certified_seq_floor(&prefix).await?;
-            let from_watermark = self.persisted_high(topition).await?;
-            self.cache_coalesced_watermark(topition, from_watermark, floor)?;
-
-            let recovered = self
-                .recover_substream_next_offset(topition, from_watermark)
-                .await?;
-            let high = recovered.max(self.cached_high(topition)?.unwrap_or(0));
-            // Anchor to when the prefix index was actually listed, not `now`:
-            // `recover_substream_next_offset` may have served a TTL-cached index,
-            // so stamping `now` would let cross-pod staleness compound to ~2×TTL
-            // (#91). Fall back to `now` only if the index has no timestamp (it was
-            // just refreshed above, so this is the safe degenerate case).
-            let as_of = self
-                .prefix_index_refreshed_at(&prefix)
-                .unwrap_or_else(SystemTime::now);
-            self.mark_listed(topition, high, as_of)?;
+        if let Some(high) = self.coalesced_high_from_index(topition).await? {
             return Ok(high);
         }
 
-        // Cold/stale hint: read the persisted watermark as the listing floor (and
-        // to fold in lake-sink topics' authoritative high). Only on this slow
-        // path, not on every poll.
+        // Index not authoritative for this sub-stream — hybrid (legacy
+        // `records/` objects may sit above the segments), no segment at
+        // all (never produced, fully retention-drained, or a lake-sink
+        // topic whose offset lives only in `watermark.high`), or a cold /
+        // floor-invalidated watermark cache. Pay the `watermark.json` GET
+        // and recover footer-only (#58), caching the watermark under the
+        // certified floor read *before* it so the fast path serves the
+        // next stale-hint resolution.
+        let prefix = self.routed_prefix_of(topition).await?;
+        let floor = self.certified_seq_floor(&prefix).await?;
         let from_watermark = self.persisted_high(topition).await?;
+        self.cache_coalesced_watermark(topition, from_watermark, floor)?;
 
-        let cached = self.cached_high(topition)?;
-        let was_cold = cached.is_none();
-        let floor = cached.unwrap_or(0).max(from_watermark);
-
-        let listed_at = SystemTime::now();
-        let from_objects = self.tail_next_offset(topition, Some(floor)).await?;
-        self.mark_listed(topition, from_objects, listed_at)?;
-
-        let high = from_objects.max(from_watermark);
-
-        // Cold read: refresh the persisted floor so the next cold reader scans
-        // only forward from here. Skipped for lake-sink topics (no batch objects
-        // → `high == from_watermark`) so we never clobber their authoritative
-        // watermark.
-        if was_cold && high > from_watermark {
-            self.watermark(topition)?
-                .with_mut(&self.object_store, |watermark| {
-                    watermark.high = Some(watermark.high.unwrap_or(0).max(high));
-                    Ok(())
-                })
-                .await?;
-        }
-
+        let recovered = self
+            .recover_substream_next_offset(topition, from_watermark)
+            .await?;
+        let high = recovered.max(self.cached_high(topition)?.unwrap_or(0));
+        // Anchor to when the prefix index was actually listed, not `now`:
+        // `recover_substream_next_offset` may have served a TTL-cached index,
+        // so stamping `now` would let cross-pod staleness compound to ~2×TTL
+        // (#91). Fall back to `now` only if the index has no timestamp (it was
+        // just refreshed above, so this is the safe degenerate case).
+        let as_of = self
+            .prefix_index_refreshed_at(&prefix)
+            .unwrap_or_else(SystemTime::now);
+        self.mark_listed(topition, high, as_of)?;
         Ok(high)
     }
 
@@ -2993,16 +2883,11 @@ impl DynoStore {
         // create-only namespaces cannot detect across each other (#78). Take the
         // lock so the two offset authorities serialize. No re-entrancy: the flush
         // path holds this lock and calls `assign_and_create_segment`, never this
-        // function. `None` on the non-coalesce path leaves behaviour unchanged.
-        let _flush_guard = if self.prefix_coalesce {
-            Some(
-                self.prefix_flush_lock(&self.routed_prefix_of(topition).await?)?
-                    .lock_owned()
-                    .await,
-            )
-        } else {
-            None
-        };
+        // function.
+        let _flush_guard = self
+            .prefix_flush_lock(&self.routed_prefix_of(topition).await?)?
+            .lock_owned()
+            .await;
 
         let mut candidate = match self.cached_high(topition)? {
             Some(hint) => hint,
@@ -3056,126 +2941,6 @@ impl DynoStore {
         Err(Error::Api(ErrorCode::KafkaStorageError))
     }
 
-    /// Buffer `deflated` for a coalesced flush and await its assigned base offset
-    /// (#50). The idempotent sequence and schema were already validated by
-    /// `produce`, so only eligible (non-txn, non-control, non-compacted) batches
-    /// reach here. The produce call parks on the returned one-shot until the
-    /// batch's run is durably written, so an unflushed batch is never acked
-    /// (crash-safe: the client retries).
-    async fn enqueue_coalesced(
-        &self,
-        topition: &Topition,
-        deflated: deflated::Batch,
-    ) -> Result<i64> {
-        let (ack, offset) = oneshot::channel();
-        let span = deflated.last_offset_delta as i64 + 1;
-        let size = size_of::<i64>() + size_of::<i32>() + deflated.batch_length.max(0) as usize;
-
-        enum Action {
-            Flush(CoalesceBuffer),
-            StartTimer,
-            Wait,
-        }
-
-        let action = {
-            let mut buffers = self.coalesce.lock().map_err(Into::<Error>::into)?;
-            let buffer = buffers.entry(topition.to_owned()).or_default();
-
-            let first = buffer.pending.is_empty();
-            buffer.pending.push(Pending {
-                batch: deflated,
-                ack,
-            });
-            buffer.records += span;
-            buffer.bytes += size;
-
-            if buffer.pending.len() >= self.coalesce_batches
-                || buffer.bytes >= self.coalesce_bytes
-                || buffer.records >= Self::COALESCE_MAX_RECORDS
-            {
-                Action::Flush(std::mem::take(buffer))
-            } else if first {
-                Action::StartTimer
-            } else {
-                Action::Wait
-            }
-        };
-
-        match action {
-            Action::Flush(buffer) => self.flush_coalesced(topition, buffer).await,
-
-            Action::StartTimer => {
-                let store = self.clone();
-                let topition = topition.to_owned();
-                let linger = self.jittered_linger();
-
-                _ = tokio::spawn(async move {
-                    tokio::time::sleep(linger).await;
-
-                    let buffer = store
-                        .coalesce
-                        .lock()
-                        .ok()
-                        .and_then(|mut buffers| buffers.remove(&topition));
-
-                    if let Some(buffer) = buffer.filter(|buffer| !buffer.pending.is_empty()) {
-                        store.flush_coalesced(&topition, buffer).await;
-                    }
-                });
-            }
-
-            Action::Wait => {}
-        }
-
-        offset
-            .await
-            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
-    }
-
-    /// Flush a drained coalescing buffer as one `records/` object and resolve
-    /// each parked produce with its assigned base offset (#50). One
-    /// `assign_and_create` covers the whole run, so offset assignment stays the
-    /// create-only, single-writer authority it is for a lone batch; on failure
-    /// every parked producer gets the error and retries.
-    async fn flush_coalesced(&self, topition: &Topition, buffer: CoalesceBuffer) {
-        if buffer.pending.is_empty() {
-            return;
-        }
-
-        let batches: Vec<deflated::Batch> = buffer
-            .pending
-            .iter()
-            .map(|pending| pending.batch.clone())
-            .collect();
-        let total: i64 = batches
-            .iter()
-            .map(|batch| batch.last_offset_delta as i64 + 1)
-            .sum();
-
-        let base = match async {
-            let payload = self.encode_frame(&batches)?;
-            self.assign_and_create(topition, total, payload).await
-        }
-        .await
-        {
-            Ok(base) => base,
-            Err(error) => {
-                error!(?error, ?topition, "coalesced flush failed");
-                for pending in buffer.pending {
-                    _ = pending.ack.send(Err(error.clone()));
-                }
-                return;
-            }
-        };
-
-        let mut running = base;
-        for pending in buffer.pending {
-            let offset = running;
-            running += pending.batch.last_offset_delta as i64 + 1;
-            _ = pending.ack.send(Ok(offset));
-        }
-    }
-
     /// The connector prefix a topition's records coalesce under (#57). Popsink
     /// topics are `org.env.conn.<schema>.<table>`; the prefix is the connector
     /// unit `org.env.conn` (the first three dotted components) — the
@@ -3204,12 +2969,11 @@ impl DynoStore {
     }
 
     /// Whether compacted topics are segment-routed to dedicated prefixes
-    /// (#175): both flags, because without `prefix_coalesce` there is no
-    /// segment routing to override — a compacted topic would otherwise start
-    /// coalescing into per-partition `records/` objects (#50), which the legacy
-    /// compactor cannot rewrite.
+    /// (#175). Segment routing itself is unconditional since #177, so this is
+    /// now just the compacted-topic flag: a compacted topic still keeps the
+    /// legacy `records/` path until the flag is flipped on a uniform fleet.
     fn compacted_topics_in_segments(&self) -> bool {
-        self.prefix_coalesce && self.compacted_segments
+        self.compacted_segments
     }
 
     /// Whether maintenance may drain a segment-routed compacted topic's legacy
@@ -3804,19 +3568,11 @@ impl DynoStore {
                 }
 
                 Err(object_store::Error::AlreadyExists { .. }) => {
-                    // A seq conflict means another writer wrote this sequence.
-                    // With per-prefix flush serialization (#1) that can only be a
-                    // *different* broker — i.e. a lease takeover. Re-validate the
-                    // lease before resyncing (#59 review fix): if we've been
-                    // fenced, abort now instead of appending the next sequence
-                    // with stale offsets (which would split-brain the log). A
-                    // still-valid holder resyncs and retries. Compaction
-                    // (fence_on_conflict=false) is not the produce writer, so a
-                    // conflict is just the producer taking that seq — resync only.
-                    if role.fences_on_conflict() {
-                        _ = self.acquire_or_renew_lease(prefix).await?;
-                    }
-
+                    // A seq conflict just means another writer took that
+                    // sequence: resync and retry. There is no lease to
+                    // re-validate since #177 — the leaseless arbiter (#86) makes
+                    // the create-only CAS itself the arbiter, so a loser is
+                    // never a fenced writer, only a slower one.
                     // Every loss costs a re-LIST and a re-upload of the whole
                     // payload into the same key prefix (#130).
                     conflicts += 1;
@@ -4728,10 +4484,9 @@ impl DynoStore {
         // to do, for every idle stream and after every restart — was the dominant
         // tier-1 request source in production.
         //
-        // A positive result, or a topition outside prefix coalescing, keeps the
-        // short TTL: there a drain (`true`->`false`) or a first legacy write is
-        // expected, and must be seen within seconds.
-        let ttl = if present || !self.prefix_coalesce {
+        // A positive result keeps the short TTL: there a drain
+        // (`true`->`false`) is expected, and must be seen within seconds.
+        let ttl = if present {
             Self::HIGH_WATERMARK_HINT_TTL
         } else if self.segment_region_start(topition).await?.is_some() {
             Self::LEGACY_ABSENCE_TTL
@@ -4836,15 +4591,14 @@ impl DynoStore {
             self.cluster, topition.topic, topition.partition
         ));
 
-        // Under #50 coalescing `offset` may fall inside a multi-batch object;
-        // start from the object that contains it so the seek does not skip it.
-        let start_offset = if self.produce_coalesce {
-            self.coalesce_fetch_floor(topition, offset)
-                .await?
-                .unwrap_or(offset)
-        } else {
-            offset
-        };
+        // Historic #50 multi-batch objects are still in production buckets, so
+        // `offset` may fall inside one; start from the object that contains it
+        // so the seek does not skip it. Probed unconditionally since #177: the
+        // writer is gone, the objects are not.
+        let start_offset = self
+            .coalesce_fetch_floor(topition, offset)
+            .await?
+            .unwrap_or(offset);
 
         let start_after = Path::from(format!(
             "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}",
@@ -5023,19 +4777,15 @@ impl DynoStore {
             // `coalesced_latest_timestamp` returns `None` for a non-coalesced
             // or hybrid topic (a legacy object may sit above the segments), and
             // we then take the legacy tail's mtime as before.
-            let timestamp = match if self.prefix_coalesce {
-                self.coalesced_latest_timestamp(topition).await?
-            } else {
-                None
-            } {
+            let timestamp = match self.coalesced_latest_timestamp(topition).await? {
                 Some(timestamp) => Some(timestamp),
                 // Only the legacy `records/` tail can carry a timestamp when
                 // the segment index has none. For a pure-segment coalesced
                 // topic there are no legacy objects, so that LIST would scan
                 // an empty prefix and return nothing (#113) — skip it (the
-                // memo is cheap, #110) and report no timestamp. A hybrid /
-                // non-coalesced topic still lists for the legacy tail mtime.
-                None if self.prefix_coalesce && !self.has_legacy_records(topition).await? => None,
+                // memo is cheap, #110) and report no timestamp. A hybrid topic
+                // still lists for the legacy tail mtime.
+                None if !self.has_legacy_records(topition).await? => None,
                 None => self
                     .list_batch_offsets(topition)
                     .await?
@@ -5054,7 +4804,7 @@ impl DynoStore {
         // offset for this sub-stream, read from the footer index — no
         // `records/` listing (there is none). LATEST already went through
         // `high_watermark` above (footer-aware).
-        if self.prefix_coalesce && *offset_request == ListOffset::Earliest {
+        if *offset_request == ListOffset::Earliest {
             let earliest = self.coalesced_earliest_offset(topition).await?;
 
             return Ok(Some(ListOffsetResponse {
@@ -5073,8 +4823,7 @@ impl DynoStore {
         // after the target, matching Kafka's "no offset" semantics. A hybrid
         // topic (legacy objects above the segment tail) falls through to the
         // records/ path so those batches are still considered.
-        if self.prefix_coalesce
-            && let ListOffset::Timestamp(target) = offset_request
+        if let ListOffset::Timestamp(target) = offset_request
             && !self.has_legacy_records(topition).await?
         {
             let prefix = self.routed_prefix_of(topition).await?;
@@ -5264,27 +5013,6 @@ impl DynoStore {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map(|elapsed| elapsed.as_millis() as i64)
             .unwrap_or(0)
-    }
-
-    /// Acquire or renew this writer's single-writer lease on `prefix` and return
-    /// the held epoch (#59). The etag CAS is the fence: if another writer holds a
-    /// live lease, or wins the acquire race, this call returns
-    /// `NotLeaderOrFollower` (retriable) — so at most one writer appends per
-    /// prefix, with no external coordinator.
-    ///
-    /// Note: this broker is single-node (node 111), so the fenced writer *is*
-    /// this process and the retry lands back here after the stale lease lapses.
-    /// The lease path is therefore intended for single-broker deployments; the
-    /// multi-replica answer is the leaseless seq-CAS arbiter (`prefix_leaseless`,
-    /// #86), which needs no produce routing at all.
-    ///
-    /// A held term is reused with no write while more than a third of it
-    /// remains, so the lease object is mutated ~once per `2/3 · ttl`, never per
-    /// flush — keeping it under GCS's ~1/s/object mutation cap (#13).
-    async fn acquire_or_renew_lease(&self, prefix: &str) -> Result<i64> {
-        let location = self.lease_location(prefix);
-        self.acquire_or_renew_lease_at(prefix, &location, &self.prefix_leases)
-            .await
     }
 
     /// Acquire or renew the compaction lease for `prefix` (#66) — same fence as
@@ -5550,156 +5278,9 @@ impl DynoStore {
             return;
         }
 
-        // Leaseless seq-CAS arbiter (#86): no lease, any replica may append.
-        if self.prefix_leaseless {
-            return self.flush_prefix_coalesced_leaseless(prefix, buffer).await;
-        }
-
-        // Serialize flushes for this prefix so offset assignment (read
-        // `cached_high`) → segment PUT → `set_high` is atomic (#1 fix): two
-        // overlapping windows must not both read the same base offset. Held
-        // across the whole flush; per-prefix, so distinct prefixes still flush
-        // concurrently.
-        let flush_lock = match self.prefix_flush_lock(prefix) {
-            Ok(lock) => lock,
-            Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
-        };
-        let _flush_guard = flush_lock.lock().await;
-
-        // Fence first (#59): acquire/renew the single-writer lease before writing.
-        // A fenced writer fails here and never appends a segment; the parked
-        // producers get NotLeaderOrFollower and retry (routed to the live
-        // writer). On a fresh acquire this precedes offset recovery below, so a
-        // new writer recovers the tail before it writes (the handoff order).
-        let epoch = match self.acquire_or_renew_lease(prefix).await {
-            Ok(epoch) => epoch,
-            Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
-        };
-
-        // Group pending batches by topition (arrival order preserved within a
-        // topition). BTreeMap gives a deterministic per-segment sub-stream order.
-        let mut grouped: BTreeMap<Topition, Vec<usize>> = BTreeMap::new();
-        for (index, pending) in buffer.pending.iter().enumerate() {
-            grouped
-                .entry(pending.topition.clone())
-                .or_default()
-                .push(index);
-        }
-
-        // Resolve each sub-stream's base offset and the absolute offset of every
-        // batch within it. `assigned[index]` is the offset the pending at that
-        // index will be acked with; `advances` is the post-flush high per
-        // topition.
-        let mut substreams: Vec<(Topition, i64, Vec<deflated::Batch>)> =
-            Vec::with_capacity(grouped.len());
-        let mut assigned = vec![0i64; buffer.pending.len()];
-        let mut advances: Vec<(Topition, i64)> = Vec::with_capacity(grouped.len());
-
-        for (topition, indices) in &grouped {
-            let base = match self.cached_high(topition) {
-                Ok(Some(hint)) => hint,
-                // Cold counter (fresh process / #59 failover): recover the next
-                // offset as max(segment footer tail, legacy records/ tail,
-                // persisted floor) so a seam/backfill/drained sub-stream never
-                // reuses or regresses an offset (#58/#61 review fixes).
-                Ok(None) => {
-                    // Cold writer path: fetch the persisted floor once and hand it
-                    // to recovery (which no longer fetches it itself, #72).
-                    let persisted = self.persisted_high(topition).await.unwrap_or(0);
-                    match self
-                        .recover_substream_next_offset(topition, persisted)
-                        .await
-                    {
-                        Ok(high) => {
-                            _ = self
-                                .set_high(topition, high)
-                                .inspect_err(|err| debug!(?err));
-                            high
-                        }
-                        Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
-                    }
-                }
-                Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
-            };
-
-            let mut running = base;
-            let mut batches = Vec::with_capacity(indices.len());
-            for &index in indices {
-                assigned[index] = running;
-                let batch = &buffer.pending[index].batch;
-                running += batch.last_offset_delta as i64 + 1;
-                batches.push(batch.clone());
-            }
-
-            substreams.push((topition.clone(), base, batches));
-            advances.push((topition.clone(), running));
-        }
-
-        let (seq, footer) = match async {
-            let (payload, footer) = self.encode_segment(&substreams, epoch)?;
-            let seq = self
-                .assign_and_create_segment(prefix, payload, SegmentCreateRole::LeasedProduce)
-                .await?;
-            Ok::<_, Error>((seq, footer))
-        }
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
-        };
-
-        self.finalize_prefix_flush(
-            prefix,
-            seq,
-            &substreams,
-            footer,
-            buffer,
-            &assigned,
-            &advances,
-        )
-        .await;
-    }
-
-    /// Post-write finalization shared by the lease and leaseless (#86) flush
-    /// paths: cache the footer in the in-memory index, advance each sub-stream's
-    /// hint, mirror the lake sink per batch, and ack every parked producer with
-    /// its assigned offset. Called only after the segment PUT is durable.
-    #[allow(clippy::too_many_arguments)]
-    async fn finalize_prefix_flush(
-        &self,
-        prefix: &str,
-        seq: u64,
-        substreams: &[(Topition, i64, Vec<deflated::Batch>)],
-        footer: SegmentFooter,
-        buffer: PrefixCoalesceBuffer,
-        assigned: &[i64],
-        advances: &[(Topition, i64)],
-    ) {
-        // Populate the in-memory footer index so reads on this node need no
-        // listing/GET to see the segment we just wrote (read-path #60 fix).
-        _ = self
-            .index_insert(prefix, seq, footer, Self::now_ms())
-            .inspect_err(|err| debug!(?err));
-        SEGMENT_FLUSHES.add(1, &[]);
-
-        debug!(
-            prefix,
-            seq,
-            substreams = substreams.len(),
-            "prefix segment flushed"
-        );
-
-        // The write succeeded and is durable — advance each sub-stream's hint.
-        for (topition, high) in advances {
-            _ = self
-                .set_high(topition, *high)
-                .inspect_err(|err| debug!(?err));
-        }
-
-        for (index, pending) in buffer.pending.into_iter().enumerate() {
-            let offset = assigned[index];
-            _ = pending.ack.send(Ok(offset));
-        }
+        // The leaseless seq-CAS arbiter (#86) is the only flush since #177: no
+        // lease, no fencing epoch, any replica may append to any prefix.
+        self.flush_prefix_coalesced_leaseless(prefix, buffer).await
     }
 
     /// Send `error` to every parked producer in a failed prefix flush (#57) so
@@ -6319,15 +5900,29 @@ impl DynoStore {
             .filter_map(|metadata| {
                 let configs = metadata.topic.configs.as_deref().unwrap_or_default();
 
-                let delete = configs.iter().any(|config| {
-                    config.name == "cleanup.policy"
-                        && config
-                            .value
-                            .as_deref()
-                            .is_some_and(|value| value.contains("delete"))
-                });
+                // An ABSENT `cleanup.policy` means Kafka's default, `delete`
+                // — so it expires. This path used to read absent as
+                // retain-forever, which made it the only place in the engine
+                // that did: `segment_retention_thresholds` has always applied
+                // the 7-day default to a policy-less topic, so on a
+                // segment-backed deployment (all of production) the data was
+                // expiring while this path claimed it would not. #177 makes
+                // segments the only layout, so the segment reading is the one
+                // that survives; aligning here removes the divergence rather
+                // than preserving a promise the engine was not keeping.
+                //
+                // A policy that is present and compact-only still yields no
+                // time expiry — the latest value of a key must survive.
+                let expires = match configs
+                    .iter()
+                    .find(|config| config.name == "cleanup.policy")
+                    .and_then(|config| config.value.as_deref())
+                {
+                    Some(policy) => policy.contains("delete"),
+                    None => true,
+                };
 
-                if !delete {
+                if !expires {
                     return None;
                 }
 
@@ -6866,15 +6461,10 @@ impl DynoStore {
             // whose batches were compacted — a retry of a compacted batch is
             // recognized as a duplicate and acked with its original offset
             // instead of being re-appended. A fresh per-segment nonce (#89) is
-            // stamped as on any create. Emitted only under the leaseless
-            // arbiter, which is where the coordinates and log-based dedup
-            // live; the lease path keeps the v1 encoder (its segments carry
-            // no coordinates to preserve).
-            let (payload, footer) = if self.prefix_leaseless {
+            // stamped as on any create.
+            let (payload, footer) = {
                 let nonce = rng().random::<u64>();
                 self.encode_segment_v3(&substreams, merged_epoch.max(0), nonce)?
-            } else {
-                self.encode_segment(&substreams, merged_epoch.max(0))?
             };
             let seq = self
                 .assign_and_create_segment(prefix, payload, SegmentCreateRole::Compaction)
@@ -7126,11 +6716,9 @@ impl DynoStore {
             };
             let (epoch, last_modified) = segments_meta.get(seq).copied().unwrap_or((0, i64::MIN));
 
-            let (payload, footer) = if self.prefix_leaseless {
+            let (payload, footer) = {
                 let nonce = rng().random::<u64>();
                 self.encode_segment_v3(substreams, epoch.max(0), nonce)?
-            } else {
-                self.encode_segment(substreams, epoch.max(0))?
             };
             let new_seq = self
                 .assign_and_create_segment(prefix, payload, SegmentCreateRole::Compaction)
@@ -7274,11 +6862,9 @@ impl DynoStore {
         // invisible — the coverage gate below would (correctly) refuse to delete,
         // and the carry could never complete. Read it the same way the leaseless
         // flush does.
-        let (payload, footer) = if self.prefix_leaseless {
+        let (payload, footer) = {
             let era = self.seed_era_epoch(&prefix).await?;
             self.encode_segment_v3(&substreams, era.max(0), rng().random::<u64>())?
-        } else {
-            self.encode_segment(&substreams, 0)?
         };
 
         let seq = self
@@ -7444,7 +7030,7 @@ impl DynoStore {
     /// off. Paired with [`Self::drain_compact_prefix`] by
     /// [`Self::maintain_prefix_segments`].
     async fn compactable_prefixes(&self, owned: Option<&BTreeSet<String>>) -> Result<Vec<String>> {
-        if !self.prefix_coalesce || self.prefix_compact_min_segments == 0 {
+        if self.prefix_compact_min_segments == 0 {
             return Ok(Vec::new());
         }
 
@@ -7686,10 +7272,6 @@ impl DynoStore {
         /// drain throughput ~K× without more pods.
         const PREFIX_MAINTENANCE_CONCURRENCY: usize = 4;
 
-        if !self.prefix_coalesce {
-            return Ok((0, 0));
-        }
-
         let thresholds = self.segment_retention_thresholds(now_ms, owned).await?;
         let compactable: BTreeSet<String> = self
             .compactable_prefixes(owned)
@@ -7822,6 +7404,11 @@ impl DynoStore {
             // timestamp deleting old latest-values is exactly Kafka's
             // `compact,delete` semantics. Unrouted compacted topics have no
             // segments — skip, exactly as before.
+            //
+            // An ABSENT `cleanup.policy` falls through to a threshold, which is
+            // Kafka's default (`delete`, 7 days) and is the contract the whole
+            // engine now follows — see `policy_delete_records`, which was the
+            // odd one out until #177 and treated absent as retain-forever.
             if compact && !(self.compacted_topics_in_segments() && policy.contains("delete")) {
                 continue;
             }
@@ -8107,9 +7694,8 @@ impl DynoStore {
         // after `RETENTION_EMPTY_SKIP_TTL` so a legacy object written afterwards —
         // possibly by another process, since the broker and the dedicated
         // `maintain` worker do not share this map — is still expired within one
-        // TTL. The non-coalesce path is unchanged: ordinary writes go to
-        // `records/` there, so an empty partition must keep being re-scanned.
-        if self.prefix_coalesce && surviving_oldest_ms.is_none() {
+        // TTL.
+        if surviving_oldest_ms.is_none() {
             self.record_retention_empty_skip(topition)?;
         }
 
@@ -8180,10 +7766,8 @@ impl DynoStore {
         // truncated (#176) would not be re-examined until age retention fired
         // anyway. Best-effort like the reclaim itself — a peer maintainer
         // keeps its own hint and converges via its normal age-based rescan.
-        if self.prefix_coalesce {
-            let prefix = self.routed_prefix_of(topition).await?;
-            self.record_prefix_oldest_retained(&prefix, None)?;
-        }
+        let prefix = self.routed_prefix_of(topition).await?;
+        self.record_prefix_oldest_retained(&prefix, None)?;
 
         Ok(floor)
     }
@@ -8366,6 +7950,7 @@ impl DynoStore {
     /// order; a single-batch slice is byte-identical to [`Self::encode`], so a
     /// coalesced object and a legacy object are read back the same way by
     /// [`Self::decode_frame`].
+    #[cfg(test)]
     fn encode_frame(&self, batches: &[deflated::Batch]) -> Result<PutPayload> {
         let mut buf = Vec::new();
         for batch in batches {
@@ -8388,6 +7973,7 @@ impl DynoStore {
     /// the footer so a fenced writer's segment is identifiable. Empty
     /// sub-streams are skipped. Returns the payload and the footer, which the
     /// writer keeps as the segment's in-memory index.
+    #[cfg(test)]
     fn encode_segment(
         &self,
         substreams: &[(Topition, i64, Vec<deflated::Batch>)],
@@ -9137,49 +8723,24 @@ impl Storage for DynoStore {
             // the topic metadata object per batch; with the flag on the `||`
             // short-circuits it away entirely here, and `routed_prefix_of`
             // consults the same memo at enqueue instead.
-            let txn_free =
-                transaction_id.is_none() && !attributes.transaction && !attributes.control;
             let coalesce_eligible = self.compacted_topics_in_segments()
                 || !self.topic_is_compacted(topition.topic()).await?;
 
             // Will this batch be buffered into a prefix-coalesced segment (#57)?
             //
-            // Under the leaseless arbiter (#86) the answer is always yes (#90):
-            // the segment CAS is the *single* offset authority, so backfill must
-            // go through it too — a legacy `records/` object would be a second
-            // authority the two create-only name spaces can't reconcile (#78) and
-            // would reintroduce the per-topic LIST/GET the epic removes (#75). A
-            // large backfill batch trips the raised byte threshold (see
-            // `flush_thresholds`) and flushes as ~its own segment, keeping the
-            // 1-PUT parity the bypass gave. The flush is strictly one segment at a
-            // time under the per-prefix lock, so folding backfill in never
-            // pipelines sequences (a failed N after N+1 landed would mint a gap).
-            //
-            // On the lease path (pre-SCOS), keep the #62 backfill high-throughput
-            // bypass: it is single-broker only (a multi-replica lease deployment
-            // hits the #70 fence storm), so it can't safely carry the bulk
-            // load, and legacy offsets stay strictly below segment offsets only
-            // while the sub-stream has no segment yet (the #58 seam the hybrid
-            // read path depends on) — so a large batch bypasses only then, and one
-            // arriving after segmentation still coalesces.
-            let prefix_buffer_route = if !(coalesce_eligible && self.prefix_coalesce) {
-                false
-            } else if self.prefix_leaseless {
-                // Transactional and control batches included (#174 release B):
-                // the segment CAS is the single offset authority, so they must
-                // go through it like everything else.
-                true
-            } else if !txn_free {
-                // Lease mode keeps the transactional/control bypass — it is
-                // dying with the make-segments-mandatory work and gets no
-                // footer/transaction story.
-                false
-            } else {
-                let records = deflated.last_offset_delta as i64 + 1;
-                let bypass_backfill = records >= Self::PREFIX_BACKFILL_MIN_RECORDS
-                    && self.segment_region_start(topition).await?.is_none();
-                !bypass_backfill
-            };
+            // Since #177 the answer is "whenever it is eligible": the segment
+            // CAS is the *single* offset authority, so everything must go
+            // through it — a legacy `records/` object would be a second
+            // authority the two create-only name spaces can't reconcile (#78)
+            // and would reintroduce the per-topic LIST/GET the epic removes
+            // (#75). That includes transactional and control batches (#174
+            // release B) and bulk backfill (#90): a large backfill batch trips
+            // the raised byte threshold (see `flush_thresholds`) and flushes as
+            // ~its own segment, keeping the 1-PUT parity the old #62 bypass
+            // gave. The flush is strictly one segment at a time under the
+            // per-prefix lock, so folding backfill in never pipelines sequences
+            // (a failed N after N+1 landed would mint a gap).
+            let prefix_buffer_route = coalesce_eligible;
 
             if deflated.is_idempotent() {
                 // Under the leaseless arbiter (#86) the segment flush owns
@@ -9199,8 +8760,7 @@ impl Storage for DynoStore {
                 // `meta` object, so distinct producers no longer contend on one
                 // hot object on GCS (#13); the advance is applied in memory and
                 // checkpointed lazily so an idempotent batch costs ~1 PUT (#48).
-                let leaseless_segment_route = self.prefix_leaseless && prefix_buffer_route;
-                if !leaseless_segment_route {
+                if !prefix_buffer_route {
                     self.advance_idempotent_sequence(
                         deflated.producer_id,
                         deflated.producer_epoch,
@@ -9223,13 +8783,6 @@ impl Storage for DynoStore {
                         }
                     })?;
                 }
-            }
-
-            // The per-partition coalescer (#50) keeps the transactional/control
-            // bypass: it has no footer to index them. Non-transactional by
-            // construction, so returning before the registration below is fine.
-            if coalesce_eligible && txn_free && !self.prefix_coalesce && self.produce_coalesce {
-                return self.enqueue_coalesced(topition, deflated).await;
             }
 
             // Captured before `deflated` is moved into the prefix buffer; the
@@ -9344,75 +8897,29 @@ impl Storage for DynoStore {
         let mut batches = vec![];
 
         if offset < high_watermark {
-            if self.prefix_coalesce {
-                // Prefix-coalesced (#60): records live in shared segments, located
-                // by footer index and read with a ranged GET of exactly the
-                // topition's byte span — no cross-topic download. A *hybrid* topic
-                // (flipped to segment mode mid-life) also has legacy `records/`
-                // objects for `[0, C)`; serve those first, then segments from `C`.
-                // Legacy offsets are all below segment offsets (the #58 seam), so
-                // legacy-then-segment preserves order and a single fetch with
-                // budget to spare stitches across the seam.
-                //
-                // Nothing below the truncation floor is served (#176):
-                // truncated records survive physically in shared segments, so
-                // the floor is enforced by clamping the requested offset —
-                // skip, not error, and batch-granular by construction via the
-                // whole-batch skip in `fetch_prefix_coalesced`. Served from
-                // in-process caches on a warm poll (`truncate_floor` memoizes
-                // absence, so floor-less partitions add no request, #161).
-                // The non-coalesced branch below is untouched: there
-                // DeleteRecords deletes the per-partition objects physically.
-                let offset = offset.max(self.truncate_floor(topition).await?);
-                let mut from = offset;
-                let hybrid = self.has_legacy_records(topition).await?;
+            // Prefix-coalesced (#60): records live in shared segments, located
+            // by footer index and read with a ranged GET of exactly the
+            // topition's byte span — no cross-topic download. A *hybrid* topic
+            // (flipped to segment mode mid-life) also has legacy `records/`
+            // objects for `[0, C)`; serve those first, then segments from `C`.
+            // Legacy offsets are all below segment offsets (the #58 seam), so
+            // legacy-then-segment preserves order and a single fetch with
+            // budget to spare stitches across the seam.
+            //
+            // Nothing below the truncation floor is served (#176):
+            // truncated records survive physically in shared segments, so
+            // the floor is enforced by clamping the requested offset —
+            // skip, not error, and batch-granular by construction via the
+            // whole-batch skip in `fetch_prefix_coalesced`. Served from
+            // in-process caches on a warm poll (`truncate_floor` memoizes
+            // absence, so floor-less partitions add no request, #161).
+            // The non-coalesced branch below is untouched: there
+            // DeleteRecords deletes the per-partition objects physically.
+            let offset = offset.max(self.truncate_floor(topition).await?);
+            let mut from = offset;
+            let hybrid = self.has_legacy_records(topition).await?;
 
-                if hybrid {
-                    batches = self
-                        .fetch_legacy_records(
-                            topition,
-                            offset,
-                            max_bytes,
-                            high_watermark,
-                            started_at,
-                            max_wait,
-                        )
-                        .await?;
-                    from = batches
-                        .last()
-                        .map(|batch| batch.base_offset + batch.last_offset_delta as i64 + 1)
-                        .unwrap_or(offset);
-                }
-
-                // Enter the segment region only once the legacy region is
-                // consumed up to the seam C (the lowest segment base). If the
-                // legacy read was byte-budget-limited and stopped below C, do NOT
-                // jump into segments — that would skip the un-served legacy range
-                // [from, C) (#60 review fix). The consumer re-fetches from `from`
-                // and continues. Non-hybrid topics have no such gap.
-                let seam = self.segment_region_start(topition).await?;
-                let blocked_by_legacy = hybrid && seam.is_some_and(|c| from < c);
-
-                let consumed: u64 = batches
-                    .iter()
-                    .map(|batch| batch.batch_length.max(0) as u64)
-                    .sum();
-                let remaining = (max_bytes as u64).saturating_sub(consumed);
-
-                if !blocked_by_legacy && from < high_watermark && remaining > 0 {
-                    let segment = self
-                        .fetch_prefix_coalesced(
-                            topition,
-                            from,
-                            remaining.min(u32::MAX as u64) as u32,
-                            high_watermark,
-                            started_at,
-                            max_wait,
-                        )
-                        .await?;
-                    batches.extend(segment);
-                }
-            } else {
+            if hybrid {
                 batches = self
                     .fetch_legacy_records(
                         topition,
@@ -9423,6 +8930,39 @@ impl Storage for DynoStore {
                         max_wait,
                     )
                     .await?;
+                from = batches
+                    .last()
+                    .map(|batch| batch.base_offset + batch.last_offset_delta as i64 + 1)
+                    .unwrap_or(offset);
+            }
+
+            // Enter the segment region only once the legacy region is
+            // consumed up to the seam C (the lowest segment base). If the
+            // legacy read was byte-budget-limited and stopped below C, do NOT
+            // jump into segments — that would skip the un-served legacy range
+            // [from, C) (#60 review fix). The consumer re-fetches from `from`
+            // and continues. Non-hybrid topics have no such gap.
+            let seam = self.segment_region_start(topition).await?;
+            let blocked_by_legacy = hybrid && seam.is_some_and(|c| from < c);
+
+            let consumed: u64 = batches
+                .iter()
+                .map(|batch| batch.batch_length.max(0) as u64)
+                .sum();
+            let remaining = (max_bytes as u64).saturating_sub(consumed);
+
+            if !blocked_by_legacy && from < high_watermark && remaining > 0 {
+                let segment = self
+                    .fetch_prefix_coalesced(
+                        topition,
+                        from,
+                        remaining.min(u32::MAX as u64) as u32,
+                        high_watermark,
+                        started_at,
+                        max_wait,
+                    )
+                    .await?;
+                batches.extend(segment);
             }
         }
 
@@ -11061,12 +10601,8 @@ impl Storage for DynoStore {
         // so retention and compaction of a prefix run under one claim (one
         // discovery LIST, not one per pass per replica). `None` when prefix
         // coalescing is off = today's every-prefix behaviour.
-        let owned = if self.prefix_coalesce {
-            Some(self.claim_maintenance_prefixes(now_ms).await?)
-        } else {
-            None
-        };
-        let owned = owned.as_ref();
+        let owned = self.claim_maintenance_prefixes(now_ms).await?;
+        let owned = Some(&owned);
 
         let deleted = self.policy_delete_records(now).await?;
         let compacted = self.policy_compact().await?;

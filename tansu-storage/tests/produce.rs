@@ -16,6 +16,7 @@ use crate::common::{Error, init_tracing};
 use bytes::Bytes;
 use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
 use rand::{distr::Alphanumeric, prelude::*, rng};
+use std::time::Duration;
 use tansu_sans_io::{
     CreateTopicsRequest, DeleteTopicsRequest, ErrorCode, InitProducerIdRequest, IsolationLevel,
     ListOffset, ListOffsetsRequest, ProduceRequest, ProduceResponse,
@@ -64,8 +65,12 @@ fn topic_data(
         .map_err(Into::into)
 }
 
+/// A producer with no coordinate in the log is admitted as new (#88), not
+/// answered with `UnknownProducerId` — the per-pod registry that used to reject
+/// it is gone. A deliberate Kafka divergence, recorded in
+/// `dynostore::tests::idempotent::an_unknown_producer_is_admitted_as_new`.
 #[tokio::test]
-async fn non_txn_idempotent_unknown_producer_id() -> Result<(), Error> {
+async fn non_txn_idempotent_unknown_producer_is_admitted() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
     const HOST: &str = "localhost";
@@ -117,8 +122,8 @@ async fn non_txn_idempotent_unknown_producer_id() -> Result<(), Error> {
                     .partition_responses(Some(vec![
                         PartitionProduceResponse::default()
                             .index(index)
-                            .error_code(ErrorCode::UnknownProducerId.into())
-                            .base_offset(-1)
+                            .error_code(ErrorCode::None.into())
+                            .base_offset(0)
                             .log_append_time_ms(Some(-1))
                             .log_start_offset(Some(0))
                             .record_errors(Some(vec![]))
@@ -314,8 +319,11 @@ async fn non_txn_idempotent() -> Result<(), Error> {
     Ok(())
 }
 
+/// A duplicate is acked with the offset the original landed at (#88), rather
+/// than raising `DuplicateSequenceNumber`: a retry after an ack the client never
+/// saw is idempotent, not fatal.
 #[tokio::test]
-async fn non_txn_idempotent_duplicate_sequence() -> Result<(), Error> {
+async fn non_txn_idempotent_duplicate_is_acked_with_the_original_offset() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
     const HOST: &str = "localhost";
@@ -428,8 +436,8 @@ async fn non_txn_idempotent_duplicate_sequence() -> Result<(), Error> {
                     .partition_responses(Some(vec![
                         PartitionProduceResponse::default()
                             .index(index)
-                            .error_code(ErrorCode::DuplicateSequenceNumber.into())
-                            .base_offset(-1)
+                            .error_code(ErrorCode::None.into())
+                            .base_offset(0)
                             .log_append_time_ms(Some(-1))
                             .log_start_offset(Some(0))
                             .record_errors(Some(vec![]))
@@ -911,6 +919,79 @@ async fn url_coalesce_batches_reaches_the_leaseless_flush() -> Result<(), Error>
         offsets,
         "the three batches tile one segment contiguously"
     );
+
+    Ok(())
+}
+
+/// #177 acceptance: a store built from a **plain** storage URL — no query flags
+/// at all — routes an eligible produce into a prefix-coalesced `segments/`
+/// object and mints no `records/{offset:020}.batch` object at all.
+///
+/// This is the whole point of making segments mandatory: before #177 the same
+/// URL produced the legacy layout, and segments were reachable only by opting
+/// in with `?prefix_coalesce=true&prefix_leaseless=true`. The footer is v3
+/// (#188), the format every reader in the fleet already decodes.
+#[tokio::test]
+async fn a_plain_url_produces_segments_and_no_legacy_object() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = StorageContainer::builder()
+        .cluster_id("tansu")
+        .node_id(111)
+        .advertised_listener(Url::parse("tcp://localhost:9092")?)
+        .storage(Url::parse("memory://tansu/")?)
+        .build()
+        .await?;
+
+    let topic = "org.env.conn.plain";
+    _ = storage
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic.into())
+                .num_partitions(1)
+                .replication_factor(1)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+    let topition = Topition::new(topic, 0);
+
+    let batch = inflated::Batch::builder()
+        .record(Record::builder().value(Some(Bytes::from_static(b"plain"))))
+        .last_offset_delta(0)
+        .build()
+        .and_then(deflated::Batch::try_from)?;
+
+    assert_eq!(0, storage.produce(None, &topition, batch).await?);
+
+    let latest = storage
+        .list_offsets(
+            IsolationLevel::ReadUncommitted,
+            &[(topition.clone(), ListOffset::Latest)],
+        )
+        .await?;
+    assert_eq!(
+        Some(1),
+        latest[0].1.offset,
+        "the segment advanced the log end"
+    );
+
+    // Readable back through the same store, which is what actually proves the
+    // segment was written and indexed rather than merely that no legacy object
+    // appeared.
+    let fetched = storage
+        .fetch(
+            &topition,
+            0,
+            0,
+            8 * 1024 * 1024,
+            IsolationLevel::ReadUncommitted,
+            Duration::from_millis(200),
+        )
+        .await?;
+    assert_eq!(1, fetched.len());
+    assert_eq!(0, fetched[0].base_offset);
 
     Ok(())
 }

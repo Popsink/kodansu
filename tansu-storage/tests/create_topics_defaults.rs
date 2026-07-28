@@ -210,8 +210,14 @@ async fn explicit_config_is_not_overwritten() -> Result<(), Error> {
     Ok(())
 }
 
-// Opting out (no default cleanup.policy) restores the legacy behaviour: a topic
-// created with no config keeps no config, so it never expires.
+// Opting out (no default cleanup.policy) stores nothing: a topic created with no
+// config keeps no config.
+//
+// Note this controls what is *stored*, not what maintenance does. Since #177 an
+// absent `cleanup.policy` reads as Kafka's default (`delete` at the default
+// retention), so opting out no longer means "never expires" — it means the
+// defaults are applied at maintenance time instead of frozen into the topic at
+// creation. Retain-forever has one spelling: `retention.ms=-1`.
 #[tokio::test]
 async fn opt_out_injects_nothing() -> Result<(), Error> {
     let _guard = init_tracing()?;

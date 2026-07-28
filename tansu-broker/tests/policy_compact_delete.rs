@@ -281,11 +281,11 @@ where
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
     assert_eq!(Some(0), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
+    // EARLIEST carries no record timestamp (#177), so the wire value is the
+    // Kafka "unknown" sentinel, -1. The legacy `records/` path reported the tail
+    // object's mtime here instead — an object-store artifact, not a record
+    // timestamp, and not something Kafka answers an offset query with.
+    assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
@@ -380,11 +380,9 @@ where
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
     assert_eq!(Some(2), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
+    // LATEST, like EARLIEST, carries no record timestamp (#177): the wire
+    // value is Kafka's "unknown" sentinel, -1, not the tail object's mtime.
+    assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
