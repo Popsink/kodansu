@@ -281,7 +281,7 @@ async fn read_era(bucket: &InMemory, store: &DynoStore, prefix: &str) -> Option<
 #[tokio::test]
 async fn one_window_across_topics_is_one_segment() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     let topic_a = "org.env.conn.tab_a";
     let topic_b = "org.env.conn.tab_b";
@@ -333,7 +333,7 @@ async fn one_window_across_topics_is_one_segment() -> Result<(), Error> {
 #[tokio::test]
 async fn a_later_window_continues_offsets_in_a_new_segment() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     let topic_a = "org.env.conn.tab_a";
     create_topic(&store, topic_a).await?;
@@ -375,9 +375,7 @@ async fn cold_restart_recovers_offsets_from_the_footer() -> Result<(), Error> {
 
     // First process: two windows -> offsets 0 then 3 (5 records total).
     {
-        let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-            .prefix_coalesce(true)
-            .prefix_lease_ttl(ttl);
+        let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_lease_ttl(ttl);
         create_topic(&store, topic_a).await?;
         assert_eq!(0, store.produce(None, &a, batch(3)?).await?);
         assert_eq!(3, store.produce(None, &a, batch(2)?).await?);
@@ -389,7 +387,7 @@ async fn cold_restart_recovers_offsets_from_the_footer() -> Result<(), Error> {
     // A fresh process on the same bucket: empty in-memory counters. The next
     // produce must continue at 5, recovered from the tail segment footer, and
     // land in a third segment (sequence recovered from the tail listing).
-    let restarted = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let restarted = DynoStore::new(CLUSTER, NODE, bucket.clone());
     let resumed = restarted.produce(None, &a, batch(1)?).await?;
     assert_eq!(5, resumed, "resume past the footer end offset, no reuse");
     assert_eq!(3, segments(&bucket).await.len());
@@ -415,7 +413,7 @@ async fn fetch_from(store: &DynoStore, tp: &Topition, offset: i64) -> Result<Vec
 #[tokio::test]
 async fn fetch_reads_only_its_topition_from_a_shared_segment() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     let topic_a = "org.env.conn.tab_a";
     let topic_b = "org.env.conn.tab_b";
@@ -463,13 +461,13 @@ async fn a_fresh_reader_fetches_from_segments() -> Result<(), Error> {
     let a = Topition::new(topic_a, 0);
 
     {
-        let writer = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+        let writer = DynoStore::new(CLUSTER, NODE, bucket.clone());
         create_topic(&writer, topic_a).await?;
         assert_eq!(0, writer.produce(None, &a, batch(3)?).await?);
     }
 
     // Fresh reader: no cached hint, no lease — read path only.
-    let reader = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let reader = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     let latest = reader
         .list_offsets(
@@ -503,7 +501,7 @@ async fn a_fresh_reader_fetches_from_segments() -> Result<(), Error> {
 #[tokio::test]
 async fn list_offsets_latest_timestamp_from_footer() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
     let a = Topition::new(topic, 0);
@@ -536,7 +534,7 @@ async fn list_offsets_latest_timestamp_from_footer() -> Result<(), Error> {
 #[tokio::test]
 async fn pure_segment_partition_retention_skips_rescan() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
     let a = Topition::new(topic, 0);
@@ -598,7 +596,7 @@ async fn first_segment_continues_from_the_legacy_tail() -> Result<(), Error> {
     }
 
     // Cutover to segment mode: the first segment must start at the legacy tail.
-    let seg = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let seg = DynoStore::new(CLUSTER, NODE, bucket.clone());
     let first = seg.produce(None, &a, batch(4)?).await?;
     assert_eq!(
         5, first,
@@ -626,7 +624,7 @@ async fn hybrid_fetch_stitches_legacy_and_segment() -> Result<(), Error> {
     }
 
     // Segment [5, 9): batch(4)@5 (continues from the seam).
-    let seg = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let seg = DynoStore::new(CLUSTER, NODE, bucket.clone());
     assert_eq!(5, seg.produce(None, &a, batch(4)?).await?);
 
     // A single fetch from 0 stitches legacy + segment: 9 records, base offsets
@@ -666,12 +664,10 @@ async fn hybrid_fetch_stitches_legacy_and_segment() -> Result<(), Error> {
 #[tokio::test]
 async fn concurrent_flushes_assign_unique_offsets() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .coalesce_tuning(CoalesceTuning {
-            coalesce_batches: Some(2),
-            ..Default::default()
-        });
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).coalesce_tuning(CoalesceTuning {
+        coalesce_batches: Some(2),
+        ..Default::default()
+    });
 
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
@@ -703,7 +699,7 @@ async fn concurrent_flushes_assign_unique_offsets() -> Result<(), Error> {
 #[tokio::test]
 async fn expires_aged_segments_keeps_recent_ones() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
@@ -741,7 +737,7 @@ async fn lowered_retention_rescans_a_skipped_prefix() -> Result<(), Error> {
     const HOUR_MS: i64 = 60 * 60 * 1_000;
 
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
@@ -794,7 +790,7 @@ async fn lowered_retention_rescans_a_skipped_prefix() -> Result<(), Error> {
 #[tokio::test]
 async fn keeps_a_segment_while_any_substream_is_live() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     let topic_a = "org.env.conn.tab_a";
     let topic_b = "org.env.conn.tab_b";
@@ -829,8 +825,8 @@ async fn keeps_a_segment_while_any_substream_is_live() -> Result<(), Error> {
 #[tokio::test]
 async fn segment_expiry_yields_to_the_lease_holder() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let holder = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
-    let other = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let holder = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    let other = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     let topic = "org.env.conn.tab_a";
     create_topic(&holder, topic).await?;
@@ -922,9 +918,7 @@ async fn maintainer_with_cold_index_compacts() -> Result<(), Error> {
 
     // A producer writes four segments, then goes away.
     {
-        let producer = DynoStore::new(CLUSTER, NODE, bucket.clone())
-            .prefix_coalesce(true)
-            .coalesce_tuning(tuning);
+        let producer = DynoStore::new(CLUSTER, NODE, bucket.clone()).coalesce_tuning(tuning);
         create_topic(&producer, topic).await?;
         for _ in 0..4 {
             _ = producer.produce(None, &a, batch(1)?).await?;
@@ -933,9 +927,7 @@ async fn maintainer_with_cold_index_compacts() -> Result<(), Error> {
     }
 
     // A fresh maintainer (cold index) runs the compaction pass.
-    let maintainer = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .coalesce_tuning(tuning);
+    let maintainer = DynoStore::new(CLUSTER, NODE, bucket.clone()).coalesce_tuning(tuning);
     assert!(
         maintainer.maintain_prefix_segments(now_ms(), None).await?.1 > 0,
         "maintainer discovered the prefix and compacted"
@@ -951,14 +943,12 @@ async fn maintainer_with_cold_index_compacts() -> Result<(), Error> {
 #[tokio::test]
 async fn compaction_drops_zombie_overlap_input() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .coalesce_tuning(CoalesceTuning {
-            prefix_compact_min_segments: Some(1),
-            prefix_compact_keep_hot: Some(0),
-            prefix_compact_target_bytes: Some(1 << 30),
-            ..Default::default()
-        });
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).coalesce_tuning(CoalesceTuning {
+        prefix_compact_min_segments: Some(1),
+        prefix_compact_keep_hot: Some(0),
+        prefix_compact_target_bytes: Some(1 << 30),
+        ..Default::default()
+    });
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
     let a = Topition::new(topic, 0);
@@ -1006,14 +996,12 @@ async fn compaction_drops_zombie_overlap_input() -> Result<(), Error> {
 #[tokio::test]
 async fn stale_index_entry_reads_via_merged() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .coalesce_tuning(CoalesceTuning {
-            prefix_compact_min_segments: Some(1),
-            prefix_compact_keep_hot: Some(0),
-            prefix_compact_target_bytes: Some(1 << 30),
-            ..Default::default()
-        });
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).coalesce_tuning(CoalesceTuning {
+        prefix_compact_min_segments: Some(1),
+        prefix_compact_keep_hot: Some(0),
+        prefix_compact_target_bytes: Some(1 << 30),
+        ..Default::default()
+    });
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
     let a = Topition::new(topic, 0);
@@ -1052,14 +1040,12 @@ async fn stale_index_entry_reads_via_merged() -> Result<(), Error> {
 #[tokio::test]
 async fn compaction_drains_to_min_segments() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .coalesce_tuning(CoalesceTuning {
-            prefix_compact_min_segments: Some(2),
-            prefix_compact_keep_hot: Some(0),
-            prefix_compact_target_bytes: Some(4096),
-            ..Default::default()
-        });
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).coalesce_tuning(CoalesceTuning {
+        prefix_compact_min_segments: Some(2),
+        prefix_compact_keep_hot: Some(0),
+        prefix_compact_target_bytes: Some(4096),
+        ..Default::default()
+    });
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
     let a = Topition::new(topic, 0);
@@ -1091,14 +1077,12 @@ async fn compaction_drains_to_min_segments() -> Result<(), Error> {
 #[tokio::test]
 async fn compaction_merges_segments_and_reads_are_unchanged() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .coalesce_tuning(CoalesceTuning {
-            prefix_compact_min_segments: Some(2),
-            prefix_compact_keep_hot: Some(0),
-            prefix_compact_target_bytes: Some(1 << 30),
-            ..Default::default()
-        });
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).coalesce_tuning(CoalesceTuning {
+        prefix_compact_min_segments: Some(2),
+        prefix_compact_keep_hot: Some(0),
+        prefix_compact_target_bytes: Some(1 << 30),
+        ..Default::default()
+    });
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
     let a = Topition::new(topic, 0);
@@ -1139,12 +1123,10 @@ async fn compaction_merges_segments_and_reads_are_unchanged() -> Result<(), Erro
 #[tokio::test]
 async fn compaction_below_threshold_is_a_noop() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .coalesce_tuning(CoalesceTuning {
-            prefix_compact_min_segments: Some(10),
-            ..Default::default()
-        });
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).coalesce_tuning(CoalesceTuning {
+        prefix_compact_min_segments: Some(10),
+        ..Default::default()
+    });
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
     let a = Topition::new(topic, 0);
@@ -1178,15 +1160,12 @@ async fn large_oldest_segment_does_not_stall_compaction() -> Result<(), Error> {
     // Leaseless so every produce routes through the segment path (the
     // non-leaseless backfill bypass would send the big batch to legacy
     // `records/` instead of making it the large oldest *segment* under test).
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .prefix_leaseless(true)
-        .coalesce_tuning(CoalesceTuning {
-            prefix_compact_min_segments: Some(2),
-            prefix_compact_keep_hot: Some(0),
-            prefix_compact_target_bytes: Some(2048),
-            ..Default::default()
-        });
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).coalesce_tuning(CoalesceTuning {
+        prefix_compact_min_segments: Some(2),
+        prefix_compact_keep_hot: Some(0),
+        prefix_compact_target_bytes: Some(2048),
+        ..Default::default()
+    });
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
     let a = Topition::new(topic, 0);
@@ -1232,7 +1211,7 @@ async fn large_oldest_segment_does_not_stall_compaction() -> Result<(), Error> {
 /// kept.
 #[tokio::test]
 async fn epoch_fencing_drops_stale_overlapping_segment() -> Result<(), Error> {
-    let store = DynoStore::new(CLUSTER, NODE, InMemory::new()).prefix_coalesce(true);
+    let store = DynoStore::new(CLUSTER, NODE, InMemory::new());
     let topic = "org.env.conn.tab_a";
 
     let entry = |base: i64, count: i64| SubstreamEntry {
@@ -1271,7 +1250,7 @@ async fn epoch_fencing_drops_stale_overlapping_segment() -> Result<(), Error> {
 #[tokio::test]
 async fn large_batch_after_segmentation_coalesces() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
     let a = Topition::new(topic, 0);
@@ -1306,7 +1285,7 @@ async fn large_batch_after_segmentation_coalesces() -> Result<(), Error> {
 #[tokio::test]
 async fn backfill_then_coalesce_offsets_are_contiguous() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
     let a = Topition::new(topic, 0);
@@ -1343,7 +1322,6 @@ async fn full_drain_then_restart_keeps_offset() -> Result<(), Error> {
 
     {
         let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-            .prefix_coalesce(true)
             .prefix_lease_ttl(Duration::from_millis(80));
         create_topic(&store, topic).await?;
         assert_eq!(0, store.produce(None, &a, batch_at(1, 1_000)?).await?);
@@ -1360,7 +1338,7 @@ async fn full_drain_then_restart_keeps_offset() -> Result<(), Error> {
 
     // Fresh process: no in-memory state, no segments, legacy drained. The next
     // offset must still be 2 (recovered from the persisted floor), not 0.
-    let restarted = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let restarted = DynoStore::new(CLUSTER, NODE, bucket.clone());
     let resumed = restarted.produce(None, &a, batch(1)?).await?;
     assert_eq!(2, resumed, "no offset reuse after a full retention drain");
 
@@ -1380,7 +1358,6 @@ async fn seq_name_not_reused_after_full_expiry() -> Result<(), Error> {
 
     {
         let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-            .prefix_coalesce(true)
             .prefix_lease_ttl(Duration::from_millis(80));
         create_topic(&store, topic).await?;
         assert_eq!(0, store.produce(None, &a, batch_at(1, 1_000)?).await?);
@@ -1400,7 +1377,7 @@ async fn seq_name_not_reused_after_full_expiry() -> Result<(), Error> {
 
     // Fresh process: cold state, all segments gone. The next segment must be
     // written at seq 2 (the floor), never at the freed seq 0.
-    let restarted = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let restarted = DynoStore::new(CLUSTER, NODE, bucket.clone());
     _ = restarted.produce(None, &a, batch(1)?).await?;
 
     let seqs = segments(&bucket).await;
@@ -1429,7 +1406,7 @@ async fn hybrid_fetch_budget_limited_does_not_skip_legacy() -> Result<(), Error>
         seed_legacy_batch(&seeder, &bucket, &a, 0, batch(3)?).await?;
         seed_legacy_batch(&seeder, &bucket, &a, 3, batch(2)?).await?;
     }
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
     assert_eq!(5, store.produce(None, &a, batch(4)?).await?);
 
     // max_bytes=1 stops the legacy read after the first batch (base 0). The fetch
@@ -1458,7 +1435,7 @@ async fn hybrid_fetch_budget_limited_does_not_skip_legacy() -> Result<(), Error>
 #[tokio::test]
 async fn retention_forever_keeps_segments() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
     let topic = "org.env.conn.tab_a";
     create_topic_with_configs(
         &store,
@@ -1486,11 +1463,7 @@ async fn retention_forever_keeps_segments() -> Result<(), Error> {
 #[tokio::test]
 async fn leaseless_alternating_writers_stay_contiguous() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let mk = || {
-        DynoStore::new(CLUSTER, NODE, bucket.clone())
-            .prefix_coalesce(true)
-            .prefix_leaseless(true)
-    };
+    let mk = || DynoStore::new(CLUSTER, NODE, bucket.clone());
     let a_store = mk();
     let b_store = mk();
     let topic = "org.env.conn.tab_a";
@@ -1523,11 +1496,7 @@ async fn leaseless_alternating_writers_stay_contiguous() -> Result<(), Error> {
 #[tokio::test]
 async fn leaseless_concurrent_writers_no_reuse_or_gap() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let mk = || {
-        DynoStore::new(CLUSTER, NODE, bucket.clone())
-            .prefix_coalesce(true)
-            .prefix_leaseless(true)
-    };
+    let mk = || DynoStore::new(CLUSTER, NODE, bucket.clone());
     let a_store = mk();
     let b_store = mk();
     let topic = "org.env.conn.tab_a";
@@ -1602,9 +1571,7 @@ fn api_error(result: Result<i64>) -> ErrorCode {
 #[tokio::test]
 async fn leaseless_idempotent_dedup_is_log_based() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .prefix_leaseless(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
     let tp = Topition::new(topic, 0);
@@ -1677,11 +1644,7 @@ async fn leaseless_idempotent_dedup_is_log_based() -> Result<(), Error> {
 #[tokio::test]
 async fn leaseless_dedup_survives_pod_migration() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let mk = || {
-        DynoStore::new(CLUSTER, NODE, bucket.clone())
-            .prefix_coalesce(true)
-            .prefix_leaseless(true)
-    };
+    let mk = || DynoStore::new(CLUSTER, NODE, bucket.clone());
     let a_store = mk();
     let topic = "org.env.conn.tab_a";
     create_topic(&a_store, topic).await?;
@@ -1740,9 +1703,7 @@ async fn leaseless_dedup_survives_pod_migration() -> Result<(), Error> {
 #[tokio::test]
 async fn leaseless_out_of_order_sequence_is_rejected() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .prefix_leaseless(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
     let tp = Topition::new(topic, 0);
@@ -1894,9 +1855,7 @@ where
 #[tokio::test]
 async fn leaseless_backfill_folds_into_segments() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .prefix_leaseless(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
     let tp = Topition::new(topic, 0);
@@ -1964,9 +1923,7 @@ async fn leaseless_ambiguous_put_is_adopted_via_nonce() -> Result<(), Error> {
     let inner = InMemory::new();
     let fault = AmbiguousSegmentPut::new(inner.clone());
     let armed = fault.armed.clone();
-    let store = DynoStore::new(CLUSTER, NODE, fault)
-        .prefix_coalesce(true)
-        .prefix_leaseless(true);
+    let store = DynoStore::new(CLUSTER, NODE, fault);
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
     let tp = Topition::new(topic, 0);
@@ -2012,9 +1969,7 @@ async fn leaseless_ambiguous_put_is_adopted_via_nonce() -> Result<(), Error> {
 #[tokio::test]
 async fn leaseless_segment_stamps_seeded_era_above_lease() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .prefix_leaseless(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
     let tp = Topition::new(topic, 0);
@@ -2045,9 +2000,7 @@ async fn leaseless_segment_stamps_seeded_era_above_lease() -> Result<(), Error> 
 #[tokio::test]
 async fn era_seed_defaults_to_one_and_is_stable() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let a = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .prefix_leaseless(true);
+    let a = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     assert_eq!(
         1,
@@ -2062,9 +2015,7 @@ async fn era_seed_defaults_to_one_and_is_stable() -> Result<(), Error> {
 
     // A fresh process (cold in-memory cache) reads the durable value, not a
     // re-seed — the era is a constant for the whole leaseless regime.
-    let b = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .prefix_leaseless(true);
+    let b = DynoStore::new(CLUSTER, NODE, bucket.clone());
     assert_eq!(1, b.seed_era_epoch(PREFIX).await?, "shared across replicas");
 
     Ok(())
@@ -2076,9 +2027,7 @@ async fn era_seed_defaults_to_one_and_is_stable() -> Result<(), Error> {
 #[tokio::test]
 async fn rollback_rewrites_lease_above_era() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .prefix_leaseless(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     write_lease(&bucket, &store, PREFIX, 5).await;
     assert_eq!(6, store.seed_era_epoch(PREFIX).await?);
@@ -2106,9 +2055,7 @@ fn at_ms(ms: u64) -> SystemTime {
 #[tokio::test]
 async fn list_offsets_by_timestamp_resolves_from_segments() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .prefix_leaseless(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
     let tp = Topition::new(topic, 0);
@@ -2262,9 +2209,7 @@ async fn prefix_index_cold_build_commits_incrementally() -> Result<(), Error> {
 
     // Writer populates 6 segments (0..=5) under one prefix.
     {
-        let writer = DynoStore::new(CLUSTER, NODE, inner.clone())
-            .prefix_coalesce(true)
-            .prefix_leaseless(true);
+        let writer = DynoStore::new(CLUSTER, NODE, inner.clone());
         let topic = "org.env.conn.tab_a";
         create_topic(&writer, topic).await?;
         let tp = Topition::new(topic, 0);
@@ -2287,9 +2232,7 @@ async fn prefix_index_cold_build_commits_incrementally() -> Result<(), Error> {
             inner: inner.clone(),
             fail_from_seq: fail_from_seq.clone(),
         },
-    )
-    .prefix_coalesce(true)
-    .prefix_leaseless(true);
+    );
 
     let cached = |store: &DynoStore| {
         store
@@ -2331,13 +2274,10 @@ async fn prefix_index_cold_build_commits_incrementally() -> Result<(), Error> {
 #[tokio::test]
 async fn maintenance_claim_recency_skips_then_reclaims() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .prefix_leaseless(true)
-        .coalesce_tuning(CoalesceTuning {
-            maintenance_recency: Some(Duration::from_secs(60)),
-            ..Default::default()
-        });
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).coalesce_tuning(CoalesceTuning {
+        maintenance_recency: Some(Duration::from_secs(60)),
+        ..Default::default()
+    });
     create_topic(&store, "org.env.conn.tab_a").await?;
 
     let t = now_ms();
@@ -2367,13 +2307,10 @@ async fn maintenance_claim_recency_skips_then_reclaims() -> Result<(), Error> {
 async fn maintenance_claim_peer_skips_recently_maintained_prefix() -> Result<(), Error> {
     let bucket = InMemory::new();
     let scheduler = |bucket: InMemory| {
-        DynoStore::new(CLUSTER, NODE, bucket)
-            .prefix_coalesce(true)
-            .prefix_leaseless(true)
-            .coalesce_tuning(CoalesceTuning {
-                maintenance_recency: Some(Duration::from_secs(60)),
-                ..Default::default()
-            })
+        DynoStore::new(CLUSTER, NODE, bucket).coalesce_tuning(CoalesceTuning {
+            maintenance_recency: Some(Duration::from_secs(60)),
+            ..Default::default()
+        })
     };
     let a = scheduler(bucket.clone());
     let b = scheduler(bucket.clone());
@@ -2510,9 +2447,7 @@ async fn leaseless_flush_exhaustion_is_retriable_not_fatal() -> Result<(), Error
             inner: inner.clone(),
             armed: armed.clone(),
         },
-    )
-    .prefix_coalesce(true)
-    .prefix_leaseless(true);
+    );
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
     let tp = Topition::new(topic, 0);
@@ -2556,9 +2491,7 @@ async fn leaseless_flush_exhaustion_is_retriable_not_fatal() -> Result<(), Error
 #[tokio::test]
 async fn leaseless_steps_over_footerless_segment_object() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .prefix_leaseless(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
     let tp = Topition::new(topic, 0);
@@ -2601,7 +2534,7 @@ async fn leaseless_steps_over_footerless_segment_object() -> Result<(), Error> {
 /// against an accidental bump.
 #[tokio::test]
 async fn default_compaction_target_bytes_is_modest() {
-    let store = DynoStore::new(CLUSTER, NODE, InMemory::new()).prefix_coalesce(true);
+    let store = DynoStore::new(CLUSTER, NODE, InMemory::new());
     assert_eq!(16 << 20, store.prefix_compact_target_bytes);
 }
 
@@ -2699,10 +2632,7 @@ fn decode_per_the_doc(object: &[u8]) -> (u16, Vec<DocEntry>, usize) {
 #[tokio::test]
 async fn documented_layout_decodes_a_segment_this_build_writes() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        // The regime production runs, and the one that emits footer v3.
-        .prefix_leaseless(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     let topic_a = "org.env.conn.tab_a";
     let topic_b = "org.env.conn.tab_b";
@@ -2907,14 +2837,12 @@ where
 #[tokio::test]
 async fn maintenance_expires_then_compacts_each_prefix() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .coalesce_tuning(CoalesceTuning {
-            prefix_compact_min_segments: Some(2),
-            prefix_compact_keep_hot: Some(0),
-            prefix_compact_target_bytes: Some(4096),
-            ..Default::default()
-        });
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).coalesce_tuning(CoalesceTuning {
+        prefix_compact_min_segments: Some(2),
+        prefix_compact_keep_hot: Some(0),
+        prefix_compact_target_bytes: Some(4096),
+        ..Default::default()
+    });
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
     let tp = Topition::new(topic, 0);
@@ -2957,7 +2885,6 @@ async fn a_failing_prefix_does_not_stop_the_others() -> Result<(), Error> {
             fail_delete_under: Some("prefixes/org.env.aaa/".into()),
         },
     )
-    .prefix_coalesce(true)
     .coalesce_tuning(CoalesceTuning {
         prefix_compact_min_segments: Some(2),
         prefix_compact_keep_hot: Some(0),
@@ -3014,7 +2941,6 @@ async fn maintenance_visits_the_largest_prefix_first() -> Result<(), Error> {
             fail_delete_under: None,
         },
     )
-    .prefix_coalesce(true)
     .coalesce_tuning(CoalesceTuning {
         prefix_compact_min_segments: Some(2),
         prefix_compact_keep_hot: Some(0),
@@ -3068,14 +2994,12 @@ async fn maintenance_visits_the_largest_prefix_first() -> Result<(), Error> {
 #[tokio::test]
 async fn compaction_resyncs_when_its_target_sequence_is_taken() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .coalesce_tuning(CoalesceTuning {
-            prefix_compact_min_segments: Some(2),
-            prefix_compact_keep_hot: Some(0),
-            prefix_compact_target_bytes: Some(4096),
-            ..Default::default()
-        });
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).coalesce_tuning(CoalesceTuning {
+        prefix_compact_min_segments: Some(2),
+        prefix_compact_keep_hot: Some(0),
+        prefix_compact_target_bytes: Some(4096),
+        ..Default::default()
+    });
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
     let tp = Topition::new(topic, 0);
@@ -3139,7 +3063,7 @@ async fn compaction_resyncs_when_its_target_sequence_is_taken() -> Result<(), Er
 #[tokio::test]
 async fn co_prefix_consumers_read_disjoint_ranges_of_one_segment() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     let topic_a = "org.env.conn.tab_a";
     let topic_b = "org.env.conn.tab_b";
@@ -3189,7 +3113,7 @@ async fn co_prefix_consumers_read_disjoint_ranges_of_one_segment() -> Result<(),
 #[tokio::test]
 async fn re_reading_one_substream_repeats_the_same_range() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
     let tp = Topition::new(topic, 0);
@@ -3219,7 +3143,7 @@ async fn re_reading_one_substream_repeats_the_same_range() -> Result<(), Error> 
 /// read would turn an observability aid into a leak.
 #[tokio::test]
 async fn segment_read_trace_stays_bounded() {
-    let store = DynoStore::new(CLUSTER, NODE, InMemory::new()).prefix_coalesce(true);
+    let store = DynoStore::new(CLUSTER, NODE, InMemory::new());
 
     for seq in 0..(4 * 1_024u64) {
         store.note_segment_data_read(PREFIX, seq, 0, 64);
@@ -3339,9 +3263,7 @@ async fn tail_probe_follows_a_peer_without_listing() -> Result<(), Error> {
     let bucket = InMemory::new();
     let lists = Arc::new(AtomicU64::new(0));
 
-    let writer = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .prefix_leaseless(true);
+    let writer = DynoStore::new(CLUSTER, NODE, bucket.clone());
     let reader = DynoStore::new(
         CLUSTER,
         NODE,
@@ -3349,9 +3271,7 @@ async fn tail_probe_follows_a_peer_without_listing() -> Result<(), Error> {
             inner: bucket.clone(),
             lists: lists.clone(),
         },
-    )
-    .prefix_coalesce(true)
-    .prefix_leaseless(true);
+    );
 
     let topic = "org.env.conn.tab_a";
     create_topic(&writer, topic).await?;
@@ -3420,9 +3340,7 @@ async fn tail_probe_defers_to_a_listing_when_the_floor_is_ahead() -> Result<(), 
             inner: bucket.clone(),
             lists: lists.clone(),
         },
-    )
-    .prefix_coalesce(true)
-    .prefix_leaseless(true);
+    );
 
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
@@ -3499,7 +3417,7 @@ fn record_count(batches: &[deflated::Batch]) -> i64 {
 #[tokio::test]
 async fn delete_records_pure_segment_advances_log_start() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
@@ -3551,7 +3469,7 @@ async fn delete_records_pure_segment_advances_log_start() -> Result<(), Error> {
 #[tokio::test]
 async fn delete_records_shared_segment_isolates_substreams() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     let topic_a = "org.env.conn.tab_a";
     let topic_b = "org.env.conn.tab_b";
@@ -3597,7 +3515,7 @@ async fn delete_records_floor_survives_restart() -> Result<(), Error> {
     let a = Topition::new(topic, 0);
 
     {
-        let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+        let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
         create_topic(&store, topic).await?;
         assert_eq!(0, store.produce(None, &a, batch(3)?).await?);
         assert_eq!(3, store.produce(None, &a, batch(2)?).await?);
@@ -3606,7 +3524,7 @@ async fn delete_records_floor_survives_restart() -> Result<(), Error> {
 
     // Fresh process. EARLIEST first, before anything else warms the
     // watermark cache: this pins the floor accessor's cold read.
-    let restarted = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let restarted = DynoStore::new(CLUSTER, NODE, bucket.clone());
     assert_eq!(3, earliest(&restarted, &a).await?);
 
     let stage = restarted
@@ -3629,7 +3547,7 @@ async fn delete_records_floor_survives_restart() -> Result<(), Error> {
 #[tokio::test]
 async fn delete_records_is_monotonic() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
@@ -3668,7 +3586,7 @@ async fn delete_records_is_monotonic() -> Result<(), Error> {
 #[tokio::test]
 async fn delete_records_all_then_produce() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
@@ -3708,7 +3626,6 @@ async fn fully_truncated_segment_expires() -> Result<(), Error> {
 
     {
         let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-            .prefix_coalesce(true)
             .prefix_lease_ttl(Duration::from_millis(80));
         create_topic(&store, topic).await?;
 
@@ -3745,7 +3662,7 @@ async fn fully_truncated_segment_expires() -> Result<(), Error> {
     // Fresh process on the fully-drained prefix: the next produce resumes at
     // offset 4 (the persisted watermark floor) in a segment named by the
     // raised sequence floor (seq 2) — never a freed offset or seq name.
-    let restarted = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let restarted = DynoStore::new(CLUSTER, NODE, bucket.clone());
     assert_eq!(4, restarted.produce(None, &a, batch(1)?).await?);
     assert_eq!(vec![segment_path(2)], segments(&bucket).await);
 
@@ -3763,7 +3680,7 @@ async fn unknown_floor_defers_reclaim_until_warmed() -> Result<(), Error> {
     let a = Topition::new(topic, 0);
 
     {
-        let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+        let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
         create_topic(&store, topic).await?;
         let recent = now_ms();
         assert_eq!(0, store.produce(None, &a, batch_at(2, recent)?).await?);
@@ -3772,7 +3689,7 @@ async fn unknown_floor_defers_reclaim_until_warmed() -> Result<(), Error> {
 
     // A fresh maintainer holds no floor for the partition: the fully
     // truncated (but recent) segment must survive its pass.
-    let maintainer = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let maintainer = DynoStore::new(CLUSTER, NODE, bucket.clone());
     assert_eq!(0, maintainer.expire_prefix_segments(PREFIX, 1_000).await?);
     assert_eq!(1, segments(&bucket).await.len());
 
@@ -3804,7 +3721,7 @@ async fn delete_records_hybrid_topic() -> Result<(), Error> {
     }
 
     // Flipped to prefix mode mid-life: a segment carries [5,7).
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_coalesce(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
     assert_eq!(5, store.produce(None, &a, batch(2)?).await?);
     assert_eq!(2, legacy_records(&bucket, topic).await.len());
     assert_eq!(1, segments(&bucket).await.len());
@@ -3917,9 +3834,7 @@ async fn produced_range(
 #[tokio::test]
 async fn txn_commit_marker_lands_in_segment() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .prefix_leaseless(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     let topic_a = "org.env.conn.tab_a";
     let topic_b = "org.env.conn.tab_b";
@@ -4033,9 +3948,7 @@ async fn txn_commit_marker_lands_in_segment() -> Result<(), Error> {
 #[tokio::test]
 async fn read_committed_sees_only_committed_records_from_shared_segment() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .prefix_leaseless(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
@@ -4166,9 +4079,7 @@ async fn txn_abort_lso_and_aborted_match_legacy() -> Result<(), Error> {
     }
 
     let legacy = DynoStore::new(CLUSTER, NODE, InMemory::new());
-    let segment = DynoStore::new(CLUSTER, NODE, InMemory::new())
-        .prefix_coalesce(true)
-        .prefix_leaseless(true);
+    let segment = DynoStore::new(CLUSTER, NODE, InMemory::new());
 
     let (legacy_pid, legacy_open, legacy_after, legacy_aborted) = script(&legacy).await?;
     let (segment_pid, segment_open, segment_after, segment_aborted) = script(&segment).await?;
@@ -4189,9 +4100,7 @@ async fn txn_abort_lso_and_aborted_match_legacy() -> Result<(), Error> {
 #[tokio::test]
 async fn control_coordinate_not_folded_into_producer_tail() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .prefix_leaseless(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
@@ -4231,14 +4140,11 @@ async fn control_batch_triggers_immediate_flush() -> Result<(), Error> {
     let bucket = InMemory::new();
     // A linger far beyond the test's patience: only a non-linger trigger can
     // flush. Data flushes on the 2-batch count; a marker must flush by itself.
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .prefix_leaseless(true)
-        .coalesce_tuning(CoalesceTuning {
-            coalesce_linger: Some(Duration::from_secs(30)),
-            coalesce_batches: Some(2),
-            ..Default::default()
-        });
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).coalesce_tuning(CoalesceTuning {
+        coalesce_linger: Some(Duration::from_secs(30)),
+        coalesce_batches: Some(2),
+        ..Default::default()
+    });
 
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;
@@ -4288,9 +4194,7 @@ async fn control_batch_triggers_immediate_flush() -> Result<(), Error> {
 #[tokio::test]
 async fn transactional_duplicate_reregistration_is_idempotent() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .prefix_coalesce(true)
-        .prefix_leaseless(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     let topic = "org.env.conn.tab_a";
     create_topic(&store, topic).await?;

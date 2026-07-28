@@ -270,11 +270,10 @@ pub struct DynoStore {
     /// reconciliation for any future straggler.
     compacted_carryover: bool,
 
-    /// Per-prefix coalescing buffer (#57), used only when
-    /// [`Self::prefix_coalesce`] is set. Like [`Self::coalesce`] but keyed by
-    /// prefix, so one buffer accumulates `PrefixPending` batches across many
-    /// topitions; drained (never held across an await) on a threshold or linger
-    /// flush into one create-only segment object.
+    /// Per-prefix coalescing buffer (#57) — the only produce buffer since #177.
+    /// Keyed by prefix, so one buffer accumulates `PrefixPending` batches across
+    /// many topitions; drained (never held across an await) on a threshold or
+    /// linger flush into one create-only segment object.
     prefix_coalesce_buffers: Arc<Mutex<BTreeMap<String, PrefixCoalesceBuffer>>>,
 
     /// Per-prefix next segment sequence hint (#57). The segment object name
@@ -1605,32 +1604,10 @@ impl DynoStore {
         }
     }
 
-    /// No-op since #177: server-side produce coalescing per partition (#50) no
-    /// longer exists — every eligible batch is coalesced per connector prefix
-    /// into a shared segment. Retained so the existing call sites still
-    /// compile; deleted with them in #181.
-    pub fn produce_coalesce(self, _produce_coalesce: bool) -> Self {
-        self
-    }
-
-    /// No-op since #177: the leaseless seq-CAS arbiter (#86) is the only prefix
-    /// flush path. Retained so the existing call sites still compile; deleted
-    /// with them in #181.
-    pub fn prefix_leaseless(self, _prefix_leaseless: bool) -> Self {
-        self
-    }
-
-    /// No-op since #177: prefix-coalesced segments (#56/#57) are the only
-    /// layout, so there is nothing left to switch. Retained so the existing
-    /// call sites still compile; deleted with them in #181.
-    pub fn prefix_coalesce(self, _prefix_coalesce: bool) -> Self {
-        self
-    }
-
     /// Route compacted topics into segments under a dedicated per-topic prefix
-    /// and per-key-compact them there (#175). Off by default; a no-op unless
-    /// [`Self::prefix_coalesce`] is also set (there is no segment routing to
-    /// override without it). See the `compacted_segments` field.
+    /// and per-key-compact them there (#175). Off by default. Segment routing
+    /// itself is unconditional since #177; this only decides whether a
+    /// *compacted* topic joins it. See the `compacted_segments` field.
     pub fn compacted_segments(self, compacted_segments: bool) -> Self {
         Self {
             compacted_segments,
@@ -1642,8 +1619,8 @@ impl DynoStore {
     /// release 2): maintenance re-encodes each such topic's legacy `records/`
     /// objects verbatim into segments under its dedicated prefix and deletes
     /// them, newest chunk first. Off by default; a no-op unless
-    /// [`Self::compacted_segments`] (with [`Self::prefix_coalesce`]) is also
-    /// set. Flipped only after `compacted_segments` is live on a **uniform**
+    /// [`Self::compacted_segments`] is also set. Flipped only after
+    /// `compacted_segments` is live on a **uniform**
     /// fleet — see the `compacted_carryover` field for why the two flips are
     /// separate deploys.
     pub fn compacted_carryover(self, compacted_carryover: bool) -> Self {
