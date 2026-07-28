@@ -368,3 +368,204 @@ async fn span_and_tail_survive_per_key_merge_across_restart() -> Result<(), Erro
 
     Ok(())
 }
+
+/// Carry-over drains the legacy region **one chunk at a time**, and every
+/// intermediate state must still be fully readable (#175 release 2).
+///
+/// This is the test that matters. The legacy region is the hybrid seam `[0, C)`
+/// and [`DynoStore::fetch`] reads a *gap* in it as "compacted away" — it skips
+/// silently rather than erroring. So a carry-over that removed objects from the
+/// middle would make live keys invisible with no signal, which for a connector
+/// offsets topic means re-snapshotting its source. Carrying tail-first and
+/// deleting descending is what keeps every intermediate region a contiguous
+/// `[0, x)`; driving the drain with a budget of one object per call exercises
+/// exactly those intermediate states.
+#[tokio::test]
+async fn carryover_drains_legacy_chunk_by_chunk_with_no_hole() -> Result<(), Error> {
+    let _guard = super::init_tracing()?;
+
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.offsets";
+    let tp = Topition::new(topic, 0);
+
+    // Pre-release-2 state: a compacted topic whose data sits in legacy
+    // `records/`, one object per batch, and no segment anywhere.
+    {
+        let store = unrouted_store(&bucket);
+        create_topic_with_configs(&store, topic, &[("cleanup.policy", "compact")]).await?;
+        for (key, value) in [
+            (b"k1".as_slice(), b"v1".as_slice()),
+            (b"k2".as_slice(), b"v2".as_slice()),
+            (b"k3".as_slice(), b"v3".as_slice()),
+            (b"k4".as_slice(), b"v4".as_slice()),
+        ] {
+            _ = store.produce(None, &tp, keyed_batch(key, value)?).await?;
+        }
+        assert_eq!(4, legacy_records(&bucket, topic).await.len());
+        assert!(segments_of(&bucket, topic).await.is_empty());
+    }
+
+    let store = routed_store(&bucket).compacted_carryover(true);
+    assert_eq!(4, store.high_watermark(&tp).await?);
+
+    async fn readable(store: &DynoStore, tp: &Topition) -> Result<i64> {
+        Ok(store
+            .fetch(
+                tp,
+                0,
+                1,
+                64 * 1024,
+                IsolationLevel::ReadUncommitted,
+                Duration::from_millis(500),
+            )
+            .await?
+            .iter()
+            .map(|batch| i64::from(batch.record_count))
+            .sum())
+    }
+
+    // Every record is readable before the drain starts.
+    assert_eq!(4, readable(&store, &tp).await?);
+
+    // One object per call: each iteration is an intermediate state a crash could
+    // leave behind, and each must still expose all four records.
+    for expected_legacy in [3usize, 2, 1, 0] {
+        let mut budget = 1usize;
+        let retired = store.carry_over_legacy(&tp, &mut budget).await?;
+        assert_eq!(1, retired, "one object per budgeted call");
+        assert_eq!(
+            expected_legacy,
+            legacy_records(&bucket, topic).await.len(),
+            "legacy region must shrink from the tail only"
+        );
+        assert_eq!(
+            4,
+            readable(&store, &tp).await?,
+            "a partially drained region must not hide a single record"
+        );
+    }
+
+    // Fully drained, and the data now lives under the topic's dedicated prefix.
+    assert!(legacy_records(&bucket, topic).await.is_empty());
+    assert!(!segments_of(&bucket, topic).await.is_empty());
+    assert_eq!(4, store.high_watermark(&tp).await?);
+
+    // A cold process reads the same log from the footers alone.
+    let restarted = routed_store(&bucket).compacted_carryover(true);
+    assert_eq!(4, readable(&restarted, &tp).await?);
+    assert_eq!(4, restarted.high_watermark(&tp).await?);
+
+    Ok(())
+}
+
+/// The carry-over re-encodes **verbatim** and never computes latest-per-key
+/// itself (#175 release 2). Once routing is on, a segment write may already
+/// supersede a legacy key; folding the legacy region alone would elect the stale
+/// value and resurrect it. Carrying as-is leaves release 1's per-key pass to
+/// decide with the full picture.
+#[tokio::test]
+async fn carryover_does_not_resurrect_a_superseded_key() -> Result<(), Error> {
+    let _guard = super::init_tracing()?;
+
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.state";
+    let tp = Topition::new(topic, 0);
+
+    // `stale` lands in the legacy region...
+    {
+        let store = unrouted_store(&bucket);
+        create_topic_with_configs(&store, topic, &[("cleanup.policy", "compact")]).await?;
+        _ = store
+            .produce(None, &tp, keyed_batch(b"key", b"stale")?)
+            .await?;
+        assert_eq!(1, legacy_records(&bucket, topic).await.len());
+    }
+
+    // ...and `fresh` supersedes it in a segment, after the routing flip.
+    let store = routed_store(&bucket).compacted_carryover(true);
+    _ = store
+        .produce(None, &tp, keyed_batch(b"key", b"fresh")?)
+        .await?;
+
+    // Drive the carry through its real entry point. Calling `carry_over_legacy`
+    // directly would take the compaction lease *outside* the #126 claim, so the
+    // next claim would skip this prefix as recently maintained and the per-key
+    // pass would never run — a sequence production never performs, since the
+    // carry-over runs inside `maintain` after the claim.
+    store.maintain(SystemTime::now()).await?;
+    assert!(
+        legacy_records(&bucket, topic).await.is_empty(),
+        "maintenance must drain the legacy region"
+    );
+    assert_eq!(
+        2,
+        segments_of(&bucket, topic).await.len(),
+        "the carried region is its own segment beside the post-flip one"
+    );
+
+    // One tick suffices: the #126 claim is computed *before* the carry-over runs,
+    // so the prefix is already owned when the per-key pass reaches it later in the
+    // same tick. Nothing is left for a second pass to remove.
+    assert_eq!(
+        0,
+        store.compact_prefix_per_key(topic).await?,
+        "the carried copy was already elected against within the same tick"
+    );
+
+    let batches = store
+        .fetch(
+            &tp,
+            0,
+            1,
+            64 * 1024,
+            IsolationLevel::ReadUncommitted,
+            Duration::from_millis(500),
+        )
+        .await?;
+    let values: Vec<Bytes> = batches
+        .iter()
+        .filter_map(|batch| inflated::Batch::try_from(batch).ok())
+        .flat_map(|batch| batch.records)
+        .filter_map(|record| record.value)
+        .collect();
+    assert_eq!(
+        vec![Bytes::from_static(b"fresh")],
+        values,
+        "the surviving value must be the post-flip one, not the carried legacy copy"
+    );
+
+    Ok(())
+}
+
+/// With the carry-over flag off, a routed compacted topic's legacy region is
+/// left strictly alone — the routing flip and the drain are two config deploys,
+/// and the first must not start the second.
+#[tokio::test]
+async fn carryover_off_leaves_the_legacy_region_untouched() -> Result<(), Error> {
+    let _guard = super::init_tracing()?;
+
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.configs";
+    let tp = Topition::new(topic, 0);
+
+    {
+        let store = unrouted_store(&bucket);
+        create_topic_with_configs(&store, topic, &[("cleanup.policy", "compact")]).await?;
+        _ = store.produce(None, &tp, keyed_batch(b"a", b"1")?).await?;
+        _ = store.produce(None, &tp, keyed_batch(b"b", b"2")?).await?;
+    }
+    let before = legacy_records(&bucket, topic).await;
+    assert_eq!(2, before.len());
+
+    // Routing on, carry-over off: maintenance must not retire a single object.
+    let store = routed_store(&bucket);
+    store.maintain(SystemTime::now()).await?;
+    assert_eq!(before, legacy_records(&bucket, topic).await);
+
+    // And the explicit call is a no-op too, not merely unreached.
+    let mut budget = 8usize;
+    assert_eq!(0, store.carry_over_legacy(&tp, &mut budget).await?);
+    assert_eq!(8, budget, "an inert pass must not spend the tick's budget");
+
+    Ok(())
+}
