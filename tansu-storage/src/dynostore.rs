@@ -767,6 +767,19 @@ static SEGMENT_RECORDS_COMPACTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// drain progress signal, and the one that tells when the backlog is gone: it
 /// stops moving because every compacted topic is drained, not because the pass
 /// stopped running.
+/// Topics `Metadata` could not resolve but the topics index knows exist (#214).
+///
+/// Expected to be zero. Nonzero means a per-topic metadata read came back empty
+/// for a topic that is there — the failure that previously reached clients as
+/// `UNKNOWN_TOPIC_OR_PARTITION` and took source connectors into restart loops,
+/// with no broker-side signal at all. This counter is that signal.
+static METADATA_UNRESOLVED_EXISTING: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_metadata_unresolved_existing_topic")
+        .with_description("topics Metadata could not resolve although the index knows them")
+        .build()
+});
+
 static SEGMENT_CARRYOVER_OBJECTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_prefix_segment_carryover_objects")
@@ -9596,6 +9609,62 @@ impl Storage for DynoStore {
                     .collect::<Vec<_>>()
                     .await;
 
+                // A per-topic read that resolved to nothing is NOT proof the
+                // topic is gone (#214).
+                //
+                // `topic_metadata` reads one object through the `OptiCon` cache,
+                // and `OptiCon::refresh` *clears* its cached value on any
+                // `NotFound` — real, transient or spurious alike. So a single
+                // 404 against a live topic's object turns into `Ok(None)`, and
+                // reporting that as `UnknownTopicOrPartition` is the worst
+                // available answer: the client cannot tell it from a deleted
+                // topic, so it refreshes metadata until `max.block.ms` expires
+                // and fails the batch. Production saw eight topics answered
+                // absent minutes after being written, taking six of twenty-four
+                // source connectors into restart loops.
+                //
+                // The topics index is an independent witness: it is built from a
+                // LIST of the `topic-metadata/` prefix, not from the per-object
+                // reads that just came back empty. If it knows the topic, the
+                // read failed to resolve rather than the topic being absent, and
+                // the honest answer is a retriable one.
+                let unresolved: BTreeSet<&str> = topics
+                    .iter()
+                    .zip(&fetched)
+                    .filter(|(_, result)| matches!(result, Ok(None)))
+                    .filter_map(|(topic, _)| match topic {
+                        TopicId::Name(name) => Some(name.as_str()),
+                        TopicId::Id(_) => None,
+                    })
+                    .collect();
+
+                let existing_but_unresolved: BTreeSet<String> = if unresolved.is_empty() {
+                    BTreeSet::new()
+                } else {
+                    let known = self
+                        .topics_index()
+                        .await
+                        .inspect_err(|error| warn!(?error, "topics index for absent-topic check"))
+                        .unwrap_or_default();
+
+                    let existing: BTreeSet<String> = known
+                        .iter()
+                        .map(|metadata| metadata.topic.name.clone())
+                        .filter(|name| unresolved.contains(name.as_str()))
+                        .collect();
+
+                    for name in &existing {
+                        METADATA_UNRESOLVED_EXISTING.add(1, &[]);
+                        warn!(
+                            topic = name.as_str(),
+                            "metadata could not resolve a topic the index knows; \
+                             answering retriably rather than reporting it absent"
+                        );
+                    }
+
+                    existing
+                };
+
                 topics
                     .iter()
                     .zip(fetched)
@@ -9661,7 +9730,18 @@ impl Storage for DynoStore {
                             }
 
                             Ok(None) => MetadataResponseTopic::default()
-                                .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                                .error_code(
+                                    // Retriable when the index says the topic is
+                                    // there: the client backs off and retries
+                                    // instead of spinning on an assertion of
+                                    // absence it cannot question (#214).
+                                    if matches!(topic, TopicId::Name(name) if existing_but_unresolved.contains(name))
+                                    {
+                                        ErrorCode::LeaderNotAvailable.into()
+                                    } else {
+                                        ErrorCode::UnknownTopicOrPartition.into()
+                                    },
+                                )
                                 .name(match topic {
                                     TopicId::Name(name) => Some(name.into()),
                                     TopicId::Id(_) => None,

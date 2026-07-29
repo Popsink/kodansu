@@ -12,9 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use object_store::{ObjectStore as _, PutPayload, memory::InMemory, path::Path};
-use std::collections::BTreeMap;
-use tansu_sans_io::create_topics_request::CreatableTopic;
+use async_trait::async_trait;
+use futures::stream::BoxStream;
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory, path::Path,
+};
+use std::{
+    collections::BTreeMap,
+    fmt::{self, Debug, Display},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering::Relaxed},
+    },
+};
+use tansu_sans_io::{ErrorCode, create_topics_request::CreatableTopic};
 use uuid::Uuid;
 
 use crate::{
@@ -48,6 +60,160 @@ async fn create_topic(storage: &DynoStore, name: &str, partitions: i32) -> Resul
 /// failed with `UnknownTopicOrPartition`. Per-topic objects fix this: B holds
 /// no cached etag for a topic it only saw as absent, so the conditional GET
 /// cannot be short-circuited to a stale `NotModified`.
+/// An object store that answers `NotFound` for one key, once, then behaves.
+///
+/// Models the shape behind #214: a single spurious 404 against a live topic's
+/// metadata object. `OptiCon::refresh` clears its cached value on any
+/// `NotFound`, so one such answer is enough to make `topic_metadata` return
+/// `Ok(None)` for a topic that exists.
+#[derive(Clone)]
+struct NotFoundOnce<O> {
+    inner: O,
+    key: Path,
+    fired: Arc<AtomicBool>,
+}
+
+impl<O> Debug for NotFoundOnce<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NotFoundOnce").finish()
+    }
+}
+
+impl<O> Display for NotFoundOnce<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NotFoundOnce").finish()
+    }
+}
+
+#[async_trait]
+impl<O> ObjectStore for NotFoundOnce<O>
+where
+    O: ObjectStore,
+{
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult, object_store::Error> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> Result<GetResult, object_store::Error> {
+        if *location == self.key && !self.fired.swap(true, Relaxed) {
+            return Err(object_store::Error::NotFound {
+                path: location.to_string(),
+                source: "injected spurious 404".into(),
+            });
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path, object_store::Error>>,
+    ) -> BoxStream<'static, Result<Path, object_store::Error>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> Result<ListResult, object_store::Error> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: CopyOptions,
+    ) -> Result<(), object_store::Error> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+}
+
+/// #214: a topic whose metadata object cannot be resolved is answered
+/// **retriably**, not reported absent.
+///
+/// One spurious 404 is enough to empty `OptiCon`'s cached value, so
+/// `topic_metadata` returns `Ok(None)` for a topic that plainly exists. Reporting
+/// that as `UNKNOWN_TOPIC_OR_PARTITION` is the worst available answer: a client
+/// cannot tell it from a deleted topic, so it refreshes metadata until
+/// `max.block.ms` expires and then fails the batch. Production saw eight such
+/// topics and six of twenty-four source connectors in restart loops.
+///
+/// The topics index is the witness — it comes from a LIST of `topic-metadata/`,
+/// not from the per-object read that just came back empty — so `LeaderNotAvailable`
+/// is both true and retriable.
+#[tokio::test]
+async fn an_unresolvable_existing_topic_is_retriable_not_absent() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let topic = "actively-produced";
+
+    // Create it, and warm the topics index so the witness knows it.
+    let seeder = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    _ = create_topic(&seeder, topic, 1).await?;
+
+    // A replica whose very first read of that object gets a spurious 404.
+    let store = DynoStore::new(
+        CLUSTER,
+        NODE,
+        NotFoundOnce {
+            inner: bucket.clone(),
+            key: Path::from(format!("clusters/{CLUSTER}/topic-metadata/{topic}.json")),
+            fired: Arc::new(AtomicBool::new(false)),
+        },
+    );
+
+    let response = store.metadata(Some(&[TopicId::Name(topic.into())])).await?;
+
+    assert_eq!(1, response.topics.len());
+
+    let code = ErrorCode::try_from(response.topics[0].error_code)?;
+    assert_ne!(
+        ErrorCode::UnknownTopicOrPartition,
+        code,
+        "an existing topic must never be reported absent",
+    );
+    assert_eq!(
+        ErrorCode::LeaderNotAvailable,
+        code,
+        "and the answer must be one the client retries",
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn topic_created_on_one_replica_is_visible_on_another() -> Result<(), Error> {
     let _guard = init_tracing()?;
