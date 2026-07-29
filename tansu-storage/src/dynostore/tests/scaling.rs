@@ -55,6 +55,12 @@ struct Counters {
     /// Bounded `list_with_offset` calls (S3 `start-after`, scans only forward).
     list_with_offset_calls: AtomicU64,
     listed_objects: AtomicU64,
+    /// Requests whose path lies under a legacy `records/` prefix, whatever the
+    /// method. #179's acceptance is that this reaches zero: once no writer can
+    /// create a `records/` object, every read-path branch that asks "is there a
+    /// legacy region, and where does it end?" is asking a question with one
+    /// possible answer, and the requests spent asking it are pure residual cost.
+    records_requests: AtomicU64,
 }
 
 impl Counters {
@@ -64,6 +70,14 @@ impl Counters {
         self.list_calls.store(0, Relaxed);
         self.list_with_offset_calls.store(0, Relaxed);
         self.listed_objects.store(0, Relaxed);
+        self.records_requests.store(0, Relaxed);
+    }
+
+    /// Requests touching a legacy `records/` prefix since the last reset.
+    /// Deliberately not folded into `report`'s tuple so the existing op profiles
+    /// keep their shape.
+    fn records_requests(&self) -> u64 {
+        self.records_requests.load(Relaxed)
     }
 
     fn report(&self, label: &str) -> (u64, u64, u64, u64, u64) {
@@ -102,6 +116,13 @@ impl<O> Display for Counting<O> {
     }
 }
 
+/// Does `path` address the legacy per-`(topic, partition)` `records/` layout?
+fn is_records_path(path: Option<&Path>) -> bool {
+    path.is_some_and(|path| {
+        path.as_ref().contains("/records/") || path.as_ref().ends_with("/records")
+    })
+}
+
 #[async_trait]
 impl<O> ObjectStore for Counting<O>
 where
@@ -114,6 +135,9 @@ where
         opts: PutOptions,
     ) -> Result<PutResult, object_store::Error> {
         _ = self.counters.put.fetch_add(1, Relaxed);
+        if is_records_path(Some(location)) {
+            _ = self.counters.records_requests.fetch_add(1, Relaxed);
+        }
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -131,6 +155,9 @@ where
         options: GetOptions,
     ) -> Result<GetResult, object_store::Error> {
         _ = self.counters.get.fetch_add(1, Relaxed);
+        if is_records_path(Some(location)) {
+            _ = self.counters.records_requests.fetch_add(1, Relaxed);
+        }
         self.inner.get_opts(location, options).await
     }
 
@@ -146,6 +173,9 @@ where
         prefix: Option<&Path>,
     ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
         _ = self.counters.list_calls.fetch_add(1, Relaxed);
+        if is_records_path(prefix) {
+            _ = self.counters.records_requests.fetch_add(1, Relaxed);
+        }
         let counters = self.counters.clone();
         self.inner
             .list(prefix)
@@ -161,6 +191,9 @@ where
         offset: &Path,
     ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
         _ = self.counters.list_with_offset_calls.fetch_add(1, Relaxed);
+        if is_records_path(prefix) {
+            _ = self.counters.records_requests.fetch_add(1, Relaxed);
+        }
         let counters = self.counters.clone();
         self.inner
             .list_with_offset(prefix, offset)
@@ -175,6 +208,9 @@ where
         prefix: Option<&Path>,
     ) -> Result<ListResult, object_store::Error> {
         _ = self.counters.list_calls.fetch_add(1, Relaxed);
+        if is_records_path(prefix) {
+            _ = self.counters.records_requests.fetch_add(1, Relaxed);
+        }
         let result = self.inner.list_with_delimiter(prefix).await?;
         _ = self
             .counters
@@ -212,6 +248,24 @@ fn segment_store() -> (DynoStore, Arc<Counters>) {
     let counters = Arc::new(Counters::default());
     let store = Counting {
         inner: InMemory::new(),
+        counters: counters.clone(),
+    };
+    (
+        DynoStore::new(CLUSTER, NODE, store).coalesce_tuning(CoalesceTuning {
+            coalesce_batches: Some(1),
+            ..Default::default()
+        }),
+        counters,
+    )
+}
+
+/// A segment-mode counting store over an EXISTING bucket, so a second store can
+/// read the same objects with cold in-process memos — which is where the residual
+/// `records/` probing actually shows up.
+fn segment_store_on(bucket: InMemory) -> (DynoStore, Arc<Counters>) {
+    let counters = Arc::new(Counters::default());
+    let store = Counting {
+        inner: bucket,
         counters: counters.clone(),
     };
     (
@@ -1370,5 +1424,87 @@ async fn read_committed_polling_does_not_get_watermark_json() -> Result<(), Erro
         "16 read-committed polls must not GET watermark.json (#161)"
     );
 
+    Ok(())
+}
+
+/// How much of a segment topic's read path is still spent asking about a legacy
+/// `records/` region — the residual #179 removes.
+///
+/// Nothing writes that layout any more (#177/#178), so on a segment-only topic
+/// every such request is asking a question with one possible answer. This pins the
+/// cost of asking, for the whole read surface: `fetch`, `list_offsets` LATEST and
+/// EARLIEST, and `offset_stage_at`.
+///
+/// The warm figure is the one that matters in production and is already zero — the
+/// absence memo holds it there, and that assertion must survive #179 unchanged. The
+/// cold figure is what #179 collects: **when that issue lands it becomes 0 too.**
+/// Written as an equality rather than an upper bound so the number cannot drift up
+/// unnoticed while the branch still exists.
+#[tokio::test]
+async fn a_segment_topic_read_path_still_probes_records_when_cold() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.tab";
+    let tp = Topition::new(topic, 0);
+
+    {
+        let (storage, _) = segment_store_on(bucket.clone());
+        create(&storage, topic, 1).await?;
+        for n in 0..3 {
+            _ = storage
+                .produce(None, &tp, batch(format!("m-{n}").as_bytes())?)
+                .await?;
+        }
+    }
+
+    // Cold: a fresh process over the same objects, every memo empty.
+    let (storage, counters) = segment_store_on(bucket.clone());
+    counters.reset();
+    exercise_read_paths(&storage, &tp).await?;
+    assert_eq!(
+        1,
+        counters.records_requests(),
+        "cold read path spends this many requests on a legacy region that cannot exist; \
+         #179 removes the branch and this becomes 0"
+    );
+
+    // Warm again on that same process: the memo holds, so repeating the whole read
+    // surface costs nothing further. This assertion must survive #179 unchanged.
+    counters.reset();
+    exercise_read_paths(&storage, &tp).await?;
+    assert_eq!(
+        0,
+        counters.records_requests(),
+        "a warm read path must never re-probe records/"
+    );
+
+    Ok(())
+}
+
+/// Drive the whole read surface once: fetch, LATEST, EARLIEST, offset stage.
+async fn exercise_read_paths(storage: &DynoStore, tp: &Topition) -> Result<()> {
+    _ = storage
+        .fetch(
+            tp,
+            0,
+            1,
+            64 * 1024,
+            IsolationLevel::ReadUncommitted,
+            Duration::from_millis(500),
+        )
+        .await?;
+    _ = storage
+        .list_offsets(
+            IsolationLevel::ReadUncommitted,
+            &[
+                (tp.clone(), ListOffset::Latest),
+                (tp.clone(), ListOffset::Earliest),
+            ],
+        )
+        .await?;
+    _ = storage
+        .offset_stage_at(tp, IsolationLevel::ReadUncommitted)
+        .await?;
     Ok(())
 }
