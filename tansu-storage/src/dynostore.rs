@@ -193,18 +193,6 @@ pub struct DynoStore {
     /// `DuplicateSequenceNumber` / `ProducerFenced` semantics are preserved.
     producers: Arc<Mutex<BTreeMap<ProducerId, OptiCon<ProducerDetail>>>>,
 
-    /// Per-producer debounce state for the lazy `producers/{id}.json` checkpoint
-    /// (#48). The in-memory sequence is advanced on every idempotent batch; the
-    /// durable object is written at most once per
-    /// [`Self::PRODUCER_CHECKPOINT_BATCHES`] batches or
-    /// [`Self::PRODUCER_CHECKPOINT_INTERVAL`], whichever comes first (plus the
-    /// immediate seed/epoch-bump write via [`Self::seed_producer`]). On an
-    /// unclean crash the persisted sequence may lag the acked one by at most one
-    /// such window (graceful-shutdown flush is intentionally not wired — a stale
-    /// checkpoint can only re-accept a bounded tail on replay, never lose data,
-    /// since the object never moves backwards).
-    producer_checkpoints: Arc<Mutex<BTreeMap<ProducerId, ProducerCheckpoint>>>,
-
     /// Per-partition `last_modified` (ms) of the *oldest* surviving batch object,
     /// as observed at the last `delete`-policy scan (#49). Lets the maintenance
     /// loop skip the full `records/` LIST of a partition whose oldest data is
@@ -336,8 +324,6 @@ pub struct DynoStore {
     coalesce_linger: Duration,
     coalesce_batches: usize,
     coalesce_bytes: usize,
-    producer_checkpoint_interval: Duration,
-    producer_checkpoint_batches: u64,
 
     /// Segment-compaction thresholds (#66), each seeded from its compile-time
     /// default and overridable per deployment via [`Self::coalesce_tuning`].
@@ -663,17 +649,8 @@ struct HeldLease {
     version: Option<UpdateVersion>,
 }
 
-/// Debounce accounting for one producer's lazy `producers/{id}.json` checkpoint
-/// (see [`DynoStore::producer_checkpoints`], #48).
-#[derive(Clone, Copy, Debug)]
-struct ProducerCheckpoint {
-    batches_since_flush: u64,
-    last_flush: SystemTime,
-}
-
-/// Per-deployment overrides for the produce-coalescing (#50) and
-/// producer-checkpoint (#48) flush thresholds (#54), applied via
-/// [`DynoStore::coalesce_tuning`]. A `None` field keeps that trigger's
+/// Per-deployment overrides for the coalescing flush thresholds (#54), applied
+/// via [`DynoStore::coalesce_tuning`]. A `None` field keeps that trigger's
 /// compile-time default, so omitting every key reproduces the shipped
 /// behaviour. Populated from the storage URL query string; see the storage
 /// tuning docs for the fan-out tradeoff these expose.
@@ -682,6 +659,12 @@ pub struct CoalesceTuning {
     pub coalesce_linger: Option<Duration>,
     pub coalesce_batches: Option<usize>,
     pub coalesce_bytes: Option<usize>,
+    /// **Inert since #178.** The per-pod `producers/{id}.json` debounce these
+    /// tuned (#48) died with the legacy write path — idempotent dedup is the
+    /// segment flush's folded `ProducerTable` (#88), which has no debounce to
+    /// tune. Still parsed from the storage URL so an existing deployment keeps
+    /// starting; removing the keys is tracked separately, and until then setting
+    /// them does nothing.
     pub producer_checkpoint_interval: Option<Duration>,
     pub producer_checkpoint_batches: Option<u64>,
     pub prefix_compact_min_segments: Option<usize>,
@@ -1323,26 +1306,6 @@ struct ProducerDetail {
     sequences: BTreeMap<ProducerEpoch, BTreeMap<String, BTreeMap<i32, Sequence>>>,
 }
 
-impl ProducerDetail {
-    /// Fold `other` into `self` by taking the element-wise maximum sequence per
-    /// (epoch, topic, partition). Idempotent sequences are monotonic, so a
-    /// max-merge reconciles a lagging or concurrently-written checkpoint without
-    /// ever lowering an already-acked sequence. Used as the `reconcile` closure
-    /// of [`OptiCon::checkpoint`] on the lazy `producers/{id}.json` flush (#48).
-    fn reconcile(&mut self, other: &ProducerDetail) {
-        for (epoch, topics) in &other.sequences {
-            let dst_topics = self.sequences.entry(*epoch).or_default();
-            for (topic, partitions) in topics {
-                let dst_partitions = dst_topics.entry(topic.clone()).or_default();
-                for (partition, sequence) in partitions {
-                    let dst = dst_partitions.entry(*partition).or_default();
-                    *dst = (*dst).max(*sequence);
-                }
-            }
-        }
-    }
-}
-
 impl OptiCon<ProducerDetail> {
     fn new(cluster: &str, producer_id: ProducerId) -> Self {
         Self::path(format!("clusters/{cluster}/producers/{producer_id}.json"))
@@ -1556,7 +1519,6 @@ impl DynoStore {
             truncate_floors: Arc::new(Mutex::new(BTreeMap::new())),
             prefix_read_sync_locks: Arc::new(Mutex::new(BTreeMap::new())),
             producers: Arc::new(Mutex::new(BTreeMap::new())),
-            producer_checkpoints: Arc::new(Mutex::new(BTreeMap::new())),
             oldest_retained: Arc::new(Mutex::new(BTreeMap::new())),
             retention_empty_skip: Arc::new(Mutex::new(BTreeMap::new())),
             oldest_retained_prefix: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1584,8 +1546,6 @@ impl DynoStore {
             coalesce_linger: Self::COALESCE_LINGER,
             coalesce_batches: Self::COALESCE_BATCHES,
             coalesce_bytes: Self::COALESCE_BYTES,
-            producer_checkpoint_interval: Self::PRODUCER_CHECKPOINT_INTERVAL,
-            producer_checkpoint_batches: Self::PRODUCER_CHECKPOINT_BATCHES,
             prefix_compact_min_segments: Self::PREFIX_COMPACT_MIN_SEGMENTS,
             prefix_compact_target_bytes: Self::PREFIX_COMPACT_TARGET_BYTES,
             prefix_compact_keep_hot: Self::PREFIX_COMPACT_KEEP_HOT,
@@ -1655,12 +1615,6 @@ impl DynoStore {
             coalesce_linger: tuning.coalesce_linger.unwrap_or(self.coalesce_linger),
             coalesce_batches: tuning.coalesce_batches.unwrap_or(self.coalesce_batches),
             coalesce_bytes: tuning.coalesce_bytes.unwrap_or(self.coalesce_bytes),
-            producer_checkpoint_interval: tuning
-                .producer_checkpoint_interval
-                .unwrap_or(self.producer_checkpoint_interval),
-            producer_checkpoint_batches: tuning
-                .producer_checkpoint_batches
-                .unwrap_or(self.producer_checkpoint_batches),
             prefix_compact_min_segments: tuning
                 .prefix_compact_min_segments
                 .unwrap_or(self.prefix_compact_min_segments),
@@ -1843,18 +1797,6 @@ impl DynoStore {
     /// visible to every replica (#166), which also retires the per-partition probe
     /// entirely.
     const LEGACY_ABSENCE_UNSEGMENTED_TTL: Duration = Duration::from_secs(5 * 60);
-
-    /// Default debounce window for persisting a producer's `producers/{id}.json`
-    /// (#48): the durable object is checkpointed after at most this many
-    /// idempotent batches have advanced its in-memory sequence. Overridable per
-    /// deployment via `producer_checkpoint_batches` (#54).
-    const PRODUCER_CHECKPOINT_BATCHES: u64 = 64;
-
-    /// Time-based companion to [`Self::PRODUCER_CHECKPOINT_BATCHES`]: a producer
-    /// that keeps advancing below the batch threshold is still checkpointed at
-    /// least this often, bounding the unclean-crash replay window. Overridable
-    /// via `producer_checkpoint_interval` (#54).
-    const PRODUCER_CHECKPOINT_INTERVAL: Duration = Duration::from_millis(250);
 
     /// Default coalescing flush triggers (#50), whichever is reached first:
     /// linger time, batch count, byte size, or offset span. `COALESCE_LINGER`,
@@ -2190,13 +2132,6 @@ impl DynoStore {
         ))
     }
 
-    fn batch_location(&self, topition: &Topition, offset: i64) -> Path {
-        Path::from(format!(
-            "clusters/{}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
-            self.cluster, topition.topic, topition.partition, offset,
-        ))
-    }
-
     fn watermark(&self, topition: &Topition) -> Result<OptiCon<Watermark>> {
         self.watermarks
             .lock()
@@ -2408,118 +2343,6 @@ impl DynoStore {
             .map(|_| ())
     }
 
-    /// Validate and advance a producer's idempotent sequence for `topition`.
-    ///
-    /// The sequence check/advance happens in memory only (the fast-path
-    /// authority); the durable `producers/{id}.json` object is persisted lazily
-    /// via [`OptiCon::checkpoint`] once the per-producer debounce window
-    /// ([`Self::PRODUCER_CHECKPOINT_BATCHES`] / [`Self::PRODUCER_CHECKPOINT_INTERVAL`])
-    /// elapses, so an all-idempotent workload issues ~1 PUT per batch instead of
-    /// two (#48). The `OutOfOrderSequenceNumber` / `DuplicateSequenceNumber` /
-    /// `ProducerFenced` / `UnknownProducerId` outcomes are unchanged from the
-    /// former per-batch `with_mut` (the seed/epoch-bump write stays immediate).
-    async fn advance_idempotent_sequence(
-        &self,
-        producer_id: ProducerId,
-        producer_epoch: ProducerEpoch,
-        topition: &Topition,
-        base_sequence: Sequence,
-        last_offset_delta: i32,
-    ) -> Result<()> {
-        let producer = self.producer(producer_id)?;
-
-        producer
-            .mutate_cached(&self.object_store, |pd| {
-                let Some(mut current) = pd.sequences.last_entry() else {
-                    // An empty/absent producer object means the id was never
-                    // registered (InitProducerId seeds it).
-                    debug!(producer_id, ?pd);
-                    return Err(Error::Api(ErrorCode::UnknownProducerId));
-                };
-
-                if current.key() != &producer_epoch {
-                    debug!(current = ?current.key(), producer_epoch);
-                    return Err(Error::Api(ErrorCode::ProducerFenced));
-                }
-
-                let sequences = current.get_mut();
-                debug!(?sequences);
-
-                match sequences
-                    .entry(topition.topic.clone())
-                    .or_default()
-                    .entry(topition.partition)
-                    .or_default()
-                {
-                    sequence if *sequence < base_sequence => {
-                        debug!(?sequence, base_sequence);
-                        Err(Error::Api(ErrorCode::OutOfOrderSequenceNumber))
-                    }
-
-                    sequence if *sequence > base_sequence => {
-                        debug!(?sequence, base_sequence);
-                        Err(Error::Api(ErrorCode::DuplicateSequenceNumber))
-                    }
-
-                    sequence => {
-                        debug!(?sequence, delta = last_offset_delta + 1);
-                        *sequence += last_offset_delta + 1;
-                        Ok(())
-                    }
-                }
-            })
-            .await?;
-
-        // The advance succeeded; persist it only when the debounce window is due.
-        if self.producer_checkpoint_due(producer_id)? {
-            producer
-                .checkpoint(&self.object_store, ProducerDetail::reconcile)
-                .await?;
-            self.producer_checkpoint_reset(producer_id)?;
-        }
-
-        Ok(())
-    }
-
-    /// Record one more advance for `producer_id` and report whether its durable
-    /// checkpoint is now due (batch-count or interval threshold reached). Seeds
-    /// the entry on first use.
-    fn producer_checkpoint_due(&self, producer_id: ProducerId) -> Result<bool> {
-        let now = SystemTime::now();
-
-        self.producer_checkpoints
-            .lock()
-            .map_err(Into::into)
-            .map(|mut locked| {
-                let entry = locked.entry(producer_id).or_insert(ProducerCheckpoint {
-                    batches_since_flush: 0,
-                    last_flush: now,
-                });
-                entry.batches_since_flush += 1;
-
-                entry.batches_since_flush >= self.producer_checkpoint_batches
-                    || now
-                        .duration_since(entry.last_flush)
-                        .is_ok_and(|elapsed| elapsed >= self.producer_checkpoint_interval)
-            })
-    }
-
-    /// Reset `producer_id`'s debounce accounting after a successful checkpoint.
-    fn producer_checkpoint_reset(&self, producer_id: ProducerId) -> Result<()> {
-        self.producer_checkpoints
-            .lock()
-            .map_err(Into::into)
-            .map(|mut locked| {
-                _ = locked.insert(
-                    producer_id,
-                    ProducerCheckpoint {
-                        batches_since_flush: 0,
-                        last_flush: SystemTime::now(),
-                    },
-                );
-            })
-    }
-
     /// The cached next offset (== high watermark) hint for `topition`, if known
     /// to this process. `None` means the partition has not been read or written
     /// here yet and the tail must be listed. Ignores listing freshness — used for
@@ -2707,25 +2530,6 @@ impl DynoStore {
             .map_err(Into::into)
     }
 
-    /// Reconcile the cached high-watermark hint for `topition` against the
-    /// partition's batch objects and return the authoritative next offset.
-    async fn refresh_high(&self, topition: &Topition) -> Result<i64> {
-        // Cold (no in-memory hint): floor at the persisted watermark so we scan
-        // only the tail, not the whole partition. Still correct for offset
-        // assignment — listing from a floor at/below the true tail still finds
-        // the true tail.
-        let floor = match self.cached_high(topition)? {
-            Some(hint) => hint,
-            None => self.persisted_high(topition).await?,
-        };
-        // Anchor freshness to before the listing (#91): the LIST reflects state
-        // no newer than this instant, so the fresh window never over-claims.
-        let listed_at = SystemTime::now();
-        let high = self.tail_next_offset(topition, Some(floor)).await?;
-        self.mark_listed(topition, high, listed_at)?;
-        Ok(high)
-    }
-
     /// The stale-hint high watermark of a prefix-coalesced sub-stream served
     /// from the in-memory segment index alone — no per-partition object-store
     /// request. `None` means the index is not authoritative for this
@@ -2867,97 +2671,6 @@ impl DynoStore {
             .unwrap_or_else(SystemTime::now);
         self.mark_listed(topition, high, as_of)?;
         Ok(high)
-    }
-
-    /// Assign the next offset to `deflated` and persist it as an immutable,
-    /// create-only batch object whose name encodes the base offset.
-    ///
-    /// The `PutMode::Create` *is* the offset-assignment authority: two writers
-    /// (tasks on one replica, or different replicas) racing the same offset both
-    /// attempt the create, exactly one wins and the loser gets `AlreadyExists`
-    /// (GCS guards this with `x-goog-if-generation-match: 0`), resyncs from the
-    /// partition tail and retries at the next free offset. This keeps the
-    /// produce hot path on *creating distinct new objects* (high create rate is
-    /// fine on GCS) instead of *updating one hot `watermark` object* (capped at
-    /// ~1/s), which is the #13 collapse. Contiguity holds because the resync
-    /// reads the real tail, never a speculative reservation — no gaps, no
-    /// overlaps.
-    async fn assign_and_create(
-        &self,
-        topition: &Topition,
-        record_count: i64,
-        payload: PutPayload,
-    ) -> Result<i64> {
-        /// Bounds the conflict-resync loop so a pathologically hot partition
-        /// fails fast instead of spinning; far above any real contention.
-        const MAX_ATTEMPTS: usize = 64;
-
-        // Under prefix coalescing, a segment-routed topic's ineligible batches
-        // (transactional / control / backfill) still take this legacy
-        // `records/{offset}.batch` path, and assign offsets from the SAME
-        // per-(topic,partition) `cached_high` that a coalesced flush of the same
-        // prefix reads under the per-prefix flush lock. Without holding that lock
-        // here, a legacy write and a flush can both stamp the same offset — a
-        // legacy object and a segment record at one offset, which the two
-        // create-only namespaces cannot detect across each other (#78). Take the
-        // lock so the two offset authorities serialize. No re-entrancy: the flush
-        // path holds this lock and calls `assign_and_create_segment`, never this
-        // function.
-        let _flush_guard = self
-            .prefix_flush_lock(&self.routed_prefix_of(topition).await?)?
-            .lock_owned()
-            .await;
-
-        let mut candidate = match self.cached_high(topition)? {
-            Some(hint) => hint,
-            None => self.refresh_high(topition).await?,
-        };
-
-        for attempt in 0..MAX_ATTEMPTS {
-            match self
-                .object_store
-                .put_opts(
-                    &self.batch_location(topition, candidate),
-                    payload.clone(),
-                    PutOptions {
-                        mode: PutMode::Create,
-                        attributes: Attributes::new(),
-                        ..Default::default()
-                    },
-                )
-                .await
-            {
-                Ok(outcome) => {
-                    debug!(?outcome, candidate, ?topition);
-                    self.set_high(topition, candidate + record_count)?;
-                    // A legacy `records/` object now exists for this topition:
-                    // flip the presence memo to `true` so a following read on
-                    // this process does not serve a stale "no legacy" from the
-                    // long negative window (#110).
-                    self.note_legacy_records_present(topition)?;
-                    return Ok(candidate);
-                }
-
-                Err(object_store::Error::AlreadyExists { .. }) => {
-                    debug!(
-                        candidate,
-                        attempt,
-                        ?topition,
-                        "offset taken, resyncing tail"
-                    );
-                    let listed_at = SystemTime::now();
-                    candidate = self.tail_next_offset(topition, Some(candidate)).await?;
-                    self.mark_listed(topition, candidate, listed_at)?;
-                }
-
-                Err(err) => return Err(err.into()),
-            }
-        }
-
-        error!(?topition, candidate, "offset assignment exhausted retries");
-        // Retriable: exhaustion is contention/backpressure, not a permanent
-        // fault — a fatal code would make the client drop the batch (#6/#129).
-        Err(Error::Api(ErrorCode::KafkaStorageError))
     }
 
     /// The connector prefix a topition's records coalesce under (#57). Popsink
@@ -4624,24 +4337,6 @@ impl DynoStore {
         });
 
         Ok(compacted)
-    }
-
-    /// Record that a legacy `records/` object was just written for `topition` on
-    /// this process, flipping the memoized presence to `true` at once so a
-    /// following read does not serve a stale "no legacy" from the long negative
-    /// window ([`Self::LEGACY_ABSENCE_TTL`]). Called on the legacy create path
-    /// (txn/control/compacted/backfill/non-coalesced batches); the segment write
-    /// path does not touch `records/` and so does not call this.
-    fn note_legacy_records_present(&self, topition: &Topition) -> Result<()> {
-        self.legacy_records_present
-            .lock()
-            .map_err(Into::into)
-            .map(|mut cache| {
-                _ = cache.insert(
-                    topition.to_owned(),
-                    (true, SystemTime::now(), Self::HIGH_WATERMARK_HINT_TTL),
-                );
-            })
     }
 
     /// Fetch a topition's records from the legacy per-`(topic, partition)`
@@ -7860,10 +7555,6 @@ impl DynoStore {
         Ok(floor)
     }
 
-    fn encode(&self, deflated: deflated::Batch) -> Result<PutPayload> {
-        Ok(PutPayload::from(Bytes::from(deflated)))
-    }
-
     fn decode(&self, encoded: Bytes) -> Result<deflated::Batch> {
         debug!(encoded = ?&encoded[..]);
         deflated::Batch::try_from(encoded)
@@ -8665,121 +8356,37 @@ impl Storage for DynoStore {
             let attributes =
                 BatchAttribute::try_from(deflated.attributes).inspect_err(|err| debug!(?err))?;
 
-            // Server-side coalescing: buffer the batch and flush a run as one
-            // object per linger window — per connector prefix into a shared
-            // segment (#57) when prefix mode is on, else per partition (#50).
-            // Transactional and control batches route into segments on the
-            // leaseless prefix path since release B of #174 (footer v3 indexes
-            // them; `meta.json` stays the commit authority); they still bypass
-            // the lease-mode prefix path and the per-partition coalescer,
-            // neither of which has a footer/transaction story. Compacted
-            // batches bypass both paths — a compacted topic can't share a
-            // whole-segment-expiry segment (#61) — UNLESS compacted topics are
-            // segment-routed (#175), which sidesteps that objection by giving
-            // each compacted topic a dedicated prefix (`routed_prefix`); with
-            // the flag off, the gate is exactly today's. The compacted-policy
-            // check is memoized (#113) so a steady-state produce does not read
-            // the topic metadata object per batch; with the flag on the `||`
-            // short-circuits it away entirely here, and `routed_prefix_of`
-            // consults the same memo at enqueue instead.
-            // Every topic is segment-routed since the compacted flags were
-            // hardwired: a compacted topic under its own dedicated prefix, all
-            // others under their connector prefix. Nothing is ineligible, so
-            // nothing reaches the legacy `records/` writer — which is what makes
-            // it deletable here (#178).
-            let coalesce_eligible = true;
-
-            // Will this batch be buffered into a prefix-coalesced segment (#57)?
-            //
-            // Since #177 the answer is "whenever it is eligible": the segment
-            // CAS is the *single* offset authority, so everything must go
-            // through it — a legacy `records/` object would be a second
-            // authority the two create-only name spaces can't reconcile (#78)
-            // and would reintroduce the per-topic LIST/GET the epic removes
-            // (#75). That includes transactional and control batches (#174
-            // release B) and bulk backfill (#90): a large backfill batch trips
-            // the raised byte threshold (see `flush_thresholds`) and flushes as
-            // ~its own segment, keeping the 1-PUT parity the old #62 bypass
-            // gave. The flush is strictly one segment at a time under the
-            // per-prefix lock, so folding backfill in never pipelines sequences
-            // (a failed N after N+1 landed would mint a gap).
-            let prefix_buffer_route = coalesce_eligible;
-
-            if deflated.is_idempotent() {
-                // Under the leaseless arbiter (#86) the segment flush owns
-                // idempotent dedup: it folds the log's producer coordinates into
-                // a `ProducerTable` (#88) — a cross-pod-convergent authority that
-                // also cannot advance before the batch is durable. So the per-pod
-                // `producers/{id}.json` gate is *skipped* for batches taking that
-                // route, since it diverges across a connection migration (#79)
-                // and mishandles i32 sequence wraparound (#80). Transactional
-                // data batches carry real sequences and shift to the same folded
-                // authority now that they take the route (#174 release B);
-                // control markers are not idempotent and never reach this block.
-                // Every other path (non-leaseless, compacted-unrouted, backfill
-                // bypass, legacy create) keeps the gate: validate (and advance)
-                // the idempotent sequence on the producer's own
-                // `producers/{id}.json` object rather than the cluster-global
-                // `meta` object, so distinct producers no longer contend on one
-                // hot object on GCS (#13); the advance is applied in memory and
-                // checkpointed lazily so an idempotent batch costs ~1 PUT (#48).
-                if !prefix_buffer_route {
-                    self.advance_idempotent_sequence(
-                        deflated.producer_id,
-                        deflated.producer_epoch,
-                        topition,
-                        deflated.base_sequence,
-                        deflated.last_offset_delta,
-                    )
-                    .await
-                    .inspect(|outcome| debug!(transaction_id, ?topition, ?outcome))
-                    // `DuplicateSequenceNumber` / `OutOfOrderSequenceNumber` are
-                    // the expected idempotent-producer outcomes for a retried
-                    // batch, not broker failures — log them at debug like the CAS
-                    // itself, and reserve error! for genuinely unexpected Api
-                    // errors (#37).
-                    .inspect_err(|err| {
-                        if err.is_expected_idempotent_outcome() {
-                            debug!(?err, transaction_id, ?topition);
-                        } else {
-                            error!(?err, transaction_id, ?topition);
-                        }
-                    })?;
-                }
-            }
-
             // Captured before `deflated` is moved into the prefix buffer; the
             // transaction registration below needs both.
             let last_offset_delta = deflated.last_offset_delta;
             let producer_epoch = deflated.producer_epoch;
 
-            let offset = if prefix_buffer_route {
-                // Buffered into a prefix-coalesced segment (#57/#174): the
-                // offset resolves only once the segment PUT is durable and the
-                // parked producer is acked, so the transaction registration
-                // below still runs durable-then-register, exactly like the
-                // legacy arm. Deliberately NOT an early return: a transactional
-                // produce that skipped the registration would leave its range
-                // out of `meta.transactions`, `txn_end` would find nothing to
-                // mark, and a read-committed consumer would read aborted data
-                // as committed (the #81 bug class).
-                self.enqueue_prefix_coalesced(topition, deflated).await?
-            } else {
-                // Assign the offset by *creating* the immutable batch object
-                // (its name encodes the base offset), rather than by updating a
-                // hot per-partition `watermark` object on every batch. The
-                // create is the authority; the watermark stays a write-behind
-                // cache only. This is the #13 fix: the produce hot path no
-                // longer hammers a single object capped at ~1 write/s on GCS.
-                let payload = self
-                    .encode(deflated.clone())
-                    .inspect_err(|err| debug!(?err))?;
-
-                self.assign_and_create(topition, last_offset_delta as i64 + 1, payload)
-                    .await
-                    .inspect(|offset| debug!(offset, transaction_id, ?topition))
-                    .inspect_err(|err| error!(?err, transaction_id, ?topition))?
-            };
+            // Every batch is buffered into a prefix-coalesced segment (#57/#174):
+            // a compacted topic under its own dedicated prefix (#175), everything
+            // else under its connector prefix. There is no second write path, and
+            // with #178 there is no longer any code that can form a legacy
+            // `records/` key — so the #78 dual-offset-authority class is
+            // impossible by construction rather than prevented by a routing
+            // invariant. That covers transactional and control batches (#174
+            // release B; footer v3 indexes them, `meta.json` stays the commit
+            // authority) and bulk backfill (#90), which trips the raised byte
+            // threshold and flushes as ~its own segment, keeping the 1-PUT parity
+            // the old #62 bypass gave.
+            //
+            // Idempotent dedup belongs to the segment flush, which folds the log's
+            // producer coordinates into a `ProducerTable` (#88) — a
+            // cross-pod-convergent authority that cannot advance before the batch
+            // is durable. The per-pod `producers/{id}.json` gate it replaced
+            // diverged across a connection migration (#79) and mishandled i32
+            // sequence wraparound (#80); with the legacy path gone, nothing
+            // reaches it and it goes too.
+            //
+            // Deliberately NOT an early return: a transactional produce that
+            // skipped the registration below would leave its range out of
+            // `meta.transactions`, `txn_end` would find nothing to mark, and a
+            // read-committed consumer would read aborted data as committed (the
+            // #81 bug class).
+            let offset = self.enqueue_prefix_coalesced(topition, deflated).await?;
 
             // Register the produced range on the open transaction. Covers the
             // end-transaction marker too (`txn_end` produces it with the
