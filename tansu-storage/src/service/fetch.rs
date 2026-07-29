@@ -500,9 +500,30 @@ where
     }
 }
 
+/// Wire size of a record batch's fixed header: `base_offset` (8) +
+/// `batch_length` (4) + `partition_leader_epoch` (4) + `magic` (1) + `crc` (4) +
+/// `attributes` (2) + `last_offset_delta` (4) + `base_timestamp` (8) +
+/// `max_timestamp` (8) + `producer_id` (8) + `producer_epoch` (2) +
+/// `base_sequence` (4) + `record_count` (4).
+const BATCH_HEADER_BYTES: u64 = 61;
+
 impl ByteSize for Batch {
+    /// A batch costs its header plus its records — NOT its records alone.
+    ///
+    /// Charging only `record_data` made a record-less batch free, and per-key
+    /// compaction leaves exactly those: emptied headers holding the offset space
+    /// contiguous. Two things went wrong for a compacted partition (#228). The
+    /// fetch walk decrements its `max_bytes` budget by this, so a run of headers
+    /// never spent any of it and the walk accumulated every batch from the fetch
+    /// offset to the high watermark — unbounded in memory and on the wire. And
+    /// `fetch`'s outer loop compares the same total against `min_bytes`, so a
+    /// header-only response looked like "no data" and it re-read the same objects
+    /// until `max_wait_ms` expired instead of returning what it had.
+    ///
+    /// The header is real bytes on the wire and real bytes in memory, so charging
+    /// it is both the bound and the honest accounting.
     fn byte_size(&self) -> u64 {
-        self.record_data.len() as u64
+        BATCH_HEADER_BYTES + self.record_data.len() as u64
     }
 }
 
