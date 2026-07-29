@@ -379,9 +379,20 @@ where
     assert_eq!(num_partitions as usize, partitions.len());
 
     assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
-    assert_eq!(Some(2), partitions[0].offset);
-    // LATEST, like EARLIEST, carries no record timestamp (#177): the wire
-    // value is Kafka's "unknown" sentinel, -1, not the tail object's mtime.
+    // Compaction does not move the log start: it removes superseded records, it
+    // does not truncate the offset space, so EARLIEST stays at 0. Only retention
+    // and DeleteRecords advance the log start, which is Kafka's rule.
+    //
+    // This asserted 2 while the legacy in-place compactor did the work — it
+    // rewrote the `records/` objects and advanced `watermark.low` with them, so
+    // the log start followed the surviving record. The per-key pass over segments
+    // does not, and is the conformant one, so the expectation moves rather than
+    // the engine. Verified separately: the survivor keeps its original offset 2,
+    // offsets 0 and 1 remain as emptied batch headers, and the high watermark
+    // stays at 3.
+    assert_eq!(Some(0), partitions[0].offset);
+    // EARLIEST carries no record timestamp (#177): the wire value is Kafka's
+    // "unknown" sentinel, -1, not the tail object's mtime.
     assert_eq!(Some(-1), partitions[0].timestamp);
 
     for partition in partitions[1..].iter() {

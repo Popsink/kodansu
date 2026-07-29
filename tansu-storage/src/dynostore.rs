@@ -236,40 +236,6 @@ pub struct DynoStore {
     /// soundness as the per-partition hint. In-memory only.
     oldest_retained_prefix: Arc<Mutex<BTreeMap<String, i64>>>,
 
-    /// When set, a compacted topic (`cleanup.policy`
-    /// containing `compact`) is segment-routed like any other topic, but under
-    /// its **own** dedicated prefix — the full topic name — instead of
-    /// [`Self::prefix_of`]'s first-three-components connector prefix (#175). A
-    /// dedicated prefix is what keeps whole-segment expiry (#61) away from a
-    /// compacted topic's old-but-latest keys: a shared segment is deleted on
-    /// the *prefix's* retention, which would erase a compacted sibling's only
-    /// copy of a key. Off by default: with the flag off, compacted topics keep
-    /// the legacy `records/` produce path and every routing decision is
-    /// byte-identical to today — the property a mixed-version fleet depends on
-    /// (an old pod resolving a different prefix than a new one is the #78-class
-    /// dual-offset-authority hazard), so the flag is flipped only on a uniform
-    /// fleet.
-    compacted_segments: bool,
-
-    /// When set (with [`Self::compacted_segments`]), maintenance re-encodes a
-    /// segment-routed compacted topic's legacy `records/` objects into segments
-    /// under its dedicated prefix and deletes them (#175 release 2:
-    /// [`Self::carry_over_legacy`]). Off by default, and meaningless without
-    /// `compacted_segments` — there is no segment route for the carried data
-    /// without it, so a carried segment would be invisible to every reader and
-    /// deleting the legacy objects after it would be immediate data loss.
-    ///
-    /// Kept a **separate** flag so the two behaviour changes are two config
-    /// deploys: the carry-over must not start while a flag-off writer can still
-    /// exist, since a rolling-restart pod still producing to legacy `records/`
-    /// is a second offset authority over the region being drained (the
-    /// #78-class hazard). Deploy `compacted_segments=true` fleet-wide first,
-    /// verify the hybrid steady state, then flip this to drain the now-frozen
-    /// legacy regions. Left on permanently afterwards: a drained topic degrades
-    /// to a memoized no-op probe, so the pass becomes the standing
-    /// reconciliation for any future straggler.
-    compacted_carryover: bool,
-
     /// Per-prefix coalescing buffer (#57) — the only produce buffer since #177.
     /// Keyed by prefix, so one buffer accumulates `PrefixPending` batches across
     /// many topitions; drained (never held across an await) on a threshold or
@@ -1594,8 +1560,6 @@ impl DynoStore {
             oldest_retained: Arc::new(Mutex::new(BTreeMap::new())),
             retention_empty_skip: Arc::new(Mutex::new(BTreeMap::new())),
             oldest_retained_prefix: Arc::new(Mutex::new(BTreeMap::new())),
-            compacted_segments: false,
-            compacted_carryover: false,
             prefix_coalesce_buffers: Arc::new(Mutex::new(BTreeMap::new())),
             segment_seqs: Arc::new(Mutex::new(BTreeMap::new())),
             prefix_flush_locks: Arc::new(Mutex::new(BTreeMap::new())),
@@ -1656,30 +1620,20 @@ impl DynoStore {
         }
     }
 
-    /// Route compacted topics into segments under a dedicated per-topic prefix
-    /// and per-key-compact them there (#175). Off by default. Segment routing
-    /// itself is unconditional since #177; this only decides whether a
-    /// *compacted* topic joins it. See the `compacted_segments` field.
-    pub fn compacted_segments(self, compacted_segments: bool) -> Self {
-        Self {
-            compacted_segments,
-            ..self
-        }
+    /// No-op: compacted topics are always segment-routed to their own dedicated
+    /// prefix (#175), and the per-key pass there is what enforces
+    /// `cleanup.policy=compact`. Retained so the existing call sites still
+    /// compile.
+    pub fn compacted_segments(self, _compacted_segments: bool) -> Self {
+        self
     }
 
-    /// Enable the legacy carry-over for segment-routed compacted topics (#175
-    /// release 2): maintenance re-encodes each such topic's legacy `records/`
-    /// objects verbatim into segments under its dedicated prefix and deletes
-    /// them, newest chunk first. Off by default; a no-op unless
-    /// [`Self::compacted_segments`] is also set. Flipped only after
-    /// `compacted_segments` is live on a **uniform**
-    /// fleet — see the `compacted_carryover` field for why the two flips are
-    /// separate deploys.
-    pub fn compacted_carryover(self, compacted_carryover: bool) -> Self {
-        Self {
-            compacted_carryover,
-            ..self
-        }
+    /// No-op: the legacy carry-over always runs, which makes it the standing
+    /// reconciliation for any straggler rather than a one-shot migration
+    /// (#175 release 2, widened by #211). Retained so the existing call sites
+    /// still compile.
+    pub fn compacted_carryover(self, _compacted_carryover: bool) -> Self {
+        self
     }
 
     /// Override the prefix single-writer lease term (#59). Kept above ~1s in
@@ -3033,14 +2987,6 @@ impl DynoStore {
         prefix
     }
 
-    /// Whether compacted topics are segment-routed to dedicated prefixes
-    /// (#175). Segment routing itself is unconditional since #177, so this is
-    /// now just the compacted-topic flag: a compacted topic still keeps the
-    /// legacy `records/` path until the flag is flipped on a uniform fleet.
-    fn compacted_topics_in_segments(&self) -> bool {
-        self.compacted_segments
-    }
-
     /// Whether this topic's legacy `records/` region must be carried into
     /// segments rather than abandoned in place (#211).
     ///
@@ -3094,17 +3040,6 @@ impl DynoStore {
             })
     }
 
-    /// Whether maintenance may drain a segment-routed compacted topic's legacy
-    /// `records/` regions into segments (#175 release 2): the carry-over flag on
-    /// top of [`Self::compacted_topics_in_segments`], because without segment
-    /// routing a carried segment would be invisible to every reader
-    /// (`routed_prefix_of` would resolve the shared prefix) — carrying under a
-    /// flag-off fleet is immediate data loss, so the flags are flipped as two
-    /// config deploys: routing first, carry-over second.
-    fn compacted_carryover_enabled(&self) -> bool {
-        self.compacted_topics_in_segments() && self.compacted_carryover
-    }
-
     /// The prefix a topition's records are segment-routed under, given a
     /// `compacted` verdict the caller already holds (#175): a compacted topic's
     /// dedicated prefix is its **full topic name**, so its segments never share
@@ -3113,7 +3048,7 @@ impl DynoStore {
     /// everything, when the flag is off — is [`Self::prefix_of`], byte-identical
     /// to today.
     fn routed_prefix(&self, topition: &Topition, compacted: bool) -> String {
-        if compacted && self.compacted_topics_in_segments() {
+        if compacted {
             topition.topic().to_owned()
         } else {
             self.prefix_of(topition)
@@ -3132,7 +3067,7 @@ impl DynoStore {
     /// override cannot change their routing.
     async fn routed_prefix_of(&self, topition: &Topition) -> Result<String> {
         let prefix = self.prefix_of(topition);
-        if !self.compacted_topics_in_segments() || prefix == topition.topic() {
+        if prefix == topition.topic() {
             return Ok(prefix);
         }
 
@@ -6994,7 +6929,7 @@ impl DynoStore {
     /// already covered and takes the delete-only path, so it neither duplicates
     /// nor strands.
     async fn carry_over_legacy(&self, topition: &Topition, budget: &mut usize) -> Result<u64> {
-        if !self.compacted_carryover_enabled() || *budget == 0 {
+        if *budget == 0 {
             return Ok(0);
         }
 
@@ -7187,10 +7122,9 @@ impl DynoStore {
             // Compacted topics reach segments only when segment-routed (#175);
             // until then they hold no prefix to maintain. Routed, their
             // dedicated prefix joins the universe so the per-key pass runs
-            // under the same claim as every other prefix's maintenance.
-            if compact && !self.compacted_topics_in_segments() {
-                continue;
-            }
+            // under the same claim as every other prefix's maintenance. Since
+            // the routing flag was hardwired every compacted topic is routed, so
+            // there is no unrouted case left to skip.
             for partition in 0..metadata.topic.num_partitions {
                 _ = universe.insert(self.routed_prefix(
                     &Topition::new(metadata.topic.name.clone(), partition),
@@ -7262,11 +7196,7 @@ impl DynoStore {
             // Segment-routed compacted topics (#175) are size-merge candidates
             // too: the per-key pass leaves cleaned small segments and header
             // residues behind, and the byte-identical merge (#66) is what
-            // bounds their count. Unrouted compacted topics have no segments —
-            // skip, exactly as before.
-            if compact && !self.compacted_topics_in_segments() {
-                continue;
-            }
+            // bounds their count.
             for partition in 0..metadata.topic.num_partitions {
                 _ = prefix_set.insert(self.routed_prefix(
                     &Topition::new(metadata.topic.name.clone(), partition),
@@ -7293,10 +7223,6 @@ impl DynoStore {
         &self,
         owned: Option<&BTreeSet<String>>,
     ) -> Result<BTreeSet<String>> {
-        if !self.compacted_topics_in_segments() {
-            return Ok(BTreeSet::new());
-        }
-
         let mut prefixes = BTreeSet::new();
         for metadata in self.topics_index().await?.iter() {
             // Compacted only, and deliberately *not* the widened carry-over
@@ -7351,10 +7277,6 @@ impl DynoStore {
     /// errors are logged and skip that partition only, as elsewhere in maintenance
     /// (#140): one unreadable object must not strand every other topic's drain.
     async fn carry_over_legacy_topitions(&self, owned: Option<&BTreeSet<String>>) -> Result<u64> {
-        if !self.compacted_carryover_enabled() {
-            return Ok(0);
-        }
-
         let mut budget = Self::CARRYOVER_OBJECT_BUDGET;
         let mut retired = 0u64;
 
@@ -7608,7 +7530,7 @@ impl DynoStore {
             // Kafka's default (`delete`, 7 days) and is the contract the whole
             // engine now follows — see `policy_delete_records`, which was the
             // odd one out until #177 and treated absent as retain-forever.
-            if compact && !(self.compacted_topics_in_segments() && policy.contains("delete")) {
+            if compact && !policy.contains("delete") {
                 continue;
             }
 
@@ -7689,39 +7611,6 @@ impl DynoStore {
 
             _ = offsets.insert(offset, meta);
         }
-
-        Ok(offsets)
-    }
-
-    /// List the base offsets of `topition`'s batch files, sorted ascending.
-    ///
-    /// Unlike [`Self::list_batch_offsets`] this only retains the `i64` offsets
-    /// (not the full [`ObjectMeta`] of every object), so the transient
-    /// allocation stays small on hot partitions with many batch objects (#8).
-    async fn list_batch_offset_keys(&self, topition: &Topition) -> Result<Vec<i64>> {
-        let prefix = self.records_prefix(topition);
-
-        let mut offsets = Vec::new();
-        let mut list_stream = self.scan(Scan::LegacyRecords, &prefix);
-
-        while let Some(meta) = list_stream
-            .next()
-            .await
-            .transpose()
-            .inspect_err(|err| error!(?err, ?topition))?
-        {
-            let Some(name) = meta.location.parts().next_back() else {
-                continue;
-            };
-
-            let Ok(offset) = i64::from_str(&name.as_ref()[0..20]) else {
-                continue;
-            };
-
-            offsets.push(offset);
-        }
-
-        offsets.sort_unstable();
 
         Ok(offsets)
     }
@@ -7969,135 +7858,6 @@ impl DynoStore {
         self.record_prefix_oldest_retained(&prefix, None)?;
 
         Ok(floor)
-    }
-
-    /// Enforce the `compact` cleanup policy: for every topic configured with
-    /// `cleanup.policy` containing `compact`, keep only the latest record per key
-    /// (by offset), dropping the earlier versions. Surviving offsets are
-    /// preserved. Returns the number of records removed.
-    #[instrument(skip(self), ret)]
-    async fn policy_compact(&self) -> Result<u64> {
-        // Segment-routed compacted topics are off-limits to the legacy in-place
-        // compactor (#175 release 2). Gated on *routing*, not on the carry-over
-        // flag, and deliberately so:
-        //
-        // - Once a compacted topic's new writes go to segments, its legacy
-        //   region is frozen — no new duplicate keys land there — so rewriting
-        //   it in place buys nothing.
-        // - It would race the carry-over over the same objects: this path
-        //   mutates with `PutMode::Overwrite`, so a rewrite interleaved between
-        //   the carry-over's read and its delete would be silently dropped.
-        // - It also writes `watermark.low` via `advance_low_watermark`, which
-        //   sets rather than folds; leaving it to run alongside #176's
-        //   truncation floor is more state to reason about for no gain.
-        //
-        // The per-key pass over the dedicated prefix
-        // ([`Self::compact_prefix_per_key`], release 1) is what enforces
-        // `cleanup.policy=compact` for these topics instead.
-        if self.compacted_topics_in_segments() {
-            return Ok(0);
-        }
-
-        let topics = self
-            .topics_index()
-            .await?
-            .iter()
-            .filter_map(|metadata| {
-                let configs = metadata.topic.configs.as_deref().unwrap_or_default();
-
-                let compact = configs.iter().any(|config| {
-                    config.name == "cleanup.policy"
-                        && config
-                            .value
-                            .as_deref()
-                            .is_some_and(|value| value.contains("compact"))
-                });
-
-                compact.then(|| (metadata.topic.name.clone(), metadata.topic.num_partitions))
-            })
-            .collect::<Vec<_>>();
-
-        let mut compacted = 0;
-
-        for (topic, num_partitions) in topics {
-            for partition in 0..num_partitions {
-                let topition = Topition::new(topic.clone(), partition);
-
-                compacted += self
-                    .compact_partition(&topition)
-                    .await
-                    .inspect_err(|err| error!(?err, ?topition))?;
-            }
-        }
-
-        Ok(compacted)
-    }
-
-    /// Compact a single partition: walking the batches newest first, drop every
-    /// record whose key reappears in a more recent batch (and earlier duplicates
-    /// within a batch). Emptied batch files are removed, partially compacted ones
-    /// are rewritten in place (preserving base offset and record offsets).
-    async fn compact_partition(&self, topition: &Topition) -> Result<u64> {
-        let offsets = self.list_batch_offset_keys(topition).await?;
-
-        if offsets.is_empty() {
-            return Ok(0);
-        }
-
-        let mut seen: BTreeSet<Bytes> = BTreeSet::new();
-        let mut removed = vec![];
-        let mut surviving_low: Option<i64> = None;
-        let mut compacted = 0;
-
-        // newest to oldest: a key kept in a newer batch supersedes older ones
-        for offset in offsets.into_iter().rev() {
-            let location = self.batch_location(topition, offset);
-
-            let deflated = match self.object_store.get(&location).await {
-                Ok(get_result) => self.decode(get_result.bytes().await?)?,
-                Err(object_store::Error::NotFound { .. }) => continue,
-                Err(err) => return Err(err.into()),
-            };
-
-            let inflated::Compaction { batch, records } =
-                inflated::Batch::try_from(&deflated)?.compact(&seen)?;
-
-            compacted += records;
-            seen.extend(batch.keys());
-
-            if batch.records.is_empty() {
-                removed.push(location);
-            } else {
-                if records > 0 {
-                    let payload = self.encode(deflated::Batch::try_from(batch)?)?;
-
-                    _ = self
-                        .object_store
-                        .put_opts(
-                            &location,
-                            payload,
-                            PutOptions {
-                                mode: PutMode::Overwrite,
-                                attributes: Attributes::new(),
-                                ..Default::default()
-                            },
-                        )
-                        .await
-                        .inspect_err(|err| error!(?err, ?topition, offset))?;
-                }
-
-                if surviving_low.is_none_or(|low| offset < low) {
-                    surviving_low = Some(offset);
-                }
-            }
-        }
-
-        if !removed.is_empty() {
-            self.delete_batches(removed).await?;
-            self.advance_low_watermark(topition, surviving_low).await?;
-        }
-
-        Ok(compacted as u64)
     }
 
     fn encode(&self, deflated: deflated::Batch) -> Result<PutPayload> {
@@ -8922,8 +8682,12 @@ impl Storage for DynoStore {
             // the topic metadata object per batch; with the flag on the `||`
             // short-circuits it away entirely here, and `routed_prefix_of`
             // consults the same memo at enqueue instead.
-            let coalesce_eligible = self.compacted_topics_in_segments()
-                || !self.topic_is_compacted(topition.topic()).await?;
+            // Every topic is segment-routed since the compacted flags were
+            // hardwired: a compacted topic under its own dedicated prefix, all
+            // others under their connector prefix. Nothing is ineligible, so
+            // nothing reaches the legacy `records/` writer — which is what makes
+            // it deletable here (#178).
+            let coalesce_eligible = true;
 
             // Will this batch be buffered into a prefix-coalesced segment (#57)?
             //
@@ -10871,7 +10635,7 @@ impl Storage for DynoStore {
         let owned = Some(&owned);
 
         let deleted = self.policy_delete_records(now).await?;
-        let compacted = self.policy_compact().await?;
+
         // Retention and segment compaction per prefix, interleaved and
         // concurrent (#140) — not two whole sequential passes, where a delete
         // backlog consumed the bounded run (#131) before compaction ever ran.
@@ -10880,7 +10644,7 @@ impl Storage for DynoStore {
         let expired_groups = self.expire_groups(now).await?;
         debug!(
             deleted,
-            compacted, deleted_segments, compacted_segments, expired_groups
+            deleted_segments, compacted_segments, expired_groups
         );
 
         Ok(())

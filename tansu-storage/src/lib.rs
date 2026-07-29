@@ -2268,25 +2268,6 @@ fn auto_topic_create(storage: &Url) -> AutoTopicCreate {
     config
 }
 
-/// Parse the coalescing (#50) / producer-checkpoint (#48) flush-threshold
-/// overrides from the storage URL query string (#54):
-/// `?coalesce_linger=250ms&coalesce_batches=128&coalesce_bytes=4M&producer_checkpoint_interval=5s&producer_checkpoint_batches=256`.
-///
-/// Durations and sizes use the same `human-units` grammar as `batch_max_delay`
-/// / `batch_min_size`. Any absent or unparseable key is left as `None`, keeping
-/// that trigger at its [`DynoStore`] compile-time default — so omitting every
-/// key reproduces today's behaviour.
-/// Parse a boolean feature flag from the storage URL query string: `true` iff
-/// `key` is present and parses as `true` (an absent or unparseable value is
-/// `false`). Shared by the per-backend `compacted_segments` / `compacted_carryover`
-/// switches.
-#[cfg(feature = "dynostore")]
-fn url_flag(storage: &Url, key: &str) -> bool {
-    storage
-        .query_pairs()
-        .any(|(k, v)| k == key && v.as_ref().parse().unwrap_or(false))
-}
-
 /// Warn once, at store build, for storage-URL keys that selected the pre-#177
 /// layout.
 ///
@@ -2299,7 +2280,13 @@ fn url_flag(storage: &Url, key: &str) -> bool {
 /// comes.
 #[cfg(feature = "dynostore")]
 fn warn_deprecated_layout_flags(storage: &Url) {
-    const DEPRECATED: [&str; 3] = ["prefix_coalesce", "prefix_leaseless", "produce_coalesce"];
+    const DEPRECATED: [&str; 5] = [
+        "prefix_coalesce",
+        "prefix_leaseless",
+        "produce_coalesce",
+        "compacted_segments",
+        "compacted_carryover",
+    ];
 
     let present: Vec<&str> = DEPRECATED
         .into_iter()
@@ -2443,20 +2430,7 @@ impl Builder<i32, String, Url, Url> {
 
                 // Compacted topics segment-routed to dedicated prefixes with a
                 // per-key compaction pass (#175). Off by default; flipped only
-                // on a uniform fleet (see `DynoStore::compacted_segments`).
-                let compacted_segments = url_flag(&self.storage, "compacted_segments");
-                // Drain those topics' legacy `records/` regions into segments
-                // (#175 release 2). A separate flag on purpose: flipped only
-                // once `compacted_segments` is live fleet-wide, so no flag-off
-                // writer can still be appending to the region being drained.
-                let compacted_carryover = url_flag(&self.storage, "compacted_carryover");
-
-                debug!(
-                    ?minimum_size,
-                    ?maximum_delay,
-                    compacted_segments,
-                    compacted_carryover
-                );
+                debug!(?minimum_size, ?maximum_delay);
 
                 AmazonS3Builder::from_env()
                     .with_bucket_name(bucket_name)
@@ -2482,8 +2456,6 @@ impl Builder<i32, String, Url, Url> {
                         DynoStore::new(self.cluster_id.as_str(), self.node_id, object_store)
                             .advertised_listener(self.advertised_listener.clone())
                             .auto_create(auto_topic_create(&self.storage))
-                            .compacted_segments(compacted_segments)
-                            .compacted_carryover(compacted_carryover)
                             .coalesce_tuning(coalesce_tuning(&self.storage))
                     })
                     .map(|storage| {
@@ -2531,9 +2503,6 @@ impl Builder<i32, String, Url, Url> {
 
                 warn_deprecated_layout_flags(&self.storage);
 
-                let compacted_segments = url_flag(&self.storage, "compacted_segments");
-                let compacted_carryover = url_flag(&self.storage, "compacted_carryover");
-
                 GoogleCloudStorageBuilder::from_env()
                     .with_bucket_name(bucket_name)
                     // GCS caps updates to a single object at ~1 write/second; an
@@ -2563,8 +2532,6 @@ impl Builder<i32, String, Url, Url> {
                         DynoStore::new(self.cluster_id.as_str(), self.node_id, object_store)
                             .advertised_listener(self.advertised_listener.clone())
                             .auto_create(auto_topic_create(&self.storage))
-                            .compacted_segments(compacted_segments)
-                            .compacted_carryover(compacted_carryover)
                             .coalesce_tuning(coalesce_tuning(&self.storage))
                     })
                     .map(|storage| {
@@ -2582,8 +2549,6 @@ impl Builder<i32, String, Url, Url> {
                 DynoStore::new(self.cluster_id.as_str(), self.node_id, InMemory::new())
                     .advertised_listener(self.advertised_listener.clone())
                     .auto_create(auto_topic_create(&self.storage))
-                    .compacted_segments(url_flag(&self.storage, "compacted_segments"))
-                    .compacted_carryover(url_flag(&self.storage, "compacted_carryover"))
                     .coalesce_tuning(coalesce_tuning(&self.storage)),
             )
             .map(|storage| Box::new(storage) as Box<dyn Storage>)
@@ -3545,29 +3510,6 @@ mod tests {
         let topition = Topition::from_str("test-topic-0000000-eFC79C8-2147483647")?;
         assert_eq!("test-topic-0000000-eFC79C8", topition.topic());
         assert_eq!(i32::MAX, topition.partition());
-        Ok(())
-    }
-
-    #[cfg(feature = "dynostore")]
-    #[test]
-    fn url_flag_parses_compacted_segments() -> Result<()> {
-        assert!(url_flag(
-            &Url::parse("memory://tansu/?compacted_segments=true")?,
-            "compacted_segments"
-        ));
-        assert!(!url_flag(
-            &Url::parse("memory://tansu/?compacted_segments=false")?,
-            "compacted_segments"
-        ));
-        // Absent and unparseable both read as off, so default is off.
-        assert!(!url_flag(
-            &Url::parse("memory://tansu/")?,
-            "compacted_segments"
-        ));
-        assert!(!url_flag(
-            &Url::parse("memory://tansu/?compacted_segments=notabool")?,
-            "compacted_segments"
-        ));
         Ok(())
     }
 
