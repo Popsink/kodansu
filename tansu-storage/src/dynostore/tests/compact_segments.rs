@@ -29,7 +29,7 @@ use std::{
 
 use bytes::Bytes;
 use futures::TryStreamExt as _;
-use object_store::{ObjectStore as _, memory::InMemory, path::Path};
+use object_store::{ObjectStore as _, ObjectStoreExt as _, memory::InMemory, path::Path};
 use tansu_sans_io::{
     IsolationLevel, ListOffset,
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
@@ -99,6 +99,31 @@ async fn segments_of(bucket: &InMemory, prefix: &str) -> Vec<Path> {
         .try_collect::<Vec<_>>()
         .await
         .expect("list segments")
+}
+
+/// Seed a legacy `records/{offset:020}.batch` object directly into the bucket.
+///
+/// A *compacted* topic can be seeded by producing through a routing-off store,
+/// because the `topic_is_compacted` gate sends it to `records/`. A
+/// **non-compacted** one cannot: it is segment-routed from its first write
+/// whatever the flags say. So the retain-forever cases below — which are not
+/// compacted — have to write the legacy object themselves. Nothing writes this
+/// layout any more (#177); the objects still exist in production buckets.
+async fn seed_legacy_batch(
+    store: &DynoStore,
+    bucket: &InMemory,
+    topition: &Topition,
+    base_offset: i64,
+    batch: deflated::Batch,
+) -> Result<()> {
+    let location = Path::from(format!(
+        "clusters/{CLUSTER}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
+        topition.topic(),
+        topition.partition(),
+        base_offset,
+    ));
+    _ = bucket.put(&location, store.encode_frame(&[batch])?).await?;
+    Ok(())
 }
 
 /// The legacy per-`(topic, partition)` `records/` objects for partition 0.
@@ -527,6 +552,154 @@ async fn carryover_does_not_resurrect_a_superseded_key() -> Result<(), Error> {
         vec![Bytes::from_static(b"fresh")],
         values,
         "the surviving value must be the post-flip one, not the carried legacy copy"
+    );
+
+    Ok(())
+}
+
+/// #211: a **retain-forever** topic's legacy region is carried over too, not
+/// just a compacted one's.
+///
+/// The production case, reproduced: a schema-history topic with
+/// `cleanup.policy=delete` and `retention.ms` at `i64::MAX`, holding legacy
+/// objects and *no segment at all*. The original predicate selected on
+/// `compact`, so it skipped this topic entirely — and #179, which deletes the
+/// legacy read paths, would then have made it read as **empty**. A sweep of the
+/// production bucket found five such topics, one of them exactly this shape.
+///
+/// A schema history is what a connector needs to decode its own journal, so
+/// losing it is not losing replayable history — it is losing the ability to read
+/// what remains. `retention.ms` at infinity is an operator saying so.
+#[tokio::test]
+async fn carryover_drains_a_retain_forever_topic() -> Result<(), Error> {
+    let _guard = super::init_tracing()?;
+
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.schema";
+    let tp = Topition::new(topic, 0);
+
+    // Pre-cutover: everything in legacy `records/`, no segment anywhere — the
+    // shape that would read as empty after #179.
+    {
+        let store = unrouted_store(&bucket);
+        create_topic_with_configs(
+            &store,
+            topic,
+            &[
+                ("cleanup.policy", "delete"),
+                ("retention.ms", &i64::MAX.to_string()),
+            ],
+        )
+        .await?;
+        seed_legacy_batch(&store, &bucket, &tp, 0, keyed_batch(b"s1", b"ddl-1")?).await?;
+        seed_legacy_batch(&store, &bucket, &tp, 1, keyed_batch(b"s2", b"ddl-2")?).await?;
+    }
+    assert_eq!(2, legacy_records(&bucket, topic).await.len());
+    // Not compacted, so its segments would live under the *connector* prefix,
+    // not a dedicated one — and there are none yet.
+    assert!(segments_of(&bucket, "org.env.conn").await.is_empty());
+
+    // Carry-over on. The topic is not compacted, so before #211 this drained
+    // nothing at all.
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .compacted_segments(true)
+        .compacted_carryover(true);
+
+    store.maintain(SystemTime::now()).await?;
+
+    assert!(
+        legacy_records(&bucket, topic).await.is_empty(),
+        "the legacy region must be drained, not abandoned",
+    );
+    assert!(
+        !segments_of(&bucket, "org.env.conn").await.is_empty(),
+        "its content must have landed in segments under the connector prefix",
+    );
+
+    // The whole point: still readable, from the segments alone.
+    let readable: i64 = store
+        .fetch(
+            &tp,
+            0,
+            1,
+            64 * 1024,
+            IsolationLevel::ReadUncommitted,
+            Duration::from_millis(500),
+        )
+        .await?
+        .iter()
+        .map(|batch| i64::from(batch.record_count))
+        .sum();
+    assert_eq!(2, readable, "both schema records survive the carry-over");
+    assert_eq!(2, store.high_watermark(&tp).await?);
+
+    Ok(())
+}
+
+/// `retention.ms=-1` is the documented spelling of retain-forever and selects
+/// the same way as `i64::MAX` (#211) — production carries the latter, the docs
+/// say the former, and both mean expiry can never fire.
+#[tokio::test]
+async fn carryover_treats_minus_one_retention_as_retain_forever() -> Result<(), Error> {
+    let _guard = super::init_tracing()?;
+
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.history";
+    let tp = Topition::new(topic, 0);
+
+    {
+        let store = unrouted_store(&bucket);
+        create_topic_with_configs(&store, topic, &[("retention.ms", "-1")]).await?;
+        seed_legacy_batch(&store, &bucket, &tp, 0, keyed_batch(b"h1", b"v1")?).await?;
+    }
+    assert_eq!(1, legacy_records(&bucket, topic).await.len());
+
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .compacted_segments(true)
+        .compacted_carryover(true);
+    store.maintain(SystemTime::now()).await?;
+
+    assert!(legacy_records(&bucket, topic).await.is_empty());
+
+    Ok(())
+}
+
+/// An ordinary topic is still abandoned in place — the epic's decision (2)
+/// (#211 widens the carve-out, it does not remove it).
+///
+/// Without this, "carry everything" would pass the two tests above while
+/// re-encoding the 3,000-odd hybrid seams the epic deliberately writes off, and
+/// the widening would be indistinguishable from abandoning the decision.
+#[tokio::test]
+async fn carryover_still_leaves_an_ordinary_topic_alone() -> Result<(), Error> {
+    let _guard = super::init_tracing()?;
+
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.ordinary";
+    let tp = Topition::new(topic, 0);
+
+    {
+        let store = unrouted_store(&bucket);
+        create_topic_with_configs(
+            &store,
+            topic,
+            &[("cleanup.policy", "delete"), ("retention.ms", "604800000")],
+        )
+        .await?;
+        seed_legacy_batch(&store, &bucket, &tp, 0, keyed_batch(b"o1", b"v1")?).await?;
+    }
+    let before = legacy_records(&bucket, topic).await;
+    assert_eq!(1, before.len());
+
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .compacted_segments(true)
+        .compacted_carryover(true);
+    store.maintain(SystemTime::now()).await?;
+
+    assert_eq!(
+        before,
+        legacy_records(&bucket, topic).await,
+        "a week's retention is abandonable history: decision (2) still applies",
     );
 
     Ok(())
