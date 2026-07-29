@@ -89,7 +89,7 @@ pub(super) struct Arg {
     #[arg(group = "tls", long)]
     key: Option<PathBuf>,
 
-    /// Default `cleanup.policy` applied to topics created without one (Kafka default: delete). Set empty to opt out (infinite retention).
+    /// Default `cleanup.policy` applied to topics created without one (Kafka default: delete). Set empty to store no policy; note the engine still reads absent as delete, so this does NOT give infinite retention — use retention.ms=-1 per topic for that.
     #[arg(long, env = "DEFAULT_CLEANUP_POLICY", default_value = DEFAULT_CLEANUP_POLICY)]
     default_cleanup_policy: String,
 
