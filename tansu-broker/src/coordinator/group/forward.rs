@@ -61,7 +61,7 @@
 //! status quo rather than to an outage.
 
 use super::{Coordinator, OffsetCommit, administrator::Controller};
-use crate::{METER, Result};
+use crate::{Error, METER, Result};
 use async_trait::async_trait;
 use opentelemetry::{
     KeyValue,
@@ -69,7 +69,7 @@ use opentelemetry::{
 };
 use rama::{Context, Layer as _, Service as _};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fmt::Debug,
     net::IpAddr,
     sync::{
@@ -82,8 +82,8 @@ use tansu_client::{
     BytesConnectionService, ConnectionManager, FrameConnectionLayer, FramePoolLayer, Pool,
 };
 use tansu_sans_io::{
-    ApiKey as _, Body, Frame, Header, HeartbeatRequest, JoinGroupRequest, LeaveGroupRequest,
-    OffsetCommitRequest, OffsetFetchRequest, SyncGroupRequest,
+    ApiKey as _, Body, ErrorCode, Frame, Header, HeartbeatRequest, JoinGroupRequest,
+    LeaveGroupRequest, OffsetCommitRequest, OffsetFetchRequest, SyncGroupRequest,
     join_group_request::JoinGroupRequestProtocol,
     leave_group_request::MemberIdentity,
     offset_commit_request::OffsetCommitRequestTopic,
@@ -504,7 +504,55 @@ pub struct ForwardingCoordinator<C> {
     forward: Arc<dyn Forward>,
     join_timeout_slack: Duration,
     call_timeout: Duration,
+    /// Last rebalance window each group's members asked for, learned from the
+    /// `join` this replica forwarded (#190). `sync` has no such parameter in
+    /// its own signature, yet it is the request that carries the whole
+    /// assignment — so without this it was the biggest payload on the smallest
+    /// deadline.
+    rebalance_windows: Arc<Mutex<BTreeMap<String, Duration>>>,
     fallbacks: Arc<AtomicU64>,
+}
+
+/// What is being forwarded — the parts that describe the request rather than
+/// where it goes or how long it may take.
+struct Forwardee<'a> {
+    api: &'static str,
+    api_key: i16,
+    client_id: Option<&'a str>,
+    /// Reported on a timeout so the deadline can be sized against the payload
+    /// it was too small for (#190). `None` where the request is small and
+    /// fixed-shape.
+    payload_bytes: Option<usize>,
+    /// Whether serving this API locally would write group state. Decides what a
+    /// live-but-slow owner means: for a mutating API it means "do not race it",
+    /// for a read-only one the local answer is free.
+    mutating: bool,
+}
+
+/// What the caller should do with a forward attempt (#190).
+///
+/// The decision turns on distinguishing the two failure shapes. Peers come from
+/// a headless-Service DNS lookup, which publishes only *ready* pods, so an owner
+/// this replica can name is an owner that is up — and ownership moves on its own
+/// when it is not. A **timeout** therefore means the owner accepted the request
+/// and is still working on it. A **transport error** is the genuinely ambiguous
+/// case: the owner may have gone between the DNS refresh and the call.
+///
+/// For a state-mutating API those are opposite situations. Processing locally
+/// against a live owner puts a second writer on one group document — #78's
+/// hazard applied to group state, and the split-brain behind #190's permanent
+/// rebalance churn. Processing locally when the owner has actually gone is the
+/// backstop that keeps the group serviceable.
+#[derive(Debug)]
+enum Forwarded {
+    /// The owner answered.
+    Response(Body),
+    /// Process locally: this replica owns the group, or the forward failed in a
+    /// way that makes the local answer the right one.
+    Local,
+    /// Tell the client to retry against the real owner, which is up and still
+    /// working on this group.
+    Retry,
 }
 
 impl<C> ForwardingCoordinator<C>
@@ -525,7 +573,18 @@ where
             forward,
             join_timeout_slack: JOIN_TIMEOUT_SLACK,
             call_timeout: CALL_TIMEOUT,
+            rebalance_windows: Arc::new(Mutex::new(BTreeMap::new())),
             fallbacks: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Override the flat forward deadline (#190). A deployment whose pooled
+    /// groups are large enough to need longer than the default can raise it
+    /// without a rebuild.
+    pub fn with_call_timeout(self, call_timeout: Duration) -> Self {
+        Self {
+            call_timeout,
+            ..self
         }
     }
 
@@ -535,22 +594,54 @@ where
         self.fallbacks.load(Ordering::Relaxed)
     }
 
+    /// Remember what rebalance window this group's members granted themselves
+    /// (#190), so `sync` can spend it rather than a flat constant.
+    fn note_rebalance_window(&self, group_id: &str, window: Duration) {
+        if let Ok(mut windows) = self.rebalance_windows.lock() {
+            _ = windows.insert(group_id.to_owned(), window);
+        }
+    }
+
+    /// The deadline for forwarding this group's `sync`.
+    ///
+    /// A member that granted itself `rebalance_timeout_ms` for the whole
+    /// rebalance should let the owner use it: `sync` carries members ×
+    /// subscribed topics, and at the scale in #190 the owner legitimately needs
+    /// longer than the flat 15s that applied before. Falls back to
+    /// `call_timeout` for a group whose join this replica never saw, and never
+    /// goes below it — this only ever lengthens the deadline.
+    fn sync_deadline(&self, group_id: &str) -> Duration {
+        self.rebalance_windows
+            .lock()
+            .ok()
+            .and_then(|windows| windows.get(group_id).copied())
+            .map_or(self.call_timeout, |window| window.max(self.call_timeout))
+    }
+
     /// Forward `body` to the owner of `group_id` if that owner is another
     /// replica, bounded by `deadline`.
     ///
-    /// `None` means the caller must process the request locally: either this
-    /// replica is the owner (`outcome="local_owner"`), or the forward failed
-    /// and local processing is the correctness backstop
-    /// (`outcome="fallback"`).
+    /// See [`Forwarded`] for why the caller must treat a timeout and a transport
+    /// error differently rather than both meaning "process locally".
+    ///
+    /// `payload_bytes` is carried only so the timeout warning can report how
+    /// big the request was: a deadline that is too small is impossible to size
+    /// without knowing what it was too small *for* (#190).
     async fn forwarded(
         &self,
-        api: &'static str,
+        what: Forwardee<'_>,
         group_id: &str,
-        api_key: i16,
-        client_id: Option<&str>,
         body: Body,
         deadline: Duration,
-    ) -> Option<Body> {
+    ) -> Forwarded {
+        let Forwardee {
+            api,
+            api_key,
+            client_id,
+            payload_bytes,
+            mutating,
+        } = what;
+
         let owner = self.peers.owner(group_id);
 
         if owner == self.peers.self_ip() {
@@ -562,12 +653,12 @@ where
                 ],
             );
 
-            return None;
+            return Forwarded::Local;
         }
 
         self.forward.retain(&self.peers.peers());
 
-        let kind = match tokio::time::timeout(
+        let (kind, outcome, decision) = match tokio::time::timeout(
             deadline,
             self.forward.call(owner, api_key, client_id, body),
         )
@@ -582,31 +673,46 @@ where
                     ],
                 );
 
-                return Some(response);
+                return Forwarded::Response(response);
             }
 
+            // The owner may already be gone: local processing is the backstop.
             Ok(Err(error)) => {
                 warn!(api, group_id, %owner, %error, "group forward failed; processing locally");
-                "forward"
+                ("forward", "fallback", Forwarded::Local)
+            }
+
+            // The owner is up and still working. Racing it is only a problem if
+            // serving locally would write.
+            Err(_elapsed) if mutating => {
+                warn!(
+                    api,
+                    group_id,
+                    %owner,
+                    ?deadline,
+                    payload_bytes,
+                    "group forward timed out; owner is up, telling the client to retry"
+                );
+                ("timeout", "owner_slow", Forwarded::Retry)
             }
 
             Err(_elapsed) => {
                 warn!(api, group_id, %owner, ?deadline, "group forward timed out; processing locally");
-                "timeout"
+                ("timeout", "fallback", Forwarded::Local)
             }
         };
 
         GROUP_FORWARD_ERRORS.add(1, &[KeyValue::new("kind", kind)]);
         GROUP_FORWARD_TOTAL.add(
             1,
-            &[
-                KeyValue::new("api", api),
-                KeyValue::new("outcome", "fallback"),
-            ],
+            &[KeyValue::new("api", api), KeyValue::new("outcome", outcome)],
         );
-        _ = self.fallbacks.fetch_add(1, Ordering::Relaxed);
 
-        None
+        if matches!(decision, Forwarded::Local) {
+            _ = self.fallbacks.fetch_add(1, Ordering::Relaxed);
+        }
+
+        decision
     }
 }
 
@@ -633,6 +739,9 @@ where
             u64::try_from(rebalance_timeout_ms.unwrap_or(session_timeout_ms)).unwrap_or_default(),
         ) + self.join_timeout_slack;
 
+        // The same window the owner may spend on this group's `sync` (#190).
+        self.note_rebalance_window(group_id, deadline);
+
         let request = JoinGroupRequest::default()
             .group_id(group_id.into())
             .session_timeout_ms(session_timeout_ms)
@@ -645,18 +754,24 @@ where
 
         // join forwards the caller's own client id: the owner derives the
         // member id from it.
-        if let Some(response) = self
+        match self
             .forwarded(
-                "join",
+                Forwardee {
+                    api: "join",
+                    api_key: JoinGroupRequest::KEY,
+                    client_id,
+                    payload_bytes: None,
+                    mutating: true,
+                },
                 group_id,
-                JoinGroupRequest::KEY,
-                client_id,
                 request.into(),
                 deadline,
             )
             .await
         {
-            return Ok(response);
+            Forwarded::Response(response) => return Ok(response),
+            Forwarded::Retry => return Err(Error::Api(ErrorCode::NotCoordinator)),
+            Forwarded::Local => {}
         }
 
         self.local
@@ -685,6 +800,15 @@ where
         protocol_name: Option<&str>,
         assignments: Option<&[SyncGroupRequestAssignment]>,
     ) -> Result<Body> {
+        // Reported on a timeout so the deadline can be sized against what it
+        // was too small for, rather than guessed (#190).
+        let assignment_bytes = assignments.map_or(0, |assignments| {
+            assignments
+                .iter()
+                .map(|assignment| assignment.assignment.len())
+                .sum()
+        });
+
         let request = SyncGroupRequest::default()
             .group_id(group_id.into())
             .generation_id(generation_id)
@@ -694,18 +818,24 @@ where
             .protocol_name(protocol_name.map(ToOwned::to_owned))
             .assignments(assignments.map(<[SyncGroupRequestAssignment]>::to_vec));
 
-        if let Some(response) = self
+        match self
             .forwarded(
-                "sync",
+                Forwardee {
+                    api: "sync",
+                    api_key: SyncGroupRequest::KEY,
+                    client_id: Some(FORWARD_CLIENT_ID),
+                    payload_bytes: Some(assignment_bytes),
+                    mutating: true,
+                },
                 group_id,
-                SyncGroupRequest::KEY,
-                Some(FORWARD_CLIENT_ID),
                 request.into(),
-                self.call_timeout,
+                self.sync_deadline(group_id),
             )
             .await
         {
-            return Ok(response);
+            Forwarded::Response(response) => return Ok(response),
+            Forwarded::Retry => return Err(Error::Api(ErrorCode::NotCoordinator)),
+            Forwarded::Local => {}
         }
 
         self.local
@@ -734,12 +864,19 @@ where
             .member_id(member_id.into())
             .group_instance_id(group_instance_id.map(ToOwned::to_owned));
 
-        if let Some(response) = self
+        // Heartbeat keeps the local fallback on both failure shapes: it is
+        // small, frequent, and a missed one costs a member its session, which is
+        // worse than the write it makes.
+        if let Forwarded::Response(response) = self
             .forwarded(
-                "heartbeat",
+                Forwardee {
+                    api: "heartbeat",
+                    api_key: HeartbeatRequest::KEY,
+                    client_id: Some(FORWARD_CLIENT_ID),
+                    payload_bytes: None,
+                    mutating: false,
+                },
                 group_id,
-                HeartbeatRequest::KEY,
-                Some(FORWARD_CLIENT_ID),
                 request.into(),
                 self.call_timeout,
             )
@@ -771,18 +908,24 @@ where
             .member_id(member_id.map(ToOwned::to_owned))
             .members(forwarded_members);
 
-        if let Some(response) = self
+        match self
             .forwarded(
-                "leave",
+                Forwardee {
+                    api: "leave",
+                    api_key: LeaveGroupRequest::KEY,
+                    client_id: Some(FORWARD_CLIENT_ID),
+                    payload_bytes: None,
+                    mutating: true,
+                },
                 group_id,
-                LeaveGroupRequest::KEY,
-                Some(FORWARD_CLIENT_ID),
                 request.into(),
                 self.call_timeout,
             )
             .await
         {
-            return Ok(response);
+            Forwarded::Response(response) => return Ok(response),
+            Forwarded::Retry => return Err(Error::Api(ErrorCode::NotCoordinator)),
+            Forwarded::Local => {}
         }
 
         self.local.leave(group_id, member_id, members).await
@@ -799,18 +942,27 @@ where
             .retention_time_ms(detail.retention_time_ms)
             .topics(detail.topics.map(<[OffsetCommitRequestTopic]>::to_vec));
 
-        if let Some(response) = self
+        match self
             .forwarded(
-                "offset_commit",
+                Forwardee {
+                    api: "offset_commit",
+                    api_key: OffsetCommitRequest::KEY,
+                    client_id: Some(FORWARD_CLIENT_ID),
+                    payload_bytes: None,
+                    mutating: true,
+                },
                 detail.group_id,
-                OffsetCommitRequest::KEY,
-                Some(FORWARD_CLIENT_ID),
                 request.into(),
                 self.call_timeout,
             )
             .await
         {
-            return Ok(response);
+            Forwarded::Response(response) => return Ok(response),
+            // Committing locally against a live owner is how an offset write is
+            // lost to a CAS conflict (#190) — the very symptom that issue
+            // reports. Retry against the real owner instead.
+            Forwarded::Retry => return Err(Error::Api(ErrorCode::NotCoordinator)),
+            Forwarded::Local => {}
         }
 
         self.local.offset_commit(detail).await
@@ -840,12 +992,18 @@ where
                 .groups(groups.map(<[OffsetFetchRequestGroup]>::to_vec))
                 .require_stable(require_stable);
 
-            if let Some(response) = self
+            // Read-only, so serving it locally cannot create a second writer:
+            // the local fallback stays for both failure shapes.
+            if let Forwarded::Response(response) = self
                 .forwarded(
-                    "offset_fetch",
+                    Forwardee {
+                        api: "offset_fetch",
+                        api_key: OffsetFetchRequest::KEY,
+                        client_id: Some(FORWARD_CLIENT_ID),
+                        payload_bytes: None,
+                        mutating: false,
+                    },
                     target,
-                    OffsetFetchRequest::KEY,
-                    Some(FORWARD_CLIENT_ID),
                     request.into(),
                     self.call_timeout,
                 )
@@ -1705,6 +1863,143 @@ mod tests {
             // one forward attempt per join call (member-id-required + rejoin).
             assert_eq!(2, stub.calls());
             assert_eq!(2, coordinator.fallbacks());
+
+            Ok(())
+        }
+
+        /// #190: a `sync` whose owner is up but slow must not be served
+        /// locally.
+        ///
+        /// The owner comes from a headless-Service DNS lookup, which lists only
+        /// ready pods, so a named owner is a live one and a timeout means it is
+        /// still working on this same generation. Serving the request here too
+        /// puts a second writer on one group document: the group-state CAS then
+        /// conflicts, and the members that lose are told
+        /// `REBALANCE_IN_PROGRESS` on every commit cycle — the permanent
+        /// rebalance churn #190 reports, with the dropped offset commits that
+        /// come with it.
+        ///
+        /// The client is told `NOT_COORDINATOR` instead, which is retriable and
+        /// sends it back to the real owner. `fallbacks` stays zero because
+        /// nothing fell back.
+        #[tokio::test(start_paused = true)]
+        async fn slow_owner_does_not_get_a_second_writer_on_sync() -> Result<()> {
+            let storage = storage_container().await?;
+            let stub = StubForward::new(StubBehaviour::Hang);
+
+            let owner_ip = peer(2);
+            let registry = registry_owning_nothing(peer(1), owner_ip);
+            let group_id = (0u32..)
+                .map(|i| format!("slow-owner-group-{i}"))
+                .find(|group_id| registry.owner(group_id) == owner_ip)
+                .expect("a peer-owned group exists");
+
+            let coordinator = ForwardingCoordinator::with_forward(
+                Controller::with_storage(storage)?,
+                registry,
+                stub.clone(),
+            );
+
+            let error = coordinator
+                .sync(group_id.as_str(), 0, "some-member", None, None, None, None)
+                .await
+                .expect_err("a live-but-slow owner must not be raced");
+
+            assert!(
+                matches!(error, Error::Api(ErrorCode::NotCoordinator)),
+                "expected a retriable NOT_COORDINATOR, got {error:?}",
+            );
+            assert_eq!(1, stub.calls());
+            assert_eq!(
+                0,
+                coordinator.fallbacks(),
+                "nothing fell back: the request was refused, not processed twice",
+            );
+
+            Ok(())
+        }
+
+        /// A transport failure is the opposite case and keeps the backstop
+        /// (#190): the owner may have gone between the DNS refresh and the
+        /// call, so refusing would strand the group.
+        #[tokio::test]
+        async fn unreachable_owner_still_falls_back_on_sync() -> Result<()> {
+            let storage = storage_container().await?;
+            let stub = StubForward::new(StubBehaviour::Fail);
+
+            let owner_ip = peer(2);
+            let registry = registry_owning_nothing(peer(1), owner_ip);
+            let group_id = (0u32..)
+                .map(|i| format!("gone-owner-group-{i}"))
+                .find(|group_id| registry.owner(group_id) == owner_ip)
+                .expect("a peer-owned group exists");
+
+            let coordinator = ForwardingCoordinator::with_forward(
+                Controller::with_storage(storage)?,
+                registry,
+                stub.clone(),
+            );
+
+            // Served by the local Controller, exactly as before.
+            _ = coordinator
+                .sync(group_id.as_str(), 0, "some-member", None, None, None, None)
+                .await?;
+
+            assert_eq!(1, stub.calls());
+            assert_eq!(1, coordinator.fallbacks());
+
+            Ok(())
+        }
+
+        /// #190: `sync` spends the rebalance window its members granted
+        /// themselves, not a flat constant.
+        ///
+        /// `sync` carries the whole assignment — members × subscribed topics —
+        /// so it is the largest group request, and before this it ran on the
+        /// smallest deadline. The window is learned from the `join` this
+        /// replica forwarded, since `sync`'s own signature does not carry it.
+        #[tokio::test]
+        async fn sync_spends_the_rebalance_window_the_members_asked_for() -> Result<()> {
+            let storage = storage_container().await?;
+            let stub = StubForward::new(StubBehaviour::Fail);
+
+            let owner_ip = peer(2);
+            let registry = registry_owning_nothing(peer(1), owner_ip);
+            let group_id = (0u32..)
+                .map(|i| format!("window-group-{i}"))
+                .find(|group_id| registry.owner(group_id) == owner_ip)
+                .expect("a peer-owned group exists");
+
+            let coordinator = ForwardingCoordinator::with_forward(
+                Controller::with_storage(storage)?,
+                registry,
+                stub.clone(),
+            );
+
+            // Unknown group: the flat timeout, which is what applied to every
+            // sync before this.
+            assert_eq!(
+                CALL_TIMEOUT,
+                coordinator.sync_deadline(group_id.as_str()),
+                "an unseen group falls back to the flat deadline",
+            );
+
+            _ = join_as_leader(&coordinator, group_id.as_str()).await?;
+
+            let expected = Duration::from_millis(
+                u64::try_from(REBALANCE_TIMEOUT_MS.unwrap_or(SESSION_TIMEOUT_MS))
+                    .unwrap_or_default(),
+            ) + JOIN_TIMEOUT_SLACK;
+
+            assert_eq!(
+                expected,
+                coordinator.sync_deadline(group_id.as_str()),
+                "after a join, sync gets the window the members granted",
+            );
+            assert!(
+                coordinator.sync_deadline(group_id.as_str()) > CALL_TIMEOUT,
+                "which is longer than the flat deadline that timed out in #190",
+            );
 
             Ok(())
         }
