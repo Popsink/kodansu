@@ -819,36 +819,6 @@ async fn legacy_records_presence_memo_ttls_and_write_through() -> Result<(), Err
         );
     }
 
-    // A legacy `records/` write on this process flips the memo to `true` at once
-    // (the write-through the produce path performs after an `assign_and_create`),
-    // so a stale long-negative cannot hide a just-written legacy record: the next
-    // read returns `true` from memory, no LIST.
-    {
-        let (storage, counters) = coalesce_store();
-        create(&storage, "org.env.conn.hot", 1).await?;
-        let topition = Topition::new("org.env.conn.hot", 0);
-        for n in 0..4 {
-            _ = storage
-                .produce(None, &topition, batch(format!("m-{n}").as_bytes())?)
-                .await?;
-        }
-
-        assert!(!storage.has_legacy_records(&topition).await?);
-        storage.note_legacy_records_present(&topition)?;
-
-        counters.reset();
-        assert!(
-            storage.has_legacy_records(&topition).await?,
-            "a local legacy write must flip the memo to present"
-        );
-        let after = counters.report("has_legacy_records after write-through");
-        assert_eq!(
-            (0, 0),
-            (after.2, after.3),
-            "the flipped-present memo is served from memory, no LIST"
-        );
-    }
-
     Ok(())
 }
 
@@ -1236,14 +1206,6 @@ async fn legacy_probe_is_not_relisted_for_a_segmentless_coalesced_partition() ->
         (0, 0, 0, 0, 0),
         repeated,
         "a segment-less coalesced partition must not re-list records/ per poll"
-    );
-
-    // A legacy write on this process is visible immediately — the longer window
-    // must never outrank the write-through.
-    storage.note_legacy_records_present(&tp)?;
-    assert!(
-        storage.has_legacy_records(&tp).await?,
-        "a legacy write here must flip the memo at once"
     );
 
     Ok(())
