@@ -1855,8 +1855,19 @@ impl DynoStore {
     /// target), not by this size. Overridable via `prefix_compact_target_bytes`.
     const PREFIX_COMPACT_TARGET_BYTES: usize = 16 << 20;
 
-    /// Newest segments never compacted (#66): leaves the actively-produced tail
-    /// alone so compaction never races the current write point.
+    /// Newest segments never compacted (#66): the actively-produced tail is left
+    /// out of the merge, so compaction never rewrites a segment a producer is
+    /// still appending behind.
+    ///
+    /// This does **not** keep compaction out of the producers' race, which an
+    /// earlier wording of this comment claimed. `keep_hot` constrains which
+    /// segments are *merged*; the merged object is still *created* at the next
+    /// tail sequence, in the same `PutMode::Create` namespace produce uses, so
+    /// the compactor remains a contender for it (#130) — and a costly one, since
+    /// a lost claim re-uploads the whole merged payload. That is the shape of a
+    /// production incident, not a theoretical concern: a large compaction PUT
+    /// losing repeatedly against a hot prefix has exhausted the claim budget and
+    /// taken produce down with it.
     const PREFIX_COMPACT_KEEP_HOT: usize = 16;
 
     /// Default maintenance recency window (#126): ~0.9× the default
