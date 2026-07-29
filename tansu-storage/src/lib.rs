@@ -930,10 +930,24 @@ impl From<&GroupDetail> for ConsumerGroupState {
                 ..
             } => Self::Stable,
 
-            _ => {
-                debug!(unknown = ?value);
-                Self::Unknown
-            }
+            // Members have joined and a leader is elected, but `SyncGroup` has
+            // not distributed the assignment yet (#215). Kafka calls that
+            // `CompletingRebalance`; reporting `Unknown` made an
+            // actively-consuming group that rebalances often look broken, and
+            // indistinguishable from a genuinely unknown one.
+            //
+            // This was the *only* way to reach `Unknown` from a `GroupDetail`,
+            // which the compiler now confirms: with this arm present the
+            // catch-all is unreachable. A `GroupDetail` is a group the broker
+            // holds state for, so it never had an unknown state to report — it
+            // had a state with no mapping.
+            GroupDetail {
+                state:
+                    GroupState::Forming {
+                        leader: Some(_), ..
+                    },
+                ..
+            } => Self::CompletingRebalance,
         }
     }
 }
@@ -1011,9 +1025,20 @@ impl From<&NamedGroupDetail> for consumer_group_describe_response::DescribedGrou
                     .error_message(Some(ErrorCode::None.to_string()))
                     .group_id(name.into())
                     .group_state(group_state)
-                    .group_epoch(-1)
-                    .assignment_epoch(-1)
+                    // The generation is the epoch this engine actually has
+                    // (#215). `-1` read as "no information" to every tool.
+                    .group_epoch(group_detail.generation_id)
+                    .assignment_epoch(group_detail.generation_id)
                     .assignor_name(assignor_name)
+                    // Still empty: a KIP-848 member carries a *structured*
+                    // topic-partition assignment, while what this engine
+                    // persists is the classic protocol's opaque blob. Filling
+                    // this means decoding that blob, which is real work and not
+                    // a field copy — deferred, with the reasoning on #215. The
+                    // tools in that issue's report (`rpk`,
+                    // `kafka-consumer-groups.sh`, the AdminClient) all read the
+                    // classic `DescribeGroups` path below, which is now
+                    // populated.
                     .members(Some([].into()))
                     .authorized_operations(-1)
             }
@@ -1044,17 +1069,40 @@ impl From<&NamedGroupDetail> for describe_groups_response::DescribedGroup {
             } => {
                 let group_state = ConsumerGroupState::from(group_detail).to_string();
 
+                // The assignment every client and admin tool decodes to learn
+                // which partitions a group holds (#215). It is persisted — it is
+                // what `SyncGroup` distributed — and was simply never surfaced:
+                // an empty buffer here means `rpk`, `kafka-consumer-groups.sh`
+                // and the AdminClient all derive an empty partition set, never
+                // issue `OffsetFetch`, and report `TOTAL-LAG 0` for every group
+                // whether it is healthy or wedged.
+                let assignments = match group_detail.state {
+                    GroupState::Formed {
+                        ref assignments, ..
+                    } => Some(assignments),
+                    GroupState::Forming { .. } => None,
+                };
+
                 let members = group_detail
                     .members
-                    .keys()
-                    .map(|member_id| {
+                    .iter()
+                    .map(|(member_id, member)| {
                         describe_groups_response::DescribedGroupMember::default()
                             .member_id(member_id.into())
-                            .group_instance_id(None)
+                            .group_instance_id(member.join_response.group_instance_id.clone())
+                            // Not persisted in the group state, so it cannot be
+                            // reported without widening `GroupMember` — see the
+                            // note on #215.
                             .client_id("".into())
                             .client_host("".into())
-                            .member_metadata(Bytes::new())
-                            .member_assignment(Bytes::new())
+                            // The subscription the member joined with.
+                            .member_metadata(member.join_response.metadata.clone())
+                            .member_assignment(
+                                assignments
+                                    .and_then(|assignments| assignments.get(member_id))
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            )
                     })
                     .collect::<Vec<_>>();
 
@@ -1063,7 +1111,7 @@ impl From<&NamedGroupDetail> for describe_groups_response::DescribedGroup {
                     .group_id(name.clone())
                     .group_state(group_state)
                     .protocol_type(group_detail.state.protocol_type().unwrap_or_default())
-                    .protocol_data("".into())
+                    .protocol_data(group_detail.state.protocol_name().unwrap_or_default())
                     .members(Some(members))
                     .authorized_operations(Some(-1))
             }
@@ -3364,6 +3412,125 @@ impl Storage for StorageContainer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn formed_group_with_assignment(
+        member_id: &str,
+        subscription: &[u8],
+        assignment: &[u8],
+    ) -> GroupDetail {
+        GroupDetail {
+            generation_id: 7,
+            members: [(
+                member_id.to_owned(),
+                GroupMember {
+                    join_response: JoinGroupResponseMember::default()
+                        .member_id(member_id.into())
+                        .group_instance_id(Some("inst-1".into()))
+                        .metadata(Bytes::copy_from_slice(subscription)),
+                    last_contact: None,
+                },
+            )]
+            .into(),
+            state: GroupState::Formed {
+                protocol_type: "consumer".into(),
+                protocol_name: "range".into(),
+                leader: member_id.to_owned(),
+                assignments: [(member_id.to_owned(), Bytes::copy_from_slice(assignment))].into(),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// #215: `DescribeGroups` reports the assignment the coordinator handed out.
+    ///
+    /// It was a zero-length buffer for every member. `rpk`,
+    /// `kafka-consumer-groups.sh` and the AdminClient all derive a group's
+    /// partition set from that field and then issue `OffsetFetch` for it, so an
+    /// empty assignment means committed offsets are never read and lag computes
+    /// to 0 — for every group, healthy or wedged. A monitoring stack built on it
+    /// showed all-green through a multi-day consumption outage.
+    #[test]
+    fn describe_groups_reports_the_assignment_and_subscription() {
+        let described = describe_groups_response::DescribedGroup::from(&NamedGroupDetail::found(
+            "g1".into(),
+            formed_group_with_assignment("m-1", b"subscription-bytes", b"assignment-bytes"),
+        ));
+
+        let members = described.members.expect("members");
+        assert_eq!(1, members.len());
+
+        assert_eq!(
+            Bytes::from_static(b"assignment-bytes"),
+            members[0].member_assignment,
+            "the assignment must be surfaced, not an empty buffer",
+        );
+        assert_eq!(
+            Bytes::from_static(b"subscription-bytes"),
+            members[0].member_metadata,
+            "and so must the subscription the member joined with",
+        );
+        assert_eq!(Some("inst-1".to_owned()), members[0].group_instance_id);
+        assert_eq!("Stable", described.group_state.as_str());
+        assert_eq!("range", described.protocol_data.as_str());
+    }
+
+    /// A group mid-rebalance with a leader elected is `CompletingRebalance`, not
+    /// `Unknown` (#215).
+    ///
+    /// That state was the only route to `Unknown`, so an actively-consuming group
+    /// that rebalances often was reported as though the broker knew nothing about
+    /// it — indistinguishable from a group that is genuinely gone.
+    #[test]
+    fn a_group_awaiting_sync_group_is_completing_rebalance() {
+        let awaiting_sync = GroupDetail {
+            members: [("m-1".to_owned(), GroupMember::default())].into(),
+            state: GroupState::Forming {
+                protocol_type: Some("consumer".into()),
+                protocol_name: Some("range".into()),
+                leader: Some("m-1".into()),
+            },
+            ..Default::default()
+        };
+
+        assert_eq!(
+            ConsumerGroupState::CompletingRebalance,
+            ConsumerGroupState::from(&awaiting_sync),
+        );
+
+        // The two neighbouring states are unchanged.
+        let no_leader = GroupDetail {
+            members: [("m-1".to_owned(), GroupMember::default())].into(),
+            state: GroupState::Forming {
+                protocol_type: None,
+                protocol_name: None,
+                leader: None,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            ConsumerGroupState::Assigning,
+            ConsumerGroupState::from(&no_leader),
+        );
+        assert_eq!(
+            ConsumerGroupState::Empty,
+            ConsumerGroupState::from(&GroupDetail::default()),
+        );
+    }
+
+    /// The KIP-848 response reports the generation as its epoch rather than `-1`
+    /// (#215). Its member list stays empty for now — see the note at the call
+    /// site.
+    #[test]
+    fn consumer_group_describe_reports_the_generation_as_its_epoch() {
+        let described =
+            consumer_group_describe_response::DescribedGroup::from(&NamedGroupDetail::found(
+                "g1".into(),
+                formed_group_with_assignment("m-1", b"sub", b"assign"),
+            ));
+
+        assert_eq!(7, described.group_epoch);
+        assert_eq!(7, described.assignment_epoch);
+    }
 
     #[test]
     fn topition_from_str() -> Result<()> {
