@@ -32,15 +32,26 @@ pub const DEFAULT_CLEANUP_POLICY: &str = "delete";
 ///
 /// Mirrors Apache Kafka, where `cleanup.policy` defaults to `delete` and
 /// `retention.ms` to 7 days, so retention is enforced even when the client sends
-/// no topic config. Setting [`cleanup_policy`](Self::cleanup_policy) to `None`
-/// (or an empty string) opts out of injecting any default, restoring the legacy
-/// "infinite retention unless configured" behaviour.
+/// no topic config.
+///
+/// Setting [`cleanup_policy`](Self::cleanup_policy) to `None` (or an empty
+/// string) opts out of *injecting* a stored policy. It does **not** give the
+/// topic infinite retention, which is what this said before #223: the engine
+/// reads an absent `cleanup.policy` as Kafka's default, `delete`, and applies the
+/// 7-day `retention.ms` fallback, so opting out of the injection produces a topic
+/// that expires at 7 days with nothing recorded to explain why.
+///
+/// Retain-forever has exactly one spelling: `retention.ms=-1`, which both expiry
+/// paths map to "never". It can be set per topic with `(Incremental)AlterConfigs`;
+/// there is no broker-level default that expresses it (#224).
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TopicDefaults {
-    /// Default `cleanup.policy`; `None`/empty means "do not inject a default".
+    /// Default `cleanup.policy`; `None`/empty means "do not inject a stored
+    /// policy" — the engine still reads absent as `delete`.
     pub cleanup_policy: Option<String>,
 
-    /// Default `retention.ms`, injected only for `delete`-policy topics.
+    /// Default `retention.ms`, injected only for `delete`-policy topics. `-1`
+    /// means retain forever.
     pub retention_ms: i64,
 }
 
