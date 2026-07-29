@@ -616,9 +616,19 @@ async fn cold_prefix_index_reads_one_get_per_small_footer() -> Result<(), Error>
         region_start,
         "the footer decoded from the over-read locates the segment at base offset 0"
     );
+    // Two GETs: the single small footer, plus the memoized `topic_is_compacted`
+    // read that resolves which prefix this sub-stream lives under. That second
+    // one is the price of routing being unconditional — a compacted topic gets a
+    // dedicated prefix, so the resolution can no longer be skipped. It is paid
+    // once per topic per memo TTL, and the produce gate already pays it, so
+    // steady state is unchanged; it shows up here because this is a deliberately
+    // cold reader.
+    //
+    // The footer itself is still one GET, which is what #112's follow-up bought
+    // and what this test exists to pin.
     assert_eq!(
-        1, reads.1,
-        "one GET for the single small footer (was two before #112 follow-up)"
+        2, reads.1,
+        "one GET for the footer, one to resolve the prefix"
     );
 
     Ok(())

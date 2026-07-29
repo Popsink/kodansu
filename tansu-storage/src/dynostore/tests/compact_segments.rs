@@ -152,56 +152,6 @@ fn now_ms() -> i64 {
     .unwrap_or(i64::MAX)
 }
 
-/// With the flag OFF, routing is byte-identical to today for every policy —
-/// and with it ON, a non-compacted topic is untouched. Without this, deploying
-/// the (dark) flag to one pod of a fleet would already split the prefix the
-/// pods resolve for the same topic: two offset authorities for one sub-stream,
-/// the #78 corruption.
-#[tokio::test]
-async fn flag_off_routing_is_byte_identical() -> Result<(), Error> {
-    let _guard = super::init_tracing()?;
-
-    let bucket = InMemory::new();
-    let store = unrouted_store(&bucket);
-
-    create_topic_with_configs(
-        &store,
-        "org.env.conn.config",
-        &[("cleanup.policy", "compact")],
-    )
-    .await?;
-    let compacted = Topition::new("org.env.conn.config", 0);
-
-    // Flag off: a dotted compacted topic still resolves the SHARED connector
-    // prefix, exactly as `prefix_of` always has.
-    assert_eq!(
-        store.prefix_of(&compacted),
-        store.routed_prefix_of(&compacted).await?
-    );
-    assert_eq!("org.env.conn", store.routed_prefix_of(&compacted).await?);
-
-    // Flag on: a NON-compacted topic keeps the shared prefix — the override
-    // exists for compacted topics only.
-    let routed = routed_store(&bucket);
-    create_topic_with_configs(&routed, "org.env.conn.table", &[]).await?;
-    let plain = Topition::new("org.env.conn.table", 0);
-    assert_eq!("org.env.conn", routed.routed_prefix_of(&plain).await?);
-
-    // Flag on, compacted: the dedicated prefix is the full topic name.
-    assert_eq!(
-        "org.env.conn.config",
-        routed.routed_prefix_of(&compacted).await?
-    );
-
-    // A dotless topic is its own prefix under every combination.
-    create_topic_with_configs(&routed, "kv", &[("cleanup.policy", "compact")]).await?;
-    let dotless = Topition::new("kv", 0);
-    assert_eq!("kv", routed.routed_prefix_of(&dotless).await?);
-    assert_eq!("kv", store.routed_prefix_of(&dotless).await?);
-
-    Ok(())
-}
-
 /// A compacted dotted topic's produce lands in a segment under its OWN prefix
 /// — not the connector prefix shared with its CDC siblings, and not legacy
 /// `records/`. Without this, the topic's segments would share objects whose
@@ -277,14 +227,6 @@ async fn compact_only_prefix_has_no_retention_threshold() -> Result<(), Error> {
     // The delete-policy sibling keeps the shared prefix's threshold, as today.
     assert!(thresholds.contains_key("org.env.conn"));
 
-    // Flag off: every compacted topic is skipped — no threshold under either
-    // its own name or the shared prefix beyond the sibling's.
-    let unrouted = unrouted_store(&bucket);
-    let thresholds = unrouted.segment_retention_thresholds(now, None).await?;
-    assert!(!thresholds.contains_key("org.env.conn.config"));
-    assert!(!thresholds.contains_key("org.env.conn.status"));
-    assert!(thresholds.contains_key("org.env.conn"));
-
     Ok(())
 }
 
@@ -309,10 +251,6 @@ async fn per_key_set_holds_the_dedicated_prefixes() -> Result<(), Error> {
 
     let per_key = store.per_key_compact_prefixes(None).await?;
     assert_eq!(BTreeSet::from(["org.env.conn.config".to_owned()]), per_key);
-
-    // Flag off: empty — the pass must not exist for an unrouted fleet.
-    let unrouted = unrouted_store(&bucket);
-    assert!(unrouted.per_key_compact_prefixes(None).await?.is_empty());
 
     Ok(())
 }
@@ -532,13 +470,25 @@ async fn carryover_drains_legacy_chunk_by_chunk_with_no_hole() -> Result<(), Err
     {
         let store = unrouted_store(&bucket);
         create_topic_with_configs(&store, topic, &[("cleanup.policy", "compact")]).await?;
-        for (key, value) in [
+        // Written directly: routing is unconditional now, so producing would
+        // land in segments rather than the legacy region this test drains.
+        for (offset, (key, value)) in [
             (b"k1".as_slice(), b"v1".as_slice()),
             (b"k2".as_slice(), b"v2".as_slice()),
             (b"k3".as_slice(), b"v3".as_slice()),
             (b"k4".as_slice(), b"v4".as_slice()),
-        ] {
-            _ = store.produce(None, &tp, keyed_batch(key, value)?).await?;
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            seed_legacy_batch(
+                &store,
+                &bucket,
+                &tp,
+                offset as i64,
+                keyed_batch(key, value)?,
+            )
+            .await?;
         }
         assert_eq!(4, legacy_records(&bucket, topic).await.len());
         assert!(segments_of(&bucket, topic).await.is_empty());
@@ -614,9 +564,7 @@ async fn carryover_does_not_resurrect_a_superseded_key() -> Result<(), Error> {
     {
         let store = unrouted_store(&bucket);
         create_topic_with_configs(&store, topic, &[("cleanup.policy", "compact")]).await?;
-        _ = store
-            .produce(None, &tp, keyed_batch(b"key", b"stale")?)
-            .await?;
+        seed_legacy_batch(&store, &bucket, &tp, 0, keyed_batch(b"key", b"stale")?).await?;
         assert_eq!(1, legacy_records(&bucket, topic).await.len());
     }
 
@@ -820,39 +768,6 @@ async fn carryover_still_leaves_an_ordinary_topic_alone() -> Result<(), Error> {
         legacy_records(&bucket, topic).await,
         "a week's retention is abandonable history: decision (2) still applies",
     );
-
-    Ok(())
-}
-
-/// With the carry-over flag off, a routed compacted topic's legacy region is
-/// left strictly alone — the routing flip and the drain are two config deploys,
-/// and the first must not start the second.
-#[tokio::test]
-async fn carryover_off_leaves_the_legacy_region_untouched() -> Result<(), Error> {
-    let _guard = super::init_tracing()?;
-
-    let bucket = InMemory::new();
-    let topic = "org.env.conn.configs";
-    let tp = Topition::new(topic, 0);
-
-    {
-        let store = unrouted_store(&bucket);
-        create_topic_with_configs(&store, topic, &[("cleanup.policy", "compact")]).await?;
-        _ = store.produce(None, &tp, keyed_batch(b"a", b"1")?).await?;
-        _ = store.produce(None, &tp, keyed_batch(b"b", b"2")?).await?;
-    }
-    let before = legacy_records(&bucket, topic).await;
-    assert_eq!(2, before.len());
-
-    // Routing on, carry-over off: maintenance must not retire a single object.
-    let store = routed_store(&bucket);
-    store.maintain(SystemTime::now()).await?;
-    assert_eq!(before, legacy_records(&bucket, topic).await);
-
-    // And the explicit call is a no-op too, not merely unreached.
-    let mut budget = 8usize;
-    assert_eq!(0, store.carry_over_legacy(&tp, &mut budget).await?);
-    assert_eq!(8, budget, "an inert pass must not spend the tick's budget");
 
     Ok(())
 }
