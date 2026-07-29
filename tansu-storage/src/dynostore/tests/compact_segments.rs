@@ -35,7 +35,7 @@ use tansu_sans_io::{
     FetchRequest, IsolationLevel, ListOffset,
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
     fetch_request::{FetchPartition, FetchTopic},
-    record::{Record, deflated, deflated::Batch, inflated},
+    record::{Record, deflated, inflated},
 };
 
 use crate::{Error, FetchService, Result, Storage as _, Topition, dynostore::DynoStore};
@@ -430,7 +430,11 @@ async fn fetch_service_serves_survivors_past_compacted_headers() -> Result<(), E
     }
     store.maintain(SystemTime::now()).await?;
 
-    async fn service_fetch(store: &DynoStore, tp: &Topition, from: i64) -> Result<Vec<Batch>> {
+    async fn service_fetch(
+        store: &DynoStore,
+        tp: &Topition,
+        from: i64,
+    ) -> Result<Vec<deflated::Batch>> {
         let response = FetchService
             .serve(
                 Context::with_state(store.clone()),
