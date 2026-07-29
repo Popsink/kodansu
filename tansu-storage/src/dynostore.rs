@@ -3028,6 +3028,59 @@ impl DynoStore {
         self.compacted_segments
     }
 
+    /// Whether this topic's legacy `records/` region must be carried into
+    /// segments rather than abandoned in place (#211).
+    ///
+    /// Two classes, for the same reason expressed two ways.
+    ///
+    /// A **compacted** topic's surviving latest-value-per-key *is* its state
+    /// (#175), so abandoning its legacy region loses the state itself.
+    ///
+    /// A **retain-forever** topic is an operator saying the same thing
+    /// explicitly. The case that forced this: schema-history topics carrying
+    /// `cleanup.policy=delete` with `retention.ms` at `i64::MAX`. They are not
+    /// compacted, so the original predicate skipped them — yet a schema history
+    /// is what a connector needs to decode its own journal, so losing it is not
+    /// losing replayable history, it is losing the ability to read what remains.
+    /// A production sweep found five such topics still holding legacy objects,
+    /// one of them with no segment at all, which #179 would have made read as
+    /// empty.
+    ///
+    /// Everything else is genuinely abandonable — the epic's decision (2) —
+    /// and is left alone.
+    fn legacy_region_must_survive(topic: &CreatableTopic) -> bool {
+        let configs = topic.configs.as_deref().unwrap_or_default();
+
+        let retain_forever = configs.iter().any(|config| {
+            config.name == "retention.ms"
+                && config
+                    .value
+                    .as_deref()
+                    .and_then(|value| i64::from_str(value).ok())
+                    .is_some_and(|ms| !(0..Self::RETAIN_FOREVER_MS).contains(&ms))
+        });
+
+        Self::topic_configs_are_compacted(topic) || retain_forever
+    }
+
+    /// Whether `cleanup.policy` names `compact`, read straight off the stored
+    /// config. Shared so the carry-over's selection and its prefix resolution
+    /// cannot disagree about what "compacted" means (#211).
+    fn topic_configs_are_compacted(topic: &CreatableTopic) -> bool {
+        topic
+            .configs
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|config| {
+                config.name == "cleanup.policy"
+                    && config
+                        .value
+                        .as_deref()
+                        .is_some_and(|value| value.contains("compact"))
+            })
+    }
+
     /// Whether maintenance may drain a segment-routed compacted topic's legacy
     /// `records/` regions into segments (#175 release 2): the carry-over flag on
     /// top of [`Self::compacted_topics_in_segments`], because without segment
@@ -7233,20 +7286,11 @@ impl DynoStore {
 
         let mut prefixes = BTreeSet::new();
         for metadata in self.topics_index().await?.iter() {
-            let compact = metadata
-                .topic
-                .configs
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .any(|config| {
-                    config.name == "cleanup.policy"
-                        && config
-                            .value
-                            .as_deref()
-                            .is_some_and(|value| value.contains("compact"))
-                });
-            if !compact {
+            // Compacted only, and deliberately *not* the widened carry-over
+            // predicate (#211): the per-key pass keeps one value per key, so
+            // running it over a topic that merely retains forever would delete
+            // records the operator asked to keep.
+            if !Self::topic_configs_are_compacted(&metadata.topic) {
                 continue;
             }
             for partition in 0..metadata.topic.num_partitions {
@@ -7271,9 +7315,22 @@ impl DynoStore {
     /// the retention pass it runs beside.
     const CARRYOVER_OBJECT_BUDGET: usize = 2_048;
 
-    /// Run [`Self::carry_over_legacy`] across every segment-routed compacted
-    /// topic-partition this replica owns this tick (#175 release 2), under one
-    /// shared object budget. Returns the objects retired.
+    /// `retention.ms` at or beyond which time-based expiry can never fire, so
+    /// the topic is retain-forever in practice (#211).
+    ///
+    /// A century. `-1` is the documented spelling, but production carries
+    /// `i64::MAX`, and `segment_retention_thresholds` uses `saturating_sub`, so
+    /// any retention past the current epoch floors the threshold at zero and
+    /// nothing ever expires. Testing against a fixed century rather than
+    /// `now_ms` keeps the predicate time-independent.
+    const RETAIN_FOREVER_MS: i64 = 100 * 365 * 24 * 60 * 60 * 1_000;
+
+    /// Run [`Self::carry_over_legacy`] across every topic-partition this replica
+    /// owns whose legacy region must survive (#175 release 2, widened by #211),
+    /// under one shared object budget. Returns the objects retired.
+    ///
+    /// See [`Self::legacy_region_must_survive`] for which topics those are: the
+    /// selection is not "compacted" but "compacted or retain-forever".
     ///
     /// Sequential on purpose: the budget is per tick, so concurrent workers would
     /// have to share it under a lock, and this is one-shot backlog drainage rather
@@ -7289,22 +7346,17 @@ impl DynoStore {
         let mut retired = 0u64;
 
         for metadata in self.topics_index().await?.iter() {
-            let compact = metadata
-                .topic
-                .configs
-                .as_deref()
-                .unwrap_or_default()
-                .iter()
-                .any(|config| {
-                    config.name == "cleanup.policy"
-                        && config
-                            .value
-                            .as_deref()
-                            .is_some_and(|value| value.contains("compact"))
-                });
-            if !compact {
+            if !Self::legacy_region_must_survive(&metadata.topic) {
                 continue;
             }
+
+            // Which prefix this topic's segments live under, and therefore which
+            // maintenance claim covers it. Only a *compacted* topic gets a
+            // dedicated prefix (#175); a retain-forever one (#211) shares its
+            // connector prefix like any other topic, so assuming `true` below
+            // would look for a claim on a prefix that never exists and skip
+            // every topic the widened predicate just selected.
+            let compacted = Self::topic_configs_are_compacted(&metadata.topic);
 
             for partition in 0..metadata.topic.num_partitions {
                 if budget == 0 {
@@ -7318,7 +7370,7 @@ impl DynoStore {
                 // prefix, so N maintainers split the backlog instead of racing on
                 // the same partition's compaction lease.
                 if let Some(owned) = owned
-                    && !owned.contains(&self.routed_prefix(&topition, true))
+                    && !owned.contains(&self.routed_prefix(&topition, compacted))
                 {
                     continue;
                 }
