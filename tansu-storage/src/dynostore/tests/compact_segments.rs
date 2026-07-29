@@ -30,13 +30,15 @@ use std::{
 use bytes::Bytes;
 use futures::TryStreamExt as _;
 use object_store::{ObjectStore as _, ObjectStoreExt as _, memory::InMemory, path::Path};
+use rama::{Context, Service as _};
 use tansu_sans_io::{
-    IsolationLevel, ListOffset,
+    FetchRequest, IsolationLevel, ListOffset,
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
+    fetch_request::{FetchPartition, FetchTopic},
     record::{Record, deflated, inflated},
 };
 
-use crate::{Error, Result, Storage as _, Topition, dynostore::DynoStore};
+use crate::{Error, FetchService, Result, Storage as _, Topition, dynostore::DynoStore};
 
 const CLUSTER: &str = "tansu";
 const NODE: i32 = 111;
@@ -385,6 +387,123 @@ async fn span_and_tail_survive_per_key_merge_across_restart() -> Result<(), Erro
         .produce(None, &tp, keyed_batch(b"alpha", b"four")?)
         .await?;
     assert_eq!(3, next);
+
+    Ok(())
+}
+
+/// A consumer reading a compacted partition **through the Fetch service** from
+/// an offset whose batch was compacted away still receives the surviving
+/// records (#219).
+///
+/// The storage layer was always right here — it returns the emptied headers and
+/// the survivor together. [`FetchService`] discarded the whole read because its
+/// loop treated a leading `record_count == 0` batch as end-of-stream, and
+/// advanced by `record_count` (0 on a header) rather than by the batch's offset
+/// span. Since compaction does not move the log start, offset 0 stays valid and
+/// resolves to a header — so a fresh `auto.offset.reset=earliest` consumer read
+/// nothing at all, forever, while the high watermark sat above it.
+///
+/// This has to go through the service, not `DynoStore::fetch`: the defect was
+/// entirely in the service's walk over what storage handed it, so a
+/// storage-level assertion cannot see it.
+#[tokio::test]
+async fn fetch_service_serves_survivors_past_compacted_headers() -> Result<(), Error> {
+    let _guard = super::init_tracing()?;
+
+    let bucket = InMemory::new();
+    let tp = Topition::new("org.env.conn.config", 0);
+    let store = routed_store(&bucket);
+
+    create_topic_with_configs(
+        &store,
+        "org.env.conn.config",
+        &[("cleanup.policy", "compact")],
+    )
+    .await?;
+
+    // One key, three writes: compaction keeps the last and empties offsets 0
+    // and 1 down to headers.
+    for value in [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()] {
+        _ = store
+            .produce(None, &tp, keyed_batch(b"alpha", value)?)
+            .await?;
+    }
+    store.maintain(SystemTime::now()).await?;
+
+    async fn service_fetch(
+        store: &DynoStore,
+        tp: &Topition,
+        from: i64,
+    ) -> Result<Vec<deflated::Batch>> {
+        let response = FetchService
+            .serve(
+                Context::with_state(store.clone()),
+                FetchRequest::default()
+                    .max_wait_ms(500)
+                    .min_bytes(1)
+                    .max_bytes(Some(64 * 1024))
+                    .isolation_level(Some((&IsolationLevel::ReadUncommitted).into()))
+                    .topics(Some(
+                        [FetchTopic::default()
+                            .topic(Some(tp.topic().to_owned()))
+                            .partitions(Some(
+                                [FetchPartition::default()
+                                    .partition(tp.partition())
+                                    .fetch_offset(from)
+                                    .partition_max_bytes(64 * 1024)]
+                                .into(),
+                            ))]
+                        .into(),
+                    )),
+            )
+            .await?;
+
+        Ok(response
+            .responses
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|topic| topic.partitions.unwrap_or_default())
+            .filter_map(|partition| partition.records)
+            .flat_map(|frame| frame.batches)
+            .collect())
+    }
+
+    // From 0 — the compacted-away offset a fresh consumer resolves to. The
+    // survivor comes back; before the fix this was empty.
+    let batches = service_fetch(&store, &tp, 0).await?;
+    assert_eq!(
+        1,
+        batches
+            .iter()
+            .map(|batch| i64::from(batch.record_count))
+            .sum::<i64>()
+    );
+    let survivor = batches
+        .iter()
+        .find(|batch| batch.record_count > 0)
+        .expect("survivor");
+    assert_eq!(2, survivor.base_offset);
+
+    // The emptied headers are carried in the response rather than filtered out,
+    // each still spanning the offset it stands for, so a client can skip past
+    // them: every offset in `[0, 3)` is accounted for exactly once.
+    let mut spanned: Vec<i64> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch.base_offset..=batch.base_offset + i64::from(batch.last_offset_delta)
+        })
+        .collect();
+    spanned.sort_unstable();
+    assert_eq!(vec![0, 1, 2], spanned);
+
+    // And a consumer already positioned past the headers is unaffected.
+    let batches = service_fetch(&store, &tp, 2).await?;
+    assert_eq!(1, batches.len());
+    assert_eq!(2, batches[0].base_offset);
+    assert_eq!(1, batches[0].record_count);
+
+    // At the high watermark there is nothing to serve and the walk terminates.
+    assert!(service_fetch(&store, &tp, 3).await?.is_empty());
 
     Ok(())
 }

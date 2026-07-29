@@ -176,20 +176,45 @@ impl FetchService {
 
             debug!(?offset, ?fetched, max_bytes);
 
-            if fetched.is_empty() || fetched.first().is_some_and(|batch| batch.record_count == 0) {
+            if fetched.is_empty() {
                 break;
             }
 
-            if let Some(latest) = fetched
+            // Advance by each batch's OFFSET SPAN, not by its record count, and
+            // never treat a record-less batch as end-of-stream (#219).
+            //
+            // Per-key compaction over segments keeps a compacted-away batch as
+            // a header — records stripped, `last_offset_delta` preserved — so
+            // that the partition's offset space stays contiguous. So
+            // `record_count == 0` is an ordinary interior state of a compacted
+            // log, not a terminator, and `base_offset + record_count` stands
+            // still on such a header. Breaking discarded the whole read
+            // including the surviving records that follow, and a consumer
+            // whose fetch offset had been compacted away (which is any fresh
+            // `auto.offset.reset=earliest` consumer, since compaction does not
+            // move the log start) never made progress.
+            //
+            // The headers stay in the response rather than being filtered out.
+            // They cost only their own 61-byte header, they are what Kafka
+            // itself returns for a compacted log, and they carry the span a
+            // client needs to skip past them — filtering them would reintroduce
+            // the stall for any position that resolves into a run of headers
+            // with nothing surviving after it.
+            let next = fetched
                 .iter()
-                .map(|batch| batch.base_offset + batch.record_count as i64)
+                .map(|batch| batch.base_offset + batch.last_offset_delta as i64 + 1)
                 .max()
-                .inspect(|latest| debug!(latest))
-            {
-                offset = latest;
-            }
+                .inspect(|next| debug!(next));
 
             batches.append(&mut fetched);
+
+            match next {
+                // Only keep reading while the offset actually moves forward: a
+                // batch that spans nothing would otherwise re-read the same
+                // objects forever.
+                Some(next) if next > offset => offset = next,
+                _ => break,
+            }
         }
 
         // Isolation-aware: read-uncommitted resolves its response offsets from
