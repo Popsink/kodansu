@@ -329,6 +329,51 @@ async fn span_and_tail_survive_per_key_merge_across_restart() -> Result<(), Erro
     Ok(())
 }
 
+/// Fetch `tp` from `from` **through [`FetchService`]**, with an explicit byte
+/// budget, and return the batches the client would see.
+///
+/// Going through the service rather than `DynoStore::fetch` is the point: both
+/// #219 and #228 lived entirely in the service's walk over what storage handed
+/// it, so a storage-level assertion cannot see either.
+async fn service_fetch(
+    store: &DynoStore,
+    tp: &Topition,
+    from: i64,
+    max_bytes: i32,
+) -> Result<Vec<deflated::Batch>> {
+    let response = FetchService
+        .serve(
+            Context::with_state(store.clone()),
+            FetchRequest::default()
+                .max_wait_ms(500)
+                .min_bytes(1)
+                .max_bytes(Some(max_bytes))
+                .isolation_level(Some((&IsolationLevel::ReadUncommitted).into()))
+                .topics(Some(
+                    [FetchTopic::default()
+                        .topic(Some(tp.topic().to_owned()))
+                        .partitions(Some(
+                            [FetchPartition::default()
+                                .partition(tp.partition())
+                                .fetch_offset(from)
+                                .partition_max_bytes(max_bytes)]
+                            .into(),
+                        ))]
+                    .into(),
+                )),
+        )
+        .await?;
+
+    Ok(response
+        .responses
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|topic| topic.partitions.unwrap_or_default())
+        .filter_map(|partition| partition.records)
+        .flat_map(|frame| frame.batches)
+        .collect())
+}
+
 /// A consumer reading a compacted partition **through the Fetch service** from
 /// an offset whose batch was compacted away still receives the surviving
 /// records (#219).
@@ -368,47 +413,9 @@ async fn fetch_service_serves_survivors_past_compacted_headers() -> Result<(), E
     }
     store.maintain(SystemTime::now()).await?;
 
-    async fn service_fetch(
-        store: &DynoStore,
-        tp: &Topition,
-        from: i64,
-    ) -> Result<Vec<deflated::Batch>> {
-        let response = FetchService
-            .serve(
-                Context::with_state(store.clone()),
-                FetchRequest::default()
-                    .max_wait_ms(500)
-                    .min_bytes(1)
-                    .max_bytes(Some(64 * 1024))
-                    .isolation_level(Some((&IsolationLevel::ReadUncommitted).into()))
-                    .topics(Some(
-                        [FetchTopic::default()
-                            .topic(Some(tp.topic().to_owned()))
-                            .partitions(Some(
-                                [FetchPartition::default()
-                                    .partition(tp.partition())
-                                    .fetch_offset(from)
-                                    .partition_max_bytes(64 * 1024)]
-                                .into(),
-                            ))]
-                        .into(),
-                    )),
-            )
-            .await?;
-
-        Ok(response
-            .responses
-            .unwrap_or_default()
-            .into_iter()
-            .flat_map(|topic| topic.partitions.unwrap_or_default())
-            .filter_map(|partition| partition.records)
-            .flat_map(|frame| frame.batches)
-            .collect())
-    }
-
     // From 0 — the compacted-away offset a fresh consumer resolves to. The
     // survivor comes back; before the fix this was empty.
-    let batches = service_fetch(&store, &tp, 0).await?;
+    let batches = service_fetch(&store, &tp, 0, 64 * 1024).await?;
     assert_eq!(
         1,
         batches
@@ -435,13 +442,114 @@ async fn fetch_service_serves_survivors_past_compacted_headers() -> Result<(), E
     assert_eq!(vec![0, 1, 2], spanned);
 
     // And a consumer already positioned past the headers is unaffected.
-    let batches = service_fetch(&store, &tp, 2).await?;
+    let batches = service_fetch(&store, &tp, 2, 64 * 1024).await?;
     assert_eq!(1, batches.len());
     assert_eq!(2, batches[0].base_offset);
     assert_eq!(1, batches[0].record_count);
 
     // At the high watermark there is nothing to serve and the walk terminates.
-    assert!(service_fetch(&store, &tp, 3).await?.is_empty());
+    assert!(service_fetch(&store, &tp, 3, 64 * 1024).await?.is_empty());
+
+    Ok(())
+}
+
+/// A fetch over a heavily-compacted partition is bounded by the client's byte
+/// budget instead of walking to the high watermark (#228).
+///
+/// Emptied batch headers cost no `record_data`, so while `ByteSize for Batch`
+/// charged records alone a run of them spent **none** of `max_bytes`: the walk
+/// introduced by #219 accumulated every batch from the fetch offset to the high
+/// watermark, unbounded in memory and on the wire. Two production brokers grew
+/// past 1.4 GiB within three hours of the beta.28 deploy on this.
+///
+/// The budget must bound the walk, and what comes back must still let a consumer
+/// advance — a bounded response that skipped offsets would be a silent gap.
+#[tokio::test]
+async fn a_tight_byte_budget_bounds_the_walk_over_compacted_headers() -> Result<(), Error> {
+    let _guard = super::init_tracing()?;
+
+    const RECORDS: i64 = 64;
+
+    let bucket = InMemory::new();
+    let tp = Topition::new("org.env.conn.config", 0);
+    let store = routed_store(&bucket);
+
+    create_topic_with_configs(
+        &store,
+        "org.env.conn.config",
+        &[("cleanup.policy", "compact")],
+    )
+    .await?;
+
+    // One key, many writes: compaction keeps the last and leaves RECORDS-1
+    // emptied headers behind it.
+    for _ in 0..RECORDS {
+        _ = store
+            .produce(None, &tp, keyed_batch(b"alpha", b"v")?)
+            .await?;
+    }
+    store.maintain(SystemTime::now()).await?;
+    assert_eq!(RECORDS, store.high_watermark(&tp).await?);
+
+    // A generous budget reaches the survivor at the tail.
+    let generous = service_fetch(&store, &tp, 0, 64 * 1024).await?;
+    assert_eq!(
+        1,
+        generous
+            .iter()
+            .map(|batch| i64::from(batch.record_count))
+            .sum::<i64>(),
+        "the survivor must be served when the budget allows the whole span"
+    );
+
+    // A tight budget stops early rather than accumulating the whole span. 512
+    // bytes buys ~8 batch headers; without the fix this returned all 64.
+    let tight = service_fetch(&store, &tp, 0, 512).await?;
+    assert!(
+        !tight.is_empty(),
+        "a bounded walk must still return something to advance on"
+    );
+    assert!(
+        (tight.len() as i64) < RECORDS,
+        "the walk must be bounded by max_bytes, got all {RECORDS} batches"
+    );
+
+    // Whatever came back starts at the requested offset and is contiguous, so the
+    // consumer can resume from the last batch's end and lose nothing.
+    assert_eq!(0, tight[0].base_offset);
+    let mut expected = 0;
+    for batch in &tight {
+        assert_eq!(
+            expected, batch.base_offset,
+            "a bounded response must not skip offsets"
+        );
+        expected = batch.base_offset + i64::from(batch.last_offset_delta) + 1;
+    }
+
+    // Resuming where the bounded response ended eventually reaches the survivor,
+    // so the consumer makes progress rather than stalling.
+    let mut from = expected;
+    let mut guard = 0;
+    let mut saw_survivor = false;
+    while from < RECORDS && guard < RECORDS {
+        let next = service_fetch(&store, &tp, from, 512).await?;
+        if next.is_empty() {
+            break;
+        }
+        assert_eq!(from, next[0].base_offset, "resume must not skip offsets");
+        if next.iter().any(|batch| batch.record_count > 0) {
+            saw_survivor = true;
+        }
+        from = next
+            .last()
+            .map(|batch| batch.base_offset + i64::from(batch.last_offset_delta) + 1)
+            .expect("non-empty");
+        guard += 1;
+    }
+    assert!(
+        saw_survivor,
+        "stepping through with a tight budget must still reach the survivor"
+    );
 
     Ok(())
 }
