@@ -12,15 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Compacted topics over segments (#175): behind the `compacted_segments`
-//! flag, a compacted topic is prefix-coalesced into segments under its OWN
-//! dedicated prefix (the full topic name) instead of `prefix_of`'s
-//! first-three-components connector prefix, is excluded from whole-segment
-//! time expiry unless its policy also contains `delete`, and is per-key
-//! compacted by `compact_prefix_per_key`. With the flag off, routing must be
-//! byte-identical to a build without this code: the flag ships dark to a
-//! mixed-version fleet, and any off-state drift is a #78-class
-//! dual-offset-authority hazard.
+//! Compacted topics over segments (#175): a compacted topic is prefix-coalesced
+//! into segments under its OWN dedicated prefix (the full topic name) instead of
+//! `prefix_of`'s first-three-components connector prefix, is excluded from
+//! whole-segment time expiry unless its policy also contains `delete`, and is
+//! per-key compacted by `compact_prefix_per_key`. Its legacy `records/` region is
+//! drained into that prefix by the carry-over.
+//!
+//! This shipped behind `compacted_segments` / `compacted_carryover` so it could
+//! roll out dark to a mixed-version fleet — any off-state drift being a #78-class
+//! dual-offset-authority hazard. Both are hardwired on since #222, so the tests
+//! below no longer have an off state to pin.
 
 use std::{
     collections::BTreeSet,
@@ -43,13 +45,12 @@ use crate::{Error, FetchService, Result, Storage as _, Topition, dynostore::Dyno
 const CLUSTER: &str = "tansu";
 const NODE: i32 = 111;
 
-/// Segment mode with compacted-topic routing on (#175).
-fn routed_store(bucket: &InMemory) -> DynoStore {
-    DynoStore::new(CLUSTER, NODE, bucket.clone()).compacted_segments(true)
-}
-
-/// Segment mode with the routing flag OFF — today's shipped behaviour.
-fn unrouted_store(bucket: &InMemory) -> DynoStore {
+/// A store over `bucket`. Compacted-topic routing and carry-over are no longer
+/// switchable (#222 hardwired both on), so there is exactly one mode: a compacted
+/// topic is segment-routed under its own dedicated prefix and its legacy region
+/// is drained. This used to be a `routed_store` / `unrouted_store` pair, kept
+/// distinct while the flags shipped dark.
+fn new_store(bucket: &InMemory) -> DynoStore {
     DynoStore::new(CLUSTER, NODE, bucket.clone())
 }
 
@@ -105,12 +106,10 @@ async fn segments_of(bucket: &InMemory, prefix: &str) -> Vec<Path> {
 
 /// Seed a legacy `records/{offset:020}.batch` object directly into the bucket.
 ///
-/// A *compacted* topic can be seeded by producing through a routing-off store,
-/// because the `topic_is_compacted` gate sends it to `records/`. A
-/// **non-compacted** one cannot: it is segment-routed from its first write
-/// whatever the flags say. So the retain-forever cases below — which are not
-/// compacted — have to write the legacy object themselves. Nothing writes this
-/// layout any more (#177); the objects still exist in production buckets.
+/// Nothing in the engine writes this layout any more — #177 made segments the only
+/// routing and #178 deleted the writer itself — so a test that needs a legacy
+/// object to drain has to write it here. The objects still exist in production
+/// buckets, which is what the carry-over is for.
 async fn seed_legacy_batch(
     store: &DynoStore,
     bucket: &InMemory,
@@ -162,7 +161,7 @@ async fn dotted_compacted_topic_routes_to_its_own_prefix() -> Result<(), Error> 
     let _guard = super::init_tracing()?;
 
     let bucket = InMemory::new();
-    let store = routed_store(&bucket);
+    let store = new_store(&bucket);
 
     create_topic_with_configs(
         &store,
@@ -196,7 +195,7 @@ async fn compact_only_prefix_has_no_retention_threshold() -> Result<(), Error> {
     let _guard = super::init_tracing()?;
 
     let bucket = InMemory::new();
-    let store = routed_store(&bucket);
+    let store = new_store(&bucket);
 
     create_topic_with_configs(
         &store,
@@ -239,7 +238,7 @@ async fn per_key_set_holds_the_dedicated_prefixes() -> Result<(), Error> {
     let _guard = super::init_tracing()?;
 
     let bucket = InMemory::new();
-    let store = routed_store(&bucket);
+    let store = new_store(&bucket);
 
     create_topic_with_configs(
         &store,
@@ -268,7 +267,7 @@ async fn span_and_tail_survive_per_key_merge_across_restart() -> Result<(), Erro
     let tp = Topition::new("org.env.conn.config", 0);
 
     {
-        let store = routed_store(&bucket);
+        let store = new_store(&bucket);
         create_topic_with_configs(
             &store,
             "org.env.conn.config",
@@ -305,7 +304,7 @@ async fn span_and_tail_survive_per_key_merge_across_restart() -> Result<(), Erro
     }
 
     // A fresh process (cold caches) recovers the SAME tail from the footers...
-    let restarted = routed_store(&bucket);
+    let restarted = new_store(&bucket);
     assert_eq!(3, restarted.high_watermark(&tp).await?);
 
     let responses = restarted
@@ -395,7 +394,7 @@ async fn fetch_service_serves_survivors_past_compacted_headers() -> Result<(), E
 
     let bucket = InMemory::new();
     let tp = Topition::new("org.env.conn.config", 0);
-    let store = routed_store(&bucket);
+    let store = new_store(&bucket);
 
     create_topic_with_configs(
         &store,
@@ -472,7 +471,7 @@ async fn a_tight_byte_budget_bounds_the_walk_over_compacted_headers() -> Result<
 
     let bucket = InMemory::new();
     let tp = Topition::new("org.env.conn.config", 0);
-    let store = routed_store(&bucket);
+    let store = new_store(&bucket);
 
     create_topic_with_configs(
         &store,
@@ -576,7 +575,7 @@ async fn carryover_drains_legacy_chunk_by_chunk_with_no_hole() -> Result<(), Err
     // Pre-release-2 state: a compacted topic whose data sits in legacy
     // `records/`, one object per batch, and no segment anywhere.
     {
-        let store = unrouted_store(&bucket);
+        let store = new_store(&bucket);
         create_topic_with_configs(&store, topic, &[("cleanup.policy", "compact")]).await?;
         // Written directly: routing is unconditional now, so producing would
         // land in segments rather than the legacy region this test drains.
@@ -602,7 +601,7 @@ async fn carryover_drains_legacy_chunk_by_chunk_with_no_hole() -> Result<(), Err
         assert!(segments_of(&bucket, topic).await.is_empty());
     }
 
-    let store = routed_store(&bucket).compacted_carryover(true);
+    let store = new_store(&bucket);
     assert_eq!(4, store.high_watermark(&tp).await?);
 
     async fn readable(store: &DynoStore, tp: &Topition) -> Result<i64> {
@@ -648,7 +647,28 @@ async fn carryover_drains_legacy_chunk_by_chunk_with_no_hole() -> Result<(), Err
     assert_eq!(4, store.high_watermark(&tp).await?);
 
     // A cold process reads the same log from the footers alone.
-    let restarted = routed_store(&bucket).compacted_carryover(true);
+    let restarted = new_store(&bucket);
+    assert_eq!(4, readable(&restarted, &tp).await?);
+    assert_eq!(4, restarted.high_watermark(&tp).await?);
+
+    // Draining again is a no-op. The carry-over is permanently on, so maintenance
+    // revisits a drained topic on every tick forever; a pass that re-carried would
+    // duplicate records into a new segment and move the tail, which is offset
+    // reuse. Pinned on the segment set rather than on a counter so a rewrite is
+    // caught as well as an append.
+    //
+    // The timestamp is past `MAINTENANCE_RECENCY` (9 min) deliberately: at
+    // `now()` the claim would skip this prefix as recently maintained and the
+    // assertion would hold vacuously, pinning nothing.
+    let before = segments_of(&bucket, topic).await;
+    restarted
+        .maintain(SystemTime::now() + Duration::from_secs(10 * 60))
+        .await?;
+    assert_eq!(
+        before,
+        segments_of(&bucket, topic).await,
+        "a second carry-over over a drained topic must write nothing"
+    );
     assert_eq!(4, readable(&restarted, &tp).await?);
     assert_eq!(4, restarted.high_watermark(&tp).await?);
 
@@ -670,14 +690,14 @@ async fn carryover_does_not_resurrect_a_superseded_key() -> Result<(), Error> {
 
     // `stale` lands in the legacy region...
     {
-        let store = unrouted_store(&bucket);
+        let store = new_store(&bucket);
         create_topic_with_configs(&store, topic, &[("cleanup.policy", "compact")]).await?;
         seed_legacy_batch(&store, &bucket, &tp, 0, keyed_batch(b"key", b"stale")?).await?;
         assert_eq!(1, legacy_records(&bucket, topic).await.len());
     }
 
     // ...and `fresh` supersedes it in a segment, after the routing flip.
-    let store = routed_store(&bucket).compacted_carryover(true);
+    let store = new_store(&bucket);
     _ = store
         .produce(None, &tp, keyed_batch(b"key", b"fresh")?)
         .await?;
@@ -756,7 +776,7 @@ async fn carryover_drains_a_retain_forever_topic() -> Result<(), Error> {
     // Pre-cutover: everything in legacy `records/`, no segment anywhere — the
     // shape that would read as empty after #179.
     {
-        let store = unrouted_store(&bucket);
+        let store = new_store(&bucket);
         create_topic_with_configs(
             &store,
             topic,
@@ -776,9 +796,7 @@ async fn carryover_drains_a_retain_forever_topic() -> Result<(), Error> {
 
     // Carry-over on. The topic is not compacted, so before #211 this drained
     // nothing at all.
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .compacted_segments(true)
-        .compacted_carryover(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     store.maintain(SystemTime::now()).await?;
 
@@ -823,15 +841,13 @@ async fn carryover_treats_minus_one_retention_as_retain_forever() -> Result<(), 
     let tp = Topition::new(topic, 0);
 
     {
-        let store = unrouted_store(&bucket);
+        let store = new_store(&bucket);
         create_topic_with_configs(&store, topic, &[("retention.ms", "-1")]).await?;
         seed_legacy_batch(&store, &bucket, &tp, 0, keyed_batch(b"h1", b"v1")?).await?;
     }
     assert_eq!(1, legacy_records(&bucket, topic).await.len());
 
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .compacted_segments(true)
-        .compacted_carryover(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
     store.maintain(SystemTime::now()).await?;
 
     assert!(legacy_records(&bucket, topic).await.is_empty());
@@ -854,7 +870,7 @@ async fn carryover_still_leaves_an_ordinary_topic_alone() -> Result<(), Error> {
     let tp = Topition::new(topic, 0);
 
     {
-        let store = unrouted_store(&bucket);
+        let store = new_store(&bucket);
         create_topic_with_configs(
             &store,
             topic,
@@ -866,9 +882,7 @@ async fn carryover_still_leaves_an_ordinary_topic_alone() -> Result<(), Error> {
     let before = legacy_records(&bucket, topic).await;
     assert_eq!(1, before.len());
 
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone())
-        .compacted_segments(true)
-        .compacted_carryover(true);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
     store.maintain(SystemTime::now()).await?;
 
     assert_eq!(
