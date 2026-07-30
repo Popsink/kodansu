@@ -34,13 +34,14 @@ use futures::TryStreamExt as _;
 use object_store::{ObjectStore as _, ObjectStoreExt as _, memory::InMemory, path::Path};
 use rama::{Context, Service as _};
 use tansu_sans_io::{
-    FetchRequest, IsolationLevel, ListOffset,
+    ErrorCode, FetchRequest, IsolationLevel, ListOffset, OpType,
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
     fetch_request::{FetchPartition, FetchTopic},
+    incremental_alter_configs_request::AlterableConfig,
     record::{Record, deflated, inflated},
 };
 
-use crate::{Error, FetchService, Result, Storage as _, Topition, dynostore::DynoStore};
+use crate::{Error, FetchService, Result, Storage as _, TopicId, Topition, dynostore::DynoStore};
 
 const CLUSTER: &str = "tansu";
 const NODE: i32 = 111;
@@ -889,6 +890,189 @@ async fn carryover_still_leaves_an_ordinary_topic_alone() -> Result<(), Error> {
         before,
         legacy_records(&bucket, topic).await,
         "a week's retention is abandonable history: decision (2) still applies",
+    );
+
+    Ok(())
+}
+
+/// An `AlterConfigs` that turns compaction ON for a live topic does NOT move where
+/// its records are written (#236). The routing prefix is pinned at creation, so the
+/// topic keeps the prefix its existing segments are under.
+///
+/// This is the dual-offset-authority window (#78) closing. While routing was
+/// derived from `cleanup.policy`, the verdict was memoized per pod for
+/// `HIGH_WATERMARK_HINT_TTL`, so for a few seconds after such an `AlterConfigs` one
+/// pod routed a batch to the dedicated prefix while a peer still routed the same
+/// `(topic, partition)` to the connector prefix — two create-CAS namespaces
+/// assigning offsets for one partition. Pinned, there is no window at all, and the
+/// value becomes permanently cacheable, which is where the ~$38/day goes.
+#[tokio::test]
+async fn alter_configs_does_not_move_pinned_routing() -> Result<(), Error> {
+    let _guard = super::init_tracing()?;
+
+    let bucket = InMemory::new();
+    let store = new_store(&bucket);
+
+    let topic = "org.env.conn.live";
+    create_topic_with_configs(&store, topic, &[("cleanup.policy", "delete")]).await?;
+    let tp = Topition::new(topic, 0);
+
+    assert_eq!(
+        0,
+        store.produce(None, &tp, keyed_batch(b"k", b"v1")?).await?
+    );
+    assert_eq!(1, segments_of(&bucket, "org.env.conn").await.len());
+    assert!(segments_of(&bucket, topic).await.is_empty());
+
+    // Turn compaction on: the operation that used to move the routing.
+    store
+        .topic_meta(topic)?
+        .with_mut(&store.object_store, |metadata| {
+            metadata.alter_configs(&[AlterableConfig::default()
+                .name("cleanup.policy".into())
+                .config_operation(OpType::Set.into())
+                .value(Some("compact".into()))])
+        })
+        .await?;
+
+    // A pod with a cold memo is the interesting one: it reads the pin, not the
+    // config it would otherwise find changed.
+    let peer = new_store(&bucket);
+    assert_eq!(
+        "org.env.conn",
+        peer.routed_prefix_of(&tp).await?,
+        "a pinned topic's routing must not follow cleanup.policy"
+    );
+
+    assert_eq!(
+        1,
+        store.produce(None, &tp, keyed_batch(b"k", b"v2")?).await?
+    );
+    assert_eq!(
+        2,
+        segments_of(&bucket, "org.env.conn").await.len(),
+        "the second produce must land in the same prefix as the first — one segment each, \
+         since an awaited produce flushes"
+    );
+    assert!(
+        segments_of(&bucket, topic).await.is_empty(),
+        "no dedicated-prefix segment may appear for a topic pinned to the connector prefix"
+    );
+
+    Ok(())
+}
+
+/// A topic created before pinning existed has no pin, and the fallback must
+/// reproduce **exactly** the old derivation before pinning it (#236) — for both
+/// classes. Getting this wrong is not a cost regression: new records would land
+/// under a prefix the topic's existing segments are not under, and what is already
+/// written would become unreachable.
+#[tokio::test]
+async fn an_unpinned_topic_keeps_the_routing_it_already_has() -> Result<(), Error> {
+    let _guard = super::init_tracing()?;
+
+    let bucket = InMemory::new();
+
+    for (topic, configs, expected) in [
+        (
+            "org.env.conn.plain",
+            &[("cleanup.policy", "delete")][..],
+            "org.env.conn",
+        ),
+        (
+            "org.env.conn.state",
+            &[("cleanup.policy", "compact")][..],
+            "org.env.conn.state",
+        ),
+    ] {
+        let store = new_store(&bucket);
+        create_topic_with_configs(&store, topic, configs).await?;
+
+        // Erase the pin: this is what a pre-#236 topic looks like in a production
+        // bucket — metadata object, segments, no `topic-routing/` object.
+        bucket.delete(&store.topic_routing_path(topic)).await?;
+
+        let cold = new_store(&bucket);
+        let tp = Topition::new(topic, 0);
+        assert_eq!(
+            expected,
+            cold.routed_prefix_of(&tp).await?,
+            "the fallback must reproduce the pre-pin derivation for {topic}"
+        );
+
+        // … and it pins that answer, so this is the last derivation anyone pays for.
+        assert_eq!(
+            Some(expected.to_owned()),
+            cold.read_routing_pin(topic).await?,
+            "the derived answer must be pinned for {topic}"
+        );
+    }
+
+    Ok(())
+}
+
+/// Two pods that race the lazy pin converge on one value: create-only means the
+/// first writer wins and the loser adopts the winner's prefix (#236).
+///
+/// Without that, a permanent per-pod cache would turn the old bounded window into a
+/// permanent split — two offset authorities for one partition, for as long as both
+/// pods live.
+#[tokio::test]
+async fn a_lazily_pinned_prefix_converges_across_pods() -> Result<(), Error> {
+    let _guard = super::init_tracing()?;
+
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.race";
+
+    let seed = new_store(&bucket);
+    create_topic_with_configs(&seed, topic, &[("cleanup.policy", "delete")]).await?;
+    bucket.delete(&seed.topic_routing_path(topic)).await?;
+
+    // One pod pins the answer it derives; the other arrives after and must adopt it
+    // rather than keeping its own.
+    let winner = new_store(&bucket);
+    let loser = new_store(&bucket);
+    let tp = Topition::new(topic, 0);
+
+    let first = winner.routed_prefix_of(&tp).await?;
+    let second = loser.routed_prefix_of(&tp).await?;
+
+    assert_eq!(first, second, "pods must agree on a lazily pinned prefix");
+    assert_eq!(Some(first), loser.read_routing_pin(topic).await?);
+
+    Ok(())
+}
+
+/// A re-created topic does not inherit its predecessor's routing: the pin is
+/// deleted with the topic, and `create_topic` overwrites rather than writing
+/// create-only, so even a torn delete cannot leave a stale pin in force (#236).
+#[tokio::test]
+async fn a_recreated_topic_is_pinned_afresh() -> Result<(), Error> {
+    let _guard = super::init_tracing()?;
+
+    let bucket = InMemory::new();
+    let store = new_store(&bucket);
+
+    let topic = "org.env.conn.reborn";
+    create_topic_with_configs(&store, topic, &[("cleanup.policy", "compact")]).await?;
+    assert_eq!(Some(topic.to_owned()), store.read_routing_pin(topic).await?);
+
+    assert_eq!(
+        ErrorCode::None,
+        store.delete_topic(&TopicId::Name(topic.into())).await?
+    );
+    assert_eq!(None, store.read_routing_pin(topic).await?);
+
+    create_topic_with_configs(&store, topic, &[("cleanup.policy", "delete")]).await?;
+    assert_eq!(
+        Some("org.env.conn".to_owned()),
+        store.read_routing_pin(topic).await?,
+        "a re-created topic is pinned from its own config"
+    );
+    assert_eq!(
+        "org.env.conn",
+        store.routed_prefix_of(&Topition::new(topic, 0)).await?,
+        "the in-process memo must not survive the delete"
     );
 
     Ok(())
