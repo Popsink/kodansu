@@ -32,7 +32,7 @@ use futures::{
     StreamExt,
     stream::{BoxStream, TryStreamExt},
 };
-use metadata::Cache;
+use metadata::{Cache, key_class};
 use object_store::{
     Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetRange,
     GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode,
@@ -10411,6 +10411,25 @@ fn object_store_error_name(error: &object_store::Error) -> &'static str {
 #[derive(Debug, Clone)]
 struct Metron<O> {
     request_duration: Histogram<u64>,
+
+    /// Metered request outcomes that are not a body, labelled by method, reason
+    /// and — for a request that addresses a key — key class (#167).
+    ///
+    /// The class is what makes the `not_modified` and `not_found` populations
+    /// attributable *at the layer that bills*: this wrapper sits under the
+    /// metadata cache, so it counts only the round trips that actually left the
+    /// process. Without it, the 304 plane could only be inferred from
+    /// `tansu_objectstore_cache_outcomes` misses by class — and that series
+    /// conflates two populations, since a miss is recorded whenever no etag is
+    /// memoized, whether the caller presented one (a revalidation, which the
+    /// store answers `304`) or not (a body read, e.g. a ranged segment GET).
+    /// That inference was right about `watermark` and `topic_metadata` and wrong
+    /// about `segment`, which carries no `if_none_match` and is never revalidated
+    /// at all.
+    ///
+    /// Deliberately not added to `request_duration`: a class label multiplies a
+    /// bucketed histogram by the number of classes, and "which keys buy
+    /// unchanged/absent" is a counting question.
     request_error: Counter<u64>,
 
     cluster: String,
@@ -10501,7 +10520,10 @@ where
             Err(err) => {
                 debug!(?err, method);
 
-                let mut additional = vec![KeyValue::new("reason", object_store_error_name(err))];
+                let mut additional = vec![
+                    KeyValue::new("reason", object_store_error_name(err)),
+                    KeyValue::new("class", "prefix"),
+                ];
                 additional.extend(attributes.iter().cloned());
                 request_error.add(1, &additional[..]);
             }
@@ -10544,7 +10566,10 @@ where
             .inspect_err(|err| {
                 debug!(%location, opts = ?opts, err = ?err);
 
-                let mut additional = vec![KeyValue::new("reason", object_store_error_name(err))];
+                let mut additional = vec![
+                    KeyValue::new("reason", object_store_error_name(err)),
+                    KeyValue::new("class", key_class(location)),
+                ];
                 additional.append(&mut attributes);
                 self.request_error.add(1, &additional[..]);
             })
@@ -10575,7 +10600,10 @@ where
                 )
             })
             .inspect_err(|err| {
-                let mut additional = vec![KeyValue::new("reason", object_store_error_name(err))];
+                let mut additional = vec![
+                    KeyValue::new("reason", object_store_error_name(err)),
+                    KeyValue::new("class", key_class(location)),
+                ];
                 additional.append(&mut attributes);
                 self.request_error.add(1, &additional[..]);
             })
@@ -10611,7 +10639,10 @@ where
             .inspect_err(|err| {
                 debug!(?err);
 
-                let mut additional = vec![KeyValue::new("reason", object_store_error_name(err))];
+                let mut additional = vec![
+                    KeyValue::new("reason", object_store_error_name(err)),
+                    KeyValue::new("class", key_class(location)),
+                ];
                 additional.append(&mut attributes);
                 self.request_error.add(1, &additional[..]);
             })
@@ -10636,7 +10667,18 @@ where
             ];
 
             if let Err(err) = result {
-                let mut additional = vec![KeyValue::new("reason", object_store_error_name(err))];
+                // The stream yields the key only on success, so a failed delete
+                // is classed from the error when it carries a path — the
+                // `DeleteObjects` per-key failures do.
+                let class = match err {
+                    object_store::Error::NotFound { path, .. } => key_class(&Path::from(&path[..])),
+                    _ => "other",
+                };
+
+                let mut additional = vec![
+                    KeyValue::new("reason", object_store_error_name(err)),
+                    KeyValue::new("class", class),
+                ];
                 additional.extend(attributes);
                 request_error.add(1, &additional[..]);
             } else {
@@ -10701,7 +10743,13 @@ where
             .inspect_err(|err| {
                 debug!(?prefix, err = ?err);
 
-                let mut additional = vec![KeyValue::new("reason", object_store_error_name(err))];
+                // A listing addresses a prefix, not a key: the same stand-in the
+                // cache metrics use, so `sum by (class)` covers every series
+                // rather than leaving listings in an unlabelled bucket.
+                let mut additional = vec![
+                    KeyValue::new("reason", object_store_error_name(err)),
+                    KeyValue::new("class", "prefix"),
+                ];
                 additional.append(&mut attributes);
                 self.request_error.add(1, &additional[..]);
             })
@@ -10737,7 +10785,10 @@ where
             .inspect_err(|err| {
                 debug!(%from, %to, err = ?err);
 
-                let mut additional = vec![KeyValue::new("reason", object_store_error_name(err))];
+                let mut additional = vec![
+                    KeyValue::new("reason", object_store_error_name(err)),
+                    KeyValue::new("class", key_class(from)),
+                ];
                 additional.append(&mut attributes);
                 self.request_error.add(1, &additional[..]);
             })
