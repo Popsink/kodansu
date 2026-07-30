@@ -132,6 +132,18 @@ pub struct DynoStore {
     /// invalidated on delete.
     topic_ids: Arc<Mutex<BTreeMap<Uuid, Topic>>>,
 
+    /// Cache of the pinned routing prefix (`topic-routing/{name}.json`), the
+    /// prefix a topic's records coalesce under (#236).
+    ///
+    /// Held **without a TTL**, for the same reason [`Self::topic_ids`] is: the
+    /// pinned value is immutable for a topic's lifetime, so there is no staleness
+    /// argument to make. That is the whole point of pinning it. Before, routing
+    /// was re-derived from `cleanup.policy` — mutable config — so the value could
+    /// only be memoized for seconds, and the per-topic conditional GET that
+    /// refreshed it was 57% of the fleet's 304 plane (~$38/day). Invalidated on
+    /// delete, exactly like the id pointer.
+    routing_prefixes: Arc<Mutex<BTreeMap<Topic, String>>>,
+
     /// Broker auto-topic-creation policy (Kafka `auto.create.topics.enable` /
     /// `num.partitions` / `default.replication.factor`), consulted by the
     /// Metadata handler.
@@ -1438,6 +1450,28 @@ impl OptiCon<TopicMetadata> {
     }
 }
 
+/// The pinned routing prefix at `topic-routing/{name}.json`: the prefix a topic's
+/// records coalesce under, decided **once, at creation**, and never re-derived
+/// (#236).
+///
+/// Written create-only alongside the topic, and immutable for its lifetime — which
+/// is what lets every reader cache it permanently, with no TTL and no staleness
+/// argument, exactly as `topic-ids/{uuid}.json` already is.
+///
+/// It replaces a derivation from `cleanup.policy`, and that is a correctness fix
+/// as much as a cost one. The prefix selects the create-CAS namespace a batch's
+/// offsets are assigned from, so while it was derived from mutable config, an
+/// `AlterConfigs` setting `cleanup.policy=compact` on a live topic opened a window
+/// where one pod routed to the dedicated prefix and a peer, holding a staler
+/// verdict, still routed to the connector prefix — two offset authorities for the
+/// same `(topic, partition)`, the #78 class that #177/#178 made impossible
+/// everywhere else. Pinned, `cleanup.policy` can change freely without moving
+/// where records live.
+#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+struct TopicRouting {
+    prefix: String,
+}
+
 /// Pointer object at `topic-ids/{uuid}.json` mapping a topic's id back to its
 /// name, so a metadata lookup by topic-id can resolve to the per-topic
 /// `topic-metadata/{name}.json` object. Written create-only alongside the
@@ -1574,6 +1608,7 @@ impl DynoStore {
             topic_index: Arc::new(Mutex::new(TopicIndex::default())),
             topic_index_refresh: Arc::new(tokio::sync::Mutex::new(())),
             topic_ids: Arc::new(Mutex::new(BTreeMap::new())),
+            routing_prefixes: Arc::new(Mutex::new(BTreeMap::new())),
             auto_create: AutoTopicCreate::default(),
             topic_defaults: TopicDefaults::default(),
             meta: OptiCon::<Meta>::new(cluster),
@@ -1689,6 +1724,20 @@ impl DynoStore {
     fn topic_metadata_path(&self, name: &str) -> Path {
         Path::from(format!(
             "clusters/{}/topic-metadata/{}.json",
+            self.cluster, name
+        ))
+    }
+
+    /// The pinned routing prefix object for `name` (see [`TopicRouting`]).
+    ///
+    /// A prefix of its own, not a field of `topic-metadata/{name}.json`: that
+    /// object carries genuinely mutable config, so a permanent cache of it would
+    /// be wrong, and a cache of one field of it would be a discipline someone has
+    /// to maintain. A separate immutable object makes it structural. It also keeps
+    /// the pin out of [`Self::all_topics`]'s listing of `topic-metadata/`.
+    fn topic_routing_path(&self, name: &str) -> Path {
+        Path::from(format!(
+            "clusters/{}/topic-routing/{}.json",
             self.cluster, name
         ))
     }
@@ -2824,26 +2873,107 @@ impl DynoStore {
         }
     }
 
-    /// [`Self::routed_prefix`] when the caller has no `compacted` verdict in
-    /// hand. `prefix_of` is synchronous and on many paths, but every segment
-    /// routing consumer is an async fn — so rather than guessing from a cold
-    /// cache (a wrong guess would route a compacted topic's segments into the
-    /// shared prefix, where a sibling's retention could delete them), this
-    /// awaits the memoized [`Self::topic_is_compacted`] (#113): a warm memo is
-    /// one map lookup, a cold one is the same conditional metadata GET the
-    /// produce gate already pays once per TTL. Topics whose connector prefix
-    /// already equals their name (≤ 3 dotted components) skip even that — the
-    /// override cannot change their routing.
+    /// The prefix `topition`'s records are segment-routed under: the **pinned**
+    /// value (#236), read once per process and then served from memory forever.
+    ///
+    /// Three steps, in cost order:
+    ///
+    /// 1. Topics whose connector prefix already equals their own name (fewer than
+    ///    three dotted components) need nothing at all — both routings agree, so
+    ///    there is no decision to pin and no request to make.
+    /// 2. The permanent memo. Sound because the pin is immutable, which is the
+    ///    property that makes this whole path free; see [`TopicRouting`].
+    /// 3. Otherwise read the pin. A topic created before pinning existed has none,
+    ///    so the fallback **reproduces exactly today's derivation** —
+    ///    [`Self::prefix_of`] plus the [`Self::topic_is_compacted`] verdict — and
+    ///    pins that answer, create-only. Reproducing it is not a nicety: a
+    ///    different answer would route the topic's new records to a prefix its
+    ///    existing segments are not under, which is not a cost regression but data
+    ///    becoming unreachable.
+    ///
+    /// The lazy pin is create-only so peers converge: whoever writes first wins,
+    /// and a loser adopts the winner's value rather than keeping its own. Without
+    /// that, two pods that derived different answers — possible for exactly as long
+    /// as the old 5s window was open, if an `AlterConfigs` lands between their
+    /// reads — would each cache their own permanently, turning a bounded window
+    /// into a permanent split. The pin is the tie-breaker.
     async fn routed_prefix_of(&self, topition: &Topition) -> Result<String> {
+        let topic = topition.topic();
+
         let prefix = self.prefix_of(topition);
-        if prefix == topition.topic() {
+        if prefix == topic {
             return Ok(prefix);
         }
 
-        if self.topic_is_compacted(topition.topic()).await? {
-            Ok(topition.topic().to_owned())
-        } else {
-            Ok(prefix)
+        if let Some(pinned) = self
+            .routing_prefixes
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .get(topic)
+            .cloned()
+        {
+            return Ok(pinned);
+        }
+
+        let pinned = match self.read_routing_pin(topic).await? {
+            Some(pinned) => pinned,
+
+            // Pre-#236 topic: derive as before, then pin it so this is the last
+            // time anyone derives it.
+            None => {
+                let derived = self.routed_prefix(topition, self.topic_is_compacted(topic).await?);
+
+                if self
+                    .put_create(
+                        &self.topic_routing_path(topic),
+                        serde_json::to_vec(&TopicRouting {
+                            prefix: derived.clone(),
+                        })
+                        .map(Bytes::from)
+                        .map(PutPayload::from)?,
+                    )
+                    .await?
+                {
+                    derived
+                } else {
+                    // A peer pinned it first: adopt its value, whatever we derived.
+                    self.read_routing_pin(topic).await?.unwrap_or(derived)
+                }
+            }
+        };
+
+        _ = self
+            .routing_prefixes
+            .lock()
+            .map(|mut locked| locked.insert(topic.to_owned(), pinned.clone()));
+
+        Ok(pinned)
+    }
+
+    /// The pinned prefix for `topic`, or `None` when the object does not exist (a
+    /// topic created before #236). One GET, uncached — the caller memoizes.
+    async fn read_routing_pin(&self, topic: &str) -> Result<Option<String>> {
+        match self.object_store.get(&self.topic_routing_path(topic)).await {
+            Ok(get_result) => get_result
+                .bytes()
+                .await
+                .map_err(Into::into)
+                .and_then(|encoded| {
+                    serde_json::from_slice::<TopicRouting>(&encoded).map_err(Into::into)
+                })
+                .map(|routing| Some(routing.prefix)),
+
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+
+            Err(otherwise) => Err(otherwise.into()),
+        }
+    }
+
+    /// Drop a cached pinned prefix (on delete), so a topic re-created under the
+    /// same name cannot inherit a dead incarnation's routing.
+    fn invalidate_routing_prefix(&self, topic: &str) {
+        if let Ok(mut cache) = self.routing_prefixes.lock() {
+            _ = cache.remove(topic);
         }
     }
 
@@ -8218,6 +8348,34 @@ impl Storage for DynoStore {
             )
             .await?;
 
+        // Pin the routing prefix from the config this topic is created with
+        // (#236), so it is never derived from `cleanup.policy` again. Reached only
+        // by the creator that won the metadata CAS above, so an overwriting PUT is
+        // uncontended here — and it is deliberately an overwrite rather than a
+        // create: it clears any pin left behind by a torn delete of a same-named
+        // predecessor, which a create-only write would silently adopt.
+        let pinned = self.routed_prefix(
+            &Topition::new(topic.name.as_str(), 0),
+            Self::topic_configs_are_compacted(&topic),
+        );
+        _ = self
+            .object_store
+            .put_opts(
+                &self.topic_routing_path(topic.name.as_str()),
+                serde_json::to_vec(&TopicRouting {
+                    prefix: pinned.clone(),
+                })
+                .map(Bytes::from)
+                .map(PutPayload::from)?,
+                PutOptions::default(),
+            )
+            .await?;
+
+        _ = self
+            .routing_prefixes
+            .lock()
+            .map(|mut locked| locked.insert(topic.name.clone(), pinned));
+
         for partition in 0..topic.num_partitions {
             let topition = Topition::new(topic.name.as_str(), partition);
 
@@ -8322,15 +8480,20 @@ impl Storage for DynoStore {
                 .await?;
 
             self.invalidate_topic_id(&metadata.id);
+            self.invalidate_routing_prefix(metadata.topic.name.as_str());
             self.invalidate_topic_index();
 
-            match self
-                .object_store
-                .delete(&self.topic_id_path(&metadata.id))
-                .await
-            {
-                Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
-                Err(otherwise) => return Err(otherwise.into()),
+            for path in [
+                self.topic_id_path(&metadata.id),
+                // The routing pin goes with the topic (#236): it is immutable for a
+                // topic's lifetime, so leaving it would let a same-named successor
+                // inherit a dead incarnation's routing.
+                self.topic_routing_path(metadata.topic.name.as_str()),
+            ] {
+                match self.object_store.delete(&path).await {
+                    Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                    Err(otherwise) => return Err(otherwise.into()),
+                }
             }
 
             let prefix = Path::from(format!(

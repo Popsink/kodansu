@@ -197,6 +197,20 @@ sequence is always higher.
 
 ## Notes for readers
 
+- **A topic's prefix is pinned at creation, not derivable from its config (#236).**
+  The mapping lives in
+  `clusters/{cluster}/topic-routing/{topic}.json` — `{"prefix": "..."}` — written
+  create-only with the topic, immutable for its lifetime, and deleted with it. A
+  reader that needs the prefix for a topic name must read that object (it can be
+  cached indefinitely).
+
+  Do **not** recompute the prefix from `cleanup.policy`: a compacted topic is
+  routed under its own name and everything else under its connector prefix (the
+  first three dotted components), but that derivation is only correct until an
+  `AlterConfigs` changes the policy — after which the records stay where they
+  were, and only the pin still says where that is. Topics created before this
+  object existed have no pin until a broker resolves their routing once, at which
+  point it writes the derivation they were already using.
 - **Retention** is whole-segment, per prefix: a segment is deleted only once
   every sub-stream in it is past retention (`max_timestamp`), so a live topic
   never loses a shared segment.
