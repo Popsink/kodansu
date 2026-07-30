@@ -31,28 +31,31 @@ mod common;
 
 type DynStorage = Arc<Box<dyn Storage>>;
 
-async fn storage() -> Result<DynStorage, Error> {
+/// A store carrying the broker-level `defaults`, which is where the injection now
+/// lives: `create_topic` is the single choke point, so every creation path
+/// inherits them (#225).
+async fn storage(defaults: TopicDefaults) -> Result<DynStorage, Error> {
     StorageContainer::builder()
         .cluster_id("tansu")
         .node_id(111)
         .advertised_listener(Url::parse("tcp://localhost:9092")?)
         .storage(Url::parse("memory://tansu/")?)
+        .topic_defaults(defaults)
         .build()
         .await
         .map_err(Into::into)
 }
 
-/// Create `name` with the given client `configs` under the supplied broker
+/// Create `name` with the given client `configs` on a store built with the broker
 /// `defaults`, then read the stored config back through `DescribeConfigs`.
 async fn create_then_describe(
     storage: &DynStorage,
-    defaults: TopicDefaults,
     name: &str,
     configs: Option<Vec<CreatableTopicConfig>>,
 ) -> Result<Vec<(String, Option<String>)>, Error> {
     let create = {
         let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService::new(defaults))
+        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
     };
 
     _ = create
@@ -114,10 +117,9 @@ fn value<'a>(configs: &'a [(String, Option<String>)], name: &str) -> Option<&'a 
 #[tokio::test]
 async fn no_config_gets_kafka_defaults() -> Result<(), Error> {
     let _guard = init_tracing()?;
-    let storage = storage().await?;
+    let storage = storage(TopicDefaults::default()).await?;
 
-    let configs =
-        create_then_describe(&storage, TopicDefaults::default(), "no-config", None).await?;
+    let configs = create_then_describe(&storage, "no-config", None).await?;
 
     assert_eq!(
         Some(DEFAULT_CLEANUP_POLICY),
@@ -135,15 +137,9 @@ async fn no_config_gets_kafka_defaults() -> Result<(), Error> {
 #[tokio::test]
 async fn empty_config_gets_kafka_defaults() -> Result<(), Error> {
     let _guard = init_tracing()?;
-    let storage = storage().await?;
+    let storage = storage(TopicDefaults::default()).await?;
 
-    let configs = create_then_describe(
-        &storage,
-        TopicDefaults::default(),
-        "empty-config",
-        Some(vec![]),
-    )
-    .await?;
+    let configs = create_then_describe(&storage, "empty-config", Some(vec![])).await?;
 
     assert_eq!(
         Some(DEFAULT_CLEANUP_POLICY),
@@ -163,11 +159,10 @@ async fn empty_config_gets_kafka_defaults() -> Result<(), Error> {
 #[tokio::test]
 async fn compact_policy_is_preserved_without_retention() -> Result<(), Error> {
     let _guard = init_tracing()?;
-    let storage = storage().await?;
+    let storage = storage(TopicDefaults::default()).await?;
 
     let configs = create_then_describe(
         &storage,
-        TopicDefaults::default(),
         "compact",
         Some(vec![
             CreatableTopicConfig::default()
@@ -187,11 +182,10 @@ async fn compact_policy_is_preserved_without_retention() -> Result<(), Error> {
 #[tokio::test]
 async fn explicit_config_is_not_overwritten() -> Result<(), Error> {
     let _guard = init_tracing()?;
-    let storage = storage().await?;
+    let storage = storage(TopicDefaults::default()).await?;
 
     let configs = create_then_describe(
         &storage,
-        TopicDefaults::default(),
         "explicit",
         Some(vec![
             CreatableTopicConfig::default()
@@ -221,14 +215,14 @@ async fn explicit_config_is_not_overwritten() -> Result<(), Error> {
 #[tokio::test]
 async fn opt_out_injects_nothing() -> Result<(), Error> {
     let _guard = init_tracing()?;
-    let storage = storage().await?;
-
     let defaults = TopicDefaults {
         cleanup_policy: None,
         retention_ms: DEFAULT_RETENTION_MS,
     };
 
-    let configs = create_then_describe(&storage, defaults, "opt-out", None).await?;
+    let storage = storage(defaults).await?;
+
+    let configs = create_then_describe(&storage, "opt-out", None).await?;
 
     assert_eq!(None, value(&configs, "cleanup.policy"));
     assert_eq!(None, value(&configs, "retention.ms"));

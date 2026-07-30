@@ -115,7 +115,7 @@ async fn wide_assignment_earliest_and_latest() -> Result<(), Error> {
 
     let create_topic = {
         let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService::default())
+        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
     };
 
     let produce = {
@@ -284,7 +284,7 @@ async fn wide_assignment_earliest_and_latest_prefix_coalesced() -> Result<(), Er
 
     let create_topic = {
         let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService::default())
+        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
     };
 
     let produce = {

@@ -45,7 +45,7 @@ mod doctest_template {
 
         let create_topic = {
             let storage = storage.clone();
-            MapStateLayer::new(|_| storage).into_layer(CreateTopicsService::default())
+            MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
         };
 
         let name = "abcba";

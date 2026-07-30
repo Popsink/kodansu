@@ -24,7 +24,10 @@ use tansu_sans_io::{
     describe_configs_response::{DescribeConfigsResourceResult, DescribeConfigsResult},
     incremental_alter_configs_request::{AlterConfigsResource, AlterableConfig},
 };
-use tansu_storage::{DescribeConfigsService, IncrementalAlterConfigsService, Storage};
+use tansu_storage::{
+    DEFAULT_CLEANUP_POLICY, DEFAULT_RETENTION_MS, DescribeConfigsService,
+    IncrementalAlterConfigsService, Storage,
+};
 use tracing::debug;
 use uuid::Uuid;
 pub mod common;
@@ -112,6 +115,40 @@ where
     Ok(())
 }
 
+/// The `DescribeConfigs` response for `topic_name` carrying exactly `rows`, in
+/// order. Since #225 the engine injects the broker-level defaults at
+/// `create_topic` — the single creation choke point — so a topic created with no
+/// config still stores Kafka's `cleanup.policy=delete` and `retention.ms`, and
+/// every expectation below carries the `retention.ms` an `AlterConfigs` on the
+/// policy leaves untouched.
+fn expected_configs(topic_name: &str, rows: &[(&str, &str)]) -> DescribeConfigsResponse {
+    let none = ErrorCode::None;
+
+    DescribeConfigsResponse::default().results(Some(vec![
+        DescribeConfigsResult::default()
+            .error_code(none.into())
+            .error_message(Some(none.to_string()))
+            .resource_type(ConfigResource::Topic.into())
+            .resource_name(topic_name.into())
+            .configs(Some(
+                rows.iter()
+                    .map(|(name, value)| {
+                        DescribeConfigsResourceResult::default()
+                            .name((*name).into())
+                            .value(Some((*value).into()))
+                            .read_only(false)
+                            .is_default(None)
+                            .config_source(Some(ConfigSource::DefaultConfig.into()))
+                            .is_sensitive(false)
+                            .synonyms(Some([].into()))
+                            .config_type(Some(ConfigResource::Topic.into()))
+                            .documentation(Some("".into()))
+                    })
+                    .collect(),
+            )),
+    ]))
+}
+
 pub async fn alter_single_topic<G>(
     cluster_id: impl Into<String>,
     broker_id: i32,
@@ -166,16 +203,19 @@ where
 
     let none = ErrorCode::None;
 
+    // A topic created with no config stores the injected defaults (#225), rather
+    // than nothing at all as it did when the injection lived in the CreateTopics
+    // service and this direct `create_topic` call bypassed it.
+    let retention_ms = DEFAULT_RETENTION_MS.to_string();
     assert_eq!(
         results,
-        DescribeConfigsResponse::default().results(Some(vec![
-            DescribeConfigsResult::default()
-                .error_code(none.into())
-                .error_message(Some(none.to_string()))
-                .resource_type(ConfigResource::Topic.into())
-                .resource_name(topic_name.clone())
-                .configs(Some([].into()))
-        ]))
+        expected_configs(
+            &topic_name,
+            &[
+                (cleanup_policy, DEFAULT_CLEANUP_POLICY),
+                ("retention.ms", retention_ms.as_str()),
+            ],
+        )
     );
 
     let response = IncrementalAlterConfigsService
@@ -214,26 +254,13 @@ where
 
     assert_eq!(
         results,
-        DescribeConfigsResponse::default().results(Some(vec![
-            DescribeConfigsResult::default()
-                .error_code(none.into())
-                .error_message(Some(none.to_string()))
-                .resource_type(ConfigResource::Topic.into())
-                .resource_name(topic_name.clone())
-                .configs(Some(
-                    [DescribeConfigsResourceResult::default()
-                        .name(cleanup_policy.into())
-                        .value(Some(compact.into()))
-                        .read_only(false)
-                        .is_default(None)
-                        .config_source(Some(ConfigSource::DefaultConfig.into()))
-                        .is_sensitive(false)
-                        .synonyms(Some([].into()))
-                        .config_type(Some(ConfigResource::Topic.into()))
-                        .documentation(Some("".into()))]
-                    .into(),
-                )),
-        ],))
+        expected_configs(
+            &topic_name,
+            &[
+                (cleanup_policy, compact),
+                ("retention.ms", retention_ms.as_str())
+            ],
+        )
     );
 
     let response = IncrementalAlterConfigsService
@@ -272,26 +299,13 @@ where
 
     assert_eq!(
         results,
-        DescribeConfigsResponse::default().results(Some(vec![
-            DescribeConfigsResult::default()
-                .error_code(none.into())
-                .error_message(Some(none.to_string()))
-                .resource_type(ConfigResource::Topic.into())
-                .resource_name(topic_name.clone())
-                .configs(Some(
-                    [DescribeConfigsResourceResult::default()
-                        .name(cleanup_policy.into())
-                        .value(Some(delete.into()))
-                        .read_only(false)
-                        .is_default(None)
-                        .config_source(Some(ConfigSource::DefaultConfig.into()))
-                        .is_sensitive(false)
-                        .synonyms(Some([].into()))
-                        .config_type(Some(ConfigResource::Topic.into()))
-                        .documentation(Some("".into()))]
-                    .into(),
-                )),
-        ],))
+        expected_configs(
+            &topic_name,
+            &[
+                (cleanup_policy, delete),
+                ("retention.ms", retention_ms.as_str())
+            ],
+        )
     );
 
     let response = IncrementalAlterConfigsService
@@ -328,16 +342,11 @@ where
         )
         .await?;
 
+    // Deleting the policy leaves the injected retention behind: `AlterConfigs`
+    // touches only the key it names.
     assert_eq!(
         results,
-        DescribeConfigsResponse::default().results(Some(vec![
-            DescribeConfigsResult::default()
-                .error_code(none.into())
-                .error_message(Some(none.to_string()))
-                .resource_type(ConfigResource::Topic.into())
-                .resource_name(topic_name.clone())
-                .configs(Some([].into()))
-        ],))
+        expected_configs(&topic_name, &[("retention.ms", retention_ms.as_str())])
     );
 
     debug!(?topic_id);
