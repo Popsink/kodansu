@@ -20,7 +20,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
-use object_store::memory::InMemory;
+use object_store::{ObjectStoreExt as _, memory::InMemory, path::Path};
 use tansu_sans_io::{
     create_topics_request::CreatableTopic, record::Record, record::deflated, record::inflated,
 };
@@ -71,6 +71,84 @@ async fn create_topic(storage: &DynoStore, name: &str) -> Result<()> {
             false,
         )
         .await?;
+
+    Ok(())
+}
+
+/// Seed a legacy `records/{offset:020}.batch` object straight into the bucket.
+///
+/// Nothing writes this layout any more (#177/#178), but production buckets still
+/// hold it and retention still drains it — which is what this file's #241 test is
+/// about.
+async fn seed_legacy_batch(
+    store: &DynoStore,
+    bucket: &InMemory,
+    topition: &Topition,
+    base_offset: i64,
+    batch: deflated::Batch,
+) -> Result<()> {
+    let location = Path::from(format!(
+        "clusters/{CLUSTER}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
+        topition.topic(),
+        topition.partition(),
+        base_offset,
+    ));
+
+    _ = bucket.put(&location, store.encode_frame(&[batch])?).await?;
+
+    Ok(())
+}
+
+/// #241: draining a legacy partition to empty must leave the log END behind, not
+/// just the log start.
+///
+/// `expire_partition` wrote only `watermark.low`, so once retention removed every
+/// object nothing recorded where the log ended. `high_watermark` folds
+/// `max(segment tail, legacy tail, persisted high)`, which is then `0` — the
+/// `committed 171,958 / HWM 0` pairs #241 reports. The same fold is what
+/// `leaseless_base` assigns from, so the next produce re-used offsets from `0`,
+/// invisibly to every group whose committed position was above the new tail.
+///
+/// Asserted on a **cold** store, because that is the state that matters: the pod
+/// that ran the drain still holds an in-process hint, so it cannot see the loss.
+#[tokio::test]
+async fn draining_a_legacy_partition_keeps_its_offset_floor() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
+
+    let topic = "org.env.conn.drained_legacy";
+    create_topic(&store, topic).await?;
+    let topition = Topition::new(topic, 0);
+
+    // Two legacy batches of three records: the log ends at 6.
+    seed_legacy_batch(&store, &bucket, &topition, 0, batch(3)?).await?;
+    seed_legacy_batch(&store, &bucket, &topition, 3, batch(3)?).await?;
+    assert_eq!(6, store.high_watermark(&topition).await?);
+
+    // A threshold in the future expires everything, regardless of age.
+    assert_eq!(
+        2,
+        store
+            .expire_partition(&topition, now_ms() + HOUR_MS)
+            .await?
+    );
+
+    let cold = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    assert_eq!(
+        6,
+        cold.high_watermark(&topition).await?,
+        "a drained partition must not report its log end as 0"
+    );
+
+    // The consequence that matters: the next produce continues past the drained
+    // region instead of re-using offsets from 0.
+    assert_eq!(
+        6,
+        cold.produce(None, &topition, batch(1)?).await?,
+        "offsets must never be re-used after a drain"
+    );
 
     Ok(())
 }
