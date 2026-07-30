@@ -234,7 +234,10 @@ sequence is always higher.
   the create-only segment-sequence CAS, and the per-prefix marker object is
   `era.json` (above), not `lease.json`. Either way the reader contract is the
   same — decode the footer, and use the overlap rule above.
-- **Hybrid topics:** a topic opted into segments mid-life keeps its earlier
-  `records/{offset}.batch` objects for `[0, C)` and writes segments for
-  `[C, ∞)`; a reader serves the legacy region from `records/` and the rest from
-  segments, continuous across the seam `C`.
+- **There is no hybrid layout any more (#179).** A topic opted into segments
+  mid-life used to keep its earlier `records/{offset}.batch` objects for `[0, C)`
+  and write segments for `[C, ∞)`, and a reader was expected to stitch the two
+  across the seam `C`. The broker no longer writes, reads or probes that layout:
+  segments are the whole log. A reader that still implements the seam is not
+  wrong, but it is dead code — and a `records/` object it finds is abandoned data
+  the broker will never serve, not a region below a seam.
