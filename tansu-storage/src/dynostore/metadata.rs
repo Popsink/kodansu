@@ -219,6 +219,30 @@ where
     }
 }
 
+/// Drop every memoized etag, as the retention window does when it lapses.
+///
+/// Test-only, and object-safe so [`super::DynoStore`] can hold a handle on its
+/// own cache after erasing the store type. An op-profile test that measures
+/// revalidations has to be able to cross the window — 5s in production — and
+/// crossing it by sleeping would put 5s of wall clock in the suite for every
+/// count. Same trick as the hint tests, which age `listed_at` rather than wait.
+#[cfg(test)]
+pub(super) trait ExpireCachedEtags: Debug + Send + Sync {
+    fn expire_cached_etags(&self);
+}
+
+#[cfg(test)]
+impl<O> ExpireCachedEtags for Cache<O>
+where
+    O: ObjectStore,
+{
+    fn expire_cached_etags(&self) {
+        if let Ok(mut guard) = self.entries.lock() {
+            *guard.deref_mut() = ExpiringSizedCache::new(self.retention);
+        }
+    }
+}
+
 static REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_objectstore_cache_requests")

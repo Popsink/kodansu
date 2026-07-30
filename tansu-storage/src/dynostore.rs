@@ -362,6 +362,11 @@ pub struct DynoStore {
     maintenance_seed: u64,
 
     object_store: Arc<DynObjectStore>,
+
+    /// The same cache as `object_store`, typed, so a test can expire its etag
+    /// memo instead of sleeping through the window (#167).
+    #[cfg(test)]
+    metadata_etags: Arc<dyn metadata::ExpireCachedEtags>,
 }
 
 /// A batch parked in the prefix coalescing buffer (#57), carrying the topition
@@ -1509,6 +1514,11 @@ fn json_content_type() -> Attributes {
 
 impl DynoStore {
     pub fn new(cluster: &str, node: i32, object_store: impl ObjectStore) -> Self {
+        let cache = Arc::new(Cache::new(
+            Metron::new(object_store, cluster),
+            Duration::from_millis(5_000),
+        ));
+
         Self {
             cluster: cluster.into(),
             node,
@@ -1559,11 +1569,18 @@ impl DynoStore {
             topic_ids: Arc::new(Mutex::new(BTreeMap::new())),
             auto_create: AutoTopicCreate::default(),
             meta: OptiCon::<Meta>::new(cluster),
-            object_store: Arc::new(Cache::new(
-                Metron::new(object_store, cluster),
-                Duration::from_millis(5_000),
-            )),
+            #[cfg(test)]
+            metadata_etags: cache.clone(),
+            object_store: cache,
         }
+    }
+
+    /// Expire the metadata cache's etag memo, as its 5s window does — so an
+    /// op-profile test can count revalidations across windows without sleeping
+    /// through them (#167).
+    #[cfg(test)]
+    fn expire_metadata_etags(&self) {
+        self.metadata_etags.expire_cached_etags();
     }
 
     pub fn advertised_listener(self, advertised_listener: Url) -> Self {
@@ -2571,11 +2588,22 @@ impl DynoStore {
     ///   sub-stream only advances in an operation that then raises the seq
     ///   floor, so an unchanged certified floor proves the cached value is
     ///   current; any rise invalidates the cache and the slow path re-reads.
-    /// - **No segments at all** is not served: an empty sub-stream is
-    ///   indistinguishable from a fully drained or lake-sink one, whose only
-    ///   authority is `watermark.json` — and a lake-sink high advances
-    ///   *without* raising the seq floor, so the floor-certified cache must
-    ///   not vouch for it. Those keep today's per-partition GET.
+    /// - **No segments at all** is served the same way (#167): a sub-stream
+    ///   that never produced, or was fully drained, has `watermark.json` as its
+    ///   only authority — and that field is advanced by exactly one operation,
+    ///   [`Self::expire_prefix_segments`], which raises the seq floor
+    ///   immediately after. The certification argument above therefore does not
+    ///   depend on the sub-stream owning a segment: an unchanged floor proves
+    ///   the cached value current whether the tail is a segment or nothing at
+    ///   all. A cold or floor-invalidated cache still declines to the slow path
+    ///   below, so the first read still pays the GET.
+    ///
+    ///   This case was excluded for lake-sink topics, whose high advanced
+    ///   without raising the floor. That engine went with the lakehouse (#96) —
+    ///   nothing in this fork writes `watermark.high` outside segment expiry —
+    ///   so the exclusion was charging one conditional GET per poll per drained
+    ///   partition (~660/s, a third of the fleet's 304 plane) to protect an
+    ///   authority that cannot move behind the floor.
     async fn coalesced_high_from_index(&self, topition: &Topition) -> Result<Option<i64>> {
         if self.has_legacy_records(topition).await? {
             return Ok(None);
@@ -2584,13 +2612,13 @@ impl DynoStore {
         let prefix = self.routed_prefix_of(topition).await?;
         self.refresh_prefix_index(&prefix).await?;
 
-        let Some(tail) = self
+        // `0` for a sub-stream holding no segment: the persisted floor below is
+        // then the whole answer, which is what the slow path would fold too.
+        let tail = self
             .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
             .last()
             .map(|(_, entry)| entry.base_offset + entry.record_count)
-        else {
-            return Ok(None);
-        };
+            .unwrap_or(0);
 
         // Certified after the refresh above, so the floor covers every
         // watermark advance whose segment deletion that listing could have
@@ -2601,6 +2629,10 @@ impl DynoStore {
             return Ok(None);
         };
 
+        // The same fold the slow path performs — `recover_substream_next_offset`
+        // is `max(segment tail, legacy tail, persisted floor)` and the legacy
+        // tail is 0 here (no legacy records, checked above) — so this serves the
+        // value that path would have computed, without its per-partition GET.
         let high = tail
             .max(watermark_floor)
             .max(self.cached_high(topition)?.unwrap_or(0));
@@ -2622,23 +2654,21 @@ impl DynoStore {
     /// `watermark.high` — so a *cold* reader (empty hint after a restart or on
     /// another replica) lists only the batches *after* that floor via S3
     /// `start-after`, instead of scanning the whole partition (the cold-LIST
-    /// storm at scale). On a cold read the computed high is persisted back to
-    /// `watermark.high`, keeping the floor current for the next cold reader; this
-    /// runs once per process per partition, not on the produce hot path, so it
-    /// does not reintroduce the #13 hot-object write. Lake-sink topics
-    /// (`tansu.lake.sink`) write no batch objects and carry the offset in
-    /// `watermark.high`, which the `max` below preserves.
+    /// storm at scale). A read never writes that floor back: `watermark.high` is
+    /// advanced only by [`Self::expire_prefix_segments`], write-ahead of the
+    /// segment deletes it is about to perform — no read path CASes it (#13), and
+    /// that single writer is what lets the floor-certified cache stand in for the
+    /// object (see [`Self::coalesced_high_from_index`]).
     async fn high_watermark(&self, topition: &Topition) -> Result<i64> {
         // Warm fast path: serve from the in-memory hint without ANY per-poll S3
         // request while it is fresh (reconciled against a listing within the TTL).
         // Every hint refresh (`mark_listed`) already folds in `from_watermark` —
-        // including lake-sink topics' authoritative high (they write no batch
-        // objects) — see the `mark_listed` call sites below, so a fresh hint needs
-        // neither the tail `ListObjectsV2` (#40) nor the `watermark.json` GET
-        // (#72). This is what takes the consumer Fetch hot path off ~1 GET per
-        // poll per partition. Bounded staleness (== the hint TTL): another
-        // replica's just-produced batch, or a lake-sink high bump in the last TTL
-        // window, is picked up on the next TTL-triggered listing below.
+        // see the `mark_listed` call sites below — so a fresh hint needs neither
+        // the tail `ListObjectsV2` (#40) nor the `watermark.json` GET (#72). This
+        // is what takes the consumer Fetch hot path off ~1 GET per poll per
+        // partition. Bounded staleness (== the hint TTL): another replica's
+        // just-produced batch is picked up on the next TTL-triggered listing
+        // below.
         if let Some(hint) = self.cached_high_fresh(topition)? {
             return Ok(hint);
         }
@@ -2656,9 +2686,7 @@ impl DynoStore {
         }
 
         // Index not authoritative for this sub-stream — hybrid (legacy
-        // `records/` objects may sit above the segments), no segment at
-        // all (never produced, fully retention-drained, or a lake-sink
-        // topic whose offset lives only in `watermark.high`), or a cold /
+        // `records/` objects may sit above the segments), or a cold /
         // floor-invalidated watermark cache. Pay the `watermark.json` GET
         // and recover footer-only (#58), caching the watermark under the
         // certified floor read *before* it so the fast path serves the

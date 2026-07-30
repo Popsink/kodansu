@@ -1146,6 +1146,195 @@ async fn coalesced_latest_survives_peer_expiry_via_floor_certification() -> Resu
     Ok(())
 }
 
+/// A sub-stream holding **no segment** — never produced, or drained by retention
+/// — resolves stale-hint LATEST from the floor-certified cache, at zero
+/// per-partition object-store requests (#167).
+///
+/// Both cases used to be excluded: `coalesced_high_from_index` returned `None`
+/// whenever the sub-stream owned no segment, so every poll paid its own
+/// `watermark.json` round trip. Measured at ~660/s on the production fleet — a
+/// third of a 304 plane that is ~90% of metered GETs — and the population only
+/// grows, since retention moves partitions into it and nothing moves them out.
+/// The exclusion was there for lake-sink topics, whose high advanced *without*
+/// raising the seq floor; that engine went with the lakehouse (#96), leaving
+/// `expire_prefix_segments` as the only writer of the field, and it raises the
+/// floor write-ahead of its deletes.
+///
+/// Counted across the etag memo's window, which is what production polling
+/// crosses: within one 5s window the memo answers the revalidation locally, so
+/// the cost is one request either way and only wall-clock hours separate the two
+/// versions. `age` therefore expires the memo alongside the hint and index
+/// clocks, and each poll below is a fresh window: 8 polls used to cost 8
+/// `watermark.json` requests, and now cost one.
+#[tokio::test]
+async fn segmentless_substream_stale_hint_latest_costs_no_per_partition_get() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let watermark_gets = Arc::new(AtomicU64::new(0));
+    let counters = Arc::new(Counters::default());
+    let storage = DynoStore::new(
+        CLUSTER,
+        NODE,
+        Counting {
+            inner: CountWatermarkGets {
+                inner: InMemory::new(),
+                gets: watermark_gets.clone(),
+            },
+            counters: counters.clone(),
+        },
+    );
+
+    // Age every clock a poll consults — the offset hint, the prefix index, and the
+    // metadata etag memo — so the next call takes the stale-hint path with nothing
+    // memoized, which is the state a production poll arrives in once per window.
+    let age = |storage: &DynoStore| {
+        let past = SystemTime::now() - Duration::from_secs(60);
+        for hint in storage
+            .next_offsets
+            .lock()
+            .expect("next_offsets lock")
+            .values_mut()
+        {
+            hint.listed_at = Some(past);
+        }
+        for entry in storage
+            .prefix_index
+            .lock()
+            .expect("prefix_index lock")
+            .values_mut()
+        {
+            entry.refreshed_at = Some(past);
+        }
+        storage.expire_metadata_etags();
+    };
+
+    // A topic created and never produced to — the shape of an idle CDC table whose
+    // rows have not changed.
+    let empty_topic = "org.env.empty.tab";
+    create(&storage, empty_topic, 1).await?;
+    let empty = Topition::new(empty_topic, 0);
+
+    watermark_gets.store(0, Relaxed);
+    for _ in 0..8 {
+        age(&storage);
+        assert_eq!(
+            0,
+            storage.high_watermark(&empty).await?,
+            "an empty sub-stream's LATEST is 0"
+        );
+    }
+    assert_eq!(
+        1,
+        watermark_gets.load(Relaxed),
+        "8 stale-hint polls of a never-produced partition must cost ONE watermark.json \
+         request, not one each (#167)"
+    );
+
+    // The drained case: produced, then retention took every segment the sub-stream
+    // owned. `expire_prefix_segments` persists each affected tail into
+    // `watermark.high`, raises the seq floor write-ahead, then deletes.
+    // Two partitions so the remaining cost can be shown to be per *prefix*: that
+    // is the whole claim, since a prefix carries thousands of partitions.
+    let topic = "org.env.drained.tab";
+    create(&storage, topic, 2).await?;
+    let a = Topition::new(topic, 0);
+    let b = Topition::new(topic, 1);
+    for n in 0..4 {
+        _ = storage
+            .produce(None, &a, batch(format!("a-{n}").as_bytes())?)
+            .await?;
+    }
+    for n in 0..2 {
+        _ = storage
+            .produce(None, &b, batch(format!("b-{n}").as_bytes())?)
+            .await?;
+    }
+    let prefix = storage.prefix_of(&a);
+    assert_eq!(4, storage.high_watermark(&a).await?);
+    assert_eq!(2, storage.high_watermark(&b).await?);
+
+    // A threshold in the future expires regardless of record age; one segment per
+    // awaited produce, so every segment of the prefix goes.
+    let threshold = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since| since.as_millis() as i64 + 60_000)
+        .expect("clock before the epoch");
+    assert_eq!(6, storage.expire_prefix_segments(&prefix, threshold).await?);
+    for tp in [&a, &b] {
+        assert!(
+            storage
+                .valid_substream_segments(&prefix, topic, tp.partition())?
+                .is_empty(),
+            "{tp:?} must hold no segment for this to be the drained case"
+        );
+    }
+
+    // The drain raised the floor, which invalidates the cached watermark: the first
+    // stale-hint read of each partition after it re-reads that partition's object
+    // once and reports the persisted high rather than regressing to 0. The
+    // watermark cache is per partition, so this is one re-read each — bounded by
+    // how often a floor moves, which is a maintenance event, not a poll.
+    age(&storage);
+    watermark_gets.store(0, Relaxed);
+    assert_eq!(4, storage.high_watermark(&a).await?);
+    assert_eq!(2, storage.high_watermark(&b).await?);
+    assert_eq!(
+        2,
+        watermark_gets.load(Relaxed),
+        "a floor rise must force exactly one watermark re-read per partition"
+    );
+
+    // Every stale-hint poll after that is served from the certified cache, and
+    // LATEST never regresses to 0 — the persisted high is these sub-streams' only
+    // authority.
+    const WINDOWS: u64 = 8;
+    watermark_gets.store(0, Relaxed);
+    counters.reset();
+    for _ in 0..WINDOWS {
+        age(&storage);
+        assert_eq!(4, storage.high_watermark(&a).await?);
+        assert_eq!(2, storage.high_watermark(&b).await?);
+    }
+    assert_eq!(
+        0,
+        watermark_gets.load(Relaxed),
+        "16 stale-hint polls of drained sub-streams must not GET watermark.json (#167)"
+    );
+    let polls = counters.report("8 windows x 2 drained partitions, stale-hint LATEST");
+    assert_eq!(0, polls.0, "no puts");
+    assert_eq!(
+        (WINDOWS, WINDOWS),
+        (polls.2, polls.1),
+        "what remains is per prefix per window — one segments LIST and the seq-floor \
+         GET that certifies it — and does not grow with the partition count"
+    );
+
+    // Freshness is not traded away. A produce lands above the drained floor and is
+    // visible on the next stale-hint read …
+    assert_eq!(4, storage.produce(None, &a, batch(b"after-drain")?).await?);
+    age(&storage);
+    assert_eq!(5, storage.high_watermark(&a).await?);
+
+    // … and a peer's expiry — `watermark.high` advanced, then the floor raised —
+    // still invalidates the cache and is picked up, never regressing LATEST.
+    storage
+        .watermark(&a)?
+        .with_mut(&storage.object_store, |watermark| {
+            watermark.high = Some(100);
+            Ok(())
+        })
+        .await?;
+    storage.raise_seq_floor(&prefix, 1_000).await?;
+    age(&storage);
+    assert_eq!(
+        100,
+        storage.high_watermark(&a).await?,
+        "a peer-acked high must survive being served from the certified cache"
+    );
+
+    Ok(())
+}
+
 /// #165: every listing this engine issues must go through the attributed helpers
 /// (`DynoStore::scan` / `scan_from` / `scan_delimited`), so the tier-1 plane can be
 /// broken down by call site. The metric was blind for ~20 scan sites — reporting
