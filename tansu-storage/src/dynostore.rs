@@ -683,14 +683,6 @@ pub struct CoalesceTuning {
     pub coalesce_linger: Option<Duration>,
     pub coalesce_batches: Option<usize>,
     pub coalesce_bytes: Option<usize>,
-    /// **Inert since #178.** The per-pod `producers/{id}.json` debounce these
-    /// tuned (#48) died with the legacy write path — idempotent dedup is the
-    /// segment flush's folded `ProducerTable` (#88), which has no debounce to
-    /// tune. Still parsed from the storage URL so an existing deployment keeps
-    /// starting; removing the keys is tracked separately, and until then setting
-    /// them does nothing.
-    pub producer_checkpoint_interval: Option<Duration>,
-    pub producer_checkpoint_batches: Option<u64>,
     pub prefix_compact_min_segments: Option<usize>,
     pub prefix_compact_target_bytes: Option<usize>,
     pub prefix_compact_keep_hot: Option<usize>,

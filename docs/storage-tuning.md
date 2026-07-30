@@ -62,24 +62,16 @@ Validate any change by sweeping the param in one deployment and watching S3
 `PutRequests` (CloudWatch) against produce p99 latency, rather than adopting a
 figure blind.
 
-## Producer idempotency checkpoint
+## Producer idempotency checkpoint — removed
 
-For idempotent/`acks=all` producers, the durable per-producer sequence state in
-`producers/{id}.json` is checkpointed lazily (#48): the in-memory sequence
-advances on every batch, and the object is written at most once per interval or
-per N batches, whichever comes first.
+There is nothing to tune here any more. The lazily-checkpointed per-producer
+sequence object `producers/{id}.json` (#48) went with the legacy write path
+(#178): idempotent dedup is derived from the segment flush's folded
+`ProducerTable` (#88), which is written with the segment and has no debounce.
 
-| Query param | Default | Meaning |
-|---|---|---|
-| `producer_checkpoint_batches` | `64` | Checkpoint after this many idempotent batches. |
-| `producer_checkpoint_interval` | `250ms` | Checkpoint at least this often while advancing. |
-
-This is safety-bounded: on an unclean restart the persisted sequence lags the
-acked one by at most one window and is reconciled by a max-merge on replay —
-never moved backwards, never lost. Widening the interval to `2s`–`5s` is cheap
-and reduces checkpoint PUTs, though the gain is small unless you have many
-active idempotent producers (the object count scales with *distinct producers*,
-not partitions).
+`producer_checkpoint_batches` and `producer_checkpoint_interval` were parsed but
+ignored from #178 until #227, and are now in the deprecated-key list: a storage
+URL still carrying them starts and logs one warning, rather than failing.
 
 ## Prefix coalescing — virtual topics
 
@@ -219,8 +211,8 @@ There are two independent write-batching paths:
 ## Example
 
 ```
-s3://my-bucket/?coalesce_linger=300ms&coalesce_batches=128&coalesce_bytes=4m&producer_checkpoint_interval=5s
+s3://my-bucket/?coalesce_linger=300ms&coalesce_batches=128&coalesce_bytes=4m
 ```
 
-Coalesces produce with a 300 ms linger (or 128 batches / 4 MiB, whichever comes
-first) and checkpoints idempotent producers at most every 5 s.
+Coalesces produce with a 300 ms linger, or 128 batches, or 4 MiB — whichever
+comes first.

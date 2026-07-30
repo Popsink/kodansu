@@ -2385,12 +2385,18 @@ fn auto_topic_create(storage: &Url) -> AutoTopicCreate {
 /// comes.
 #[cfg(feature = "dynostore")]
 fn warn_deprecated_layout_flags(storage: &Url) {
-    const DEPRECATED: [&str; 5] = [
+    const DEPRECATED: [&str; 7] = [
         "prefix_coalesce",
         "prefix_leaseless",
         "produce_coalesce",
         "compacted_segments",
         "compacted_carryover",
+        // Inert since #178, parsed-but-ignored until #227: the per-pod
+        // `producers/{id}.json` debounce they tuned (#48) died with the legacy
+        // write path, and idempotent dedup is now the segment flush's folded
+        // `ProducerTable` (#88), which has no debounce to tune.
+        "producer_checkpoint_interval",
+        "producer_checkpoint_batches",
     ];
 
     let present: Vec<&str> = DEPRECATED
@@ -2437,18 +2443,6 @@ fn coalesce_tuning(storage: &Url) -> CoalesceTuning {
                     )
                     .ok()
                     .and_then(|size| usize::try_from(size).ok());
-            }
-            "producer_checkpoint_interval" => {
-                tuning.producer_checkpoint_interval = human_units::Duration::from_str(value)
-                    .map(|duration| duration.0)
-                    .inspect_err(|err| warn!(storage = %storage, key = "producer_checkpoint_interval", value, ?err))
-                    .ok();
-            }
-            "producer_checkpoint_batches" => {
-                tuning.producer_checkpoint_batches = value
-                    .parse()
-                    .inspect_err(|err| warn!(storage = %storage, key = "producer_checkpoint_batches", value, ?err))
-                    .ok();
             }
             "prefix_compact_min_segments" => {
                 tuning.prefix_compact_min_segments = value
@@ -3662,6 +3656,32 @@ mod tests {
         Ok(())
     }
 
+    /// #227: the removed producer-checkpoint keys must not fail a build either.
+    ///
+    /// They were parsed-but-ignored from #178, so a deployment carrying them is
+    /// expected to exist. Dropping the parse arms without adding them to the
+    /// deprecated list would turn a no-op config line into a failed rollout, which
+    /// is the trade #177 and #222 already made for the layout flags.
+    #[cfg(feature = "dynostore")]
+    #[tokio::test]
+    async fn removed_producer_checkpoint_keys_still_build() -> Result<()> {
+        let storage = StorageContainer::builder()
+            .cluster_id("tansu")
+            .node_id(111)
+            .advertised_listener(Url::parse("tcp://localhost:9092")?)
+            .storage(Url::parse(
+                "memory://tansu/?producer_checkpoint_interval=5s&producer_checkpoint_batches=256",
+            )?)
+            .build()
+            .await;
+
+        assert!(
+            storage.is_ok(),
+            "a URL carrying the removed keys must still start"
+        );
+        Ok(())
+    }
+
     #[cfg(feature = "dynostore")]
     #[test]
     fn coalesce_tuning_parses_compaction_keys() -> Result<()> {
@@ -3684,8 +3704,6 @@ mod tests {
         assert_eq!(None, tuning.coalesce_linger);
         assert_eq!(None, tuning.coalesce_batches);
         assert_eq!(None, tuning.coalesce_bytes);
-        assert_eq!(None, tuning.producer_checkpoint_interval);
-        assert_eq!(None, tuning.producer_checkpoint_batches);
         Ok(())
     }
 
@@ -3693,17 +3711,11 @@ mod tests {
     #[test]
     fn coalesce_tuning_parses_all_keys() -> Result<()> {
         let tuning = coalesce_tuning(&Url::parse(
-            "s3://tansu/?coalesce_linger=300ms&coalesce_batches=128&coalesce_bytes=4M\
-             &producer_checkpoint_interval=5s&producer_checkpoint_batches=256",
+            "s3://tansu/?coalesce_linger=300ms&coalesce_batches=128&coalesce_bytes=4M",
         )?);
         assert_eq!(Some(Duration::from_millis(300)), tuning.coalesce_linger);
         assert_eq!(Some(128), tuning.coalesce_batches);
         assert_eq!(Some(4 << 20), tuning.coalesce_bytes);
-        assert_eq!(
-            Some(Duration::from_secs(5)),
-            tuning.producer_checkpoint_interval
-        );
-        assert_eq!(Some(256), tuning.producer_checkpoint_batches);
         Ok(())
     }
 
