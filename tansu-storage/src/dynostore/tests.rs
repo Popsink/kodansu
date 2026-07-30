@@ -105,7 +105,7 @@ fn schema_change() -> Result<()> {
 
 /// `watermark.json` is round-tripped through `OptiCon::with_mut` on the
 /// maintainer path every maintenance interval (`expire_prefix_segments`
-/// persists `high`, `advance_low_watermark` persists `low`), so a binary
+/// persists `high`, `delete_records_before` the truncation floor), so a binary
 /// whose [`Watermark`] does not model a field would silently erase it on
 /// that round-trip: during a rolling deploy, an old maintainer would drop
 /// what a newer process had just written. For the truncation floor (#176)
@@ -117,6 +117,11 @@ fn schema_change() -> Result<()> {
 /// watermark with no extra fields still serialises byte-identically to the
 /// pre-catch-all layout (`truncate` is `skip_serializing_if`), so the change
 /// does not rewrite every existing object on first touch.
+///
+/// Since #180 it also pins that removal's migration guarantee: `low` is no longer a
+/// modeled field, so an object written before it was dropped carries `"low"` as an
+/// unknown key — and the catch-all is what keeps that key intact instead of erasing
+/// it, which is why dropping the field needed no data migration.
 #[tokio::test]
 async fn watermark_with_mut_preserves_unknown_fields() -> Result<(), Error> {
     let _guard = init_tracing()?;
@@ -126,7 +131,7 @@ async fn watermark_with_mut_preserves_unknown_fields() -> Result<(), Error> {
     // fleet with no floors must not have every watermark object rewritten
     // with a `"truncate":null` key (etag churn across the whole cost plane).
     assert_eq!(
-        r#"{"low":null,"high":5}"#,
+        r#"{"high":5}"#,
         serde_json::to_string(&Watermark {
             high: Some(5),
             ..Default::default()
@@ -135,7 +140,7 @@ async fn watermark_with_mut_preserves_unknown_fields() -> Result<(), Error> {
 
     // A held floor serialises as the named field, after `high`.
     assert_eq!(
-        r#"{"low":null,"high":5,"truncate":3}"#,
+        r#"{"high":5,"truncate":3}"#,
         serde_json::to_string(&Watermark {
             high: Some(5),
             truncate: Some(3),
@@ -175,6 +180,12 @@ async fn watermark_with_mut_preserves_unknown_fields() -> Result<(), Error> {
     assert_eq!(Some(7), object["high"].as_i64());
     assert_eq!(Some(42), object["truncate"].as_i64());
     assert_eq!(Some(17), object["future"].as_i64());
+    // The historic `low` is one of those unknown keys now (#180): present, and
+    // preserved rather than erased.
+    assert!(
+        object.get("low").is_some(),
+        "a pre-#180 object's `low` must survive the round-trip"
+    );
 
     Ok(())
 }
@@ -182,17 +193,34 @@ async fn watermark_with_mut_preserves_unknown_fields() -> Result<(), Error> {
 /// A `watermark.json` carrying a truncation floor — written by a #176-aware
 /// pod, possibly round-tripped through a beta.23 pod's catch-all in between —
 /// deserialises into the **named** `truncate` field (serde routes a named key
-/// to the field, never to the `#[serde(flatten)]` catch-all) and
-/// re-serialises byte-identically, so mixed-version round-trips are stable.
+/// to the field, never to the `#[serde(flatten)]` catch-all).
+///
+/// Byte identity holds for the fields this binary models. It does **not** hold for
+/// an object still carrying the `low` that #180 dropped: an unmodeled key lands in
+/// the catch-all, which serialises after the named fields, so the key moves to the
+/// end. The value survives — that is the guarantee that made dropping the field
+/// safe — but the bytes are reordered, so such an object gets one rewrite the next
+/// time something else on it changes. Bounded: `watermark.json` is only written when
+/// a floor or a high watermark actually moves, never on a read.
 #[test]
 fn watermark_truncate_round_trips_as_a_named_field() -> Result<()> {
     let raw = r#"{"low":null,"high":5,"truncate":42}"#;
 
     let watermark = serde_json::from_str::<Watermark>(raw)?;
     assert_eq!(Some(42), watermark.truncate);
-    assert!(watermark.rest.is_empty(), "named key must not land in rest");
+    // `truncate` is modeled so it does not land in the catch-all; `low` is not
+    // modeled any more (#180) so it does, which is what preserves it.
+    assert_eq!(
+        vec!["low"],
+        watermark.rest.keys().collect::<Vec<_>>(),
+        "only the dropped `low` may land in rest"
+    );
 
-    assert_eq!(raw, serde_json::to_string(&watermark)?);
+    // Same content, `low` relocated to the end by the catch-all (#180).
+    assert_eq!(
+        r#"{"high":5,"truncate":42,"low":null}"#,
+        serde_json::to_string(&watermark)?
+    );
 
     Ok(())
 }
