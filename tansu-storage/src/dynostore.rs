@@ -2760,7 +2760,22 @@ impl DynoStore {
         let prefix = self.routed_prefix_of(topition).await?;
         let floor = self.certified_seq_floor(&prefix).await?;
         let from_watermark = self.persisted_high(topition).await?;
-        self.cache_coalesced_watermark(topition, from_watermark, floor)?;
+
+        // Only a pure-segment sub-stream's watermark is cacheable under the
+        // certified floor (#241). The certification argument is "`watermark.high`
+        // advances only in `expire_prefix_segments`, which raises the floor
+        // immediately after" — and that holds for segment retention alone. Legacy
+        // retention also advances it now, write-ahead of its own deletes, without
+        // freeing any sequence to raise a floor with. Caching a hybrid sub-stream's
+        // value would therefore let a peer keep serving a pre-drain high under an
+        // unchanged floor, and hand out offsets from it.
+        //
+        // Nothing is lost: the fast path refuses a hybrid sub-stream before it ever
+        // consults this cache (`has_legacy_records` bails first), so the entry was
+        // written and never legitimately read — it existed only to go stale.
+        if !self.has_legacy_records(topition).await? {
+            self.cache_coalesced_watermark(topition, from_watermark, floor)?;
+        }
 
         let recovered = self
             .recover_substream_next_offset(topition, from_watermark)
@@ -7496,6 +7511,46 @@ impl DynoStore {
         Ok(offsets)
     }
 
+    /// Persist `topition`'s current log end into `watermark.high` before anything
+    /// is deleted from under it (#241), at most once per call via `persisted`.
+    ///
+    /// Legacy retention used to write only `watermark.low`, so a partition drained
+    /// to empty lost every record of where its log ended: `high_watermark` folds
+    /// `max(segment tail, legacy tail, persisted high)`, and with the objects gone
+    /// and nothing persisted that is `0`. The observable end of it was committed
+    /// group offsets sitting above a high watermark of `0` on 70 topics — but the
+    /// same fold is what `leaseless_base` assigns from, so the next produce would
+    /// re-use offsets from `0`, invisibly to every group whose committed position
+    /// is above the new tail.
+    ///
+    /// This is the fix the review of #61 applied to segment expiry, which persists
+    /// each affected sub-stream's tail write-ahead of the delete for exactly this
+    /// reason. The legacy path never received it, and #177/#178 stopped *writing*
+    /// that layout without changing how it is drained.
+    ///
+    /// Must be called before the first delete: once the objects are gone the tail
+    /// cannot be derived. Max-folded inside the CAS, so it can only ever rise.
+    async fn persist_offset_floor(&self, topition: &Topition, persisted: &mut bool) -> Result<()> {
+        if *persisted {
+            return Ok(());
+        }
+
+        *persisted = true;
+
+        let high = self.high_watermark(topition).await?;
+
+        if high <= 0 {
+            return Ok(());
+        }
+
+        self.watermark(topition)?
+            .with_mut(&self.object_store, |watermark| {
+                watermark.high = Some(watermark.high.unwrap_or(0).max(high));
+                Ok(())
+            })
+            .await
+    }
+
     /// Set the log start offset (`watermark.low`) to `low`.
     async fn advance_low_watermark(&self, topition: &Topition, low: Option<i64>) -> Result<()> {
         self.watermark(topition)?
@@ -7612,6 +7667,7 @@ impl DynoStore {
         let mut surviving_oldest_ms: Option<i64> = None;
         let mut chunk: Vec<Path> = Vec::new();
         let mut deleted: u64 = 0;
+        let mut floor_persisted = false;
 
         while let Some(meta) = list_stream
             .next()
@@ -7633,6 +7689,9 @@ impl DynoStore {
                 chunk.push(meta.location);
 
                 if chunk.len() >= EXPIRE_DELETE_CHUNK {
+                    self.persist_offset_floor(topition, &mut floor_persisted)
+                        .await?;
+
                     deleted += chunk.len() as u64;
                     self.delete_batches(std::mem::take(&mut chunk)).await?;
                 }
@@ -7646,6 +7705,9 @@ impl DynoStore {
         }
 
         if !chunk.is_empty() {
+            self.persist_offset_floor(topition, &mut floor_persisted)
+                .await?;
+
             deleted += chunk.len() as u64;
             self.delete_batches(chunk).await?;
         }
