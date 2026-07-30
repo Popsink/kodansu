@@ -1215,6 +1215,40 @@ fn every_listing_is_attributed_to_a_call_site() {
     );
 }
 
+/// #167: every metered outcome `Metron` counts must carry the key class, so the
+/// 304 and 404 planes are attributable at the layer that bills rather than
+/// inferred from the cache's miss series — which conflates a revalidation with a
+/// body read and, on that inference, put the `segment` class in a plane it is
+/// never in.
+///
+/// A source-level guard for the same reason #165 needed one: a counter that lost a
+/// label still counts, and the only symptom is a `sum by (class)` that quietly
+/// drops a plane into an unlabelled bucket months later, when someone is costing
+/// it.
+#[test]
+fn every_metered_outcome_carries_a_key_class() {
+    let source = include_str!("../../dynostore.rs");
+
+    // `Metron`'s error sites are the ones that reach the meter. Each is the pair
+    // "reason label, then class label" — find every `reason` and require a
+    // `class` within the same attribute vector.
+    let unclassed = source
+        .split("KeyValue::new(\"reason\"")
+        .skip(1)
+        .filter(|after| {
+            after
+                .split_once("request_error.add")
+                .is_some_and(|(vector, _)| !vector.contains("KeyValue::new(\"class\""))
+        })
+        .count();
+
+    assert_eq!(
+        0, unclassed,
+        "{unclassed} object-store outcome(s) are counted without a `class` label — \
+         tansu_object_store_request_error must stay attributable by key class (#167)"
+    );
+}
+
 /// #166: a prefix-coalesced partition with no segment yet must not re-list
 /// `records/` on the read path every few seconds. That short TTL applied to every
 /// idle stream and to every partition whose memo was cold after a restart, which

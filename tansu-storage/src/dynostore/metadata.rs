@@ -80,7 +80,11 @@ impl From<&GetResult> for CacheEntry {
 /// store: the fix for a single hot cluster-wide key (collapse the concurrent
 /// burst) is not the fix for thousands of per-partition keys (stop needing them
 /// per partition), and the aggregate cannot tell them apart.
-fn key_class(path: &Path) -> &'static str {
+///
+/// Shared with [`super::Metron`], which labels the *metered* outcomes with it —
+/// the same classes, so a plane can be followed from the cache boundary down to
+/// the request that left the process.
+pub(super) fn key_class(path: &Path) -> &'static str {
     let path = path.as_ref();
 
     if path.ends_with(".seg") {
