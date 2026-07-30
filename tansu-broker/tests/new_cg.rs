@@ -1035,27 +1035,60 @@ async fn stability_check<S>(
 
     debug!("awaiting stability");
 
+    // Stability is "every permanent consumer has heartbeated a few times **in one
+    // generation**", not "every permanent consumer has heartbeated a few times"
+    // (#195).
+    //
+    // The heartbeat count alone says each consumer is alive; it says nothing about
+    // whether they are alive in the *same* rebalance. A transient consumer
+    // rejoining bumps the generation, and the assignments this test asserts on —
+    // no partition twice, every partition once — are properties of one settled
+    // generation. Sampled across two, they legitimately overlap or leave a gap,
+    // which is the whole of this test's non-determinism: it failed under load and
+    // passed on a re-run of the same commit.
+    let mut settled_generation = None;
+
     while !is_stable {
-        debug!(is_stable);
+        debug!(is_stable, ?settled_generation);
         sleep(Duration::from_secs(1)).await;
 
-        is_stable = consumers
-            .iter()
-            .enumerate()
-            .filter(|(id, _)| !is_transient(*id))
-            .all(|(id, consumer)| {
+        let permanent = || {
+            consumers
+                .iter()
+                .enumerate()
+                .filter(|(id, _)| !is_transient(*id))
+        };
+
+        // One generation shared by every permanent consumer, or nothing.
+        let generation = permanent()
+            .map(|(id, consumer)| {
                 consumer
-                    .stable_heartbeat_count()
-                    .map(|heartbeats| {
-                        heartbeats
-                            .inspect(|heartbeats| debug!(id = format!("c{id}"), heartbeats))
-                            .is_some_and(|heartbeats| heartbeats > 2)
-                    })
+                    .generation()
+                    .inspect(|generation| debug!(id = format!("c{id}"), ?generation))
                     .unwrap_or_default()
-            });
+            })
+            .reduce(|acc, generation| acc.filter(|acc| Some(acc) == generation.as_ref()))
+            .flatten();
+
+        let heartbeating = permanent().all(|(id, consumer)| {
+            consumer
+                .stable_heartbeat_count()
+                .map(|heartbeats| {
+                    heartbeats
+                        .inspect(|heartbeats| debug!(id = format!("c{id}"), heartbeats))
+                        .is_some_and(|heartbeats| heartbeats > 2)
+                })
+                .unwrap_or_default()
+        });
+
+        // Require the agreed generation to hold across two consecutive polls: a
+        // rebalance that starts between the check and the cancel would otherwise
+        // still be sampled in flight.
+        is_stable = heartbeating && generation.is_some() && generation == settled_generation;
+        settled_generation = generation;
     }
 
-    debug!(is_stable);
+    debug!(is_stable, ?settled_generation);
     simulation.cancel();
 
     Ok(())

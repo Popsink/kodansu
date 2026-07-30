@@ -126,6 +126,19 @@ impl<S> ConsumerGroupService<S> {
             .map_err(Into::into)
     }
 
+    /// The generation this consumer last saw, or `None` before its first join.
+    ///
+    /// Exposed so a caller can tell "each consumer has heartbeated a few times"
+    /// from "every consumer is heartbeating in the SAME generation" (#195). Only
+    /// the second is evidence that a rebalance has settled, and an assignment
+    /// sampled without it can straddle two generations.
+    pub fn generation(&self) -> Result<Option<i32>, crate::Error> {
+        self.consumer
+            .lock()
+            .map(|consumer| consumer.generation_id())
+            .map_err(Into::into)
+    }
+
     pub fn stable_heartbeat_count(&self) -> Result<Option<usize>, crate::Error> {
         self.heartbeats
             .lock()

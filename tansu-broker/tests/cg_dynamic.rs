@@ -101,8 +101,20 @@ where
 
     let mut controller = Controller::with_storage(sc.clone())?;
 
-    let session_timeout_ms = 45_000;
-    let rebalance_timeout_ms = Some(300_000);
+    // Far beyond any plausible run of this test, deliberately (#195).
+    //
+    // At 45s it was within reach: this test takes 32-46s, and `missed_heartbeat`
+    // evicts a member whose `last_contact` is older than the session timeout,
+    // against the real clock. When the evicted member is the leader, the leader
+    // slot is cleared and the next join elects the *other* member — so a slow run
+    // silently swaps the roles these assertions are written around. That is why two
+    // consecutive failures reported different assertions: whichever divergence the
+    // eviction reached first.
+    //
+    // Session expiry is not what this test covers, so the fix is to put it out of
+    // reach rather than to chase the wall clock.
+    let session_timeout_ms = 600_000;
+    let rebalance_timeout_ms = Some(900_000);
     let group_instance_id = None;
 
     let group_id: String = alphanumeric_string(15);
