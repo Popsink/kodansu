@@ -30,7 +30,7 @@ use tokio::{
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, instrument, warn};
 
 use crate::{
     BYTES_RECEIVED, BYTES_SENT, Error, REQUEST_DURATION, REQUEST_SIZE, RESPONSE_SIZE, frame_length,
@@ -298,13 +298,30 @@ where
             .await
             .inspect_err(|err| debug!(?err))?;
 
-        if maximum_frame_size
-            .is_some_and(|maximum_frame_size| maximum_frame_size > frame_length(size))
-        {
-            return Err(Into::into(Error::FrameTooBig(frame_length(size))));
-        } else {
-            Ok(size)
+        let length = frame_length(size);
+
+        // Reject a frame LARGER than the cap (#244). The comparison used to run the
+        // other way round, so the guard fired on every frame *smaller* than the
+        // limit and passed everything above it: the cap did not cap, and it refused
+        // ordinary traffic. Nothing set `maximum_frame_size`, so it was inert — but
+        // the first operator to arm it, which is the natural response to a
+        // payload-size incident, would have taken every connection down instead.
+        //
+        // Rejection ends the connection task, so the peer sees a close mid-request
+        // rather than an error response — `early eof` on the client side. Hence the
+        // `warn!`: it is the only place that says which limit was hit and by how
+        // much, and without it the symptom is indistinguishable from a peer
+        // disappearing.
+        if maximum_frame_size.is_some_and(|maximum| length > maximum) {
+            warn!(
+                length,
+                maximum_frame_size, "rejecting an oversized frame; closing the connection"
+            );
+
+            return Err(Into::into(Error::FrameTooBig(length)));
         }
+
+        Ok(size)
     }
 
     #[instrument(skip_all)]
@@ -459,5 +476,63 @@ where
             .serve(ctx, req)
             .await
             .inspect(|response| debug!(response = ?&response[..]))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #244: the cap rejects a frame larger than the limit and accepts one at it.
+    ///
+    /// The comparison was inverted, which made the guard fire on every frame
+    /// *smaller* than the limit and pass everything above it. Both halves are
+    /// asserted here, at the boundary, because either alone would still pass with
+    /// the operator reversed: a limit that rejects nothing looks identical to a
+    /// correct one until something oversized arrives.
+    #[tokio::test]
+    async fn oversized_frames_are_rejected_at_the_boundary() {
+        // `frame_length` is the declared size plus its own 4 bytes, so a declared
+        // 96 is a 100-byte frame.
+        const DECLARED: i32 = 96;
+        let size = DECLARED.to_be_bytes();
+        let length = frame_length(size);
+        assert_eq!(100, length);
+
+        let service: TcpBytesService<EchoBytes, ()> = TcpBytesService {
+            inner: EchoBytes,
+            _state: PhantomData,
+        };
+
+        // No cap configured: every frame passes, which is the behaviour of every
+        // deployment today.
+        assert!(service.wait(&mut &size[..], None).await.is_ok());
+
+        // At the limit, and one byte of headroom: accepted.
+        assert!(service.wait(&mut &size[..], Some(length)).await.is_ok());
+        assert!(service.wait(&mut &size[..], Some(length + 1)).await.is_ok());
+
+        // One byte over: refused.
+        assert!(
+            service
+                .wait(&mut &size[..], Some(length - 1))
+                .await
+                .is_err(),
+            "a frame larger than the cap must be rejected"
+        );
+    }
+
+    /// A `Service<(), Bytes>` that satisfies `TcpBytesService`'s bounds. `wait`
+    /// never reaches the inner service, so echoing is enough.
+    #[derive(Clone, Debug, Default)]
+    struct EchoBytes;
+
+    impl Service<(), Bytes> for EchoBytes {
+        type Response = Bytes;
+        type Error = Error;
+
+        async fn serve(&self, _ctx: Context<()>, req: Bytes) -> Result<Bytes, Error> {
+            Ok(req)
+        }
     }
 }
