@@ -82,7 +82,7 @@ mod tests;
 use crate::{
     AutoTopicCreate, BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER,
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
+    Result, ScramCredential, Storage, TopicDefaults, TopicId, Topition, TxnAddPartitionsRequest,
     TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
 };
 
@@ -136,6 +136,13 @@ pub struct DynoStore {
     /// `num.partitions` / `default.replication.factor`), consulted by the
     /// Metadata handler.
     auto_create: AutoTopicCreate,
+
+    /// Broker-level topic config defaults, injected into every topic this engine
+    /// creates. Held here rather than in the `CreateTopics` service so the
+    /// injection sits at the single creation choke point and cannot be bypassed by
+    /// a caller that builds its own `CreatableTopic` — which is exactly how the
+    /// auto-create path silently dropped it (#225).
+    topic_defaults: TopicDefaults,
 
     /// Per-partition cache of the next offset to assign (== the high watermark).
     ///
@@ -1568,6 +1575,7 @@ impl DynoStore {
             topic_index_refresh: Arc::new(tokio::sync::Mutex::new(())),
             topic_ids: Arc::new(Mutex::new(BTreeMap::new())),
             auto_create: AutoTopicCreate::default(),
+            topic_defaults: TopicDefaults::default(),
             meta: OptiCon::<Meta>::new(cluster),
             #[cfg(test)]
             metadata_etags: cache.clone(),
@@ -1593,6 +1601,15 @@ impl DynoStore {
     pub fn auto_create(self, auto_create: AutoTopicCreate) -> Self {
         Self {
             auto_create,
+            ..self
+        }
+    }
+
+    /// The broker-level topic config defaults this engine injects into every topic
+    /// it creates (#225).
+    pub fn topic_defaults(self, topic_defaults: TopicDefaults) -> Self {
+        Self {
+            topic_defaults,
             ..self
         }
     }
@@ -8149,9 +8166,20 @@ impl Storage for DynoStore {
     }
 
     #[instrument(skip_all, fields(topic = %topic.name))]
-    async fn create_topic(&self, topic: CreatableTopic, _validate_only: bool) -> Result<Uuid> {
+    async fn create_topic(&self, mut topic: CreatableTopic, _validate_only: bool) -> Result<Uuid> {
         let id = Uuid::now_v7();
         debug!(%id);
+
+        // The single choke point for the broker-level config defaults (#225).
+        // Every creation path lands here — `CreateTopics`, auto-create, and
+        // anything added later — so a topic's stored config cannot depend on which
+        // API materialised it. It used to be applied in the `CreateTopics` service
+        // only, and auto-create, which builds its own `CreatableTopic`, stored no
+        // config at all: invisible in `DescribeConfigs`, and expiring on Kafka's
+        // absent-policy fallback instead of the configured default. Injection is
+        // idempotent and never overwrites a value the caller supplied.
+        self.topic_defaults
+            .apply(topic.configs.get_or_insert_with(Vec::new));
 
         // Create-only PUT of the per-topic object. A losing creator (another
         // replica racing the same name) gets `false` here and returns

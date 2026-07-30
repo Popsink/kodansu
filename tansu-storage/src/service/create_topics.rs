@@ -15,95 +15,19 @@
 use rama::{Context, Service};
 use tansu_sans_io::{
     ApiKey, CreateTopicsRequest, CreateTopicsResponse, ErrorCode, NULL_TOPIC_ID,
-    create_topics_request::CreatableTopicConfig, create_topics_response::CreatableTopicResult,
+    create_topics_response::CreatableTopicResult,
 };
 use tracing::{debug, instrument};
 
 use crate::{Error, Result, Storage};
 
-/// The Apache Kafka default `retention.ms` (7 days).
-pub const DEFAULT_RETENTION_MS: i64 = 604_800_000;
-
-/// The Apache Kafka default `cleanup.policy`.
-pub const DEFAULT_CLEANUP_POLICY: &str = "delete";
-
-/// Broker-level topic config defaults applied by [`CreateTopicsService`] when a
-/// client creates a topic without an explicit value.
-///
-/// Mirrors Apache Kafka, where `cleanup.policy` defaults to `delete` and
-/// `retention.ms` to 7 days, so retention is enforced even when the client sends
-/// no topic config.
-///
-/// Setting [`cleanup_policy`](Self::cleanup_policy) to `None` (or an empty
-/// string) opts out of *injecting* a stored policy. It does **not** give the
-/// topic infinite retention, which is what this said before #223: the engine
-/// reads an absent `cleanup.policy` as Kafka's default, `delete`, and applies the
-/// 7-day `retention.ms` fallback, so opting out of the injection produces a topic
-/// that expires at 7 days with nothing recorded to explain why.
-///
-/// Retain-forever has exactly one spelling: `retention.ms=-1`, which both expiry
-/// paths map to "never". It can be set per topic with `(Incremental)AlterConfigs`;
-/// there is no broker-level default that expresses it (#224).
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct TopicDefaults {
-    /// Default `cleanup.policy`; `None`/empty means "do not inject a stored
-    /// policy" — the engine still reads absent as `delete`.
-    pub cleanup_policy: Option<String>,
-
-    /// Default `retention.ms`, injected only for `delete`-policy topics. `-1`
-    /// means retain forever.
-    pub retention_ms: i64,
-}
-
-impl Default for TopicDefaults {
-    fn default() -> Self {
-        Self {
-            cleanup_policy: Some(DEFAULT_CLEANUP_POLICY.into()),
-            retention_ms: DEFAULT_RETENTION_MS,
-        }
-    }
-}
-
-impl TopicDefaults {
-    /// Inject the defaults into `configs` for any key the client omitted.
-    ///
-    /// `cleanup.policy` is only added when a default is configured; `retention.ms`
-    /// is only added when the effective `cleanup.policy` contains `delete` (a
-    /// `compact` topic keeps no retention), so internal compacted topics are left
-    /// untouched.
-    fn apply(&self, configs: &mut Vec<CreatableTopicConfig>) {
-        let default_policy = self
-            .cleanup_policy
-            .as_deref()
-            .filter(|policy| !policy.is_empty());
-
-        if let Some(policy) = default_policy
-            && !configs.iter().any(|config| config.name == "cleanup.policy")
-        {
-            configs.push(
-                CreatableTopicConfig::default()
-                    .name("cleanup.policy".into())
-                    .value(Some(policy.to_owned())),
-            );
-        }
-
-        let policy_is_delete = configs
-            .iter()
-            .find(|config| config.name == "cleanup.policy")
-            .and_then(|config| config.value.as_deref())
-            .is_some_and(|policy| policy.contains("delete"));
-
-        if policy_is_delete && !configs.iter().any(|config| config.name == "retention.ms") {
-            configs.push(
-                CreatableTopicConfig::default()
-                    .name("retention.ms".into())
-                    .value(Some(self.retention_ms.to_string())),
-            );
-        }
-    }
-}
-
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`CreateTopicsRequest`] returning [`CreateTopicsResponse`].
+///
+/// Broker-level [`crate::TopicDefaults`] are applied by the engine, inside
+/// [`Storage::create_topic`], not here: this is one of two paths that create a
+/// topic (the other is auto-create, in [`super::MetadataService`]), and a topic's
+/// effective config must not depend on which one it came through (#225).
+///
 /// ```
 /// use rama::{Context, Layer, Service as _, layer::MapStateLayer};
 /// use tansu_sans_io::{NULL_TOPIC_ID, CreateTopicsRequest,
@@ -121,7 +45,7 @@ impl TopicDefaults {
 ///     .build()
 ///     .await?;
 ///
-/// let service = MapStateLayer::new(|_| storage).into_layer(CreateTopicsService::default());
+/// let service = MapStateLayer::new(|_| storage).into_layer(CreateTopicsService);
 ///
 /// let name = "abcba";
 ///
@@ -152,17 +76,8 @@ impl TopicDefaults {
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CreateTopicsService {
-    defaults: TopicDefaults,
-}
-
-impl CreateTopicsService {
-    /// A service applying the given broker-level [`TopicDefaults`] at create time.
-    pub fn new(defaults: TopicDefaults) -> Self {
-        Self { defaults }
-    }
-}
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CreateTopicsService;
 
 impl ApiKey for CreateTopicsService {
     const KEY: i16 = CreateTopicsRequest::KEY;
@@ -201,9 +116,6 @@ where
                 }
                 otherwise => otherwise,
             });
-
-            self.defaults
-                .apply(topic.configs.get_or_insert_with(Vec::new));
 
             match ctx
                 .state()

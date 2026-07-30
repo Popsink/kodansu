@@ -160,7 +160,7 @@ use tansu_sans_io::{
     },
     add_partitions_to_txn_response::{AddPartitionsToTxnResult, AddPartitionsToTxnTopicResult},
     consumer_group_describe_response,
-    create_topics_request::CreatableTopic,
+    create_topics_request::{CreatableTopic, CreatableTopicConfig},
     delete_groups_response::DeletableGroupResult,
     delete_records_request::DeleteRecordsTopic,
     delete_records_response::DeleteRecordsTopicResult,
@@ -205,15 +205,14 @@ pub use latency::LatencyIntroducingStorage;
 
 pub use service::{
     AlterUserScramCredentialsService, ChannelRequestLayer, ChannelRequestService,
-    ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService, DEFAULT_CLEANUP_POLICY,
-    DEFAULT_RETENTION_MS, DeleteGroupsService, DeleteRecordsService, DeleteTopicsService,
-    DescribeAclsService, DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
-    DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
-    FindCoordinatorService, GetTelemetrySubscriptionsService, IncrementalAlterConfigsService,
-    InitProducerIdService, ListGroupsService, ListOffsetsService,
-    ListPartitionReassignmentsService, MetadataService, ProduceService, Request,
-    RequestChannelService, RequestLayer, RequestReceiver, RequestSender, RequestService,
-    RequestStorageService, Response, TopicDefaults, TxnAddOffsetsService, TxnAddPartitionService,
+    ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService, DeleteGroupsService,
+    DeleteRecordsService, DeleteTopicsService, DescribeAclsService, DescribeClusterService,
+    DescribeConfigsService, DescribeGroupsService, DescribeTopicPartitionsService,
+    DescribeUserScramCredentialsService, FetchService, FindCoordinatorService,
+    GetTelemetrySubscriptionsService, IncrementalAlterConfigsService, InitProducerIdService,
+    ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService, MetadataService,
+    ProduceService, Request, RequestChannelService, RequestLayer, RequestReceiver, RequestSender,
+    RequestService, RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService,
     TxnOffsetCommitService, bounded_channel,
 };
 
@@ -787,6 +786,95 @@ impl Default for AutoTopicCreate {
             enable: true,
             num_partitions: 1,
             replication_factor: 1,
+        }
+    }
+}
+
+/// The Apache Kafka default `retention.ms` (7 days).
+pub const DEFAULT_RETENTION_MS: i64 = 604_800_000;
+
+/// The Apache Kafka default `cleanup.policy`.
+pub const DEFAULT_CLEANUP_POLICY: &str = "delete";
+
+/// Broker-level topic config defaults, applied by the engine when a topic is
+/// created without an explicit value.
+///
+/// Mirrors Apache Kafka, where `cleanup.policy` defaults to `delete` and
+/// `retention.ms` to 7 days, so retention is enforced even when the client sends
+/// no topic config.
+///
+/// Applied inside [`Storage::create_topic`] rather than in the `CreateTopics`
+/// service, so a topic's effective config cannot depend on which API created it
+/// (#225): the auto-create path builds its own `CreatableTopic` and used to bypass
+/// the injection entirely, storing no config at all.
+///
+/// Setting [`cleanup_policy`](Self::cleanup_policy) to `None` (or an empty
+/// string) opts out of *injecting* a stored policy. It does **not** give the
+/// topic infinite retention, which is what this said before #223: the engine
+/// reads an absent `cleanup.policy` as Kafka's default, `delete`, and applies the
+/// 7-day `retention.ms` fallback, so opting out of the injection produces a topic
+/// that expires at 7 days with nothing recorded to explain why.
+///
+/// Retain-forever has exactly one spelling: `retention.ms=-1`, which both expiry
+/// paths map to "never". It can be set per topic with `(Incremental)AlterConfigs`;
+/// there is no broker-level default that expresses it (#224).
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TopicDefaults {
+    /// Default `cleanup.policy`; `None`/empty means "do not inject a stored
+    /// policy" — the engine still reads absent as `delete`.
+    pub cleanup_policy: Option<String>,
+
+    /// Default `retention.ms`, injected only for `delete`-policy topics. `-1`
+    /// means retain forever.
+    pub retention_ms: i64,
+}
+
+impl Default for TopicDefaults {
+    fn default() -> Self {
+        Self {
+            cleanup_policy: Some(DEFAULT_CLEANUP_POLICY.into()),
+            retention_ms: DEFAULT_RETENTION_MS,
+        }
+    }
+}
+
+impl TopicDefaults {
+    /// Inject the defaults into `configs` for any key the caller omitted.
+    ///
+    /// `cleanup.policy` is only added when a default is configured; `retention.ms`
+    /// is only added when the effective `cleanup.policy` contains `delete` (a
+    /// `compact` topic keeps no retention), so internal compacted topics are left
+    /// untouched. Idempotent — an already-present key is never overwritten — so
+    /// applying it at the single creation choke point is safe even if a caller
+    /// above has already filled a value in.
+    pub(crate) fn apply(&self, configs: &mut Vec<CreatableTopicConfig>) {
+        let default_policy = self
+            .cleanup_policy
+            .as_deref()
+            .filter(|policy| !policy.is_empty());
+
+        if let Some(policy) = default_policy
+            && !configs.iter().any(|config| config.name == "cleanup.policy")
+        {
+            configs.push(
+                CreatableTopicConfig::default()
+                    .name("cleanup.policy".into())
+                    .value(Some(policy.to_owned())),
+            );
+        }
+
+        let policy_is_delete = configs
+            .iter()
+            .find(|config| config.name == "cleanup.policy")
+            .and_then(|config| config.value.as_deref())
+            .is_some_and(|policy| policy.contains("delete"));
+
+        if policy_is_delete && !configs.iter().any(|config| config.name == "retention.ms") {
+            configs.push(
+                CreatableTopicConfig::default()
+                    .name("retention.ms".into())
+                    .value(Some(self.retention_ms.to_string())),
+            );
         }
     }
 }
@@ -2172,6 +2260,10 @@ pub struct Builder<N, C, A, S> {
     storage: S,
     silent: bool,
 
+    /// Broker-level topic config defaults, handed to the engine so they are
+    /// applied at the single creation choke point (#225).
+    topic_defaults: TopicDefaults,
+
     cancellation: CancellationToken,
 }
 
@@ -2186,6 +2278,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             advertised_listener: self.advertised_listener,
             storage: self.storage,
             silent: self.silent,
+            topic_defaults: self.topic_defaults,
             cancellation: self.cancellation,
         }
     }
@@ -2197,6 +2290,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             advertised_listener: self.advertised_listener,
             storage: self.storage,
             silent: self.silent,
+            topic_defaults: self.topic_defaults,
             cancellation: self.cancellation,
         }
     }
@@ -2208,6 +2302,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             advertised_listener: advertised_listener.into(),
             storage: self.storage,
             silent: self.silent,
+            topic_defaults: self.topic_defaults,
             cancellation: self.cancellation,
         }
     }
@@ -2221,6 +2316,7 @@ impl<N, C, A, S> Builder<N, C, A, S> {
             advertised_listener: self.advertised_listener,
             storage,
             silent: self.silent,
+            topic_defaults: self.topic_defaults,
             cancellation: self.cancellation,
         }
     }
@@ -2234,6 +2330,15 @@ impl<N, C, A, S> Builder<N, C, A, S> {
 
     pub fn silent(self, silent: bool) -> Self {
         Self { silent, ..self }
+    }
+
+    /// The broker-level topic config defaults the engine injects into every topic
+    /// it creates (#225).
+    pub fn topic_defaults(self, topic_defaults: TopicDefaults) -> Self {
+        Self {
+            topic_defaults,
+            ..self
+        }
     }
 }
 
@@ -2456,6 +2561,7 @@ impl Builder<i32, String, Url, Url> {
                         DynoStore::new(self.cluster_id.as_str(), self.node_id, object_store)
                             .advertised_listener(self.advertised_listener.clone())
                             .auto_create(auto_topic_create(&self.storage))
+                            .topic_defaults(self.topic_defaults.clone())
                             .coalesce_tuning(coalesce_tuning(&self.storage))
                     })
                     .map(|storage| {
@@ -2532,6 +2638,7 @@ impl Builder<i32, String, Url, Url> {
                         DynoStore::new(self.cluster_id.as_str(), self.node_id, object_store)
                             .advertised_listener(self.advertised_listener.clone())
                             .auto_create(auto_topic_create(&self.storage))
+                            .topic_defaults(self.topic_defaults.clone())
                             .coalesce_tuning(coalesce_tuning(&self.storage))
                     })
                     .map(|storage| {
@@ -2549,6 +2656,7 @@ impl Builder<i32, String, Url, Url> {
                 DynoStore::new(self.cluster_id.as_str(), self.node_id, InMemory::new())
                     .advertised_listener(self.advertised_listener.clone())
                     .auto_create(auto_topic_create(&self.storage))
+                    .topic_defaults(self.topic_defaults.clone())
                     .coalesce_tuning(coalesce_tuning(&self.storage)),
             )
             .map(|storage| Box::new(storage) as Box<dyn Storage>)

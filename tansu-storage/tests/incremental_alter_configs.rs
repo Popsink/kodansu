@@ -48,7 +48,7 @@ async fn req() -> Result<(), Error> {
 
     let create_topic = {
         let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService::default())
+        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
     };
 
     let response = create_topic

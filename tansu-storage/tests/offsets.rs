@@ -54,7 +54,7 @@ async fn concurrent_offset_commit_fetch_round_trip() -> Result<(), Error> {
     // Create the topic the offsets belong to.
     let create = {
         let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService::default())
+        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
     };
     let created = create
         .serve(

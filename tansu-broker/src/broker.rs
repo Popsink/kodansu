@@ -114,7 +114,6 @@ pub struct Broker<G, S> {
     tls_server_config: Option<Arc<ServerConfig>>,
     silent: bool,
     maintenance_interval: Option<Duration>,
-    topic_defaults: TopicDefaults,
 
     cancellation: CancellationToken,
 }
@@ -152,7 +151,6 @@ where
             silent: false,
 
             maintenance_interval: None,
-            topic_defaults: TopicDefaults::default(),
 
             cancellation: CancellationToken::new(),
         }
@@ -495,7 +493,6 @@ where
             groups,
             self.storage.clone(),
             self.sasl_config.clone(),
-            self.topic_defaults.clone(),
         )?;
 
         let handle = set.spawn(async move {
@@ -847,6 +844,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             .advertised_listener(self.advertised_listener.clone())
             .storage(self.storage.clone())
             .cancellation(self.cancellation.clone())
+            .topic_defaults(self.topic_defaults.clone())
             .silent(self.silent)
             .build()
             .await
@@ -927,7 +925,6 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
 
             silent: self.silent,
             maintenance_interval: self.maintenance_interval,
-            topic_defaults: self.topic_defaults,
             cancellation: self.cancellation,
         })
     }

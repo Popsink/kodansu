@@ -114,6 +114,11 @@ where
                 .collect::<Vec<_>>();
 
             if !to_create.is_empty() {
+                // No broker-level config defaults are applied here: the engine
+                // injects them inside `create_topic`, the single creation choke
+                // point, precisely because this path builds its own
+                // `CreatableTopic` and silently bypassed the injection while it
+                // lived in the `CreateTopics` service (#225).
                 for name in to_create {
                     let creatable = CreatableTopic::default()
                         .name(name.clone())

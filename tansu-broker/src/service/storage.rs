@@ -34,7 +34,7 @@ use tansu_storage::{
     DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
     FindCoordinatorService, GetTelemetrySubscriptionsService, IncrementalAlterConfigsService,
     InitProducerIdService, ListGroupsService, ListOffsetsService,
-    ListPartitionReassignmentsService, MetadataService, ProduceService, Storage, TopicDefaults,
+    ListPartitionReassignmentsService, MetadataService, ProduceService, Storage,
     TxnAddOffsetsService, TxnAddPartitionService, TxnOffsetCommitService,
 };
 
@@ -43,7 +43,6 @@ use crate::Error;
 pub fn services<S>(
     builder: FrameRouteBuilder<(), Error>,
     storage: S,
-    topic_defaults: TopicDefaults,
 ) -> Result<FrameRouteBuilder<(), Error>, Error>
 where
     S: Storage + Clone,
@@ -54,6 +53,7 @@ where
         alter_user_scram_credentials,
         consumer_group_describe,
         create_acls,
+        create_topics,
         delete_groups,
         delete_records,
         delete_topics,
@@ -79,9 +79,6 @@ where
     .try_fold(builder, |builder, service| {
         service(builder, storage.clone())
     })
-    // `create_topics` carries broker-level `TopicDefaults`, so it does not share
-    // the uniform `(builder, storage)` signature of the routes above.
-    .and_then(|builder| create_topics(builder, storage, topic_defaults))
 }
 
 pub fn alter_user_scram_credentials<S>(
@@ -192,7 +189,6 @@ where
 pub fn create_topics<S>(
     builder: FrameRouteBuilder<(), Error>,
     storage: S,
-    topic_defaults: TopicDefaults,
 ) -> Result<FrameRouteBuilder<(), Error>, Error>
 where
     S: Storage + Clone,
@@ -205,7 +201,7 @@ where
                 MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<CreateTopicsRequest>::new(),
             )
-                .into_layer(CreateTopicsService::new(topic_defaults))
+                .into_layer(CreateTopicsService)
                 .boxed(),
         )
         .map_err(Into::into)

@@ -16,9 +16,13 @@ use crate::common::{Error, init_tracing};
 use rama::{Context, Layer as _, Service, layer::MapStateLayer};
 use std::sync::Arc;
 use tansu_sans_io::{
-    ErrorCode, MetadataRequest, MetadataResponse, metadata_request::MetadataRequestTopic,
+    ConfigResource, DescribeConfigsRequest, ErrorCode, MetadataRequest, MetadataResponse,
+    describe_configs_request::DescribeConfigsResource, metadata_request::MetadataRequestTopic,
 };
-use tansu_storage::{MetadataService, Storage, StorageContainer};
+use tansu_storage::{
+    DEFAULT_CLEANUP_POLICY, DEFAULT_RETENTION_MS, DescribeConfigsService, MetadataService, Storage,
+    StorageContainer, TopicDefaults,
+};
 use url::Url;
 
 mod common;
@@ -203,6 +207,130 @@ async fn honours_configured_partition_count() -> Result<(), Error> {
     assert_eq!(3, topics[0].partitions.as_deref().unwrap_or_default().len());
 
     Ok(())
+}
+
+/// Auto-create applies the broker-level [`TopicDefaults`], so a topic materialised
+/// by a `Metadata` request stores the same effective config as one created through
+/// `CreateTopics` (#225).
+///
+/// It did not: the injection lived in `CreateTopicsService`, and `MetadataService`
+/// builds its own `CreatableTopic` with an explicitly empty config list, so
+/// `DEFAULT_CLEANUP_POLICY` / `DEFAULT_RETENTION` were silently dropped for every
+/// auto-created topic. The topic then stored no config at all — invisible in
+/// `DescribeConfigs`, and expiring on Kafka's fallback rather than the configured
+/// default, for the same broker config. Any client relying on
+/// `auto.create.topics.enable` got a different retention regime from the rest of
+/// the cluster.
+///
+/// Note what this test does *not* do: it never mentions the defaults to the
+/// service. They are configured on the store, and the service is the plain
+/// `MetadataService` — the point of moving the injection into `create_topic` is
+/// that a creation path cannot opt out of them, or forget them, at all.
+#[tokio::test]
+async fn auto_create_applies_broker_topic_defaults() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let name = "auto-defaults";
+
+    let defaults = TopicDefaults {
+        cleanup_policy: Some("delete".into()),
+        retention_ms: 2_592_000_000,
+    };
+
+    let storage = StorageContainer::builder()
+        .cluster_id("tansu")
+        .node_id(111)
+        .advertised_listener(Url::parse("tcp://localhost:9092")?)
+        .storage(Url::parse("memory://tansu/")?)
+        .topic_defaults(defaults.clone())
+        .build()
+        .await?;
+
+    let response = metadata(storage.clone(), name, true).await?;
+
+    assert_eq!(
+        i16::from(ErrorCode::None),
+        response.topics.as_deref().unwrap_or_default()[0].error_code
+    );
+
+    let configs = describe(storage.clone(), name).await?;
+
+    assert_eq!(
+        Some("delete"),
+        value(&configs, "cleanup.policy"),
+        "the configured default policy must reach an auto-created topic"
+    );
+    assert_eq!(
+        Some(defaults.retention_ms.to_string().as_str()),
+        value(&configs, "retention.ms"),
+        "the configured default retention must reach an auto-created topic"
+    );
+
+    Ok(())
+}
+
+/// The same path with the defaults left at their own defaults: Kafka's `delete` at
+/// 7 days, stored and reported, rather than nothing at all.
+#[tokio::test]
+async fn auto_create_stores_kafka_defaults_when_unconfigured() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = storage("memory://tansu/").await?;
+    let name = "auto-kafka-defaults";
+
+    _ = metadata(storage.clone(), name, true).await?;
+
+    let configs = describe(storage.clone(), name).await?;
+
+    assert_eq!(
+        Some(DEFAULT_CLEANUP_POLICY),
+        value(&configs, "cleanup.policy")
+    );
+    assert_eq!(
+        Some(DEFAULT_RETENTION_MS.to_string().as_str()),
+        value(&configs, "retention.ms")
+    );
+
+    Ok(())
+}
+
+/// The stored config of `name`, as `DescribeConfigs` reports it — which is what an
+/// operator sees and what maintenance reads.
+async fn describe(
+    storage: Arc<Box<dyn Storage>>,
+    name: &str,
+) -> Result<Vec<(String, Option<String>)>, Error> {
+    let response = MapStateLayer::new(|_| storage)
+        .into_layer(DescribeConfigsService)
+        .serve(
+            Context::default(),
+            DescribeConfigsRequest::default()
+                .include_documentation(Some(false))
+                .include_synonyms(Some(false))
+                .resources(Some(
+                    [DescribeConfigsResource::default()
+                        .resource_name(name.into())
+                        .resource_type(ConfigResource::Topic.into())
+                        .configuration_keys(Some([].into()))]
+                    .into(),
+                )),
+        )
+        .await?;
+
+    Ok(response
+        .results
+        .unwrap_or_default()
+        .into_iter()
+        .flat_map(|result| result.configs.unwrap_or_default())
+        .map(|config| (config.name, config.value))
+        .collect())
+}
+
+fn value<'a>(configs: &'a [(String, Option<String>)], name: &str) -> Option<&'a str> {
+    configs
+        .iter()
+        .find(|(key, _)| key == name)
+        .and_then(|(_, value)| value.as_deref())
 }
 
 /// A second request for the same topic is a no-op (the topic already exists);
