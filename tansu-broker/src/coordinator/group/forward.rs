@@ -529,20 +529,29 @@ struct Forwardee<'a> {
     mutating: bool,
 }
 
-/// What the caller should do with a forward attempt (#190).
+/// What the caller should do with a forward attempt (#190, #240).
 ///
-/// The decision turns on distinguishing the two failure shapes. Peers come from
-/// a headless-Service DNS lookup, which publishes only *ready* pods, so an owner
-/// this replica can name is an owner that is up — and ownership moves on its own
-/// when it is not. A **timeout** therefore means the owner accepted the request
-/// and is still working on it. A **transport error** is the genuinely ambiguous
-/// case: the owner may have gone between the DNS refresh and the call.
+/// Peers come from a headless-Service DNS lookup, which publishes only *ready*
+/// pods, so an owner this replica can name is an owner that is up — and ownership
+/// moves on its own when it is not.
 ///
-/// For a state-mutating API those are opposite situations. Processing locally
-/// against a live owner puts a second writer on one group document — #78's
-/// hazard applied to group state, and the split-brain behind #190's permanent
-/// rebalance churn. Processing locally when the owner has actually gone is the
-/// backstop that keeps the group serviceable.
+/// **For a mutating API, no failure shape justifies local processing.** A timeout
+/// means the owner is still working on this generation; a transport error means
+/// this replica could not talk to it. Neither is evidence that the owner is gone,
+/// and answering locally in either case puts a second writer on one group document
+/// — #78's hazard applied to group state. That is #190's permanent rebalance churn
+/// (through the timeout door) and #240's groups wedged in `CompletingRebalance`
+/// with zero assignments (through the transport door). Both are told
+/// `NOT_COORDINATOR`, which is retriable.
+///
+/// The departure case needs no special handling: a pod that has actually gone
+/// leaves the ready set within one refresh interval, ownership moves, and the
+/// client's retry is served by the new owner. A DNS outage empties the peer set
+/// entirely, which makes every group local — the same degradation as before
+/// forwarding existed.
+///
+/// **For a read-only API the local answer is free**, so a failed forward is served
+/// here rather than refused.
 #[derive(Debug)]
 enum Forwarded {
     /// The owner answered.
@@ -676,7 +685,37 @@ where
                 return Forwarded::Response(response);
             }
 
-            // The owner may already be gone: local processing is the backstop.
+            // A transport failure on a mutating API is refused, not raced (#240).
+            //
+            // This branch used to process locally for every API, on the reasoning
+            // that the owner may have gone between the DNS refresh and the call.
+            // What that costs is a second writer on one group document — the exact
+            // hazard the timeout branch below was changed to avoid in #190 — and it
+            // is reached through a much more common door: any transient transport
+            // error, not just a departure. In production it wedged eight of ten
+            // 16-member groups in `CompletingRebalance` with zero partitions
+            // assigned, indefinitely and silently: each replica answered `sync`
+            // from its own local state, so no assignment ever converged.
+            //
+            // What it protected against is bounded by one peer-DNS refresh (~5s):
+            // if the owner really has gone, the ready set drops it, ownership moves
+            // and the client's retry is served locally by the new owner. A
+            // retriable `NOT_COORDINATOR` costs that delay; local processing costs
+            // a split group. The unresolvable-DNS case does not reach here at all —
+            // an empty peer set makes this replica the owner of everything, which
+            // is the `local_owner` branch above.
+            Ok(Err(error)) if mutating => {
+                warn!(
+                    api,
+                    group_id,
+                    %owner,
+                    %error,
+                    "group forward failed; refusing rather than writing group state locally"
+                );
+                ("forward", "owner_unreachable", Forwarded::Retry)
+            }
+
+            // Read-only: the local answer is free and cannot diverge the group.
             Ok(Err(error)) => {
                 warn!(api, group_id, %owner, %error, "group forward failed; processing locally");
                 ("forward", "fallback", Forwarded::Local)
@@ -1831,10 +1870,16 @@ mod tests {
             Ok(())
         }
 
-        // A failed forward falls back to local processing (the etag-CAS
-        // correctness backstop) and the fallback tally increments.
+        /// A failed forward of a `join` is refused, not served locally (#240).
+        ///
+        /// This asserted the fallback until #240 — "despite the owner being
+        /// unreachable, the join is served by the local Controller". A join
+        /// registers a member and can start a rebalance, so a local answer while
+        /// the owner is up is a second writer on the group document; the wedged
+        /// groups #240 reports are what that produces at 16 members across 10
+        /// replicas. Refusal is retriable and lands the member on the real owner.
         #[tokio::test]
-        async fn forwarding_failure_falls_back_to_local() -> Result<()> {
+        async fn forwarding_failure_on_join_is_refused() -> Result<()> {
             let storage = storage_container().await?;
             let stub = StubForward::new(StubBehaviour::Fail);
 
@@ -1856,13 +1901,23 @@ mod tests {
                 stub.clone(),
             );
 
-            // despite the owner being unreachable, the join is served by the
-            // local Controller exactly as today.
-            _ = join_as_leader(&coordinator, group_id.as_str()).await?;
+            let error = join_as_leader(&coordinator, group_id.as_str())
+                .await
+                .expect_err("an unreachable owner must not be raced on join");
 
-            // one forward attempt per join call (member-id-required + rejoin).
-            assert_eq!(2, stub.calls());
-            assert_eq!(2, coordinator.fallbacks());
+            assert!(
+                matches!(error, Error::Api(ErrorCode::NotCoordinator)),
+                "expected a retriable NOT_COORDINATOR, got {error:?}",
+            );
+
+            // One attempt: the refusal ends the call rather than continuing to the
+            // rejoin the local path used to perform.
+            assert_eq!(1, stub.calls());
+            assert_eq!(
+                0,
+                coordinator.fallbacks(),
+                "nothing fell back: no group state was written here",
+            );
 
             Ok(())
         }
@@ -1919,11 +1974,20 @@ mod tests {
             Ok(())
         }
 
-        /// A transport failure is the opposite case and keeps the backstop
-        /// (#190): the owner may have gone between the DNS refresh and the
-        /// call, so refusing would strand the group.
+        /// #240: a transport failure on `sync` is refused too, not served locally.
+        ///
+        /// This test asserted the opposite until #240. The backstop it protected —
+        /// "the owner may have gone between the DNS refresh and the call" — costs
+        /// at most one refresh interval, because a departed pod leaves the ready
+        /// set and ownership moves on its own. Local processing costs a second
+        /// writer on one group document, and in production that wedged eight of ten
+        /// 16-member groups in `CompletingRebalance` with zero partitions assigned:
+        /// each replica answered `sync` from its own state, so no assignment ever
+        /// converged, silently, for hours.
+        ///
+        /// `NOT_COORDINATOR` sends the client back to discover the real owner.
         #[tokio::test]
-        async fn unreachable_owner_still_falls_back_on_sync() -> Result<()> {
+        async fn unreachable_owner_is_refused_rather_than_raced_on_sync() -> Result<()> {
             let storage = storage_container().await?;
             let stub = StubForward::new(StubBehaviour::Fail);
 
@@ -1940,9 +2004,51 @@ mod tests {
                 stub.clone(),
             );
 
-            // Served by the local Controller, exactly as before.
-            _ = coordinator
+            let error = coordinator
                 .sync(group_id.as_str(), 0, "some-member", None, None, None, None)
+                .await
+                .expect_err("an unreachable owner must not be raced");
+
+            assert!(
+                matches!(error, Error::Api(ErrorCode::NotCoordinator)),
+                "expected a retriable NOT_COORDINATOR, got {error:?}",
+            );
+            assert_eq!(1, stub.calls());
+            assert_eq!(
+                0,
+                coordinator.fallbacks(),
+                "nothing fell back: the request was refused, not processed twice",
+            );
+
+            Ok(())
+        }
+
+        /// The read-only half of the same branch: a failed forward of a heartbeat
+        /// is still served locally (#240). Nothing it answers can diverge the
+        /// group, so refusing it would only add a round trip — and a heartbeat is
+        /// the request a client sends most often.
+        #[tokio::test]
+        async fn unreachable_owner_still_falls_back_on_a_read_only_api() -> Result<()> {
+            let storage = storage_container().await?;
+            let stub = StubForward::new(StubBehaviour::Fail);
+
+            let owner_ip = peer(2);
+            let registry = registry_owning_nothing(peer(1), owner_ip);
+            let group_id = (0u32..)
+                .map(|i| format!("heartbeat-group-{i}"))
+                .find(|group_id| registry.owner(group_id) == owner_ip)
+                .expect("a peer-owned group exists");
+
+            let coordinator = ForwardingCoordinator::with_forward(
+                Controller::with_storage(storage)?,
+                registry,
+                stub.clone(),
+            );
+
+            // The local Controller answers — an unknown group, but an answer, not a
+            // refusal.
+            _ = coordinator
+                .heartbeat(group_id.as_str(), 0, "some-member", None)
                 .await?;
 
             assert_eq!(1, stub.calls());
@@ -1984,7 +2090,12 @@ mod tests {
                 "an unseen group falls back to the flat deadline",
             );
 
-            _ = join_as_leader(&coordinator, group_id.as_str()).await?;
+            // The forward fails, so since #240 the join is refused rather than
+            // served locally — the window is still learned, because it is recorded
+            // from the request before the forward is attempted.
+            _ = join_as_leader(&coordinator, group_id.as_str())
+                .await
+                .expect_err("an unreachable owner refuses a join");
 
             let expected = Duration::from_millis(
                 u64::try_from(REBALANCE_TIMEOUT_MS.unwrap_or(SESSION_TIMEOUT_MS))
