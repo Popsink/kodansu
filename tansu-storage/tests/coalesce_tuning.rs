@@ -24,12 +24,12 @@
 
 use crate::common::{Error, init_tracing};
 use bytes::Bytes;
+use std::sync::Arc;
 use std::time::Duration;
 use tansu_sans_io::{
     create_topics_request::CreatableTopic,
     record::{Record, deflated, inflated},
 };
-use std::sync::Arc;
 use tansu_storage::{Storage, StorageContainer, Topition};
 use tokio::time::timeout;
 use url::Url;
@@ -82,8 +82,10 @@ async fn storage_from(query: &str) -> Result<Arc<Box<dyn Storage>>, Error> {
 async fn url_batch_count_threshold_reaches_the_segment_flush() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let storage =
-        storage_from(&format!("coalesce_linger={LINGER}&coalesce_batches={BATCHES}")).await?;
+    let storage = storage_from(&format!(
+        "coalesce_linger={LINGER}&coalesce_batches={BATCHES}"
+    ))
+    .await?;
 
     let topic = "org.env.conn.tuned";
     _ = storage
