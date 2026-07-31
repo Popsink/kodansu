@@ -189,33 +189,6 @@ async fn segments_of(bucket: &InMemory, prefix: &str) -> Vec<Path> {
         .expect("list segments")
 }
 
-/// Seed a legacy `records/{offset:020}.batch` object directly into the bucket.
-///
-/// Since #177 no code path *writes* this layout — segments are the only
-/// writer — but production buckets are full of these objects and the hybrid
-/// read path must keep serving them until #179 deletes it. Seeding through a
-/// flag-off `DynoStore` used to do this; that store now writes segments, so a
-/// hybrid test built that way would quietly become a segment-only test that
-/// still passes. Writing the object is the only honest way to keep the seam
-/// covered.
-async fn seed_legacy_batch(
-    store: &DynoStore,
-    bucket: &InMemory,
-    topition: &Topition,
-    base_offset: i64,
-    batch: deflated::Batch,
-) -> Result<()> {
-    let location = Path::from(format!(
-        "clusters/{CLUSTER}/topics/{}/partitions/{:0>10}/records/{:0>20}.batch",
-        topition.topic(),
-        topition.partition(),
-        base_offset,
-    ));
-    let payload = store.encode_frame(&[batch])?;
-    _ = bucket.put(&location, payload).await?;
-    Ok(())
-}
-
 /// The legacy per-`(topic, partition)` `records/` objects for partition 0.
 async fn legacy_records(bucket: &InMemory, topic: &str) -> Vec<Path> {
     let listing = Path::from(format!(
@@ -522,138 +495,6 @@ async fn list_offsets_latest_timestamp_from_footer() -> Result<(), Error> {
         latest[0].1.timestamp,
         "tail timestamp derived from the footer max_timestamp",
     );
-
-    Ok(())
-}
-
-/// Retention (#71): a pure-segment partition has an empty legacy `records/`
-/// prefix, so the maintainer must not re-LIST it every tick. The real scan path
-/// (`expire_partition`) records a time-bounded skip; subsequent ticks skip it;
-/// the skip self-heals once its TTL lapses so a legacy object written afterwards
-/// (possibly by another process) is still scanned and expired.
-#[tokio::test]
-async fn pure_segment_partition_retention_skips_rescan() -> Result<(), Error> {
-    let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
-    let topic = "org.env.conn.tab_a";
-    create_topic(&store, topic).await?;
-    let a = Topition::new(topic, 0);
-
-    // Produce lands in a segment; the legacy `records/` prefix stays empty.
-    assert_eq!(0, store.produce(None, &a, batch(1)?).await?);
-
-    // A threshold far in the future would expire anything present.
-    let threshold = now_ms() + 1_000_000;
-
-    // Cold: no skip recorded yet, so the partition must be scanned once.
-    assert!(
-        store.partition_maybe_expirable(&a, threshold)?,
-        "cold partition must be scanned",
-    );
-
-    // The real maintenance scan finds an empty `records/`; under prefix
-    // coalescing it records the time-bounded skip (not a permanent sentinel).
-    _ = store.expire_partition(&a, threshold).await?;
-
-    // Subsequent maintenance ticks within the TTL skip the empty per-topic LIST.
-    assert!(
-        !store.partition_maybe_expirable(&a, threshold)?,
-        "pure-segment partition must be skipped while the skip is fresh",
-    );
-
-    // Simulate the TTL lapsing (backdate the recorded instant beyond the TTL):
-    // the skip self-heals so retention scans the partition again — which is how a
-    // legacy object written meanwhile (even by another process that never touched
-    // this in-memory map) is eventually expired.
-    {
-        let mut skip = store.retention_empty_skip.lock().expect("skip lock");
-        let stale = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
-        _ = skip.insert(a.clone(), stale);
-    }
-    assert!(
-        store.partition_maybe_expirable(&a, threshold)?,
-        "a lapsed skip must re-arm the retention scan (self-heal)",
-    );
-
-    Ok(())
-}
-
-/// Seam continuity (#58): a topic with existing legacy `records/{offset}.batch`
-/// data flipped to segment mode continues its offset sequence unbroken — the
-/// first segment offset equals the legacy tail, no gap/overlap/off-by-one.
-#[tokio::test]
-async fn first_segment_continues_from_the_legacy_tail() -> Result<(), Error> {
-    let bucket = InMemory::new();
-    let topic = "org.env.conn.tab_a";
-    let a = Topition::new(topic, 0);
-
-    // Legacy phase (prefix mode off): per-batch records/ objects, tail -> 5.
-    {
-        let seeder = DynoStore::new(CLUSTER, NODE, bucket.clone());
-        create_topic(&seeder, topic).await?;
-        seed_legacy_batch(&seeder, &bucket, &a, 0, batch(3)?).await?;
-        seed_legacy_batch(&seeder, &bucket, &a, 3, batch(2)?).await?;
-    }
-
-    // Cutover to segment mode: the first segment must start at the legacy tail.
-    let seg = DynoStore::new(CLUSTER, NODE, bucket.clone());
-    let first = seg.produce(None, &a, batch(4)?).await?;
-    assert_eq!(
-        5, first,
-        "first segment offset == legacy tail, no gap/overlap"
-    );
-
-    Ok(())
-}
-
-/// Hybrid reads (#60): a topic with `[0, C)` legacy objects and `[C, ∞)`
-/// segments serves both layouts, a single fetch spanning `C` stitches them with
-/// a continuous offset sequence, and earliest/high_watermark span both layouts.
-#[tokio::test]
-async fn hybrid_fetch_stitches_legacy_and_segment() -> Result<(), Error> {
-    let bucket = InMemory::new();
-    let topic = "org.env.conn.tab_a";
-    let a = Topition::new(topic, 0);
-
-    // Legacy [0, 5): batch(3)@0, batch(2)@3.
-    {
-        let seeder = DynoStore::new(CLUSTER, NODE, bucket.clone());
-        create_topic(&seeder, topic).await?;
-        seed_legacy_batch(&seeder, &bucket, &a, 0, batch(3)?).await?;
-        seed_legacy_batch(&seeder, &bucket, &a, 3, batch(2)?).await?;
-    }
-
-    // Segment [5, 9): batch(4)@5 (continues from the seam).
-    let seg = DynoStore::new(CLUSTER, NODE, bucket.clone());
-    assert_eq!(5, seg.produce(None, &a, batch(4)?).await?);
-
-    // A single fetch from 0 stitches legacy + segment: 9 records, base offsets
-    // 0, 3, 5, contiguous across the seam at C=5, no gap/duplicate/reorder.
-    let fetched = fetch_from(&seg, &a, 0).await?;
-    let bases: Vec<i64> = fetched.iter().map(|batch| batch.base_offset).collect();
-    assert_eq!(vec![0, 3, 5], bases, "legacy then segment, continuous");
-    let total: i64 = fetched
-        .iter()
-        .map(|batch| batch.last_offset_delta as i64 + 1)
-        .sum();
-    assert_eq!(9, total, "all records across the seam");
-
-    // earliest follows the legacy objects; high watermark spans both layouts.
-    let earliest = seg
-        .list_offsets(
-            IsolationLevel::ReadUncommitted,
-            &[(a.clone(), ListOffset::Earliest)],
-        )
-        .await?;
-    assert_eq!(Some(0), earliest[0].1.offset, "earliest from legacy");
-
-    let latest = seg
-        .list_offsets(
-            IsolationLevel::ReadUncommitted,
-            &[(a.clone(), ListOffset::Latest)],
-        )
-        .await?;
-    assert_eq!(Some(9), latest[0].1.offset, "high watermark spans the seam");
 
     Ok(())
 }
@@ -1386,46 +1227,6 @@ async fn seq_name_not_reused_after_full_expiry() -> Result<(), Error> {
         "freed seq 0 name must not be reused",
     );
     assert_eq!(vec![segment_path(2)], seqs);
-
-    Ok(())
-}
-
-/// A byte-budget-limited hybrid fetch must not jump into segments and skip the
-/// unserved legacy tail — it returns only the legacy prefix, contiguous (#60
-/// review fix).
-#[tokio::test]
-async fn hybrid_fetch_budget_limited_does_not_skip_legacy() -> Result<(), Error> {
-    let bucket = InMemory::new();
-    let topic = "org.env.conn.tab_a";
-    let a = Topition::new(topic, 0);
-
-    // Legacy [0,5): two batches. Then a segment at [5,9).
-    {
-        let seeder = DynoStore::new(CLUSTER, NODE, bucket.clone());
-        create_topic(&seeder, topic).await?;
-        seed_legacy_batch(&seeder, &bucket, &a, 0, batch(3)?).await?;
-        seed_legacy_batch(&seeder, &bucket, &a, 3, batch(2)?).await?;
-    }
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
-    assert_eq!(5, store.produce(None, &a, batch(4)?).await?);
-
-    // max_bytes=1 stops the legacy read after the first batch (base 0). The fetch
-    // must NOT append the segment [5,9) — that would skip legacy [3,5).
-    let fetched = store
-        .fetch(
-            &a,
-            0,
-            0,
-            1,
-            IsolationLevel::ReadUncommitted,
-            Duration::from_millis(200),
-        )
-        .await?;
-    assert!(
-        fetched.iter().all(|b| b.base_offset < 5),
-        "no segment data before the legacy tail is served"
-    );
-    assert_eq!(Some(0), fetched.first().map(|b| b.base_offset));
 
     Ok(())
 }
@@ -4059,54 +3860,6 @@ async fn unknown_floor_defers_reclaim_until_warmed() -> Result<(), Error> {
     assert_eq!(2, earliest(&maintainer, &a).await?);
     assert_eq!(1, maintainer.expire_prefix_segments(PREFIX, 1_000).await?);
     assert!(segments(&bucket).await.is_empty());
-
-    Ok(())
-}
-
-/// DeleteRecords on a hybrid topic (#176): legacy `records/` objects below
-/// the offset are physically deleted (per-partition objects, safe to remove),
-/// while segment-resident records above the seam are hidden by the floor —
-/// one call, both regions correct.
-#[tokio::test]
-async fn delete_records_hybrid_topic() -> Result<(), Error> {
-    let bucket = InMemory::new();
-    let topic = "org.env.conn.tab_a";
-    let a = Topition::new(topic, 0);
-
-    // A legacy life first: [0,3) and [3,5) as `records/` objects.
-    {
-        let seeder = DynoStore::new(CLUSTER, NODE, bucket.clone());
-        create_topic(&seeder, topic).await?;
-        seed_legacy_batch(&seeder, &bucket, &a, 0, batch(3)?).await?;
-        seed_legacy_batch(&seeder, &bucket, &a, 3, batch(2)?).await?;
-    }
-
-    // Flipped to prefix mode mid-life: a segment carries [5,7).
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
-    assert_eq!(5, store.produce(None, &a, batch(2)?).await?);
-    assert_eq!(2, legacy_records(&bucket, topic).await.len());
-    assert_eq!(1, segments(&bucket).await.len());
-
-    // Truncate below 6: both legacy objects go physically; the shared
-    // segment (ending at 7) survives, floor-hidden below 6.
-    assert_eq!(6, delete_before(&store, &a, 6).await?);
-    assert!(legacy_records(&bucket, topic).await.is_empty());
-    assert_eq!(1, segments(&bucket).await.len());
-
-    assert_eq!(6, earliest(&store, &a).await?);
-    assert_eq!(
-        6,
-        store
-            .offset_stage_at(&a, IsolationLevel::ReadCommitted)
-            .await?
-            .log_start()
-    );
-
-    // The fetch clamp is batch-granular: the surviving segment batch [5,7)
-    // straddles the floor and is served whole.
-    let fetched = fetch_from(&store, &a, 0).await?;
-    assert_eq!(Some(5), fetched.first().map(|batch| batch.base_offset));
-    assert_eq!(2, record_count(&fetched));
 
     Ok(())
 }

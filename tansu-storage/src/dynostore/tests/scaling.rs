@@ -764,118 +764,6 @@ async fn latest_list_offsets_on_pure_segment_issues_no_records_list() -> Result<
     Ok(())
 }
 
-/// `has_legacy_records`'s negative memo is held for the LONG window only for the
-/// provably-safe segment-routed case (prefix-coalesced + owns a segment), and
-/// for the SHORT window otherwise; a local legacy write flips it to present at
-/// once (#110). Grouped into one test so the shared helpers stay local.
-#[tokio::test]
-async fn legacy_records_presence_memo_ttls_and_write_through() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    /// The memoized TTL for `topition`'s legacy-presence entry, if any.
-    fn memo_ttl(storage: &DynoStore, topition: &Topition) -> Option<Duration> {
-        storage
-            .legacy_records_present
-            .lock()
-            .unwrap()
-            .get(topition)
-            .map(|(_, _, ttl)| *ttl)
-    }
-
-    let coalesce_store = || {
-        let counters = Arc::new(Counters::default());
-        let storage = DynoStore::new(
-            CLUSTER,
-            NODE,
-            Counting {
-                inner: InMemory::new(),
-                counters: counters.clone(),
-            },
-        );
-        (storage, counters)
-    };
-
-    // A segment-routed topition (prefix-coalesced, owns a segment) with no legacy
-    // `records/` objects memoizes its negative result for the LONG window (#110),
-    // so it is not re-listed every few seconds — the dominant residual
-    // per-topition LIST the topic→prefix collapse had left behind. And a poll
-    // within the window is served from memory (no LIST).
-    {
-        // Writer produces so the sub-stream owns a segment; a fresh reader (cold
-        // memo, separate process) then observes the segment-routed empty
-        // topition. (On the writer the flush's own `leaseless_base` warms the
-        // memo before the segment exists, so a fresh reader is what exercises the
-        // segment-present branch deterministically.)
-        let bucket = InMemory::new();
-        let writer = DynoStore::new(
-            CLUSTER,
-            NODE,
-            Counting {
-                inner: bucket.clone(),
-                counters: Arc::new(Counters::default()),
-            },
-        );
-        create(&writer, "org.env.conn.hot", 1).await?;
-        let topition = Topition::new("org.env.conn.hot", 0);
-        for n in 0..4 {
-            _ = writer
-                .produce(None, &topition, batch(format!("m-{n}").as_bytes())?)
-                .await?;
-        }
-
-        let reader_counters = Arc::new(Counters::default());
-        let reader = DynoStore::new(
-            CLUSTER,
-            NODE,
-            Counting {
-                inner: bucket.clone(),
-                counters: reader_counters.clone(),
-            },
-        );
-
-        assert!(!reader.has_legacy_records(&topition).await?);
-        assert_eq!(
-            Some(DynoStore::LEGACY_ABSENCE_TTL),
-            memo_ttl(&reader, &topition),
-            "a segment-routed empty topition memoizes its negative for the long window"
-        );
-
-        reader_counters.reset();
-        for _ in 0..50 {
-            assert!(!reader.has_legacy_records(&topition).await?);
-        }
-        let warm = reader_counters.report("50 warm has_legacy_records polls (segment-routed)");
-        assert_eq!(
-            (0, 0),
-            (warm.2, warm.3),
-            "a memoized negative is served from memory — no LIST per poll (#110)"
-        );
-    }
-
-    // Contrast: a coalesced topition that is NOT yet segment-routed gets the
-    // MIDDLE window (#166), not the seconds-long one this test originally
-    // asserted. Confining the long window to already-segmented sub-streams left
-    // every idle stream — and every partition with a cold memo after a restart —
-    // re-listing `records/` per poll, which measured as the dominant tier-1
-    // request source in production. It is still not given the full hour: this is
-    // the case we have the least evidence about, and the failure it bounds (a
-    // stream that reads as empty) is more visible than a lagging tail.
-    {
-        let (storage, _counters) = coalesce_store();
-        create(&storage, "org.env.conn.cold", 1).await?;
-        let topition = Topition::new("org.env.conn.cold", 0);
-
-        assert!(!storage.has_legacy_records(&topition).await?);
-        assert_eq!(
-            Some(DynoStore::LEGACY_ABSENCE_UNSEGMENTED_TTL),
-            memo_ttl(&storage, &topition),
-            "a coalesced topition without a segment holds its negative for minutes"
-        );
-    }
-
-    Ok(())
-}
-
 /// A wide stale-hint `ListOffsets` sweep over prefix-coalesced topics — the
 /// `endOffsets(assignment)` shape over ~1500 mostly-idle CDC topics — costs
 /// O(prefixes), not O(partitions), in object-store requests: one incremental
@@ -1438,66 +1326,6 @@ fn every_metered_outcome_carries_a_key_class() {
     );
 }
 
-/// #166: a prefix-coalesced partition with no segment yet must not re-list
-/// `records/` on the read path every few seconds. That short TTL applied to every
-/// idle stream and to every partition whose memo was cold after a restart, which
-/// made the legacy probe the dominant tier-1 request source in production
-/// (~1,200 LIST/s metered, ~85% of the bill, stepping up on each consumer
-/// restart). The write-through still has to win over the longer window, or a
-/// legacy batch written here would be invisible to our own next read.
-#[tokio::test]
-async fn legacy_probe_is_not_relisted_for_a_segmentless_coalesced_partition() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let counters = Arc::new(Counters::default());
-    let storage = DynoStore::new(
-        CLUSTER,
-        NODE,
-        Counting {
-            inner: InMemory::new(),
-            counters: counters.clone(),
-        },
-    );
-
-    let topic = "org.env.conn.idle";
-    create(&storage, topic, 1).await?;
-    let tp = Topition::new(topic, 0);
-
-    // No produce: the sub-stream owns no segment, which is the population that
-    // used to re-list every `HIGH_WATERMARK_HINT_TTL`.
-    counters.reset();
-    assert!(!storage.has_legacy_records(&tp).await?);
-    let first = counters.report("first legacy probe");
-    assert!(
-        first.2 >= 1,
-        "the first probe lists records/ once: {first:?}"
-    );
-
-    // Repeated polls are served from the memo: no further listing at all.
-    counters.reset();
-    for _ in 0..8 {
-        assert!(!storage.has_legacy_records(&tp).await?);
-    }
-    let repeated = counters.report("8 further legacy probes");
-    assert_eq!(
-        (0, 0, 0, 0, 0),
-        repeated,
-        "a segment-less coalesced partition must not re-list records/ per poll"
-    );
-
-    Ok(())
-}
-
-/// #166 companion: the graduated windows are ordered as intended — a segment-less
-/// coalesced partition is held for minutes, a segment-routed one for the full
-/// hour, and anything outside prefix coalescing keeps the seconds-long window
-/// where a first legacy write is expected.
-#[test]
-fn legacy_absence_windows_are_graduated() {
-    assert!(DynoStore::HIGH_WATERMARK_HINT_TTL < DynoStore::LEGACY_ABSENCE_UNSEGMENTED_TTL);
-    assert!(DynoStore::LEGACY_ABSENCE_UNSEGMENTED_TTL < DynoStore::LEGACY_ABSENCE_TTL);
-}
-
 /// An `ObjectStore` counting GETs of the per-partition `watermark.json` object,
 /// so a test can pin that a read path does not touch it (#161).
 #[derive(Clone)]
@@ -1650,21 +1478,21 @@ async fn read_committed_polling_does_not_get_watermark_json() -> Result<(), Erro
     Ok(())
 }
 
-/// How much of a segment topic's read path is still spent asking about a legacy
-/// `records/` region — the residual #179 removes.
+/// #179's acceptance, as an equality: the read path spends **zero** requests on a
+/// legacy `records/` region, cold or warm.
 ///
-/// Nothing writes that layout any more (#177/#178), so on a segment-only topic
-/// every such request is asking a question with one possible answer. This pins the
-/// cost of asking, for the whole read surface: `fetch`, `list_offsets` LATEST and
-/// EARLIEST, and `offset_stage_at`.
+/// This test used to record the residual — 1 request when cold, held at 0 when warm
+/// by the absence memo — with "when #179 lands it becomes 0 too" written into its
+/// doc comment. It has. Nothing in the engine reads, writes or probes that layout
+/// any more: no memo to warm, no branch to take, so the cold and warm figures are
+/// the same number and that number is zero.
 ///
-/// The warm figure is the one that matters in production and is already zero — the
-/// absence memo holds it there, and that assertion must survive #179 unchanged. The
-/// cold figure is what #179 collects: **when that issue lands it becomes 0 too.**
-/// Written as an equality rather than an upper bound so the number cannot drift up
-/// unnoticed while the branch still exists.
+/// Kept as an equality rather than deleted with the branch, because it is the only
+/// assertion that would catch a `records/` request reappearing — which is what a
+/// well-meaning revival of any of the deleted helpers would look like from the
+/// outside.
 #[tokio::test]
-async fn a_segment_topic_read_path_still_probes_records_when_cold() -> Result<(), Error> {
+async fn a_segment_topic_read_path_never_touches_records() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
     let bucket = InMemory::new();
@@ -1686,10 +1514,9 @@ async fn a_segment_topic_read_path_still_probes_records_when_cold() -> Result<()
     counters.reset();
     exercise_read_paths(&storage, &tp).await?;
     assert_eq!(
-        1,
+        0,
         counters.records_requests(),
-        "cold read path spends this many requests on a legacy region that cannot exist; \
-         #179 removes the branch and this becomes 0"
+        "a cold read path must not touch the legacy layout at all (#179)"
     );
 
     // Warm again on that same process: the memo holds, so repeating the whole read
@@ -1699,7 +1526,7 @@ async fn a_segment_topic_read_path_still_probes_records_when_cold() -> Result<()
     assert_eq!(
         0,
         counters.records_requests(),
-        "a warm read path must never re-probe records/"
+        "and neither must a warm one — there is no longer a memo making the difference"
     );
 
     Ok(())
