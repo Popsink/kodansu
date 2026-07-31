@@ -7332,28 +7332,30 @@ impl Storage for DynoStore {
 
     async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
         if let Some(metadata) = self.topic_metadata(topic).await? {
-            // Remove the per-topic metadata object and its id -> name pointer.
-            self.topic_meta(metadata.topic.name.as_str())?
-                .remove(&self.object_store)
-                .await?;
-
-            self.invalidate_topic_id(&metadata.id);
-            self.invalidate_routing_prefix(metadata.topic.name.as_str());
-            self.invalidate_topic_index();
-
-            for path in [
-                self.topic_id_path(&metadata.id),
-                // The routing pin goes with the topic (#236): it is immutable for a
-                // topic's lifetime, so leaving it would let a same-named successor
-                // inherit a dead incarnation's routing.
-                self.topic_routing_path(metadata.topic.name.as_str()),
-            ] {
-                match self.object_store.delete(&path).await {
-                    Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
-                    Err(otherwise) => return Err(otherwise.into()),
-                }
-            }
-
+            // Data BEFORE metadata (#251). The metadata object is the only handle
+            // on this topic's data: maintenance discovers work by listing
+            // `topic-metadata/`, so a topic that no longer has one is never
+            // revisited by anything. Removing it first meant that any failure
+            // in the deletions below — an error, a throttle, a pod restart, a
+            // client timeout — stranded whatever had not been reached, for good.
+            // A production audit found 878,065 such objects under two deleted
+            // topics, paid for indefinitely and skewing every audit of the
+            // layout.
+            //
+            // Ordered this way, a partial delete instead leaves a topic that
+            // still exists with some of its data gone: visible, and recoverable
+            // by re-issuing `DeleteTopics`. The cost is a wider window in which
+            // a topic being deleted is still served, which for an admin
+            // operation is the better trade.
+            //
+            // This does not reopen the offset-reuse hazard of #241, and the
+            // reason is worth stating: the watermark object removed below is not
+            // the sole authority on the log end. `coalesced_high_from_index`
+            // folds the segment tail over it, and `delete_topic` cannot touch
+            // segments (#246, #61) — so a produce landing inside the widened
+            // window still computes the same high watermark from the segments
+            // that are still there. The very impotence #246 complains about is
+            // what makes this ordering safe.
             let prefix = Path::from(format!(
                 "clusters/{}/topics/{}/",
                 self.cluster, metadata.topic.name,
@@ -7409,6 +7411,32 @@ impl Storage for DynoStore {
                 .delete_stream(locations)
                 .try_collect::<Vec<Path>>()
                 .await?;
+
+            // Only now that the data is gone: the metadata object, its id ->
+            // name pointer, and the routing pin. Past this point the topic no
+            // longer exists for the API or for maintenance, so nothing above may
+            // still need doing.
+            self.topic_meta(metadata.topic.name.as_str())?
+                .remove(&self.object_store)
+                .await?;
+
+            self.invalidate_topic_id(&metadata.id);
+            self.invalidate_routing_prefix(metadata.topic.name.as_str());
+            self.invalidate_topic_index();
+
+            for path in [
+                self.topic_id_path(&metadata.id),
+                // The routing pin goes with the topic (#236): it is immutable for a
+                // topic's lifetime, so leaving it would let a same-named successor
+                // inherit a dead incarnation's routing.
+                self.topic_routing_path(metadata.topic.name.as_str()),
+            ] {
+                match self.object_store.delete(&path).await {
+                    Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+                    Err(otherwise) => return Err(otherwise.into()),
+                }
+            }
+
             Ok(ErrorCode::None)
         } else {
             Ok(ErrorCode::UnknownTopicOrPartition)
