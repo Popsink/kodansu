@@ -714,6 +714,26 @@ static METADATA_UNRESOLVED_EXISTING: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Segments cached in this process's prefix index, across every prefix (#196).
+static PREFIX_INDEX_SEGMENTS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("tansu_prefix_index_segments")
+        .with_description("segments held in the process-local prefix index")
+        .build()
+});
+
+/// Sub-stream entries across every cached footer (#196) — the process-local
+/// structure that scales with `segments × topics`, and the one big enough to
+/// account for the broker's working-set growth. Paired with
+/// `tansu_prefix_index_segments`: the ratio is the mean sub-streams per segment,
+/// which is what makes the total interpretable rather than just large.
+static PREFIX_INDEX_SUBSTREAM_ENTRIES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("tansu_prefix_index_substream_entries")
+        .with_description("sub-stream entries across every footer in the prefix index")
+        .build()
+});
+
 /// Live segment count per prefix after a maintenance tick (#66) — the signal
 /// that tells whether compaction is keeping `S` bounded (a counter can't).
 static SEGMENTS_LIVE: LazyLock<Gauge<u64>> = LazyLock::new(|| {
@@ -3770,6 +3790,34 @@ impl DynoStore {
             let entry = index.entry(prefix.to_owned()).or_default();
             entry.refreshed_at = Some(SystemTime::now());
             entry.generation += 1;
+
+            // Size of the cached footers, process-wide (#196). The broker's
+            // working set grows ~600 MiB fresh to ~1.4 GiB over 26h on an
+            // unchanged workload, decelerating like a cache warming up rather
+            // than leaking, and differing by ~450 MiB between pods of identical
+            // age — a shape that points at something keyed by what each pod
+            // served. This index is the only per-process structure large enough
+            // to account for it: tens of prefixes, but each holding a whole
+            // `SegmentFooter` per live segment, one `SubstreamEntry` per
+            // `(topic, partition)` in that segment.
+            //
+            // Recorded here rather than on every mutation: this is the TTL-gated
+            // path, so the O(segments) walk runs at most once per prefix per
+            // `HIGH_WATERMARK_HINT_TTL`, and it is the point where the live set
+            // has just been reconciled.
+            let (segments, entries) = index.values().fold((0u64, 0u64), |(s, e), entry| {
+                (
+                    s + entry.segments.len() as u64,
+                    e + entry
+                        .segments
+                        .values()
+                        .map(|cached| cached.footer.entries.len() as u64)
+                        .sum::<u64>(),
+                )
+            });
+
+            PREFIX_INDEX_SEGMENTS.record(segments, &[]);
+            PREFIX_INDEX_SUBSTREAM_ENTRIES.record(entries, &[]);
         }
         Ok(())
     }
