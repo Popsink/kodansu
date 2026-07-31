@@ -46,7 +46,7 @@ use tansu_sans_io::{
 };
 
 use crate::{
-    Error, Result, Storage, Topition, TxnAddPartitionsRequest,
+    Error, Result, Storage, TopicId, Topition, TxnAddPartitionsRequest,
     dynostore::{
         CoalesceTuning, DynoStore, Era, PrefixLease, SegmentFooter, SubstreamEntry,
         TxnProduceOffset,
@@ -364,6 +364,91 @@ async fn cold_restart_recovers_offsets_from_the_footer() -> Result<(), Error> {
     let resumed = restarted.produce(None, &a, batch(1)?).await?;
     assert_eq!(5, resumed, "resume past the footer end offset, no reuse");
     assert_eq!(3, segments(&bucket).await.len());
+
+    Ok(())
+}
+
+/// #246: a topic re-created under the same name must not inherit its
+/// predecessor's records from a shared segment.
+///
+/// `delete_topic` cannot remove a sub-stream's slices inside a shared segment —
+/// a segment multiplexes many topics, is immutable, and is reclaimed whole only
+/// once every sub-stream in it is past retention (#61). Slices are located by
+/// `(topic, partition)` NAME in the footer, so a successor used to find its
+/// predecessor's slices, fold its offsets from them, and serve those records as
+/// its own: a `DeleteTopics` that reads as "the data is gone" left it readable,
+/// silently, for as long as a segment holding a slice survived.
+///
+/// The sibling topic here is load-bearing: it keeps the shared segment alive
+/// after the delete, which is exactly the window the issue describes.
+#[tokio::test]
+async fn a_recreated_topic_inherits_nothing_from_a_shared_segment() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
+
+    let topic_a = "org.env.conn.tab_a";
+    let topic_b = "org.env.conn.tab_b";
+    create_topic(&store, topic_a).await?;
+    create_topic(&store, topic_b).await?;
+
+    let a = Topition::new(topic_a, 0);
+    let b = Topition::new(topic_b, 0);
+
+    // One shared segment holding both topics' slices.
+    let (pa, pb) = tokio::join!(
+        store.produce(None, &a, batch(3)?),
+        store.produce(None, &b, batch(2)?),
+    );
+    _ = pa?;
+    _ = pb?;
+
+    assert_eq!(1, segments(&bucket).await.len(), "one shared segment");
+
+    assert_eq!(
+        ErrorCode::None,
+        store.delete_topic(&TopicId::Name(topic_a.into())).await?,
+    );
+
+    // The segment survives the delete: the sibling still needs it.
+    assert_eq!(
+        1,
+        segments(&bucket).await.len(),
+        "segment kept by the sibling"
+    );
+
+    // Re-create under the same name, and read it with a store that has no
+    // in-process state from before the delete — a successor on another replica,
+    // or this one after a restart.
+    create_topic(&store, topic_a).await?;
+    let successor = DynoStore::new(CLUSTER, NODE, bucket.clone());
+
+    let fetched = fetch_from(&successor, &a, 0).await?;
+    let records: i64 = fetched
+        .iter()
+        .map(|batch| batch.last_offset_delta as i64 + 1)
+        .sum();
+    assert_eq!(0, records, "a successor must inherit no records");
+
+    let earliest = successor
+        .list_offsets(
+            IsolationLevel::ReadUncommitted,
+            &[(a.clone(), ListOffset::Earliest)],
+        )
+        .await?;
+    assert_eq!(
+        Some(3),
+        earliest[0].1.offset,
+        "log start is the predecessor's end, not 0: the records are hidden, not gone",
+    );
+
+    // The sibling is untouched — the tombstone is per sub-stream, and the shared
+    // segment was never rewritten.
+    let sibling = fetch_from(&successor, &b, 0).await?;
+    let sibling_records: i64 = sibling
+        .iter()
+        .map(|batch| batch.last_offset_delta as i64 + 1)
+        .sum();
+    assert_eq!(2, sibling_records, "the sibling keeps its records");
 
     Ok(())
 }
