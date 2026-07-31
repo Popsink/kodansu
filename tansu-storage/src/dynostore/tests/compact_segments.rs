@@ -34,7 +34,7 @@ use futures::TryStreamExt as _;
 use object_store::{ObjectStore as _, ObjectStoreExt as _, memory::InMemory, path::Path};
 use rama::{Context, Service as _};
 use tansu_sans_io::{
-    ErrorCode, FetchRequest, IsolationLevel, ListOffset, OpType,
+    Compression, ErrorCode, FetchRequest, IsolationLevel, ListOffset, OpType,
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
     fetch_request::{FetchPartition, FetchTopic},
     incremental_alter_configs_request::AlterableConfig,
@@ -712,4 +712,103 @@ async fn a_recreated_topic_is_pinned_afresh() -> Result<(), Error> {
     );
 
     Ok(())
+}
+
+/// #253: the per-key pass repairs a batch whose LZ4 frame has dependent blocks,
+/// even when it has nothing to compact.
+///
+/// Every LZ4 frame this broker wrote before the encoder was corrected has linked
+/// blocks, which `KafkaLZ4BlockInputStream` rejects in its constructor — so a Java
+/// worker dies on the partition while a Go client reads it fine. The fix to the
+/// encoder stops new damage; it does nothing for what is already durable, and
+/// nothing else would: this pass re-encodes a batch only when it *removes* records
+/// from it, and an emptied compaction remnant has no keys left to supersede. The
+/// batch blocking a production worker is exactly such a remnant.
+///
+/// The frame here is built with a linked-block encoder on purpose. The corrected
+/// encoder cannot produce one any more, so a test that used our own writer would
+/// assert nothing.
+#[tokio::test]
+async fn per_key_pass_repairs_dependent_lz4_frames() -> Result<(), Error> {
+    let _guard = super::init_tracing()?;
+
+    let bucket = InMemory::new();
+    let store = new_store(&bucket);
+
+    let topic = "org.env.conn.frames";
+    create_topic_with_configs(&store, topic, &[("cleanup.policy", "compact")]).await?;
+    let tp = Topition::new(topic, 0);
+
+    // A batch carrying a linked-block frame, as a pre-fix broker wrote it.
+    let mut linked = inflated::Batch::builder()
+        .record(
+            Record::builder()
+                .key(Some(Bytes::from_static(b"k")))
+                .value(Some(Bytes::from_static(b"v"))),
+        )
+        .attributes(Compression::Lz4.into())
+        .build()
+        .and_then(deflated::Batch::try_from)?;
+    linked.record_data = dependent_lz4(&linked.record_data)?;
+
+    assert!(
+        linked.has_dependent_lz4_blocks(),
+        "the seeded batch must carry the damage this test repairs"
+    );
+
+    _ = store.produce(None, &tp, linked).await?;
+
+    // Nothing to compact — one key, one record — so only the frame can dirty it.
+    assert_eq!(0, store.compact_prefix_per_key(topic).await?);
+
+    let repaired = store
+        .fetch(
+            &tp,
+            0,
+            1,
+            64 * 1024,
+            IsolationLevel::ReadUncommitted,
+            Duration::from_millis(500),
+        )
+        .await?;
+
+    assert_eq!(1, repaired.len(), "the record must survive the repair");
+    assert!(
+        !repaired[0].has_dependent_lz4_blocks(),
+        "the rewritten batch must carry an independent-block frame"
+    );
+
+    let values: Vec<Bytes> = repaired
+        .iter()
+        .filter_map(|batch| inflated::Batch::try_from(batch).ok())
+        .flat_map(|batch| batch.records)
+        .filter_map(|record| record.value)
+        .collect();
+    assert_eq!(vec![Bytes::from_static(b"v")], values);
+
+    Ok(())
+}
+
+/// Re-compress `record_data` as an LZ4 frame with **linked** blocks — what the
+/// `lz4` crate emitted by default before #253, and what no Kafka Java client can
+/// read.
+fn dependent_lz4(independent: &Bytes) -> Result<Bytes, Error> {
+    use std::io::Write as _;
+
+    let records = lz4::Decoder::new(&independent[..])
+        .and_then(|mut decoder| {
+            let mut plain = Vec::new();
+            std::io::copy(&mut decoder, &mut plain).map(|_| plain)
+        })
+        .map_err(Error::from)?;
+
+    let mut encoder = lz4::EncoderBuilder::new()
+        .block_mode(lz4::BlockMode::Linked)
+        .build(Vec::new())
+        .map_err(Error::from)?;
+    encoder.write_all(&records[..]).map_err(Error::from)?;
+    let (buffer, result) = encoder.finish();
+    result.map_err(Error::from)?;
+
+    Ok(Bytes::from(buffer))
 }

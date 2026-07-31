@@ -4089,6 +4089,7 @@ dependencies = [
  "governor",
  "human-units",
  "indicatif",
+ "lz4",
  "object_store",
  "opentelemetry",
  "opentelemetry-semantic-conventions",

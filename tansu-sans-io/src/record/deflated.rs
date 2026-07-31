@@ -355,7 +355,11 @@ fn into_record_data(records: &[Record], compression: Compression) -> Result<Byte
         Compression::Lz4 => {
             let uncompressed = records.encode()?;
 
+            // Kafka's Java client requires BD.blockIndependence and rejects a
+            // linked-block frame ("Dependent block stream is unsupported") —
+            // the lz4 crate's default block mode (#253).
             let mut lz4 = lz4::EncoderBuilder::new()
+                .block_mode(lz4::BlockMode::Independent)
                 .build(BytesMut::with_capacity(uncompressed.len()).writer())?;
 
             lz4.write_all(&uncompressed[..])?;
@@ -410,6 +414,36 @@ impl Batch {
 
     fn compression(&self) -> Result<Compression> {
         Compression::try_from(self.attributes)
+    }
+
+    /// Whether this batch carries an LZ4 frame with **dependent (linked) blocks**,
+    /// which no Kafka Java client can decode (#253).
+    ///
+    /// Every LZ4 frame this broker wrote before the encoder was corrected is one:
+    /// the `lz4` crate defaults to `BlockMode::Linked`, and
+    /// `KafkaLZ4BlockInputStream` rejects it in its constructor — before reading a
+    /// single block, so an emptied compaction remnant compressing zero records is
+    /// refused exactly like a full one.
+    ///
+    /// The frame descriptor is `magic(4) | FLG | BD | ...`; block independence is
+    /// bit 5 of FLG. A batch this returns `true` for is durable damage: it stays
+    /// unreadable until something re-encodes it, which is why the per-key compaction
+    /// pass treats it as a reason to rewrite.
+    pub fn has_dependent_lz4_blocks(&self) -> bool {
+        /// LZ4 frame magic, little-endian on the wire.
+        const MAGIC: [u8; 4] = [0x04, 0x22, 0x4d, 0x18];
+        /// FLG bit 5.
+        const BLOCK_INDEPENDENCE: u8 = 1 << 5;
+
+        if !matches!(self.compression(), Ok(Compression::Lz4)) {
+            return false;
+        }
+
+        // A frame shorter than its own descriptor is not one we can judge; leave it
+        // to the decoder to reject rather than rewriting it blind.
+        self.record_data
+            .get(..5)
+            .is_some_and(|head| head[..4] == MAGIC && head[4] & BLOCK_INDEPENDENCE == 0)
     }
 }
 
@@ -838,6 +872,42 @@ mod tests {
                 headers: [].into()
             }],
             records
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn lz4_frame_sets_block_independence() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        // Kafka's Java client (KafkaLZ4BlockInputStream) mandates
+        // BD.blockIndependence and throws "Dependent block stream is
+        // unsupported" otherwise (issue #253). Assert on the raw frame
+        // descriptor rather than round-tripping through our own decoder:
+        // lz4::Decoder accepts both block modes, so a round-trip would pass
+        // even when the frame is unreadable by every Kafka Java client.
+        let deflated: Batch = inflated::Batch::builder()
+            .record(Record::builder().value(Bytes::from_static(LOREM).into()))
+            .attributes(
+                BatchAttribute::default()
+                    .compression(Compression::Lz4)
+                    .into(),
+            )
+            .build()
+            .and_then(TryInto::try_into)?;
+
+        let frame = &deflated.record_data[..];
+
+        // LZ4 frame magic number 0x184D2204, little endian.
+        assert_eq!([0x04, 0x22, 0x4D, 0x18], frame[..4]);
+
+        // FLG is the byte following the magic; bit 5 is B.Indep.
+        let flg = frame[4];
+        assert_eq!(
+            0b0010_0000,
+            flg & 0b0010_0000,
+            "FLG {flg:#010b} does not set block independence"
         );
 
         Ok(())

@@ -55,6 +55,9 @@ uuid.workspace = true
 assert_matches.workspace = true
 criterion.workspace = true
 dotenv.workspace = true
+# Only to *build* a linked-block LZ4 frame in the #253 repair test: the corrected
+# encoder cannot produce one, so the damage has to be constructed by hand.
+lz4.workspace = true
 pretty_assertions.workspace = true
 tempfile.workspace = true
 time.workspace = true
