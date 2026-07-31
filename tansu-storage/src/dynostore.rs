@@ -6537,15 +6537,15 @@ impl DynoStore {
             .map(|_| ())
     }
 
-    /// Truncate `topition` below `before`: physically delete the legacy
-    /// `records/` batch objects whose base offset is below `before` (they are
-    /// per-partition objects, safe to remove), and persist the offset as the
+    /// Truncate `topition` below `before` by persisting the offset as the
     /// sub-stream's durable truncation floor (`watermark.truncate`, #176).
-    /// Segment-resident records are NOT rewritten — segments are shared
-    /// across sub-streams — they are hidden at read time by the floor and
-    /// reclaimed by [`Self::expire_prefix_segments`] once every sub-stream in
-    /// a segment is past its floor. `before` of `-1` means the log end offset
-    /// (delete everything).
+    /// Nothing is deleted physically: records live in segments, which are
+    /// shared across sub-streams and immutable, so they are hidden at read
+    /// time by the floor and reclaimed by [`Self::expire_prefix_segments`]
+    /// once every sub-stream in a segment is past its floor. (Until #179 this
+    /// also removed the per-partition legacy `records/` objects; that layout
+    /// is gone.) `before` of `-1` means the log end offset — truncate
+    /// everything.
     ///
     /// The floor is **monotonic**: max-folded against any existing floor
     /// inside the watermark CAS (`with_mut` re-applies the closure on
@@ -7245,23 +7245,17 @@ impl Storage for DynoStore {
                     .to_owned()
             })?;
 
-            watermark
-                .with_mut(&self.object_store, |watermark| {
-                    _ = watermark.high.take();
-                    _ = watermark.truncate.take();
-
-                    Ok(())
-                })
-                .await?;
-
             // Drop any stale next-offset hint (e.g. a topic of the same
             // name was previously deleted) so the fresh, empty partition
-            // re-derives offset 0 from listing. The cached watermark floor
+            // re-derives its offsets from listing. The cached watermark floor
             // must go with it: the prefix's seq floor is unrelated to topic
             // lifecycle, so it alone would never invalidate a floor cached
-            // for the deleted incarnation. Same for the truncation-floor
-            // memo (#176): a re-created topic must not inherit a dead
-            // incarnation's floor.
+            // for the deleted incarnation.
+            //
+            // The truncation-floor memo (#176) goes too, but for the opposite
+            // reason since #246: not to forget the predecessor's floor but to
+            // re-read it from the watermark object, which now carries the
+            // deleted log end rather than a dead incarnation's stale value.
             _ = self
                 .next_offsets
                 .lock()
@@ -7274,6 +7268,45 @@ impl Storage for DynoStore {
                 .truncate_floors
                 .lock()
                 .map(|mut locked| locked.remove(&topition))?;
+
+            // Preserve `truncate` (#246).
+            //
+            // `delete_topic` removes a topic's own objects but cannot remove its
+            // slices inside SHARED segments: a segment multiplexes many topics,
+            // is immutable, and is reclaimed whole only once every sub-stream in
+            // it is past retention (#61). Slices are located by `(topic,
+            // partition)` NAME in the footer, so a topic created afterwards with
+            // the same name — by an operator, or by auto-create on the next
+            // metadata request — found its predecessor's slices, folded its
+            // offsets from them, and served those records as its own. A
+            // `DeleteTopics` that reads as "the data is gone" left it readable
+            // through a same-named successor, silently, for as long as a segment
+            // holding a slice survived.
+            //
+            // This used to clear the floor outright, on the assumption that a
+            // fresh partition re-derives offset 0 from listing. That holds only
+            // when nothing survives, which is exactly what a shared segment
+            // breaks. `delete_topic` now leaves the floor at the deleted log end,
+            // so keeping it is what makes the successor start past whatever it
+            // would otherwise inherit — through the machinery the read paths
+            // already honour (#176), without rewriting a shared segment.
+            //
+            // Deliberately NOT computed here from `high_watermark`: that answers
+            // the same question, but it costs a segment LIST per partition on
+            // every create — including auto-create, on the metadata path — which
+            // is the cost #40 and #167 exist to remove. A name that never had a
+            // predecessor has no watermark object at all, so preserving the field
+            // costs nothing and does nothing.
+            //
+            // `high` is still cleared: it re-derives from the segment fold, and
+            // `expire_prefix_segments` stays its single writer (#179, #237).
+            watermark
+                .with_mut(&self.object_store, |watermark| {
+                    _ = watermark.high.take();
+
+                    Ok(())
+                })
+                .await?;
         }
 
         // Reflect the new topic in this replica's list-all view at once.
@@ -7348,29 +7381,41 @@ impl Storage for DynoStore {
             // a topic being deleted is still served, which for an admin
             // operation is the better trade.
             //
-            // This does not reopen the offset-reuse hazard of #241, and the
-            // reason is worth stating: the watermark object removed below is not
-            // the sole authority on the log end. `coalesced_high_from_index`
-            // folds the segment tail over it, and `delete_topic` cannot touch
-            // segments (#246, #61) — so a produce landing inside the widened
+            // This does not reopen the offset-reuse hazard of #241: nothing
+            // below removes an authority on the log end. The watermark object is
+            // rewritten as a truncation tombstone rather than deleted (#246,
+            // below), and `coalesced_high_from_index` folds the segment tail
+            // over it regardless — so a produce landing inside the widened
             // window still computes the same high watermark from the segments
-            // that are still there. The very impotence #246 complains about is
-            // what makes this ordering safe.
-            let prefix = Path::from(format!(
-                "clusters/{}/topics/{}/",
-                self.cluster, metadata.topic.name,
-            ));
+            // that are still there.
+            // Truncate every partition to its log end (#246) rather than
+            // deleting its `watermark.json`.
+            //
+            // The slices this topic left inside SHARED segments cannot be
+            // removed — a segment multiplexes many topics, is immutable, and is
+            // reclaimed whole only once every sub-stream in it is past retention
+            // (#61) — and they are located by `(topic, partition)` NAME, so a
+            // same-named successor would find them and serve them as its own.
+            // The floor the truncation machinery already maintains
+            // (`watermark.truncate`, #176) hides them at read time without
+            // rewriting a shared segment, and is as durable as the data it
+            // hides. So the watermark object is not deleted: it BECOMES the
+            // tombstone, and `create_topic` preserves it.
+            //
+            // Only `truncate` is written, never `high`: #179 restored
+            // `expire_prefix_segments` as that field's single writer, which is
+            // what keeps the floor-certified watermark cache's certification
+            // argument unconditional (#237).
+            //
+            // The cost is one small object per partition of a deleted topic,
+            // kept indefinitely. It cannot be dropped once the slices are
+            // reclaimed without a scan costing more than the object does, and
+            // dropping it early resurrects the records it hides.
+            for partition in 0..metadata.topic.num_partitions {
+                let topition = Topition::new(metadata.topic.name.as_str(), partition);
 
-            let locations = self
-                .scan(Scan::AdminDelete, &prefix)
-                .map_ok(|m| m.location)
-                .boxed();
-
-            _ = self
-                .object_store
-                .delete_stream(locations)
-                .try_collect::<Vec<Path>>()
-                .await?;
+                _ = self.delete_records_before(&topition, -1).await?;
+            }
 
             let prefix = Path::from(format!("clusters/{}/groups/consumers/", self.cluster));
 

@@ -424,23 +424,24 @@ async fn a_failed_delete_leaves_the_topic_recoverable() -> Result<(), Error> {
     let inner = InMemory::new();
     let bucket = DeleteFailsUnder {
         inner: inner.clone(),
-        fragment: format!("/topics/{topic}/"),
+        fragment: format!("/offsets/{topic}/"),
     };
 
     let replica_a = DynoStore::new(CLUSTER, NODE, bucket.clone());
     let id = create_topic(&replica_a, topic, 2).await?;
 
-    // Give the topic something under `topics/{name}/` to delete — the watermark
-    // objects the read paths persist. Seeded directly, as
-    // `watermark_with_mut_preserves_unknown_fields` does: what is under test is
-    // the delete ordering, not how a watermark comes to exist.
+    // Give the delete something to remove outright: a group's committed offsets
+    // for this topic. Since #246 the watermark objects under `topics/{name}/`
+    // are rewritten as truncation tombstones rather than deleted, so they are no
+    // longer a failure point — the offsets are. Seeded directly: what is under
+    // test is the delete ordering, not how an offset is committed.
     for partition in 0..2 {
         _ = inner
             .put_opts(
                 &Path::from(format!(
-                    "clusters/{CLUSTER}/topics/{topic}/partitions/{partition:0>10}/watermark.json"
+                    "clusters/{CLUSTER}/groups/consumers/a-group/offsets/{topic}/partitions/{partition:0>10}.json"
                 )),
-                PutPayload::from_static(br#"{"high":5}"#),
+                PutPayload::from_static(br#"{"offset":0}"#),
                 PutOptions::default(),
             )
             .await?;
