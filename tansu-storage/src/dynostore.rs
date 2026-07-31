@@ -6642,7 +6642,7 @@ impl DynoStore {
             }
 
             let mut seen: BTreeSet<Bytes> = BTreeSet::new();
-            let mut staged: Vec<(u64, i64, Vec<deflated::Batch>, u64)> =
+            let mut staged: Vec<(u64, i64, Vec<deflated::Batch>, u64, u64)> =
                 Vec::with_capacity(regions.len());
             let mut aborted = false;
 
@@ -6650,6 +6650,7 @@ impl DynoStore {
                 // Newest batch first within the region too.
                 let mut out: Vec<deflated::Batch> = Vec::with_capacity(region.len());
                 let mut removed: u64 = 0;
+                let mut repaired: u64 = 0;
                 for batch in region.iter().rev() {
                     // Transaction markers and transactional data are exempt
                     // from the per-key transform (#174 release B routes them
@@ -6669,6 +6670,17 @@ impl DynoStore {
                         out.push(batch.clone());
                         continue;
                     }
+
+                    // A batch whose LZ4 frame has dependent blocks is durable damage
+                    // (#253): no Kafka Java client can decode it, and nothing else
+                    // will ever rewrite it — the per-key transform below only
+                    // re-encodes a batch it removes records from, and an emptied
+                    // remnant has no keys left to supersede. Repairing it here is
+                    // what takes a partition from "one worker cannot start" back to
+                    // readable, and it costs a rewrite of a segment that is being
+                    // rewritten anyway whenever anything else in it is dirty.
+                    let repair_frame = batch.has_dependent_lz4_blocks();
+
                     let compaction = inflated::Batch::try_from(batch)?.compact(&seen)?;
                     seen.extend(compaction.batch.keys());
                     if seen.len() > self.prefix_compact_seen_keys {
@@ -6685,13 +6697,19 @@ impl DynoStore {
                     if compaction.records > 0 {
                         removed += compaction.records as u64;
                         out.push(deflated::Batch::try_from(compaction.batch)?);
+                    } else if repair_frame {
+                        // Nothing to compact, but the frame itself is unreadable:
+                        // re-encode the batch unchanged. The encoder emits an
+                        // independent-block frame now, so this is the repair.
+                        repaired += 1;
+                        out.push(deflated::Batch::try_from(compaction.batch)?);
                     } else {
                         // Untouched: carry the ORIGINAL batch, not a re-encode.
                         out.push(batch.clone());
                     }
                 }
                 out.reverse();
-                staged.push((*seq, *base, out, removed));
+                staged.push((*seq, *base, out, removed, repaired));
             }
 
             if aborted {
@@ -6708,10 +6726,24 @@ impl DynoStore {
                 continue;
             }
 
-            for (seq, base, out, removed) in staged {
-                if removed > 0 {
+            for (seq, base, out, removed, repaired) in staged {
+                // Either reason dirties the segment: records removed, or a frame
+                // repaired (#253). A repair changes no record, so it is not counted
+                // as a removal — but it must still reach the object store, or the
+                // damage stays durable.
+                if removed > 0 || repaired > 0 {
                     _ = dirty.insert(seq);
                     removed_total += removed;
+
+                    if repaired > 0 {
+                        info!(
+                            prefix,
+                            topic,
+                            partition,
+                            repaired,
+                            "re-encoded LZ4 frames with dependent blocks (#253)"
+                        );
+                    }
                 }
                 outputs.entry(seq).or_default().push((
                     Topition::new(topic.clone(), partition),

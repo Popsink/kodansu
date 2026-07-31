@@ -415,6 +415,36 @@ impl Batch {
     fn compression(&self) -> Result<Compression> {
         Compression::try_from(self.attributes)
     }
+
+    /// Whether this batch carries an LZ4 frame with **dependent (linked) blocks**,
+    /// which no Kafka Java client can decode (#253).
+    ///
+    /// Every LZ4 frame this broker wrote before the encoder was corrected is one:
+    /// the `lz4` crate defaults to `BlockMode::Linked`, and
+    /// `KafkaLZ4BlockInputStream` rejects it in its constructor — before reading a
+    /// single block, so an emptied compaction remnant compressing zero records is
+    /// refused exactly like a full one.
+    ///
+    /// The frame descriptor is `magic(4) | FLG | BD | ...`; block independence is
+    /// bit 5 of FLG. A batch this returns `true` for is durable damage: it stays
+    /// unreadable until something re-encodes it, which is why the per-key compaction
+    /// pass treats it as a reason to rewrite.
+    pub fn has_dependent_lz4_blocks(&self) -> bool {
+        /// LZ4 frame magic, little-endian on the wire.
+        const MAGIC: [u8; 4] = [0x04, 0x22, 0x4d, 0x18];
+        /// FLG bit 5.
+        const BLOCK_INDEPENDENCE: u8 = 1 << 5;
+
+        if !matches!(self.compression(), Ok(Compression::Lz4)) {
+            return false;
+        }
+
+        // A frame shorter than its own descriptor is not one we can judge; leave it
+        // to the decoder to reject rather than rewriting it blind.
+        self.record_data
+            .get(..5)
+            .is_some_and(|head| head[..4] == MAGIC && head[4] & BLOCK_INDEPENDENCE == 0)
+    }
 }
 
 impl TryFrom<Batch> for Vec<Record> {
