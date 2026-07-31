@@ -454,7 +454,18 @@ mod in_memory {
         .await
     }
 
-    #[tokio::test]
+    // Virtual time (#256). This test spent 610s of a 612s CI run asleep: it
+    // crosses the join long-poll's `session_timeout / 2` ceiling twice, and #195
+    // raised that ceiling to 300s by raising the session timeout to put member
+    // eviction out of reach. One knob served both needs, so no value could
+    // satisfy them at once — pausing the clock decouples them instead, leaving
+    // #195's property intact at zero wall-clock cost.
+    //
+    // Sound here only because the coordinator now measures how long it has been
+    // polling on tokio's clock rather than the wall clock: under `start_paused`
+    // a `SystemTime` deadline never advances while the sleeps return instantly,
+    // which would have turned the long-poll into an infinite loop.
+    #[tokio::test(start_paused = true)]
     async fn lifecycle() -> Result<()> {
         let _guard = common::init_tracing()?;
 
