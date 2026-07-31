@@ -46,8 +46,8 @@ use tansu_sans_io::{
     sync_group_response::SyncGroupResponse,
 };
 use tansu_storage::{
-    GroupDetail, GroupMember, GroupState, OffsetCommitRequest, Storage, Topition, UpdateError,
-    Version,
+    ConsumerGroupState, GroupDetail, GroupMember, GroupState, OffsetCommitRequest, Storage,
+    Topition, UpdateError, Version,
 };
 use tokio::time::{Duration, Instant, sleep};
 use tracing::{debug, error, info, instrument, warn};
@@ -183,6 +183,33 @@ static COORDINATOR_REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .with_description("consumer group coordinator requests")
         .build()
 });
+
+/// Rebalances observed still incomplete past [`REBALANCE_STALL_AFTER`] (#240).
+///
+/// Deliberately unlabelled: this deployment has thousands of groups, so a
+/// `group` label would be unbounded cardinality. The group's identity goes in
+/// the accompanying `warn!`, which is what an operator reads once this fires.
+static REBALANCE_STALLS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_group_rebalance_stalled")
+        .with_description("rebalances still incomplete past the stall threshold")
+        .build()
+});
+
+/// How long a group may sit in `CompletingRebalance` before it is reported
+/// (#240).
+///
+/// A group reaches that state when its members have joined and a leader is
+/// elected but `SyncGroup` has not distributed the assignment — normally
+/// seconds. In the incident this exists for it lasted **hours**, silently: the
+/// broker reported the group as existing with all its members while the clients
+/// waited for an assignment that never came, and the only symptom was "the
+/// worker consumes nothing".
+///
+/// 60s is generous against the normal case and negligible against the failure,
+/// which is the whole point: this is a "this is always a bug" signal, not a
+/// latency budget.
+const REBALANCE_STALL_AFTER: Duration = Duration::from_secs(60);
 
 #[async_trait]
 pub trait Group: Debug + Send {
@@ -894,6 +921,18 @@ pub struct Controller<O> {
     storage: O,
     wrappers: WrapperMap<O>,
     group_locks: GroupLocks,
+    /// When each group was first seen mid-rebalance, and whether that has been
+    /// reported yet (#240).
+    ///
+    /// Per-replica and in-process, deliberately: the alternative is a
+    /// state-entry timestamp inside `GroupDetail`, which is a persisted-format
+    /// change, and `inception` cannot stand in for one — it is set once at group
+    /// creation and copied through every transition, so it measures the group's
+    /// age, not how long it has been rebalancing. The cost of staying in memory
+    /// is a blind window after a restart, which is exactly when a wedge is
+    /// created; against a condition that lasted hours that is an acceptable
+    /// trade, and it needs no rolling-deploy care.
+    rebalance_stalls: Arc<Mutex<BTreeMap<String, (SystemTime, bool)>>>,
 }
 
 impl<O> Controller<O>
@@ -905,7 +944,55 @@ where
             storage,
             wrappers: Arc::new(Mutex::new(BTreeMap::new())),
             group_locks: Arc::new(Mutex::new(BTreeMap::new())),
+            rebalance_stalls: Arc::new(Mutex::new(BTreeMap::new())),
         })
+    }
+
+    /// Report a group that has been mid-rebalance too long (#240).
+    ///
+    /// A group in `CompletingRebalance` — members joined, leader elected, no
+    /// assignment distributed — past [`REBALANCE_STALL_AFTER`] is always a bug:
+    /// consumption has stopped and nothing else says so. The broker answers
+    /// every request about the group normally, the clients wait, and the
+    /// backlog sits behind it.
+    ///
+    /// Reported once per episode rather than per heartbeat: members heartbeat
+    /// every few seconds, so an unguarded `warn!` here would emit thousands of
+    /// lines for one stuck group and bury the signal it exists to raise. The
+    /// entry clears as soon as the group leaves the state, so a group that
+    /// stalls, recovers and stalls again is reported each time.
+    fn observe_rebalance(&self, group_id: &str, detail: &GroupDetail, now: SystemTime) -> bool {
+        let stalled = matches!(
+            ConsumerGroupState::from(detail),
+            ConsumerGroupState::CompletingRebalance
+        );
+
+        let Ok(mut stalls) = self.rebalance_stalls.lock() else {
+            return false;
+        };
+
+        if !stalled {
+            _ = stalls.remove(group_id);
+            return false;
+        }
+
+        let (since, reported) = stalls.entry(group_id.to_owned()).or_insert((now, false));
+
+        if !*reported && now.duration_since(*since).unwrap_or_default() >= REBALANCE_STALL_AFTER {
+            *reported = true;
+            REBALANCE_STALLS.add(1, &[]);
+
+            warn!(
+                group_id,
+                members = detail.members.len(),
+                stalled_for_ms = now.duration_since(*since).unwrap_or_default().as_millis() as u64,
+                "group has not completed its rebalance: members joined, no assignment distributed (#240)"
+            );
+
+            return true;
+        }
+
+        false
     }
 
     /// The serialization lock for `group_id`, created on first use. See
@@ -1826,6 +1913,11 @@ where
                 .await;
 
             debug!(group_id, %wrapper, ?version, iteration,);
+
+            // Every member heartbeats every few seconds, so this is the densest
+            // sampling of a group's state available — which is what makes it the
+            // right place to notice one that has stopped making progress (#240).
+            _ = self.observe_rebalance(group_id, &GroupDetail::from(&wrapper), now);
 
             // Skip the group-state PUT when nothing persistent changed (#111): the
             // object exists and already holds `before` (just read), so a
@@ -3585,6 +3677,108 @@ mod tests {
     use tansu_storage::StorageContainer;
     use tracing::subscriber::DefaultGuard;
     use url::Url;
+
+    /// #240: a group that stops making progress mid-rebalance must say so.
+    ///
+    /// The incident this exists for ran for hours with no signal at all — the
+    /// broker answered every request about the group normally while its members
+    /// waited for an assignment that never arrived, and tens of millions of
+    /// records sat behind eight such groups. A group in `CompletingRebalance`
+    /// past a bounded time is always a bug; the only question was how to notice.
+    ///
+    /// Pins the three properties that make it useful rather than noisy: it does
+    /// not fire early, it fires once per episode (members heartbeat every few
+    /// seconds, so per-call reporting would bury itself), and a group that
+    /// recovers and stalls again is reported again.
+    #[tokio::test]
+    async fn a_stalled_rebalance_is_reported_once_per_episode() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let storage = StorageContainer::builder()
+            .cluster_id("test")
+            .node_id(111)
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
+            .storage(Url::parse("memory://")?)
+            .build()
+            .await?;
+
+        let s = Controller::with_storage(storage)?;
+
+        const GROUP_ID: &str = "stalled-group";
+
+        // Members joined, a leader elected, no assignment distributed: exactly
+        // what `ConsumerGroupState` maps to `CompletingRebalance`.
+        let mut members = BTreeMap::new();
+        _ = members.insert(
+            String::from("member-1"),
+            GroupMember {
+                join_response: JoinGroupResponseMember::default().member_id("member-1".into()),
+                last_contact: None,
+            },
+        );
+
+        let stalling = GroupDetail {
+            members: members.clone(),
+            state: GroupState::Forming {
+                protocol_type: Some(String::from("consumer")),
+                protocol_name: Some(String::from("range")),
+                leader: Some(String::from("member-1")),
+            },
+            ..Default::default()
+        };
+
+        // The same group once the assignment lands.
+        let progressed = GroupDetail {
+            members,
+            state: GroupState::Formed {
+                protocol_type: String::from("consumer"),
+                protocol_name: String::from("range"),
+                leader: String::from("member-1"),
+                assignments: BTreeMap::new(),
+            },
+            ..Default::default()
+        };
+
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+
+        assert!(
+            !s.observe_rebalance(GROUP_ID, &stalling, t0),
+            "not on first sight"
+        );
+        assert!(
+            !s.observe_rebalance(
+                GROUP_ID,
+                &stalling,
+                t0 + REBALANCE_STALL_AFTER - Duration::from_secs(1)
+            ),
+            "not before the threshold",
+        );
+
+        assert!(
+            s.observe_rebalance(GROUP_ID, &stalling, t0 + REBALANCE_STALL_AFTER),
+            "reported once the threshold is reached",
+        );
+        assert!(
+            !s.observe_rebalance(GROUP_ID, &stalling, t0 + REBALANCE_STALL_AFTER * 10),
+            "and not again for the same episode",
+        );
+
+        // Recovery clears the episode ...
+        assert!(!s.observe_rebalance(GROUP_ID, &progressed, t0 + REBALANCE_STALL_AFTER * 11));
+
+        // ... so a fresh stall is a fresh episode, reported on its own clock.
+        let t1 = t0 + REBALANCE_STALL_AFTER * 12;
+        assert!(
+            !s.observe_rebalance(GROUP_ID, &stalling, t1),
+            "new episode starts quiet"
+        );
+        assert!(
+            s.observe_rebalance(GROUP_ID, &stalling, t1 + REBALANCE_STALL_AFTER),
+            "and is reported in its own right",
+        );
+
+        Ok(())
+    }
 
     fn encode_subscription(topics: &[&str], generation_id: Option<i32>) -> Bytes {
         Bytes::try_from(
