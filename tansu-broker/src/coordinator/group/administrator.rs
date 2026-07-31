@@ -49,7 +49,7 @@ use tansu_storage::{
     GroupDetail, GroupMember, GroupState, OffsetCommitRequest, Storage, Topition, UpdateError,
     Version,
 };
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, Instant, sleep};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
@@ -973,6 +973,16 @@ where
 
         let started_at = SystemTime::now();
 
+        // How long this call has been long-polling, on the MONOTONIC clock
+        // (#256). Deliberately not derived from `started_at`: `SystemTime` is
+        // the wall clock, so a backwards NTP step makes `elapsed()` return
+        // `Err` — which `?` turned into an error response for a member that was
+        // merely waiting — and it cannot be paused, so a test could only buy
+        // determinism by waiting out the real duration. `SystemTime` stays for
+        // everything that is persisted or compared against stored timestamps
+        // (`last_contact`, `inception`, the join-window barrier below).
+        let polling_since = Instant::now();
+
         let mut iteration = 0;
         let mut cas_conflicts = 0u32;
 
@@ -1106,7 +1116,7 @@ where
             {
                 COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_noop_skip")]);
 
-                let elapsed_ms = started_at.elapsed().map(|duration| duration.as_millis())?;
+                let elapsed_ms = polling_since.elapsed().as_millis();
 
                 let is_leader = updated.is_leader(&body);
                 let is_assigned = updated.is_assigned(&body);
@@ -1161,7 +1171,7 @@ where
 
             match self.storage.update_group(group_id, after, version).await {
                 Ok(version) => {
-                    let elapsed_ms = started_at.elapsed().map(|duration| duration.as_millis())?;
+                    let elapsed_ms = polling_since.elapsed().as_millis();
 
                     let is_leader = updated.is_leader(&body);
                     let is_assigned = updated.is_assigned(&body);
@@ -1308,7 +1318,10 @@ where
 
         COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sync")]);
 
-        let started_at = SystemTime::now();
+        // Monotonic, for the same reasons as `join`'s (#256). Nothing here is
+        // compared against a stored timestamp, so this call needs no wall clock
+        // at all.
+        let polling_since = Instant::now();
         let mut iteration = 0;
         let mut cas_conflicts = 0u32;
 
@@ -1419,7 +1432,7 @@ where
             {
                 COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sync_noop_skip")]);
 
-                let elapsed_ms = started_at.elapsed().map(|duration| duration.as_millis())?;
+                let elapsed_ms = polling_since.elapsed().as_millis();
 
                 let is_forming = updated.is_forming();
                 let is_assigned = updated.is_assigned(&body);
@@ -1457,7 +1470,7 @@ where
 
             match self.storage.update_group(group_id, after, version).await {
                 Ok(version) => {
-                    let elapsed_ms = started_at.elapsed().map(|duration| duration.as_millis())?;
+                    let elapsed_ms = polling_since.elapsed().as_millis();
 
                     let is_forming = updated.is_forming();
                     let is_assigned = updated.is_assigned(&body);
