@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use async_trait::async_trait;
-use futures::stream::BoxStream;
+use futures::{StreamExt, stream::BoxStream};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory, path::Path,
@@ -293,6 +293,184 @@ async fn delete_topic_removes_metadata_object_and_id_pointer() -> Result<(), Err
             .is_none()
     );
     assert!(replica_b.topic_metadata(&TopicId::Id(id)).await?.is_none());
+
+    Ok(())
+}
+
+/// An object store whose `delete_stream` fails for any location under a given
+/// substring, modelling #251: the data deletion in `delete_topic` not completing
+/// (an error, a throttle, a pod restart, a client timeout).
+#[derive(Clone)]
+struct DeleteFailsUnder<O> {
+    inner: O,
+    fragment: String,
+}
+
+impl<O> Debug for DeleteFailsUnder<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeleteFailsUnder").finish()
+    }
+}
+
+impl<O> Display for DeleteFailsUnder<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeleteFailsUnder").finish()
+    }
+}
+
+#[async_trait]
+impl<O> ObjectStore for DeleteFailsUnder<O>
+where
+    O: ObjectStore + Clone,
+{
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult, object_store::Error> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> Result<GetResult, object_store::Error> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path, object_store::Error>>,
+    ) -> BoxStream<'static, Result<Path, object_store::Error>> {
+        let fragment = self.fragment.clone();
+
+        self.inner.delete_stream(
+            locations
+                .map(move |item| match item {
+                    Ok(location) if location.as_ref().contains(fragment.as_str()) => {
+                        Err(object_store::Error::Generic {
+                            store: "DeleteFailsUnder",
+                            source: "injected delete failure".into(),
+                        })
+                    }
+                    otherwise => otherwise,
+                })
+                .boxed(),
+        )
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> Result<ListResult, object_store::Error> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: CopyOptions,
+    ) -> Result<(), object_store::Error> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+}
+
+/// #251: a `delete_topic` whose data deletion fails must leave the topic
+/// **existing**.
+///
+/// The metadata object is the only handle on a topic's data — maintenance
+/// discovers work by listing `topic-metadata/`, so a topic without one is never
+/// revisited by anything, ever. Removing it before the data therefore turned any
+/// mid-delete failure into permanently unreachable objects: a production audit
+/// found 878,065 of them under two deleted topics, paid for indefinitely.
+///
+/// With the data deleted first, the same failure leaves a topic that still
+/// exists with some of its data gone — visible, and recoverable by re-issuing
+/// `DeleteTopics`. This asserts that recoverability, which is the whole property:
+/// under the old ordering the topic would be gone from both replicas here while
+/// its objects stayed behind.
+#[tokio::test]
+async fn a_failed_delete_leaves_the_topic_recoverable() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let topic = "stranded";
+
+    let inner = InMemory::new();
+    let bucket = DeleteFailsUnder {
+        inner: inner.clone(),
+        fragment: format!("/topics/{topic}/"),
+    };
+
+    let replica_a = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    let id = create_topic(&replica_a, topic, 2).await?;
+
+    // Give the topic something under `topics/{name}/` to delete — the watermark
+    // objects the read paths persist. Seeded directly, as
+    // `watermark_with_mut_preserves_unknown_fields` does: what is under test is
+    // the delete ordering, not how a watermark comes to exist.
+    for partition in 0..2 {
+        _ = inner
+            .put_opts(
+                &Path::from(format!(
+                    "clusters/{CLUSTER}/topics/{topic}/partitions/{partition:0>10}/watermark.json"
+                )),
+                PutPayload::from_static(br#"{"high":5}"#),
+                PutOptions::default(),
+            )
+            .await?;
+    }
+
+    // The delete must report the failure rather than swallow it.
+    assert!(
+        replica_a
+            .delete_topic(&TopicId::Name(topic.into()))
+            .await
+            .is_err()
+    );
+
+    // ... and the topic must still be there, by name and by id, for the deleting
+    // replica and for one that only ever sees the bucket.
+    assert!(
+        replica_a
+            .topic_metadata(&TopicId::Name(topic.into()))
+            .await?
+            .is_some()
+    );
+
+    let replica_b = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    assert!(
+        replica_b
+            .topic_metadata(&TopicId::Name(topic.into()))
+            .await?
+            .is_some()
+    );
+    assert!(replica_b.topic_metadata(&TopicId::Id(id)).await?.is_some());
 
     Ok(())
 }
