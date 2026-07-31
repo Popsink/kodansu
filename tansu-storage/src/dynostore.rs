@@ -1426,7 +1426,7 @@ struct TopicIndex {
 /// `rest` is a catch-all for fields this binary does not model: the object is
 /// round-tripped through [`OptiCon::with_mut`] on the maintainer path every
 /// maintenance interval ([`DynoStore::expire_prefix_segments`] persists `high`,
-/// [`DynoStore::advance_low_watermark`] persists `low`), so without it a
+/// [`DynoStore::delete_records_before`] persists `low`), so without it a
 /// rolling deploy would let an old process silently erase any field a newer
 /// one had just written — for the truncation floor (`truncate`, #176) that
 /// means resurrecting records a user deleted. An empty map flattens to no
@@ -4230,32 +4230,38 @@ impl DynoStore {
         offset_request: &ListOffset,
         stable: &BTreeMap<Topition, Offset>,
     ) -> Result<Option<ListOffsetResponse>> {
-        // LATEST (outside an open read-committed transaction) is the log end
-        // offset == high watermark, derived from the immutable batch objects
-        // (max base offset + that batch's record count). The previous
-        // `last_modified` ordering was wrong under inter-replica clock skew
-        // and `max_base + 1` ignored multi-record batches; `high_watermark`
-        // is correct on both counts. `None` (→ -1 on the wire) only for an
-        // empty log.
-        if *offset_request == ListOffset::Latest && !stable.contains_key(topition) {
-            let high = self.high_watermark(topition).await?;
+        // LATEST is the log end offset — except under read-committed with an open
+        // transaction, where it is the **last stable offset**: the first offset of
+        // the earliest open transaction, which is what `stable` carries.
+        //
+        // That case used to be answered by walking the legacy `records/` listing
+        // for the highest object below the stable bound (#179 deleted that scan,
+        // and its final fallback answered 0 for a partition with no objects). The
+        // value needs no scan and no approximation: it is the same fold
+        // `offset_stage` performs, `stable.get(topition).unwrap_or(high_watermark)`,
+        // so the two paths cannot disagree about the LSO.
+        //
+        // The log end itself comes from `high_watermark` (footer-aware): the
+        // previous `last_modified` ordering was wrong under inter-replica clock
+        // skew, and `max_base + 1` ignored multi-record batches.
+        if *offset_request == ListOffset::Latest {
+            let (offset, timestamp) = match stable.get(topition).copied() {
+                // An open transaction bounds LATEST. No timestamp: the bound is a
+                // transaction boundary, not a record this path has identified.
+                Some(last_stable) => (last_stable, None),
 
-            // Tail timestamp. For a PURE-segment topic (#73) read it from the
-            // footer index (the newest segment's max record timestamp) rather
-            // than a per-topic `records/` LIST. This is the segment's
-            // record-time (closer to the SQL backends' record `timestamp` than
-            // the legacy object mtime), but the two sources differ, so the
-            // fallback is used whenever a segment isn't the authoritative tail:
-            // `coalesced_latest_timestamp` returns `None` for a non-coalesced
-            // or hybrid topic (a legacy object may sit above the segments), and
-            // we then take the legacy tail's mtime as before.
-            // No timestamp when the index has none: the legacy `records/` tail
-            // whose object mtime used to stand in for one cannot exist (#179).
-            let timestamp = self.coalesced_latest_timestamp(topition).await?;
+                // Tail timestamp from the footer index (the newest segment's max
+                // record timestamp) — the segment's record-time, closer to the SQL
+                // backends' record `timestamp` than an object mtime ever was.
+                None => (
+                    self.high_watermark(topition).await?,
+                    self.coalesced_latest_timestamp(topition).await?,
+                ),
+            };
 
             return Ok(Some(ListOffsetResponse {
                 error_code: ErrorCode::None,
-                offset: Some(high),
+                offset: Some(offset),
                 timestamp,
             }));
         }
@@ -6504,8 +6510,9 @@ impl DynoStore {
         // segment-resident records are hidden by the floor rather than rewritten,
         // because segments are shared across sub-streams.
         //
-        // The floor is max-folded so a later call with a lower offset cannot
-        // regress it.
+        // One CAS carries both the truncation floor and the legacy log start
+        // (`low`, kept in lockstep for pre-floor readers). Both are max-folded so a
+        // later call with a lower offset cannot regress them.
         let floor = self
             .watermark(topition)?
             .with_mut(&self.object_store, |watermark| {
