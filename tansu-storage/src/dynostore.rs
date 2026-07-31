@@ -684,10 +684,23 @@ static SEGMENT_RECORDS_COMPACTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
-/// Legacy `records/` objects retired by the carry-over (#175 release 2) — the
-/// drain progress signal, and the one that tells when the backlog is gone: it
-/// stops moving because every compacted topic is drained, not because the pass
-/// stopped running.
+/// Batch frames re-encoded by the per-key compaction pass because they carried
+/// dependent-block LZ4 (#253) — the drain progress signal for that repair, and
+/// the one that tells when the damage is gone: it stops moving because every
+/// affected prefix has been visited, not because the pass stopped running.
+///
+/// Deliberately separate from `SEGMENT_RECORDS_COMPACTED`: a repair removes no
+/// record by construction, so the removal counter cannot show it and a flat
+/// removal counter must not be read as "nothing to repair". Expected to reach a
+/// bounded total (the frames written while the encoder bug was live) and then
+/// stay flat forever; a fresh increment after that means an encoder regression.
+static SEGMENT_FRAMES_REPAIRED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_segment_frames_repaired")
+        .with_description("batch frames re-encoded from dependent-block LZ4 by compaction")
+        .build()
+});
+
 /// Topics `Metadata` could not resolve but the topics index knows exist (#214).
 ///
 /// Expected to be zero. Nonzero means a per-topic metadata read came back empty
@@ -5792,6 +5805,7 @@ impl DynoStore {
             BTreeMap::new();
         let mut dirty: BTreeSet<u64> = BTreeSet::new();
         let mut removed_total: u64 = 0;
+        let mut repaired_total: u64 = 0;
 
         for (topic, partition) in substream_keys {
             let fenced = self.valid_substream_segments(prefix, &topic, partition)?;
@@ -5911,7 +5925,15 @@ impl DynoStore {
                     removed_total += removed;
 
                     if repaired > 0 {
-                        info!(
+                        repaired_total += repaired;
+
+                        // `warn`, not `info` (#259): re-encoding durable damage is
+                        // not steady state. It is bounded by the frames written
+                        // while the encoder bug was live, each occurrence is the
+                        // recovery of a partition no Java client could read, and
+                        // production runs at `warn` — at `info` this line was
+                        // structurally unable to appear where it is needed.
+                        warn!(
                             prefix,
                             topic,
                             partition,
@@ -5971,9 +5993,11 @@ impl DynoStore {
         self.index_prune(prefix, &pruned)?;
 
         SEGMENT_RECORDS_COMPACTED.add(removed_total, &[]);
+        SEGMENT_FRAMES_REPAIRED.add(repaired_total, &[]);
         debug!(
             prefix,
             removed = removed_total,
+            repaired = repaired_total,
             rewritten = dirty.len(),
             "per-key compacted prefix segments"
         );
