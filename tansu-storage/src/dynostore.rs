@@ -1424,11 +1424,11 @@ struct TopicIndex {
 /// The per-topition durable watermark object (`watermark.json`).
 ///
 /// `rest` is a catch-all for fields this binary does not model: the object is
-/// round-tripped through [`OptiCon::with_mut`] on the maintainer path every
-/// maintenance interval ([`DynoStore::expire_prefix_segments`] persists `high`,
-/// [`DynoStore::delete_records_before`] persists `low`), so without it a
-/// rolling deploy would let an old process silently erase any field a newer
-/// one had just written — for the truncation floor (`truncate`, #176) that
+/// round-tripped through [`OptiCon::with_mut`] ([`DynoStore::expire_prefix_segments`]
+/// persists `high`, [`DynoStore::delete_records_before`] the truncation floor), so
+/// without it a rolling deploy would let an old process silently erase any field a
+/// newer one had just written — and it is what preserves the historic `"low"` of an
+/// object written before #180 dropped that field — for the truncation floor (`truncate`, #176) that
 /// means resurrecting records a user deleted. An empty map flattens to no
 /// bytes at all, so existing objects are not rewritten on first touch; the
 /// guard test `watermark_with_mut_preserves_unknown_fields` pins both
@@ -1440,7 +1440,6 @@ struct TopicIndex {
 /// DeserializeOwned + PartialEq + Serialize`.)
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 struct Watermark {
-    low: Option<i64>,
     high: Option<i64>,
     /// Truncation floor (#176): the offset below which `DeleteRecords` has
     /// logically truncated this sub-stream (records survive physically in
@@ -6542,9 +6541,16 @@ impl DynoStore {
         // segment-resident records are hidden by the floor rather than rewritten,
         // because segments are shared across sub-streams.
         //
-        // One CAS carries both the truncation floor and the legacy log start
-        // (`low`, kept in lockstep for pre-floor readers). Both are max-folded so a
-        // later call with a lower offset cannot regress them.
+        // `truncate` is the whole floor (#180). This used to write `watermark.low`
+        // in lockstep with it, for readers that predate the field (#176) and knew
+        // only `low` — every one of those is gone, along with the legacy retention
+        // that was the field's other writer. An existing object's historic `"low"`
+        // is preserved rather than erased: it lands in the `rest` catch-all, so its
+        // value survives — relocated after the named fields, which costs such an
+        // object one rewrite the next time something else on it moves.
+        //
+        // The floor is max-folded so a later call with a lower offset cannot
+        // regress it.
         let floor = self
             .watermark(topition)?
             .with_mut(&self.object_store, |watermark| {
@@ -6552,7 +6558,6 @@ impl DynoStore {
                     .truncate
                     .map_or(before, |truncate| truncate.max(before));
                 watermark.truncate = Some(floor);
-                watermark.low = Some(watermark.low.unwrap_or(0).max(floor));
                 Ok(floor)
             })
             .await?;
@@ -7219,7 +7224,6 @@ impl Storage for DynoStore {
             watermark
                 .with_mut(&self.object_store, |watermark| {
                     _ = watermark.high.take();
-                    _ = watermark.low.take();
                     _ = watermark.truncate.take();
 
                     Ok(())
