@@ -2,7 +2,7 @@
 
 ## Overview
 
-`tansu-sans-io` is the Kafka wire protocol implementation at the heart of Tansu. As its name implies, it performs **no I/O** — it operates purely on bytes, converting between raw Kafka protocol frames and typed Rust structures. This makes it suitable for embedding in any async runtime or network stack (Tansu uses `rama`).
+`tansu-sans-io` is the Kafka wire protocol implementation at the heart of Kodansu. As its name implies, it performs **no I/O** — it operates purely on bytes, converting between raw Kafka protocol frames and typed Rust structures. This makes it suitable for embedding in any async runtime or network stack (Kodansu uses `rama`).
 
 The crate's description from `Cargo.toml`: *"A Kafka protocol implementation using serde"*.
 

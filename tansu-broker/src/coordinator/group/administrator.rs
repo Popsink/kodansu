@@ -184,7 +184,7 @@ static COORDINATOR_REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
-/// Rebalances observed still incomplete past [`REBALANCE_STALL_AFTER`] (#240).
+/// Rebalances observed still incomplete past [`stall_after`] (#240).
 ///
 /// Deliberately unlabelled: this deployment has thousands of groups, so a
 /// `group` label would be unbounded cardinality. The group's identity goes in
@@ -196,20 +196,41 @@ static REBALANCE_STALLS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
-/// How long a group may sit in `CompletingRebalance` before it is reported
+/// Floor for [`stall_after`] — the threshold used when a group declares no
+/// rebalance timeout of its own, and the minimum applied to one that declares
+/// an implausibly short value (#240).
+///
+/// Measured, after the first hour of this detector in production: large groups
+/// (9-14 members) routinely complete a rebalance in **just over a minute** —
+/// observed 60.1s, 60.4s, 62.9s, 67.2s, 81.2s, each recovering on its own. The
+/// 60s this shipped with fired ~2 per minute fleet-wide on healthy groups, which
+/// is how a signal becomes one operators learn to scroll past. 120s clears that
+/// observed tail with margin and is still three orders of magnitude below the
+/// hours the incident ran.
+const REBALANCE_STALL_FLOOR: Duration = Duration::from_secs(120);
+
+/// How long `group` may sit in `CompletingRebalance` before it is reported
 /// (#240).
 ///
-/// A group reaches that state when its members have joined and a leader is
-/// elected but `SyncGroup` has not distributed the assignment — normally
-/// seconds. In the incident this exists for it lasted **hours**, silently: the
-/// broker reported the group as existing with all its members while the clients
-/// waited for an assignment that never came, and the only symptom was "the
-/// worker consumes nothing".
+/// Taken from the group's **own** `rebalance_timeout_ms` where it declares one.
+/// That is the interval its members told the coordinator to wait for a rejoin,
+/// so still forming past it is anomalous by the group's own definition — and it
+/// scales with the group instead of against it, which a constant cannot: the
+/// same threshold cannot be right for a 2-member group and a 14-member one.
 ///
-/// 60s is generous against the normal case and negligible against the failure,
-/// which is the whole point: this is a "this is always a bug" signal, not a
-/// latency budget.
-const REBALANCE_STALL_AFTER: Duration = Duration::from_secs(60);
+/// A group reaches this state when its members have joined and a leader is
+/// elected but `SyncGroup` has not distributed the assignment. In the incident
+/// this exists for it lasted **hours**, silently: the broker reported the group
+/// as existing with all its members while the clients waited for an assignment
+/// that never came, and the only symptom was "the worker consumes nothing".
+fn stall_after(detail: &GroupDetail) -> Duration {
+    detail
+        .rebalance_timeout_ms
+        .filter(|ms| *ms > 0)
+        .map_or(REBALANCE_STALL_FLOOR, |ms| {
+            Duration::from_millis(ms as u64).max(REBALANCE_STALL_FLOOR)
+        })
+}
 
 #[async_trait]
 pub trait Group: Debug + Send {
@@ -951,7 +972,7 @@ where
     /// Report a group that has been mid-rebalance too long (#240).
     ///
     /// A group in `CompletingRebalance` — members joined, leader elected, no
-    /// assignment distributed — past [`REBALANCE_STALL_AFTER`] is always a bug:
+    /// assignment distributed — past [`stall_after`] is always a bug:
     /// consumption has stopped and nothing else says so. The broker answers
     /// every request about the group normally, the clients wait, and the
     /// backlog sits behind it.
@@ -976,16 +997,23 @@ where
             return false;
         }
 
+        let threshold = stall_after(detail);
         let (since, reported) = stalls.entry(group_id.to_owned()).or_insert((now, false));
+        let stalled_for = now.duration_since(*since).unwrap_or_default();
 
-        if !*reported && now.duration_since(*since).unwrap_or_default() >= REBALANCE_STALL_AFTER {
+        if !*reported && stalled_for >= threshold {
             *reported = true;
             REBALANCE_STALLS.add(1, &[]);
 
+            // `threshold_ms` is in the line on purpose: it is the group's own
+            // declared rebalance timeout, so an operator can tell "this group is
+            // stuck" from "this group declares an unusually tight timeout"
+            // without going to read the config.
             warn!(
                 group_id,
                 members = detail.members.len(),
-                stalled_for_ms = now.duration_since(*since).unwrap_or_default().as_millis() as u64,
+                stalled_for_ms = stalled_for.as_millis() as u64,
+                threshold_ms = threshold.as_millis() as u64,
                 "group has not completed its rebalance: members joined, no assignment distributed (#240)"
             );
 
@@ -3678,6 +3706,55 @@ mod tests {
     use tracing::subscriber::DefaultGuard;
     use url::Url;
 
+    /// #240: the stall threshold comes from the group, not from a constant.
+    ///
+    /// The first version of this detector used a flat 60s, on the assumption
+    /// that a healthy rebalance takes seconds. Production contradicted that in
+    /// under an hour: 9-14 member groups routinely completed in **just over a
+    /// minute** (60.1s, 60.4s, 62.9s, 67.2s, 81.2s observed, each recovering),
+    /// so the warning fired ~2 per minute on healthy groups — which is how a
+    /// signal becomes one operators scroll past, the failure this was meant to
+    /// prevent.
+    ///
+    /// A group's own `rebalance_timeout_ms` is the honest bound: it is what its
+    /// members told the coordinator to wait, so exceeding it is anomalous by the
+    /// group's own definition, and it scales with the group where a constant
+    /// cannot.
+    #[test]
+    fn the_stall_threshold_follows_the_group() {
+        let declared = |ms: Option<i32>| {
+            stall_after(&GroupDetail {
+                rebalance_timeout_ms: ms,
+                ..Default::default()
+            })
+        };
+
+        assert_eq!(
+            Duration::from_secs(300),
+            declared(Some(300_000)),
+            "a declared timeout is the threshold",
+        );
+
+        assert_eq!(
+            REBALANCE_STALL_FLOOR,
+            declared(None),
+            "a group that declares none gets the floor",
+        );
+
+        // Below the floor the floor wins, in both the implausible and the merely
+        // tight case: the observed healthy tail is ~81s, so a threshold under
+        // that reports groups doing nothing wrong.
+        assert_eq!(REBALANCE_STALL_FLOOR, declared(Some(1)));
+        assert_eq!(REBALANCE_STALL_FLOOR, declared(Some(60_000)));
+        assert_eq!(REBALANCE_STALL_FLOOR, declared(Some(0)));
+        assert_eq!(REBALANCE_STALL_FLOOR, declared(Some(-1)));
+
+        assert!(
+            REBALANCE_STALL_FLOOR > Duration::from_millis(81_203),
+            "the floor must clear the slowest healthy rebalance measured in production",
+        );
+    }
+
     /// #240: a group that stops making progress mid-rebalance must say so.
     ///
     /// The incident this exists for ran for hours with no signal at all — the
@@ -3717,7 +3794,13 @@ mod tests {
             },
         );
 
+        // Declares its own rebalance timeout, so the threshold is derived from
+        // the group rather than from a constant.
+        const REBALANCE_TIMEOUT_MS: i32 = 300_000;
+        let threshold = Duration::from_millis(REBALANCE_TIMEOUT_MS as u64);
+
         let stalling = GroupDetail {
+            rebalance_timeout_ms: Some(REBALANCE_TIMEOUT_MS),
             members: members.clone(),
             state: GroupState::Forming {
                 protocol_type: Some(String::from("consumer")),
@@ -3729,6 +3812,7 @@ mod tests {
 
         // The same group once the assignment lands.
         let progressed = GroupDetail {
+            rebalance_timeout_ms: Some(REBALANCE_TIMEOUT_MS),
             members,
             state: GroupState::Formed {
                 protocol_type: String::from("consumer"),
@@ -3746,34 +3830,30 @@ mod tests {
             "not on first sight"
         );
         assert!(
-            !s.observe_rebalance(
-                GROUP_ID,
-                &stalling,
-                t0 + REBALANCE_STALL_AFTER - Duration::from_secs(1)
-            ),
+            !s.observe_rebalance(GROUP_ID, &stalling, t0 + threshold - Duration::from_secs(1)),
             "not before the threshold",
         );
 
         assert!(
-            s.observe_rebalance(GROUP_ID, &stalling, t0 + REBALANCE_STALL_AFTER),
+            s.observe_rebalance(GROUP_ID, &stalling, t0 + threshold),
             "reported once the threshold is reached",
         );
         assert!(
-            !s.observe_rebalance(GROUP_ID, &stalling, t0 + REBALANCE_STALL_AFTER * 10),
+            !s.observe_rebalance(GROUP_ID, &stalling, t0 + threshold * 10),
             "and not again for the same episode",
         );
 
         // Recovery clears the episode ...
-        assert!(!s.observe_rebalance(GROUP_ID, &progressed, t0 + REBALANCE_STALL_AFTER * 11));
+        assert!(!s.observe_rebalance(GROUP_ID, &progressed, t0 + threshold * 11));
 
         // ... so a fresh stall is a fresh episode, reported on its own clock.
-        let t1 = t0 + REBALANCE_STALL_AFTER * 12;
+        let t1 = t0 + threshold * 12;
         assert!(
             !s.observe_rebalance(GROUP_ID, &stalling, t1),
             "new episode starts quiet"
         );
         assert!(
-            s.observe_rebalance(GROUP_ID, &stalling, t1 + REBALANCE_STALL_AFTER),
+            s.observe_rebalance(GROUP_ID, &stalling, t1 + threshold),
             "and is reported in its own right",
         );
 

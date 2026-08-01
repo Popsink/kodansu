@@ -4,7 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Tansu is a stateless, Apache Kafka-compatible broker written in Rust. It is a drop-in replacement for Apache Kafka backed by an object store: S3, Google Cloud Storage, or in-memory (for tests). This fork is deliberately **object-store only** — the PostgreSQL/libSQL/SlateDB/Turso backends and the schema-registry validation + Iceberg/Delta/Parquet lakehouse have been removed (see #96).
+Kodansu is a stateless, Apache Kafka-compatible broker written in Rust. It is a drop-in replacement for Apache Kafka backed by an object store: S3, Google Cloud Storage, or in-memory (for tests). This fork of [tansu](https://github.com/tansu-io/tansu) is deliberately **object-store only** — the PostgreSQL/libSQL/SlateDB/Turso backends and the schema-registry validation + Iceberg/Delta/Parquet lakehouse have been removed (see #96).
+
+The product is named **Kodansu** in documentation, but the binary, the crates and the
+container image (`ghcr.io/popsink/tansu`) are all still named `tansu` — renaming those
+is a separate breaking change. Use `tansu` for every code identifier and `Kodansu` in
+prose.
 
 - Rust edition 2024, toolchain pinned in `rust-toolchain.toml`
 - License: Apache-2.0
@@ -48,7 +53,7 @@ Note: when running tansu directly (not via docker compose), set `AWS_ENDPOINT="h
 
 ## Architecture
 
-Cargo workspace producing a single binary (`tansu`) with subcommands: `broker` (default), `topic`, `perf`, `proxy`.
+Cargo workspace producing a single binary (`tansu`) with subcommands: `broker` (default), `topic`, `user`, `perf`, `proxy`.
 
 ### Key Crates
 
@@ -62,6 +67,10 @@ Cargo workspace producing a single binary (`tansu`) with subcommands: `broker` (
 | `tansu-client` | Async Kafka protocol client (rama service layers) |
 | `tansu-model` | Kafka JSON protocol definitions (used in build.rs) |
 | `tansu-cli` | Clap-based CLI argument parsing |
+| `tansu-auth` | SASL/SCRAM authentication |
+| `tansu-otel` | OTLP metric/trace export (there is no Prometheus scrape endpoint) |
+| `tansu-topic` | Topic administration used by `tansu topic` |
+| `tansu-perf` | Produce-side benchmark used by `tansu perf` |
 
 ### Sans-I/O Code Generation (`tansu-sans-io`)
 

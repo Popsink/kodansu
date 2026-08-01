@@ -94,8 +94,12 @@ Transactional and control batches share segments like everything else (#174),
 and so do large **backfill/snapshot** batches: a bulk batch trips a widened byte
 threshold and flushes as roughly its own segment (#90), keeping the 1-PUT parity
 the old bypass gave. Compacted topics (`cleanup.policy` containing `compact`)
-are the one exception — they keep the legacy `records/` path until
-`compacted_segments` is enabled (#175).
+are no exception: they write into segments too, but are routed to a prefix equal
+to **their own topic name** rather than to the shared connector prefix, so per-key
+compaction only ever touches that one topic's keys (#175). Each topic's routing
+is pinned create-only on first use and then served from memory (#236). The
+`compacted_segments` and `compacted_carryover` flags that once gated all of this
+are gone (#222) — a storage URL still carrying them starts and logs one warning.
 
 Segments are keyed by a monotonic sequence, not by offset; each carries a
 self-describing footer with every `(topic, partition)` sub-stream's offset

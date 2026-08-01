@@ -17,12 +17,12 @@ lands on a non-lease-holder cannot acquire the lease and is fenced persistently 
 the `NotLeaderOrFollower` flush storm observed in production (#70).
 
 The shipped fix (#70 / PR #74, "Option A") forwards produce to the deterministic
-prefix owner. It works, but it imports three things that contradict Tansu's
+prefix owner. It works, but it imports three things that contradict Kodansu's
 stateless model:
 
 1. a **per-pod identity** (`routing_node_id`) — requires stable ordinals → StatefulSet;
 2. a **static member list** (`members=id@addr,…`) — every pod must know every other, reconfigured on each scale;
-3. **broker-to-broker awareness**, whereas Tansu's design principle is that brokers coordinate *only* through the object store (logical node id fixed at 111, pods interchangeable behind an L4 LB).
+3. **broker-to-broker awareness**, whereas Kodansu's design principle is that brokers coordinate *only* through the object store (logical node id fixed at 111, pods interchangeable behind an L4 LB).
 
 Production runs a **ReplicaSet**, whose pods are ephemeral with no stable
 ordinal or enumerable address. `members=` + `routing_node_id` do not template
