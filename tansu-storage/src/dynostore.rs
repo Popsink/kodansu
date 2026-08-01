@@ -8620,14 +8620,31 @@ impl Storage for DynoStore {
         Ok(results)
     }
 
+    /// Describe each group in `group_ids` (#240).
+    ///
+    /// Concurrent, because this is a fan-out over per-group objects and a client
+    /// asks about every group it owns in one call. Sequentially this cost one
+    /// round-trip per group, serialized: at a few hundred groups that is tens of
+    /// seconds, past any admin client's deadline — observed in production as
+    /// `context deadline exceeded` on `group describe`, and as the
+    /// `listConsumerGroupOffsets` timeouts that made a consumer's rebalance
+    /// callback throw. `buffered` keeps the response in request order while
+    /// letting the object store answer in parallel.
     async fn describe_groups(
         &self,
         group_ids: Option<&[String]>,
         _include_authorized_operations: bool,
     ) -> Result<Vec<NamedGroupDetail>> {
-        let mut results = vec![];
-        if let Some(group_ids) = group_ids {
-            for group_id in group_ids {
+        /// Matches the other per-object fan-outs in this file
+        /// (`FETCH_EACH_CONCURRENCY`, `FOOTER_FETCH_CONCURRENCY`).
+        const DESCRIBE_CONCURRENCY: usize = 32;
+
+        let Some(group_ids) = group_ids else {
+            return Ok(vec![]);
+        };
+
+        Ok(
+            futures::stream::iter(group_ids.iter().cloned().map(|group_id| async move {
                 let location = Path::from(format!(
                     "clusters/{}/groups/consumers/{}.json",
                     self.cluster, group_id,
@@ -8639,37 +8656,36 @@ impl Storage for DynoStore {
                     .inspect(|o| debug!(?o, group_id))
                     .inspect_err(|err| error!(?err, group_id))
                 {
-                    Ok((group_detail, _)) => {
-                        results.push(NamedGroupDetail::found(group_id.into(), group_detail));
+                    Ok((group_detail, _)) => NamedGroupDetail::found(group_id.into(), group_detail),
+
+                    // Absent means the group does not exist, which is a fact and is
+                    // reported as an empty group.
+                    Err(Error::ObjectStore(error))
+                        if matches!(error.as_ref(), object_store::Error::NotFound { .. }) =>
+                    {
+                        NamedGroupDetail::found(group_id.into(), GroupDetail::default())
                     }
 
-                    Err(Error::ObjectStore(error)) => match error.as_ref() {
-                        object_store::Error::NotFound { .. } => {
-                            results.push(NamedGroupDetail::found(
-                                group_id.into(),
-                                GroupDetail::default(),
-                            ));
-                        }
-
-                        _otherwise => {
-                            results.push(NamedGroupDetail::found(
-                                group_id.into(),
-                                GroupDetail::default(),
-                            ));
-                        }
-                    },
+                    // Any other store error means we do not know. This used to
+                    // answer with `GroupDetail::default()` too, so a throttle or a
+                    // 5xx made a live group with members report as empty — the same
+                    // shape as #214, where an unresolvable topic was reported absent
+                    // and clients could not tell it from a deleted one. Retriable is
+                    // both true and actionable.
+                    Err(Error::ObjectStore(_)) => NamedGroupDetail::error_code(
+                        group_id.into(),
+                        ErrorCode::CoordinatorLoadInProgress,
+                    ),
 
                     Err(_) => {
-                        results.push(NamedGroupDetail::error_code(
-                            group_id.into(),
-                            ErrorCode::UnknownServerError,
-                        ));
+                        NamedGroupDetail::error_code(group_id.into(), ErrorCode::UnknownServerError)
                     }
                 }
-            }
-        }
-
-        Ok(results)
+            }))
+            .buffered(DESCRIBE_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await,
+        )
     }
 
     async fn update_group(

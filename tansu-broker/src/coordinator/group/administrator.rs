@@ -1158,6 +1158,23 @@ where
 
             let before = GroupDetail::from(&original);
 
+            // Observed here as well as on the heartbeat path (#240).
+            //
+            // Heartbeat alone is blind to the failure this detector exists for.
+            // `AbstractCoordinator$HeartbeatThread` disables itself while the
+            // consumer has not joined — `if (state.hasNotJoinedGroup() ||
+            // isFailed()) { disable(); }` — so a group whose members are stuck
+            // *trying* to join sends no heartbeat at all, and was sampled
+            // nowhere. Measured: a group 90+ minutes in `CompletingRebalance`
+            // with 16 members, all 16 heartbeat threads parked in `wait()`, and
+            // not one line about it across ten broker replicas over two hours.
+            //
+            // Join and sync keep arriving from exactly that consumer — every
+            // `poll()` retries the join — so they are a live sampling source
+            // precisely when heartbeats are not. `before` is the group as read
+            // this iteration, which is the state being waited on.
+            _ = self.observe_rebalance(group_id, &before, now);
+
             if group_instance_id.is_none() {
                 original = original.missed_heartbeat(group_id, member_id, now);
             }
@@ -1508,6 +1525,23 @@ where
             }
 
             let before = GroupDetail::from(&original);
+
+            // Observed here as well as on the heartbeat path (#240).
+            //
+            // Heartbeat alone is blind to the failure this detector exists for.
+            // `AbstractCoordinator$HeartbeatThread` disables itself while the
+            // consumer has not joined — `if (state.hasNotJoinedGroup() ||
+            // isFailed()) { disable(); }` — so a group whose members are stuck
+            // *trying* to join sends no heartbeat at all, and was sampled
+            // nowhere. Measured: a group 90+ minutes in `CompletingRebalance`
+            // with 16 members, all 16 heartbeat threads parked in `wait()`, and
+            // not one line about it across ten broker replicas over two hours.
+            //
+            // Join and sync keep arriving from exactly that consumer — every
+            // `poll()` retries the join — so they are a live sampling source
+            // precisely when heartbeats are not. `before` is the group as read
+            // this iteration, which is the state being waited on.
+            _ = self.observe_rebalance(group_id, &before, now);
 
             let original_members = original.members();
 
@@ -3705,6 +3739,112 @@ mod tests {
     use tansu_storage::StorageContainer;
     use tracing::subscriber::DefaultGuard;
     use url::Url;
+
+    /// #240: a group whose members never finish joining must still be reported.
+    ///
+    /// The detector was hooked only to the heartbeat path, on the reasoning that
+    /// members heartbeat every few seconds so it is the densest sampling
+    /// available. That is true of a group whose members are *in* the group, and
+    /// false of the failure this exists for. `AbstractCoordinator$HeartbeatThread`
+    /// disables itself while the consumer has not joined:
+    ///
+    /// ```java
+    /// if (state.hasNotJoinedGroup() || isFailed()) { disable(); continue; }
+    /// ```
+    ///
+    /// So a consumer stuck trying to join sends no heartbeat at all. Measured in
+    /// production: a group 90+ minutes in `CompletingRebalance` with 16 members,
+    /// every heartbeat thread parked in `wait()`, and not one line about it
+    /// across ten replicas over two hours — the detector silent on precisely the
+    /// case it was written for.
+    ///
+    /// `join` keeps arriving from that consumer (each `poll()` retries), so it is
+    /// a live sampling source when heartbeat is not. This drives joins only, and
+    /// never a heartbeat.
+    #[tokio::test]
+    async fn a_group_that_never_joins_is_still_observed() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let storage = StorageContainer::builder()
+            .cluster_id("test")
+            .node_id(111)
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
+            .storage(Url::parse("memory://")?)
+            .build()
+            .await?;
+
+        let s = Controller::with_storage(storage.clone())?;
+
+        const GROUP_ID: &str = "never-joins";
+        const CONSUMER: &str = "consumer";
+        const RANGE: &str = "range";
+
+        // A group already mid-rebalance: members joined, leader elected, no
+        // assignment distributed. This is what a stuck consumer keeps re-joining
+        // into, and what `CompletingRebalance` maps from.
+        let mut members = BTreeMap::new();
+        _ = members.insert(
+            String::from("member-1"),
+            GroupMember {
+                join_response: JoinGroupResponseMember::default().member_id("member-1".into()),
+                last_contact: None,
+            },
+        );
+
+        _ = storage
+            .update_group(
+                GROUP_ID,
+                GroupDetail {
+                    rebalance_timeout_ms: Some(300_000),
+                    members,
+                    generation_id: 1,
+                    state: GroupState::Forming {
+                        protocol_type: Some(String::from(CONSUMER)),
+                        protocol_name: Some(String::from(RANGE)),
+                        leader: Some(String::from("member-1")),
+                    },
+                    ..Default::default()
+                },
+                None,
+            )
+            .await;
+
+        let protocols = [JoinGroupRequestProtocol::default()
+            .name(RANGE.into())
+            .metadata(encode_subscription(&["test"], None))];
+
+        _ = s
+            .join(
+                Some("a-consumer"),
+                GROUP_ID,
+                45_000,
+                Some(300_000),
+                "",
+                None,
+                CONSUMER,
+                Some(&protocols[..]),
+                None,
+            )
+            .await?;
+
+        // The join alone must have sampled the group. Reading the memo directly
+        // rather than the log: what is under test is that the forming path
+        // observes at all, which is the hook a refactor could silently drop —
+        // and did, for the whole of beta.31 and beta.32.
+        let sampled = s
+            .rebalance_stalls
+            .lock()
+            .map(|stalls| stalls.contains_key(GROUP_ID))
+            .unwrap_or_default();
+
+        assert!(
+            sampled,
+            "a group mid-rebalance was not observed on the join path, so a consumer \
+             that never joins — and therefore never heartbeats — is invisible",
+        );
+
+        Ok(())
+    }
 
     /// #240: the stall threshold comes from the group, not from a constant.
     ///
