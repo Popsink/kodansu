@@ -2303,8 +2303,25 @@ impl DynoStore {
     /// `DeleteRecords` hides segment-resident records without touching the
     /// shared segments, so the physical region start can sit below the
     /// logical log start.
-    async fn log_start(&self, topition: &Topition) -> Result<i64> {
-        let start = self.segment_region_start(topition).await?.unwrap_or(0);
+    /// When NO segment survives, the log is empty — and an empty log starts
+    /// where it ends, so the answer is `high_watermark` (#290).
+    ///
+    /// It used to be 0, which is a false statement about what the broker holds
+    /// the moment the high watermark is above it, and the falsehood is exactly
+    /// what made a damaged partition indistinguishable from a healthy one: a
+    /// prefix advertising `LOG-START-OFFSET=0 / LOG-END-OFFSET=3024895` with
+    /// nothing readable at any offset reported 3M of lag that no consumer could
+    /// ever retire. Reporting the log end instead collapses that lag to zero,
+    /// which is what makes the gap visible through ordinary metadata rather than
+    /// by probing every offset by hand.
+    ///
+    /// A fully expired log lands in the same place, correctly: retention removes
+    /// every segment, so its start becomes its end and it reports empty.
+    async fn log_start(&self, topition: &Topition, high_watermark: i64) -> Result<i64> {
+        let start = self
+            .segment_region_start(topition)
+            .await?
+            .unwrap_or(high_watermark);
 
         Ok(start.max(self.truncate_floor(topition).await?))
     }
@@ -4312,11 +4329,20 @@ impl DynoStore {
 
         // The oldest segment's base for this sub-stream, from the index (#179: the
         // legacy region that used to hold lower offsets can no longer exist).
-        Ok(self
-            .segment_region_start(topition)
-            .await?
-            .unwrap_or(0)
-            .max(floor))
+        //
+        // With no segment the log is empty and EARLIEST is the log end, not 0
+        // (#290) — see [`Self::log_start`] for why the 0 was worth removing.
+        // This is the site a client actually reads: `LOG-START-OFFSET` comes
+        // from ListOffsets EARLIEST, so it is where the false start offset
+        // became visible as unretireable lag.
+        let start = match self.segment_region_start(topition).await? {
+            Some(base) => base,
+            // Paid only when there is no segment, so a healthy EARLIEST keeps
+            // its request profile.
+            None => self.high_watermark(topition).await?,
+        };
+
+        Ok(start.max(floor))
     }
 
     /// The newest record timestamp for a PURE-segment sub-stream (#73), from the
@@ -7967,10 +7993,12 @@ impl Storage for DynoStore {
         // with zero per-partition requests, off the meta-object throttle ceiling
         // entirely.
         let high_watermark = self.high_watermark(topition).await?;
+        // No segment means an empty log, whose start is its end (#290) — see
+        // [`Self::log_start`], which this mirrors on the read-uncommitted path.
         let log_start = self
             .segment_region_start(topition)
             .await?
-            .unwrap_or(0)
+            .unwrap_or(high_watermark)
             .max(self.cached_truncate(topition)?.unwrap_or(0));
 
         Ok(OffsetStage {
@@ -8053,7 +8081,7 @@ impl Storage for DynoStore {
         // `high_watermark`).
         let high_watermark = self.high_watermark(topition).await?;
 
-        let log_start = self.log_start(topition).await?;
+        let log_start = self.log_start(topition, high_watermark).await?;
         let last_stable = stable.get(topition).copied().unwrap_or(high_watermark);
 
         // Keep aborted transactions whose records are still in the log (last

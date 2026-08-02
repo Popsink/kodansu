@@ -136,9 +136,15 @@ async fn retention_ms_expires_old_records() -> Result<(), Error> {
 
     assert_eq!(0, fetch_len(&storage, &topition).await?);
 
-    // the partition reports an empty log
+    // the partition reports an empty log — its start IS its end (#290). This
+    // used to assert 0, which said the log began three records before it ended
+    // while holding none of them: three records of lag no consumer could ever
+    // retire, and the same false statement a partition whose segments were lost
+    // makes. An empty log and a damaged one were indistinguishable through
+    // ordinary metadata precisely because of it.
     let stage = storage.offset_stage(&topition).await?;
-    assert_eq!(0, stage.log_start());
+    assert_eq!(stage.high_watermark(), stage.log_start());
+    assert_eq!(3, stage.log_start());
 
     Ok(())
 }
