@@ -682,6 +682,67 @@ async fn an_advertised_but_unbacked_offset_with_no_index_entry_is_not_reported()
     Ok(())
 }
 
+/// A partition with no surviving segment reports a log that starts where it
+/// ends, through both offset paths (#290).
+///
+/// This is the other half of the report, and the half a detector cannot reach:
+/// production advertised
+/// `LOG-START-OFFSET=0 / LOG-END-OFFSET=3024895` on a prefix that served
+/// nothing at any offset, so every lag computation downstream inherited 3M of
+/// backlog that no consumer could retire. The start offset was the false
+/// statement — the broker does not hold a record at 0 — and correcting it is
+/// what makes the gap visible through ordinary metadata instead of by probing
+/// offsets by hand.
+///
+/// It is also what tells an empty log from a damaged one at all: before this,
+/// both said "starts at 0, ends at N" while holding nothing.
+#[tokio::test]
+async fn a_partition_with_no_segment_starts_where_it_ends() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
+
+    let topic = "org.env.conn.tab_unbacked";
+    create_topic(&store, topic).await?;
+
+    let tp = Topition::new(topic, 0);
+
+    _ = bucket
+        .put_opts(
+            &Path::from(format!(
+                "clusters/{CLUSTER}/topics/{topic}/partitions/{:0>10}/watermark.json",
+                0
+            )),
+            PutPayload::from_static(br#"{"high":3024895}"#),
+            PutOptions::default(),
+        )
+        .await?;
+
+    let reader = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    assert_eq!(3024895, reader.high_watermark(&tp).await?);
+
+    // ListOffsets EARLIEST — the `LOG-START-OFFSET` a client actually prints,
+    // and where the 3M of phantom lag came from.
+    assert_eq!(
+        3024895,
+        earliest(&reader, &tp).await?,
+        "an empty log's earliest offset is its end, not 0",
+    );
+
+    // Both offset-stage paths agree: read-uncommitted (the consumer hot path,
+    // index-derived) and the transaction-aware one.
+    let uncommitted = reader
+        .offset_stage_at(&tp, IsolationLevel::ReadUncommitted)
+        .await?;
+    assert_eq!(uncommitted.high_watermark(), uncommitted.log_start());
+
+    let committed = reader
+        .offset_stage_at(&tp, IsolationLevel::ReadCommitted)
+        .await?;
+    assert_eq!(committed.high_watermark(), committed.log_start());
+
+    Ok(())
+}
+
 async fn fetch_from(store: &DynoStore, tp: &Topition, offset: i64) -> Result<Vec<deflated::Batch>> {
     store
         .fetch(
