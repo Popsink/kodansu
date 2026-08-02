@@ -5644,16 +5644,50 @@ impl DynoStore {
         };
 
         let mut objects: BTreeMap<u64, Bytes> = BTreeMap::new();
+        let mut vanished: Vec<u64> = Vec::new();
         for seq in &run {
-            let object = self
+            match self
                 .object_store
                 .get(&self.segment_location(prefix, *seq))
                 .await
-                .inspect_err(|err| error!(?err, prefix, seq))?
-                .bytes()
-                .await
-                .map_err(Error::from)?;
-            _ = objects.insert(*seq, object);
+            {
+                Ok(result) => {
+                    _ = objects.insert(*seq, result.bytes().await.map_err(Error::from)?);
+                }
+
+                // A ghost index entry, not an error (#274 — the compaction half
+                // of the race #191 fixed on the refresh path). The incremental
+                // refresh is add-only, so a replica that indexed this prefix
+                // before a peer compacted it holds entries below its own cursor
+                // permanently; run selection picks the oldest segments, which
+                // are exactly those. Treating the 404 as fatal aborted the pass
+                // while the claim had already stamped `maintained_at_ms`, so
+                // peers skipped the prefix for the whole recency window and its
+                // segment count grew unbounded, with nothing reporting it.
+                Err(object_store::Error::NotFound { .. }) => {
+                    SEGMENT_VANISHED_BEFORE_READ.add(1, &[]);
+                    debug!(
+                        prefix,
+                        seq, "segment deleted before compaction could read it; pruning"
+                    );
+                    vanished.push(*seq);
+                }
+
+                Err(err) => {
+                    error!(?err, prefix, seq);
+                    return Err(Error::from(err));
+                }
+            }
+        }
+
+        // Prune what is gone and re-list, then yield the tick. Sequence names
+        // are never reused (#77), so dropping a 404'd sequence is permanent and
+        // correct; the next pass selects its run from an index that no longer
+        // holds ghosts.
+        if !vanished.is_empty() {
+            self.index_prune(prefix, &vanished)?;
+            self.index_invalidate(prefix)?;
+            return Ok(0);
         }
 
         // Merge the EPOCH-FENCED view (#66 review fix, critical): rebuild each
@@ -5833,16 +5867,39 @@ impl DynoStore {
         // (dedicated prefix), so whole objects beat per-sub-stream ranged GETs
         // once the topic has more than one partition.
         let mut objects: BTreeMap<u64, Bytes> = BTreeMap::new();
+        let mut vanished: Vec<u64> = Vec::new();
         for seq in segments_meta.keys() {
-            let object = self
+            match self
                 .object_store
                 .get(&self.segment_location(prefix, *seq))
                 .await
-                .inspect_err(|err| error!(?err, prefix, seq))?
-                .bytes()
-                .await
-                .map_err(Error::from)?;
-            _ = objects.insert(*seq, object);
+            {
+                Ok(result) => {
+                    _ = objects.insert(*seq, result.bytes().await.map_err(Error::from)?);
+                }
+
+                // As the size merge above (#274): a ghost index entry left by a
+                // peer's compaction, not a failure.
+                Err(object_store::Error::NotFound { .. }) => {
+                    SEGMENT_VANISHED_BEFORE_READ.add(1, &[]);
+                    debug!(
+                        prefix,
+                        seq, "segment deleted before compaction could read it; pruning"
+                    );
+                    vanished.push(*seq);
+                }
+
+                Err(err) => {
+                    error!(?err, prefix, seq);
+                    return Err(Error::from(err));
+                }
+            }
+        }
+
+        if !vanished.is_empty() {
+            self.index_prune(prefix, &vanished)?;
+            self.index_invalidate(prefix)?;
+            return Ok(0);
         }
 
         // Per-key transform over the EPOCH-FENCED view (as the size merge): a
