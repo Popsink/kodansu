@@ -31,6 +31,7 @@ mod latency;
 mod metadata_visibility;
 mod offset_assignment;
 mod prefix_coalesce;
+mod reachable_panics;
 mod scaling;
 mod segment;
 
