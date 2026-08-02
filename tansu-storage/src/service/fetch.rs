@@ -148,6 +148,10 @@ impl FetchService {
 
         let mut batches = Vec::new();
 
+        // Set when storage reports this partition unservable (#290), so the
+        // failure lands on this partition's response instead of the request's.
+        let mut error_code = ErrorCode::None;
+
         let mut offset = fetch_partition.fetch_offset;
 
         loop {
@@ -157,7 +161,7 @@ impl FetchService {
 
             debug!(offset);
 
-            let mut fetched = ctx
+            let fetched = ctx
                 .state()
                 .fetch(
                     &tp,
@@ -168,8 +172,29 @@ impl FetchService {
                     max_wait.saturating_sub(started_at.elapsed()),
                 )
                 .await
-                .inspect(|r| debug!(?tp, ?offset, ?r))
-                .inspect_err(|error| error!(?tp, ?error))?;
+                .inspect(|r| debug!(?tp, ?offset, ?r));
+
+            // A partition the broker cannot serve fails *that partition* (#290).
+            //
+            // Propagating would fail the whole `Fetch`, and a fetch carries every
+            // partition a consumer is assigned — which is the amplification the
+            // issue is about: 168 damaged partitions stopped delivery on the 250
+            // healthy ones sharing the same `poll()`. Answering per partition lets
+            // the client see the error, apply its own policy, and keep consuming
+            // everything else.
+            let mut fetched = match fetched {
+                Ok(fetched) => fetched,
+
+                Err(Error::Api(code)) => {
+                    error_code = code;
+                    break;
+                }
+
+                Err(error) => {
+                    error!(?tp, ?error);
+                    return Err(error);
+                }
+            };
 
             *max_bytes =
                 u32::try_from(fetched.byte_size()).map(|bytes| max_bytes.saturating_sub(bytes))?;
@@ -230,7 +255,7 @@ impl FetchService {
 
         Ok(PartitionData::default()
             .partition_index(partition_index)
-            .error_code(ErrorCode::None.into())
+            .error_code(error_code.into())
             .high_watermark(offset_stage.high_watermark())
             .last_stable_offset(Some(offset_stage.last_stable()))
             .log_start_offset(Some(offset_stage.log_start()))
