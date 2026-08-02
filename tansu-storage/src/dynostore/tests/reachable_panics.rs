@@ -223,9 +223,9 @@ fn alter_configs_append_and_subtract_are_refused() {
 
         match metadata.alter_configs(&[change]) {
             Err(Error::Api(code)) => assert_eq!(ErrorCode::InvalidConfig, code),
-            otherwise => panic!(
-                "expected InvalidConfig for config_operation {operation}, got {otherwise:?}"
-            ),
+            otherwise => {
+                panic!("expected InvalidConfig for config_operation {operation}, got {otherwise:?}")
+            }
         }
     }
 }
