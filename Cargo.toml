@@ -157,6 +157,20 @@ url = { version = "2.5.4", features = ["serde"] }
 uuid = { version = "1.20.0", features = ["serde", "v4", "v5", "v7"] }
 zstd = "0.13.2"
 
+# `test` inherits this, so it is what every `cargo nextest run` pays.
+#
+# Full debuginfo is generated per codegen unit and then linked into each test
+# binary, and `tansu-storage` alone has 26 integration-test targets — so a
+# one-line edit to a unit test relinks 27 binaries carrying it. Line tables keep
+# what a failing test actually reads (file and line in the backtrace, which is
+# what nextest prints) and drop what needs a debugger attached to be of use
+# (local variables, types, lexical scopes).
+#
+# `profiling` and `release` are untouched: `profiling` sets `debug = true`
+# explicitly for exactly the case that wants the rest.
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 codegen-units = 1
 lto = "thin"
