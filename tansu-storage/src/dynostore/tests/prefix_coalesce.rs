@@ -478,41 +478,38 @@ async fn a_recreated_topic_inherits_nothing_from_a_shared_segment() -> Result<()
 /// it off a healthy log.
 #[tokio::test]
 async fn a_fetch_that_cannot_be_served_fails_rather_than_hanging() -> Result<(), Error> {
-    /// Once armed, serves every segment record read from the FIRST region it
-    /// ever saw, wherever the index actually pointed.
+    /// Once armed, truncates every segment record read to fewer bytes than a
+    /// batch header needs.
     ///
-    /// That is #290's second hypothesis made concrete: the index keeps claiming
-    /// a range of offsets while the bytes behind them belong to an earlier
-    /// region. Those batches all sit below the requested offset, so the
-    /// whole-batch skip drops every one and the read comes back empty against an
-    /// index that still says the records are there.
+    /// `decode_frame` wants `size_of::<i64>() + size_of::<i32>()` bytes before
+    /// it will consider a batch at all, so a shorter region decodes to no
+    /// batches and the read comes back empty — while the index goes on claiming
+    /// the offsets. That is the pairing under test: metadata saying the records
+    /// are here, against a read that produces none of them, which is what #290's
+    /// "present but unreachable" looks like from the read path.
     ///
-    /// Footer reads use a suffix range and are left alone, so the index stays
-    /// intact — which is the condition under test.
-    /// The first segment record read observed: where it was, and which bytes.
-    type FirstRegion = Arc<Mutex<Option<(Path, std::ops::Range<u64>)>>>;
-
+    /// Footer reads use a suffix range and are left alone, so the index is built
+    /// normally and keeps its claim.
     #[derive(Clone)]
-    struct RedirectRecordReads<O> {
+    struct TruncateRecordReads<O> {
         inner: O,
-        first: FirstRegion,
         armed: Arc<AtomicBool>,
     }
 
-    impl<O> Debug for RedirectRecordReads<O> {
+    impl<O> Debug for TruncateRecordReads<O> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("RedirectRecordReads").finish()
+            f.debug_struct("TruncateRecordReads").finish()
         }
     }
 
-    impl<O> Display for RedirectRecordReads<O> {
+    impl<O> Display for TruncateRecordReads<O> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("RedirectRecordReads").finish()
+            f.debug_struct("TruncateRecordReads").finish()
         }
     }
 
     #[async_trait]
-    impl<O> ObjectStore for RedirectRecordReads<O>
+    impl<O> ObjectStore for TruncateRecordReads<O>
     where
         O: ObjectStore,
     {
@@ -541,27 +538,14 @@ async fn a_fetch_that_cannot_be_served_fails_rather_than_hanging() -> Result<(),
             // Only bounded record-range reads of a segment are touched. Footer
             // reads use a suffix range, so the index is built normally.
             if let Some(GetRange::Bounded(ref range)) = options.range
+                && self.armed.load(Relaxed)
                 && location.as_ref().contains("/segments/")
             {
-                let redirect = self.first.lock().expect("poison").clone();
-
-                match redirect {
-                    Some((first_location, first_range)) if self.armed.load(Relaxed) => {
-                        let mut options = options;
-                        options.range = Some(GetRange::Bounded(first_range));
-                        return self.inner.get_opts(&first_location, options).await;
-                    }
-
-                    None => {
-                        _ = self
-                            .first
-                            .lock()
-                            .expect("poison")
-                            .replace((location.clone(), range.clone()));
-                    }
-
-                    Some(_) => {}
-                }
+                // Short of a batch header, and non-empty so the range stays
+                // valid: `decode_frame` stops before the first batch.
+                let mut options = options.clone();
+                options.range = Some(GetRange::Bounded(range.start..range.start + 4));
+                return self.inner.get_opts(location, options).await;
             }
 
             self.inner.get_opts(location, options).await
@@ -609,54 +593,51 @@ async fn a_fetch_that_cannot_be_served_fails_rather_than_hanging() -> Result<(),
     let bucket = InMemory::new();
     let armed = Arc::new(AtomicBool::new(false));
 
-    // One batch per segment, so the two produces below land in distinct
-    // segments and the second can be pointed at the first.
     let store = DynoStore::new(
         CLUSTER,
         NODE,
-        RedirectRecordReads {
+        TruncateRecordReads {
             inner: bucket.clone(),
-            first: Arc::new(Mutex::new(None)),
             armed: armed.clone(),
         },
-    )
-    .coalesce_tuning(CoalesceTuning {
-        coalesce_batches: Some(1),
-        ..Default::default()
-    });
+    );
 
     let topic = "org.env.conn.tab_orphaned";
     create_topic(&store, topic).await?;
 
     let tp = Topition::new(topic, 0);
 
-    // Segment one holds [0, 4). Reading it teaches the store's wrapper which
-    // region to replay, and proves the partition is healthy to begin with.
+    // Real records in a real segment, with a real index entry claiming [0, 4).
     assert_eq!(0, store.produce(None, &tp, batch(4)?).await?);
-    assert_eq!(4, record_count(&fetch_from(&store, &tp, 0).await?));
+    assert_eq!(4, store.high_watermark(&tp).await?);
+    assert_eq!(
+        4,
+        record_count(&fetch_from(&store, &tp, 0).await?),
+        "the partition is healthy before the region stops producing",
+    );
 
-    // Segment two holds [4, 8), and the index says so.
-    assert_eq!(4, store.produce(None, &tp, batch(4)?).await?);
-    assert_eq!(8, store.high_watermark(&tp).await?);
-
-    // From here the bytes behind segment two are segment one's — offsets [0, 4),
-    // every one below the offsets the index claims for it.
+    // The bytes behind the index entry stop yielding batches. The entry itself
+    // is untouched, so the broker goes on advertising [0, 4).
     armed.store(true, Relaxed);
 
-    let outcome = tokio::time::timeout(Duration::from_secs(30), fetch_from(&store, &tp, 4))
-        .await
-        .map_err(|_| {
-            Error::Message(String::from(
-                "the fetch never returned: a consumer here polls forever",
-            ))
-        })?;
+    // Head and tail, as the report probed them.
+    for offset in [0, 3] {
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(30), fetch_from(&store, &tp, offset))
+                .await
+                .map_err(|_| {
+                    Error::Message(format!(
+                        "fetch at offset {offset} never returned: a consumer here polls forever"
+                    ))
+                })?;
 
-    assert!(
-        matches!(outcome, Err(Error::Api(ErrorCode::OffsetOutOfRange))),
-        "offset 4 is advertised and the index claims a segment holds it, but the \
-         segment produces none of it — the fetch must say so rather than answer \
-         empty; got {outcome:?}",
-    );
+        assert!(
+            matches!(outcome, Err(Error::Api(ErrorCode::OffsetOutOfRange))),
+            "offset {offset} is advertised and the index claims a segment holds it, \
+             but the segment produces none of it — the fetch must say so rather \
+             than answer empty; got {outcome:?}",
+        );
+    }
 
     Ok(())
 }
