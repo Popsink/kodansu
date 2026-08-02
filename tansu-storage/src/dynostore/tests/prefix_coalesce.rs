@@ -489,10 +489,13 @@ async fn a_fetch_that_cannot_be_served_fails_rather_than_hanging() -> Result<(),
     ///
     /// Footer reads use a suffix range and are left alone, so the index stays
     /// intact — which is the condition under test.
+    /// The first segment record read observed: where it was, and which bytes.
+    type FirstRegion = Arc<Mutex<Option<(Path, std::ops::Range<u64>)>>>;
+
     #[derive(Clone)]
     struct RedirectRecordReads<O> {
         inner: O,
-        first: Arc<Mutex<Option<(Path, std::ops::Range<u64>)>>>,
+        first: FirstRegion,
         armed: Arc<AtomicBool>,
     }
 
