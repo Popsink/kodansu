@@ -453,6 +453,75 @@ async fn a_recreated_topic_inherits_nothing_from_a_shared_segment() -> Result<()
     Ok(())
 }
 
+/// #290: a fetch the broker cannot serve must fail, bounded, rather than
+/// answering empty and leaving the consumer polling forever.
+///
+/// Production had a prefix whose metadata advertised 3M records and served none
+/// of them at any offset, head or tail. Because a fetch that finds nothing
+/// returns an empty response rather than an error, the consumer could not tell
+/// it from "no new data" — so it polled indefinitely, and since `poll()` covers
+/// a whole assignment, 250 healthy partitions were starved alongside the 168
+/// damaged ones. 25.6M records of advertised backlog sat unreadable with no
+/// signal anywhere.
+///
+/// Reproduced here by persisting a watermark whose high offset is beyond
+/// anything the segments hold, which is what metadata outliving its data looks
+/// like. What is pinned is that the fetch returns, and that it returns an
+/// error: an empty answer here is indistinguishable from "caught up", which is
+/// the silence that let this run unnoticed. The accompanying `warn!` and
+/// `tansu_fetch_unservable` make the same fact visible to an operator.
+#[tokio::test]
+async fn a_fetch_that_cannot_be_served_fails_rather_than_hanging() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
+
+    let topic = "org.env.conn.tab_orphaned";
+    create_topic(&store, topic).await?;
+
+    let tp = Topition::new(topic, 0);
+
+    // Metadata says 3M records exist. Nothing was ever produced, so no segment
+    // backs any of them.
+    _ = bucket
+        .put_opts(
+            &Path::from(format!(
+                "clusters/{CLUSTER}/topics/{topic}/partitions/{:0>10}/watermark.json",
+                0
+            )),
+            PutPayload::from_static(br#"{"high":3024895}"#),
+            PutOptions::default(),
+        )
+        .await?;
+
+    let reader = DynoStore::new(CLUSTER, NODE, bucket.clone());
+
+    assert_eq!(
+        3024895,
+        reader.high_watermark(&tp).await?,
+        "the broker advertises the records",
+    );
+
+    // Head and tail, as the report probed them.
+    for offset in [0, 3024894] {
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(5), fetch_from(&reader, &tp, offset))
+                .await
+                .map_err(|_| {
+                    Error::Message(format!(
+                        "fetch at offset {offset} never returned: a consumer here polls forever"
+                    ))
+                })?;
+
+        assert!(
+            matches!(outcome, Err(Error::Api(ErrorCode::OffsetOutOfRange))),
+            "offset {offset} is advertised but unservable, so the fetch must say so \
+             rather than answer empty; got {outcome:?}",
+        );
+    }
+
+    Ok(())
+}
+
 async fn fetch_from(store: &DynoStore, tp: &Topition, offset: i64) -> Result<Vec<deflated::Batch>> {
     store
         .fetch(

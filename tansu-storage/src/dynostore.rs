@@ -560,6 +560,25 @@ const SEGMENT_READ_TRACE_OBJECTS: usize = 1_024;
 /// overstate what any cache could serve.
 const SEGMENT_READ_TRACE_TTL: Duration = Duration::from_secs(60);
 
+/// Fetches the broker advertised but could not serve (#290).
+///
+/// Incremented when a fetch below the high watermark, above the truncation
+/// floor, returns nothing after its long-poll window has elapsed. That
+/// combination is the broker stating records exist at an offset and then
+/// producing none of them — metadata that outlived its segments.
+///
+/// Expected to be zero. A client cannot tell this from "no new data", so it
+/// polls forever: production had 25.6M records of advertised backlog unreadable
+/// across 168 partitions with no signal anywhere, and because `poll()` covers a
+/// whole assignment, the 250 healthy partitions on the same consumer were
+/// starved with them.
+static FETCH_UNSERVABLE: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_fetch_unservable")
+        .with_description("fetches below the high watermark that returned no records")
+        .build()
+});
+
 /// Ranged GETs of segment *record* bytes on the fetch path (#117) — the
 /// tier-2 requests a consumer-side cache would target. Footer GETs are already
 /// served from the in-memory index and are not counted here.
@@ -7702,6 +7721,62 @@ impl Storage for DynoStore {
                     max_wait,
                 )
                 .await?;
+
+            // Advertised, and not served (#290).
+            //
+            // We are strictly below the high watermark and at or above the
+            // truncation floor, so the broker has just claimed records exist
+            // here — and the long-poll window has elapsed without producing one.
+            // The claim is false: the segments backing these offsets are missing
+            // or unreadable, which is what metadata outliving its data looks like
+            // from the read path.
+            //
+            // Answered with `OffsetOutOfRange`, which a consumer resolves via
+            // `auto.offset.reset`. That can skip a real backlog, so it is only
+            // reached once the transient reading — this replica's index lagging a
+            // peer's write — has been ruled out by the forced refresh below. The
+            // alternative, `KafkaStorageError`, is retriable and would put the
+            // consumer back in the poll loop this exists to break.
+            if batches.is_empty() {
+                // One forced index refresh before calling it: the benign version
+                // of an empty answer here is this replica's segment view lagging
+                // a peer's very recent write, and that resolves by observing the
+                // live set. Only the offsets that survive a current index are
+                // genuinely unbacked. It costs a LIST, paid only on a fetch that
+                // already found nothing it was told to find.
+                self.refresh_prefix_index_forced(&self.routed_prefix_of(topition).await?)
+                    .await?;
+
+                if self
+                    .fetch_prefix_coalesced(
+                        topition,
+                        offset,
+                        max_bytes,
+                        high_watermark,
+                        started_at,
+                        Duration::ZERO,
+                    )
+                    .await?
+                    .is_empty()
+                {
+                    FETCH_UNSERVABLE.add(1, &[]);
+
+                    warn!(
+                        topic = topition.topic(),
+                        partition = topition.partition(),
+                        offset,
+                        high_watermark,
+                        "advertised records could not be served: no segment covers this offset (#290)"
+                    );
+
+                    // Reported as an API error so the caller can put it on THIS
+                    // partition. It must not escape as a request-level failure:
+                    // the complaint in #290 is that one damaged partition kills
+                    // a whole consumer, and failing the fetch outright would do
+                    // exactly that to the healthy partitions sharing it.
+                    return Err(Error::Api(ErrorCode::OffsetOutOfRange));
+                }
+            }
         }
 
         Ok(batches)
