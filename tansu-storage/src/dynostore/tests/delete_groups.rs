@@ -43,7 +43,9 @@ fn group_prefix_refuses_ids_that_normalise_to_the_root() {
     }
 
     // A real id still yields the prefix that holds only that group.
-    let prefix = store.group_prefix("group-a").expect("a real id has a prefix");
+    let prefix = store
+        .group_prefix("group-a")
+        .expect("a real id has a prefix");
     assert_eq!(
         format!("clusters/{CLUSTER}/groups/consumers/group-a"),
         prefix.as_ref()

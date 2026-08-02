@@ -135,9 +135,8 @@ async fn empty_group_id_is_refused_and_keeps_committed_offsets() -> Result<(), E
             .into_layer(DeleteGroupsService)
             .serve(
                 Context::default(),
-                DeleteGroupsRequest::default().groups_names(Some(
-                    refused.iter().map(|group| (*group).into()).collect(),
-                )),
+                DeleteGroupsRequest::default()
+                    .groups_names(Some(refused.iter().map(|group| (*group).into()).collect())),
             )
             .await?
     };
