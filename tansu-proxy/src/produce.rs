@@ -635,12 +635,19 @@ fn combine(batches: Vec<deflated::Batch>) -> Result<Vec<deflated::Batch>, Error>
             for batch in i {
                 let batch = inflated::Batch::try_from(batch)?;
 
+                // `last_offset_delta` is `N - 1` for `N` records, so appending
+                // starts one past it — both of these need the `+ 1`. Without
+                // it, merging two single-record batches (each with
+                // `last_offset_delta == 0`) produced a batch whose two records
+                // both carried `offset_delta == 0`, under a header still
+                // declaring `last_offset_delta == 0` (#281). The authoritative
+                // copy in `tansu_storage::batch::combine` has always had it.
                 sink.records.append(
                     &mut batch
                         .records
                         .into_iter()
                         .map(|record| Record {
-                            offset_delta: record.offset_delta + sink.last_offset_delta,
+                            offset_delta: record.offset_delta + sink.last_offset_delta + 1,
                             timestamp_delta: record.timestamp_delta
                                 + (sink.base_timestamp - batch.base_timestamp),
                             ..record
@@ -648,7 +655,7 @@ fn combine(batches: Vec<deflated::Batch>) -> Result<Vec<deflated::Batch>, Error>
                         .collect::<Vec<_>>(),
                 );
 
-                sink.last_offset_delta += batch.last_offset_delta;
+                sink.last_offset_delta += batch.last_offset_delta + 1;
                 sink.max_timestamp = sink.max_timestamp.max(batch.max_timestamp);
             }
 
@@ -851,6 +858,123 @@ mod tests {
                 .into(),
             ))
         })
+    }
+
+    /// A batch holding one record per value, with `last_offset_delta` set to
+    /// `N - 1` the way a real producer sets it on the wire — `build()` does not
+    /// derive it from the record count.
+    fn batch_of(values: &[&'static [u8]]) -> Result<deflated::Batch, Error> {
+        let mut builder = inflated::Batch::builder()
+            .base_timestamp(1_234_567_890 * 1_000)
+            .max_timestamp(1_234_567_890 * 1_000)
+            .last_offset_delta(values.len() as i32 - 1);
+
+        for (offset_delta, value) in values.iter().enumerate() {
+            builder = builder.record(
+                Record::builder()
+                    .value(Bytes::from_static(value).into())
+                    .offset_delta(offset_delta as i32),
+            );
+        }
+
+        builder
+            .build()
+            .and_then(deflated::Batch::try_from)
+            .map_err(Into::into)
+    }
+
+    /// The contract a merged batch owes the broker: every record's
+    /// `offset_delta` is its own index — contiguous from zero, and unique — and
+    /// the header's `last_offset_delta` agrees with the record count.
+    fn assert_contiguous(combined: &inflated::Batch) {
+        for (index, record) in combined.records.iter().enumerate() {
+            assert_eq!(
+                index as i32, record.offset_delta,
+                "offset_delta at index {index}"
+            );
+        }
+
+        assert_eq!(
+            combined.records.len() as i32 - 1,
+            combined.last_offset_delta,
+            "last_offset_delta must be one less than the record count"
+        );
+    }
+
+    /// #281 in its smallest form: two single-record batches, each carrying
+    /// `last_offset_delta == 0`.
+    ///
+    /// Without the `+ 1`, both records came out with `offset_delta == 0` under a
+    /// header still declaring `last_offset_delta == 0` while holding two records
+    /// — duplicate deltas and a header/record-count mismatch, handed downstream
+    /// to the broker. The proxy's own tests never caught it because they only
+    /// ever built single-record batches and never asserted a merged delta.
+    #[test]
+    fn combine_two_single_record_batches_is_contiguous() -> Result<(), Error> {
+        let _guard = init_tracing()?;
+
+        let mut combined = combine(vec![record_data_batch(b"a")?, record_data_batch(b"b")?])?;
+        assert_eq!(1, combined.len());
+
+        let combined = inflated::Batch::try_from(combined.remove(0))?;
+
+        assert_eq!(2, combined.records.len());
+        assert_eq!(Some(Bytes::from_static(b"a")), combined.records[0].value);
+        assert_eq!(Some(Bytes::from_static(b"b")), combined.records[1].value);
+        assert_contiguous(&combined);
+
+        Ok(())
+    }
+
+    /// The same across batches of differing sizes, where the missing `+ 1`
+    /// compounds: each merge started one short of where the previous one ended.
+    #[test]
+    fn combine_multi_record_batches_is_contiguous() -> Result<(), Error> {
+        let _guard = init_tracing()?;
+
+        let mut combined = combine(vec![
+            batch_of(&[b"a", b"b", b"c"])?,
+            batch_of(&[b"d", b"e"])?,
+            batch_of(&[b"f"])?,
+        ])?;
+        assert_eq!(1, combined.len());
+
+        let combined = inflated::Batch::try_from(combined.remove(0))?;
+
+        assert_eq!(6, combined.records.len());
+        assert_contiguous(&combined);
+
+        // Order and payloads survive the merge.
+        assert_eq!(
+            [b"a", b"b", b"c", b"d", b"e", b"f"]
+                .into_iter()
+                .map(|value| Some(Bytes::from_static(value)))
+                .collect::<Vec<_>>(),
+            combined
+                .records
+                .iter()
+                .map(|record| record.value.clone())
+                .collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
+    /// Fewer than two batches is a pass-through: nothing to renumber.
+    #[test]
+    fn combine_leaves_a_lone_batch_alone() -> Result<(), Error> {
+        let _guard = init_tracing()?;
+
+        assert!(combine(vec![])?.is_empty());
+
+        let mut combined = combine(vec![batch_of(&[b"a", b"b"])?])?;
+        assert_eq!(1, combined.len());
+
+        let combined = inflated::Batch::try_from(combined.remove(0))?;
+        assert_eq!(2, combined.records.len());
+        assert_contiguous(&combined);
+
+        Ok(())
     }
 
     #[tokio::test(start_paused = true)]
