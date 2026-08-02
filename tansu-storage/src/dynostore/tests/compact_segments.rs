@@ -26,12 +26,19 @@
 
 use std::{
     collections::BTreeSet,
+    fmt::{self, Debug, Display},
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 
+use async_trait::async_trait;
 use bytes::Bytes;
-use futures::TryStreamExt as _;
-use object_store::{ObjectStore as _, ObjectStoreExt as _, memory::InMemory, path::Path};
+use futures::{TryStreamExt as _, stream::BoxStream};
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    ObjectStoreExt as _, PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory,
+    path::Path,
+};
 use rama::{Context, Service as _};
 use tansu_sans_io::{
     Compression, ErrorCode, FetchRequest, IsolationLevel, ListOffset, OpType,
@@ -811,4 +818,188 @@ fn dependent_lz4(independent: &Bytes) -> Result<Bytes, Error> {
     result.map_err(Error::from)?;
 
     Ok(Bytes::from(buffer))
+}
+
+/// Lists a segment normally but answers its GET with `NotFound`, and only once
+/// armed — so an index can be warmed against the real object first, which is
+/// what puts a cached entry in front of an unreadable object.
+#[derive(Clone)]
+struct VanishOnGetWhenArmed<O> {
+    inner: O,
+    vanished: Arc<Mutex<Option<Path>>>,
+}
+
+impl<O> Debug for VanishOnGetWhenArmed<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VanishOnGetWhenArmed").finish()
+    }
+}
+
+impl<O> Display for VanishOnGetWhenArmed<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VanishOnGetWhenArmed").finish()
+    }
+}
+
+#[async_trait]
+impl<O> ObjectStore for VanishOnGetWhenArmed<O>
+where
+    O: ObjectStore,
+{
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult, object_store::Error> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> Result<GetResult, object_store::Error> {
+        if self
+            .vanished
+            .lock()
+            .expect("poison")
+            .as_ref()
+            .is_some_and(|vanished| vanished == location)
+        {
+            return Err(object_store::Error::NotFound {
+                path: location.to_string(),
+                source: "reclaimed by a peer's compaction".into(),
+            });
+        }
+
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path, object_store::Error>>,
+    ) -> BoxStream<'static, Result<Path, object_store::Error>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> Result<ListResult, object_store::Error> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: CopyOptions,
+    ) -> Result<(), object_store::Error> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+}
+
+/// A compaction pass over a prefix holding a ghost index entry must prune it and
+/// complete, not abort (#274).
+///
+/// The incremental index refresh is add-only, so a replica that indexed a prefix
+/// before a peer compacted it keeps entries below its own cursor permanently.
+/// Run selection reads that cached snapshot and picks the *oldest* segments —
+/// exactly the ghosts. Treating their 404 as fatal aborted the pass, and because
+/// the claim had already stamped `maintained_at_ms`, peers then skipped the
+/// prefix for the whole recency window: compaction silently dead for that prefix
+/// while looking like it ran, with the live segment count growing.
+///
+/// Pruning is sound because segment sequence names are never reused (#77), so a
+/// 404'd sequence is gone for good. This is the compaction half of the race #191
+/// fixed on the refresh path.
+#[tokio::test]
+async fn compaction_prunes_a_vanished_segment_instead_of_failing() -> Result<(), Error> {
+    let _guard = super::init_tracing()?;
+
+    let bucket = InMemory::new();
+    let vanished: Arc<Mutex<Option<Path>>> = Arc::new(Mutex::new(None));
+
+    let store = DynoStore::new(
+        CLUSTER,
+        NODE,
+        VanishOnGetWhenArmed {
+            inner: bucket.clone(),
+            vanished: vanished.clone(),
+        },
+    );
+
+    let topic = "org.env.conn.ghost";
+    create_topic_with_configs(&store, topic, &[("cleanup.policy", "compact")]).await?;
+    let tp = Topition::new(topic, 0);
+
+    _ = store.produce(None, &tp, keyed_batch(b"k", b"v1")?).await?;
+    _ = store.produce(None, &tp, keyed_batch(b"k", b"v2")?).await?;
+
+    // Warm the index against the real objects: this is what leaves a cached
+    // entry that can outlive the object it names.
+    _ = store.compact_prefix_per_key(topic).await?;
+
+    let seq = {
+        let index = store.prefix_index.lock().expect("poison");
+        *index
+            .get(topic)
+            .expect("the prefix is indexed")
+            .segments
+            .keys()
+            .next()
+            .expect("at least one segment")
+    };
+
+    // The peer's compaction lands: the object this process still has indexed is
+    // gone.
+    *vanished.lock().expect("poison") = Some(store.segment_location(topic, seq));
+
+    // The pass completes. Before the fix this was `Err(ObjectStore(NotFound))`,
+    // logged twice at ERROR, with the prefix left unmaintained.
+    _ = store
+        .compact_prefix_per_key(topic)
+        .await
+        .inspect_err(|err| panic!("a vanished segment must not fail the pass: {err:?}"))?;
+
+    let pruned = {
+        let index = store.prefix_index.lock().expect("poison");
+        index
+            .get(topic)
+            .is_none_or(|entry| !entry.segments.contains_key(&seq))
+    };
+    assert!(
+        pruned,
+        "the 404'd sequence must be pruned from the index, or the next pass \
+         picks the same ghost again"
+    );
+
+    // And it stays fixed: a following pass is clean too.
+    _ = store.compact_prefix_per_key(topic).await?;
+
+    Ok(())
 }
