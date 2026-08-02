@@ -572,6 +572,16 @@ const SEGMENT_READ_TRACE_TTL: Duration = Duration::from_secs(60);
 /// across 168 partitions with no signal anywhere, and because `poll()` covers a
 /// whole assignment, the 250 healthy partitions on the same consumer were
 /// starved with them.
+/// Budget for the read that confirms a fetch is unservable (#290).
+///
+/// Its own, rather than the caller's remaining long-poll window: the confirming
+/// read exists to distinguish "the records are not there" from "the first read
+/// ran out of time", and a read sharing the exhausted deadline answers empty
+/// without looking, which is the first thing that must not happen. Bounded so a
+/// fetch cannot be extended indefinitely by the check, and only ever paid on a
+/// fetch that already found nothing the index told it to find.
+const UNSERVABLE_CONFIRM_BUDGET: Duration = Duration::from_secs(5);
+
 static FETCH_UNSERVABLE: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_fetch_unservable")
@@ -4208,6 +4218,27 @@ impl DynoStore {
             .map(|(_, entry)| entry.base_offset))
     }
 
+    /// Whether the index still claims a segment holding `offset` for this
+    /// sub-stream (#290).
+    ///
+    /// This is the positive evidence the unservable check needs. Retention
+    /// removes a segment and its index entry together, so an expired region has
+    /// no covering entry and is correctly *not* reported as damage; only an
+    /// entry that claims an offset it cannot produce is.
+    fn substream_covers_offset(
+        &self,
+        prefix: &str,
+        topition: &Topition,
+        offset: i64,
+    ) -> Result<bool> {
+        Ok(self
+            .valid_substream_segments(prefix, topition.topic(), topition.partition())?
+            .iter()
+            .any(|(_, entry)| {
+                entry.base_offset <= offset && offset < entry.base_offset + entry.record_count
+            }))
+    }
+
     /// Whether `topic`'s `cleanup.policy` is `compact`, memoized for
     /// [`Self::HIGH_WATERMARK_HINT_TTL`] (#113). `produce` needs this on every
     /// batch to choose the coalesce route; the value changes only on a rare
@@ -7724,57 +7755,81 @@ impl Storage for DynoStore {
 
             // Advertised, and not served (#290).
             //
-            // We are strictly below the high watermark and at or above the
-            // truncation floor, so the broker has just claimed records exist
-            // here — and the long-poll window has elapsed without producing one.
-            // The claim is false: the segments backing these offsets are missing
-            // or unreadable, which is what metadata outliving its data looks like
-            // from the read path.
+            // Declared only on POSITIVE evidence: the index must still claim a
+            // segment covering this offset while a read that was actually given
+            // the chance to look produces nothing. Metadata saying "records are
+            // here" against a read that finds none is damage, and nothing else
+            // produces that pair.
             //
-            // Answered with `OffsetOutOfRange`, which a consumer resolves via
-            // `auto.offset.reset`. That can skip a real backlog, so it is only
-            // reached once the transient reading — this replica's index lagging a
-            // peer's write — has been ruled out by the forced refresh below. The
-            // alternative, `KafkaStorageError`, is retriable and would put the
-            // consumer back in the poll loop this exists to break.
+            // An empty answer on its own is not evidence, and treating it as
+            // evidence is what makes this dangerous. Two ordinary conditions
+            // produce one:
+            //
+            //   - retention. Expiry deletes a segment and its index entry
+            //     together, so an aged-out partition has no covering segment
+            //     while its high watermark stays put. That is the whole of a
+            //     normal expired log, and answering `OffsetOutOfRange` there
+            //     resets a healthy consumer off a log that merely aged out.
+            //   - a slow store. The long-poll window elapsing says the read ran
+            //     out of time, not that the records are absent.
+            //
+            // `OffsetOutOfRange` is resolved by the client via
+            // `auto.offset.reset`, so a false positive skips a real backlog or
+            // replays from the start — strictly worse than the hang this
+            // exists to break. Hence: evidence, or say nothing.
             if batches.is_empty() {
                 // One forced index refresh before calling it: the benign version
                 // of an empty answer here is this replica's segment view lagging
                 // a peer's very recent write, and that resolves by observing the
-                // live set. Only the offsets that survive a current index are
-                // genuinely unbacked. It costs a LIST, paid only on a fetch that
-                // already found nothing it was told to find.
-                self.refresh_prefix_index_forced(&self.routed_prefix_of(topition).await?)
-                    .await?;
+                // live set. It costs a LIST, paid only on a fetch that already
+                // found nothing it was told to find.
+                let prefix = self.routed_prefix_of(topition).await?;
+                self.refresh_prefix_index_forced(&prefix).await?;
 
-                if self
-                    .fetch_prefix_coalesced(
-                        topition,
-                        offset,
-                        max_bytes,
-                        high_watermark,
-                        started_at,
-                        Duration::ZERO,
-                    )
-                    .await?
-                    .is_empty()
-                {
-                    FETCH_UNSERVABLE.add(1, &[]);
+                // Does a current index still claim these offsets? No covering
+                // segment means the log genuinely does not hold them — expired,
+                // not damaged — and there is nothing to report.
+                if self.substream_covers_offset(&prefix, topition, offset)? {
+                    // The confirming read gets its OWN budget, deliberately.
+                    //
+                    // Sharing the caller's `started_at` made this a guaranteed
+                    // no-op: `fetch_prefix_coalesced` computes
+                    // `max_wait - started_at.elapsed()`, so a `Duration::ZERO`
+                    // budget is expired before the first segment is considered
+                    // and the loop breaks without reading anything. It returned
+                    // empty every time, for every partition, and an empty answer
+                    // from a read that never looked is not evidence of anything.
+                    let confirming = self
+                        .fetch_prefix_coalesced(
+                            topition,
+                            offset,
+                            max_bytes,
+                            high_watermark,
+                            SystemTime::now(),
+                            UNSERVABLE_CONFIRM_BUDGET,
+                        )
+                        .await?;
 
-                    warn!(
-                        topic = topition.topic(),
-                        partition = topition.partition(),
-                        offset,
-                        high_watermark,
-                        "advertised records could not be served: no segment covers this offset (#290)"
-                    );
+                    if confirming.is_empty() {
+                        FETCH_UNSERVABLE.add(1, &[]);
 
-                    // Reported as an API error so the caller can put it on THIS
-                    // partition. It must not escape as a request-level failure:
-                    // the complaint in #290 is that one damaged partition kills
-                    // a whole consumer, and failing the fetch outright would do
-                    // exactly that to the healthy partitions sharing it.
-                    return Err(Error::Api(ErrorCode::OffsetOutOfRange));
+                        warn!(
+                            topic = topition.topic(),
+                            partition = topition.partition(),
+                            offset,
+                            high_watermark,
+                            "advertised records could not be served: a segment claims this offset \
+                             but holds none of it (#290)"
+                        );
+
+                        // Reported as an API error so the caller can put it on
+                        // THIS partition. It must not escape as a request-level
+                        // failure: the complaint in #290 is that one damaged
+                        // partition kills a whole consumer, and failing the
+                        // fetch outright would do exactly that to the healthy
+                        // partitions sharing it.
+                        return Err(Error::Api(ErrorCode::OffsetOutOfRange));
+                    }
                 }
             }
         }

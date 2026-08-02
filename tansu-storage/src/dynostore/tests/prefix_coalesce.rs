@@ -33,8 +33,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{StreamExt as _, TryStreamExt as _, stream::BoxStream};
 use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    CopyOptions, GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
     memory::InMemory, path::Path,
 };
 use tansu_sans_io::{
@@ -464,47 +464,151 @@ async fn a_recreated_topic_inherits_nothing_from_a_shared_segment() -> Result<()
 /// damaged ones. 25.6M records of advertised backlog sat unreadable with no
 /// signal anywhere.
 ///
-/// Reproduced here by persisting a watermark whose high offset is beyond
-/// anything the segments hold, which is what metadata outliving its data looks
-/// like. What is pinned is that the fetch returns, and that it returns an
-/// error: an empty answer here is indistinguishable from "caught up", which is
-/// the silence that let this run unnoticed. The accompanying `warn!` and
-/// `tansu_fetch_unservable` make the same fact visible to an operator.
+/// Reproduced as the index still claiming the offsets while the segment holding
+/// them yields nothing — #290's second hypothesis, "present but unreachable
+/// because the metadata points at slices belonging to a re-created topic".
+///
+/// That pairing is the whole signal. An empty answer on its own cannot mean
+/// damage: a fully retention-expired log is *also* an advertised high watermark
+/// with no readable records (`policy_delete::retention_ms_expires_old_records`
+/// pins exactly that state, and expects an empty fetch rather than an error).
+/// The two are indistinguishable without a covering index entry, so that is what
+/// is required before anything is reported — reporting on absence alone would
+/// hand `OffsetOutOfRange` to every consumer of an aged-out partition and reset
+/// it off a healthy log.
 #[tokio::test]
 async fn a_fetch_that_cannot_be_served_fails_rather_than_hanging() -> Result<(), Error> {
+    /// Serves a segment's record bytes as an empty body once armed, leaving the
+    /// footer reads that build the index alone. The index keeps claiming the
+    /// offsets; the data behind them produces nothing.
+    #[derive(Clone)]
+    struct HollowRecordReads<O> {
+        inner: O,
+        armed: Arc<AtomicBool>,
+    }
+
+    impl<O> Debug for HollowRecordReads<O> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("HollowRecordReads").finish()
+        }
+    }
+
+    impl<O> Display for HollowRecordReads<O> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("HollowRecordReads").finish()
+        }
+    }
+
+    #[async_trait]
+    impl<O> ObjectStore for HollowRecordReads<O>
+    where
+        O: ObjectStore,
+    {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> Result<PutResult, object_store::Error> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> Result<GetResult, object_store::Error> {
+            // Only the bounded record-range reads go hollow. Footer reads use a
+            // suffix range, so the index stays intact and keeps claiming the
+            // offsets — which is the condition under test.
+            if self.armed.load(Relaxed)
+                && matches!(options.range, Some(GetRange::Bounded(_)))
+                && location.as_ref().contains("/segments/")
+            {
+                let mut options = options;
+                options.range = Some(GetRange::Bounded(0..0));
+                return self.inner.get_opts(location, options).await;
+            }
+
+            self.inner.get_opts(location, options).await
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, Result<Path, object_store::Error>>,
+        ) -> BoxStream<'static, Result<Path, object_store::Error>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+            self.inner.list(prefix)
+        }
+
+        fn list_with_offset(
+            &self,
+            prefix: Option<&Path>,
+            offset: &Path,
+        ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+            self.inner.list_with_offset(prefix, offset)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> Result<ListResult, object_store::Error> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            opts: CopyOptions,
+        ) -> Result<(), object_store::Error> {
+            self.inner.copy_opts(from, to, opts).await
+        }
+    }
+
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    let armed = Arc::new(AtomicBool::new(false));
+
+    let store = DynoStore::new(
+        CLUSTER,
+        NODE,
+        HollowRecordReads {
+            inner: bucket.clone(),
+            armed: armed.clone(),
+        },
+    );
 
     let topic = "org.env.conn.tab_orphaned";
     create_topic(&store, topic).await?;
 
     let tp = Topition::new(topic, 0);
 
-    // Metadata says 3M records exist. Nothing was ever produced, so no segment
-    // backs any of them.
-    _ = bucket
-        .put_opts(
-            &Path::from(format!(
-                "clusters/{CLUSTER}/topics/{topic}/partitions/{:0>10}/watermark.json",
-                0
-            )),
-            PutPayload::from_static(br#"{"high":3024895}"#),
-            PutOptions::default(),
-        )
-        .await?;
+    // Real records, so a real segment and a real index entry claim them.
+    assert_eq!(0, store.produce(None, &tp, batch(4)?).await?);
+    assert_eq!(4, store.high_watermark(&tp).await?);
+    assert_eq!(4, record_count(&fetch_from(&store, &tp, 0).await?));
 
-    let reader = DynoStore::new(CLUSTER, NODE, bucket.clone());
-
-    assert_eq!(
-        3024895,
-        reader.high_watermark(&tp).await?,
-        "the broker advertises the records",
-    );
+    // The slices the index points at stop producing anything.
+    armed.store(true, Relaxed);
 
     // Head and tail, as the report probed them.
-    for offset in [0, 3024894] {
+    for offset in [0, 3] {
         let outcome =
-            tokio::time::timeout(Duration::from_secs(5), fetch_from(&reader, &tp, offset))
+            tokio::time::timeout(Duration::from_secs(30), fetch_from(&store, &tp, offset))
                 .await
                 .map_err(|_| {
                     Error::Message(format!(
@@ -518,6 +622,46 @@ async fn a_fetch_that_cannot_be_served_fails_rather_than_hanging() -> Result<(),
              rather than answer empty; got {outcome:?}",
         );
     }
+
+    Ok(())
+}
+
+/// The counterpart, and the reason the check demands a covering index entry: a
+/// log whose records have all aged out advertises a high watermark with nothing
+/// readable behind it, exactly like the damaged partition above. It must answer
+/// empty, not `OffsetOutOfRange` — a consumer of an aged-out partition that gets
+/// an out-of-range error resets off a log that is merely old.
+#[tokio::test]
+async fn an_advertised_but_unbacked_offset_with_no_index_entry_is_not_reported() -> Result<(), Error>
+{
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
+
+    let topic = "org.env.conn.tab_expired";
+    create_topic(&store, topic).await?;
+
+    let tp = Topition::new(topic, 0);
+
+    // Metadata says records exist; no segment was ever written, so none does.
+    // This is the shape retention leaves behind once everything has expired.
+    _ = bucket
+        .put_opts(
+            &Path::from(format!(
+                "clusters/{CLUSTER}/topics/{topic}/partitions/{:0>10}/watermark.json",
+                0
+            )),
+            PutPayload::from_static(br#"{"high":3024895}"#),
+            PutOptions::default(),
+        )
+        .await?;
+
+    let reader = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    assert_eq!(3024895, reader.high_watermark(&tp).await?);
+
+    assert!(
+        fetch_from(&reader, &tp, 0).await?.is_empty(),
+        "no index entry claims these offsets, so there is nothing to report",
+    );
 
     Ok(())
 }
