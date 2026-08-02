@@ -1400,9 +1400,20 @@ mod tests {
                                             batch_length: 69,
                                             partition_leader_epoch: -1,
                                             magic: 2,
-                                            crc: 2619797409,
+                                            crc: 2530424301,
                                             attributes: 0,
-                                            last_offset_delta: 0,
+                                            // These three moved with #281, and
+                                            // they are the bug: this expectation
+                                            // pinned a merged batch whose two
+                                            // records both carried
+                                            // `offset_delta == 0` under a header
+                                            // declaring `last_offset_delta == 0`
+                                            // while holding two of them. The
+                                            // second record's delta byte is now
+                                            // `\x02` (zigzag 1), the header
+                                            // agrees with the record count, and
+                                            // the CRC follows both.
+                                            last_offset_delta: 1,
                                             base_timestamp: 1234567890000,
                                             max_timestamp: 1234567890000,
                                             producer_id: -1,
@@ -1410,7 +1421,7 @@ mod tests {
                                             base_sequence: 0,
                                             record_count: 2,
                                             record_data: Bytes::from_static(
-                                                b"\x12\0\0\0\x01\x06foo\0\x12\0\0\0\x01\x06bar\0"
+                                                b"\x12\0\0\0\x01\x06foo\0\x12\0\0\x02\x01\x06bar\0"
                                             )
                                         }]
                                         .into()
