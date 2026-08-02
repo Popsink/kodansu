@@ -134,7 +134,10 @@ impl ObjectStore for AlwaysUnavailable {
         locations
     }
 
-    fn list(&self, _: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+    fn list(
+        &self,
+        _: Option<&Path>,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
         Box::pin(futures::stream::empty())
     }
 
@@ -211,15 +214,18 @@ async fn add_partitions_to_txn_v4_is_unsupported() -> Result<()> {
 fn alter_configs_append_and_subtract_are_refused() {
     let mut metadata = TopicMetadata::default();
 
-    for operation in [OpType::Append, OpType::Subtract] {
+    // `OpType` has no `Debug`, so the wire value names the case on failure.
+    for operation in [i8::from(OpType::Append), i8::from(OpType::Subtract)] {
         let change = AlterableConfig::default()
             .name("cleanup.policy".into())
-            .config_operation(i8::from(operation))
+            .config_operation(operation)
             .value(Some("compact".into()));
 
         match metadata.alter_configs(&[change]) {
             Err(Error::Api(code)) => assert_eq!(ErrorCode::InvalidConfig, code),
-            otherwise => panic!("expected InvalidConfig for {operation:?}, got {otherwise:?}"),
+            otherwise => panic!(
+                "expected InvalidConfig for config_operation {operation}, got {otherwise:?}"
+            ),
         }
     }
 }
