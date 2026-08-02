@@ -478,29 +478,38 @@ async fn a_recreated_topic_inherits_nothing_from_a_shared_segment() -> Result<()
 /// it off a healthy log.
 #[tokio::test]
 async fn a_fetch_that_cannot_be_served_fails_rather_than_hanging() -> Result<(), Error> {
-    /// Serves a segment's record bytes as an empty body once armed, leaving the
-    /// footer reads that build the index alone. The index keeps claiming the
-    /// offsets; the data behind them produces nothing.
+    /// Once armed, serves every segment record read from the FIRST region it
+    /// ever saw, wherever the index actually pointed.
+    ///
+    /// That is #290's second hypothesis made concrete: the index keeps claiming
+    /// a range of offsets while the bytes behind them belong to an earlier
+    /// region. Those batches all sit below the requested offset, so the
+    /// whole-batch skip drops every one and the read comes back empty against an
+    /// index that still says the records are there.
+    ///
+    /// Footer reads use a suffix range and are left alone, so the index stays
+    /// intact — which is the condition under test.
     #[derive(Clone)]
-    struct HollowRecordReads<O> {
+    struct RedirectRecordReads<O> {
         inner: O,
+        first: Arc<Mutex<Option<(Path, std::ops::Range<u64>)>>>,
         armed: Arc<AtomicBool>,
     }
 
-    impl<O> Debug for HollowRecordReads<O> {
+    impl<O> Debug for RedirectRecordReads<O> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("HollowRecordReads").finish()
+            f.debug_struct("RedirectRecordReads").finish()
         }
     }
 
-    impl<O> Display for HollowRecordReads<O> {
+    impl<O> Display for RedirectRecordReads<O> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("HollowRecordReads").finish()
+            f.debug_struct("RedirectRecordReads").finish()
         }
     }
 
     #[async_trait]
-    impl<O> ObjectStore for HollowRecordReads<O>
+    impl<O> ObjectStore for RedirectRecordReads<O>
     where
         O: ObjectStore,
     {
@@ -526,16 +535,30 @@ async fn a_fetch_that_cannot_be_served_fails_rather_than_hanging() -> Result<(),
             location: &Path,
             options: GetOptions,
         ) -> Result<GetResult, object_store::Error> {
-            // Only the bounded record-range reads go hollow. Footer reads use a
-            // suffix range, so the index stays intact and keeps claiming the
-            // offsets — which is the condition under test.
-            if self.armed.load(Relaxed)
-                && matches!(options.range, Some(GetRange::Bounded(_)))
+            // Only bounded record-range reads of a segment are touched. Footer
+            // reads use a suffix range, so the index is built normally.
+            if let Some(GetRange::Bounded(ref range)) = options.range
                 && location.as_ref().contains("/segments/")
             {
-                let mut options = options;
-                options.range = Some(GetRange::Bounded(0..0));
-                return self.inner.get_opts(location, options).await;
+                let redirect = self.first.lock().expect("poison").clone();
+
+                match redirect {
+                    Some((first_location, first_range)) if self.armed.load(Relaxed) => {
+                        let mut options = options;
+                        options.range = Some(GetRange::Bounded(first_range));
+                        return self.inner.get_opts(&first_location, options).await;
+                    }
+
+                    None => {
+                        _ = self
+                            .first
+                            .lock()
+                            .expect("poison")
+                            .replace((location.clone(), range.clone()));
+                    }
+
+                    Some(_) => {}
+                }
             }
 
             self.inner.get_opts(location, options).await
@@ -583,45 +606,54 @@ async fn a_fetch_that_cannot_be_served_fails_rather_than_hanging() -> Result<(),
     let bucket = InMemory::new();
     let armed = Arc::new(AtomicBool::new(false));
 
+    // One batch per segment, so the two produces below land in distinct
+    // segments and the second can be pointed at the first.
     let store = DynoStore::new(
         CLUSTER,
         NODE,
-        HollowRecordReads {
+        RedirectRecordReads {
             inner: bucket.clone(),
+            first: Arc::new(Mutex::new(None)),
             armed: armed.clone(),
         },
-    );
+    )
+    .coalesce_tuning(CoalesceTuning {
+        coalesce_batches: Some(1),
+        ..Default::default()
+    });
 
     let topic = "org.env.conn.tab_orphaned";
     create_topic(&store, topic).await?;
 
     let tp = Topition::new(topic, 0);
 
-    // Real records, so a real segment and a real index entry claim them.
+    // Segment one holds [0, 4). Reading it teaches the store's wrapper which
+    // region to replay, and proves the partition is healthy to begin with.
     assert_eq!(0, store.produce(None, &tp, batch(4)?).await?);
-    assert_eq!(4, store.high_watermark(&tp).await?);
     assert_eq!(4, record_count(&fetch_from(&store, &tp, 0).await?));
 
-    // The slices the index points at stop producing anything.
+    // Segment two holds [4, 8), and the index says so.
+    assert_eq!(4, store.produce(None, &tp, batch(4)?).await?);
+    assert_eq!(8, store.high_watermark(&tp).await?);
+
+    // From here the bytes behind segment two are segment one's — offsets [0, 4),
+    // every one below the offsets the index claims for it.
     armed.store(true, Relaxed);
 
-    // Head and tail, as the report probed them.
-    for offset in [0, 3] {
-        let outcome =
-            tokio::time::timeout(Duration::from_secs(30), fetch_from(&store, &tp, offset))
-                .await
-                .map_err(|_| {
-                    Error::Message(format!(
-                        "fetch at offset {offset} never returned: a consumer here polls forever"
-                    ))
-                })?;
+    let outcome = tokio::time::timeout(Duration::from_secs(30), fetch_from(&store, &tp, 4))
+        .await
+        .map_err(|_| {
+            Error::Message(String::from(
+                "the fetch never returned: a consumer here polls forever",
+            ))
+        })?;
 
-        assert!(
-            matches!(outcome, Err(Error::Api(ErrorCode::OffsetOutOfRange))),
-            "offset {offset} is advertised but unservable, so the fetch must say so \
-             rather than answer empty; got {outcome:?}",
-        );
-    }
+    assert!(
+        matches!(outcome, Err(Error::Api(ErrorCode::OffsetOutOfRange))),
+        "offset 4 is advertised and the index claims a segment holds it, but the \
+         segment produces none of it — the fetch must say so rather than answer \
+         empty; got {outcome:?}",
+    );
 
     Ok(())
 }
