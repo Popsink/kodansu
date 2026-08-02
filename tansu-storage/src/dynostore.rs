@@ -1386,8 +1386,19 @@ impl TopicMetadata {
                 OpType::Delete => {
                     _ = configuration.remove(change.name.as_str());
                 }
-                OpType::Append => todo!(),
-                OpType::Subtract => todo!(),
+                // Kafka's list-valued APPEND/SUBTRACT are not implemented.
+                // `config_operation` is a wire field, so a client picks it —
+                // panicking the request task on one was remote input deciding
+                // broker liveness (#276). Refuse the operation instead.
+                OpType::Append | OpType::Subtract => {
+                    error!(
+                        config = change.name,
+                        operation = change.config_operation,
+                        "IncrementalAlterConfigs APPEND/SUBTRACT are not supported"
+                    );
+
+                    return Err(Error::Api(ErrorCode::InvalidConfig));
+                }
             }
         }
 
@@ -8127,12 +8138,28 @@ impl Storage for DynoStore {
                     continue;
                 };
 
+                // The broker writes 10-digit zero-padded partition names, so a
+                // shorter component means a foreign or truncated object in the
+                // bucket rather than anything this cluster produced. Skip it:
+                // slicing it panicked the request task (#276).
                 let Some(partition) = meta
                     .location
                     .parts()
                     .nth(8)
                     .inspect(|partition| debug!(?partition))
-                    .map(|partition| i32::from_str(&partition.as_ref()[0..10]))
+                    .and_then(|partition| {
+                        partition
+                            .as_ref()
+                            .get(0..10)
+                            .map(i32::from_str)
+                            .or_else(|| {
+                                warn!(
+                                    location = %meta.location,
+                                    "skipping an offset object whose partition component is too short"
+                                );
+                                None
+                            })
+                    })
                     .transpose()?
                 else {
                     continue;
@@ -8537,7 +8564,21 @@ impl Storage for DynoStore {
                     .resource_name(name.into())
                     .configs(Some(vec![]))),
 
-                Err(_) => todo!(),
+                // Not an admin-only path: `topic_is_compacted` calls this, and
+                // it runs on produce and fetch via `routed_prefix_of` whenever
+                // the memo misses (first use of a topic in a process, or TTL
+                // expiry). So any transient object-store error while reading
+                // topic metadata reached this arm, and transient storage errors
+                // are routine.
+                //
+                // Propagate rather than panic, and rather than guessing a
+                // routing verdict: `topic_is_compacted` already has a `?`, and
+                // the storage error then classifies retriable (#275) instead of
+                // taking the request task down (#276). Answering "not
+                // compacted" on a failed read would be the other option, but
+                // routing is pinned create-only (#236) and a wrong pin is
+                // permanent — not a guess worth making on a blip.
+                Err(err) => Err(err),
             },
 
             _ => Ok(DescribeConfigsResult::default()
@@ -8940,7 +8981,24 @@ impl Storage for DynoStore {
                                             }))
                                         }
                                     } else {
-                                        todo!()
+                                        // An existing transaction whose epoch
+                                        // map is empty. Nothing in this binary
+                                        // writes that — the vacant arm above
+                                        // always inserts epoch 0, and epochs
+                                        // are only ever added — so it means a
+                                        // `meta.json` this process did not
+                                        // write. Refuse rather than fabricate
+                                        // producer state for a transaction
+                                        // whose history is unknown, answering
+                                        // as the degenerate arm below does
+                                        // (#276).
+                                        error!(transaction_id, "transaction has no epochs");
+
+                                        Ok(InitProducer::Completed(ProducerIdResponse {
+                                            id: -1,
+                                            epoch: -1,
+                                            error: ErrorCode::UnknownServerError,
+                                        }))
                                     }
                                 }
                             }
@@ -9200,7 +9258,12 @@ impl Storage for DynoStore {
             }
 
             TxnAddPartitionsRequest::VersionFourPlus { .. } => {
-                todo!()
+                // Not implemented. A client controls the API version it sends
+                // and is not bound by the advertised range, so this needed no
+                // error condition at all to panic the request task (#276).
+                error!("AddPartitionsToTxn v4+ is not implemented");
+
+                Err(Error::Api(ErrorCode::UnsupportedVersion))
             }
         }
     }

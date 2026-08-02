@@ -33,6 +33,7 @@ mod metadata_visibility;
 mod offset_assignment;
 mod offset_commit;
 mod prefix_coalesce;
+mod reachable_panics;
 mod scaling;
 mod segment;
 
