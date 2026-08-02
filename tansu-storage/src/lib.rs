@@ -378,6 +378,29 @@ impl From<object_store::Error> for Error {
     }
 }
 
+/// Map an unexpected (non-`Api`) error to the Kafka error code returned to the
+/// client.
+///
+/// Transient storage failures (e.g. an S3 error under load) are mapped to
+/// [`ErrorCode::KafkaStorageError`], which clients treat as **retriable** —
+/// instead of [`ErrorCode::UnknownServerError`] (-1), which is fatal and makes
+/// clients drop the whole batch (#6). Anything else stays UNKNOWN, since it
+/// signals a genuine bug rather than something a retry would fix.
+///
+/// This lives at the crate root because the distinction is not specific to one
+/// API: produce got it right first, and every path that reports a storage
+/// failure to a client owes the client the same answer. `OffsetCommit` did not,
+/// and a throttle burst therefore restarted connectors instead of being retried
+/// a moment later (#275).
+pub(crate) fn storage_error_code(error: &Error) -> ErrorCode {
+    match error {
+        #[cfg(feature = "dynostore")]
+        Error::ObjectStore(_) => ErrorCode::KafkaStorageError,
+
+        _ => ErrorCode::UnknownServerError,
+    }
+}
+
 impl From<ParseError> for Error {
     fn from(value: ParseError) -> Self {
         Self::ParseFilter(Arc::new(value))

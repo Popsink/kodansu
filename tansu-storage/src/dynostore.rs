@@ -84,6 +84,7 @@ use crate::{
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
     Result, ScramCredential, Storage, TopicDefaults, TopicId, Topition, TxnAddPartitionsRequest,
     TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    storage_error_code,
 };
 
 const APPLICATION_JSON: &str = "application/json";
@@ -7418,10 +7419,14 @@ impl Storage for DynoStore {
                         Err(err) => {
                             error!(?err, ?topition);
 
+                            // Same reasoning as the offset-commit path (#275),
+                            // lower stakes: an admin call rather than a client
+                            // hot loop, but a transient storage error is still
+                            // worth a retry rather than a fatal answer.
                             DeleteRecordsPartitionResult::default()
                                 .partition_index(partition.partition_index)
                                 .low_watermark(0)
-                                .error_code(ErrorCode::UnknownServerError.into())
+                                .error_code(storage_error_code(&err).into())
                         }
                     };
 
@@ -8003,12 +8008,22 @@ impl Storage for DynoStore {
                         ..Default::default()
                     };
 
+                    // #275: every failure here is an object-store failure, and
+                    // they are overwhelmingly transient — a 503 SlowDown, a
+                    // timeout, a 5xx. `UnknownServerError` is non-retriable in
+                    // Kafka clients, so `commitSync` threw rather than retrying
+                    // and a connector treating that as engine death restarted:
+                    // a throttle burst turned into connector restarts. Answer
+                    // the way produce already does.
                     self.object_store
                         .put_opts(&location, payload, options)
                         .await
                         .inspect_err(|err| error!(?err))
                         .inspect(|outcome| debug!(?outcome))
-                        .map_or(ErrorCode::UnknownServerError, |_| ErrorCode::None)
+                        .map_or_else(
+                            |err| storage_error_code(&Error::from(err)),
+                            |_| ErrorCode::None,
+                        )
                 } else {
                     ErrorCode::UnknownTopicOrPartition
                 };
