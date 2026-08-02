@@ -98,6 +98,13 @@ impl ObjectStore for ThrottledOffsetWrites {
         self.inner.get_opts(location, options).await
     }
 
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path, object_store::Error>>,
+    ) -> BoxStream<'static, Result<Path, object_store::Error>> {
+        self.inner.delete_stream(locations)
+    }
+
     fn list(
         &self,
         prefix: Option<&Path>,
@@ -210,7 +217,10 @@ async fn a_healthy_offset_commit_is_unaffected() -> Result<()> {
     assert_eq!(
         vec![
             (Topition::new(TOPIC, 0), ErrorCode::None),
-            (Topition::new("absent", 0), ErrorCode::UnknownTopicOrPartition),
+            (
+                Topition::new("absent", 0),
+                ErrorCode::UnknownTopicOrPartition
+            ),
         ],
         committed
     );
