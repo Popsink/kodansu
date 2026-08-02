@@ -24,6 +24,7 @@ use crate::{Error, Result, Topition};
 use super::{DynoStore, Watermark};
 
 mod compact_segments;
+mod delete_groups;
 mod group_describe;
 mod group_expiry;
 mod idempotent;

@@ -5210,6 +5210,34 @@ impl DynoStore {
         }
     }
 
+    /// The root of the consumer tree: every group's state object and every
+    /// committed offset in the cluster lives under this prefix.
+    fn groups_root(&self) -> Path {
+        Path::from(format!("clusters/{}/groups/consumers/", self.cluster))
+    }
+
+    /// The prefix holding everything owned by `group_id`, or `None` when
+    /// `group_id` contributes no path component of its own.
+    ///
+    /// [`Path`] drops empty components on normalisation, so an empty group id —
+    /// or one made only of delimiters — does not narrow the prefix at all: it
+    /// collapses onto [`Self::groups_root`]. Handing that to a `delete_stream`
+    /// deletes every group and every committed offset in the cluster (#277), so
+    /// this returns the widening case as `None` rather than a prefix that
+    /// silently means "everything".
+    ///
+    /// The check is structural — built prefix against root — rather than
+    /// `group_id.is_empty()`, because normalisation is what does the widening:
+    /// `""`, `"/"` and `"///"` all produce the same root.
+    fn group_prefix(&self, group_id: &str) -> Option<Path> {
+        let prefix = Path::from(format!(
+            "clusters/{}/groups/consumers/{}",
+            self.cluster, group_id,
+        ));
+
+        (prefix != self.groups_root()).then_some(prefix)
+    }
+
     /// Enforce the `delete` cleanup policy: for every topic configured with
     /// `cleanup.policy` containing `delete`, drop the batches whose records are
     /// older than `retention.ms` (defaulting to 7 days, matching the SQL
@@ -8569,6 +8597,32 @@ impl Storage for DynoStore {
 
         if let Some(group_ids) = group_ids {
             for group_id in group_ids {
+                // #277: an id contributing no path component of its own widens
+                // the deletion prefix to the root of the consumer tree, and the
+                // `delete_stream` below would then take every group and every
+                // committed offset in the cluster with it. Refuse before any
+                // path is built, and report it the way Kafka does.
+                //
+                // Not only reachable from a client: `expire_groups` derives its
+                // ids by stripping `.json` off a listing, so a stray object
+                // named exactly `.json` under the root yields an empty id from
+                // the maintenance loop.
+                let Some(prefix) = self.group_prefix(group_id) else {
+                    warn!(
+                        ?group_id,
+                        cluster = self.cluster,
+                        "refusing to delete a group id that resolves to the consumer tree root"
+                    );
+
+                    results.push(
+                        DeletableGroupResult::default()
+                            .group_id(group_id.into())
+                            .error_code(ErrorCode::InvalidGroupId.into()),
+                    );
+
+                    continue;
+                };
+
                 let location = Path::from(format!(
                     "clusters/{}/groups/consumers/{}.json",
                     self.cluster, group_id,
@@ -8583,11 +8637,6 @@ impl Storage for DynoStore {
                     .is_ok();
 
                 debug!(group_id, had_group_state);
-
-                let prefix = Path::from(format!(
-                    "clusters/{}/groups/consumers/{}",
-                    self.cluster, group_id,
-                ));
 
                 let locations = self
                     .scan(Scan::AdminDelete, &prefix)
