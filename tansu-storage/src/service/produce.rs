@@ -22,7 +22,7 @@ use tansu_sans_io::{
 };
 use tracing::{debug, error, instrument, warn};
 
-use crate::{Error, Result, Storage, Topition};
+use crate::{Error, Result, Storage, Topition, storage_error_code};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`ProduceRequest`] returning [`ProduceResponse`].
 /// ```
@@ -128,22 +128,6 @@ use crate::{Error, Result, Storage, Topition};
 /// # Ok(())
 /// # }
 /// ```
-/// Map an unexpected (non-`Api`) produce error to the Kafka error code returned
-/// to the client.
-///
-/// Transient storage failures (e.g. an S3 error under load) are mapped to
-/// [`ErrorCode::KafkaStorageError`], which clients treat as **retriable** —
-/// instead of [`ErrorCode::UnknownServerError`] (-1), which is fatal and makes
-/// clients drop the whole batch (#6). Anything else stays UNKNOWN, since it
-/// signals a genuine bug rather than something a retry would fix.
-fn storage_error_code(error: &Error) -> ErrorCode {
-    match error {
-        #[cfg(feature = "dynostore")]
-        Error::ObjectStore(_) => ErrorCode::KafkaStorageError,
-
-        _ => ErrorCode::UnknownServerError,
-    }
-}
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProduceService;
