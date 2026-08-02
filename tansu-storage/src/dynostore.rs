@@ -8656,14 +8656,14 @@ impl Storage for DynoStore {
                     .inspect(|o| debug!(?o, group_id))
                     .inspect_err(|err| error!(?err, group_id))
                 {
-                    Ok((group_detail, _)) => NamedGroupDetail::found(group_id.into(), group_detail),
+                    Ok((group_detail, _)) => NamedGroupDetail::found(group_id, group_detail),
 
                     // Absent means the group does not exist, which is a fact and is
                     // reported as an empty group.
                     Err(Error::ObjectStore(error))
                         if matches!(error.as_ref(), object_store::Error::NotFound { .. }) =>
                     {
-                        NamedGroupDetail::found(group_id.into(), GroupDetail::default())
+                        NamedGroupDetail::found(group_id, GroupDetail::default())
                     }
 
                     // Any other store error means we do not know. This used to
@@ -8672,14 +8672,11 @@ impl Storage for DynoStore {
                     // shape as #214, where an unresolvable topic was reported absent
                     // and clients could not tell it from a deleted one. Retriable is
                     // both true and actionable.
-                    Err(Error::ObjectStore(_)) => NamedGroupDetail::error_code(
-                        group_id.into(),
-                        ErrorCode::CoordinatorLoadInProgress,
-                    ),
-
-                    Err(_) => {
-                        NamedGroupDetail::error_code(group_id.into(), ErrorCode::UnknownServerError)
+                    Err(Error::ObjectStore(_)) => {
+                        NamedGroupDetail::error_code(group_id, ErrorCode::CoordinatorLoadInProgress)
                     }
+
+                    Err(_) => NamedGroupDetail::error_code(group_id, ErrorCode::UnknownServerError),
                 }
             }))
             .buffered(DESCRIBE_CONCURRENCY)
