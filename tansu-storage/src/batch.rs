@@ -1363,11 +1363,11 @@ mod tests {
 /// any particular value — a future defaulted method is caught by the same shape.
 #[cfg(all(test, feature = "dynostore"))]
 mod wrapper_parity {
+    use bytes::Bytes;
     use object_store::memory::InMemory;
-    use tansu_sans_io::{IsolationLevel, create_topics_request::CreatableTopic};
 
     use super::*;
-    use crate::{GroupDetail, dynostore::DynoStore};
+    use crate::dynostore::DynoStore;
 
     const CLUSTER: &str = "tansu";
     const NODE: i32 = 111;
@@ -1397,13 +1397,10 @@ mod wrapper_parity {
         let topition = Topition::new(topic, 0);
 
         for n in 0..3 {
-            let batch = tansu_sans_io::record::inflated::Batch::builder()
-                .record(
-                    tansu_sans_io::record::Record::builder()
-                        .value(Some(bytes::Bytes::from(format!("m-{n}")))),
-                )
+            let batch = inflated::Batch::builder()
+                .record(Record::builder().value(Some(Bytes::from(format!("m-{n}")))))
                 .build()
-                .and_then(tansu_sans_io::record::deflated::Batch::try_from)?;
+                .and_then(deflated::Batch::try_from)?;
 
             _ = bare.produce(None, &topition, batch).await?;
         }
