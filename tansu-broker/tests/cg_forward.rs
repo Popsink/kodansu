@@ -632,3 +632,61 @@ async fn scattered_sixteen_members_across_ten_replicas_do_not_converge() -> Resu
 
     Ok(())
 }
+
+/// **Measurement, not a gate.** How much CAS contention does forwarding actually
+/// remove, now that #111's GET-first gate works (#273)?
+///
+/// The binary control beside this — "scattered members must NOT converge" —
+/// stopped holding once `read_group` was delegated: each replica now reads the
+/// persisted group before writing, detects a version mismatch and refreshes, so
+/// the thrashing the control depends on largely disappears. That makes the
+/// control brittle to the system improving, and says nothing about *how much*
+/// forwarding buys.
+///
+/// This reports the number the control should have been asserting all along:
+/// total `update_group` CAS conflicts across all ten replicas on the scattered
+/// path. The forwarded path already pins its counterpart at exactly zero on the
+/// owner. A large ratio justifies forwarding whether or not convergence happens;
+/// a small one is the more interesting result and belongs on #240.
+///
+/// Prints and asserts nothing about convergence deliberately — it is here to
+/// produce a figure, and a measurement that fails is a measurement you cannot
+/// read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn measure_scattered_cas_contention() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let shared = shared_storage().await?;
+    let (replicas, cas_conflicts) = replicas(&shared)?;
+
+    let results = drive_members(&replicas, SCATTERED_WINDOW).await?;
+
+    let unassigned = results.iter().filter(|result| result.is_none()).count();
+
+    let member_ids = results
+        .iter()
+        .flatten()
+        .map(|(member_id, _)| member_id.clone())
+        .collect::<BTreeSet<_>>();
+
+    let converged = unassigned == 0 && persisted_group_converged(&shared, &member_ids).await?;
+
+    let per_replica = cas_conflicts
+        .iter()
+        .map(|counter| counter.load(Ordering::Relaxed))
+        .collect::<Vec<_>>();
+    let total: u64 = per_replica.iter().sum();
+
+    println!("MEASUREMENT scattered_without_forwarding");
+    println!("  members_assigned   = {}", results.len() - unassigned);
+    println!("  members_unassigned = {unassigned}");
+    println!("  converged          = {converged}");
+    println!("  cas_conflicts_total   = {total}");
+    println!("  cas_conflicts_per_replica = {per_replica:?}");
+    println!(
+        "  (forwarded path pins its owner-replica counterpart at exactly 0 — \
+         see forwarded_sixteen_members_across_ten_replicas_converge)"
+    );
+
+    Ok(())
+}
