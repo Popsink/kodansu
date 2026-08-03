@@ -447,12 +447,31 @@ impl Batch {
     }
 }
 
+/// Ceiling on how many [`Record`]s may be pre-allocated from a batch header
+/// (#271).
+///
+/// `record_count` is a `u32` read straight off the wire, and
+/// `Vec::with_capacity` sized from it is an unbounded allocation: at
+/// `u32::MAX` that is hundreds of gibibytes. It is worse than a panic, because
+/// `with_capacity` calls `handle_alloc_error` on failure, which **aborts the
+/// process** rather than unwinding — so it is not confined to the request task,
+/// and one frame takes the broker down with every connection on it.
+///
+/// The count is still honoured as a loop bound: the decode below fails on the
+/// first record the payload cannot supply, so an impossible count is rejected
+/// with an error as before. This only stops the wire from deciding how much
+/// memory to reserve up front; a genuinely larger batch grows into place, which
+/// is amortised and what the generated protocol decoder already relies on
+/// (`Seq` implements no `size_hint()`).
+const RECORD_PREALLOC_LIMIT: usize = 8 * 1024;
+
 impl TryFrom<Batch> for Vec<Record> {
     type Error = Error;
 
     #[instrument(skip_all)]
     fn try_from(mut batch: Batch) -> Result<Self, Self::Error> {
         let record_count = usize::try_from(batch.record_count)?;
+        let prealloc = record_count.min(RECORD_PREALLOC_LIMIT);
 
         debug!(?record_count);
         debug!(?batch.record_data);
@@ -461,7 +480,7 @@ impl TryFrom<Batch> for Vec<Record> {
             .compression()
             .is_ok_and(|compression| compression == Compression::None)
         {
-            let mut records = Vec::with_capacity(record_count);
+            let mut records = Vec::with_capacity(prealloc);
 
             for _ in 0..record_count {
                 let record = Record::decode(&mut batch.record_data)?;
@@ -475,7 +494,7 @@ impl TryFrom<Batch> for Vec<Record> {
                 .and_then(|compression| compression.inflator(batch.record_data.reader()))?;
 
             let mut decoder = Decoder::new(&mut reader);
-            let mut records = Vec::with_capacity(record_count);
+            let mut records = Vec::with_capacity(prealloc);
 
             for _ in 0..record_count {
                 let record = Record::deserialize(&mut decoder)?;
@@ -492,6 +511,7 @@ impl TryFrom<&Batch> for Vec<Record> {
 
     fn try_from(batch: &Batch) -> Result<Self, Self::Error> {
         let record_count = usize::try_from(batch.record_count)?;
+        let prealloc = record_count.min(RECORD_PREALLOC_LIMIT);
 
         debug!(?record_count);
         debug!(?batch.record_data);
@@ -501,7 +521,7 @@ impl TryFrom<&Batch> for Vec<Record> {
             .and_then(|compression| compression.inflator(batch.record_data.clone().reader()))?;
 
         let mut decoder = Decoder::new(&mut reader);
-        let mut records = Vec::with_capacity(record_count);
+        let mut records = Vec::with_capacity(prealloc);
 
         for _ in 0..record_count {
             let record = Record::deserialize(&mut decoder)?;
@@ -1128,6 +1148,98 @@ mod tests {
 
         assert_eq!(Some(key), inflated.records[0].key);
         assert_eq!(Some(value), inflated.records[0].value);
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod record_prealloc {
+    use super::*;
+    use crate::{BatchAttribute, record::inflated};
+
+    /// A batch header declaring `u32::MAX` records over a short payload must be
+    /// **rejected with an error, and the process must survive** (#271).
+    ///
+    /// It used to size a `Vec` from that count — hundreds of gibibytes — and
+    /// `Vec::with_capacity` calls `handle_alloc_error` on failure, which aborts
+    /// the process instead of unwinding. So this was not a panic confined to one
+    /// request task: one frame took the broker down with every connection on it.
+    ///
+    /// A test cannot observe an abort (it would take the test runner with it), so
+    /// what is pinned is the reachable half: the conversion returns `Err` rather
+    /// than trying to reserve the space first.
+    #[test]
+    fn an_impossible_record_count_is_rejected() {
+        let batch = Batch {
+            record_count: u32::MAX,
+            record_data: Bytes::from_static(b"\x12\0\0\0\x01\x06foo\0"),
+            attributes: BatchAttribute::default().into(),
+            ..Default::default()
+        };
+
+        assert!(
+            Vec::<Record>::try_from(batch).is_err(),
+            "a count the payload cannot supply must be an error, not an allocation",
+        );
+    }
+
+    /// **The converse.** A `record_count` that exactly matches its payload is
+    /// accepted, unchanged.
+    ///
+    /// This is the half whose absence let #302 reach production: a guard was
+    /// pinned to catch bad input and nothing pinned that good input still worked.
+    /// Here it also covers the boundary the bound is derived from.
+    #[test]
+    fn a_record_count_matching_its_payload_is_accepted() -> Result<()> {
+        for records in [1usize, 5, 100] {
+            let mut builder = inflated::Batch::builder();
+
+            for i in 0..records {
+                builder = builder
+                    .record(Record::builder().value(Some(Bytes::from(format!("value-{i}")))));
+            }
+
+            let deflated = builder
+                .last_offset_delta(records as i32 - 1)
+                .build()
+                .and_then(Batch::try_from)?;
+
+            assert_eq!(records as u32, deflated.record_count);
+
+            let decoded = Vec::<Record>::try_from(deflated)?;
+
+            assert_eq!(
+                records,
+                decoded.len(),
+                "a batch of {records} records must decode to {records} records",
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A batch larger than the pre-allocation ceiling still decodes in full — the
+    /// bound caps the *reservation*, never the result.
+    #[test]
+    fn a_batch_above_the_prealloc_ceiling_decodes_completely() -> Result<()> {
+        let records = RECORD_PREALLOC_LIMIT + 17;
+        let mut builder = inflated::Batch::builder();
+
+        for _ in 0..records {
+            builder = builder.record(Record::builder().value(Some(Bytes::from_static(b"v"))));
+        }
+
+        let deflated = builder
+            .last_offset_delta(records as i32 - 1)
+            .build()
+            .and_then(Batch::try_from)?;
+
+        assert_eq!(
+            records,
+            Vec::<Record>::try_from(deflated)?.len(),
+            "the ceiling must bound the reservation, not the decode",
+        );
 
         Ok(())
     }

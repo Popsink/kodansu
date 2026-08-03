@@ -51,3 +51,10 @@ path = "fuzz_targets/fuzz_varint.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_inflated_records"
+path = "fuzz_targets/fuzz_inflated_records.rs"
+test = false
+doc = false
+bench = false
