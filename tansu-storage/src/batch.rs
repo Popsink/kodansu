@@ -448,6 +448,29 @@ where
         self.storage.offset_stage(topition).await
     }
 
+    /// Delegated explicitly (#273). Both of these have default bodies on
+    /// `Storage`, and this wrapper is applied **unconditionally** in the `s3` and
+    /// `gs` builder arms — so the defaults silently absorbed them in every
+    /// object-store deployment: `offset_stage_at` fell back to `offset_stage`
+    /// and its `meta.json` read, defeating #109, while `read_group` always
+    /// answered `None`, so #111's GET-first gate never opened. Both shipped and
+    /// neither ran.
+    ///
+    /// The `memory://` arm is not wrapped, which is why the suite could not see
+    /// it: in-memory tests exercised the optimised paths that production never
+    /// reached.
+    async fn offset_stage_at(
+        &self,
+        topition: &Topition,
+        isolation: IsolationLevel,
+    ) -> Result<OffsetStage> {
+        self.storage.offset_stage_at(topition, isolation).await
+    }
+
+    async fn read_group(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        self.storage.read_group(group_id).await
+    }
+
     async fn list_offsets(
         &self,
         isolation_level: IsolationLevel,
@@ -1319,6 +1342,103 @@ mod tests {
         assert_eq!(None, combined.records[index].key);
         assert_eq!(Some(batches[5][3].clone()), combined.records[index].value);
         assert_eq!(index, combined.records[index].offset_delta as usize);
+
+        Ok(())
+    }
+}
+
+/// The wrapper stack must answer exactly what the engine it wraps answers
+/// (#273).
+///
+/// `Storage` has methods with default bodies, and `ProduceRequestBatcher` is
+/// applied **unconditionally** in the `s3` and `gs` builder arms. So a method
+/// this wrapper forgets to delegate is not a compile error — it silently becomes
+/// the default, in production only. Two shipped optimisations were inert that
+/// way for an unknown period, and the suite could not see it because the
+/// `memory://` arm is unwrapped: in-memory tests exercised the optimised paths
+/// that production never reached.
+///
+/// This is the regression that would have caught it, and it is deliberately
+/// written as *parity with the wrapped engine* rather than as an assertion about
+/// any particular value — a future defaulted method is caught by the same shape.
+#[cfg(all(test, feature = "dynostore"))]
+mod wrapper_parity {
+    use bytes::Bytes;
+    use object_store::memory::InMemory;
+
+    use super::*;
+    use crate::dynostore::DynoStore;
+
+    const CLUSTER: &str = "tansu";
+    const NODE: i32 = 111;
+
+    #[tokio::test]
+    async fn the_batcher_answers_what_it_wraps() -> Result<(), Error> {
+        let bucket = InMemory::new();
+
+        // One bucket, two views of it: the engine, and the engine behind the
+        // wrapper production always applies.
+        let bare = DynoStore::new(CLUSTER, NODE, bucket.clone());
+        let wrapped = ProduceRequestBatcher::new(DynoStore::new(CLUSTER, NODE, bucket.clone()));
+
+        let topic = "parity";
+        _ = bare
+            .create_topic(
+                CreatableTopic::default()
+                    .name(topic.into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let topition = Topition::new(topic, 0);
+
+        for n in 0..3 {
+            let batch = inflated::Batch::builder()
+                .record(Record::builder().value(Some(Bytes::from(format!("m-{n}")))))
+                .build()
+                .and_then(deflated::Batch::try_from)?;
+
+            _ = bare.produce(None, &topition, batch).await?;
+        }
+
+        // `offset_stage_at`: the default body redirects to `offset_stage`, which
+        // reads the cluster-wide `meta.json` — a different implementation with a
+        // separately derived `last_stable`, so this is parity of an answer, not
+        // just of a cost.
+        for isolation in [
+            IsolationLevel::ReadUncommitted,
+            IsolationLevel::ReadCommitted,
+        ] {
+            assert_eq!(
+                bare.offset_stage_at(&topition, isolation).await?,
+                wrapped.offset_stage_at(&topition, isolation).await?,
+                "offset_stage_at diverges through the wrapper at {isolation:?}",
+            );
+        }
+
+        // `read_group`: the default body answers `None` unconditionally, which is
+        // what kept #111's GET-first gate shut in production.
+        assert_eq!(
+            bare.read_group("absent").await?.is_some(),
+            wrapped.read_group("absent").await?.is_some(),
+            "read_group diverges through the wrapper for an absent group",
+        );
+
+        _ = bare
+            .update_group("present", GroupDetail::default(), None)
+            .await
+            .expect("seed group state");
+
+        assert_eq!(
+            bare.read_group("present").await?,
+            wrapped.read_group("present").await?,
+            "read_group diverges through the wrapper for a group that exists — \
+             the default body answers None, which is how #111 was inert",
+        );
 
         Ok(())
     }
