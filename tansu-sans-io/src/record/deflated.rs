@@ -1195,9 +1195,8 @@ mod record_prealloc {
             let mut builder = inflated::Batch::builder();
 
             for i in 0..records {
-                builder = builder.record(
-                    Record::builder().value(Some(Bytes::from(format!("value-{i}")))),
-                );
+                builder = builder
+                    .record(Record::builder().value(Some(Bytes::from(format!("value-{i}")))));
             }
 
             let deflated = builder
