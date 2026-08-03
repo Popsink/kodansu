@@ -843,7 +843,6 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             .node_id(self.node_id)
             .advertised_listener(self.advertised_listener.clone())
             .storage(self.storage.clone())
-            .cancellation(self.cancellation.clone())
             .topic_defaults(self.topic_defaults.clone())
             .silent(self.silent)
             .build()
