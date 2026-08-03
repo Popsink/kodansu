@@ -677,16 +677,15 @@ async fn measure_scattered_cas_contention() -> Result<()> {
         .collect::<Vec<_>>();
     let total: u64 = per_replica.iter().sum();
 
-    println!("MEASUREMENT scattered_without_forwarding");
-    println!("  members_assigned   = {}", results.len() - unassigned);
-    println!("  members_unassigned = {unassigned}");
-    println!("  converged          = {converged}");
-    println!("  cas_conflicts_total   = {total}");
-    println!("  cas_conflicts_per_replica = {per_replica:?}");
-    println!(
-        "  (forwarded path pins its owner-replica counterpart at exactly 0 — \
-         see forwarded_sixteen_members_across_ten_replicas_converge)"
+    // Reported by FAILING on purpose. `NEXTEST_PROFILE=ci` captures stdout and
+    // shows it only for failing tests, and turning `success-output` on would dump
+    // the stdout of all ~760 passing tests into the job log. So the panic message
+    // is the report. This test is on a draft branch that is never merged.
+    panic!(
+        "MEASUREMENT scattered_without_forwarding: \
+         members_assigned={} members_unassigned={unassigned} converged={converged} \
+         cas_conflicts_total={total} cas_conflicts_per_replica={per_replica:?} \
+         (the forwarded path pins its owner-replica counterpart at exactly 0)",
+        results.len() - unassigned,
     );
-
-    Ok(())
 }
