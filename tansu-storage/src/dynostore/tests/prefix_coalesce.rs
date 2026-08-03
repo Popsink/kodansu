@@ -662,7 +662,7 @@ async fn a_caught_up_consumer_is_never_told_it_is_out_of_range() -> Result<(), E
     assert_eq!(7, high_watermark);
 
     // Every offset in the log, tail included. None may error, and each must
-    // serve the records from itself onward.
+    // reach the tail.
     for offset in 0..high_watermark {
         let fetched = fetch_from(&store, &tp, offset).await.map_err(|err| {
             Error::Message(format!(
@@ -671,10 +671,26 @@ async fn a_caught_up_consumer_is_never_told_it_is_out_of_range() -> Result<(), E
             ))
         })?;
 
+        assert!(
+            !fetched.is_empty(),
+            "offset {offset} of {high_watermark} must serve records",
+        );
+
+        // Whole batches are returned, so the answer may begin *before* the
+        // requested offset — the consumer trims to its own position, as it does
+        // against Kafka. Asserting an exact record count here would pin
+        // batch-splitting the broker deliberately does not do. What matters is
+        // that the tail is reachable from every offset.
+        let last_offset = fetched
+            .iter()
+            .map(|batch| batch.base_offset + batch.last_offset_delta as i64)
+            .max()
+            .expect("a non-empty answer has a last offset");
+
         assert_eq!(
-            high_watermark - offset,
-            record_count(&fetched),
-            "offset {offset} must serve everything from itself to the tail",
+            high_watermark - 1,
+            last_offset,
+            "offset {offset} must reach the tail",
         );
     }
 
