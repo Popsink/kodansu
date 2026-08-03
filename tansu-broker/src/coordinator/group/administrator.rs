@@ -1981,13 +1981,37 @@ where
             // right place to notice one that has stopped making progress (#240).
             _ = self.observe_rebalance(group_id, &GroupDetail::from(&wrapper), now);
 
+            let after = GroupDetail::from(&wrapper);
+
             // Skip the group-state PUT when nothing persistent changed (#111): the
             // object exists and already holds `before` (just read), so a
             // steady-state heartbeat — and a heartbeat that merely observed a
             // rebalance — writes zero tier-1 PUTs. Only a real membership /
-            // generation change makes `before != after` and falls through to the
-            // CAS below.
-            if persisted.is_some() && GroupDetail::from(&wrapper) == before {
+            // generation change falls through to the CAS below.
+            //
+            // This used to be strict equality on `GroupDetail`, which could never
+            // hold (#273): `GroupMember` derives `PartialEq` over `last_contact`,
+            // and the heartbeat path assigns it `now` before we get here — via
+            // `missed_heartbeat` above and `Formed::heartbeat`. So `after !=
+            // before` on every *successful* heartbeat and the skip fired only on
+            // errors, doing precisely what the comment says it does not: 1 GET +
+            // 1 CAS PUT per member per interval, ~100 PUT/s at 300 members.
+            //
+            // `same_rebalance_state` + `liveness_renewal_due` is the join and sync
+            // pattern (`:1246`, `:1579`), and the second half is not optional.
+            // Constant heartbeat PUTs were what kept `{group}.json` mtimes fresh,
+            // and group expiry used to condemn a group on that mtime alone — so
+            // skipping without a liveness floor would have armed offset deletion
+            // for every stable group past the retention window. #272 removed that
+            // coupling by making expiry consult committed-offset activity, which
+            // is why this change is safe now and was not before. The renewal every
+            // `session_timeout/2` still preserves cross-replica member eviction.
+            if persisted.is_some()
+                && same_rebalance_state(&before, &after)
+                && !liveness_renewal_due(&before, member_id, now, before.session_timeout_ms)
+            {
+                COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "heartbeat_noop_skip")]);
+
                 _ = self
                     .wrappers
                     .lock()
