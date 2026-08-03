@@ -58,6 +58,11 @@ pub struct LatencyIntroducingStorage<S> {
     /// in-process serialization at the coordinator eliminates concurrent
     /// read-modify-write contention on the single `{group}.json` object.
     group_cas_conflicts: Arc<AtomicU64>,
+    /// Count of `update_group` calls, won or lost. This is the tier-1 PUT rate
+    /// on `{group}.json`, and it is what #111 claims a steady-state heartbeat
+    /// does not incur — a claim that was false for as long as the heartbeat skip
+    /// compared `last_contact` (#273), so a test needs to be able to see it.
+    group_updates: Arc<AtomicU64>,
 }
 
 impl<S> LatencyIntroducingStorage<S>
@@ -70,6 +75,7 @@ where
             rng: Arc::new(Mutex::new(SmallRng::seed_from_u64(0))),
             latency: 50..150,
             group_cas_conflicts: Arc::new(AtomicU64::new(0)),
+            group_updates: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -78,6 +84,13 @@ where
     /// test can read the count after the run.
     pub fn cas_conflicts_handle(&self) -> Arc<AtomicU64> {
         self.group_cas_conflicts.clone()
+    }
+
+    /// A shared handle to this store's total `update_group` count — every PUT of
+    /// `{group}.json`, won or lost — cloneable before the store is moved into a
+    /// coordinator.
+    pub fn group_updates_handle(&self) -> Arc<AtomicU64> {
+        self.group_updates.clone()
     }
 
     pub fn with_seed(self, seed: u64) -> Self {
@@ -334,6 +347,8 @@ where
         version: Option<Version>,
     ) -> Result<Version, UpdateError<GroupDetail>> {
         self.introduce_latency().await?;
+
+        _ = self.group_updates.fetch_add(1, Ordering::Relaxed);
 
         let result = self.storage.update_group(group_id, detail, version).await;
         if matches!(result, Err(UpdateError::Outdated { .. })) {

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::sync::{Arc, atomic};
 
 use common::init_tracing;
 use rama::{Context, Layer, Service};
@@ -27,7 +27,7 @@ use tansu_sans_io::{
 use tansu_service::{
     BytesFrameLayer, FrameBytesLayer, FrameRouteService, LatencyIntroducingLayer, RequestFrameLayer,
 };
-use tansu_storage::StorageContainer;
+use tansu_storage::{LatencyIntroducingStorage, StorageContainer};
 use tracing::debug;
 use url::Url;
 
@@ -49,6 +49,12 @@ async fn stack() -> Result<(), Error> {
         .storage(Url::parse("memory://")?)
         .build()
         .await?;
+
+    // Wrapped so the test can see every `{group}.json` PUT. Latency is left at
+    // near-zero here — the service stack already introduces its own, and this
+    // wrapper is present for its counter, not its delay.
+    let storage = LatencyIntroducingStorage::new(storage).with_latency(0..1);
+    let group_updates = storage.group_updates_handle();
 
     let coordinator = Controller::with_storage(storage)?;
 
@@ -129,6 +135,31 @@ async fn stack() -> Result<(), Error> {
     let next_action = consumer.next_action(Some(r2.into()))?;
     let heartbeat = HeartbeatRequest::try_from(next_action)?;
     assert_eq!(0, heartbeat.generation_id);
+
+    // #111's actual claim, which was false until #273: a steady-state heartbeat
+    // writes ZERO tier-1 PUTs on `{group}.json`.
+    //
+    // The skip compared `GroupDetail` for strict equality, and `GroupMember`
+    // derives `PartialEq` over `last_contact`, which the heartbeat path assigns
+    // `now` before the comparison. So it could never hold, and every heartbeat
+    // cost 1 GET + 1 CAS PUT per member per interval — ~100 PUT/s at 300 members
+    // fleet-wide, precisely what the code comment asserted it avoided.
+    //
+    // The group is Stable and this member has just been assigned, so nothing
+    // about the rebalance state changes from here: the only field a heartbeat
+    // touches is its own `last_contact`.
+    let settled = group_updates.load(atomic::Ordering::Relaxed);
+
+    for _ in 0..3 {
+        let response = sut.serve(context.clone(), heartbeat.clone()).await?;
+        assert_eq!(i16::from(ErrorCode::None), response.error_code);
+    }
+
+    assert_eq!(
+        settled,
+        group_updates.load(atomic::Ordering::Relaxed),
+        "a steady-state heartbeat must not rewrite {{group}}.json (#111/#273)",
+    );
 
     Ok(())
 }
