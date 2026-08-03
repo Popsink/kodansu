@@ -5333,6 +5333,30 @@ impl DynoStore {
         (prefix != self.groups_root()).then_some(prefix)
     }
 
+    /// The most recent `last_modified` across everything under `group_id`'s
+    /// prefix — its committed offsets — as epoch milliseconds. `None` when the
+    /// group has no objects there at all (#272).
+    ///
+    /// This is the liveness signal `expire_groups` was missing. The state
+    /// object's mtime freezes once a group stops rewriting it, which a
+    /// commit-only consumer does after its first commit, so the offsets
+    /// themselves are the only record that anyone is still using the group.
+    async fn group_committed_activity_ms(&self, group_id: &str) -> Result<Option<i64>> {
+        let Some(prefix) = self.group_prefix(group_id) else {
+            return Ok(None);
+        };
+
+        let mut latest: Option<i64> = None;
+        let mut listing = self.scan(Scan::Group, &prefix);
+
+        while let Some(meta) = listing.next().await.transpose()? {
+            let modified = meta.last_modified.timestamp_millis();
+            latest = Some(latest.map_or(modified, |held: i64| held.max(modified)));
+        }
+
+        Ok(latest)
+    }
+
     /// Enforce the `delete` cleanup policy: for every topic configured with
     /// `cleanup.policy` containing `delete`, drop the batches whose records are
     /// older than `retention.ms` (defaulting to 7 days, matching the SQL
@@ -5375,7 +5399,7 @@ impl DynoStore {
         // The `{group}.json` files directly under the prefix are the group
         // state objects; the `{group}/` common prefixes hold the per-partition
         // committed offsets and are removed alongside them by `delete_groups`.
-        let mut stale: Vec<String> = Vec::new();
+        let mut candidates: Vec<String> = Vec::new();
         for meta in listed.objects {
             if meta.last_modified.timestamp_millis() >= threshold_ms {
                 continue;
@@ -5386,10 +5410,62 @@ impl DynoStore {
             };
 
             if let Some(group_id) = name.as_ref().strip_suffix(".json") {
-                stale.push(group_id.to_owned());
+                candidates.push(group_id.to_owned());
 
-                if stale.len() >= GROUP_EXPIRE_CHUNK {
+                if candidates.len() >= GROUP_EXPIRE_CHUNK {
                     break;
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        // The state object's age is a candidate signal, not a verdict (#272).
+        //
+        // A group that commits offsets without rewriting `{group}.json` looks
+        // abandoned: the first commit creates the state object, and every
+        // subsequent one takes the no-op skip, so its mtime freezes at the first
+        // commit. Seven days later this deleted the group state AND every
+        // committed offset under it, while the consumer was still committing.
+        // An actively committing consumer re-created them within a commit
+        // interval, so the loss window was small; a paused or idle one lost its
+        // offsets outright, with no window at all.
+        //
+        // So each candidate's offsets subtree is consulted before it is
+        // condemned. Cost is one listing per *candidate* — a group already old
+        // enough to be considered — rather than per group, which is what makes
+        // this affordable at ~14.7k topics' worth of groups.
+        //
+        // The failure direction is deliberate: every way this can be wrong keeps
+        // a group that would have been deleted. Expiry reclaiming late is #45's
+        // complaint; expiry reclaiming a live consumer's offsets is data loss.
+        // Whether the *candidate* scan hit the per-tick cap. Taken before the
+        // liveness filter, because that is what bounds the tick's work — a tick
+        // that considered 1000 groups and condemned two still left the listing
+        // unfinished.
+        let capped = candidates.len() >= GROUP_EXPIRE_CHUNK;
+
+        let mut stale: Vec<String> = Vec::with_capacity(candidates.len());
+        for group_id in candidates {
+            match self.group_committed_activity_ms(&group_id).await {
+                Ok(Some(latest_ms)) if latest_ms >= threshold_ms => {
+                    debug!(
+                        group_id,
+                        latest_ms, threshold_ms, "group still committing offsets; not expiring"
+                    );
+                }
+
+                Ok(_) => stale.push(group_id),
+
+                // A listing that failed says nothing about liveness, so it must
+                // not read as "abandoned". Keep the group and retry next tick.
+                Err(err) => {
+                    warn!(
+                        ?err,
+                        group_id, "could not read committed-offset activity; not expiring"
+                    );
                 }
             }
         }
@@ -5398,7 +5474,6 @@ impl DynoStore {
             return Ok(0);
         }
 
-        let capped = stale.len() >= GROUP_EXPIRE_CHUNK;
         let expired = stale.len() as u64;
 
         // `delete_groups` removes each state object and every committed-offset
