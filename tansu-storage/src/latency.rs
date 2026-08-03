@@ -189,6 +189,26 @@ where
         self.storage.offset_stage(topition).await
     }
 
+    /// Delegated explicitly (#273) — see the note on
+    /// `ProduceRequestBatcher::offset_stage_at`. Absorbing these into the trait
+    /// defaults also meant this wrapper introduced no latency on them, which
+    /// quietly weakened the latency tests that exist to bound the fetch path.
+    async fn offset_stage_at(
+        &self,
+        topition: &Topition,
+        isolation: IsolationLevel,
+    ) -> Result<OffsetStage> {
+        self.introduce_latency().await?;
+
+        self.storage.offset_stage_at(topition, isolation).await
+    }
+
+    async fn read_group(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
+        self.introduce_latency().await?;
+
+        self.storage.read_group(group_id).await
+    }
+
     async fn list_offsets(
         &self,
         isolation_level: IsolationLevel,
