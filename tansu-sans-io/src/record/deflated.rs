@@ -511,6 +511,7 @@ impl TryFrom<&Batch> for Vec<Record> {
 
     fn try_from(batch: &Batch) -> Result<Self, Self::Error> {
         let record_count = usize::try_from(batch.record_count)?;
+        let prealloc = record_count.min(RECORD_PREALLOC_LIMIT);
 
         debug!(?record_count);
         debug!(?batch.record_data);
