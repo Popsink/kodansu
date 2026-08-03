@@ -597,14 +597,35 @@ async fn forwarded_sixteen_members_across_ten_replicas_converge() -> Result<()> 
 // The control, proving the proof above is meaningful: the SAME 16 consumers,
 // constants and shared-store latency, scattered across the same 10 replicas
 // WITHOUT forwarding (direct-to-random-`Controller` — the pre-fix production
-// path) must NOT converge inside the same bounded window: the scattered
-// join/sync long-polls keep thrashing the single group object's CAS.
+// path) thrash the single group object's CAS, which is the contention the
+// forwarded path drives to zero.
+//
+// This asserted "must NOT converge" until #273. That was the consequence, not
+// the cause: non-convergence is what contention looks like once it is severe
+// enough to prevent assignment, and asserting it made the control brittle to any
+// improvement anywhere in the CAS path. #273's delegation was that improvement —
+// with #111's GET-first gate finally working, each replica reads the persisted
+// group before writing and refreshes on a version mismatch, so the scattered
+// path now converges while the contention it was standing in for is still there.
+//
+// Measured on this configuration (see the discussion on #310): scattered
+// produces 41 CAS conflicts spread across 9 of the 10 replicas, and converges
+// 16/16 inside the window. The forwarded path pins its owner at exactly 0.
+//
+// So the assertion is the contention itself. The floor is deliberately far below
+// the 41 observed — the point is to prove the conflicts exist without forwarding,
+// not to pin a machine-dependent number — and far enough above zero that a
+// genuine collapse in contention fails the test instead of passing it silently,
+// which is what would have happened here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn scattered_sixteen_members_across_ten_replicas_do_not_converge() -> Result<()> {
+async fn scattered_sixteen_members_across_ten_replicas_thrash_the_group_cas() -> Result<()> {
     let _guard = init_tracing()?;
 
+    /// Well under the 41 measured, well over the 0 the forwarded path achieves.
+    const MINIMUM_SCATTERED_CONFLICTS: u64 = 5;
+
     let shared = shared_storage().await?;
-    let (replicas, _cas_conflicts) = replicas(&shared)?;
+    let (replicas, cas_conflicts) = replicas(&shared)?;
 
     let results = drive_members(&replicas, SCATTERED_WINDOW).await?;
 
@@ -616,18 +637,27 @@ async fn scattered_sixteen_members_across_ten_replicas_do_not_converge() -> Resu
         .map(|(member_id, _)| member_id.clone())
         .collect::<BTreeSet<_>>();
 
-    let converged = unassigned == 0 && persisted_group_converged(&shared, &member_ids).await?;
-
-    assert!(
-        !converged,
-        "16 members scattered across 10 replicas converged WITHOUT forwarding: \
-         the convergence proof no longer demonstrates anything"
-    );
+    let per_replica = cas_conflicts
+        .iter()
+        .map(|counter| counter.load(Ordering::Relaxed))
+        .collect::<Vec<_>>();
+    let total: u64 = per_replica.iter().sum();
 
     debug!(
         unassigned,
         assigned = member_ids.len(),
-        "scattered members did not converge"
+        total,
+        ?per_replica,
+        "scattered members contended on the group object"
+    );
+
+    assert!(
+        total >= MINIMUM_SCATTERED_CONFLICTS,
+        "scattered members produced {total} group-state CAS conflicts \
+         (per replica: {per_replica:?}), under the {MINIMUM_SCATTERED_CONFLICTS} this control \
+         exists to demonstrate. Either the contention forwarding removes has \
+         collapsed — in which case #240's justification needs re-reading, not this \
+         floor lowering — or the scattered path is no longer scattering."
     );
 
     Ok(())
