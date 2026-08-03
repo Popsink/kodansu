@@ -568,11 +568,18 @@ const SEGMENT_READ_TRACE_TTL: Duration = Duration::from_secs(60);
 /// combination is the broker stating records exist at an offset and then
 /// producing none of them — metadata that outlived its segments.
 ///
-/// Expected to be zero. A client cannot tell this from "no new data", so it
-/// polls forever: production had 25.6M records of advertised backlog unreadable
-/// across 168 partitions with no signal anywhere, and because `poll()` covers a
-/// whole assignment, the 250 healthy partitions on the same consumer were
-/// starved with them.
+/// **Not expected to be zero, and not on its own evidence of damage** (#302). It
+/// was assumed to be both, and a client-visible `OffsetOutOfRange` was hung off
+/// it; production answered with 61 topics in 3 minutes at 9 to 21859 offsets
+/// below the high watermark — caught-up consumers. The error is gone; this
+/// counter is what remains, and it is a rate to characterise rather than an
+/// alarm to wire.
+///
+/// The condition it counts is still the one #290 is about: a client cannot tell
+/// an unserved fetch from "no new data", so it polls forever. Production had
+/// 25.6M records of advertised backlog unreadable across 168 partitions with no
+/// signal anywhere, and because `poll()` covers a whole assignment, the 250
+/// healthy partitions on the same consumer were starved with them.
 /// Budget for the read that confirms a fetch is unservable (#290).
 ///
 /// Its own, rather than the caller's remaining long-poll window: the confirming
@@ -7880,30 +7887,37 @@ impl Storage for DynoStore {
                 )
                 .await?;
 
-            // Advertised, and not served (#290).
+            // A fetch that found nothing it was told to find (#290) — recorded,
+            // never answered with an error (#302).
             //
-            // Declared only on POSITIVE evidence: the index must still claim a
-            // segment covering this offset while a read that was actually given
-            // the chance to look produces nothing. Metadata saying "records are
-            // here" against a read that finds none is damage, and nothing else
-            // produces that pair.
+            // This used to return `OffsetOutOfRange` when the index still
+            // claimed a segment over the offset while a read given its own
+            // budget produced nothing, on the reasoning that nothing benign
+            // makes that pair. Production disproved it within minutes of
+            // shipping: 61 warnings in 3 minutes across 61 distinct topics, at
+            // offsets 9 to 21859 below the high watermark — a caught-up
+            // consumer, not a lost log. Every one reset a live consumer through
+            // `auto.offset.reset`.
             //
-            // An empty answer on its own is not evidence, and treating it as
-            // evidence is what makes this dangerous. Two ordinary conditions
-            // produce one:
+            // The mechanism is not established. Two hypotheses were ruled out by
+            // reading the code and are recorded so they are not re-walked:
+            // `record_count` cannot over-claim (it is summed from the encoded
+            // batches' `last_offset_delta + 1`), and the byte budget breaks
+            // *after* pushing batches, so it cannot empty the result on its own.
             //
-            //   - retention. Expiry deletes a segment and its index entry
-            //     together, so an aged-out partition has no covering segment
-            //     while its high watermark stays put. That is the whole of a
-            //     normal expired log, and answering `OffsetOutOfRange` there
-            //     resets a healthy consumer off a log that merely aged out.
-            //   - a slow store. The long-poll window elapsing says the read ran
-            //     out of time, not that the records are absent.
+            // So the condition is observed and counted, and the client is told
+            // nothing. `OffsetOutOfRange` is acted on by the consumer, which
+            // makes the cost of being wrong asymmetric: a false positive skips a
+            // real backlog or replays from the start, while a false negative is
+            // the empty answer this code path has always given. Until the
+            // condition is understood well enough to distinguish a caught-up
+            // consumer from a damaged log — the distance to the high watermark
+            // is the obvious discriminator and this has no notion of it — the
+            // asymmetry decides.
             //
-            // `OffsetOutOfRange` is resolved by the client via
-            // `auto.offset.reset`, so a false positive skips a real backlog or
-            // replays from the start — strictly worse than the hang this
-            // exists to break. Hence: evidence, or say nothing.
+            // Logged at debug: at 61 topics per 3 minutes on a healthy fleet, a
+            // `warn!` here is a signal operators learn to scroll past, which is
+            // the failure #270 had to correct for the rebalance detector.
             if batches.is_empty() {
                 // One forced index refresh before calling it: the benign version
                 // of an empty answer here is this replica's segment view lagging
@@ -7940,22 +7954,20 @@ impl Storage for DynoStore {
                     if confirming.is_empty() {
                         FETCH_UNSERVABLE.add(1, &[]);
 
-                        warn!(
+                        debug!(
                             topic = topition.topic(),
                             partition = topition.partition(),
                             offset,
                             high_watermark,
-                            "advertised records could not be served: a segment claims this offset \
-                             but holds none of it (#290)"
+                            tail_distance = high_watermark - offset,
+                            "a segment claims this offset but the read produced none of it (#302)"
                         );
 
-                        // Reported as an API error so the caller can put it on
-                        // THIS partition. It must not escape as a request-level
-                        // failure: the complaint in #290 is that one damaged
-                        // partition kills a whole consumer, and failing the
-                        // fetch outright would do exactly that to the healthy
-                        // partitions sharing it.
-                        return Err(Error::Api(ErrorCode::OffsetOutOfRange));
+                        // Deliberately no error. See the block comment above:
+                        // `tansu_fetch_unservable` carries the signal, and
+                        // `tail_distance` is what a future gate would key on —
+                        // 9 offsets below the tail is a caught-up consumer,
+                        // millions below it is the lost log of #290.
                     }
                 }
             }

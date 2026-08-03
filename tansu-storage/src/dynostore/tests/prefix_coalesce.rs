@@ -453,31 +453,21 @@ async fn a_recreated_topic_inherits_nothing_from_a_shared_segment() -> Result<()
     Ok(())
 }
 
-/// #290: a fetch the broker cannot serve must fail, bounded, rather than
-/// answering empty and leaving the consumer polling forever.
+/// A fetch whose region yields no batches returns, bounded, and returns **no
+/// error** (#302).
 ///
-/// Production had a prefix whose metadata advertised 3M records and served none
-/// of them at any offset, head or tail. Because a fetch that finds nothing
-/// returns an empty response rather than an error, the consumer could not tell
-/// it from "no new data" — so it polled indefinitely, and since `poll()` covers
-/// a whole assignment, 250 healthy partitions were starved alongside the 168
-/// damaged ones. 25.6M records of advertised backlog sat unreadable with no
-/// signal anywhere.
+/// This test used to assert `OffsetOutOfRange` here. That answer shipped and
+/// fired on 61 healthy topics in 3 minutes, resetting live consumers through
+/// `auto.offset.reset`, so it is gone: the condition is counted by
+/// `tansu_fetch_unservable` and logged at debug, and the client is told nothing.
 ///
-/// Reproduced as the index still claiming the offsets while the segment holding
-/// them yields nothing — #290's second hypothesis, "present but unreachable
-/// because the metadata points at slices belonging to a re-created topic".
-///
-/// That pairing is the whole signal. An empty answer on its own cannot mean
-/// damage: a fully retention-expired log is *also* an advertised high watermark
-/// with no readable records (`policy_delete::retention_ms_expires_old_records`
-/// pins exactly that state, and expects an empty fetch rather than an error).
-/// The two are indistinguishable without a covering index entry, so that is what
-/// is required before anything is reported — reporting on absence alone would
-/// hand `OffsetOutOfRange` to every consumer of an aged-out partition and reset
-/// it off a healthy log.
+/// What remains worth pinning is the property that survives the removal — the
+/// fetch **returns** rather than hanging. #290's complaint was a fetch that never
+/// completed at all, which is what let 25.6M records of advertised backlog sit
+/// unreadable with no signal anywhere while `poll()` starved 250 healthy
+/// partitions on the same consumer.
 #[tokio::test]
-async fn a_fetch_that_cannot_be_served_fails_rather_than_hanging() -> Result<(), Error> {
+async fn a_fetch_whose_region_yields_nothing_returns_without_erroring() -> Result<(), Error> {
     /// Once armed, truncates every segment record read to fewer bytes than a
     /// batch header needs.
     ///
@@ -632,12 +622,84 @@ async fn a_fetch_that_cannot_be_served_fails_rather_than_hanging() -> Result<(),
                 })?;
 
         assert!(
-            matches!(outcome, Err(Error::Api(ErrorCode::OffsetOutOfRange))),
-            "offset {offset} is advertised and the index claims a segment holds it, \
-             but the segment produces none of it — the fetch must say so rather \
-             than answer empty; got {outcome:?}",
+            matches!(outcome, Ok(ref batches) if batches.is_empty()),
+            "offset {offset} must answer empty and without an error — an error here \
+             resets a consumer through auto.offset.reset, and this condition is not \
+             known to mean the log is damaged (#302); got {outcome:?}",
         );
     }
+
+    Ok(())
+}
+
+/// A caught-up consumer is never told its offset is out of range (#302).
+///
+/// **This is the test whose absence let the bug reach a cluster.** Its sibling
+/// above pinned that a simulated damaged region produced `OffsetOutOfRange`;
+/// nothing pinned the converse, so an answer that fired on healthy partitions
+/// looked correct all the way to production, where it reset consumers on 61
+/// topics in 3 minutes at 9 to 21859 offsets below the high watermark.
+///
+/// The tail is where it happened, so the tail is what this walks: the last
+/// offset, and every offset in the log, on a partition with nothing wrong with
+/// it.
+#[tokio::test]
+async fn a_caught_up_consumer_is_never_told_it_is_out_of_range() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
+
+    let topic = "org.env.conn.tab_healthy";
+    create_topic(&store, topic).await?;
+
+    let tp = Topition::new(topic, 0);
+
+    // Two flushes, so the sub-stream spans more than one segment and the tail
+    // segment is not also the first.
+    assert_eq!(0, store.produce(None, &tp, batch(4)?).await?);
+    assert_eq!(4, store.produce(None, &tp, batch(3)?).await?);
+
+    let high_watermark = store.high_watermark(&tp).await?;
+    assert_eq!(7, high_watermark);
+
+    // Every offset in the log, tail included. None may error, and each must
+    // reach the tail.
+    for offset in 0..high_watermark {
+        let fetched = fetch_from(&store, &tp, offset).await.map_err(|err| {
+            Error::Message(format!(
+                "offset {offset} of {high_watermark} is servable, but the fetch errored: \
+                 {err:?} — this is what resets a healthy consumer"
+            ))
+        })?;
+
+        assert!(
+            !fetched.is_empty(),
+            "offset {offset} of {high_watermark} must serve records",
+        );
+
+        // Whole batches are returned, so the answer may begin *before* the
+        // requested offset — the consumer trims to its own position, as it does
+        // against Kafka. Asserting an exact record count here would pin
+        // batch-splitting the broker deliberately does not do. What matters is
+        // that the tail is reachable from every offset.
+        let last_offset = fetched
+            .iter()
+            .map(|batch| batch.base_offset + batch.last_offset_delta as i64)
+            .max()
+            .expect("a non-empty answer has a last offset");
+
+        assert_eq!(
+            high_watermark - 1,
+            last_offset,
+            "offset {offset} must reach the tail",
+        );
+    }
+
+    // And the tail itself: at the high watermark there is nothing yet, which is
+    // an empty answer, never an error.
+    assert!(
+        fetch_from(&store, &tp, high_watermark).await?.is_empty(),
+        "a consumer sitting exactly at the tail has caught up, not run out of range",
+    );
 
     Ok(())
 }
