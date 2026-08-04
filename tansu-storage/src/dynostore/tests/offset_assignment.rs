@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::TryStreamExt as _;
-use object_store::{ObjectStore as _, ObjectStoreExt as _, memory::InMemory, path::Path};
+use object_store::{ObjectStore as _, memory::InMemory, path::Path};
 use tansu_sans_io::{
     IsolationLevel, ListOffset, create_topics_request::CreatableTopic, record::Record,
     record::deflated, record::inflated,
