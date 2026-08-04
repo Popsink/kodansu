@@ -63,7 +63,8 @@ use bytes::{Bytes, TryGetError};
 
 use console::Emoji;
 #[cfg(feature = "dynostore")]
-use dynostore::{CoalesceTuning, DynoStore};
+use dynostore::CoalesceTuning;
+pub use dynostore::DynoStore;
 
 use glob::{GlobError, PatternError};
 
@@ -144,8 +145,6 @@ mod latency;
 mod null;
 mod service;
 
-#[cfg(feature = "dynostore")]
-pub use dynostore::DynoStore;
 pub use latency::LatencyIntroducingStorage;
 
 pub use service::{
