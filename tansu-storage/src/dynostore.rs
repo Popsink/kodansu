@@ -735,6 +735,58 @@ static PREFIX_INDEX_SUBSTREAM_ENTRIES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// How far the persisted floor sits above the surviving segment tail, or `None`
+/// when that is not the state (#290).
+///
+/// The whole subtlety is `tail == None`. A sub-stream with no segment at all is a
+/// *drained* partition, where the floor is legitimately the only authority and #299
+/// already makes it report a log that starts where it ends. The state worth
+/// measuring is the **partial** one: records still served below the tail, offsets
+/// advertised above it, and nothing in between for a consumer parked there.
+///
+/// Pure, so the distinction that matters can be asserted without standing up a
+/// metrics reader.
+fn floor_above_tail(tail: Option<i64>, watermark_floor: i64) -> Option<i64> {
+    tail.filter(|tail| watermark_floor > *tail)
+        .map(|tail| watermark_floor - tail)
+}
+
+/// High-watermark resolutions where the persisted floor was **above** the
+/// surviving segment tail, on a sub-stream that still holds segments (#290).
+///
+/// That is the state in which the broker advertises offsets no surviving segment
+/// holds. A consumer parked in the gap reads empty on every poll, forever, with no
+/// error on either side — `retention_can_orphan_offsets_below_the_advertised_watermark`
+/// pins how ordinary retention reaches it.
+///
+/// **This counter does not say a fault occurred.** The same arithmetic is produced
+/// by a peer replica having acked offsets this process never listed — segments
+/// created *and* expired inside its blind window — where advertising the floor is
+/// correct and lowering it would regress the log end below acknowledged offsets.
+/// The two are byte-identical locally *and* in the bucket, since in both cases the
+/// segments are gone. So this is a rate to characterise, not an alarm to wire, and
+/// choosing between the candidate fixes needs its magnitude first.
+///
+/// Costs nothing to compute: both operands are already in hand at the fold. It is
+/// deliberately not the shape of #292's detector, which paid a forced LIST and a
+/// confirming read per empty fetch and measured ~10/min on a healthy fleet before
+/// being removed in #314.
+///
+/// Labelled by prefix — bounded at tens — because "which prefix" is the first
+/// question, and per-partition labels would not be bounded on a 14.7k-topic fleet.
+/// The gap size goes in the log rather than a label: nine offsets below the tail is
+/// a caught-up consumer, millions is a lost log, and that distinction wants a value
+/// and not a series.
+static WATERMARK_ABOVE_SEGMENT_TAIL: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_watermark_above_segment_tail")
+        .with_description(
+            "high watermark resolutions where the persisted floor exceeded the \
+             surviving segment tail, by prefix",
+        )
+        .build()
+});
+
 /// Live segment count per prefix after a maintenance tick (#66) — the signal
 /// that tells whether compaction is keeping `S` bounded (a counter can't).
 ///
@@ -2495,13 +2547,15 @@ impl DynoStore {
         let prefix = self.routed_prefix_of(topition).await?;
         self.refresh_prefix_index(&prefix).await?;
 
-        // `0` for a sub-stream holding no segment: the persisted floor below is
-        // then the whole answer, which is what the slow path would fold too.
+        // `None` for a sub-stream holding no segment: the persisted floor below is
+        // then the whole answer, which is what the slow path would fold too. Kept
+        // as an `Option` because "holds segments at all" is what separates the
+        // state #290 is about from a drained partition (#299) — see
+        // [`Self::note_floor_above_tail`].
         let tail = self
             .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
             .last()
-            .map(|(_, entry)| entry.base_offset + entry.record_count)
-            .unwrap_or(0);
+            .map(|(_, entry)| entry.base_offset + entry.record_count);
 
         // Certified after the refresh above, so the floor covers every
         // watermark advance whose segment deletion that listing could have
@@ -2512,10 +2566,13 @@ impl DynoStore {
             return Ok(None);
         };
 
+        self.note_floor_above_tail(&prefix, topition, tail, watermark_floor);
+
         // The same fold the slow path performs — `recover_substream_next_offset`
         // is `max(segment tail, persisted floor)` — so this serves the
         // value that path would have computed, without its per-partition GET.
         let high = tail
+            .unwrap_or(0)
             .max(watermark_floor)
             .max(self.cached_high(topition)?.unwrap_or(0));
 
@@ -2527,6 +2584,43 @@ impl DynoStore {
         self.mark_listed(topition, high, as_of)?;
 
         Ok(Some(high))
+    }
+
+    /// Record that the persisted floor sits above the surviving segment tail, when
+    /// the sub-stream still holds segments (#290).
+    ///
+    /// `tail` is `None` for a sub-stream with no segment at all, which is *not* this
+    /// state: a fully drained partition legitimately has the floor as its only
+    /// authority, and #299 already makes it report a log that starts where it ends.
+    /// The state worth counting is the partial one — records still served below the
+    /// tail, offsets advertised above it, nothing in between.
+    ///
+    /// Free: both operands are already resolved by the caller. No request, no
+    /// listing, no confirming read — deliberately unlike #292's detector, which paid
+    /// for all three per empty fetch and was removed in #314 once the condition
+    /// measured ~10/min on healthy data.
+    ///
+    /// Debug rather than warn, and no error code, because the condition does not
+    /// imply damage: a peer replica that acked offsets this process never listed
+    /// produces the same arithmetic, and there the floor is the correct answer. What
+    /// is missing today is not an alarm but a magnitude — which of the candidate
+    /// fixes is worth its cost depends on whether this fires once a week or
+    /// constantly.
+    fn note_floor_above_tail(
+        &self,
+        prefix: &str,
+        topition: &Topition,
+        tail: Option<i64>,
+        watermark_floor: i64,
+    ) {
+        if let Some(gap) = floor_above_tail(tail, watermark_floor) {
+            WATERMARK_ABOVE_SEGMENT_TAIL.add(1, &[KeyValue::new("prefix", prefix.to_string())]);
+
+            debug!(
+                ?topition,
+                tail, watermark_floor, gap, "advertising offsets no surviving segment holds (#290)"
+            );
+        }
     }
 
     /// The log end offset (high watermark) for `topition`.
@@ -2583,6 +2677,18 @@ impl DynoStore {
         // layout it maintained, so there is no writer left that moves this value
         // without raising a floor.
         self.cache_coalesced_watermark(topition, from_watermark, floor)?;
+
+        // Counted here too, or the measurement would be blind to exactly the reader
+        // most likely to meet the state: a cold one, whose watermark cache the fast
+        // path declined (#290).
+        self.note_floor_above_tail(
+            &prefix,
+            topition,
+            self.valid_substream_segments(&prefix, topition.topic(), topition.partition())?
+                .last()
+                .map(|(_, entry)| entry.base_offset + entry.record_count),
+            from_watermark,
+        );
 
         let recovered = self
             .recover_substream_next_offset(topition, from_watermark)
@@ -10478,5 +10584,36 @@ mod throttle_tests {
 
         // The whole budget, at the cap, stays sub-second.
         assert!(64 * cas_conflict_backoff(64) < Duration::from_secs(3));
+    }
+}
+
+#[cfg(test)]
+mod floor_above_tail_tests {
+    use super::floor_above_tail;
+
+    /// The state #290 is about: segments survive, and the floor advertises offsets
+    /// above their tail. Two records at `[0, 2)` with a floor of 4 leaves offsets 2
+    /// and 3 advertised and unreadable.
+    #[test]
+    fn a_floor_above_a_surviving_tail_is_the_gap() {
+        assert_eq!(Some(2), floor_above_tail(Some(2), 4));
+    }
+
+    /// **Not** this state, and the distinction the counter exists to preserve: a
+    /// sub-stream with no segment at all is a drained partition, whose floor is
+    /// legitimately its only authority. #299 already reports it as a log that starts
+    /// where it ends, and counting it here would bury the partial case in noise —
+    /// drained partitions are common on a fleet with retention.
+    #[test]
+    fn a_drained_substream_is_not_the_gap() {
+        assert_eq!(None, floor_above_tail(None, 3_024_895));
+    }
+
+    /// The ordinary case: the segments reach the floor, so nothing is advertised
+    /// that cannot be served.
+    #[test]
+    fn a_tail_that_reaches_the_floor_is_not_the_gap() {
+        assert_eq!(None, floor_above_tail(Some(4), 4));
+        assert_eq!(None, floor_above_tail(Some(9), 4));
     }
 }
