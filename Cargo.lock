@@ -4095,7 +4095,6 @@ dependencies = [
  "pretty_assertions",
  "rama",
  "rand 0.10.1",
- "regex",
  "rsasl",
  "serde",
  "serde_json",

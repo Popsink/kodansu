@@ -85,18 +85,14 @@ use opentelemetry::{InstrumentationScope, global, metrics::Meter};
 use opentelemetry_semantic_conventions::SCHEMA_URL;
 
 use governor::InsufficientCapacity;
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::{
     array::TryFromSliceError,
     collections::BTreeMap,
-    ffi::OsString,
     fmt::{self, Debug, Display, Formatter},
-    fs::DirEntry,
     io,
     marker::PhantomData,
     num::{ParseIntError, TryFromIntError},
-    path::PathBuf,
     result,
     str::FromStr,
     sync::{Arc, LazyLock, PoisonError},
@@ -182,7 +178,6 @@ pub enum Error {
 
     Message(String),
     NoSuchOffset(i64),
-    OsString(OsString),
 
     #[cfg(feature = "dynostore")]
     ObjectStore(Arc<object_store::Error>),
@@ -191,8 +186,6 @@ pub enum Error {
     ParseInt(#[from] ParseIntError),
     PhantomCached(),
     Poison,
-
-    Regex(#[from] regex::Error),
 
     SansIo(#[from] tansu_sans_io::Error),
 
@@ -336,41 +329,6 @@ impl From<Cursor> for Topition {
     }
 }
 
-impl TryFrom<&DirEntry> for Topition {
-    type Error = Error;
-
-    fn try_from(value: &DirEntry) -> result::Result<Self, Self::Error> {
-        Regex::new(r"^(?<topic>.+)-(?<partition>\d{10})$")
-            .map_err(Into::into)
-            .and_then(|re| {
-                value
-                    .file_name()
-                    .into_string()
-                    .map_err(Error::OsString)
-                    .and_then(|ref file_name| {
-                        re.captures(file_name)
-                            .ok_or(Error::Message(format!("no captures for {file_name}")))
-                            .and_then(|ref captures| {
-                                let topic = captures
-                                    .name("topic")
-                                    .ok_or(Error::Message(format!("missing topic for {file_name}")))
-                                    .map(|s| s.as_str().to_owned())?;
-
-                                let partition = captures
-                                    .name("partition")
-                                    .ok_or(Error::Message(format!(
-                                        "missing partition for: {file_name}"
-                                    )))
-                                    .map(|s| s.as_str())
-                                    .and_then(|s| str::parse(s).map_err(Into::into))?;
-
-                                Ok(Self { topic, partition })
-                            })
-                    })
-            })
-    }
-}
-
 impl FromStr for Topition {
     type Err = Error;
 
@@ -382,14 +340,6 @@ impl FromStr for Topition {
                 Self { topic, partition }
             })
             .map_err(Into::into)
-    }
-}
-
-impl From<&Topition> for PathBuf {
-    fn from(value: &Topition) -> Self {
-        let topic = value.topic.as_str();
-        let partition = value.partition;
-        PathBuf::from(format!("{topic}-{partition:0>10}"))
     }
 }
 
@@ -413,13 +363,6 @@ impl TopitionOffset {
 
     pub fn offset(&self) -> i64 {
         self.offset
-    }
-}
-
-impl From<&TopitionOffset> for PathBuf {
-    fn from(value: &TopitionOffset) -> Self {
-        let offset = value.offset;
-        PathBuf::from(value.topition()).join(format!("{offset:0>20}"))
     }
 }
 
