@@ -159,6 +159,27 @@ impl TryFrom<Bytes> for Batch {
             digest.finalize() as u32
         };
 
+        // Log a mismatch, do not refuse the batch. This decoder is shared by
+        // the two directions and only one of them can afford to reject:
+        //
+        //  - decoding a request off the wire: a mismatch means a corrupt
+        //    batch, and it *is* refused — but by `ProduceService`, not here.
+        //    Failing here fails the whole request body, and a request the
+        //    broker cannot decode is answered by ending the connection with
+        //    no response at all, so the producer learns nothing. Rejecting
+        //    in the produce path instead answers CORRUPT_MESSAGE (2) for the
+        //    partition, which is what Kafka does and what a client can act
+        //    on.
+        //  - decoding bytes back out of storage: a mismatch here does not
+        //    imply corruption. `ProduceService` rewrites `base_timestamp`
+        //    and `max_timestamp` for a LogAppendTime batch after this check
+        //    and before the batch is stored, without recomputing the CRC —
+        //    both fields are inside the digested range, so the broker itself
+        //    persists batches whose CRC is stale by design. Refusing them on
+        //    the way out would refuse data we wrote.
+        //
+        // So the asymmetry is deliberate: strict on the way in, permissive
+        // on the way out. Do not "simplify" it by rejecting here (#271).
         if computed != crc {
             error!(crc, computed);
         }
@@ -224,6 +245,33 @@ impl Batch {
 
     pub fn is_idempotent(&self) -> bool {
         self.producer_id != -1 && self.base_sequence != -1
+    }
+
+    /// The CRC-32C that this batch's own fields imply.
+    ///
+    /// Recomputed from `attributes` through `record_data` — the same range,
+    /// in the same order, that is digested when a batch is built and when one
+    /// is decoded. `base_offset`, `batch_length`, `partition_leader_epoch`
+    /// and `magic` precede the CRC on the wire and are not covered by it.
+    ///
+    /// This goes through `CrcData` rather than digesting the fields directly
+    /// so that the digested range has exactly one definition — a field added
+    /// there is covered here for free. The price is a payload-sized copy and a
+    /// second CRC pass over a batch the decoder already digested once. That is
+    /// paid per produced batch, against a produce that ends in an object-store
+    /// PUT; if it ever shows up in a profile, the fix is for the decoder to
+    /// carry its verdict, not for this to hand-roll the field order.
+    pub fn computed_crc(&self) -> Result<u32> {
+        CrcData::from(self).crc()
+    }
+
+    /// Whether the `crc` field agrees with the payload it is meant to cover.
+    ///
+    /// Decoding a batch does *not* enforce this (see the note at the mismatch
+    /// in the `TryFrom<Bytes>` impl above); callers that want to refuse a
+    /// corrupt batch ask for it here.
+    pub fn crc_matches(&self) -> Result<bool> {
+        self.computed_crc().map(|computed| computed == self.crc)
     }
 }
 
@@ -1240,6 +1288,130 @@ mod record_prealloc {
             Vec::<Record>::try_from(deflated)?.len(),
             "the ceiling must bound the reservation, not the decode",
         );
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod crc_verification {
+    use super::*;
+    use crate::record::inflated;
+
+    fn a_batch() -> Result<Batch> {
+        inflated::Batch::builder()
+            .record(
+                Record::builder()
+                    .key(Some(Bytes::from_static(b"key")))
+                    .value(Some(Bytes::from_static(b"value"))),
+            )
+            .build()
+            .and_then(Batch::try_from)
+    }
+
+    /// **The converse, and the one that matters.** Every batch the builder
+    /// produces verifies.
+    ///
+    /// [`Batch::computed_crc`] recomputes from the struct's fields while
+    /// decoding digests a byte range; if those two ever disagreed on the shape
+    /// of the digested region, `ProduceService` would reject *all* traffic.
+    /// A round trip through the encoder is what pins that they agree.
+    #[test]
+    fn a_batch_and_its_decoded_form_both_verify() -> Result<()> {
+        let batch = a_batch()?;
+
+        assert!(batch.crc_matches()?, "a freshly built batch must verify");
+
+        let decoded = Batch::try_from(Bytes::from(batch.clone()))?;
+
+        assert!(decoded.crc_matches()?, "a decoded batch must verify");
+        assert_eq!(batch.crc, decoded.crc);
+        assert_eq!(batch.computed_crc()?, decoded.computed_crc()?);
+
+        Ok(())
+    }
+
+    /// The digest covers the payload, so altering it is detected.
+    #[test]
+    fn an_altered_payload_does_not_verify() -> Result<()> {
+        let batch = a_batch()?;
+
+        let mut corrupt = BytesMut::from(&batch.record_data[..]);
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xff;
+
+        let altered = Batch {
+            record_data: corrupt.freeze(),
+            ..batch.clone()
+        };
+
+        assert_ne!(batch.record_data, altered.record_data);
+        assert!(
+            !altered.crc_matches()?,
+            "a payload byte flip must not verify"
+        );
+
+        Ok(())
+    }
+
+    /// `base_offset` sits before the CRC on the wire and is *not* covered by
+    /// it — the broker assigns it at append time, so a batch whose offset was
+    /// rewritten must still verify.
+    #[test]
+    fn assigning_a_base_offset_does_not_invalidate_the_crc() -> Result<()> {
+        let batch = Batch {
+            base_offset: 91_827,
+            ..a_batch()?
+        };
+
+        assert!(batch.crc_matches()?, "base_offset is outside the digest");
+
+        Ok(())
+    }
+
+    /// The mechanism the asymmetry rests on: `base_timestamp` **is** covered,
+    /// so `ProduceService`'s LogAppendTime rewrite leaves the CRC stale.
+    ///
+    /// This is why the decoder stays permissive. A batch that took that
+    /// rewrite is stored with a CRC that no longer matches, and refusing it on
+    /// the way out would refuse data the broker itself wrote. If this test
+    /// ever fails because the rewrite started recomputing the CRC, the
+    /// permissive read side can be revisited — that is the point of pinning it.
+    #[test]
+    fn rewriting_a_covered_timestamp_leaves_the_crc_stale() -> Result<()> {
+        let batch = a_batch()?;
+
+        let rewritten = Batch {
+            base_timestamp: batch.base_timestamp + 1,
+            max_timestamp: batch.max_timestamp + 1,
+            ..batch
+        };
+
+        assert!(
+            !rewritten.crc_matches()?,
+            "timestamps are inside the digest, so a rewrite invalidates the crc"
+        );
+
+        Ok(())
+    }
+
+    /// Decoding a corrupt batch **succeeds**, deliberately.
+    ///
+    /// Pinned so that turning the mismatch into an error is a visible decision
+    /// with a failing test behind it, not a quiet edit. The rejection belongs
+    /// to `ProduceService`, which can answer CORRUPT_MESSAGE; failing here
+    /// fails the whole request and the connection dies with no response.
+    #[test]
+    fn decoding_does_not_enforce_the_crc() -> Result<()> {
+        let batch = Batch {
+            crc: a_batch()?.crc ^ 0xffff_ffff,
+            ..a_batch()?
+        };
+
+        let decoded = Batch::try_from(Bytes::from(batch.clone()))?;
+
+        assert_eq!(batch.crc, decoded.crc, "the bad crc is carried through");
+        assert!(!decoded.crc_matches()?, "and it is still detectable");
 
         Ok(())
     }
