@@ -59,7 +59,7 @@
 //!
 
 use async_trait::async_trait;
-use bytes::{Bytes, TryGetError};
+use bytes::Bytes;
 
 use console::Emoji;
 #[cfg(feature = "dynostore")]
@@ -71,8 +71,6 @@ use dynostore::CoalesceTuning;
 // `--all-features`, which resolves this one to its non-default set.
 #[cfg(feature = "dynostore")]
 pub use dynostore::DynoStore;
-
-use glob::{GlobError, PatternError};
 
 use indicatif::{ProgressBar, ProgressStyle};
 #[cfg(feature = "dynostore")]
@@ -105,7 +103,7 @@ use std::{
     time::{Duration, SystemTime, SystemTimeError},
 };
 use tansu_sans_io::{
-    Body, ConfigResource, ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, ScramMechanism,
+    ConfigResource, ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, ScramMechanism,
     add_partitions_to_txn_request::{
         AddPartitionsToTxnRequest, AddPartitionsToTxnTopic, AddPartitionsToTxnTransaction,
     },
@@ -134,7 +132,6 @@ use tansu_sans_io::{
     txn_offset_commit_request::TxnOffsetCommitRequestTopic,
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
-use tokio::sync::AcquireError;
 use tracing::debug;
 use tracing_subscriber::filter::ParseError;
 use url::Url;
@@ -173,44 +170,17 @@ mod os;
 /// Storage Errors
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
-    Acquire(Arc<AcquireError>),
-
     Api(ErrorCode),
-
-    ChronoParse(#[from] chrono::ParseError),
-
-    Decode(Bytes),
 
     FeatureNotEnabled {
         feature: String,
         message: String,
     },
 
-    Glob(Arc<GlobError>),
     InsufficientCapacity(#[from] InsufficientCapacity),
     Io(Arc<io::Error>),
 
-    LessThanBaseOffset {
-        offset: i64,
-        base_offset: i64,
-    },
-    LessThanLastOffset {
-        offset: i64,
-        last_offset: Option<i64>,
-    },
-
-    LessThanMaxTime {
-        time: i64,
-        max_time: Option<i64>,
-    },
-    LessThanMinTime {
-        time: i64,
-        min_time: Option<i64>,
-    },
     Message(String),
-    NoSuchEntry {
-        nth: u32,
-    },
     NoSuchOffset(i64),
     OsString(OsString),
 
@@ -218,7 +188,6 @@ pub enum Error {
     ObjectStore(Arc<object_store::Error>),
 
     ParseFilter(Arc<ParseError>),
-    Pattern(Arc<PatternError>),
     ParseInt(#[from] ParseIntError),
     PhantomCached(),
     Poison,
@@ -227,27 +196,12 @@ pub enum Error {
 
     SansIo(#[from] tansu_sans_io::Error),
 
-    Rustls(#[from] rustls::Error),
-
-    SegmentEmpty(Topition),
-
-    SegmentMissing {
-        topition: Topition,
-        offset: Option<i64>,
-    },
-
     SerdeJson(Arc<serde_json::Error>),
 
     SystemTime(#[from] SystemTimeError),
 
     TryFromInt(#[from] TryFromIntError),
     TryFromSlice(#[from] TryFromSliceError),
-
-    TryGet(Arc<TryGetError>),
-
-    UnexpectedBody(Box<Body>),
-
-    UnknownCacheKey(String),
 
     UnsupportedStorageUrl(Url),
     UnexpectedAddPartitionsToTxnRequest(Box<AddPartitionsToTxnRequest>),
@@ -280,27 +234,9 @@ impl Display for Error {
     }
 }
 
-impl From<TryGetError> for Error {
-    fn from(value: TryGetError) -> Self {
-        Self::TryGet(Arc::new(value))
-    }
-}
-
 impl<T> From<PoisonError<T>> for Error {
     fn from(_value: PoisonError<T>) -> Self {
         Self::Poison
-    }
-}
-
-impl From<AcquireError> for Error {
-    fn from(value: AcquireError) -> Self {
-        Self::Acquire(Arc::new(value))
-    }
-}
-
-impl From<GlobError> for Error {
-    fn from(value: GlobError) -> Self {
-        Self::Glob(Arc::new(value))
     }
 }
 
@@ -350,12 +286,6 @@ pub(crate) fn storage_error_code(error: &Error) -> ErrorCode {
 impl From<ParseError> for Error {
     fn from(value: ParseError) -> Self {
         Self::ParseFilter(Arc::new(value))
-    }
-}
-
-impl From<PatternError> for Error {
-    fn from(value: PatternError) -> Self {
-        Self::Pattern(Arc::new(value))
     }
 }
 
