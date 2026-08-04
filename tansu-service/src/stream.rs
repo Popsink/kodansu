@@ -386,8 +386,24 @@ where
     where
         W: AsyncWriteExt + Unpin,
     {
+        // Deliberately does not log. A write that fails here is almost always the
+        // client having gone away mid-response — `BrokenPipe`, `ConnectionReset` —
+        // which is routine for a broker clients connect to and drop continuously,
+        // and it was logged at ERROR unconditionally.
+        //
+        // #289 removed the same duplication from `process` and reworked the
+        // per-connection boundaries to classify, but missed this site. beta.36
+        // found it in twenty minutes: with the retriable protocol answers gone from
+        // the error plane, the one remaining unclassified emitter was the only
+        // ERROR left standing — `err=Os { code: 32, kind: BrokenPipe }` from
+        // exactly here.
+        //
+        // The error still propagates to the boundary that ends the connection, and
+        // that boundary asks the error what it is worth ([`crate::Classify`]),
+        // where a broken pipe is `Severity::Expected`. So dropping the log loses
+        // nothing and stops asserting that a departing client is a fault.
         let mut w = BufWriter::new(req);
-        w.write_all(&frame).await.inspect_err(|err| error!(?err))?;
+        w.write_all(&frame).await?;
         BYTES_SENT.add(frame.len() as u64, &[]);
         w.flush().await.map_err(Into::into)
     }
