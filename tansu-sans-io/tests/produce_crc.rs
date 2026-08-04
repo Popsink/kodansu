@@ -179,6 +179,11 @@ const PRODUCE_REQUEST_V10_003: &[u8] = &[
 ];
 
 /// Every batch in every captured produce request verifies.
+///
+/// Collects **all** disagreements before failing. A test over nine captures that
+/// stops at the first tells you the least useful thing it could: the first run of
+/// this file panicked on capture one and left the other eight unknown, which cost
+/// a whole CI cycle to learn nothing about them.
 #[test]
 fn every_captured_produce_request_verifies() -> Result<()> {
     let captures: [(&str, &[u8]); 9] = [
@@ -193,7 +198,8 @@ fn every_captured_produce_request_verifies() -> Result<()> {
         ("produce_request_v10_003", PRODUCE_REQUEST_V10_003),
     ];
 
-    let mut batches_checked = 0usize;
+    let mut checked = 0usize;
+    let mut disagreements = Vec::new();
 
     for (name, bytes) in captures {
         let request = Frame::request_from_bytes(bytes)
@@ -206,29 +212,38 @@ fn every_captured_produce_request_verifies() -> Result<()> {
                     .into_iter()
                     .flat_map(|frame| frame.batches)
                 {
-                    assert!(
-                        batch.crc_matches()?,
-                        "{name}: a real client's batch does not verify — the produce path \
-                         would answer CORRUPT_MESSAGE and refuse this producer's data. \
-                         crc={} computed={} attributes={} record_count={}",
-                        batch.crc,
-                        batch.computed_crc()?,
-                        batch.attributes,
-                        batch.record_count,
-                    );
+                    checked += 1;
 
-                    batches_checked += 1;
+                    if !batch.crc_matches()? {
+                        disagreements.push(format!(
+                            "{name}: crc={} computed={} magic={} attributes={} \
+                             record_count={} batch_length={} record_data_len={}",
+                            batch.crc,
+                            batch.computed_crc()?,
+                            batch.magic,
+                            batch.attributes,
+                            batch.record_count,
+                            batch.batch_length,
+                            batch.record_data.len(),
+                        ));
+                    }
                 }
             }
         }
     }
 
-    // The precondition. Without it an empty walk — a decode that yielded no
-    // batches, a field renamed, a capture list that silently emptied — passes
-    // while checking nothing.
+    // The precondition. Without it an empty walk passes while checking nothing.
     assert!(
-        batches_checked >= 9,
-        "expected at least one batch per capture, walked {batches_checked}",
+        checked >= 9,
+        "expected at least one batch per capture, walked {checked}",
+    );
+
+    assert!(
+        disagreements.is_empty(),
+        "{} of {checked} real-client batches do not verify — the produce path would \
+         answer CORRUPT_MESSAGE and refuse this traffic (#271/#315):\n  {}",
+        disagreements.len(),
+        disagreements.join("\n  "),
     );
 
     Ok(())
