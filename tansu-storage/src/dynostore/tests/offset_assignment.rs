@@ -525,8 +525,8 @@ async fn a_cold_replica_must_not_reuse_offsets_below_the_persisted_floor() -> Re
 
     assert!(
         base >= floor,
-        "leaseless_base returned {base}, below the persisted floor of {floor}: a produce \\
-         here re-assigns offsets {base}..{floor} that were already acknowledged, so \\
+        "leaseless_base returned {base}, below the persisted floor of {floor}: a produce \
+         here re-assigns offsets {base}..{floor} that were already acknowledged, so \
          consumers see duplicate offsets carrying different payloads (#287)",
     );
 
