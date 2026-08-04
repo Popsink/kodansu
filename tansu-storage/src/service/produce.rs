@@ -919,10 +919,19 @@ mod tests {
 
         // The precondition. Without it a pass could mean the batch was
         // rejected for some unrelated reason.
-        assert!(
-            !corrupt.crc_matches()?,
-            "the batch under test must actually be corrupt",
-        );
+        assert!(!corrupt.crc_matches()?, "the batch must actually be corrupt");
+
+        let frame = Frame {
+            batches: vec![corrupt],
+        };
+
+        let partition_data = PartitionProduceData::default()
+            .index(index)
+            .records(Some(frame));
+
+        let topic_data = TopicProduceData::default()
+            .name(topic.into())
+            .partition_data(Some(vec![partition_data]));
 
         let response = ProduceService
             .serve(
@@ -931,17 +940,7 @@ mod tests {
                     .transactional_id(None)
                     .acks(0)
                     .timeout_ms(0)
-                    .topic_data(Some(vec![
-                        TopicProduceData::default()
-                            .name(topic.into())
-                            .partition_data(Some(vec![
-                                PartitionProduceData::default().index(index).records(Some(
-                                    Frame {
-                                        batches: vec![corrupt],
-                                    },
-                                )),
-                            ])),
-                    ])),
+                    .topic_data(Some(vec![topic_data])),
             )
             .await?;
 
@@ -993,7 +992,7 @@ mod tests {
         // The precondition: this batch really does take the rewrite.
         assert_eq!(
             TimestampType::LogAppendTime,
-            BatchAttribute::try_from(attributes)?.timestamp,
+            BatchAttribute::try_from(attributes)?.timestamp
         );
 
         assert_eq!(

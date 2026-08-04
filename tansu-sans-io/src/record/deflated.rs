@@ -250,13 +250,11 @@ impl Batch {
     /// The CRC-32C that this batch's own fields imply.
     ///
     /// Recomputed from `attributes` through `record_data` — the same range,
-    /// in the same order, that [`CrcData::crc`] digests when a batch is
-    /// built, and that [`TryFrom<Bytes>`](Batch::try_from) digests when one
-    /// is decoded. `base_offset`, `batch_length`,
-    /// `partition_leader_epoch` and `magic` precede the CRC on the wire and
-    /// are not covered by it.
+    /// in the same order, that is digested when a batch is built and when one
+    /// is decoded. `base_offset`, `batch_length`, `partition_leader_epoch`
+    /// and `magic` precede the CRC on the wire and are not covered by it.
     ///
-    /// This goes through [`CrcData`] rather than digesting the fields directly
+    /// This goes through `CrcData` rather than digesting the fields directly
     /// so that the digested range has exactly one definition — a field added
     /// there is covered here for free. The price is a payload-sized copy and a
     /// second CRC pass over a batch the decoder already digested once. That is
@@ -269,9 +267,9 @@ impl Batch {
 
     /// Whether the `crc` field agrees with the payload it is meant to cover.
     ///
-    /// Decoding a batch does *not* enforce this (see the note at the
-    /// mismatch in [`TryFrom<Bytes>`](Batch::try_from)); callers that want
-    /// to refuse a corrupt batch ask for it here.
+    /// Decoding a batch does *not* enforce this (see the note at the mismatch
+    /// in the `TryFrom<Bytes>` impl above); callers that want to refuse a
+    /// corrupt batch ask for it here.
     pub fn crc_matches(&self) -> Result<bool> {
         self.computed_crc().map(|computed| computed == self.crc)
     }
@@ -1348,10 +1346,7 @@ mod crc_verification {
         };
 
         assert_ne!(batch.record_data, altered.record_data);
-        assert!(
-            !altered.crc_matches()?,
-            "a payload byte flip must not verify",
-        );
+        assert!(!altered.crc_matches()?, "a payload byte flip must not verify");
 
         Ok(())
     }
@@ -1391,7 +1386,7 @@ mod crc_verification {
 
         assert!(
             !rewritten.crc_matches()?,
-            "timestamps are inside the digest, so a rewrite invalidates the crc",
+            "timestamps are inside the digest, so a rewrite invalidates the crc"
         );
 
         Ok(())
