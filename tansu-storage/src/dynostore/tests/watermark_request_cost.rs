@@ -216,6 +216,106 @@ fn batch(records: usize) -> Result<deflated::Batch> {
         .map_err(Into::into)
 }
 
+/// **Step 1: validate the instrument before trusting a zero from it.**
+///
+/// Two earlier runs reported zero `watermark.json` GETs on both sides of #316.
+/// The first was a genuine miss — the store was not on the coalesced path. The
+/// second was not explicable that way: `LIST=1` and a segment PUT proved a
+/// coalesced flush ran, and `flush_prefix_coalesced` states the leaseless
+/// arbiter "is the only flush since #177", so `leaseless_base` must have run and
+/// must have called `persisted_high`.
+///
+/// A zero that cannot be explained is an instrument fault until proven
+/// otherwise. This calls `persisted_high` directly: if the counter still reads
+/// zero, the wrapper does not observe what it claims to and every number this
+/// file has produced is void.
+#[tokio::test]
+async fn the_counter_observes_a_direct_watermark_read() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let tally = Tally::default();
+    let storage = DynoStore::new(CLUSTER, NODE, Counted::new(tally.clone()));
+    let tp = Topition::new("org.env.conn.tab_probe", 0);
+
+    let before = tally.snapshot().0;
+    let high = storage.persisted_high(&tp).await;
+    let after = tally.snapshot().0;
+
+    assert!(
+        after > before,
+        "persisted_high issued no watermark.json GET (before={before} after={after}, \
+         result={high:?}) — the counter cannot see this path, so no zero it reports \
+         means anything"
+    );
+
+    Ok(())
+}
+
+/// **Step 2: is the fold a 304 revalidation, or a miss?**
+///
+/// #316's comment and PR body justify the unconditional fold as "a conditional
+/// GET answering 304 while the watermark is unchanged". A 304 needs a cached
+/// etag, which needs the object to **exist**. #161 records that `watermark.json`
+/// is often absent for a pure-segment sub-stream: it measured ~1490 GET/s of
+/// `404 NoSuchKey`, "billable on a store that charges 4xx", and exists to stop
+/// exactly that pattern.
+///
+/// So the number that decides whether #316's cost claim holds is the split
+/// between revalidations and misses, not the raw count.
+#[tokio::test]
+async fn does_the_fold_revalidate_or_miss() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let tally = Tally::default();
+    let storage = DynoStore::new(CLUSTER, NODE, Counted::new(tally.clone())).coalesce_tuning(
+        CoalesceTuning {
+            coalesce_batches: Some(1),
+            ..Default::default()
+        },
+    );
+
+    let topic = "org.env.conn.tab_split";
+    let tp = Topition::new(topic, 0);
+
+    _ = storage
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic.into())
+                .num_partitions(1)
+                .replication_factor(1)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    const FLUSHES: u64 = 10;
+
+    for _ in 0..FLUSHES {
+        _ = storage.produce(None, &tp, batch(1)?).await?;
+    }
+
+    let snapshot = tally.snapshot();
+    let gets = snapshot.0;
+    let conditional = snapshot.1;
+    let puts = snapshot.2;
+    let unconditional = gets - conditional;
+
+    let high = storage.persisted_high(&tp).await;
+
+    panic!(
+        "SPLIT over {FLUSHES} flushes:\n  \
+         watermark.json GETs total   {gets}\n  \
+         ...carrying if_none_match   {conditional}  (can answer 304)\n  \
+         ...without an etag          {unconditional}  (full GET or 404)\n  \
+         watermark.json PUTs         {puts}\n  \
+         direct persisted_high       {high:?}\n\
+         Reading: a high if_none_match share supports #316's 304 claim. A high \
+         no-etag share means the object is absent or never cached, so every fold \
+         is a billed miss — the #161 pattern, on the produce path."
+    );
+}
+
 /// Count the object-store requests a steady-state produce costs, broken down by
 /// kind, and fail with the numbers so CI shows them.
 ///
