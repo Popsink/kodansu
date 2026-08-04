@@ -31,7 +31,7 @@ use rustls::{
 };
 use tansu_broker::{NODE_ID, broker::Broker, coordinator::group::forward::GroupCoordinator};
 use tansu_sans_io::ErrorCode;
-use tansu_storage::{ArcDynStorage, DEFAULT_CLEANUP_POLICY, StorageContainer, TopicDefaults};
+use tansu_storage::{ArcDynStorage, DEFAULT_CLEANUP_POLICY, TopicDefaults};
 use tokio::time::Instant;
 use tracing::debug;
 use url::Url;
