@@ -36,6 +36,7 @@ mod prefix_coalesce;
 mod reachable_panics;
 mod scaling;
 mod segment;
+mod watermark_request_cost;
 
 pub(crate) fn init_tracing() -> Result<DefaultGuard, Error> {
     _ = dotenv().ok();
