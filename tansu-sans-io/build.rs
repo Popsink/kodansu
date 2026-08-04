@@ -743,10 +743,18 @@ fn maximum_allocation_size(name: &Type, fields: &[Field], include_tag: bool) -> 
         })
         .collect::<Vec<_>>();
 
+    // Every struct ends with a tag buffer in a flexible version, and none of it
+    // was counted — so the estimate under-counted by a byte per struct, which is
+    // linear in the number of topic and partition structs in a `FetchResponse`
+    // (#312). Charged unconditionally: this arithmetic has no `api_version` to
+    // consult, and over-reserving is the safe direction for a *maximum*
+    // allocation size.
+    let tagged = fields.iter().filter(|field| field.tag().is_some()).count();
+
     quote! {
         impl crate::MaximumAllocationSize for #name {
             fn maximum_allocation_size(&self) -> Result<usize, crate::Error> {
-                let mut total:usize = 0;
+                let mut total:usize = crate::tag_buffer_allowance(#tagged);
 
                 #(#sizes;)*
 
