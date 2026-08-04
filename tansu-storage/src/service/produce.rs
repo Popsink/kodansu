@@ -166,6 +166,31 @@ impl ProduceService {
             for mut batch in records.batches {
                 let tp = Topition::new(name, partition.index);
 
+                // Refuse a record format this broker does not read, and do it
+                // before the CRC gate below (#320).
+                //
+                // The order is the point. A pre-v2 MessageSet also fails that
+                // gate — its checksum is a CRC-32 over a different range, not
+                // the CRC-32C of a v2 payload — so legacy producers were
+                // already being turned away, but as a side effect, and told
+                // "your CRC is wrong" when the truth is that this broker does
+                // not read their message format. Deciding here makes the
+                // refusal deliberate, and keeps it from moving the next time
+                // the CRC path is touched.
+                //
+                // UNSUPPORTED_FOR_MESSAGE_FORMAT (43) rather than
+                // UNSUPPORTED_VERSION (35): the API version was understood, it
+                // is the record format inside it that is not supported. Kafka
+                // answers 43 for the same reason.
+                if !batch.is_record_batch_v2() {
+                    warn!(
+                        ?tp,
+                        magic = batch.magic,
+                        "rejecting a record format this broker does not read"
+                    );
+                    return self.error(partition.index, ErrorCode::UnsupportedForMessageFormat);
+                }
+
                 // Refuse a batch whose CRC does not cover its payload, as
                 // Kafka's LogValidator does, rather than storing it and
                 // discovering the corruption on the read side (#271).
@@ -970,6 +995,102 @@ mod tests {
                 .throttle_time_ms(Some(0))
                 .node_endpoints(None),
             response
+        );
+
+        Ok(())
+    }
+
+    /// A pre-v2 MessageSet is answered `UNSUPPORTED_FOR_MESSAGE_FORMAT` (43),
+    /// and is not stored (#320).
+    ///
+    /// It used to be refused as `CORRUPT_MESSAGE` (2) — accurately, in that it
+    /// fails the CRC gate, but for the wrong reason: a legacy checksum is a
+    /// CRC-32 over a different range, so it could never match. The producer was
+    /// told its data was damaged when the truth is that this broker does not
+    /// read its record format.
+    #[tokio::test]
+    async fn a_pre_v2_message_set_is_answered_unsupported_for_message_format() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let topic = "stu";
+        let index = 0;
+
+        let storage = DynoStore::new("abc", 12321, InMemory::new());
+        let ctx = Context::with_state(storage.clone());
+
+        // A magic-0 MessageSet captured from `sarama` on Produce v0, decoded
+        // the way the broker decodes a request body. Built from bytes rather
+        // than from the builder: no builder in this crate can produce a record
+        // format it does not support.
+        let legacy = deflated::Batch::try_from(Bytes::from_static(&[
+            0, 0, 0, 0, 0, 0, 0, 0, // base offset
+            0, 0, 0, 80, // message size
+            14, 140, 97, 161, // legacy CRC-32
+            0,   // magic
+            0,   // attributes
+            255, 255, 255, 255, // null key
+            0, 0, 0, 66, // value length
+            181, 164, 112, 10, 42, 24, 68, 168, 93, 201, 190, 85, 75, 81, 82, 227, 134, 137, 91,
+            20, 86, 4, 92, 187, 141, 103, 65, 71, 241, 103, 73, 174, 19, 227, 180, 158, 176, 4, 27,
+            78, 34, 140, 106, 1, 209, 63, 255, 52, 206, 164, 132, 184, 32, 34, 45, 24, 162, 18,
+            187, 77, 19, 3, 161, 102, 20, 14,
+        ]))?;
+
+        // The precondition. A pass could otherwise mean the batch was turned
+        // away for some unrelated reason.
+        assert_eq!(0, legacy.magic);
+        assert!(!legacy.is_record_batch_v2());
+
+        let data = TopicProduceData::default()
+            .name(topic.into())
+            .partition_data(Some(vec![
+                PartitionProduceData::default()
+                    .index(index)
+                    .records(Some(Frame {
+                        batches: vec![legacy],
+                    })),
+            ]));
+
+        assert_eq!(
+            ProduceResponse::default()
+                .responses(Some(vec![
+                    TopicProduceResponse::default()
+                        .name(topic.into())
+                        .partition_responses(Some(vec![
+                            PartitionProduceResponse::default()
+                                .index(index)
+                                .error_code(ErrorCode::UnsupportedForMessageFormat.into())
+                                .base_offset(-1)
+                                .log_append_time_ms(Some(-1))
+                                .log_start_offset(Some(0))
+                                .record_errors(Some(vec![]))
+                                .error_message(None)
+                                .current_leader(None)
+                        ]))
+                ]))
+                .throttle_time_ms(Some(0))
+                .node_endpoints(None),
+            ProduceService
+                .serve(
+                    ctx,
+                    ProduceRequest::default()
+                        .transactional_id(None)
+                        .acks(0)
+                        .timeout_ms(0)
+                        .topic_data(Some(vec![data])),
+                )
+                .await?
+        );
+
+        // And nothing reached the log.
+        assert_eq!(
+            0,
+            storage
+                .offset_stage(&Topition::new(topic, index))
+                .await
+                .map(|stage| stage.high_watermark)
+                .unwrap_or_default(),
+            "a refused batch must not advance the high watermark"
         );
 
         Ok(())
