@@ -983,7 +983,7 @@ mod tests {
         };
 
         fn builder() -> Builder<i32, String, Uuid, Url, Url, Url> {
-            Broker::<GroupCoordinator<StorageContainer>, StorageContainer>::builder()
+            Broker::<GroupCoordinator<ArcDynStorage>, ArcDynStorage>::builder()
                 .node_id(111)
                 .cluster_id(Uuid::now_v7().to_string())
                 .incarnation_id(Uuid::now_v7())
