@@ -53,13 +53,16 @@ Absolute offsets come from the footer, **not** from the batch headers.
 
 ### Footer
 
-Three versions exist. **v2 is what production writes** — the leaseless writer
-(#86) emits it, and so does compaction on a leaseless prefix. v1 is emitted only
-by the lease-mode writer (#59) and remains readable. **v3 (#174) is accepted on
-read but not yet emitted by anything**: it exists so every reader — this broker
-and external S3-direct readers alike — learns the layout one release before the
-first v3 segment can appear (see [Versioning](#versioning--backward-compatibility)).
-A reader MUST accept all three, and MUST reject any other version.
+Three versions exist. **v3 is what production writes** — since
+`0.7.0-beta.25` (#188), every write emits it: the leaseless flush (#86), merge
+compaction, and the per-key compaction rewrite alike. **Nothing emits v2 or v1
+any more**; both remain readable so segments written before that release stay
+readable in place. A reader MUST accept all three, and MUST reject any other
+version.
+
+The practical consequence for an external reader: **v3 support is not optional.**
+Every segment written by a current broker is v3, so a reader that implements only
+v1 and v2 fails on the whole bucket, not on a subset.
 
 ```
 writer_epoch      i64          # see "writer_epoch" below
@@ -115,26 +118,28 @@ running from `base_offset`.
 
 #### `writer_epoch`
 
-The field is present in both versions and is the overlap tie-break in both, but
-the two writer regimes stamp it differently:
+The field is present in every version and is the overlap tie-break in all of
+them, but the writer regimes stamp it differently:
 
-- **v1, lease mode (#59):** the epoch of the lease the writer held, `0` if none.
-- **v2, leaseless mode (#86, what production runs):** the prefix's **era epoch**,
-  read from `prefixes/{prefix}/era.json` (`{"era_epoch": i64}`). It is a constant
-  per prefix, not per writer: seeded once as
+- **leaseless mode (#86, what production runs — v3 segments):** the prefix's
+  **era epoch**, read from `prefixes/{prefix}/era.json` (`{"era_epoch": i64}`).
+  It is a constant per prefix, not per writer: seeded once as
   `max(last lease epoch, highest footer epoch) + 1`, so it is `>= 1` and every
   leaseless segment out-epochs every pre-cutover lease-era segment on the same
   prefix (#92).
 - **compaction:** the merged segment carries the maximum `writer_epoch` of the
-  segments it merged (floored at 0), and is written v2 on a leaseless prefix and
-  v1 otherwise.
+  segments it merged (floored at 0). It is written v3 regardless of the prefix —
+  the encoder takes no version parameter.
+- **lease mode (#59) — historical, v1 segments only:** the epoch of the lease the
+  writer held, `0` if none. No current writer emits v1; this is here to read
+  segments written before `0.7.0-beta.25`.
 
 ### Trailer (fixed 18 bytes, at the very end)
 
 ```
 footer_len    u64
 entry_count   u32
-version       u16              # 1, 2 or 3 (2 is what production writes)
+version       u16              # 1, 2 or 3 (3 is what production writes)
 magic         u32              # 0x5453_4547  ("TSEG")
 ```
 
@@ -146,16 +151,18 @@ magic         u32              # 0x5453_4547  ("TSEG")
   widens coordinate emission to transactional and control batches. A reader
   MUST accept `{1, 2, 3}` and MUST reject any other version rather than
   guessing.
-- **v3 is not yet written.** Production writes v2 everywhere today; v3 starts
-  being emitted only in a later release (release B of #174, which routes
-  transactional and control batches into segments), and only once every
-  deployed reader accepts `{1, 2, 3}`. This ordering is deliberate: the
-  version-rejection MUST above means a v2-only reader fails **cleanly** on a v3
-  segment — it does not mis-read — but it fails on *every* segment the moment a
-  writer flips, because the writer stamps v3 unconditionally (the version
-  follows the writer regime, never the segment's content). Readers must
-  therefore upgrade **before** writers, which is why this document describes v3
-  ahead of any object carrying it.
+- **v3 is what is written, since `0.7.0-beta.25` (#188).** The writer stamps it
+  unconditionally — the version follows the writer, never the segment's content —
+  so from that release on, *every* new segment is v3, including compaction
+  output. v2 and v1 are read-only history.
+
+  This document previously said v3 was accepted on read but not yet emitted,
+  which was the plan: publish the layout one release ahead so every reader could
+  accept `{1, 2, 3}` before any writer flipped. The flip has happened. The
+  ordering advice still holds for the next version — readers before writers,
+  because the version-rejection MUST above means an old reader fails **cleanly**
+  on a newer segment, but it fails on *every* segment the moment a writer flips,
+  not on a subset.
 - A **legacy** single-topic coalesced object (#50) has **no trailer**: its last
   bytes are record data, so the trailing `magic` will not equal `TSEG`. A reader
   MUST treat "magic absent" as the v0 case and decode the whole object as a bare
@@ -164,9 +171,9 @@ magic         u32              # 0x5453_4547  ("TSEG")
 
 ## Transactional and control batches
 
-Once v3 segments are written (#174, release B — not yet, see above), a
-sub-stream region can contain transactional data batches and **control
-batches** (transaction markers). Both are ordinary Kafka `RecordBatch` wire
+A sub-stream region can contain transactional data batches and **control
+batches** (transaction markers) — routed into segments by #188, the same change
+that made v3 the emitted version. Both are ordinary Kafka `RecordBatch` wire
 bytes inside the region; the batch's attribute bits say what it is (bit 4
 transactional, bit 5 control), and the v3 footer's `flags` mirror those bits
 per coordinate.
