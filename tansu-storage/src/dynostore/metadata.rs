@@ -679,15 +679,33 @@ mod tests {
 
     /// Anything else is a fault and must stay on `cache_errors`, which is what
     /// leaves that counter alertable (#203).
+    ///
+    /// The `reason` a fault carries is a separate question from whether it *is*
+    /// one, and the two moved apart in #284: a 503 SlowDown is now named
+    /// `throttle` rather than falling into `otherwise`, which is the whole point
+    /// of that change — during an S3 event it is the label that makes this
+    /// counter actionable. What must not move is the `is_control_outcome` verdict
+    /// below: a throttle is a fault, however well it is named.
     #[test]
     fn a_genuine_failure_is_still_a_fault() {
-        let error = object_store::Error::Generic {
+        let throttled = object_store::Error::Generic {
             store: "S3",
             source: "503 SlowDown".into(),
         };
 
-        assert!(!is_control_outcome(&error));
-        assert_eq!("otherwise", object_store_error_name(&error));
+        assert!(!is_control_outcome(&throttled));
+        assert_eq!("throttle", object_store_error_name(&throttled));
+
+        // And a fault with no name of its own still reaches the fallthrough —
+        // the case this test covered before `throttle` existed to claim its
+        // example.
+        let unnamed = object_store::Error::Generic {
+            store: "S3",
+            source: "connection reset by peer".into(),
+        };
+
+        assert!(!is_control_outcome(&unnamed));
+        assert_eq!("otherwise", object_store_error_name(&unnamed));
     }
 
     /// Every classed counter must be able to name the key (#203): the 404

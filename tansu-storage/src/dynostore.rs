@@ -737,10 +737,13 @@ static PREFIX_INDEX_SUBSTREAM_ENTRIES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
 
 /// Live segment count per prefix after a maintenance tick (#66) — the signal
 /// that tells whether compaction is keeping `S` bounded (a counter can't).
+///
+/// Carries a `prefix` attribute: without one the last write of a pass won and the
+/// gauge reported an arbitrary prefix rather than the growing one (#284).
 static SEGMENTS_LIVE: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("tansu_prefix_segments_live")
-        .with_description("live segments for a prefix after maintenance")
+        .with_description("live segments for a prefix after maintenance, by prefix")
         .build()
 });
 
@@ -6546,10 +6549,18 @@ impl DynoStore {
 
         // Report the live segment count so runaway `S` is observable even if the
         // drain can't keep up.
+        //
+        // Labelled by prefix (#284). Recorded once per prefix per pass with no
+        // attributes, last write won, so the gauge showed whichever prefix
+        // happened to be drained last — never the one running away, which is the
+        // only reason to look at it. Cardinality is tens of prefixes.
         if let Ok(index) = self.prefix_index.lock()
             && let Some(entry) = index.get(prefix)
         {
-            SEGMENTS_LIVE.record(entry.segments.len() as u64, &[]);
+            SEGMENTS_LIVE.record(
+                entry.segments.len() as u64,
+                &[KeyValue::new("prefix", prefix.to_string())],
+            );
         }
 
         compacted
@@ -9909,6 +9920,44 @@ fn is_s3_throttle(error: &object_store::Error) -> bool {
     false
 }
 
+/// True if `error` looks like a request that ran out of time rather than one the
+/// store answered.
+///
+/// `object_store` has no timeout variant — a connect, read or overall-deadline
+/// expiry arrives as `Generic` wrapping the transport error — so this walks the
+/// source chain for the text, as [`is_s3_throttle`] does. Same trade-off: coupled
+/// to wording that could change under us, and the alternative is not
+/// distinguishing a timeout at all (#284).
+fn is_timeout(error: &object_store::Error) -> bool {
+    let mut current: Option<&dyn std::error::Error> = Some(error);
+
+    while let Some(err) = current {
+        let text = err.to_string().to_ascii_lowercase();
+
+        if text.contains("timed out")
+            || text.contains("timeout")
+            || text.contains("deadline has elapsed")
+        {
+            return true;
+        }
+
+        current = err.source();
+    }
+
+    false
+}
+
+/// The `reason` label for an object-store failure.
+///
+/// The interesting failures used to collapse into a single `otherwise` bucket, so
+/// a 503 SlowDown, a DNS failure and a TLS reset were indistinguishable in metrics
+/// — during an S3 event, the one label that would make the error counter alertable
+/// was the one missing (#284). Throttles and timeouts are now named; the throttle
+/// signal in particular existed only in logs, via `is_s3_throttle`.
+///
+/// The two text-matched arms are checked *after* the structured variants, so a
+/// `NotFound` whose source happens to mention a timeout is still `not_found`. They
+/// are guards on the fallthrough rather than a pre-match for the same reason.
 fn object_store_error_name(error: &object_store::Error) -> &'static str {
     match error {
         object_store::Error::Precondition { .. } => "pre_condition",
@@ -9918,6 +9967,10 @@ fn object_store_error_name(error: &object_store::Error) -> &'static str {
         object_store::Error::NotModified { .. } => "not_modified",
 
         object_store::Error::NotFound { .. } => "not_found",
+
+        throttled if is_s3_throttle(throttled) => "throttle",
+
+        timed_out if is_timeout(timed_out) => "timeout",
 
         otherwise => {
             debug!(?otherwise);
@@ -10315,7 +10368,9 @@ where
 
 #[cfg(test)]
 mod throttle_tests {
-    use super::{Duration, cas_conflict_backoff, is_s3_throttle, throttle_backoff};
+    use super::{
+        Duration, cas_conflict_backoff, is_s3_throttle, object_store_error_name, throttle_backoff,
+    };
 
     fn generic_s3(source: &'static str) -> object_store::Error {
         object_store::Error::Generic {
@@ -10348,6 +10403,51 @@ mod throttle_tests {
             source: "missing".into(),
         }));
         assert!(!is_s3_throttle(&generic_s3("connection reset by peer")));
+    }
+
+    /// #284's acceptance: a throttle is distinguishable from a 404 and from a
+    /// transport failure in the `reason` label, not just in the logs.
+    #[test]
+    fn throttle_and_timeout_have_their_own_reason() {
+        assert_eq!(
+            "throttle",
+            object_store_error_name(&generic_s3(
+                "Status { status: 503, body: \"<Error><Code>SlowDown</Code></Error>\" }"
+            ))
+        );
+
+        assert_eq!(
+            "timeout",
+            object_store_error_name(&generic_s3("error sending request: operation timed out"))
+        );
+
+        // The two failures the report names as currently indistinguishable from a
+        // throttle. A TLS reset stays in the fallthrough — naming it is not what
+        // #284 asks for — but it must not be *mislabelled* as one of the two.
+        assert_eq!(
+            "not_found",
+            object_store_error_name(&object_store::Error::NotFound {
+                path: "x".into(),
+                source: "missing".into(),
+            })
+        );
+        assert_eq!(
+            "otherwise",
+            object_store_error_name(&generic_s3("connection reset by peer"))
+        );
+    }
+
+    /// A structured variant wins over the text match, so an error the store
+    /// actually answered is never relabelled by wording in its source chain.
+    #[test]
+    fn a_structured_variant_is_not_reclassified_by_its_source_text() {
+        assert_eq!(
+            "not_found",
+            object_store_error_name(&object_store::Error::NotFound {
+                path: "x".into(),
+                source: "request timed out before the object was found".into(),
+            })
+        );
     }
 
     #[test]

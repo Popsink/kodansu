@@ -15,7 +15,7 @@
 pub mod group;
 
 use crate::{
-    CancelKind, Result,
+    CancelKind, METER, Result,
     coordinator::group::{
         Coordinator,
         administrator::Controller,
@@ -26,6 +26,7 @@ use crate::{
 };
 use console::Term;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use opentelemetry::metrics::Counter;
 use rama::{Context, Service};
 use rsasl::config::SASLConfig;
 use rustls::ServerConfig;
@@ -36,7 +37,7 @@ use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
     str::FromStr,
     sync::{
-        Arc,
+        Arc, LazyLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, SystemTime},
@@ -57,6 +58,21 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Level, debug, error, span, warn};
 use url::Url;
 use uuid::Uuid;
+
+/// Maintenance passes that failed at the top, by reason.
+///
+/// A pass that fails before it starts — the topics-index refresh, the claim —
+/// means **no retention and no compaction on this replica** until a later tick
+/// succeeds. That was logged at `debug!`, and production runs at
+/// `RUST_LOG=warn`, so a fleet could stop compacting entirely and the only
+/// symptom would be growth (#284). A counter makes it alertable rather than
+/// something a person has to notice in logs.
+static MAINTENANCE_FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_maintenance_failures")
+        .with_description("maintenance passes that failed at the top")
+        .build()
+});
 
 /// Releases the maintenance in-flight flag on drop — on normal return, timeout
 /// cancellation, or panic unwind — so a run can never leave it stuck `true` and
@@ -425,7 +441,31 @@ where
                             // tick can retry, rather than wedging maintenance
                             // pod-wide until restart (#131).
                             run_bounded_maintenance(in_flight, maintenance_run_timeout, async move {
-                                _ = storage.maintain(SystemTime::now()).await.inspect(|maintain|debug!(?maintain)).inspect_err(|err|debug!(?err)).ok();
+                                // A failure here is not cosmetic: it means this
+                                // replica did no retention and no compaction this
+                                // tick. `warn!` rather than `debug!` so it is
+                                // visible at the level production runs at, plus a
+                                // counter so it does not depend on someone reading
+                                // logs (#284).
+                                _ = storage
+                                    .maintain(SystemTime::now())
+                                    .await
+                                    .inspect(|maintain| debug!(?maintain))
+                                    .inspect_err(|err| {
+                                        // Unlabelled deliberately: `tansu_storage::Error`
+                                        // has no bounded name helper, and inventing a
+                                        // taxonomy here to fill a label would be a
+                                        // second one to keep in step. The counter
+                                        // carries the alert, the `warn!` below carries
+                                        // the detail.
+                                        MAINTENANCE_FAILURES.add(1, &[]);
+                                        warn!(
+                                            ?err,
+                                            "maintenance pass failed: no retention or compaction \
+                                             on this replica this tick"
+                                        )
+                                    })
+                                    .ok();
                             }).instrument(span).await
                         });
 
