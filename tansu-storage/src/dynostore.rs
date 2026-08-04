@@ -561,42 +561,6 @@ const SEGMENT_READ_TRACE_OBJECTS: usize = 1_024;
 /// overstate what any cache could serve.
 const SEGMENT_READ_TRACE_TTL: Duration = Duration::from_secs(60);
 
-/// Fetches the broker advertised but could not serve (#290).
-///
-/// Incremented when a fetch below the high watermark, above the truncation
-/// floor, returns nothing after its long-poll window has elapsed. That
-/// combination is the broker stating records exist at an offset and then
-/// producing none of them — metadata that outlived its segments.
-///
-/// **Not expected to be zero, and not on its own evidence of damage** (#302). It
-/// was assumed to be both, and a client-visible `OffsetOutOfRange` was hung off
-/// it; production answered with 61 topics in 3 minutes at 9 to 21859 offsets
-/// below the high watermark — caught-up consumers. The error is gone; this
-/// counter is what remains, and it is a rate to characterise rather than an
-/// alarm to wire.
-///
-/// The condition it counts is still the one #290 is about: a client cannot tell
-/// an unserved fetch from "no new data", so it polls forever. Production had
-/// 25.6M records of advertised backlog unreadable across 168 partitions with no
-/// signal anywhere, and because `poll()` covers a whole assignment, the 250
-/// healthy partitions on the same consumer were starved with them.
-/// Budget for the read that confirms a fetch is unservable (#290).
-///
-/// Its own, rather than the caller's remaining long-poll window: the confirming
-/// read exists to distinguish "the records are not there" from "the first read
-/// ran out of time", and a read sharing the exhausted deadline answers empty
-/// without looking, which is the first thing that must not happen. Bounded so a
-/// fetch cannot be extended indefinitely by the check, and only ever paid on a
-/// fetch that already found nothing the index told it to find.
-const UNSERVABLE_CONFIRM_BUDGET: Duration = Duration::from_secs(5);
-
-static FETCH_UNSERVABLE: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("tansu_fetch_unservable")
-        .with_description("fetches below the high watermark that returned no records")
-        .build()
-});
-
 /// Ranged GETs of segment *record* bytes on the fetch path (#117) — the
 /// tier-2 requests a consumer-side cache would target. Footer GETs are already
 /// served from the in-memory index and are not counted here.
@@ -4252,27 +4216,6 @@ impl DynoStore {
             .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
             .first()
             .map(|(_, entry)| entry.base_offset))
-    }
-
-    /// Whether the index still claims a segment holding `offset` for this
-    /// sub-stream (#290).
-    ///
-    /// This is the positive evidence the unservable check needs. Retention
-    /// removes a segment and its index entry together, so an expired region has
-    /// no covering entry and is correctly *not* reported as damage; only an
-    /// entry that claims an offset it cannot produce is.
-    fn substream_covers_offset(
-        &self,
-        prefix: &str,
-        topition: &Topition,
-        offset: i64,
-    ) -> Result<bool> {
-        Ok(self
-            .valid_substream_segments(prefix, topition.topic(), topition.partition())?
-            .iter()
-            .any(|(_, entry)| {
-                entry.base_offset <= offset && offset < entry.base_offset + entry.record_count
-            }))
     }
 
     /// Whether `topic`'s `cleanup.policy` is `compact`, memoized for
@@ -7961,91 +7904,6 @@ impl Storage for DynoStore {
                     max_wait,
                 )
                 .await?;
-
-            // A fetch that found nothing it was told to find (#290) — recorded,
-            // never answered with an error (#302).
-            //
-            // This used to return `OffsetOutOfRange` when the index still
-            // claimed a segment over the offset while a read given its own
-            // budget produced nothing, on the reasoning that nothing benign
-            // makes that pair. Production disproved it within minutes of
-            // shipping: 61 warnings in 3 minutes across 61 distinct topics, at
-            // offsets 9 to 21859 below the high watermark — a caught-up
-            // consumer, not a lost log. Every one reset a live consumer through
-            // `auto.offset.reset`.
-            //
-            // The mechanism is not established. Two hypotheses were ruled out by
-            // reading the code and are recorded so they are not re-walked:
-            // `record_count` cannot over-claim (it is summed from the encoded
-            // batches' `last_offset_delta + 1`), and the byte budget breaks
-            // *after* pushing batches, so it cannot empty the result on its own.
-            //
-            // So the condition is observed and counted, and the client is told
-            // nothing. `OffsetOutOfRange` is acted on by the consumer, which
-            // makes the cost of being wrong asymmetric: a false positive skips a
-            // real backlog or replays from the start, while a false negative is
-            // the empty answer this code path has always given. Until the
-            // condition is understood well enough to distinguish a caught-up
-            // consumer from a damaged log — the distance to the high watermark
-            // is the obvious discriminator and this has no notion of it — the
-            // asymmetry decides.
-            //
-            // Logged at debug: at 61 topics per 3 minutes on a healthy fleet, a
-            // `warn!` here is a signal operators learn to scroll past, which is
-            // the failure #270 had to correct for the rebalance detector.
-            if batches.is_empty() {
-                // One forced index refresh before calling it: the benign version
-                // of an empty answer here is this replica's segment view lagging
-                // a peer's very recent write, and that resolves by observing the
-                // live set. It costs a LIST, paid only on a fetch that already
-                // found nothing it was told to find.
-                let prefix = self.routed_prefix_of(topition).await?;
-                self.refresh_prefix_index_forced(&prefix).await?;
-
-                // Does a current index still claim these offsets? No covering
-                // segment means the log genuinely does not hold them — expired,
-                // not damaged — and there is nothing to report.
-                if self.substream_covers_offset(&prefix, topition, offset)? {
-                    // The confirming read gets its OWN budget, deliberately.
-                    //
-                    // Sharing the caller's `started_at` made this a guaranteed
-                    // no-op: `fetch_prefix_coalesced` computes
-                    // `max_wait - started_at.elapsed()`, so a `Duration::ZERO`
-                    // budget is expired before the first segment is considered
-                    // and the loop breaks without reading anything. It returned
-                    // empty every time, for every partition, and an empty answer
-                    // from a read that never looked is not evidence of anything.
-                    let confirming = self
-                        .fetch_prefix_coalesced(
-                            topition,
-                            offset,
-                            max_bytes,
-                            high_watermark,
-                            SystemTime::now(),
-                            UNSERVABLE_CONFIRM_BUDGET,
-                        )
-                        .await?;
-
-                    if confirming.is_empty() {
-                        FETCH_UNSERVABLE.add(1, &[]);
-
-                        debug!(
-                            topic = topition.topic(),
-                            partition = topition.partition(),
-                            offset,
-                            high_watermark,
-                            tail_distance = high_watermark - offset,
-                            "a segment claims this offset but the read produced none of it (#302)"
-                        );
-
-                        // Deliberately no error. See the block comment above:
-                        // `tansu_fetch_unservable` carries the signal, and
-                        // `tail_distance` is what a future gate would key on —
-                        // 9 offsets below the tail is a caught-up consumer,
-                        // millions below it is the lost log of #290.
-                    }
-                }
-            }
         }
 
         Ok(batches)
