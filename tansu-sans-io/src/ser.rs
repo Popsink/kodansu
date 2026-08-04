@@ -525,6 +525,20 @@ impl Serializer for &mut Encoder {
             );
 
             let records = {
+                // `split_off` past `len` borrows from spare capacity, and panics
+                // outright if the offset runs past `capacity`. So the buffer's
+                // size — computed once by `size_in_bytes()` in
+                // `Frame::response`, never grown — was load-bearing for memory
+                // safety and not merely for efficiency, and an under-count by as
+                // little as three bytes took down a `tokio-rt-worker` instead of
+                // reallocating (#312, observed twice in 12 hours on a
+                // `FetchResponse`).
+                //
+                // Reserve the length prefix rather than trust the estimate. This
+                // makes a wrong estimate cost what a wrong estimate should cost
+                // anywhere else: a reallocation.
+                self.working.reserve(size_of::<u32>());
+
                 let records = self
                     .working
                     .split_off(self.working.len() + size_of::<u32>());
@@ -1283,6 +1297,85 @@ impl SerializeStructVariant for &mut RecordBatchEncoder {
     }
 
     fn end(self) -> std::result::Result<Self::Ok, Self::Error> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod encode_allocation {
+    use crate::{ApiKey as _, FetchResponse, Frame, MaximumAllocationSize as _, Result};
+
+    /// A real `FetchResponse` v16 carrying a record batch, taken from the worked
+    /// example in `record.rs`.
+    fn fetch_response_v16_bytes() -> Vec<u8> {
+        vec![
+            0, 0, 0, 186, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 28, 205, 172, 195, 142,
+            19, 71, 71, 182, 128, 13, 18, 65, 142, 210, 222, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 255, 255, 255, 255, 255, 255, 255, 255, 1, 0, 0, 0, 0,
+            74, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 61, 255, 255, 255, 255, 2, 153, 143, 24, 144, 0,
+            0, 0, 0, 0, 0, 0, 0, 1, 144, 238, 148, 84, 54, 0, 0, 1, 144, 238, 148, 84, 54, 0, 0, 0,
+            0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 22, 0, 0, 0, 1, 10, 112, 111, 105, 117,
+            121, 0, 3, 0, 13, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 1, 9,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 13, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+            255, 255, 0, 0, 0,
+        ]
+    }
+
+    /// Encoding a `FetchResponse` must not depend on `size_in_bytes()` being
+    /// exact (#312).
+    ///
+    /// `Frame::response` allocates once from that estimate and never grows the
+    /// buffer, and the records field then splits **past `len`** into the reserved
+    /// capacity. `BytesMut::split_off` panics when the offset runs past
+    /// `capacity`, so an estimate three bytes short took down a
+    /// `tokio-rt-worker` — twice in twelve hours of production — where anywhere
+    /// else a wrong estimate would have cost a reallocation.
+    ///
+    /// This asserts the encode completes. It cannot assert the estimate is
+    /// correct, which is the point: correctness of the estimate must stop being
+    /// a liveness requirement.
+    #[test]
+    fn encoding_a_fetch_response_does_not_depend_on_an_exact_estimate() -> Result<()> {
+        let api_key = FetchResponse::KEY;
+        let api_version = 16;
+
+        let bytes = fetch_response_v16_bytes();
+        let frame = Frame::response_from_bytes(&bytes[..], api_key, api_version)?;
+
+        let encoded = Frame::response(frame.header, frame.body, api_key, api_version)?;
+
+        assert!(!encoded.is_empty());
+
+        Ok(())
+    }
+
+    /// The estimate must cover what is produced (#312).
+    ///
+    /// With the reservation in place an under-count is a reallocation rather than
+    /// a panic, so it becomes *testable* — which is why this assertion can exist
+    /// at all. It failing is a diagnosis, not an outage: the delta names how many
+    /// bytes `ByteSize` is missing.
+    #[test]
+    fn the_size_estimate_covers_the_encoded_frame() -> Result<()> {
+        let api_key = FetchResponse::KEY;
+        let api_version = 16;
+
+        let bytes = fetch_response_v16_bytes();
+        let frame = Frame::response_from_bytes(&bytes[..], api_key, api_version)?;
+
+        let estimate = frame.maximum_allocation_size()?;
+        let encoded = Frame::response(frame.header, frame.body, api_key, api_version)?;
+
+        assert!(
+            estimate >= encoded.len(),
+            "maximum_allocation_size() said {estimate} but the frame encoded to {} — short by \
+             {} bytes. \
+             Before #312 this shortfall was a panic in the records `split_off` rather than \
+             an assertion.",
+            encoded.len(),
+            encoded.len().saturating_sub(estimate),
+        );
+
         Ok(())
     }
 }
