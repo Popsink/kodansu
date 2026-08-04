@@ -76,10 +76,7 @@ use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 #[cfg(feature = "dynostore")]
 use object_store::{BackoffConfig, RetryConfig};
 
-use opentelemetry::{
-    InstrumentationScope, KeyValue, global,
-    metrics::{Counter, Meter},
-};
+use opentelemetry::{InstrumentationScope, global, metrics::Meter};
 use opentelemetry_semantic_conventions::SCHEMA_URL;
 
 use governor::InsufficientCapacity;
@@ -131,7 +128,7 @@ use tansu_sans_io::{
     txn_offset_commit_response::TxnOffsetCommitResponseTopic,
 };
 use tokio::sync::AcquireError;
-use tracing::{debug, instrument};
+use tracing::debug;
 use tracing_subscriber::filter::ParseError;
 use url::Url;
 use uuid::Uuid;
@@ -147,6 +144,8 @@ mod latency;
 mod null;
 mod service;
 
+#[cfg(feature = "dynostore")]
+pub use dynostore::DynoStore;
 pub use latency::LatencyIntroducingStorage;
 
 pub use service::{
@@ -2658,8 +2657,6 @@ pub struct ScramCredential {
     pub stored_key: Bytes,
     pub server_key: Bytes,
 }
-
-#[async_trait]
 
 #[cfg(test)]
 mod tests {
