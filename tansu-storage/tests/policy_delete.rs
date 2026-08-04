@@ -22,7 +22,7 @@ use std::{
 use crate::common::{Error, init_tracing};
 use bytes::Bytes;
 use tansu_sans_io::{
-    IsolationLevel,
+    ErrorCode, IsolationLevel,
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
     record::{Record, deflated, inflated},
 };
@@ -134,7 +134,19 @@ async fn retention_ms_expires_old_records() -> Result<(), Error> {
         .expect("an hour ahead");
     storage.maintain(later).await?;
 
-    assert_eq!(0, fetch_len(&storage, &topition).await?);
+    // Offset 0 is below the start of a log that is now empty, so it is out of
+    // range rather than empty (#337). Answering empty here is what left consumers
+    // polling a stranded partition forever: 77 of them on one connector, which
+    // delivered nothing for days because `poll()` covers a whole assignment.
+    //
+    // Safe to say so because #299 already reports `log_start == log_end`, so a
+    // consumer resetting to earliest lands at the end and skips nothing available.
+    assert!(matches!(
+        fetch_len(&storage, &topition).await,
+        Err(Error::Storage(tansu_storage::Error::Api(
+            ErrorCode::OffsetOutOfRange
+        )))
+    ));
 
     // the partition reports an empty log — its start IS its end (#290). This
     // used to assert 0, which said the log began three records before it ended
@@ -187,7 +199,19 @@ async fn default_retention_keeps_recent_records() -> Result<(), Error> {
         .expect("eight days ahead");
     storage.maintain(later).await?;
 
-    assert_eq!(0, fetch_len(&storage, &topition).await?);
+    // Offset 0 is below the start of a log that is now empty, so it is out of
+    // range rather than empty (#337). Answering empty here is what left consumers
+    // polling a stranded partition forever: 77 of them on one connector, which
+    // delivered nothing for days because `poll()` covers a whole assignment.
+    //
+    // Safe to say so because #299 already reports `log_start == log_end`, so a
+    // consumer resetting to earliest lands at the end and skips nothing available.
+    assert!(matches!(
+        fetch_len(&storage, &topition).await,
+        Err(Error::Storage(tansu_storage::Error::Api(
+            ErrorCode::OffsetOutOfRange
+        )))
+    ));
 
     Ok(())
 }
@@ -224,9 +248,15 @@ async fn without_cleanup_policy_kafka_defaults_apply() -> Result<(), Error> {
         .expect("a hundred days ahead");
     storage.maintain(later).await?;
 
-    assert_eq!(
-        0,
-        fetch_len(&storage, &topition).await?,
+    // Expired to nothing, so offset 0 is below the start of an empty log and is
+    // out of range rather than empty (#337).
+    assert!(
+        matches!(
+            fetch_len(&storage, &topition).await,
+            Err(Error::Storage(tansu_storage::Error::Api(
+                ErrorCode::OffsetOutOfRange
+            )))
+        ),
         "a policy-less topic expires at the default retention, as Kafka does",
     );
 

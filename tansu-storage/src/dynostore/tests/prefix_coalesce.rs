@@ -708,14 +708,35 @@ async fn a_caught_up_consumer_is_never_told_it_is_out_of_range() -> Result<(), E
     Ok(())
 }
 
-/// The counterpart, and the reason the check demands a covering index entry: a
-/// log whose records have all aged out advertises a high watermark with nothing
-/// readable behind it, exactly like the damaged partition above. It must answer
-/// empty, not `OffsetOutOfRange` — a consumer of an aged-out partition that gets
-/// an out-of-range error resets off a log that is merely old.
+/// A fully expired log answers `OffsetOutOfRange` below its end (#337).
+///
+/// **This reverses what this test asserted, deliberately.** It used to demand
+/// empty, on the reasoning that "a consumer of an aged-out partition that gets an
+/// out-of-range error resets off a log that is merely old". Two things retire that
+/// reasoning:
+///
+/// - **#299 changed the premise.** A drained partition now reports
+///   `log_start == log_end`, so `auto.offset.reset=earliest` moves the consumer to
+///   the log start, which *is* the end. Nothing available is skipped, because
+///   nothing is available. The old fear assumed `log_start` still lied as `0`,
+///   which is what made a reset look like data loss.
+/// - **Production measured the alternative.** Answering empty reads to a consumer
+///   as "caught up, nothing new", so it polls again, forever. On one connector that
+///   stranded 77 partitions, 15 of 16 members holding at least one, and delivered
+///   zero records for days — because `poll()` covers the whole assignment, so one
+///   such partition freezes every healthy partition beside it.
+///
+/// What still holds is the guard that actually protects against the #303 incident:
+/// `a_caught_up_consumer_is_never_told_it_is_out_of_range`, which passes unchanged.
+/// A consumer *at* the end is caught up, not out of range — that distinction is what
+/// reset 61 topics when it was got wrong, and it is untouched here.
+///
+/// Narrow on purpose: the answer is keyed on there being **no segment at all**, not
+/// on the offset being below `log_start`. With segments present a low offset is
+/// already served the records above it, and the truncation floor is deliberately a
+/// skip rather than an error (#176).
 #[tokio::test]
-async fn an_advertised_but_unbacked_offset_with_no_index_entry_is_not_reported() -> Result<(), Error>
-{
+async fn a_fully_expired_log_is_out_of_range_below_its_end() -> Result<(), Error> {
     let bucket = InMemory::new();
     let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
@@ -740,9 +761,37 @@ async fn an_advertised_but_unbacked_offset_with_no_index_entry_is_not_reported()
     let reader = DynoStore::new(CLUSTER, NODE, bucket.clone());
     assert_eq!(3024895, reader.high_watermark(&tp).await?);
 
+    // The log start is the log end, so there is no live position below it. That is
+    // the property that makes the reset harmless.
+    assert_eq!(
+        3024895,
+        reader.log_start(&tp, 3024895).await?,
+        "an expired log starts where it ends (#299)"
+    );
+
+    // The committed offset of a group that stopped before the data expired — the
+    // production shape, `committed < log_start`.
     assert!(
-        fetch_from(&reader, &tp, 0).await?.is_empty(),
-        "no index entry claims these offsets, so there is nothing to report",
+        matches!(
+            fetch_from(&reader, &tp, 868_514).await,
+            Err(Error::Api(ErrorCode::OffsetOutOfRange))
+        ),
+        "a committed offset below the start of an empty log must be told so, not \
+         answered empty forever (#337)"
+    );
+
+    // And from the bottom, which is where a reset-to-earliest lands a client that
+    // never committed.
+    assert!(matches!(
+        fetch_from(&reader, &tp, 0).await,
+        Err(Error::Api(ErrorCode::OffsetOutOfRange))
+    ));
+
+    // At the end there is nothing to report: this consumer has caught up with an
+    // empty log, which is the case #303's incident was about.
+    assert!(
+        fetch_from(&reader, &tp, 3024895).await?.is_empty(),
+        "at the end is caught up, not out of range"
     );
 
     Ok(())
