@@ -64,6 +64,12 @@ use bytes::{Bytes, TryGetError};
 use console::Emoji;
 #[cfg(feature = "dynostore")]
 use dynostore::CoalesceTuning;
+// Gated like the `mod dynostore` it names, and like the `CoalesceTuning` import
+// directly above. Without this the crate does not build without its own optional
+// feature: `cargo check -p tansu-storage --no-default-features` fails on an
+// unresolved `dynostore`, and so does building any *other* crate alone with
+// `--all-features`, which resolves this one to its non-default set.
+#[cfg(feature = "dynostore")]
 pub use dynostore::DynoStore;
 
 use glob::{GlobError, PatternError};
