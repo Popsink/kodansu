@@ -8105,6 +8105,54 @@ impl Storage for DynoStore {
                     max_wait,
                 )
                 .await?;
+
+            // An empty log cannot serve an offset below its end, and saying so is
+            // what lets the consumer recover on its own (#337).
+            //
+            // The state: retention removed every segment, so `log_start` is
+            // `high_watermark` (#299) and a group whose committed offset predates
+            // that start asks for offsets no segment will ever hold. Answering
+            // empty reads to a consumer as "caught up, nothing new", so it polls
+            // again, forever — and because `poll()` covers the whole assignment, one
+            // such partition stops delivery on every healthy partition sharing it.
+            // Production: 77 stranded partitions, 15 of 16 members holding at least
+            // one, zero records delivered for days.
+            //
+            // `OFFSET_OUT_OF_RANGE` is Kafka's defined answer here, and it is
+            // load-bearing rather than cosmetic: `auto.offset.reset` then moves the
+            // consumer to a live position with no operator action, and `none` fails
+            // loudly, which is also correct.
+            //
+            // Why "no segment at all" and not "below `log_start`":
+            //
+            // - with segments present, an offset below their base is already served
+            //   the records *above* it, so the consumer advances and nothing wedges;
+            // - the truncation floor is deliberately a skip and not an error (#176),
+            //   and a production fix is not the place to reverse that.
+            //
+            // Why this is not #292's detector, which reset live consumers on 61
+            // topics and was removed in #314: that condition was *an index entry
+            // claiming the offset over a read that produced none of it* — a
+            // heuristic a stale index could forge. This one is the absence of any
+            // segment, which is the definition of an empty log and is already what
+            // the broker advertises through `log_start == log_end`. Answering
+            // consistently with what ListOffsets already claims adds no new way to
+            // be wrong.
+            //
+            // Cost: nothing when records are served. The index read happens only on
+            // a fetch that already came back empty, and it is an index read — no
+            // LIST, no confirming re-read.
+            if batches.is_empty() && self.segment_region_start(topition).await?.is_none() {
+                debug!(
+                    ?topition,
+                    offset,
+                    high_watermark,
+                    "no segment holds this offset and the log is empty; \
+                     answering OFFSET_OUT_OF_RANGE (#337)"
+                );
+
+                return Err(Error::Api(ErrorCode::OffsetOutOfRange));
+            }
         }
 
         Ok(batches)
