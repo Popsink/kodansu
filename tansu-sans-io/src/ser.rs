@@ -1303,7 +1303,7 @@ impl SerializeStructVariant for &mut RecordBatchEncoder {
 
 #[cfg(test)]
 mod encode_allocation {
-    use crate::{ApiKey as _, ByteSize as _, FetchResponse, Frame, Result};
+    use crate::{ApiKey as _, FetchResponse, Frame, MaximumAllocationSize as _, Result};
 
     /// A real `FetchResponse` v16 carrying a record batch, taken from the worked
     /// example in `record.rs`.
@@ -1363,12 +1363,13 @@ mod encode_allocation {
         let bytes = fetch_response_v16_bytes();
         let frame = Frame::response_from_bytes(&bytes[..], api_key, api_version)?;
 
-        let estimate = frame.size_in_bytes()?;
+        let estimate = frame.maximum_allocation_size()?;
         let encoded = Frame::response(frame.header, frame.body, api_key, api_version)?;
 
         assert!(
             estimate >= encoded.len(),
-            "size_in_bytes() said {estimate} but the frame encoded to {} — short by {} bytes. \
+            "maximum_allocation_size() said {estimate} but the frame encoded to {} — short by \
+             {} bytes. \
              Before #312 this shortfall was a panic in the records `split_off` rather than \
              an assertion.",
             encoded.len(),
