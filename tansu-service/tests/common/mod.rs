@@ -42,6 +42,11 @@ impl fmt::Display for Error {
     }
 }
 
+// Takes the default — `Severity::Failure` for everything — which is the point of
+// the default existing: a type that has not thought about severity keeps the loud
+// behaviour rather than being quietly downgraded.
+impl tansu_service::Classify for Error {}
+
 impl From<JoinError> for Error {
     fn from(value: JoinError) -> Self {
         Self::Join(Arc::new(value))

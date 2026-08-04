@@ -82,6 +82,32 @@ impl fmt::Display for Error {
     }
 }
 
+impl tansu_service::Classify for Error {
+    fn severity(&self) -> tansu_service::Severity {
+        match self {
+            // The peer went away mid-request.
+            Self::Io(io)
+                if matches!(
+                    io.kind(),
+                    io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                tansu_service::Severity::Expected
+            }
+
+            Self::FrameTooBig(_) => tansu_service::Severity::Unexpected,
+
+            // Defer rather than second-guess the layer that produced it.
+            Self::Client(client) => client.severity(),
+            Self::Service(service) => service.severity(),
+
+            _ => tansu_service::Severity::Failure,
+        }
+    }
+}
+
 impl From<JoinError> for Error {
     fn from(value: JoinError) -> Self {
         Self::Join(Arc::new(value))

@@ -117,6 +117,51 @@ pub enum Error {
     Send(Arc<SendError<CancelKind>>),
 }
 
+impl tansu_service::Classify for Error {
+    fn severity(&self) -> tansu_service::Severity {
+        use tansu_service::Severity;
+
+        match self {
+            // A retriable answer the broker returns on purpose. `NOT_COORDINATOR`
+            // is what #243 added: when the forward hop to a group's owner fails,
+            // answer retriably so the client retries against the real owner
+            // rather than processing locally and splitting the group. Every pod
+            // restart lands some forwards on a terminating peer, so every
+            // rollout produces these by design (#289).
+            Self::Api(
+                ErrorCode::NotCoordinator
+                | ErrorCode::CoordinatorLoadInProgress
+                | ErrorCode::CoordinatorNotAvailable
+                | ErrorCode::RebalanceInProgress
+                | ErrorCode::NotLeaderOrFollower
+                | ErrorCode::UnknownMemberId
+                | ErrorCode::IllegalGeneration,
+            ) => Severity::Expected,
+
+            // The peer went away mid-request.
+            Self::Io(io)
+                if matches!(
+                    io.kind(),
+                    io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                Severity::Expected
+            }
+
+            // Any other API error is a real answer to a real client, and the
+            // broker chose it — worth seeing, but it is not a broker failure.
+            Self::Api(_) => Severity::Unexpected,
+
+            // Defer to the layer that produced it rather than second-guessing.
+            Self::Service(service) => service.severity(),
+
+            _ => Severity::Failure,
+        }
+    }
+}
+
 impl From<PatternError> for Error {
     fn from(value: PatternError) -> Self {
         Self::Pattern(Arc::new(value))
