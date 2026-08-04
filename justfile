@@ -47,6 +47,20 @@ fuzz-generate-seed: (cargo-fuzz "run" "--package" "fuzz" "--bin" "generate_seeds
 check:
     cargo check --workspace --all-features --all-targets
 
+# Every crate must still build with its own optional features OFF.
+#
+# Nothing checked this, and a re-export that had lost its `#[cfg]` sat broken for
+# as long as it took someone to build a single crate on its own — the failure
+# surfaces in a crate you did not touch, pointing at a line you did not write.
+# Every other invocation here passes `--all-features`, so the gap was invisible.
+#
+# `fuzz` needs a C++ libfuzzer toolchain that is not always present. `tansu` is
+# the binary, and its only feature gates the dependencies it is made of
+# (`dep:tansu-broker`, `dep:tansu-cli`, `dep:tansu-storage`), so building it
+# without them is not a thing to ask for.
+check-no-default-features:
+    cargo check --workspace --exclude fuzz --exclude tansu --no-default-features --all-targets
+
 clippy:
     cargo clippy --workspace --all-features --all-targets -- -D warnings
 
