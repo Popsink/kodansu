@@ -111,6 +111,36 @@ impl TryFrom<Bytes> for Batch {
 
         let partition_leader_epoch = encoded.try_get_i32()?;
         let magic = encoded.try_get_i8()?;
+
+        // Decide the format here, before a single v2-only field is read.
+        //
+        // `magic` sits at the same absolute offset in both layouts — that is
+        // by design, and it is how a broker tells them apart. Everything
+        // after it differs: a pre-v2 MessageSet carries
+        // `attributes | [timestamp] | key | value` where v2 carries
+        // `crc | attributes | last_offset_delta | ...`. Parsing on regardless
+        // is what produced a batch claiming 2_920_539_060 records from a
+        // 92-byte magic-0 message (#320).
+        //
+        // This struct cannot represent a pre-v2 MessageSet, so it does not
+        // try: only the three fields read above are at known positions, and
+        // the rest are left at their defaults. The batch is returned rather
+        // than refused because the framing is shared — `base_offset` then a
+        // `batch_length`-long body — so the request body still decodes, and
+        // refusing here would fail the whole frame, which the broker answers
+        // by closing the connection with no response at all. `ProduceService`
+        // refuses it per-partition instead, where the producer can be told.
+        if magic != Self::MAGIC_RECORD_BATCH_V2 {
+            debug!(base_offset, batch_length, magic, "pre-v2 message set");
+
+            return Ok(Batch {
+                base_offset,
+                batch_length,
+                magic,
+                ..Default::default()
+            });
+        }
+
         let crc = encoded.try_get_u32()?;
 
         debug!(base_offset, batch_length);
@@ -234,6 +264,25 @@ impl TryFrom<Bytes> for Batch {
 impl Batch {
     const TRANSACTIONAL_BITMASK: i16 = 0b1_0000i16;
     const CONTROL_BITMASK: i16 = 0b10_0000i16;
+
+    /// The `magic` of the v2 RecordBatch — the only record format this broker
+    /// reads or writes.
+    ///
+    /// Kafka has had three: the magic-0 and magic-1 MessageSets, superseded by
+    /// the v2 RecordBatch in 0.11. A producer only sends a pre-v2 MessageSet on
+    /// `Produce` v0, v1 or v2, so the API version and the record format move
+    /// together.
+    pub const MAGIC_RECORD_BATCH_V2: i8 = 2;
+
+    /// Whether this batch is in the v2 RecordBatch format.
+    ///
+    /// A batch that is not carries no meaningful field beyond `base_offset`,
+    /// `batch_length` and `magic`: the decoder stops at `magic` rather than
+    /// reading a pre-v2 MessageSet through the v2 field layout (#320). Refuse
+    /// such a batch — `UNSUPPORTED_FOR_MESSAGE_FORMAT` — do not act on it.
+    pub fn is_record_batch_v2(&self) -> bool {
+        self.magic == Self::MAGIC_RECORD_BATCH_V2
+    }
 
     pub fn is_transactional(&self) -> bool {
         self.attributes & Self::TRANSACTIONAL_BITMASK == Self::TRANSACTIONAL_BITMASK
@@ -1412,6 +1461,91 @@ mod crc_verification {
 
         assert_eq!(batch.crc, decoded.crc, "the bad crc is carried through");
         assert!(!decoded.crc_matches()?, "and it is still detectable");
+
+        Ok(())
+    }
+
+    /// A real magic-0 MessageSet, captured from `sarama` on `Produce` v0.
+    ///
+    /// Taken from the `produce_request_v0_000` frame in `tests/decode.rs`: the
+    /// 92 bytes of its `records` field, which is exactly what the decoder is
+    /// handed for one batch.
+    ///
+    /// `offset(8) | size(4) = 80 | crc(4) | magic = 0 | attributes(1) |
+    ///  key_len = -1 | value_len = 66 | value(66)`
+    fn a_magic_0_message_set() -> Bytes {
+        Bytes::from_static(&[
+            // base offset
+            0, 0, 0, 0, 0, 0, 0, 0, //
+            // message size: 80
+            0, 0, 0, 80, //
+            // legacy CRC-32 — not a CRC-32C, and over a different range
+            14, 140, 97, 161, //
+            // magic
+            0, //
+            // attributes
+            0, //
+            // key: null
+            255, 255, 255, 255, //
+            // value: 66 bytes
+            0, 0, 0, 66, //
+            181, 164, 112, 10, 42, 24, 68, 168, 93, 201, 190, 85, 75, 81, 82, 227, 134, 137, 91,
+            20, 86, 4, 92, 187, 141, 103, 65, 71, 241, 103, 73, 174, 19, 227, 180, 158, 176, 4, 27,
+            78, 34, 140, 106, 1, 209, 63, 255, 52, 206, 164, 132, 184, 32, 34, 45, 24, 162, 18,
+            187, 77, 19, 3, 161, 102, 20, 14,
+        ])
+    }
+
+    /// A pre-v2 MessageSet decodes as *itself*, not as a v2 batch full of
+    /// garbage (#320).
+    ///
+    /// Before this, the v2 field layout was read straight over a magic-0
+    /// message and `record_count` came out as 2_920_539_060 — bytes 45..49 of
+    /// a 66-byte payload, where a v2 batch keeps its record count. Nothing
+    /// downstream could tell that apart from a batch that really did claim
+    /// 2.9 billion records.
+    #[test]
+    fn a_pre_v2_message_set_is_not_decoded_as_v2() -> Result<()> {
+        let encoded = a_magic_0_message_set();
+
+        // The precondition: the trap is real in *these* bytes. Where a v2
+        // batch keeps `record_count`, this capture holds part of its payload,
+        // and reading it as a count gives 2_920_539_060. Without this, the
+        // assertions below could pass over a capture that never had a
+        // plausible-looking count to fabricate.
+        assert_eq!(
+            2_920_539_060u32,
+            u32::from_be_bytes(encoded[57..61].try_into()?),
+            "the v2 record_count slot must hold the number from #320"
+        );
+
+        let decoded = Batch::try_from(encoded)?;
+
+        assert!(!decoded.is_record_batch_v2());
+        assert_eq!(0, decoded.magic);
+
+        // The three fields that are at known positions in both layouts.
+        assert_eq!(0, decoded.base_offset);
+        assert_eq!(80, decoded.batch_length);
+
+        // And nothing was invented from the v2 layout. `record_count` is the
+        // one that mattered: it sized an allocation until #306 bounded it.
+        assert_eq!(0, decoded.record_count, "no fabricated record count");
+        assert_eq!(0, decoded.attributes);
+        assert_eq!(0, decoded.crc);
+        assert!(decoded.record_data.is_empty());
+
+        Ok(())
+    }
+
+    /// The v2 path is untouched: `magic` is checked, not merely present.
+    #[test]
+    fn a_v2_batch_still_decodes_in_full() -> Result<()> {
+        let batch = a_batch()?;
+        let decoded = Batch::try_from(Bytes::from(batch.clone()))?;
+
+        assert!(decoded.is_record_batch_v2());
+        assert_eq!(batch, decoded);
 
         Ok(())
     }
