@@ -52,7 +52,7 @@ use tansu_sans_io::{
 
 use crate::{
     Result, Storage, Topition,
-    dynostore::{DynoStore, tests::init_tracing},
+    dynostore::{CoalesceTuning, DynoStore, tests::init_tracing},
 };
 
 const CLUSTER: &str = "tansu";
@@ -228,7 +228,18 @@ async fn what_does_a_produce_cost_in_object_store_requests() -> Result<()> {
     const FLUSHES: u64 = 10;
 
     let tally = Tally::default();
-    let storage = DynoStore::new(CLUSTER, NODE, Counted::new(tally.clone()));
+
+    // `coalesce_tuning` is what puts produce on the prefix-coalesced leaseless
+    // flush — the path `leaseless_base` lives on. Without it the store takes the
+    // per-batch create path, never calls `leaseless_base`, and this measurement
+    // reads zero on both sides of #316 while measuring nothing. It did exactly
+    // that on the first run; the identical A/B numbers are what gave it away.
+    let storage = DynoStore::new(CLUSTER, NODE, Counted::new(tally.clone())).coalesce_tuning(
+        CoalesceTuning {
+            coalesce_batches: Some(1),
+            ..Default::default()
+        },
+    );
 
     let topic = "org.env.conn.tab_cost";
     let tp = Topition::new(topic, 0);
@@ -249,6 +260,19 @@ async fn what_does_a_produce_cost_in_object_store_requests() -> Result<()> {
     // index is empty, its hint absent), and a cold flush read the floor even
     // before #316. What is being measured is the *steady state*.
     _ = storage.produce(None, &tp, batch(1)?).await?;
+
+    // **The precondition.** The first flush is cold — its index is empty and its
+    // hint absent — so it reads the persisted floor on *both* sides of #316: the
+    // conditional fold also read it when the derived base was zero. So a non-zero
+    // count here proves the leaseless flush ran and reached `leaseless_base`,
+    // independent of which side we are measuring. Without this, zero is
+    // indistinguishable from "the code under test never executed".
+    let warmed = tally.snapshot();
+    assert!(
+        warmed.0 > 0,
+        "the cold flush must have read watermark.json at least once, else this is \
+         not measuring the leaseless path at all — got {warmed:?}",
+    );
 
     let before = tally.snapshot();
 
