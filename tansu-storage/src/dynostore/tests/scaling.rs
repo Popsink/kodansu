@@ -1064,8 +1064,9 @@ async fn segmentless_substream_stale_hint_latest_costs_no_per_partition_get() ->
         CLUSTER,
         NODE,
         Counting {
-            inner: CountWatermarkGets {
+            inner: CountGetsOf {
                 inner: InMemory::new(),
+                suffix: "watermark.json",
                 gets: watermark_gets.clone(),
             },
             counters: counters.clone(),
@@ -1326,28 +1327,35 @@ fn every_metered_outcome_carries_a_key_class() {
     );
 }
 
-/// An `ObjectStore` counting GETs of the per-partition `watermark.json` object,
-/// so a test can pin that a read path does not touch it (#161).
+/// An `ObjectStore` counting GETs of objects whose path ends with `suffix`, so a
+/// test can pin how often one named object is fetched: that a read path does not
+/// touch `watermark.json` at all (#161), or that a flush reads `seq-floor.json`
+/// once rather than twice (#278).
+///
+/// Suffix-parameterised rather than one struct per object — the `ObjectStore`
+/// forwarding below is ~90 lines that say nothing, and duplicating it per counter
+/// is the shape #286 is about.
 #[derive(Clone)]
-struct CountWatermarkGets<O> {
+struct CountGetsOf<O> {
     inner: O,
+    suffix: &'static str,
     gets: Arc<AtomicU64>,
 }
 
-impl<O> Debug for CountWatermarkGets<O> {
+impl<O> Debug for CountGetsOf<O> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CountWatermarkGets").finish()
+        f.debug_struct("CountGetsOf").finish()
     }
 }
 
-impl<O> Display for CountWatermarkGets<O> {
+impl<O> Display for CountGetsOf<O> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CountWatermarkGets").finish()
+        f.debug_struct("CountGetsOf").finish()
     }
 }
 
 #[async_trait]
-impl<O> ObjectStore for CountWatermarkGets<O>
+impl<O> ObjectStore for CountGetsOf<O>
 where
     O: ObjectStore,
 {
@@ -1373,7 +1381,7 @@ where
         location: &Path,
         options: GetOptions,
     ) -> Result<GetResult, object_store::Error> {
-        if location.as_ref().ends_with("watermark.json") {
+        if location.as_ref().ends_with(self.suffix) {
             _ = self.gets.fetch_add(1, Relaxed);
         }
         self.inner.get_opts(location, options).await
@@ -1432,8 +1440,9 @@ async fn read_committed_polling_does_not_get_watermark_json() -> Result<(), Erro
     let storage = DynoStore::new(
         CLUSTER,
         NODE,
-        CountWatermarkGets {
+        CountGetsOf {
             inner: InMemory::new(),
+            suffix: "watermark.json",
             gets: gets.clone(),
         },
     );
@@ -1474,6 +1483,67 @@ async fn read_committed_polling_does_not_get_watermark_json() -> Result<(), Erro
         gets.load(Relaxed),
         "16 read-committed polls must not GET watermark.json (#161)"
     );
+
+    Ok(())
+}
+
+/// #278's acceptance: a steady-state leaseless flush reads `seq-floor.json`
+/// **once**, not twice.
+///
+/// It used to read it twice, milliseconds apart, for the same object: the tail
+/// probe ends with a live floor read certified under the current generation, and
+/// then `tail_next_seq_folded` immediately issued another. Both satisfied the same
+/// ordering requirement — the floor observed after the tail — so the second could
+/// only re-read what the first had just read.
+///
+/// Counted per flush rather than in total, because the first flush of a prefix is
+/// not steady state: it lists cold, which bumps the index generation and therefore
+/// *must* re-read the floor. Asserting a total would either encode that warm-up as
+/// a magic number or hide a regression inside it.
+#[tokio::test]
+async fn a_steady_state_flush_reads_the_seq_floor_once() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let floor_gets = Arc::new(AtomicU64::new(0));
+    let storage = DynoStore::new(
+        CLUSTER,
+        NODE,
+        CountGetsOf {
+            inner: InMemory::new(),
+            suffix: "seq-floor.json",
+            gets: floor_gets.clone(),
+        },
+    )
+    // One batch per flush, so each produce below is exactly one flush and the
+    // per-flush cost is the difference between two readings.
+    .coalesce_tuning(CoalesceTuning {
+        coalesce_batches: Some(1),
+        ..Default::default()
+    });
+
+    let topic = "org.env.conn.floor";
+    create(&storage, topic, 1).await?;
+    let tp = Topition::new(topic, 0);
+
+    // Warm the prefix: the cold path lists, which bumps the generation.
+    _ = storage.produce(None, &tp, batch(b"warm")?).await?;
+
+    // Now measure steady state.
+    for n in 0..4u32 {
+        let before = floor_gets.load(Relaxed);
+
+        _ = storage
+            .produce(None, &tp, batch(format!("m-{n}").as_bytes())?)
+            .await?;
+
+        let spent = floor_gets.load(Relaxed) - before;
+
+        assert_eq!(
+            1, spent,
+            "flush {n} spent {spent} GETs on seq-floor.json, expected 1 — the probe's \
+             certified read is the only one a steady-state flush needs (#278)"
+        );
+    }
 
     Ok(())
 }
