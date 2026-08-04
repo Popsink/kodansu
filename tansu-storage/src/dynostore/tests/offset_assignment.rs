@@ -27,14 +27,16 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use object_store::memory::InMemory;
+use futures::TryStreamExt as _;
+use object_store::{ObjectStore as _, ObjectStoreExt as _, memory::InMemory, path::Path};
 use tansu_sans_io::{
     IsolationLevel, ListOffset, create_topics_request::CreatableTopic, record::Record,
     record::deflated, record::inflated,
 };
 
 use crate::{
-    Error, Result, Storage, Topition, dynostore::DynoStore, dynostore::tests::init_tracing,
+    Error, Result, Storage, Topition,
+    dynostore::{CoalesceTuning, DynoStore, tests::init_tracing},
 };
 
 const CLUSTER: &str = "tansu";
@@ -59,6 +61,36 @@ fn batch(records: usize) -> Result<deflated::Batch> {
         .build()
         .and_then(deflated::Batch::try_from)
         .map_err(Into::into)
+}
+
+/// As [`batch`], but with an explicit record timestamp so retention can be
+/// driven deterministically. Timestamps are independent of offset order.
+fn batch_at(records: usize, timestamp: i64) -> Result<deflated::Batch> {
+    let mut builder = inflated::Batch::builder();
+
+    for i in 0..records {
+        builder = builder.record(Record::builder().value(Some(Bytes::copy_from_slice(
+            format!("record-{i}").as_bytes(),
+        ))));
+    }
+
+    builder
+        .last_offset_delta(records as i32 - 1)
+        .base_timestamp(timestamp)
+        .max_timestamp(timestamp)
+        .build()
+        .and_then(deflated::Batch::try_from)
+        .map_err(Into::into)
+}
+
+fn now_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or_default()
 }
 
 async fn create_topic(storage: &DynoStore, name: &str, partitions: i32) -> Result<()> {
@@ -355,6 +387,195 @@ async fn delete_records_all_uses_listing_high_watermark() -> Result<(), Error> {
     // not back at 0.
     assert!(fetch_offsets(&store, &topition, 0).await.is_empty());
     assert_eq!(5, store.produce(None, &topition, batch(1)?).await?);
+
+    Ok(())
+}
+
+/// The segment objects under `prefix`, oldest sequence first.
+///
+/// `prefix` is the *routed* prefix, not the topic name: an uncompacted dotted
+/// topic is coalesced under its connector prefix (`prefix_of`, the first three
+/// components), so it shares segment objects with its siblings. Resolve it with
+/// `routed_prefix_of` rather than assuming — the first draft of this test
+/// listed under the topic name, found nothing, and its precondition assertion
+/// is what caught that.
+async fn segment_objects(bucket: &InMemory, prefix: &str) -> Vec<Path> {
+    let listing = Path::from(format!("clusters/{CLUSTER}/prefixes/{prefix}/segments/"));
+    let mut found = bucket
+        .list(Some(&listing))
+        .map_ok(|meta| meta.location)
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("list segments");
+    found.sort();
+    found
+}
+
+/// #287: when a sub-stream's tail-holding segment is gone and an OLDER segment
+/// for it survives, does the flush path skip the persisted floor and re-assign
+/// offsets that were already acknowledged?
+///
+/// `leaseless_base` folded the floor only when the segment tail was zero, while
+/// `recover_substream_next_offset` and `docs/design-multiwriter-segments.md`
+/// step 2 both fold it unconditionally. This test decides whether that
+/// divergence is reachable. It is.
+///
+/// **The expiry pass drives it, and that is the point.** An earlier draft
+/// deleted the tail-holding object by hand and asserted the floor was already
+/// 8 — it was 0, because `watermark.high` has exactly one writer,
+/// `expire_prefix_segments`, which persists it write-ahead of its own deletes.
+/// So the floor and the deletion are two halves of one pass and a test that
+/// fakes the deletion cannot have a floor. Only a *precondition* assertion
+/// caught that; the conclusion would have passed and proved nothing.
+///
+/// The state under test — tail-holder gone, older survives — is reached here
+/// through record *timestamps*, which are independent of offset order: a batch
+/// produced second (so holding the higher offsets) may carry an older timestamp
+/// than the batch produced first. Whole-segment retention (#61) then reclaims
+/// the tail-holder while the lower-offset segment survives. Out-of-order
+/// timestamps are ordinary — a producer sets them, and a replayed or
+/// backfilled batch routinely carries older ones than its predecessor. The
+/// issue's own route, a *shared* segment kept alive by a hot sibling topic
+/// (#61), reaches the same state.
+///
+/// **The preconditions are asserted, not assumed.** If the tail-holder is not
+/// gone, or an older segment does not survive, or the cold store's tail is not
+/// below the floor, a pass here proves nothing about the code.
+#[tokio::test]
+async fn a_cold_replica_must_not_reuse_offsets_below_the_persisted_floor() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.tab_reuse";
+    let tp = Topition::new(topic, 0);
+
+    // One batch per segment, so the two flushes land in distinct objects and one
+    // of them is unambiguously the tail-holder.
+    let writer = DynoStore::new(CLUSTER, NODE, bucket.clone()).coalesce_tuning(CoalesceTuning {
+        coalesce_batches: Some(1),
+        ..Default::default()
+    });
+    create_topic(&writer, topic, 1).await?;
+
+    // The routed prefix, not the topic name — see `segment_objects`.
+    let prefix = writer.routed_prefix_of(&tp).await?;
+
+    // Offsets 0..4 carry a *recent* timestamp, offsets 4..8 an ancient one.
+    let recent = now_ms();
+    let ancient = 1_000;
+
+    assert_eq!(0, writer.produce(None, &tp, batch_at(4, recent)?).await?);
+    assert_eq!(4, writer.produce(None, &tp, batch_at(4, ancient)?).await?);
+
+    assert_eq!(
+        8,
+        writer.high_watermark(&tp).await?,
+        "eight offsets were acknowledged"
+    );
+
+    // Precondition 1: two segments, so there is an older one to survive.
+    assert_eq!(
+        2,
+        segment_objects(&bucket, &prefix).await.len(),
+        "the two flushes must be distinct segments"
+    );
+
+    // Retention reclaims the ancient segment — which holds offsets 4..8, the
+    // tail — and keeps the recent one holding 0..4. This is the production
+    // pass, so it writes the floor itself.
+    let deleted = writer.expire_prefix_segments(&prefix, ancient + 1).await?;
+
+    // Precondition 2: exactly the tail-holder went.
+    assert_eq!(1, deleted, "exactly one segment must have been reclaimed");
+    assert_eq!(
+        1,
+        segment_objects(&bucket, &prefix).await.len(),
+        "the lower-offset segment must remain",
+    );
+
+    // Precondition 3: the floor records the true log end. Without this the test
+    // is not exercising the fold at all.
+    let floor = DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .persisted_high(&tp)
+        .await?;
+    assert_eq!(
+        8, floor,
+        "the expiry write-ahead must have persisted watermark.high",
+    );
+
+    // A cold replica: it has never seen either sequence, so its index is rebuilt
+    // from a full listing and its high-watermark hint is empty.
+    let cold = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    cold.refresh_prefix_index_forced(&prefix).await?;
+
+    // Precondition 4: the cold tail really is below the floor. This is the whole
+    // hypothesis — a non-zero tail that under-reports the log end.
+    let cold_tail = cold
+        .valid_substream_segments(&prefix, tp.topic(), tp.partition())?
+        .last()
+        .map(|(_, entry)| entry.base_offset + entry.record_count)
+        .unwrap_or(0);
+    assert_eq!(
+        4, cold_tail,
+        "the surviving lower-offset segment must give a non-zero tail below the floor",
+    );
+
+    // The question: does the flush path answer the stale tail, or the floor?
+    let base = cold.leaseless_base(&prefix, &tp).await?;
+
+    assert!(
+        base >= floor,
+        "leaseless_base returned {base}, below the persisted floor of {floor}: a produce \\
+         here re-assigns offsets {base}..{floor} that were already acknowledged, so \\
+         consumers see duplicate offsets carrying different payloads (#287)",
+    );
+
+    Ok(())
+}
+
+/// **The converse.** Folding the floor unconditionally must not inflate the base
+/// on a healthy sub-stream — it is a `max`, so the only way it could go wrong is
+/// by answering *above* the segment tail and leaving a gap.
+///
+/// This is the half whose absence let #302 reach production: a guard was pinned
+/// to catch the bad case and nothing pinned that the good case still worked.
+#[tokio::test]
+async fn folding_the_floor_does_not_move_a_healthy_base() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.tab_healthy";
+    let tp = Topition::new(topic, 0);
+
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    create_topic(&store, topic, 1).await?;
+
+    let prefix = store.routed_prefix_of(&tp).await?;
+
+    assert_eq!(0, store.produce(None, &tp, batch(4)?).await?);
+    assert_eq!(4, store.produce(None, &tp, batch(4)?).await?);
+
+    // Nothing has expired, so the floor is absent (0) and contributes nothing.
+    assert_eq!(
+        0,
+        store.persisted_high(&tp).await?,
+        "no expiry has run, so there is no persisted floor",
+    );
+
+    // Warm store: the base is exactly the tail, not one above it.
+    assert_eq!(8, store.leaseless_base(&prefix, &tp).await?);
+
+    // Cold store: same answer, derived from the segments alone.
+    let cold = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    cold.refresh_prefix_index_forced(&prefix).await?;
+    assert_eq!(
+        8,
+        cold.leaseless_base(&prefix, &tp).await?,
+        "a cold replica must derive the same base, with no gap",
+    );
+
+    // And a produce continues contiguously from it.
+    assert_eq!(8, cold.produce(None, &tp, batch(4)?).await?);
 
     Ok(())
 }

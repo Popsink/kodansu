@@ -5189,9 +5189,9 @@ impl DynoStore {
     }
 
     /// The next offset for `topition` under the leaseless path (#86), derived from
-    /// the already force-folded prefix index: the epoch-fenced segment tail folded
-    /// with this process's hint, and — only for a cold/drained sub-stream — the
-    /// persisted floor, so an offset is never reused.
+    /// the already force-folded prefix index: the epoch-fenced segment tail, this
+    /// process's hint, and the persisted floor, all three folded with `max` so an
+    /// offset is never reused.
     /// `prefix` is the flush's (routed, #175) buffer key, threaded through
     /// rather than re-derived so the base is read from exactly the segment set
     /// the flush is about to append to.
@@ -5203,16 +5203,41 @@ impl DynoStore {
             .unwrap_or(0);
         let cached = self.cached_high(topition)?.unwrap_or(0);
 
-        // The persisted floor only matters when nothing else is known (a fully
-        // retention-drained sub-stream), so it costs a GET only then. The legacy
-        // tail is no longer folded (#179): it guarded against a `records/` object
-        // sitting above the segment tail, which nothing can create.
-        let base = segment_tail.max(cached);
-        if base > 0 {
-            Ok(base)
-        } else {
-            Ok(self.persisted_high(topition).await.unwrap_or(0))
-        }
+        // Fold the persisted floor **unconditionally** (#287), matching
+        // `recover_substream_next_offset` and `docs/design-multiwriter-segments.md`
+        // step 2. It used to be folded only when `segment_tail.max(cached)` was
+        // zero, on the reasoning that a non-zero tail already knows the log end.
+        // It does not: `expire_prefix_segments` can reclaim a sub-stream's
+        // *tail-holding* segment while a lower-offset one survives — a shared
+        // segment kept alive by a hot sibling topic, or simply a batch whose
+        // timestamp is older than its predecessor's. A replica that then rebuilds
+        // its index from a listing sees a non-zero tail that under-reports the log
+        // end, skipped the floor, and re-assigned acknowledged offsets. Silent
+        // offset reuse: consumers see one offset carrying two different payloads.
+        //
+        // The floor is the only surviving record of those offsets, which is why
+        // expiry writes it write-ahead of the delete.
+        //
+        // Cost: `persisted_high` goes through the cached `OptiCon<Watermark>`
+        // handle, so this is a conditional GET that answers 304 while the
+        // watermark is unchanged — which is almost always, since only expiry and
+        // truncation move it. One revalidation round trip per flush, against a
+        // flush that already does a LIST and at least one create-CAS PUT. It is
+        // *not* the full GET per flush that the conditional appeared to be
+        // avoiding, which is why no memo is needed here.
+        //
+        // A per-process memo was considered and rejected: it would be unsound in
+        // exactly the case this fixes. The obvious memo keys off `cached_high`,
+        // but that hint reflects only *this* replica's writes (see `set_high`),
+        // so a warm replica whose peer produced the offsets that expiry then
+        // reclaimed would hold a memo below the floor and reuse them anyway.
+        //
+        // The legacy tail is no longer folded (#179): it guarded against a
+        // `records/` object sitting above the segment tail, which nothing can
+        // create.
+        let floor = self.persisted_high(topition).await.unwrap_or(0);
+
+        Ok(segment_tail.max(cached).max(floor))
     }
 
     /// Build the folded [`ProducerTail`] for `(topition, producer_id)` from the
