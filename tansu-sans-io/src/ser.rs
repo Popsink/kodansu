@@ -1303,7 +1303,9 @@ impl SerializeStructVariant for &mut RecordBatchEncoder {
 
 #[cfg(test)]
 mod encode_allocation {
-    use crate::{ApiKey as _, FetchResponse, Frame, MaximumAllocationSize as _, Result};
+    use crate::{
+        ApiKey as _, Body, FetchResponse, Frame, Header, MaximumAllocationSize as _, Result,
+    };
 
     /// A real `FetchResponse` v16 carrying a record batch, taken from the worked
     /// example in `record.rs`.
@@ -1375,6 +1377,109 @@ mod encode_allocation {
             encoded.len(),
             encoded.len().saturating_sub(estimate),
         );
+
+        Ok(())
+    }
+
+    /// The estimate covers the frame at **every** version, not just the one
+    /// vector that happened to be captured (#312).
+    ///
+    /// Worth being precise about what this one does: it did **not** find the
+    /// under-count, and still passes with the tag-buffer allowance removed. What
+    /// it shows is where the margin goes — the slack narrows steadily as versions
+    /// add fields, from 86 bytes at v0 to 3 from v13 on, where the flexible
+    /// encoding starts paying for tag buffers. That is the warning the sweep
+    /// below turns into a failure.
+    #[test]
+    fn the_size_estimate_covers_every_version() -> Result<()> {
+        let api_key = FetchResponse::KEY;
+
+        let bytes = fetch_response_v16_bytes();
+        let decoded = Frame::response_from_bytes(&bytes[..], api_key, 16)?;
+        let body = FetchResponse::try_from(decoded.body)?;
+
+        for api_version in 0..=17i16 {
+            let header = Header::Response { correlation_id: 8 };
+
+            let estimate = Frame {
+                size: 0,
+                header: header.clone(),
+                body: Body::from(body.clone()),
+            }
+            .maximum_allocation_size()?;
+
+            let encoded = Frame::response(header, Body::from(body.clone()), api_key, api_version)?;
+
+            assert!(
+                estimate >= encoded.len(),
+                "v{api_version}: maximum_allocation_size() said {estimate} but the frame encoded \
+                 to {} — short by {} bytes",
+                encoded.len(),
+                encoded.len().saturating_sub(estimate),
+            );
+        }
+
+        Ok(())
+    }
+
+    /// The estimate covers the frame as the **number of structs** grows (#312).
+    ///
+    /// The sweep that localises the defect rather than merely detecting it. A
+    /// tag buffer costs a byte per struct and was counted nowhere, so the
+    /// shortfall is linear in the struct count while the slack that hid it —
+    /// a compact array counted as 4 bytes, a null field counted as 4 — is
+    /// per-array, not per-struct. Measured before the fix, at v16, one
+    /// partition per topic:
+    ///
+    /// | topics | estimate | encoded | slack |
+    /// |---|---|---|---|
+    /// | 1 | 193 | 190 | +3 |
+    /// | 2 | 360 | 359 | +1 |
+    /// | 4 | 694 | 697 | **-3** |
+    /// | 1024 | 171 034 | 173 078 | **-2044** |
+    ///
+    /// Two bytes per topic — one for the topic's tag buffer, one for its
+    /// partition's. The production panic was a `FetchResponse` three bytes over
+    /// its 8 KiB allocation, which is this at four topics.
+    #[test]
+    fn the_size_estimate_covers_a_frame_of_many_structs() -> Result<()> {
+        let api_key = FetchResponse::KEY;
+        let api_version = 16;
+
+        let bytes = fetch_response_v16_bytes();
+        let decoded = Frame::response_from_bytes(&bytes[..], api_key, api_version)?;
+        let body = FetchResponse::try_from(decoded.body)?;
+        let one_topic = body.responses.clone().unwrap_or_default();
+
+        // The precondition: a single topic is what the captured vector holds, so
+        // without more than one struct this test is the assertion above.
+        assert_eq!(1, one_topic.len());
+
+        for topics in [1usize, 2, 4, 8, 16, 64, 256, 1024] {
+            let body = body.clone().responses(Some(
+                one_topic.iter().cycle().take(topics).cloned().collect(),
+            ));
+
+            let header = Header::Response { correlation_id: 8 };
+
+            let estimate = Frame {
+                size: 0,
+                header: header.clone(),
+                body: Body::from(body.clone()),
+            }
+            .maximum_allocation_size()?;
+
+            let encoded = Frame::response(header, Body::from(body), api_key, api_version)?;
+
+            assert!(
+                estimate >= encoded.len(),
+                "{topics} topics: maximum_allocation_size() said {estimate} but the frame encoded \
+                 to {} — short by {} bytes, {:.2} per topic",
+                encoded.len(),
+                encoded.len().saturating_sub(estimate),
+                encoded.len().saturating_sub(estimate) as f64 / topics as f64,
+            );
+        }
 
         Ok(())
     }

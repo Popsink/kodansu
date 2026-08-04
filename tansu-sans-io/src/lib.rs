@@ -159,6 +159,47 @@ pub trait MaximumAllocationSize {
     fn maximum_allocation_size(&self) -> Result<usize>;
 }
 
+/// What a struct's tag buffer can cost, beyond the fields it is counted with.
+///
+/// In a flexible version every struct ends with a tag buffer: an
+/// `UnsignedVarInt` count of the tagged fields present, then, for each one, an
+/// `UnsignedVarInt` tag and an `UnsignedVarInt` length ahead of its payload.
+/// None of that was counted anywhere, so `maximum_allocation_size()`
+/// under-counted by a byte per struct — invisible on a small frame, where the
+/// slack from counting a compact array as 4 bytes and a null field as 4 covers
+/// it, and linear in the number of topic and partition structs on a large one
+/// (#312).
+///
+/// The allowance is unconditional, because this arithmetic runs without an
+/// `api_version` and cannot know whether the encoding will be flexible. That is
+/// the right way round for a *maximum* allocation size: over-reserving costs a
+/// few bytes per struct that are never written, and under-reserving used to cost
+/// a panicked `tokio-rt-worker`.
+///
+/// The count varint: the number of tagged fields on a struct is known when this
+/// crate is generated and is always well under 128, so one byte covers it.
+pub(crate) const TAG_BUFFER_COUNT_ALLOWANCE: usize = 1;
+
+/// What one present tagged field can cost in the tag buffer, on top of its own
+/// counted size: an `UnsignedVarInt` tag — Kafka's tags are small, so one byte —
+/// and an `UnsignedVarInt` length, at most five.
+///
+/// Charged per tagged field a struct *declares*, not per field actually present,
+/// which over-reserves for the common case of a tagged field left `None`. See
+/// [`TAG_BUFFER_COUNT_ALLOWANCE`] for why that direction is the safe one.
+pub(crate) const TAG_FIELD_ALLOWANCE: usize = 6;
+
+/// The tag-buffer allowance for a struct declaring `tagged_fields` tagged fields.
+///
+/// The generated [`MaximumAllocationSize`] impls call this rather than inlining
+/// the arithmetic, which keeps it in one place and keeps the generated code free
+/// of `0 *` and `1 *` — clippy's `erasing_op` and `identity_op`, both errors here
+/// under `-D warnings`, and between them they cover most of the 185 message
+/// types.
+pub(crate) const fn tag_buffer_allowance(tagged_fields: usize) -> usize {
+    TAG_BUFFER_COUNT_ALLOWANCE + (tagged_fields * TAG_FIELD_ALLOWANCE)
+}
+
 impl<T> MaximumAllocationSize for T
 where
     T: ByteSize,
@@ -688,8 +729,12 @@ impl MaximumAllocationSize for Header {
             } => Ok(api_key.maximum_allocation_size()?
                 + api_version.maximum_allocation_size()?
                 + correlation_id.maximum_allocation_size()?
-                + client_id.maximum_allocation_size()?),
-            Self::Response { correlation_id } => correlation_id.maximum_allocation_size(),
+                + client_id.maximum_allocation_size()?
+                // The header carries a tag buffer too, in a flexible version.
+                + TAG_BUFFER_COUNT_ALLOWANCE),
+            Self::Response { correlation_id } => correlation_id
+                .maximum_allocation_size()
+                .map(|size| size + TAG_BUFFER_COUNT_ALLOWANCE),
         }
     }
 }
