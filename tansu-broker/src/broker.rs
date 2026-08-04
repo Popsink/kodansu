@@ -15,7 +15,7 @@
 pub mod group;
 
 use crate::{
-    CancelKind, Error, Result,
+    CancelKind, Result,
     coordinator::group::{
         Coordinator,
         administrator::Controller,
@@ -31,7 +31,7 @@ use rsasl::config::SASLConfig;
 use rustls::ServerConfig;
 use std::{
     future::{Future, pending},
-    io::{self, ErrorKind},
+    io,
     marker::PhantomData,
     net::{IpAddr, Ipv6Addr, SocketAddr},
     str::FromStr,
@@ -42,6 +42,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 use tansu_sans_io::{ErrorCode, RootMessageMeta};
+use tansu_service::{Classify as _, Severity};
 use tansu_storage::{
     ArcDynStorage, BrokerRegistrationRequest, Storage, StorageContainer, TopicDefaults,
 };
@@ -497,14 +498,32 @@ where
 
         let handle = set.spawn(async move {
             match service.serve(c, stream).await {
-                Err(Error::Io(ref io))
-                    if io.kind() == ErrorKind::UnexpectedEof
-                        || io.kind() == ErrorKind::BrokenPipe
-                        || io.kind() == ErrorKind::ConnectionReset => {}
+                // Two separate facts, and this arm used to conflate them into one
+                // `error!` (#289).
+                //
+                // *Which* error occurred is classified by the error itself, so a
+                // deliberately retriable answer does not fill the error plane on
+                // every rollout.
+                //
+                // *That the connection is being abandoned with no response
+                // written* is reported whatever the error was, because it is the
+                // part the client experiences and nothing else records it. From
+                // the caller's side an abandoned connection is indistinguishable
+                // from the peer closing mid-frame — which is exactly the
+                // `early eof` shape of #300, and this line is the only evidence
+                // that a request-level error is what caused it. Downgrading the
+                // error code must not take that with it.
+                Err(error) => match error.severity() {
+                    Severity::Expected => debug!(?error),
 
-                Err(error) => {
-                    error!(?error);
-                }
+                    Severity::Unexpected => {
+                        warn!(?error, "connection ended, no response written")
+                    }
+
+                    Severity::Failure => {
+                        error!(?error, "connection ended, no response written")
+                    }
+                },
 
                 Ok(response) => {
                     debug!(?response)

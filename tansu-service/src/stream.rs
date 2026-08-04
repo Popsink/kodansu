@@ -33,7 +33,8 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument, warn};
 
 use crate::{
-    BYTES_RECEIVED, BYTES_SENT, Error, REQUEST_DURATION, REQUEST_SIZE, RESPONSE_SIZE, frame_length,
+    BYTES_RECEIVED, BYTES_SENT, Classify, Error, REQUEST_DURATION, REQUEST_SIZE, RESPONSE_SIZE,
+    Severity, frame_length,
 };
 
 /// A [`Layer`] that listens for TCP connections
@@ -76,7 +77,7 @@ impl<State, S> Service<State, TcpListener> for TcpListenerService<S>
 where
     S: Service<State, TcpStream> + Clone,
     S::Response: Debug,
-    S::Error: error::Error,
+    S::Error: error::Error + Classify,
     State: Clone + Send + Sync + 'static,
 {
     type Response = ();
@@ -100,8 +101,20 @@ where
 
                     let handle = set.spawn(async move {
                             match service.serve(ctx, stream).await {
-                                Err(error) => {
-                                    debug!(%addr, %error);
+                                // The connection ends here, and it ends because
+                                // of this error — a fact the client experiences
+                                // and nothing else records. Report it at the
+                                // severity the error itself claims, rather than
+                                // at `debug` for everything, which is what this
+                                // boundary used to do while the broker's own
+                                // accept loop logged the same class at `error`
+                                // (#289).
+                                Err(error) => match error.severity() {
+                                    Severity::Expected => debug!(%addr, %error),
+                                    Severity::Unexpected => warn!(%addr, %error),
+                                    Severity::Failure => {
+                                        error!(%addr, %error, "connection ended, no response written")
+                                    }
                                 },
 
                                 Ok(response) => {
@@ -354,17 +367,18 @@ where
         let (ctx, _) = ctx.swap_state(State::default());
         let request_start = SystemTime::now();
 
-        self.inner
-            .serve(ctx, request)
-            .await
-            .inspect_err(|err| error!(?err))
-            .inspect(|response| {
-                RESPONSE_SIZE.record(response.len() as u64, attributes);
+        // Deliberately does not log the error. It propagates, through `req` and
+        // the `serve` loop, to the per-connection boundary that ends the
+        // connection because of it — and that boundary logs it there. Logging
+        // here as well put every error into the error plane twice, which is how
+        // one `NOT_COORDINATOR` became two `ERROR` lines (#289).
+        self.inner.serve(ctx, request).await.inspect(|response| {
+            RESPONSE_SIZE.record(response.len() as u64, attributes);
 
-                let elapsed_millis = self.elapsed_millis(request_start);
+            let elapsed_millis = self.elapsed_millis(request_start);
 
-                REQUEST_DURATION.record(elapsed_millis, attributes);
-            })
+            REQUEST_DURATION.record(elapsed_millis, attributes);
+        })
     }
 
     #[instrument(skip_all)]

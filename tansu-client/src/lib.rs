@@ -148,6 +148,28 @@ pub enum Error {
     UnknownHost(Url),
 }
 
+impl tansu_service::Classify for Error {
+    fn severity(&self) -> tansu_service::Severity {
+        match self {
+            // The peer went away. Ordinary for a pooled connection.
+            Self::Io(io)
+                if matches!(
+                    io.kind(),
+                    io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                tansu_service::Severity::Expected
+            }
+
+            Self::Service(service) => service.severity(),
+
+            _ => tansu_service::Severity::Failure,
+        }
+    }
+}
+
 impl<T> From<PoisonError<T>> for Error {
     fn from(_value: PoisonError<T>) -> Self {
         Self::Poison

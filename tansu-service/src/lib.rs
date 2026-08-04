@@ -298,6 +298,69 @@ impl fmt::Display for Error {
     }
 }
 
+/// How loudly an error that reached a request boundary deserves to be logged.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Severity {
+    /// A deliberate protocol answer, or ordinary transport noise. The broker is
+    /// working; the client is expected to retry or has simply gone away.
+    Expected,
+
+    /// Unexpected, but handled.
+    Unexpected,
+
+    /// Everything else.
+    Failure,
+}
+
+/// Classify an error by whether it is something going wrong.
+///
+/// Logging by whether a value is an `Err` puts the broker working correctly into
+/// the error plane: a `NOT_COORDINATOR` answered on purpose — what #243 added, so
+/// that a failed forward makes the client retry against the real owner instead of
+/// splitting the group — is protocol flow control, and every rollout produces a
+/// burst of them. The cost is not the lines but what they do to the ones that
+/// matter (#289).
+///
+/// The decision cannot live in this crate. A layer here sees `S::Error` and has
+/// no idea whether a variant means `NOT_COORDINATOR`; the error type does. So the
+/// classification is a trait implemented next to each error type, and the
+/// boundaries that log call it instead of each growing their own match — they had
+/// already drifted apart, one logging connection errors at `debug` while another
+/// logged the same class at `error`.
+///
+/// The default is [`Severity::Failure`]: a type that has not thought about this
+/// keeps the loud behaviour, so adding a variant cannot quietly downgrade it.
+pub trait Classify {
+    fn severity(&self) -> Severity {
+        Severity::Failure
+    }
+}
+
+impl Classify for Error {
+    fn severity(&self) -> Severity {
+        match self {
+            // The peer went away. Routine for a broker that clients connect to
+            // and disconnect from continuously.
+            Self::Io(io)
+                if matches!(
+                    io.kind(),
+                    io::ErrorKind::UnexpectedEof
+                        | io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                Severity::Expected
+            }
+
+            // A client asked for more than the cap allows: its problem, but
+            // worth seeing.
+            Self::FrameTooBig(_) => Severity::Unexpected,
+
+            _ => Severity::Failure,
+        }
+    }
+}
+
 impl From<JoinError> for Error {
     fn from(value: JoinError) -> Self {
         Self::Join(Arc::new(value))
