@@ -2937,6 +2937,21 @@ impl DynoStore {
         Ok(floor)
     }
 
+    /// Forget any certified seq floor cached for `prefix`, so the next
+    /// [`Self::certified_seq_floor`] re-reads it.
+    ///
+    /// Called by [`Self::raise_seq_floor`] the moment the persisted floor moves.
+    fn invalidate_certified_seq_floor(&self, prefix: &str) -> Result<()> {
+        self.prefix_index
+            .lock()
+            .map_err(Into::into)
+            .map(|mut index| {
+                if let Some(entry) = index.get_mut(prefix) {
+                    entry.seq_floor = None;
+                }
+            })
+    }
+
     /// The certified seq floor for `prefix` iff one is cached for the current
     /// index generation (see [`Self::certified_seq_floor`]).
     fn cached_certified_seq_floor(&self, prefix: &str) -> Result<Option<u64>> {
@@ -2997,7 +3012,24 @@ impl DynoStore {
                 )
                 .await
             {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    // The persisted floor moved, so any floor this process has
+                    // certified is now stale. Drop it here rather than relying on
+                    // the caller's later `index_prune` to bump the generation.
+                    //
+                    // Every raise call site does prune afterwards, but *afterwards*
+                    // is the problem: between this PUT and that bump the generation
+                    // is unchanged, so a concurrent `certified_seq_floor` would be
+                    // served the pre-raise value. That is harmless for the LATEST
+                    // fast path, which only compares watermarks, and not harmless
+                    // for `tail_next_seq_folded` (#278), which picks the next
+                    // sequence *name* from it — serving a floor from before the
+                    // raise is how a just-freed name gets reused, the one thing #77
+                    // forbids. Invalidating at the source closes the window without
+                    // making anything depend on raise-then-prune ordering.
+                    self.invalidate_certified_seq_floor(prefix)?;
+                    return Ok(());
+                }
                 // Lost the CAS (create race or stale version) — re-read and retry.
                 Err(object_store::Error::AlreadyExists { .. })
                 | Err(object_store::Error::Precondition { .. }) => continue,
@@ -3238,6 +3270,33 @@ impl DynoStore {
     /// readable set: an occupied-but-undecodable name would otherwise be re-picked
     /// on every attempt and burn the whole create-CAS budget (#157). This matches
     /// the name-derived [`Self::tail_next_seq`] the leased/compaction path uses.
+    /// Takes the floor through [`Self::certified_seq_floor`] rather than a second
+    /// live GET, which is what made the steady-state flush read
+    /// `seq-floor.json` twice milliseconds apart (#278).
+    ///
+    /// **Why one read still establishes #77.** The invariant is that a sequence
+    /// name freed by retention or compaction is never reused, and it needs a
+    /// floor observed *after* the tail. That ordering is preserved, in both
+    /// cases and for different reasons:
+    ///
+    /// - **Probe resolved the tail.** There is exactly one path returning
+    ///   [`TailProbe::Resolved`], and it is inside the branch that observed the
+    ///   tail *absent* — which reads the floor live via
+    ///   [`Self::probe_seq_floor`] and certifies it under the current
+    ///   generation. So a cache hit here can only be that read: fresh, and
+    ///   ordered after the absence it followed. Never an older caller's value,
+    ///   because the probe overwrites it on the way out.
+    /// - **Probe was inconclusive.** The forced refresh falls through to the
+    ///   authoritative LIST, which bumps the generation. The cached floor is
+    ///   then certified against a superseded view, so
+    ///   [`Self::certified_seq_floor`] declines it and re-reads — the fallback,
+    ///   taken because the generation moved rather than because anything assumed
+    ///   it had not.
+    ///
+    /// A prune by this process also bumps the generation, and a floor raise by
+    /// another replica is exactly what the live read on the inconclusive path
+    /// catches. So the removed GET was redundant, not load-bearing: it could
+    /// only ever re-read what the probe had just read under the same generation.
     async fn tail_next_seq_folded(&self, prefix: &str) -> Result<u64> {
         let listed_max = self
             .prefix_index
@@ -3245,7 +3304,7 @@ impl DynoStore {
             .map_err(Into::<Error>::into)?
             .get(prefix)
             .and_then(PrefixIndex::resolved_max);
-        let floor = self.read_seq_floor(prefix).await?;
+        let floor = self.certified_seq_floor(prefix).await?;
         Ok(listed_max.map_or(0, |m| m + 1).max(floor))
     }
 
