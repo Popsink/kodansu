@@ -458,8 +458,12 @@ async fn a_recreated_topic_inherits_nothing_from_a_shared_segment() -> Result<()
 ///
 /// This test used to assert `OffsetOutOfRange` here. That answer shipped and
 /// fired on 61 healthy topics in 3 minutes, resetting live consumers through
-/// `auto.offset.reset`, so it is gone: the condition is counted by
-/// `tansu_fetch_unservable` and logged at debug, and the client is told nothing.
+/// `auto.offset.reset`, so it is gone and the client is told nothing.
+///
+/// It was then counted by `tansu_fetch_unservable` and logged at debug for one
+/// release. #314 removed both once the condition measured ~10/min on a healthy
+/// fleet, so today it is neither counted nor logged — the condition is currently
+/// unobservable, which is an open question in #290 rather than a settled one.
 ///
 /// What remains worth pinning is the property that survives the removal — the
 /// fetch **returns** rather than hanging. #290's complaint was a fetch that never
@@ -994,6 +998,123 @@ async fn expires_aged_segments_keeps_recent_ones() -> Result<(), Error> {
     let deleted = store.expire_prefix_segments(PREFIX, recent - 1_000).await?;
     assert_eq!(1, deleted);
     assert_eq!(1, segments(&bucket).await.len());
+
+    Ok(())
+}
+
+/// **#290, named.** Ordinary retention can leave a sub-stream advertising
+/// offsets that no surviving segment holds, and a consumer parked in that gap
+/// reads empty on every poll, forever, with no error on either side.
+///
+/// No damage is simulated here. Every step is the retention path working as
+/// designed:
+///
+/// 1. `expire_prefix_segments` persists `watermark.high = max(current, tail)`
+///    for each sub-stream losing segments, **write-ahead of the delete**, where
+///    `tail` is computed from the *pre-delete* segment set
+///    (`dynostore.rs:5690-5706`). That floor exists so cold recovery cannot
+///    regress to 0 and reuse offsets (#61 review fix).
+/// 2. Retention is keyed on **record timestamps**, not segment order, so the
+///    segment holding the tail can expire while a lower one survives. Below,
+///    the recent batch is produced first and the ancient batch second — which
+///    is what a CDC backfill stamping source timestamps does routinely.
+/// 3. `high_watermark` is `tail.max(watermark_floor).max(hint)`
+///    (`dynostore.rs:2518-2520`), so the floor wins and the partition still
+///    advertises the pre-delete tail.
+/// 4. A fetch in `[surviving tail, floor)` passes the `offset < high_watermark`
+///    gate (`:7975`), then every surviving entry is skipped by
+///    `base_offset + record_count <= offset` (`:4195`), and the read returns
+///    `Ok(vec![])` (`:4260`).
+///
+/// **This is why the #292 detector could never have seen it.** That check
+/// demanded a covering index entry — `base <= offset < base + record_count` —
+/// and in this state no entry covers the offset. The population it did fire on
+/// (about ten a minute, #314) is therefore disjoint from this one: it required
+/// the entry to exist, and here the entry is precisely what is missing.
+///
+/// #299 fixed the neighbouring case where *every* segment is gone, by reporting
+/// a log that starts where it ends. It does not reach this one, because the log
+/// is not empty — records at `[0, surviving tail)` are still there and still
+/// served.
+///
+/// **Why the obvious fix does not work, established by trying it.** Splitting the
+/// fold — log end from the segment tail, next-offset-to-assign from the floor —
+/// makes this partition advertise 2 and closes the gap. It also breaks
+/// `scaling::coalesced_latest_survives_peer_expiry_via_floor_certification`, and
+/// that test is right: a peer replica can ack offsets this process never listed
+/// (segments created *and* expired inside its blind window), leaving exactly
+/// `floor > tail` with segments present. Ignoring the floor there regresses the
+/// log end below offsets already acknowledged to a producer — worse than the wedge
+/// it removes.
+///
+/// The two states are byte-identical locally: `floor > tail`, segments present,
+/// either because a peer wrote offsets we have not seen or because retention
+/// deleted the ones we had. A forced LIST would separate them, which is what the
+/// #292 detector paid for and what the request-profile tests in `scaling` forbid on
+/// this path.
+///
+/// So this is #290's point 2, demonstrated rather than argued: the read path has no
+/// information that tells the two apart, and the fix is a durable end-of-log mark
+/// maintained by expiry — a format change with the release-ordering constraint
+/// `truncate` had (#182) — not an arithmetic change here.
+///
+/// Asserts today's behaviour deliberately. It is a characterisation, so that
+/// whatever is decided is decided against something reproducible.
+#[tokio::test]
+async fn retention_can_orphan_offsets_below_the_advertised_watermark() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
+
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    let recent = now_ms();
+    let ancient = 1_000;
+
+    // Segment 0 holds offsets [0, 2) with *recent* records; segment 1 holds
+    // [2, 4) with *ancient* ones. Produced in that order deliberately: record
+    // time need not follow segment order.
+    _ = store.produce(None, &a, batch_at(2, recent)?).await?;
+    _ = store.produce(None, &a, batch_at(2, ancient)?).await?;
+    assert_eq!(2, segments(&bucket).await.len());
+    assert_eq!(4, store.high_watermark(&a).await?);
+
+    // Retention with a threshold between the two: the *tail-holding* segment is
+    // the one that expires, and the lower one survives.
+    let deleted = store.expire_prefix_segments(PREFIX, recent - 1_000).await?;
+    assert_eq!(1, deleted, "exactly the ancient, tail-holding segment");
+    assert_eq!(1, segments(&bucket).await.len());
+
+    // The advertised end offset has not moved: the durable floor, written
+    // write-ahead of the delete, still says 4.
+    assert_eq!(
+        4,
+        store.high_watermark(&a).await?,
+        "the write-ahead floor keeps advertising the pre-delete tail"
+    );
+
+    // Offsets 0 and 1 are still served: the log is not empty, which is why
+    // #299's "starts where it ends" never reached this case.
+    assert!(
+        !fetch_from(&store, &a, 0).await?.is_empty(),
+        "the surviving segment still serves its own offsets"
+    );
+
+    // A cold reader agrees, so this is a property of the store and not of one
+    // process's memory.
+    let cold = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    assert_eq!(4, cold.high_watermark(&a).await?);
+
+    // Offsets 2 and 3 are advertised and unreadable — empty, not an error, and
+    // this repeats on every poll for as long as a consumer is asked to read them.
+    // That is the wedge.
+    for offset in [2, 3] {
+        assert!(
+            fetch_from(&store, &a, offset).await?.is_empty(),
+            "offset {offset} is below the advertised watermark of 4 and returns nothing"
+        );
+    }
 
     Ok(())
 }
