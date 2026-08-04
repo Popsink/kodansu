@@ -199,6 +199,7 @@ fn every_captured_produce_request_verifies() -> Result<()> {
     ];
 
     let mut checked = 0usize;
+    let mut legacy = 0usize;
     let mut disagreements = Vec::new();
 
     for (name, bytes) in captures {
@@ -213,6 +214,25 @@ fn every_captured_produce_request_verifies() -> Result<()> {
                     .flat_map(|frame| frame.batches)
                 {
                     checked += 1;
+
+                    // A pre-v2 MessageSet (magic 0/1) is a different wire format:
+                    // no `attributes`/`record_count` at these offsets, and a
+                    // CRC-32 over a different range rather than CRC-32C. Decoding
+                    // one into a v2 `Batch` yields garbage in the v2-only fields
+                    // — `produce_request_v0_000` (sarama, Produce v0) decodes to
+                    // `record_count = 2_920_539_060` — so its CRC cannot match
+                    // and this check is not the right instrument for it.
+                    //
+                    // Pinned rather than skipped silently, because #315 makes it
+                    // a **behaviour change**: a magic-0 produce is now refused
+                    // with CORRUPT_MESSAGE. Previously it was accepted and stored
+                    // with that absurd record count, so refusing is arguably an
+                    // improvement — but it should be an explicit decision, taken
+                    // at the format check, not an accident of the CRC gate.
+                    if batch.magic < 2 {
+                        legacy += 1;
+                        continue;
+                    }
 
                     if !batch.crc_matches()? {
                         disagreements.push(format!(
@@ -236,6 +256,13 @@ fn every_captured_produce_request_verifies() -> Result<()> {
     assert!(
         checked >= 9,
         "expected at least one batch per capture, walked {checked}",
+    );
+
+    // Exactly one capture is pre-v2. If this changes, the corpus changed and the
+    // reasoning above needs revisiting rather than the number bumping.
+    assert_eq!(
+        1, legacy,
+        "expected exactly one pre-v2 capture (sarama at Produce v0), found {legacy}"
     );
 
     assert!(
