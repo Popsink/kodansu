@@ -1346,7 +1346,10 @@ mod crc_verification {
         };
 
         assert_ne!(batch.record_data, altered.record_data);
-        assert!(!altered.crc_matches()?, "a payload byte flip must not verify");
+        assert!(
+            !altered.crc_matches()?,
+            "a payload byte flip must not verify"
+        );
 
         Ok(())
     }

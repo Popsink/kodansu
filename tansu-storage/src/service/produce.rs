@@ -919,7 +919,10 @@ mod tests {
 
         // The precondition. Without it a pass could mean the batch was
         // rejected for some unrelated reason.
-        assert!(!corrupt.crc_matches()?, "the batch must actually be corrupt");
+        assert!(
+            !corrupt.crc_matches()?,
+            "the batch must actually be corrupt"
+        );
 
         let frame = Frame {
             batches: vec![corrupt],
@@ -929,7 +932,10 @@ mod tests {
             .index(index)
             .records(Some(frame));
 
-        let topic_data = TopicProduceData::default()
+        // Built inline rather than through the `topic_data` helper above: that
+        // one goes via the builder, which recomputes the CRC and would undo the
+        // corruption under test.
+        let data = TopicProduceData::default()
             .name(topic.into())
             .partition_data(Some(vec![partition_data]));
 
@@ -940,7 +946,7 @@ mod tests {
                     .transactional_id(None)
                     .acks(0)
                     .timeout_ms(0)
-                    .topic_data(Some(vec![topic_data])),
+                    .topic_data(Some(vec![data])),
             )
             .await?;
 
