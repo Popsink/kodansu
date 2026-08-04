@@ -148,16 +148,14 @@ mod service;
 pub use latency::LatencyIntroducingStorage;
 
 pub use service::{
-    AlterUserScramCredentialsService, ChannelRequestLayer, ChannelRequestService,
-    ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService, DeleteGroupsService,
-    DeleteRecordsService, DeleteTopicsService, DescribeAclsService, DescribeClusterService,
-    DescribeConfigsService, DescribeGroupsService, DescribeTopicPartitionsService,
-    DescribeUserScramCredentialsService, FetchService, FindCoordinatorService,
-    GetTelemetrySubscriptionsService, IncrementalAlterConfigsService, InitProducerIdService,
-    ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService, MetadataService,
-    ProduceService, Request, RequestChannelService, RequestLayer, RequestReceiver, RequestSender,
-    RequestService, RequestStorageService, Response, TxnAddOffsetsService, TxnAddPartitionService,
-    TxnOffsetCommitService, bounded_channel,
+    AlterUserScramCredentialsService, ConsumerGroupDescribeService, CreateAclsService,
+    CreateTopicsService, DeleteGroupsService, DeleteRecordsService, DeleteTopicsService,
+    DescribeAclsService, DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
+    DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
+    FindCoordinatorService, GetTelemetrySubscriptionsService, IncrementalAlterConfigsService,
+    InitProducerIdService, ListGroupsService, ListOffsetsService,
+    ListPartitionReassignmentsService, MetadataService, ProduceService, TxnAddOffsetsService,
+    TxnAddPartitionService, TxnOffsetCommitService,
 };
 
 #[cfg(feature = "dynostore")]
@@ -242,8 +240,6 @@ pub enum Error {
     TryGet(Arc<TryGetError>),
 
     UnexpectedBody(Box<Body>),
-
-    UnexpectedServiceResponse(Box<Response>),
 
     UnknownCacheKey(String),
 
