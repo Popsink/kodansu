@@ -56,7 +56,7 @@ struct Group {
 }
 
 #[derive(Clone, Debug)]
-pub struct Engine {
+pub(crate) struct Engine {
     cluster: String,
     node: i32,
     advertised_listener: Url,
@@ -66,7 +66,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(cluster: String, node: i32, advertised_listener: Url) -> Self {
+    pub(crate) fn new(cluster: String, node: i32, advertised_listener: Url) -> Self {
         Self {
             cluster,
             node,

@@ -31,7 +31,7 @@ use rustls::{
 };
 use tansu_broker::{NODE_ID, broker::Broker, coordinator::group::forward::GroupCoordinator};
 use tansu_sans_io::ErrorCode;
-use tansu_storage::{ArcDynStorage, DEFAULT_CLEANUP_POLICY, StorageContainer, TopicDefaults};
+use tansu_storage::{ArcDynStorage, DEFAULT_CLEANUP_POLICY, TopicDefaults};
 use tokio::time::Instant;
 use tracing::debug;
 use url::Url;
@@ -211,7 +211,7 @@ impl Arg {
             retention_ms: self.default_retention_ms,
         };
 
-        let broker = Broker::<GroupCoordinator<StorageContainer>, StorageContainer>::builder()
+        let broker = Broker::<GroupCoordinator<ArcDynStorage>, ArcDynStorage>::builder()
             .node_id(NODE_ID)
             .cluster_id(cluster_id)
             .incarnation_id(incarnation_id)

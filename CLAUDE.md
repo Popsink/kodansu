@@ -63,7 +63,7 @@ Cargo workspace producing a single binary (`tansu`) with subcommands: `broker` (
 | `tansu-broker` | Kafka API broker: `Broker<G, S>` generic over Coordinator + Storage |
 | `tansu-sans-io` | **Code-generated** Kafka wire protocol (pure serde, no I/O) |
 | `tansu-service` | Network service layers built on `rama` (Layer/Service composition) |
-| `tansu-storage` | Storage abstraction: `StorageContainer` enum over the object store (`DynoStore`) and the `Null` engine |
+| `tansu-storage` | Storage abstraction: `Box<dyn Storage>` over the object store (`DynoStore`) and the `Null` engine, selected by `StorageContainer::builder` |
 | `tansu-client` | Async Kafka protocol client (rama service layers) |
 | `tansu-model` | Kafka JSON protocol definitions (used in build.rs) |
 | `tansu-cli` | Clap-based CLI argument parsing |
@@ -84,9 +84,11 @@ Uses `rama` crate for Layer/Service composition:
 
 ### Storage (`tansu-storage`)
 
-Runtime dispatch through the `StorageContainer` enum. There is a single real
-backend — the object store (`DynoStore`) — plus a `Null` engine. The storage
-engine is selected from the URL scheme:
+Runtime dispatch through `Box<dyn Storage>`. `StorageContainer` is the builder
+entry point and nothing more — the enum that used to dispatch here was never
+constructed and was deleted in #279. There is a single real backend — the object
+store (`DynoStore`) — plus a `Null` engine. The engine is selected from the URL
+scheme:
 - `memory://` - in-memory (tests / ephemeral)
 - `s3://` - S3 / MinIO
 - `gs://` - Google Cloud Storage
