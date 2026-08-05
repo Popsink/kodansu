@@ -2749,6 +2749,29 @@ where
 
         debug!(?member_id, ?self.members);
 
+        // Heal an orphaned leader before considering a promotion: group state
+        // written before the `Forming::leave` fix-up (or by any other path
+        // that forgot the invariant) can carry a leader that is no longer a
+        // member. Left in place it deadlocks the group — every live member is
+        // told someone else is the leader, so nobody ever sends assignments —
+        // and only an owner change would clear it, via the fix-up in
+        // `with_storage_group_detail` (#240).
+        if self
+            .state
+            .leader
+            .as_ref()
+            .is_some_and(|leader| !self.members.contains_key(leader))
+        {
+            warn!(
+                group_id,
+                orphaned_leader = self.state.leader.as_deref(),
+                generation_id = self.generation_id,
+                "leader is no longer a member; clearing so a live member is promoted (#240)"
+            );
+
+            _ = self.state.leader.take();
+        }
+
         if self.state.leader.is_none() {
             info!(member_id, group_id, self.generation_id);
 
@@ -3066,6 +3089,29 @@ where
             member.error_code == error_code
         }) {
             self.generation_id += 1;
+        }
+
+        // The departing member may be the elected leader. `Formed::leave`
+        // already re-checks this (leader no longer a member -> `None`);
+        // without the same fix-up here, a leader that leaves while the group
+        // is still forming stays behind as a phantom: `join` never promotes
+        // anyone else (`state.leader.is_none()` never holds), every follower
+        // sync is refused as not-leader, and the group freezes silently with
+        // no writes and nothing to evict (#240).
+        if self
+            .state
+            .leader
+            .as_ref()
+            .is_some_and(|leader| !self.members.contains_key(leader))
+        {
+            info!(
+                group_id,
+                departed_leader = self.state.leader.as_deref(),
+                generation_id = self.generation_id,
+                "leader left while forming; clearing so a live member is promoted (#240)"
+            );
+
+            _ = self.state.leader.take();
         }
 
         let body = LeaveGroupResponse::default()
@@ -6217,6 +6263,251 @@ mod tests {
 
         assert!(s.is_forming());
         assert_eq!(6, s.generation_id());
+
+        Ok(())
+    }
+
+    /// #240: the leader leaving a still-Forming group must not stay behind as
+    /// a phantom leader.
+    ///
+    /// `Formed::leave` re-checks the leader against the remaining members;
+    /// `Forming::leave` did not. A leader that left mid-rebalance (a
+    /// connector pod's graceful shutdown sends LeaveGroup) therefore kept
+    /// `state.leader = Some(departed)`: `join` never promoted anyone else,
+    /// every follower sync was refused as not-leader, no write ever happened,
+    /// and the group froze silently — until the owning broker restarted and
+    /// `with_storage_group_detail`'s fix-up cleared the orphan. Measured in
+    /// production as a 16-member group held in `CompletingRebalance` for
+    /// hours with zero broker log lines.
+    #[tokio::test]
+    async fn leave_of_leader_while_forming_clears_leader() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const CLIENT_ID: &str = "console-consumer";
+        const GROUP_ID: &str = "leader-leaves-while-forming";
+        const RANGE: &str = "range";
+        const PROTOCOL_TYPE: &str = "consumer";
+
+        let session_timeout_ms = 45_000;
+        let rebalance_timeout_ms = Some(300_000);
+        let group_instance_id = None;
+        let reason = None;
+
+        let storage = StorageContainer::builder()
+            .cluster_id("test")
+            .node_id(111)
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
+            .storage(Url::parse("memory://")?)
+            .build()
+            .await?;
+
+        let s = Wrapper::with_storage_group_detail(
+            storage,
+            GroupDetail {
+                session_timeout_ms,
+                rebalance_timeout_ms,
+                state: GroupState::Forming {
+                    protocol_type: Some(PROTOCOL_TYPE.into()),
+                    protocol_name: Some(RANGE.into()),
+                    leader: None,
+                },
+                ..Default::default()
+            },
+        );
+
+        let now = SystemTime::now();
+
+        let leader_id = format!("{CLIENT_ID}-{}", Uuid::new_v4());
+        let follower_id = format!("{CLIENT_ID}-{}", Uuid::new_v4());
+
+        let protocols = [JoinGroupRequestProtocol::default()
+            .name(RANGE.into())
+            .metadata(Bytes::from_static(b"leader_meta"))];
+
+        let (s, _) = s
+            .join(
+                now,
+                Some(CLIENT_ID),
+                GROUP_ID,
+                session_timeout_ms,
+                rebalance_timeout_ms,
+                leader_id.as_str(),
+                group_instance_id,
+                PROTOCOL_TYPE,
+                Some(&protocols[..]),
+                reason,
+            )
+            .await;
+
+        let follower_protocols = [JoinGroupRequestProtocol::default()
+            .name(RANGE.into())
+            .metadata(Bytes::from_static(b"follower_meta"))];
+
+        let (s, _) = s
+            .join(
+                now,
+                Some(CLIENT_ID),
+                GROUP_ID,
+                session_timeout_ms,
+                rebalance_timeout_ms,
+                follower_id.as_str(),
+                group_instance_id,
+                PROTOCOL_TYPE,
+                Some(&follower_protocols[..]),
+                reason,
+            )
+            .await;
+
+        assert_eq!(Some(leader_id.as_str()), s.leader());
+        assert_eq!(2, s.members().len());
+
+        // The leader leaves while the group is still forming.
+        let (s, _) = s.leave(now, GROUP_ID, Some(leader_id.as_str()), None).await;
+
+        assert_eq!(1, s.members().len());
+        assert_eq!(
+            None,
+            s.leader(),
+            "a departed leader must not remain elected"
+        );
+
+        // The next join from the surviving member must promote it...
+        let (s, body) = s
+            .join(
+                now,
+                Some(CLIENT_ID),
+                GROUP_ID,
+                session_timeout_ms,
+                rebalance_timeout_ms,
+                follower_id.as_str(),
+                group_instance_id,
+                PROTOCOL_TYPE,
+                Some(&follower_protocols[..]),
+                reason,
+            )
+            .await;
+
+        assert_eq!(Some(follower_id.as_str()), s.leader());
+
+        let Body::JoinGroupResponse(join_response) = body else {
+            panic!("expected a join response");
+        };
+        assert_eq!(i16::from(ErrorCode::None), join_response.error_code);
+        assert_eq!(follower_id, join_response.leader);
+
+        // ...and its assignment sync must form the group.
+        let generation_id = s.generation_id();
+        let assignments = [SyncGroupRequestAssignment::default()
+            .member_id(follower_id.clone())
+            .assignment(Bytes::from_static(b"assignment"))];
+
+        let (s, body) = s
+            .sync(
+                now,
+                GROUP_ID,
+                generation_id,
+                follower_id.as_str(),
+                group_instance_id,
+                Some(PROTOCOL_TYPE),
+                Some(RANGE),
+                Some(&assignments[..]),
+            )
+            .await;
+
+        let Body::SyncGroupResponse(sync_response) = body else {
+            panic!("expected a sync response");
+        };
+        assert_eq!(i16::from(ErrorCode::None), sync_response.error_code);
+        assert!(!s.is_forming());
+
+        Ok(())
+    }
+
+    /// #240: a persisted group can already carry an orphaned leader (written
+    /// before the `Forming::leave` fix-up existed, or by a replica still
+    /// running without it). A join must heal it — clear the orphan and
+    /// promote a live member — rather than keep answering "the leader is
+    /// someone else" to every live member forever.
+    #[tokio::test]
+    async fn join_heals_an_orphaned_leader() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const CLIENT_ID: &str = "console-consumer";
+        const GROUP_ID: &str = "orphaned-leader-group";
+        const RANGE: &str = "range";
+        const PROTOCOL_TYPE: &str = "consumer";
+
+        let session_timeout_ms = 45_000;
+        let rebalance_timeout_ms = Some(300_000);
+
+        let storage = StorageContainer::builder()
+            .cluster_id("test")
+            .node_id(111)
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
+            .storage(Url::parse("memory://")?)
+            .build()
+            .await?;
+
+        let now = SystemTime::now();
+        let member_id = format!("{CLIENT_ID}-{}", Uuid::new_v4());
+
+        // Built directly rather than through `with_storage_group_detail`,
+        // whose own fix-up would already clear the orphan: this is the shape
+        // an owner replica holds in memory after the departed leader was
+        // removed from `members` with `state.leader` left in place.
+        let s = Wrapper::Forming(Inner {
+            session_timeout_ms,
+            rebalance_timeout_ms,
+            members: BTreeMap::from([(
+                member_id.clone(),
+                Member {
+                    join_response: JoinGroupResponseMember::default()
+                        .member_id(member_id.clone())
+                        .metadata(Bytes::from_static(b"member_meta")),
+                    last_contact: Some(now),
+                },
+            )]),
+            generation_id: 7,
+            state: Forming {
+                protocol_type: Some(PROTOCOL_TYPE.into()),
+                protocol_name: Some(RANGE.into()),
+                leader: Some(format!("{CLIENT_ID}-{}", Uuid::new_v4())),
+            },
+            storage,
+            skip_assignment: Some(false),
+            inception: now,
+        });
+
+        let protocols = [JoinGroupRequestProtocol::default()
+            .name(RANGE.into())
+            .metadata(Bytes::from_static(b"member_meta"))];
+
+        let (s, body) = s
+            .join(
+                now,
+                Some(CLIENT_ID),
+                GROUP_ID,
+                session_timeout_ms,
+                rebalance_timeout_ms,
+                member_id.as_str(),
+                None,
+                PROTOCOL_TYPE,
+                Some(&protocols[..]),
+                None,
+            )
+            .await;
+
+        assert_eq!(
+            Some(member_id.as_str()),
+            s.leader(),
+            "the live member must be promoted over the orphan"
+        );
+
+        let Body::JoinGroupResponse(join_response) = body else {
+            panic!("expected a join response");
+        };
+        assert_eq!(i16::from(ErrorCode::None), join_response.error_code);
+        assert_eq!(member_id, join_response.leader);
 
         Ok(())
     }
