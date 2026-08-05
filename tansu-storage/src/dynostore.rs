@@ -175,7 +175,7 @@ pub struct DynoStore {
     /// ([`Self::coalesced_high_from_index`]) off the per-partition
     /// `watermark.json` conditional GET: a wide `endOffsets(assignment)` costs
     /// O(prefixes), not O(partitions), in object-store round-trips.
-    coalesced_watermark_floors: Arc<Mutex<BTreeMap<Topition, (i64, Option<ServedEnd>, u64)>>>,
+    coalesced_watermark_floors: Arc<Mutex<BTreeMap<Topition, CachedWatermark>>>,
 
     /// Per-partition memo of the resolved truncation floor (#176), including
     /// the **absence** of one (memoized as `0`). Read paths that do not pass
@@ -1608,6 +1608,17 @@ impl ServedEnd {
     }
 }
 
+/// A `watermark.json` read cached for a prefix-coalesced sub-stream: the
+/// assignment floor (`high`), its served-end certification (#290), and the
+/// certified seq floor the read was performed under — the pairing that makes
+/// the cache valid (see [`DynoStore::cached_coalesced_watermark`]).
+#[derive(Clone, Copy, Debug)]
+struct CachedWatermark {
+    high: i64,
+    served: Option<ServedEnd>,
+    seq_floor: u64,
+}
+
 impl OptiCon<Watermark> {
     fn new(cluster: &str, topition: &Topition) -> Self {
         Self::path(format!(
@@ -2548,9 +2559,9 @@ impl DynoStore {
         self.coalesced_watermark_floors
             .lock()
             .map(|locked| {
-                locked
-                    .get(topition)
-                    .and_then(|(high, served, at)| (*at == floor).then_some((*high, *served)))
+                locked.get(topition).and_then(|cached| {
+                    (cached.seq_floor == floor).then_some((cached.high, cached.served))
+                })
             })
             .map_err(Into::into)
     }
@@ -2570,7 +2581,14 @@ impl DynoStore {
         self.coalesced_watermark_floors
             .lock()
             .map(|mut locked| {
-                _ = locked.insert(topition.to_owned(), (high, served, floor));
+                _ = locked.insert(
+                    topition.to_owned(),
+                    CachedWatermark {
+                        high,
+                        served,
+                        seq_floor: floor,
+                    },
+                );
             })
             .map_err(Into::into)
     }
