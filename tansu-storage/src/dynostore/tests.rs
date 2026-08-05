@@ -21,7 +21,7 @@ use tracing_subscriber::EnvFilter;
 
 use crate::{Error, Result, Topition};
 
-use super::{DynoStore, Watermark};
+use super::{DynoStore, ServedEnd, Watermark};
 
 mod compact_segments;
 mod delete_groups;
@@ -226,6 +226,44 @@ fn watermark_truncate_round_trips_as_a_named_field() -> Result<()> {
         r#"{"high":5,"truncate":42,"low":null}"#,
         serde_json::to_string(&watermark)?
     );
+
+    Ok(())
+}
+
+/// The served-end certification (#290) follows the `truncate` discipline
+/// (#176/#182): absent it serialises to nothing — no watermark object is
+/// rewritten on first touch — and present it is one named nested object, so
+/// the `{end, at_high}` pair can never be split by a partial rewrite. An old
+/// binary round-trips it whole through the `#[serde(flatten)]` catch-all
+/// (pinned by `watermark_with_mut_preserves_unknown_fields`' `future` key),
+/// and if that binary's own expiry moves `high`, the stale pair is ignored by
+/// the honor condition (`at_high == high`), never misread.
+#[test]
+fn watermark_served_end_round_trips_as_a_named_field() -> Result<()> {
+    // Absent: byte-identical to the pre-#290 layout.
+    assert_eq!(
+        r#"{"high":5}"#,
+        serde_json::to_string(&Watermark {
+            high: Some(5),
+            ..Default::default()
+        })?
+    );
+
+    // Present: one nested object.
+    let raw = r#"{"high":5,"served":{"end":2,"at_high":5}}"#;
+    assert_eq!(
+        raw,
+        serde_json::to_string(&Watermark {
+            high: Some(5),
+            served: Some(ServedEnd { end: 2, at_high: 5 }),
+            ..Default::default()
+        })?
+    );
+
+    // A named key routes to the field, not the catch-all.
+    let watermark = serde_json::from_str::<Watermark>(raw)?;
+    assert_eq!(Some(ServedEnd { end: 2, at_high: 5 }), watermark.served);
+    assert!(watermark.rest.is_empty());
 
     Ok(())
 }
