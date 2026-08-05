@@ -175,7 +175,7 @@ pub struct DynoStore {
     /// ([`Self::coalesced_high_from_index`]) off the per-partition
     /// `watermark.json` conditional GET: a wide `endOffsets(assignment)` costs
     /// O(prefixes), not O(partitions), in object-store round-trips.
-    coalesced_watermark_floors: Arc<Mutex<BTreeMap<Topition, (i64, u64)>>>,
+    coalesced_watermark_floors: Arc<Mutex<BTreeMap<Topition, CachedWatermark>>>,
 
     /// Per-partition memo of the resolved truncation floor (#176), including
     /// the **absence** of one (memoized as `0`). Read paths that do not pass
@@ -1559,8 +1559,64 @@ struct Watermark {
     /// maintenance round-trip, silently un-deleting records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     truncate: Option<i64>,
+    /// What the last segment expiry left servable (#290): `end` is the tail of
+    /// the segments that survived it, `at_high` the assignment floor (`high`)
+    /// written by the same CAS. Read paths honor the pair only while
+    /// `at_high == high`: a floor moved by a writer that did not re-certify —
+    /// an older binary's expiry, which round-trips the pair untouched through
+    /// `rest` — invalidates it, falling back to pre-#290 behaviour (a fetch in
+    /// the gap answers empty rather than `OffsetOutOfRange`). Same byte-layout
+    /// discipline as `truncate`: absent until an expiry writes it, so existing
+    /// watermark objects are not rewritten on first touch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    served: Option<ServedEnd>,
     #[serde(flatten)]
     rest: BTreeMap<String, serde_json::Value>,
+}
+
+/// The `{end, at_high}` pair certifying what a segment expiry left servable
+/// (#290). A single nested object so the two halves can never be split by a
+/// partial rewrite: either both round-trip, or the pair is dropped whole.
+///
+/// `floor > segment tail` is locally ambiguous between two states that demand
+/// opposite treatment: a peer may have acked offsets this process never
+/// listed (the floor is the log end; regressing under acked offsets re-reads
+/// or reuses them), or retention may have deleted the tail-holding segment
+/// while a lower one survived (the floor advertises offsets no segment holds,
+/// and a consumer parked on them polls empty forever — the #290 wedge). Only
+/// the expiry that performed the delete knows which, and this is it saying
+/// so: every offset in `[end, at_high)` was destroyed by that expiry, and the
+/// seq-floor fence (#77, #316) forbids assigning new offsets below `at_high`,
+/// so nothing can ever appear in the gap again.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ServedEnd {
+    end: i64,
+    at_high: i64,
+}
+
+impl ServedEnd {
+    /// Whether this certification still describes the current floor, i.e. no
+    /// uncertified writer has moved `watermark.high` since it was written.
+    fn certifies(&self, high: i64) -> bool {
+        self.at_high == high
+    }
+
+    /// Whether `offset` falls in the gap this certification declares dead:
+    /// at/above the surviving tail, below the floor the expiry raised.
+    fn gap_contains(&self, offset: i64) -> bool {
+        offset >= self.end && offset < self.at_high
+    }
+}
+
+/// A `watermark.json` read cached for a prefix-coalesced sub-stream: the
+/// assignment floor (`high`), its served-end certification (#290), and the
+/// certified seq floor the read was performed under — the pairing that makes
+/// the cache valid (see [`DynoStore::cached_coalesced_watermark`]).
+#[derive(Clone, Copy, Debug)]
+struct CachedWatermark {
+    high: i64,
+    served: Option<ServedEnd>,
+    seq_floor: u64,
 }
 
 impl OptiCon<Watermark> {
@@ -2463,6 +2519,11 @@ impl DynoStore {
     /// The persisted `watermark.high`: a durable lower bound on the tail offset,
     /// used as a listing floor so a cold reader scans only forward (S3
     /// `start-after`) rather than the whole partition.
+    ///
+    /// This is the *assignment* floor and deliberately ignores the #290
+    /// served-end certification: `leaseless_base` folds this value so a freed
+    /// offset is never reused, and that must hold whether or not the offsets
+    /// above the surviving tail are still fetchable.
     async fn persisted_high(&self, topition: &Topition) -> Result<i64> {
         self.watermark(topition)?
             .with(&self.object_store, |watermark| {
@@ -2471,32 +2532,63 @@ impl DynoStore {
             .await
     }
 
-    /// The cached `watermark.high` floor for a prefix-coalesced sub-stream,
-    /// valid only when it was read under the still-current certified seq
-    /// `floor` (see [`Self::coalesced_watermark_floors`]). `None` means the
-    /// caller must pay the `watermark.json` GET (once — the slow path caches
-    /// it via [`Self::cache_coalesced_watermark`]).
-    fn cached_coalesced_watermark(&self, topition: &Topition, floor: u64) -> Result<Option<i64>> {
+    /// The persisted `watermark.high` together with the served-end
+    /// certification (#290), in the single GET the read path already pays.
+    async fn persisted_watermark_bounds(
+        &self,
+        topition: &Topition,
+    ) -> Result<(i64, Option<ServedEnd>)> {
+        self.watermark(topition)?
+            .with(&self.object_store, |watermark| {
+                Ok((watermark.high.unwrap_or(0), watermark.served))
+            })
+            .await
+    }
+
+    /// The cached `watermark.high` floor (and its #290 served-end
+    /// certification, if any) for a prefix-coalesced sub-stream, valid only
+    /// when it was read under the still-current certified seq `floor` (see
+    /// [`Self::coalesced_watermark_floors`]). `None` means the caller must pay
+    /// the `watermark.json` GET (once — the slow path caches it via
+    /// [`Self::cache_coalesced_watermark`]).
+    fn cached_coalesced_watermark(
+        &self,
+        topition: &Topition,
+        floor: u64,
+    ) -> Result<Option<(i64, Option<ServedEnd>)>> {
         self.coalesced_watermark_floors
             .lock()
             .map(|locked| {
-                locked
-                    .get(topition)
-                    .and_then(|(high, at)| (*at == floor).then_some(*high))
+                locked.get(topition).and_then(|cached| {
+                    (cached.seq_floor == floor).then_some((cached.high, cached.served))
+                })
             })
             .map_err(Into::into)
     }
 
-    /// Cache `high` (a just-read `watermark.high`) for `topition` under the
-    /// certified seq `floor` that was current *at or before* the read. Pairing
-    /// with an older floor is safe: any watermark advance after the read
-    /// raises the floor above `floor`, invalidating this entry; an advance
-    /// before the read is already contained in `high`.
-    fn cache_coalesced_watermark(&self, topition: &Topition, high: i64, floor: u64) -> Result<()> {
+    /// Cache `high` and `served` (a just-read `watermark.json`) for `topition`
+    /// under the certified seq `floor` that was current *at or before* the
+    /// read. Pairing with an older floor is safe: any watermark advance after
+    /// the read raises the floor above `floor`, invalidating this entry; an
+    /// advance before the read is already contained in `high`.
+    fn cache_coalesced_watermark(
+        &self,
+        topition: &Topition,
+        high: i64,
+        served: Option<ServedEnd>,
+        floor: u64,
+    ) -> Result<()> {
         self.coalesced_watermark_floors
             .lock()
             .map(|mut locked| {
-                _ = locked.insert(topition.to_owned(), (high, floor));
+                _ = locked.insert(
+                    topition.to_owned(),
+                    CachedWatermark {
+                        high,
+                        served,
+                        seq_floor: floor,
+                    },
+                );
             })
             .map_err(Into::into)
     }
@@ -2562,7 +2654,8 @@ impl DynoStore {
         // reflected. One GET per prefix per listing generation, amortized
         // across every partition of the prefix — not per partition.
         let floor = self.certified_seq_floor(&prefix).await?;
-        let Some(watermark_floor) = self.cached_coalesced_watermark(topition, floor)? else {
+        let Some((watermark_floor, _served)) = self.cached_coalesced_watermark(topition, floor)?
+        else {
             return Ok(None);
         };
 
@@ -2584,6 +2677,25 @@ impl DynoStore {
         self.mark_listed(topition, high, as_of)?;
 
         Ok(Some(high))
+    }
+
+    /// The `[end, at_high)` gap certified dead by the last segment expiry, when
+    /// one exists for `topition` and still describes the current floor (#290).
+    ///
+    /// Served purely from in-process caches — the coalesced watermark cache
+    /// that the high-watermark read populates — so an empty fetch pays no
+    /// extra object request to consult it (deliberately unlike #292's
+    /// confirming read, removed in #314). A cold cache answers `None`,
+    /// degrading to today's empty response until the read path warms it.
+    async fn certified_dead_gap(&self, topition: &Topition) -> Result<Option<ServedEnd>> {
+        let prefix = self.routed_prefix_of(topition).await?;
+        let floor = self.certified_seq_floor(&prefix).await?;
+
+        Ok(self
+            .cached_coalesced_watermark(topition, floor)?
+            .and_then(|(high, served)| {
+                served.filter(|served| served.certifies(high) && served.end < served.at_high)
+            }))
     }
 
     /// Record that the persisted floor sits above the surviving segment tail, when
@@ -2668,7 +2780,7 @@ impl DynoStore {
         // next stale-hint resolution.
         let prefix = self.routed_prefix_of(topition).await?;
         let floor = self.certified_seq_floor(&prefix).await?;
-        let from_watermark = self.persisted_high(topition).await?;
+        let (from_watermark, served) = self.persisted_watermark_bounds(topition).await?;
 
         // Unconditionally cacheable again (#179). The certification argument is
         // "`watermark.high` advances only in `expire_prefix_segments`, which raises
@@ -2676,7 +2788,7 @@ impl DynoStore {
         // retention — the second writer #241 had to gate against — went with the
         // layout it maintained, so there is no writer left that moves this value
         // without raising a floor.
-        self.cache_coalesced_watermark(topition, from_watermark, floor)?;
+        self.cache_coalesced_watermark(topition, from_watermark, served, floor)?;
 
         // Counted here too, or the measurement would be blind to exactly the reader
         // most likely to meet the state: a cold one, whose watermark cache the fast
@@ -5793,17 +5905,37 @@ impl DynoStore {
         // is the sub-stream's current tail; recovery folds it in via `max`.
         // Bounded to the affected sub-streams (a window's worth), on the maintain
         // path — not the produce hot path.
+        //
+        // The same CAS certifies what this expiry leaves servable (#290): the
+        // tail of the sub-stream's *surviving* segments, paired with the floor
+        // being written. Only this operation knows whether `floor > tail` means
+        // "a peer acked offsets you have not listed" (advertise the floor) or
+        // "the tail-holding segment is about to be deleted" (a fetch parked in
+        // `[surviving tail, floor)` waits for records that can never come) —
+        // writing that knowledge down is what lets the fetch path answer
+        // `OffsetOutOfRange` instead of empty-forever. `None` survivors certify
+        // at the floor itself: an empty log whose end is the floor, which #299
+        // already reports as starting where it ends.
+        let expirable_seqs: BTreeSet<u64> = expirable.iter().copied().collect();
         for (topic, partition) in &affected {
-            let tail = self
-                .valid_substream_segments(prefix, topic, *partition)?
-                .last()
-                .map(|(_, e)| e.base_offset + e.record_count);
+            let segments = self.valid_substream_segments(prefix, topic, *partition)?;
+            let tail = segments.last().map(|(_, e)| e.base_offset + e.record_count);
+            let surviving = segments
+                .iter()
+                .filter(|(seq, _)| !expirable_seqs.contains(seq))
+                .map(|(_, e)| e.base_offset + e.record_count)
+                .max();
             if let Some(tail) = tail {
                 let tp = Topition::new(topic.clone(), *partition);
                 _ = self
                     .watermark(&tp)?
                     .with_mut(&self.object_store, |watermark| {
-                        watermark.high = Some(watermark.high.unwrap_or(0).max(tail));
+                        let high = watermark.high.unwrap_or(0).max(tail);
+                        watermark.high = Some(high);
+                        watermark.served = Some(ServedEnd {
+                            end: surviving.unwrap_or(high),
+                            at_high: high,
+                        });
                         Ok(())
                     })
                     .await
@@ -5836,6 +5968,24 @@ impl DynoStore {
         }
 
         self.index_prune(prefix, &expirable)?;
+
+        // This process's next-offset hints and cached watermark floors for the
+        // affected sub-streams predate the delete: drop them so the next read
+        // re-derives from the pruned index and the re-read watermark — which is
+        // also what makes the served-end certification written above visible
+        // locally without waiting out the hint TTL (#290). Peers converge on
+        // their own: the seq-floor raise invalidates their cached watermark
+        // floors, so their next read pays the one GET and sees the pair.
+        self.next_offsets.lock().map(|mut locked| {
+            for (topic, partition) in &affected {
+                _ = locked.remove(&Topition::new(topic.clone(), *partition));
+            }
+        })?;
+        self.coalesced_watermark_floors.lock().map(|mut locked| {
+            for (topic, partition) in &affected {
+                _ = locked.remove(&Topition::new(topic.clone(), *partition));
+            }
+        })?;
 
         Ok(deleted)
     }
@@ -8149,6 +8299,33 @@ impl Storage for DynoStore {
                     high_watermark,
                     "no segment holds this offset and the log is empty; \
                      answering OFFSET_OUT_OF_RANGE (#337)"
+                );
+
+                return Err(Error::Api(ErrorCode::OffsetOutOfRange));
+            }
+
+            // The mid-log sibling of the check above (#290): the log is not
+            // empty — segments below the offset are still served — but the
+            // offsets from the surviving tail up to the floor were destroyed by
+            // a segment expiry, and that expiry certified so in the watermark.
+            // Without the certification this state is indistinguishable from a
+            // peer having acked offsets this process never listed (where empty
+            // is the right answer and an error would reset live consumers — the
+            // #292/#314 lesson), so only the certified case errors. A consumer
+            // parked here polls empty forever otherwise: `auto.offset.reset`
+            // then moves it to a live position, and `none` fails loudly, which
+            // is also correct.
+            if batches.is_empty()
+                && let Some(served) = self.certified_dead_gap(topition).await?
+                && served.gap_contains(offset)
+            {
+                info!(
+                    ?topition,
+                    offset,
+                    end = served.end,
+                    at_high = served.at_high,
+                    "offset is in a gap certified dead by segment expiry; \
+                     answering OFFSET_OUT_OF_RANGE (#290)"
                 );
 
                 return Err(Error::Api(ErrorCode::OffsetOutOfRange));
@@ -10663,5 +10840,44 @@ mod floor_above_tail_tests {
     fn a_tail_that_reaches_the_floor_is_not_the_gap() {
         assert_eq!(None, floor_above_tail(Some(4), 4));
         assert_eq!(None, floor_above_tail(Some(9), 4));
+    }
+}
+
+#[cfg(test)]
+mod served_end_tests {
+    use super::ServedEnd;
+
+    /// The honor condition (#290): the pair speaks only for the floor it was
+    /// written with. Any other `high` — an older binary's expiry moved it
+    /// without re-certifying — silences it.
+    #[test]
+    fn a_pair_certifies_exactly_its_own_floor() {
+        let served = ServedEnd { end: 2, at_high: 4 };
+        assert!(served.certifies(4));
+        assert!(!served.certifies(9));
+        assert!(!served.certifies(2));
+    }
+
+    /// The gap is `[end, at_high)`: `end` is the first destroyed offset — a
+    /// consumer parked there waits for a record that can never come — and
+    /// `at_high` is excluded because it is where the next record will be
+    /// assigned (a peer may already be writing it).
+    #[test]
+    fn the_gap_is_the_surviving_tail_up_to_the_floor() {
+        let served = ServedEnd { end: 2, at_high: 4 };
+        assert!(!served.gap_contains(1));
+        assert!(served.gap_contains(2));
+        assert!(served.gap_contains(3));
+        assert!(!served.gap_contains(4));
+    }
+
+    /// A certification with nothing destroyed above the survivors — the
+    /// expiry deleted only lower segments, or none of this sub-stream's —
+    /// declares an empty gap and can never error a fetch.
+    #[test]
+    fn survivors_reaching_the_floor_leave_no_gap() {
+        let served = ServedEnd { end: 4, at_high: 4 };
+        assert!(!served.gap_contains(3));
+        assert!(!served.gap_contains(4));
     }
 }

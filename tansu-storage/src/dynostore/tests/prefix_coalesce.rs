@@ -48,7 +48,7 @@ use tansu_sans_io::{
 use crate::{
     Error, Result, Storage, TopicId, Topition, TxnAddPartitionsRequest,
     dynostore::{
-        CoalesceTuning, DynoStore, Era, PrefixLease, SegmentFooter, SubstreamEntry,
+        CoalesceTuning, DynoStore, Era, PrefixLease, SegmentFooter, ServedEnd, SubstreamEntry,
         TxnProduceOffset,
     },
 };
@@ -462,8 +462,14 @@ async fn a_recreated_topic_inherits_nothing_from_a_shared_segment() -> Result<()
 ///
 /// It was then counted by `tansu_fetch_unservable` and logged at debug for one
 /// release. #314 removed both once the condition measured ~10/min on a healthy
-/// fleet, so today it is neither counted nor logged — the condition is currently
-/// unobservable, which is an open question in #290 rather than a settled one.
+/// fleet, so today this condition is neither counted nor logged.
+///
+/// The *neighbouring* state — a floor above the surviving segment tail — is
+/// counted (`tansu_watermark_above_segment_tail`, #338) and, when the segment
+/// expiry that created it certified so (`Watermark::served`), its fetches now
+/// answer `OffsetOutOfRange` (#290). Neither reaches this test's state: here
+/// the index *covers* the offset and no expiry certified anything, so empty —
+/// bounded, error-free — remains the answer.
 ///
 /// What remains worth pinning is the property that survives the removal — the
 /// fetch **returns** rather than hanging. #290's complaint was a fetch that never
@@ -1103,12 +1109,21 @@ async fn expires_aged_segments_keeps_recent_ones() -> Result<(), Error> {
 /// this path.
 ///
 /// So this is #290's point 2, demonstrated rather than argued: the read path has no
-/// information that tells the two apart, and the fix is a durable end-of-log mark
-/// maintained by expiry — a format change with the release-ordering constraint
-/// `truncate` had (#182) — not an arithmetic change here.
+/// information that tells the two apart — which is why the fix is the durable
+/// served-end certification (`Watermark::served`), written by the expiry itself
+/// in the same CAS that raises the floor. Only that operation knows whether
+/// `floor > tail` means "a peer acked offsets you have not listed" or "the
+/// tail-holding segment is gone", and it is the single writer of both values.
 ///
-/// Asserts today's behaviour deliberately. It is a characterisation, so that
-/// whatever is decided is decided against something reproducible.
+/// With the certification in place the advertised end deliberately does NOT
+/// move — the floor is the log end in Kafka's sense, the next offset to be
+/// assigned, and lowering it under offsets a peer may have acked is the
+/// regression `scaling::coalesced_latest_survives_peer_expiry_via_floor_certification`
+/// exists to forbid. What changes is the fetch: a poll that found nothing,
+/// whose offset lies inside the certified-dead gap, answers
+/// `OFFSET_OUT_OF_RANGE` instead of empty — bounded, loud, and recoverable via
+/// `auto.offset.reset`, exactly the #337 discipline extended from the empty
+/// log to the mid-log gap.
 #[tokio::test]
 async fn retention_can_orphan_offsets_below_the_advertised_watermark() -> Result<(), Error> {
     let bucket = InMemory::new();
@@ -1136,11 +1151,21 @@ async fn retention_can_orphan_offsets_below_the_advertised_watermark() -> Result
     assert_eq!(1, segments(&bucket).await.len());
 
     // The advertised end offset has not moved: the durable floor, written
-    // write-ahead of the delete, still says 4.
+    // write-ahead of the delete, still says 4. That is deliberate — the floor
+    // is where the next record will be assigned, and regressing it under
+    // offsets a peer may have acked is worse than the gap (see the doc above).
     assert_eq!(
         4,
         store.high_watermark(&a).await?,
         "the write-ahead floor keeps advertising the pre-delete tail"
+    );
+
+    // The expiry certified what it left behind: offsets [2, 4) are dead, by
+    // the one writer that could know.
+    assert_eq!(
+        (4, Some(ServedEnd { end: 2, at_high: 4 })),
+        store.persisted_watermark_bounds(&a).await?,
+        "expiry must certify the surviving tail alongside the floor it raised"
     );
 
     // Offsets 0 and 1 are still served: the log is not empty, which is why
@@ -1150,20 +1175,92 @@ async fn retention_can_orphan_offsets_below_the_advertised_watermark() -> Result
         "the surviving segment still serves its own offsets"
     );
 
-    // A cold reader agrees, so this is a property of the store and not of one
-    // process's memory.
-    let cold = DynoStore::new(CLUSTER, NODE, bucket.clone());
-    assert_eq!(4, cold.high_watermark(&a).await?);
-
-    // Offsets 2 and 3 are advertised and unreadable — empty, not an error, and
-    // this repeats on every poll for as long as a consumer is asked to read them.
-    // That is the wedge.
+    // Offsets 2 and 3 are advertised and destroyed — and the fetch now says
+    // so, instead of answering empty on every poll forever (#290). This is
+    // what un-parks a consumer committed inside the gap: `auto.offset.reset`
+    // moves it to a live position, and `none` fails loudly.
     for offset in [2, 3] {
         assert!(
-            fetch_from(&store, &a, offset).await?.is_empty(),
-            "offset {offset} is below the advertised watermark of 4 and returns nothing"
+            matches!(
+                fetch_from(&store, &a, offset).await,
+                Err(Error::Api(ErrorCode::OffsetOutOfRange))
+            ),
+            "offset {offset} is in the certified-dead gap and must answer OFFSET_OUT_OF_RANGE"
         );
     }
+
+    // Fetching at the surviving tail itself is not an error: that is the
+    // caught-up position for a consumer of what remains.
+    assert!(fetch_from(&store, &a, 4).await?.is_empty());
+
+    // A cold reader reaches the same answers, so this is a property of the
+    // store and not of one process's memory: same advertised end, and the
+    // same error once its read path has warmed the watermark cache.
+    let cold = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    assert_eq!(4, cold.high_watermark(&a).await?);
+    assert!(
+        matches!(
+            fetch_from(&cold, &a, 2).await,
+            Err(Error::Api(ErrorCode::OffsetOutOfRange))
+        ),
+        "a cold replica must refuse the certified-dead gap too"
+    );
+
+    Ok(())
+}
+
+/// The honor condition that keeps the certified-gap error safe on a mixed
+/// fleet (#290): a floor moved by a writer that did not re-certify — an older
+/// binary's expiry round-trips `served` untouched through the catch-all while
+/// raising `high` — invalidates the pair, and a fetch in the gap falls back
+/// to answering empty. Erring on a stale pair would be the #292 failure over
+/// again: resetting live consumers off a claim that no longer describes the
+/// store.
+#[tokio::test]
+async fn a_stale_served_end_is_ignored_not_misread() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
+
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    let recent = now_ms();
+    let ancient = 1_000;
+    _ = store.produce(None, &a, batch_at(2, recent)?).await?;
+    _ = store.produce(None, &a, batch_at(2, ancient)?).await?;
+
+    // A certified expiry first: `served == {end: 2, at_high: 4}`.
+    assert_eq!(
+        1,
+        store.expire_prefix_segments(PREFIX, recent - 1_000).await?
+    );
+    assert_eq!(
+        (4, Some(ServedEnd { end: 2, at_high: 4 })),
+        store.persisted_watermark_bounds(&a).await?
+    );
+
+    // An "old binary" raises the floor without re-certifying — exactly what a
+    // pre-#290 `expire_prefix_segments` does to this object: `high` moves,
+    // `served` rides along untouched.
+    store
+        .watermark(&a)?
+        .with_mut(&store.object_store, |watermark| {
+            watermark.high = Some(9);
+            Ok(())
+        })
+        .await?;
+
+    // A cold reader advertises the raised floor, and the stale pair no longer
+    // certifies it: a fetch in the old gap answers empty — bounded, no error —
+    // because nothing can say whether those offsets are destroyed or merely
+    // unlisted here.
+    let cold = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    assert_eq!(9, cold.high_watermark(&a).await?);
+    assert!(
+        fetch_from(&cold, &a, 2).await?.is_empty(),
+        "a stale certification must degrade to empty, never to an error"
+    );
 
     Ok(())
 }
