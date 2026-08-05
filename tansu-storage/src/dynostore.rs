@@ -619,6 +619,25 @@ impl SegmentCreateRole {
     }
 }
 
+/// What a create-only segment PUT actually achieved, once an *ambiguous* result
+/// has been resolved (#89) — see [`DynoStore::resolve_segment_create`].
+#[derive(Debug)]
+enum SegmentCreate {
+    /// The object at the claimed sequence is ours: either the PUT returned
+    /// success, or it failed ambiguously and the footer there carries our nonce.
+    Won,
+
+    /// A peer holds the sequence. Fold it in and retry the next free one.
+    /// `ambiguous` separates a plain `AlreadyExists` from a PUT that errored and
+    /// only *then* turned out to have been beaten to the sequence — the two cost
+    /// the same but say different things about what is going wrong.
+    Lost { ambiguous: bool },
+
+    /// The create did not land and cannot be claimed. Carries the storage error,
+    /// which is classified retriable (#6/#129).
+    Failed(Error),
+}
+
 /// A prefix lease this process currently holds (#59): the in-memory side of
 /// [`PrefixLease`]. `version` is the etag the next renewal CASes against;
 /// `expires_at` gates the no-write fast path so a live term is reused without
@@ -1257,6 +1276,45 @@ impl OptiCon<Meta> {
 }
 
 impl Meta {
+    /// The last-stable-offset floor contributed by each still-open transaction,
+    /// as the minimum `offset_start` per topition over every epoch detail that
+    /// is neither `Committed` nor `Aborted`.
+    ///
+    /// A read-committed consumer may not see past the first offset written by a
+    /// transaction that has not yet resolved. Both `offset_stage` and
+    /// `list_offsets` answer with this floor, and the two must agree: this is
+    /// the single definition, so a change to the open-transaction predicate
+    /// (transaction-state pruning, a new `TxnState`) reaches `Fetch` and
+    /// `ListOffsets` together (#286).
+    fn open_transaction_floors(&self) -> BTreeMap<Topition, Offset> {
+        let mut floors = BTreeMap::new();
+
+        for txn in self.transactions.values() {
+            debug!(?txn);
+
+            for detail in txn.epochs.values().filter(|detail| {
+                detail
+                    .state
+                    .is_some_and(|state| state != TxnState::Committed && state != TxnState::Aborted)
+            }) {
+                for (topition, offset_start) in BTreeMap::<Topition, Offset>::from(detail) {
+                    _ = floors
+                        .entry(topition)
+                        .and_modify(|existing: &mut Offset| {
+                            if *existing > offset_start {
+                                *existing = offset_start
+                            }
+                        })
+                        .or_insert(offset_start);
+                }
+            }
+        }
+
+        debug!(?floors);
+
+        floors
+    }
+
     fn produced(
         &self,
         transaction_id: &str,
@@ -2986,9 +3044,9 @@ impl DynoStore {
     /// cached under that generation.
     ///
     /// Why this certifies the LATEST fast path: the floor is raised
-    /// write-ahead of *every* segment delete
-    /// ([`Self::raise_seq_floor`] call sites in `expire_prefix_segments` and
-    /// `compact_prefix_segments`), and `expire_prefix_segments` persists each
+    /// write-ahead of *every* segment delete (segments are deleted only through
+    /// [`Self::retire_segments`], which raises this floor first), and
+    /// `expire_prefix_segments` persists each
     /// affected sub-stream's tail into `watermark.high` *before* that raise.
     /// So `watermark.high` of a prefix-coalesced sub-stream can only advance
     /// in an operation that subsequently raises this floor. A floor value read
@@ -3074,7 +3132,8 @@ impl DynoStore {
 
     /// Raise the persisted next-sequence floor for `prefix` to at least `floor`
     /// (#77). MUST be called write-ahead of deleting any segment, so a freed
-    /// sequence name is never reused. Max-fold CAS: a lost race means another
+    /// sequence name is never reused — [`Self::retire_segments`] is the one
+    /// delete path and does exactly that. Max-fold CAS: a lost race means another
     /// worker wrote concurrently — re-read and, if the value already covers our
     /// floor, we are done; otherwise retry. Returns an error on persistent
     /// contention so the caller aborts the delete rather than break the invariant.
@@ -3417,21 +3476,100 @@ impl DynoStore {
         Ok(listed_max.map_or(0, |m| m + 1).max(floor))
     }
 
-    /// Write `payload` as the next create-only segment under `prefix` and return
-    /// its assigned sequence (#57). The create is the authority: a conflicting
-    /// sequence (a racing writer during a #59 failover) resyncs from the tail
-    /// and retries. Single-writer per prefix makes the conflict path an edge
-    /// case, not the steady state.
+    /// Resolve a create-only segment PUT at `candidate`, disambiguating an
+    /// *ambiguous* result through the per-segment footer nonce (#89).
     ///
-    /// `fence_on_conflict` controls the produce vs. compaction contract: the
-    /// produce path passes `true` — a seq conflict means a lease takeover, so it
-    /// re-validates the lease and aborts if fenced (#59). Compaction passes
-    /// `false` — it does not hold the produce lease and a conflict just means the
-    /// producer grabbed that tail seq, so it simply resyncs to the next free one.
+    /// `AlreadyExists` is unambiguous: a peer won the sequence. Any other error
+    /// is ambiguous — the create may have landed durably before the response was
+    /// lost — so the footer at `candidate` is probed and the object adopted iff
+    /// it carries our nonce. Our nonce can only exist at a sequence our own PUT
+    /// won, so a match is proof the create succeeded; blind-retrying at the next
+    /// sequence would double-write the payload. A *peer's* footer means we lost
+    /// the sequence exactly as in the `AlreadyExists` case and the transport
+    /// error was moot. No footer at all means the create genuinely did not land
+    /// (the store is read-after-write consistent, so a durable create would be
+    /// visible) and a probe that itself errors leaves it unknown — both surface
+    /// the storage error for a retry, which log-based dedup (#88) makes safe.
+    ///
+    /// One definition for the leaseless flush and for compaction (#286).
+    /// Compaction used to treat every ambiguous PUT as a plain error, so a
+    /// merged segment that had actually landed was retried as a failure and its
+    /// whole payload re-uploaded — the #130 write amplification.
+    async fn resolve_segment_create(
+        &self,
+        prefix: &str,
+        candidate: u64,
+        nonce: u64,
+        result: Result<PutResult, object_store::Error>,
+    ) -> SegmentCreate {
+        let error = match result {
+            Ok(outcome) => {
+                debug!(?outcome, prefix, candidate);
+                return SegmentCreate::Won;
+            }
+
+            Err(object_store::Error::AlreadyExists { .. }) => {
+                debug!(prefix, candidate, "segment seq taken, re-deriving");
+                return SegmentCreate::Lost { ambiguous: false };
+            }
+
+            Err(error) => error,
+        };
+
+        match self
+            .read_segment_footer(&self.segment_location(prefix, candidate))
+            .await
+        {
+            Ok(Some(found)) if found.nonce == nonce => {
+                debug!(prefix, candidate, "ambiguous PUT adopted via nonce");
+                SegmentCreate::Won
+            }
+
+            Ok(Some(_)) => {
+                debug!(prefix, candidate, ?error, "ambiguous PUT lost to peer");
+                SegmentCreate::Lost { ambiguous: true }
+            }
+
+            Ok(None) => {
+                debug!(
+                    prefix,
+                    candidate,
+                    ?error,
+                    "ambiguous PUT did not land, failing retriably"
+                );
+                SegmentCreate::Failed(error.into())
+            }
+
+            Err(probe_error) => {
+                debug!(
+                    prefix,
+                    candidate,
+                    ?error,
+                    ?probe_error,
+                    "ambiguous PUT unresolved"
+                );
+                SegmentCreate::Failed(error.into())
+            }
+        }
+    }
+
+    /// Write `payload` — encoded with `nonce` in its footer — as the next
+    /// create-only segment under `prefix`, and return its assigned sequence
+    /// (#57). The create is the authority: on a lost sequence, fold and retry
+    /// the next free one. There is no lease to re-validate since #177 — the
+    /// leaseless arbiter (#86) makes the create-only CAS itself the arbiter, so
+    /// a loser is never a fenced writer, only a slower one.
+    ///
+    /// The conflict protocol is the leaseless flush's, and deliberately so
+    /// (#286): [`Self::resolve_segment_create`] for the ambiguous PUT, a
+    /// jittered [`cas_conflict_backoff`] so N contenders do not resync in
+    /// lockstep, and fold-before-claim off the in-memory index (#91) instead of
+    /// a fresh `tail_next_seq` LIST per attempt.
     async fn assign_and_create_segment(
         &self,
         prefix: &str,
         payload: PutPayload,
+        nonce: u64,
         role: SegmentCreateRole,
     ) -> Result<u64> {
         /// Bounds the conflict-resync loop; far above any real contention.
@@ -3451,7 +3589,7 @@ impl DynoStore {
         };
 
         for attempt in 0..MAX_ATTEMPTS {
-            match self
+            let put_result = self
                 .object_store
                 .put_opts(
                     &self.segment_location(prefix, candidate),
@@ -3462,32 +3600,36 @@ impl DynoStore {
                         ..Default::default()
                     },
                 )
+                .await;
+
+            match self
+                .resolve_segment_create(prefix, candidate, nonce, put_result)
                 .await
             {
-                Ok(outcome) => {
-                    debug!(?outcome, candidate, prefix);
+                SegmentCreate::Won => {
                     SEGMENT_CREATES.add(1, &attributes);
                     self.set_seq(prefix, candidate + 1)?;
                     return Ok(candidate);
                 }
 
-                Err(object_store::Error::AlreadyExists { .. }) => {
-                    // A seq conflict just means another writer took that
-                    // sequence: resync and retry. There is no lease to
-                    // re-validate since #177 — the leaseless arbiter (#86) makes
-                    // the create-only CAS itself the arbiter, so a loser is
-                    // never a fenced writer, only a slower one.
-                    // Every loss costs a re-LIST and a re-upload of the whole
-                    // payload into the same key prefix (#130).
+                SegmentCreate::Lost { .. } => {
+                    // Every loss costs a re-upload of the whole payload into the
+                    // same key prefix (#130).
                     conflicts += 1;
                     SEGMENT_CREATE_CONFLICTS.add(1, &attributes);
                     SEGMENT_CREATE_BYTES_REWRITTEN.add(payload_len, &attributes);
 
                     debug!(candidate, attempt, prefix, "segment seq taken, resyncing");
-                    candidate = self.tail_next_seq(prefix).await?;
+
+                    tokio::time::sleep(cas_conflict_backoff(attempt)).await;
+
+                    // Fold-before-claim off the index the forced refresh just
+                    // listed, rather than a second full LIST (#91).
+                    self.refresh_prefix_index_forced(prefix).await?;
+                    candidate = self.tail_next_seq_folded(prefix).await?;
                 }
 
-                Err(err) => return Err(err.into()),
+                SegmentCreate::Failed(error) => return Err(error),
             }
         }
 
@@ -4090,6 +4232,159 @@ impl DynoStore {
                     entry.generation += 1;
                 }
             })
+    }
+
+    /// GET each of `seqs` whole, or `None` when any of them had already been
+    /// deleted.
+    ///
+    /// A 404 is a ghost index entry, not a failure (#274 — the compaction half
+    /// of the race #191 fixed on the refresh path). The incremental refresh is
+    /// add-only, so a replica that indexed this prefix before a peer compacted
+    /// it holds entries below its own cursor permanently. Treating that as fatal
+    /// aborted the pass *after* the claim had stamped `maintained_at_ms`, so
+    /// peers skipped the prefix for the whole recency window and its segment
+    /// count grew unbounded with nothing reporting it. Instead the vanished
+    /// sequences are pruned — names are never reused (#77), so dropping one is
+    /// permanent and correct — the prefix is invalidated so the next tick
+    /// re-lists, and `None` tells the caller to yield this tick.
+    ///
+    /// Both compaction passes read their inputs this way (#286): whole objects
+    /// beat per-sub-stream ranged GETs once a prefix holds more than one
+    /// sub-stream, and every byte is about to be rewritten anyway.
+    async fn fetch_segment_objects(
+        &self,
+        prefix: &str,
+        seqs: impl IntoIterator<Item = u64>,
+    ) -> Result<Option<BTreeMap<u64, Bytes>>> {
+        let mut objects: BTreeMap<u64, Bytes> = BTreeMap::new();
+        let mut vanished: Vec<u64> = Vec::new();
+
+        for seq in seqs {
+            match self
+                .object_store
+                .get(&self.segment_location(prefix, seq))
+                .await
+            {
+                Ok(result) => {
+                    _ = objects.insert(seq, result.bytes().await.map_err(Error::from)?);
+                }
+
+                Err(object_store::Error::NotFound { .. }) => {
+                    SEGMENT_VANISHED_BEFORE_READ.add(1, &[]);
+                    debug!(
+                        prefix,
+                        seq, "segment deleted before compaction could read it; pruning"
+                    );
+                    vanished.push(seq);
+                }
+
+                Err(err) => {
+                    error!(?err, prefix, seq);
+                    return Err(Error::from(err));
+                }
+            }
+        }
+
+        if !vanished.is_empty() {
+            self.index_prune(prefix, &vanished)?;
+            self.index_invalidate(prefix)?;
+            return Ok(None);
+        }
+
+        Ok(Some(objects))
+    }
+
+    /// Decode a sub-stream's epoch-fenced regions out of already-fetched segment
+    /// objects, as `(seq, base_offset, batches)` ascending by sequence.
+    ///
+    /// The fenced view ([`Self::valid_substream_segments`]) is what both
+    /// compaction passes transform (#286): overlap-resolved, higher
+    /// epoch/sequence wins, so a zombie region is dropped here and never fused
+    /// into a rewritten segment. The view spans the whole prefix, so it is
+    /// narrowed to the segments the caller actually fetched — the size merge
+    /// fetches its run, per-key rewrite fetches everything.
+    ///
+    /// A region whose recorded extent runs past its object is skipped rather
+    /// than decoded: a footer that disagrees with its object is damage, and
+    /// carrying its *base* forward without its records would mislabel the
+    /// batches that follow it.
+    fn decode_fenced_regions(
+        &self,
+        prefix: &str,
+        topic: &str,
+        partition: i32,
+        objects: &BTreeMap<u64, Bytes>,
+    ) -> Result<Vec<(u64, i64, Vec<deflated::Batch>)>> {
+        let fenced = self.valid_substream_segments(prefix, topic, partition)?;
+        let mut regions = Vec::with_capacity(fenced.len());
+
+        for (seq, entry) in fenced {
+            let Some(object) = objects.get(&seq) else {
+                continue;
+            };
+
+            let start = entry.byte_start as usize;
+            let end = start + entry.byte_len as usize;
+            if end > object.len() {
+                continue;
+            }
+
+            regions.push((
+                seq,
+                entry.base_offset,
+                self.decode_frame(object.slice(start..end))?,
+            ));
+        }
+
+        Ok(regions)
+    }
+
+    /// Retire `seqs` from `prefix`: raise the durable sequence floor past the
+    /// highest of them, delete their objects, then prune them from the index.
+    /// Returns the number of objects deleted.
+    ///
+    /// The floor write is **write-ahead of the delete** (#77): a freed sequence
+    /// name must never be reused, or a peer caching the old footer would serve
+    /// stale byte ranges against a reborn object. Deleting can lower the listing
+    /// max, so without the persisted floor a later `tail_next_seq` would hand
+    /// the freed name back out. On a floor-write error this returns before
+    /// deleting anything — the caller retries on the next tick rather than break
+    /// the invariant.
+    ///
+    /// This is the only place segment objects are deleted (#286): expiry,
+    /// whole-segment compaction and per-key rewrite all retire through here, so
+    /// a fourth delete path cannot get the ordering wrong by omission.
+    async fn retire_segments(&self, prefix: &str, seqs: &[u64]) -> Result<u64> {
+        /// Segment objects deleted per bulk request — matches the S3
+        /// `DeleteObjects` per-request key cap.
+        const RETIRE_DELETE_CHUNK: usize = 1_000;
+
+        let Some(max_seq) = seqs.iter().copied().max() else {
+            return Ok(0);
+        };
+
+        self.raise_seq_floor(prefix, max_seq + 1).await?;
+
+        let mut deleted: u64 = 0;
+        let mut chunk: Vec<Path> = Vec::new();
+
+        for seq in seqs {
+            chunk.push(self.segment_location(prefix, *seq));
+
+            if chunk.len() >= RETIRE_DELETE_CHUNK {
+                deleted += chunk.len() as u64;
+                self.delete_batches(std::mem::take(&mut chunk)).await?;
+            }
+        }
+
+        if !chunk.is_empty() {
+            deleted += chunk.len() as u64;
+            self.delete_batches(chunk).await?;
+        }
+
+        self.index_prune(prefix, seqs)?;
+
+        Ok(deleted)
     }
 
     /// The epoch-fenced segments holding a sub-stream, as `(seq, entry)` sorted
@@ -5154,9 +5449,15 @@ impl DynoStore {
                 .await;
             put_elapsed += put_started.elapsed();
 
-            match put_result {
+            // Resolve the PUT, including the ambiguous case, through the one
+            // definition shared with compaction (#286) — see
+            // [`Self::resolve_segment_create`].
+            match self
+                .resolve_segment_create(prefix, candidate, nonce, put_result)
+                .await
+            {
                 // Won the sequence — this create is the linearization point.
-                Ok(_) => {
+                SegmentCreate::Won => {
                     _ = self
                         .set_seq(prefix, candidate + 1)
                         .inspect_err(|err| debug!(?err));
@@ -5169,9 +5470,12 @@ impl DynoStore {
 
                 // A peer took `candidate`: fold it and retry the next free
                 // sequence with re-derived bases.
-                Err(object_store::Error::AlreadyExists { .. }) => {
-                    debug!(prefix, candidate, attempt, "segment seq taken, re-deriving");
-                    conflicts += 1;
+                SegmentCreate::Lost { ambiguous } => {
+                    if ambiguous {
+                        ambiguous_lost += 1;
+                    } else {
+                        conflicts += 1;
+                    }
                     slowest_attempt = slowest_attempt.max(attempt_started.elapsed());
                     FLUSH_CAS_CONFLICTS.add(1, &[]);
                     // Yield briefly, jittered (#157): N replicas flushing this
@@ -5184,82 +5488,11 @@ impl DynoStore {
                     continue;
                 }
 
-                // Ambiguous PUT (#89): the create may have landed durably before
-                // the transport error. Probe the footer at `candidate` and adopt
-                // it iff the nonce is ours — a blind retry at the next sequence
-                // would double-write the batch. Our nonce can only exist at a
-                // sequence our PUT actually won, so a match is proof the create
-                // succeeded. A peer's footer or none → we did not win, fold and
-                // re-derive. A probe error leaves it genuinely unknown → fail for
-                // a client retry (log-based dedup, #88, dedups the replay).
-                Err(error) => {
-                    match self
-                        .read_segment_footer(&self.segment_location(prefix, candidate))
-                        .await
-                    {
-                        Ok(Some(found)) if found.nonce == nonce => {
-                            debug!(
-                                prefix,
-                                candidate, attempt, "ambiguous PUT adopted via nonce"
-                            );
-                            _ = self
-                                .set_seq(prefix, candidate + 1)
-                                .inspect_err(|err| debug!(?err));
-                            return self
-                                .finalize_prefix_flush_leaseless(
-                                    prefix, candidate, footer, buffer, outcomes, &advances,
-                                )
-                                .await;
-                        }
-                        // A *peer* created `candidate` while our PUT was
-                        // failing: we lost the sequence exactly as in the
-                        // AlreadyExists arm (the transport error was moot). Fold
-                        // it and retry the next sequence — cheap, not a fault.
-                        Ok(Some(_)) => {
-                            debug!(
-                                prefix,
-                                candidate,
-                                attempt,
-                                ?error,
-                                "ambiguous PUT lost to peer, re-deriving"
-                            );
-                            ambiguous_lost += 1;
-                            slowest_attempt = slowest_attempt.max(attempt_started.elapsed());
-                            FLUSH_CAS_CONFLICTS.add(1, &[]);
-                            let backoff = cas_conflict_backoff(attempt);
-                            backoff_elapsed += backoff;
-                            tokio::time::sleep(backoff).await;
-                            continue;
-                        }
-                        // Nothing landed at `candidate` (S3 is read-after-write
-                        // consistent, so a durable create would be visible): our
-                        // PUT genuinely failed — a transient S3 throttle /
-                        // transport error, not a lost race. Surface the storage
-                        // error so it is classified *retriable* (#6/#129) and the
-                        // client backs off and retries (log-based dedup #88 makes
-                        // the replay safe), instead of spinning the attempt budget
-                        // against a throttling bucket toward a fatal terminal.
-                        Ok(None) => {
-                            debug!(
-                                prefix,
-                                candidate,
-                                attempt,
-                                ?error,
-                                "ambiguous PUT did not land, failing retriably"
-                            );
-                            return Self::fail_prefix_flush(buffer, error.into(), prefix);
-                        }
-                        Err(probe_error) => {
-                            debug!(
-                                prefix,
-                                candidate,
-                                ?error,
-                                ?probe_error,
-                                "ambiguous PUT unresolved"
-                            );
-                            return Self::fail_prefix_flush(buffer, error.into(), prefix);
-                        }
-                    }
+                // The create did not land and cannot be claimed: fail for a
+                // client retry, which log-based dedup (#88) makes safe, instead
+                // of spinning the attempt budget against a throttling bucket.
+                SegmentCreate::Failed(error) => {
+                    return Self::fail_prefix_flush(buffer, error, prefix);
                 }
             }
         }
@@ -5670,9 +5903,6 @@ impl DynoStore {
     /// defers, never forces, the reclaim). Deletes in bounded `DeleteObjects`
     /// chunks and refreshes the per-prefix skip hint from what survived.
     async fn expire_prefix_segments(&self, prefix: &str, threshold_ms: i64) -> Result<u64> {
-        /// Matches the S3 `DeleteObjects` per-request key cap.
-        const EXPIRE_DELETE_CHUNK: usize = 1_000;
-
         self.refresh_prefix_index(prefix).await?;
 
         // Decide from the cached footers (no per-segment footer GET). A segment
@@ -5811,33 +6041,8 @@ impl DynoStore {
             }
         }
 
-        // Raise the durable sequence floor past every seq we are about to delete,
-        // write-ahead of the delete (#77): a freed sequence name must never be
-        // reused, or a peer caching the old footer would serve stale byte ranges
-        // against a reborn object. On error, abort before deleting (retry next
-        // tick) rather than break the invariant.
-        if let Some(max_expirable) = expirable.iter().copied().max() {
-            self.raise_seq_floor(prefix, max_expirable + 1).await?;
-        }
-
-        // Delete the expired segment objects in bounded chunks.
-        let mut deleted: u64 = 0;
-        let mut chunk: Vec<Path> = Vec::new();
-        for seq in &expirable {
-            chunk.push(self.segment_location(prefix, *seq));
-            if chunk.len() >= EXPIRE_DELETE_CHUNK {
-                deleted += chunk.len() as u64;
-                self.delete_batches(std::mem::take(&mut chunk)).await?;
-            }
-        }
-        if !chunk.is_empty() {
-            deleted += chunk.len() as u64;
-            self.delete_batches(chunk).await?;
-        }
-
-        self.index_prune(prefix, &expirable)?;
-
-        Ok(deleted)
+        // Floor before delete, then prune (#77) — see [`Self::retire_segments`].
+        self.retire_segments(prefix, &expirable).await
     }
 
     /// Compact a prefix's oldest segments into fewer, larger ones (#66) to bound
@@ -5977,59 +6182,22 @@ impl DynoStore {
                 .collect()
         };
 
-        let mut objects: BTreeMap<u64, Bytes> = BTreeMap::new();
-        let mut vanished: Vec<u64> = Vec::new();
-        for seq in &run {
-            match self
-                .object_store
-                .get(&self.segment_location(prefix, *seq))
-                .await
-            {
-                Ok(result) => {
-                    _ = objects.insert(*seq, result.bytes().await.map_err(Error::from)?);
-                }
-
-                // A ghost index entry, not an error (#274 — the compaction half
-                // of the race #191 fixed on the refresh path). The incremental
-                // refresh is add-only, so a replica that indexed this prefix
-                // before a peer compacted it holds entries below its own cursor
-                // permanently; run selection picks the oldest segments, which
-                // are exactly those. Treating the 404 as fatal aborted the pass
-                // while the claim had already stamped `maintained_at_ms`, so
-                // peers skipped the prefix for the whole recency window and its
-                // segment count grew unbounded, with nothing reporting it.
-                Err(object_store::Error::NotFound { .. }) => {
-                    SEGMENT_VANISHED_BEFORE_READ.add(1, &[]);
-                    debug!(
-                        prefix,
-                        seq, "segment deleted before compaction could read it; pruning"
-                    );
-                    vanished.push(*seq);
-                }
-
-                Err(err) => {
-                    error!(?err, prefix, seq);
-                    return Err(Error::from(err));
-                }
-            }
-        }
-
-        // Prune what is gone and re-list, then yield the tick. Sequence names
-        // are never reused (#77), so dropping a 404'd sequence is permanent and
-        // correct; the next pass selects its run from an index that no longer
-        // holds ghosts.
-        if !vanished.is_empty() {
-            self.index_prune(prefix, &vanished)?;
-            self.index_invalidate(prefix)?;
+        // GET each run segment once; a ghost index entry yields the tick (#274).
+        // Run selection picks the oldest segments, which are exactly the ones a
+        // peer's compaction may already have deleted from under this replica's
+        // add-only index.
+        let Some(objects) = self
+            .fetch_segment_objects(prefix, run.iter().copied())
+            .await?
+        else {
             return Ok(0);
-        }
+        };
 
         // Merge the EPOCH-FENCED view (#66 review fix, critical): rebuild each
-        // sub-stream from `valid_substream_segments` (overlap-resolved, higher
+        // sub-stream from `decode_fenced_regions` (overlap-resolved, higher
         // epoch/sequence wins) restricted to the run — NOT the raw footer
-        // entries. A zombie/overlap input is dropped here, never fused into the
+        // entries. A zombie/overlap input is dropped there, never fused into the
         // merged segment, so compaction can't bake in duplicate/shifted offsets.
-        let run_set: BTreeSet<u64> = run.iter().copied().collect();
         let substream_keys: BTreeSet<(String, i32)> = footers
             .values()
             .flat_map(|footer| {
@@ -6044,30 +6212,19 @@ impl DynoStore {
         let mut merged_epoch = i64::MIN;
 
         for (topic, partition) in substream_keys {
-            let in_run: Vec<(u64, SubstreamEntry)> = self
-                .valid_substream_segments(prefix, &topic, partition)?
-                .into_iter()
-                .filter(|(seq, _)| run_set.contains(seq))
-                .collect();
-            if in_run.is_empty() {
-                // Every run segment holding this sub-stream is superseded by a
-                // segment outside the run — nothing to carry forward.
-                continue;
-            }
+            let in_run = self.decode_fenced_regions(prefix, &topic, partition, &objects)?;
 
-            let base = in_run[0].1.base_offset;
+            // Every run segment holding this sub-stream is superseded by a
+            // segment outside the run — nothing to carry forward.
+            let Some((_, base, _)) = in_run.first() else {
+                continue;
+            };
+            let base = *base;
+
             let mut batches = Vec::new();
-            for (seq, entry) in &in_run {
-                let Some(object) = objects.get(seq) else {
-                    continue;
-                };
-                let start = entry.byte_start as usize;
-                let end = start + entry.byte_len as usize;
-                if end > object.len() {
-                    continue;
-                }
-                batches.extend(self.decode_frame(object.slice(start..end))?);
-                if let Some(footer) = footers.get(seq) {
+            for (seq, _, region) in in_run {
+                batches.extend(region);
+                if let Some(footer) = footers.get(&seq) {
                     merged_epoch = merged_epoch.max(footer.writer_epoch);
                 }
             }
@@ -6089,32 +6246,23 @@ impl DynoStore {
             // recognized as a duplicate and acked with its original offset
             // instead of being re-appended. A fresh per-segment nonce (#89) is
             // stamped as on any create.
-            let (payload, footer) = {
-                let nonce = rng().random::<u64>();
-                self.encode_segment_v3(&substreams, merged_epoch.max(0), nonce)?
-            };
+            let nonce = rng().random::<u64>();
+            let (payload, footer) =
+                self.encode_segment_v3(&substreams, merged_epoch.max(0), nonce)?;
             let seq = self
-                .assign_and_create_segment(prefix, payload, SegmentCreateRole::Compaction)
+                .assign_and_create_segment(prefix, payload, nonce, SegmentCreateRole::Compaction)
                 .await?;
             self.index_insert(prefix, seq, footer, max_last_modified)?;
             Some(seq)
         };
 
-        // Raise the durable sequence floor past every run seq, write-ahead of the
-        // delete (#77). Compaction usually adds a higher merged seq so the listing
-        // max is unchanged, but when every run segment is superseded no merged seq
-        // is written (`new_seq == None`) and deleting the run *can* lower the
-        // listing max — freeing a run name for reuse without the floor.
-        if let Some(max_run) = run.iter().copied().max() {
-            self.raise_seq_floor(prefix, max_run + 1).await?;
-        }
-
-        let locations: Vec<Path> = run
-            .iter()
-            .map(|seq| self.segment_location(prefix, *seq))
-            .collect();
-        self.delete_batches(locations).await?;
-        self.index_prune(prefix, &run)?;
+        // Retire the run: floor before delete, then prune (#77) — see
+        // [`Self::retire_segments`]. Compaction usually adds a higher merged seq
+        // so the listing max is unchanged, but when every run segment is
+        // superseded no merged seq is written (`new_seq == None`) and deleting
+        // the run *can* lower the listing max — freeing a run name for reuse
+        // without the floor.
+        _ = self.retire_segments(prefix, &run).await?;
 
         SEGMENT_COMPACTIONS.add(run.len() as u64, &[]);
         debug!(
@@ -6197,44 +6345,14 @@ impl DynoStore {
             return Ok(0);
         }
 
-        // GET each segment once; every byte belongs to the compacted topic
-        // (dedicated prefix), so whole objects beat per-sub-stream ranged GETs
-        // once the topic has more than one partition.
-        let mut objects: BTreeMap<u64, Bytes> = BTreeMap::new();
-        let mut vanished: Vec<u64> = Vec::new();
-        for seq in segments_meta.keys() {
-            match self
-                .object_store
-                .get(&self.segment_location(prefix, *seq))
-                .await
-            {
-                Ok(result) => {
-                    _ = objects.insert(*seq, result.bytes().await.map_err(Error::from)?);
-                }
-
-                // As the size merge above (#274): a ghost index entry left by a
-                // peer's compaction, not a failure.
-                Err(object_store::Error::NotFound { .. }) => {
-                    SEGMENT_VANISHED_BEFORE_READ.add(1, &[]);
-                    debug!(
-                        prefix,
-                        seq, "segment deleted before compaction could read it; pruning"
-                    );
-                    vanished.push(*seq);
-                }
-
-                Err(err) => {
-                    error!(?err, prefix, seq);
-                    return Err(Error::from(err));
-                }
-            }
-        }
-
-        if !vanished.is_empty() {
-            self.index_prune(prefix, &vanished)?;
-            self.index_invalidate(prefix)?;
+        // GET every segment of the prefix once; a ghost index entry yields the
+        // tick, as for the size merge (#274).
+        let Some(objects) = self
+            .fetch_segment_objects(prefix, segments_meta.keys().copied())
+            .await?
+        else {
             return Ok(0);
-        }
+        };
 
         // Per-key transform over the EPOCH-FENCED view (as the size merge): a
         // zombie/overlap region is dropped from any rewrite, never fused in.
@@ -6247,27 +6365,10 @@ impl DynoStore {
         let mut repaired_total: u64 = 0;
 
         for (topic, partition) in substream_keys {
-            let fenced = self.valid_substream_segments(prefix, &topic, partition)?;
-
-            // Decode every fenced region once, newest first — a key kept in a
-            // newer region supersedes older copies.
-            let mut regions: Vec<(u64, i64, Vec<deflated::Batch>)> =
-                Vec::with_capacity(fenced.len());
-            for (seq, entry) in fenced.iter().rev() {
-                let Some(object) = objects.get(seq) else {
-                    continue;
-                };
-                let start = entry.byte_start as usize;
-                let end = start + entry.byte_len as usize;
-                if end > object.len() {
-                    continue;
-                }
-                regions.push((
-                    *seq,
-                    entry.base_offset,
-                    self.decode_frame(object.slice(start..end))?,
-                ));
-            }
+            // Decode every fenced region once, then walk them newest first — a
+            // key kept in a newer region supersedes older copies.
+            let mut regions = self.decode_fenced_regions(prefix, &topic, partition, &objects)?;
+            regions.reverse();
 
             let mut seen: BTreeSet<Bytes> = BTreeSet::new();
             let mut staged: Vec<(u64, i64, Vec<deflated::Batch>, u64, u64)> =
@@ -6407,29 +6508,18 @@ impl DynoStore {
             };
             let (epoch, last_modified) = segments_meta.get(seq).copied().unwrap_or((0, i64::MIN));
 
-            let (payload, footer) = {
-                let nonce = rng().random::<u64>();
-                self.encode_segment_v3(substreams, epoch.max(0), nonce)?
-            };
+            let nonce = rng().random::<u64>();
+            let (payload, footer) = self.encode_segment_v3(substreams, epoch.max(0), nonce)?;
             let new_seq = self
-                .assign_and_create_segment(prefix, payload, SegmentCreateRole::Compaction)
+                .assign_and_create_segment(prefix, payload, nonce, SegmentCreateRole::Compaction)
                 .await?;
             self.index_insert(prefix, new_seq, footer, last_modified)?;
         }
 
-        // Raise the durable sequence floor past every rewritten seq, write-ahead
-        // of the delete (#77): a freed sequence name must never be reused.
-        if let Some(max_dirty) = dirty.iter().copied().max() {
-            self.raise_seq_floor(prefix, max_dirty + 1).await?;
-        }
-
-        let locations: Vec<Path> = dirty
-            .iter()
-            .map(|seq| self.segment_location(prefix, *seq))
-            .collect();
-        self.delete_batches(locations).await?;
-        let pruned: Vec<u64> = dirty.iter().copied().collect();
-        self.index_prune(prefix, &pruned)?;
+        // Retire the rewritten seqs: floor before delete, then prune (#77) — see
+        // [`Self::retire_segments`].
+        let retired: Vec<u64> = dirty.iter().copied().collect();
+        _ = self.retire_segments(prefix, &retired).await?;
 
         SEGMENT_RECORDS_COMPACTED.add(removed_total, &[]);
         SEGMENT_FRAMES_REPAIRED.add(repaired_total, &[]);
@@ -8207,39 +8297,7 @@ impl Storage for DynoStore {
         let (stable, aborted_raw) = self
             .meta
             .with(&self.object_store, |meta| {
-                let stable = meta
-                    .transactions
-                    .values()
-                    .flat_map(|txn| {
-                        debug!(?txn);
-
-                        txn.epochs
-                            .values()
-                            .filter(|detail| {
-                                detail.state.is_some_and(|state| {
-                                    state != TxnState::Committed && state != TxnState::Aborted
-                                })
-                            })
-                            .map(BTreeMap::<Topition, Offset>::from)
-                            .collect::<Vec<_>>()
-                    })
-                    .reduce(|mut acc, e| {
-                        debug!(?acc, ?e);
-
-                        for (topition, offset_start) in e.iter() {
-                            _ = acc
-                                .entry(topition.to_owned())
-                                .and_modify(|existing_offset_start| {
-                                    if *existing_offset_start > *offset_start {
-                                        *existing_offset_start = *offset_start
-                                    }
-                                })
-                                .or_insert(*offset_start);
-                        }
-
-                        acc
-                    })
-                    .unwrap_or(BTreeMap::new());
+                let stable = meta.open_transaction_floors();
 
                 // Aborted transactions that produced to `topition` (#81), as
                 // `(producer_id, first_offset, last_offset)` — read-committed
@@ -8303,38 +8361,10 @@ impl Storage for DynoStore {
     ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
         let stable = if isolation_level == IsolationLevel::ReadCommitted {
             self.meta
-                .with(&self.object_store, |meta| {
-                    Ok(meta
-                        .transactions
-                        .values()
-                        .flat_map(|txn| {
-                            txn.epochs
-                                .values()
-                                .filter(|detail| {
-                                    detail.state.is_some_and(|state| {
-                                        state != TxnState::Committed && state != TxnState::Aborted
-                                    })
-                                })
-                                .map(BTreeMap::<Topition, Offset>::from)
-                                .collect::<Vec<_>>()
-                        })
-                        .reduce(|mut acc, e| {
-                            debug!(?acc, ?e);
-                            for (topition, offset_start) in e.iter() {
-                                _ = acc
-                                    .entry(topition.to_owned())
-                                    .and_modify(|existing_offset_start| {
-                                        if *existing_offset_start > *offset_start {
-                                            *existing_offset_start = *offset_start
-                                        }
-                                    })
-                                    .or_insert(*offset_start);
-                            }
-
-                            acc
-                        })
-                        .unwrap_or(BTreeMap::new()))
-                })
+                .with(
+                    &self.object_store,
+                    |meta| Ok(meta.open_transaction_floors()),
+                )
                 .await?
         } else {
             BTreeMap::new()
