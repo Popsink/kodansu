@@ -913,6 +913,102 @@ static SEGMENT_VANISHED_BEFORE_READ: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Topics this process holds a metadata handle for, after a maintenance sweep
+/// (#283).
+///
+/// The level, not a count of evictions: the failure being watched is monotonic
+/// growth, so what says the fix is working is that this tracks the cluster's live
+/// topic count instead of climbing past it. Divergence is the signal that
+/// something populates a per-topic map by a path the sweep does not reach.
+static TOPIC_CACHE_TOPICS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("tansu_topic_cache_topics")
+        .with_description("topics held in this process's topic-metadata cache")
+        .build()
+});
+
+/// Partitions this process holds a watermark handle for, after a maintenance
+/// sweep (#283) — the partition-scale companion to [`TOPIC_CACHE_TOPICS`], and
+/// the larger of the two by the partition count, so it is the one that shows up
+/// first in RSS.
+static TOPIC_CACHE_PARTITIONS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("tansu_topic_cache_partitions")
+        .with_description("partitions held in this process's watermark cache")
+        .build()
+});
+
+/// The topic names a per-topic cache holds entries for that are **not** in
+/// `live` (#283), where `topic_of` projects the map's key onto its topic name —
+/// identity for the name-keyed caches, [`Topition::topic`] for the
+/// partition-keyed ones.
+///
+/// Generic so the six maps, whose keys and values are all different types, are
+/// swept by one rule rather than by six copies of it. A poisoned lock yields
+/// nothing: the sweep is opportunistic, and the next tick retries.
+fn dead_keys<K, V, F>(
+    cache: &Arc<Mutex<BTreeMap<K, V>>>,
+    topic_of: F,
+    live: &BTreeSet<Topic>,
+) -> BTreeSet<Topic>
+where
+    F: Fn(&K) -> &str,
+{
+    cache.lock().map_or_else(
+        |_| BTreeSet::new(),
+        |cache| {
+            cache
+                .keys()
+                .map(topic_of)
+                .filter(|topic| !live.contains(*topic))
+                .map(ToOwned::to_owned)
+                .collect()
+        },
+    )
+}
+
+/// Entries in the cluster-global `meta.json` producer table (#283).
+///
+/// Nothing prunes this table, and every `InitProducerId` appends to it — so every
+/// connector restart mints an entry that is kept forever. The cost that matters is
+/// not the bytes but the access pattern: `init_producer` round-trips the **whole**
+/// object (GET, parse, mutate, CAS-PUT), so registration cost grows with the number
+/// of producers the cluster has ever seen, and it degrades exactly when it hurts
+/// most — the `InitProducerId` herd of a mass reconnect after an incident.
+///
+/// Recorded before any expiry policy exists, deliberately: the design decision (and
+/// the transaction half of it, which #81's aborted-transaction retention constrains)
+/// needs the growth rate and the current magnitude first. A gauge and not a counter
+/// because the question is the level, and the level is what a prune would change.
+static META_PRODUCERS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("tansu_meta_producers")
+        .with_description("producer entries in the cluster-global meta.json")
+        .build()
+});
+
+/// Entries in the cluster-global `meta.json` transaction table (#283). Same shape
+/// as [`META_PRODUCERS`], with the extra constraint that aborted transactions are
+/// retained on purpose (#81), so this half needs a design decision rather than a
+/// prune.
+static META_TRANSACTIONS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("tansu_meta_transactions")
+        .with_description("transaction entries in the cluster-global meta.json")
+        .build()
+});
+
+/// Serialised size of the cluster-global `meta.json` (#283) — the payload every
+/// `InitProducerId` and every transaction state change moves twice. This is the
+/// number the growth math is actually about; the two entry-count gauges above say
+/// which table is responsible for it.
+static META_BYTES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("tansu_meta_bytes")
+        .with_description("serialised size of the cluster-global meta.json")
+        .build()
+});
+
 /// Why a listing was issued (#165). A per-method LIST total says the tier-1
 /// plane is large; it does not say which of the ~20 scan sites is spending it,
 /// which is the question an aggregate cannot answer and the one that matters when
@@ -3038,6 +3134,162 @@ impl DynoStore {
         if let Ok(mut cache) = self.routing_prefixes.lock() {
             _ = cache.remove(topic);
         }
+    }
+
+    /// Drop every remaining process-local cache entry keyed by `topic` or by one
+    /// of its topitions (#283).
+    ///
+    /// Called for a topic whose metadata object is gone — by `delete_topic` for
+    /// the one it just deleted, and by [`Self::evict_deleted_topic_caches`] for one
+    /// a peer replica deleted.
+    ///
+    /// `delete_topic` used to invalidate three caches — the id pointer, the
+    /// routing pin and the topic index — and leave six behind. Those six kept
+    /// their entries until a same-named `create_topic` cleared them or the
+    /// process restarted, so under create/delete churn with **fresh** names
+    /// nothing ever cleared them: the growth was monotonic for the life of the
+    /// pod. `topic_metas` and `watermarks` each hold a cached JSON value per
+    /// entry, which makes it real memory rather than a few bytes of key.
+    ///
+    /// Every one of these is a cache or a hint whose authority is in the object
+    /// store, so dropping an entry can only cost a re-read:
+    ///
+    /// - `topic_metas` — the per-topic `OptiCon`. Dropping it is also what makes a
+    ///   same-named successor behave like a topic this replica has never read,
+    ///   which is the state #28 needs for a fresh create to be immediately visible
+    ///   (a retained handle holds a cached etag that can short-circuit the
+    ///   conditional GET to a stale `NotModified`).
+    /// - `next_offsets` — a hint, reconciled against the segment listing on a
+    ///   cold read or a create conflict. Reached **only** because the topic is
+    ///   gone: this is offset-authority state for a live topic, so a size- or
+    ///   age-triggered eviction here would be a correctness bug, not a cache miss.
+    /// - `coalesced_watermark_floors` — certified by [`Self::certified_seq_floor`],
+    ///   which is unrelated to topic lifecycle, so nothing else would ever
+    ///   invalidate a floor cached for the deleted incarnation.
+    /// - `truncate_floors` / `watermarks` — re-read from the `watermark.json` that
+    ///   `delete_topic` rewrites as the truncation tombstone (#246). The floor that
+    ///   hides the topic's slices inside shared segments lives in that object, not
+    ///   in these maps, so dropping the memo cannot resurrect anything: the next
+    ///   reader re-reads the same floor.
+    /// - `compacted_topics` — a TTL'd memo of `cleanup.policy`.
+    ///
+    /// Prefix-keyed state is deliberately untouched. A prefix is shared between
+    /// topics (`a.b.c` and `a.b.c.d` route to the same one), and neither caller can
+    /// tell whether the deleted topic was its last member without a scan — so
+    /// evicting `segment_seqs` or a flush lock here could put a second sequence
+    /// authority on a prefix a sibling topic is still producing to. A compacted
+    /// topic's prefix *is* per-topic (#175), so that state does still grow with
+    /// compacted-topic churn; establishing exclusivity cheaply is a separate
+    /// change.
+    fn invalidate_topic_caches(&self, topic: &str) {
+        if let Ok(mut cache) = self.topic_metas.lock() {
+            _ = cache.remove(topic);
+        }
+
+        if let Ok(mut cache) = self.compacted_topics.lock() {
+            _ = cache.remove(topic);
+        }
+
+        if let Ok(mut cache) = self.watermarks.lock() {
+            cache.retain(|topition, _| topition.topic() != topic);
+        }
+
+        if let Ok(mut cache) = self.next_offsets.lock() {
+            cache.retain(|topition, _| topition.topic() != topic);
+        }
+
+        if let Ok(mut cache) = self.coalesced_watermark_floors.lock() {
+            cache.retain(|topition, _| topition.topic() != topic);
+        }
+
+        if let Ok(mut cache) = self.truncate_floors.lock() {
+            cache.retain(|topition, _| topition.topic() != topic);
+        }
+    }
+
+    /// Drop the per-topic caches of every topic that no longer exists,
+    /// returning how many topics were evicted (#283).
+    ///
+    /// [`Self::invalidate_topic_caches`] fixes only the replica that served the
+    /// `DeleteTopics`. Eviction is process-local and a stateless fleet puts every
+    /// topic through every replica, so on a ten-pod deployment nine pods keep
+    /// their entries for a deleted topic — the growth is still monotonic, just at
+    /// nine tenths of the rate. This is the half that converges the peers.
+    ///
+    /// Reconciled against the topic index rather than against a clock, because
+    /// "this topic is gone" is a fact about the bucket and an idle window is only
+    /// a guess at one. The index is exactly the right authority: it is rebuilt
+    /// from a single LIST of `topic-metadata/`, drops deleted topics by
+    /// construction, and is already maintained for the list-all metadata path —
+    /// so the sweep costs one listing per maintenance tick and no per-topic
+    /// requests.
+    ///
+    /// A refresh that **fails** propagates rather than evicting: a listing that
+    /// did not happen says nothing about what exists, and treating it as "no
+    /// topics" would drop the whole fleet's caches at once. An empty listing that
+    /// succeeded is a cluster with no topics, and evicting is then correct.
+    ///
+    /// This is the one trigger that touches [`Self::next_offsets`] without a local
+    /// delete, so it is worth being explicit that it is not the size-triggered
+    /// eviction that map must never have: the criterion is the topic's *absence
+    /// from the bucket*, never memory pressure or age, so a live topic cannot be
+    /// selected however hot or cold its partitions are. The only way to reach a
+    /// live topic here is a listing that omits an object that exists, which is not
+    /// a state either object store produces.
+    async fn evict_deleted_topic_caches(&self) -> Result<usize> {
+        // Force the listing: a snapshot up to `TOPIC_INDEX_TTL` old is fine for
+        // answering Metadata and is not fine for deciding what to forget.
+        self.invalidate_topic_index();
+
+        let live = self
+            .topics_index()
+            .await?
+            .iter()
+            .map(|metadata| metadata.topic.name.clone())
+            .collect::<BTreeSet<_>>();
+
+        // Whose entries to drop, decided once across every map, so the six
+        // cannot end up disagreeing about which topics are gone.
+        let mut evicted = BTreeSet::new();
+
+        evicted.extend(dead_keys(&self.topic_metas, |topic| topic, &live));
+        evicted.extend(dead_keys(&self.compacted_topics, |topic| topic, &live));
+        evicted.extend(dead_keys(&self.watermarks, Topition::topic, &live));
+        evicted.extend(dead_keys(&self.next_offsets, Topition::topic, &live));
+        evicted.extend(dead_keys(
+            &self.coalesced_watermark_floors,
+            Topition::topic,
+            &live,
+        ));
+        evicted.extend(dead_keys(&self.truncate_floors, Topition::topic, &live));
+
+        for topic in &evicted {
+            self.invalidate_topic_caches(topic);
+        }
+
+        // Read from the maps after the eviction rather than derived from `live`:
+        // these must report what is actually held, so a map populated by a path
+        // this sweep does not reach shows up as divergence from the cluster's topic
+        // count instead of being papered over. Both are a `len()`, so the gauges
+        // cost nothing even at 14.7k topics.
+        let topics = self.topic_metas.lock().map_or(0, |cache| cache.len());
+        let partitions = self.watermarks.lock().map_or(0, |cache| cache.len());
+
+        TOPIC_CACHE_TOPICS.record(topics as u64, &[]);
+        TOPIC_CACHE_PARTITIONS.record(partitions as u64, &[]);
+
+        if !evicted.is_empty() {
+            debug!(
+                evicted = evicted.len(),
+                live = live.len(),
+                topics,
+                partitions,
+                cluster = self.cluster,
+                "evicted per-topic caches of deleted topics"
+            );
+        }
+
+        Ok(evicted.len())
     }
 
     /// List `prefix`, attributing the call to the code that asked for it (#165).
@@ -5974,6 +6226,47 @@ impl DynoStore {
         Ok(expired)
     }
 
+    /// Record the size of the cluster-global `meta.json` and of the two tables
+    /// inside it that nothing prunes (#283), returning `(producers, transactions,
+    /// bytes)` so the numbers can be asserted without standing up a metrics
+    /// reader.
+    ///
+    /// **Measurement, not a fix.** The producer table grows by one entry per
+    /// `InitProducerId` — one per connector restart — and there is no `remove` or
+    /// `retain` on it anywhere in the tree. Whether that needs an expiry policy
+    /// *now* is a question about the production bucket's actual growth rate, and
+    /// no amount of reading the code answers it; the transaction half additionally
+    /// needs a decision, since #81 retains aborted transactions on purpose. So
+    /// this attaches the growth math before the table is big enough to matter,
+    /// which is the whole of what the issue asks for at this stage.
+    ///
+    /// On the maintenance tick, which is the right cadence for a level that moves
+    /// with restarts rather than with traffic: at one conditional GET per tick it
+    /// is a rounding error against the pass it runs in, and the cached etag makes
+    /// most of those a `NotModified`. The serialisation is the same one
+    /// `OptiCon::with_mut` performs on every producer registration, so its cost is
+    /// already characterised.
+    async fn measure_meta(&self) -> Result<(u64, u64, u64)> {
+        let measured = self
+            .meta
+            .with(&self.object_store, |meta| {
+                Ok((
+                    meta.producers.len() as u64,
+                    meta.transactions.len() as u64,
+                    serde_json::to_vec(meta)?.len() as u64,
+                ))
+            })
+            .await?;
+
+        let (producers, transactions, bytes) = measured;
+
+        META_PRODUCERS.record(producers, &[]);
+        META_TRANSACTIONS.record(transactions, &[]);
+        META_BYTES.record(bytes, &[]);
+
+        Ok(measured)
+    }
+
     /// Whether a prefix might hold a segment older than `threshold_ms`, from the
     /// per-prefix oldest-retained hint (#61, the per-prefix analogue of
     /// [`Self::partition_maybe_expirable`]). `true` (must scan) when unknown.
@@ -8162,6 +8455,11 @@ impl Storage for DynoStore {
             self.invalidate_routing_prefix(metadata.topic.name.as_str());
             self.invalidate_topic_index();
 
+            // The other six per-topic caches (#283). After the tombstone write
+            // above, so the watermark handle this drops is not one a later step
+            // still needs.
+            self.invalidate_topic_caches(metadata.topic.name.as_str());
+
             for path in [
                 self.topic_id_path(&metadata.id),
                 // The routing pin goes with the topic (#236): it is immutable for a
@@ -10183,7 +10481,31 @@ impl Storage for DynoStore {
         let (deleted_segments, compacted_segments) =
             self.maintain_prefix_segments(now_ms, owned).await?;
         let expired_groups = self.expire_groups(now).await?;
-        debug!(deleted_segments, compacted_segments, expired_groups);
+
+        // Converge the per-topic caches of topics another replica deleted (#283).
+        // Not `?`: this is memory hygiene, and a failed topic listing must not
+        // cost the pass its retention and compaction — the next tick retries.
+        let evicted_topics = self
+            .evict_deleted_topic_caches()
+            .await
+            .inspect_err(|err| warn!(?err, "could not evict deleted-topic caches"))
+            .unwrap_or_default();
+
+        // Measurement only (#283): a failure here must not cost this replica its
+        // retention and compaction, which is why it is not `?`.
+        let meta = self
+            .measure_meta()
+            .await
+            .inspect_err(|err| debug!(?err, "could not measure meta.json"))
+            .ok();
+
+        debug!(
+            deleted_segments,
+            compacted_segments,
+            expired_groups,
+            evicted_topics,
+            ?meta
+        );
 
         Ok(())
     }

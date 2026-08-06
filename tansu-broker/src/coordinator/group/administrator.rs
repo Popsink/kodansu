@@ -24,7 +24,10 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use opentelemetry::{KeyValue, metrics::Counter};
+use opentelemetry::{
+    KeyValue,
+    metrics::{Counter, Gauge},
+};
 use rand::{prelude::*, rng};
 use tansu_sans_io::{
     Body, ErrorCode,
@@ -321,6 +324,44 @@ static REBALANCE_STALLS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .with_description("rebalances still incomplete past the stall threshold")
         .build()
 });
+
+/// Per-group state evicted from this replica's in-process maps (#283) — the
+/// numerator whose growth against `tansu_group_coordinator_cached` says whether
+/// the sweep is keeping up with group churn.
+static GROUPS_EVICTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_group_coordinator_evicted")
+        .with_description("groups whose process-local coordinator state was evicted when idle")
+        .build()
+});
+
+/// Groups whose state this replica still holds in memory after a sweep (#283).
+///
+/// A counter cannot answer the question this exists for: the maps grew
+/// monotonically, so what matters is whether the *level* is flat under churn, not
+/// how many entries were ever made. Unlabelled — thousands of groups, so a
+/// `group` label would be unbounded cardinality.
+static GROUPS_CACHED: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("tansu_group_coordinator_cached")
+        .with_description("groups held in this replica's process-local coordinator maps")
+        .build()
+});
+
+/// How long a group must go unserved before its process-local coordinator state
+/// is evicted (#283).
+///
+/// Comfortably above every window a *live* group can be quiet for — the session
+/// timeout, the rebalance timeout, the join long-poll — because the cost of
+/// being wrong in that direction is not a stale answer (every path re-reads the
+/// group object GET-first, so an evicted entry costs a cache miss) but pointless
+/// re-reads on a busy group. Well below the pod lifetime, which is the window
+/// the growth was previously bounded by.
+///
+/// Not tied to the storage engine's group-expiry threshold: this is not a
+/// statement about when a group is dead, only about when this replica has
+/// stopped hearing from one.
+pub const GROUP_STATE_IDLE_AFTER: Duration = Duration::from_mins(30);
 
 /// Floor for [`stall_after`] — the threshold used when a group declares no
 /// rebalance timeout of its own, and the minimum applied to one that declares
@@ -1058,9 +1099,11 @@ type WrapperMap<O> = Arc<Mutex<BTreeMap<String, (Wrapper<O>, Option<Version>)>>>
 /// backstop (a forward timeout falls back to local processing on another
 /// replica, which this in-process lock cannot serialize).
 ///
-/// The map is keyed by group id and grows with the set of groups this replica
-/// owns; entries are cheap (`Arc<tokio::sync::Mutex<()>>`) and bounded by the
-/// active group population divided across replicas, so it is never pruned.
+/// The map is keyed by group id, so it grows with the set of groups this replica
+/// has *ever* served rather than the set it currently serves — a
+/// group-per-restart or group-per-subscription naming pattern grew it without
+/// bound. Swept by [`Controller::prune`] (#283); an entry whose `Arc` the map is
+/// not the sole holder of is left alone, see there.
 type GroupLocks = Arc<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>>;
 
 #[derive(Clone, Debug)]
@@ -1080,6 +1123,23 @@ pub struct Controller<O> {
     /// created; against a condition that lasted hours that is an acceptable
     /// trade, and it needs no rolling-deploy care.
     rebalance_stalls: Arc<Mutex<BTreeMap<String, (SystemTime, bool)>>>,
+
+    /// When each group was last served by this replica — the touch stamp
+    /// [`Self::prune`] evicts on (#283).
+    ///
+    /// Written by [`Self::group_lock`], which every request path that populates
+    /// any of the maps above calls *before* it touches them. That ordering is
+    /// what makes the sweep leak-free: see [`Self::prune`].
+    ///
+    /// On the MONOTONIC clock, unlike [`Self::rebalance_stalls`]: nothing here is
+    /// persisted or compared against a stored timestamp, and a backwards NTP step
+    /// would otherwise make `elapsed()` fail and freeze the sweep (#256).
+    last_seen: Arc<Mutex<BTreeMap<String, Instant>>>,
+
+    /// How long a group must go unserved before [`Self::prune`] evicts its
+    /// state (#283). Lowered in tests so the sweep can be exercised without
+    /// waiting one out.
+    idle_after: Duration,
 }
 
 impl<O> Controller<O>
@@ -1092,7 +1152,15 @@ where
             wrappers: Arc::new(Mutex::new(BTreeMap::new())),
             group_locks: Arc::new(Mutex::new(BTreeMap::new())),
             rebalance_stalls: Arc::new(Mutex::new(BTreeMap::new())),
+            last_seen: Arc::new(Mutex::new(BTreeMap::new())),
+            idle_after: GROUP_STATE_IDLE_AFTER,
         })
+    }
+
+    /// Override the idle window before [`Self::prune`] evicts a group's state
+    /// (#283). Tests set it to zero to sweep without waiting.
+    pub fn with_idle_after(self, idle_after: Duration) -> Self {
+        Self { idle_after, ..self }
     }
 
     /// Report a group that has been mid-rebalance too long (#240).
@@ -1152,13 +1220,137 @@ where
     /// The serialization lock for `group_id`, created on first use. See
     /// [`GroupLocks`]. Callers hold the returned guard across a single
     /// read->CAS window and drop it before any long-poll / rebalance sleep.
+    ///
+    /// Also the single touch point for [`Self::last_seen`] (#283). Every request
+    /// path that populates a per-group map calls this first, so one stamp here
+    /// covers all of them — and covers them from *before* the wrapper is checked
+    /// out, which is what [`Self::prune`] relies on.
     fn group_lock(&self, group_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        if let Ok(mut last_seen) = self.last_seen.lock() {
+            _ = last_seen.insert(group_id.to_owned(), Instant::now());
+        }
+
         self.group_locks
             .lock()
             .expect("group_locks mutex poisoned")
             .entry(group_id.to_owned())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// The body of [`Coordinator::prune`] for this controller (#283) — see there
+    /// for what it evicts and why that is safe.
+    ///
+    /// Inherent so the trait impl below is a one-liner and the reasoning lives
+    /// next to the maps it reasons about.
+    ///
+    /// The four maps swept here were keyed by a client-controlled string and had
+    /// no removal path at all — not even when the group was deleted from the
+    /// object store — so a group-per-restart or group-per-subscription naming
+    /// pattern grew them for the life of the pod. `wrappers` is the expensive one:
+    /// it holds each group's full member-metadata byte blobs.
+    ///
+    /// **Idle-triggered rather than delete-triggered**, which is a deliberate
+    /// choice and not an approximation of one. The two events the issue names —
+    /// `DeleteGroups` and group expiry — both happen inside the storage engine,
+    /// which has no handle on the broker's coordinator, so wiring either as a
+    /// callback would invert the layering. Idleness needs no such handle and
+    /// covers strictly more: a group nobody deleted and nothing expired, because
+    /// its committed offsets are still there, but whose consumers are gone for
+    /// good, is the shape the observed naming patterns actually produce.
+    ///
+    /// **Safe because none of this is authority.** Every request path re-reads
+    /// `{group}.json` GET-first and adopts the persisted state whenever its cached
+    /// version differs — and a freshly created wrapper has no version, so it
+    /// always adopts. `inception` (the one field that could not be recomputed) is
+    /// persisted in `GroupDetail`. So an eviction costs one object read on the
+    /// group's next request and can change no answer.
+    ///
+    /// **`group_locks` is the exception, and needs the `Arc` count.** Dropping a
+    /// lock another task holds does not free it — it means the *next* request
+    /// creates a second lock for the same group, and two members then run their
+    /// read->CAS windows concurrently, which is exactly the CAS thrash
+    /// [`GroupLocks`] exists to prevent. `Arc::strong_count == 1` rules that out:
+    /// the map is the only holder, so no request is between [`Self::group_lock`]
+    /// and its end (`lock_owned` moves the `Arc` into the guard, and the join/sync
+    /// loops keep their own clone for the whole call, so a live request always
+    /// holds one).
+    ///
+    /// That check is also what makes the sweep **leak-free**, which it would not
+    /// otherwise be: a request that has checked its wrapper *out* of `wrappers`
+    /// and not yet put it back would be invisible to a sweep keyed on the map's
+    /// contents, and the re-insert afterwards would strand an entry with no touch
+    /// stamp — never a candidate again. Since the stamp is written before the
+    /// checkout and the `Arc` is held across it, such a group is skipped whole
+    /// (stamp included) and reconsidered on the next sweep.
+    fn prune_idle_groups(&self) -> usize {
+        let now = Instant::now();
+
+        // Candidates decided from `last_seen` alone, then confirmed per group
+        // under the lock below. Collected first so no two of these mutexes are
+        // ever held at once.
+        let Ok(idle) = self.last_seen.lock().map(|last_seen| {
+            last_seen
+                .iter()
+                .filter(|(_, seen)| now.duration_since(**seen) >= self.idle_after)
+                .map(|(group_id, _)| group_id.to_owned())
+                .collect::<Vec<_>>()
+        }) else {
+            return 0;
+        };
+
+        let mut evicted = 0;
+
+        for group_id in idle {
+            // Serving now: leave every one of this group's entries, stamp
+            // included, and reconsider it next sweep.
+            let released = self.group_locks.lock().is_ok_and(|mut group_locks| {
+                match group_locks.get(&group_id) {
+                    Some(lock) if Arc::strong_count(lock) == 1 => {
+                        _ = group_locks.remove(&group_id);
+                        true
+                    }
+
+                    // No lock entry at all: nothing can be mid-request, since
+                    // `group_lock` creates one before anything else happens.
+                    None => true,
+
+                    Some(_) => false,
+                }
+            });
+
+            if !released {
+                continue;
+            }
+
+            if let Ok(mut wrappers) = self.wrappers.lock() {
+                _ = wrappers.remove(&group_id);
+            }
+
+            if let Ok(mut stalls) = self.rebalance_stalls.lock() {
+                _ = stalls.remove(&group_id);
+            }
+
+            if let Ok(mut last_seen) = self.last_seen.lock() {
+                _ = last_seen.remove(&group_id);
+            }
+
+            evicted += 1;
+        }
+
+        let cached = self
+            .last_seen
+            .lock()
+            .map_or(0, |last_seen| last_seen.len() as u64);
+
+        GROUPS_CACHED.record(cached, &[]);
+
+        if evicted > 0 {
+            GROUPS_EVICTED.add(evicted as u64, &[]);
+            debug!(evicted, cached, "evicted idle group state");
+        }
+
+        evicted
     }
 }
 
@@ -2125,6 +2317,10 @@ where
                 }
             }
         }
+    }
+
+    fn prune(&self) -> usize {
+        self.prune_idle_groups()
     }
 }
 
@@ -6568,6 +6764,218 @@ mod tests {
         };
         assert_eq!(i16::from(ErrorCode::None), join_response.error_code);
         assert_eq!(member_id, join_response.leader);
+
+        Ok(())
+    }
+
+    async fn memory_storage() -> Result<Arc<Box<dyn Storage>>> {
+        StorageContainer::builder()
+            .cluster_id("test")
+            .node_id(111)
+            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
+            .storage(Url::parse("memory://")?)
+            .build()
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Every per-group map entry this controller holds, as
+    /// `(wrappers, group_locks, rebalance_stalls, last_seen)`.
+    fn cached<O>(controller: &Controller<O>) -> (usize, usize, usize, usize) {
+        (
+            controller.wrappers.lock().unwrap().len(),
+            controller.group_locks.lock().unwrap().len(),
+            controller.rebalance_stalls.lock().unwrap().len(),
+            controller.last_seen.lock().unwrap().len(),
+        )
+    }
+
+    /// #283: none of the four per-group maps had a removal path — not even when
+    /// the group was deleted from the object store — so a group-per-restart or
+    /// group-per-subscription naming pattern grew them for the life of the pod.
+    /// `wrappers` is the expensive one: it holds each group's full
+    /// member-metadata byte blobs.
+    ///
+    /// Written against the *level*: the failure is monotonic growth, so what has
+    /// to hold is that churning many uniquely-named groups returns to zero rather
+    /// than climbing. A zero idle window makes every group a candidate on the
+    /// sweep after it, which is what keeps this deterministic instead of timed.
+    #[tokio::test]
+    async fn group_churn_with_fresh_names_reaches_a_flat_steady_state() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let storage = memory_storage().await?;
+        let s = Controller::with_storage(storage)?.with_idle_after(Duration::ZERO);
+
+        const ROUNDS: usize = 16;
+        const RANGE: &str = "range";
+        const PROTOCOL_TYPE: &str = "consumer";
+
+        let protocols = [JoinGroupRequestProtocol::default()
+            .name(RANGE.into())
+            .metadata(encode_subscription(&["test"], None))];
+
+        for round in 0..ROUNDS {
+            // A fresh name every round: a same-named re-join would reuse the
+            // entries rather than add to them, so it would not show the growth.
+            let group_id = format!("churn-{round}");
+
+            _ = s
+                .join(
+                    Some("a-consumer"),
+                    &group_id,
+                    45_000,
+                    Some(300_000),
+                    "",
+                    None,
+                    PROTOCOL_TYPE,
+                    Some(&protocols[..]),
+                    None,
+                )
+                .await?;
+
+            // The group is known now — otherwise the sweep below would be
+            // asserting that nothing evicts nothing.
+            let (wrappers, locks, _, last_seen) = cached(&s);
+            assert_eq!(1, wrappers, "wrappers, round {round}");
+            assert_eq!(1, locks, "group_locks, round {round}");
+            assert_eq!(1, last_seen, "last_seen, round {round}");
+
+            assert_eq!(1, s.prune(), "round {round}");
+            assert_eq!((0, 0, 0, 0), cached(&s), "not flat after round {round}");
+        }
+
+        Ok(())
+    }
+
+    /// #283: the sweep must not drop a lock a request is holding.
+    ///
+    /// Dropping it does not free anything — it means the *next* request for that
+    /// group creates a second lock, and two members then run their read->CAS
+    /// windows concurrently against one `{group}.json`, which is the CAS thrash
+    /// [`GroupLocks`] exists to prevent (#240). The `Arc` count is the guard, and
+    /// it is also what makes the sweep leak-free: a request that has checked its
+    /// wrapper out of `wrappers` and not yet put it back is invisible to a sweep
+    /// keyed on the map's contents, so its stamp must survive too or the
+    /// re-inserted entry would never be a candidate again.
+    #[tokio::test]
+    async fn a_group_being_served_is_not_evicted() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let storage = memory_storage().await?;
+        let s = Controller::with_storage(storage)?.with_idle_after(Duration::ZERO);
+
+        const GROUP_ID: &str = "in-flight";
+
+        // Stand in for a request in flight: `group_lock` is what every path calls
+        // first, and holding its `Arc` is exactly the state a live request is in.
+        let held = s.group_lock(GROUP_ID);
+
+        assert_eq!(0, s.prune());
+
+        let (_, locks, _, last_seen) = cached(&s);
+        assert_eq!(1, locks, "the held lock must survive");
+        assert_eq!(
+            1, last_seen,
+            "the stamp must survive with it, or the entry becomes unpruneable"
+        );
+
+        // Request over.
+        drop(held);
+
+        assert_eq!(1, s.prune());
+        assert_eq!((0, 0, 0, 0), cached(&s));
+
+        Ok(())
+    }
+
+    /// #283: a group served within the idle window keeps its state — the sweep
+    /// bounds growth, it does not throw away the cache it exists to be.
+    #[tokio::test]
+    async fn a_recently_served_group_is_kept() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let storage = memory_storage().await?;
+        let s = Controller::with_storage(storage)?.with_idle_after(Duration::from_secs(3_600));
+
+        _ = s.group_lock("recent");
+
+        assert_eq!(0, s.prune());
+        assert_eq!(1, cached(&s).1, "group_locks");
+
+        Ok(())
+    }
+
+    /// #283: an evicted group is a cache miss and nothing more.
+    ///
+    /// Every request path reads `{group}.json` GET-first and adopts the persisted
+    /// state whenever its cached version differs — and a freshly created wrapper
+    /// has no version, so it always adopts. `inception` is persisted in
+    /// `GroupDetail`, so it survives too. This drives a group to a generation,
+    /// evicts it, and re-joins: the coordinator must answer from the object store
+    /// as if it had never forgotten.
+    #[tokio::test]
+    async fn an_evicted_group_is_rebuilt_from_the_object_store() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let storage = memory_storage().await?;
+        let s = Controller::with_storage(storage.clone())?.with_idle_after(Duration::ZERO);
+
+        const GROUP_ID: &str = "rebuilt";
+        const RANGE: &str = "range";
+        const PROTOCOL_TYPE: &str = "consumer";
+
+        let protocols = [JoinGroupRequestProtocol::default()
+            .name(RANGE.into())
+            .metadata(encode_subscription(&["test"], None))];
+
+        let join = async || {
+            s.join(
+                Some("a-consumer"),
+                GROUP_ID,
+                45_000,
+                Some(300_000),
+                "",
+                None,
+                PROTOCOL_TYPE,
+                Some(&protocols[..]),
+                None,
+            )
+            .await
+        };
+
+        let Body::JoinGroupResponse(before) = join().await? else {
+            panic!("expected a join response");
+        };
+
+        let persisted = storage
+            .read_group(GROUP_ID)
+            .await?
+            .map(|(detail, _)| detail)
+            .expect("the group must be persisted");
+
+        assert_eq!(1, s.prune());
+        assert_eq!((0, 0, 0, 0), cached(&s));
+
+        let Body::JoinGroupResponse(after) = join().await? else {
+            panic!("expected a join response");
+        };
+
+        // Same generation and same leader as before the eviction: the state came
+        // back from the object, it was not re-formed from nothing.
+        assert_eq!(before.generation_id, after.generation_id);
+        assert_eq!(before.leader, after.leader);
+
+        // `inception` is the one field a fresh `Inner` would invent rather than
+        // recompute, so it is the one worth pinning.
+        assert_eq!(
+            persisted.inception,
+            storage
+                .read_group(GROUP_ID)
+                .await?
+                .map(|(detail, _)| detail.inception)
+                .expect("the group must still be persisted"),
+        );
 
         Ok(())
     }

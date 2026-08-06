@@ -280,7 +280,14 @@ prefix's `lease.json` epoch above `era_epoch` before restarting old pods.
   prefix across many pods, every flush eats a conflict. Consider keeping rendezvous
   as an *advisory* append-local-else-hint (no membership correctness required).
 - **`InitProducerId` herd** on `meta.json` under mass reconnect — same class the
-  design removes from produce; needs create-only/sharded id allocation.
+  design removes from produce; needs create-only/sharded id allocation. Now
+  measurable rather than argued: the maintenance tick reports
+  `tansu_meta_producers`, `tansu_meta_transactions` and `tansu_meta_bytes` (#283),
+  and `meta.json` is the payload every registration GETs and CAS-PUTs, so the
+  bytes gauge is the per-registration cost. The producer table has no prune of any
+  kind — sub-issue 5's producer-state expiry is what would give it one — and the
+  transaction table additionally needs a decision, since #81 retains aborted
+  transactions on purpose.
 
 ## References
 
