@@ -60,7 +60,10 @@
 //! local CAS behaviour, so every discovery failure mode degrades to the
 //! status quo rather than to an outage.
 
-use super::{Coordinator, OffsetCommit, administrator::Controller};
+use super::{
+    Coordinator, OffsetCommit,
+    administrator::{Controller, GROUP_STATE_IDLE_AFTER},
+};
 use crate::{Error, METER, Result};
 use async_trait::async_trait;
 use opentelemetry::{
@@ -92,7 +95,7 @@ use tansu_sans_io::{
 };
 use tansu_service::FrameBytesLayer;
 use tansu_storage::Storage;
-use tokio::task::JoinHandle;
+use tokio::{task::JoinHandle, time::Instant};
 use tracing::{debug, warn};
 use url::Url;
 
@@ -505,11 +508,19 @@ pub struct ForwardingCoordinator<C> {
     join_timeout_slack: Duration,
     call_timeout: Duration,
     /// Last rebalance window each group's members asked for, learned from the
-    /// `join` this replica forwarded (#190). `sync` has no such parameter in
-    /// its own signature, yet it is the request that carries the whole
-    /// assignment — so without this it was the biggest payload on the smallest
-    /// deadline.
-    rebalance_windows: Arc<Mutex<BTreeMap<String, Duration>>>,
+    /// `join` this replica forwarded (#190), paired with when it was last
+    /// touched. `sync` has no such parameter in its own signature, yet it is the
+    /// request that carries the whole assignment — so without this it was the
+    /// biggest payload on the smallest deadline.
+    ///
+    /// Keyed by a client-controlled group id with no removal path, this grew for
+    /// the life of the pod under a group-per-restart naming pattern; the stamp is
+    /// what [`Coordinator::prune`] evicts on (#283). Monotonic clock, for the same
+    /// reason [`Controller`]'s stamp is.
+    rebalance_windows: Arc<Mutex<BTreeMap<String, (Duration, Instant)>>>,
+    /// Idle window before [`Coordinator::prune`] drops a learned rebalance
+    /// window (#283).
+    idle_after: Duration,
     fallbacks: Arc<AtomicU64>,
 }
 
@@ -583,6 +594,7 @@ where
             join_timeout_slack: JOIN_TIMEOUT_SLACK,
             call_timeout: CALL_TIMEOUT,
             rebalance_windows: Arc::new(Mutex::new(BTreeMap::new())),
+            idle_after: GROUP_STATE_IDLE_AFTER,
             fallbacks: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -597,6 +609,12 @@ where
         }
     }
 
+    /// Override the idle window before [`Coordinator::prune`] drops a learned
+    /// rebalance window (#283). Tests set it to zero to sweep without waiting.
+    pub fn with_idle_after(self, idle_after: Duration) -> Self {
+        Self { idle_after, ..self }
+    }
+
     /// How many forwards have fallen back to local processing. Mirrors the
     /// `outcome="fallback"` counter for in-process observation.
     pub fn fallbacks(&self) -> u64 {
@@ -607,7 +625,7 @@ where
     /// (#190), so `sync` can spend it rather than a flat constant.
     fn note_rebalance_window(&self, group_id: &str, window: Duration) {
         if let Ok(mut windows) = self.rebalance_windows.lock() {
-            _ = windows.insert(group_id.to_owned(), window);
+            _ = windows.insert(group_id.to_owned(), (window, Instant::now()));
         }
     }
 
@@ -619,11 +637,20 @@ where
     /// longer than the flat 15s that applied before. Falls back to
     /// `call_timeout` for a group whose join this replica never saw, and never
     /// goes below it — this only ever lengthens the deadline.
+    ///
+    /// Refreshes the entry's idle stamp (#283): a group whose `sync` is still
+    /// being forwarded is in use, whether or not its `join` came through here
+    /// recently.
     fn sync_deadline(&self, group_id: &str) -> Duration {
         self.rebalance_windows
             .lock()
             .ok()
-            .and_then(|windows| windows.get(group_id).copied())
+            .and_then(|mut windows| {
+                windows.get_mut(group_id).map(|(window, seen)| {
+                    *seen = Instant::now();
+                    *window
+                })
+            })
             .map_or(self.call_timeout, |window| window.max(self.call_timeout))
     }
 
@@ -1056,6 +1083,25 @@ where
             .offset_fetch(group_id, topics, groups, require_stable)
             .await
     }
+
+    fn prune(&self) -> usize {
+        // Own idle stamp rather than asking the local controller which groups it
+        // still knows: this replica forwards a group's `join` without ever
+        // serving it locally, so the two maps are populated by different events
+        // and one cannot stand in for the other.
+        //
+        // Nothing here needs the in-flight guard [`Controller::prune`] applies to
+        // its lock map. This is a memo, not a mutex: losing an entry mid-`sync`
+        // costs that call the flat `call_timeout` instead of the window learned
+        // from `join`, and the next forwarded `join` relearns it (#190).
+        let now = Instant::now();
+
+        if let Ok(mut windows) = self.rebalance_windows.lock() {
+            windows.retain(|_, (_, seen)| now.duration_since(*seen) < self.idle_after);
+        }
+
+        self.local.prune()
+    }
 }
 
 /// The group coordinator the broker is built with: pure-local (today's
@@ -1248,6 +1294,13 @@ where
                     .offset_fetch(group_id, topics, groups, require_stable)
                     .await
             }
+        }
+    }
+
+    fn prune(&self) -> usize {
+        match self {
+            Self::Local(controller) => controller.prune(),
+            Self::Forwarding(forwarding) => forwarding.prune(),
         }
     }
 }
@@ -2111,6 +2164,60 @@ mod tests {
                 coordinator.sync_deadline(group_id.as_str()) > CALL_TIMEOUT,
                 "which is longer than the flat deadline that timed out in #190",
             );
+
+            Ok(())
+        }
+
+        /// #283: the learned-window map is keyed by a client-controlled group id
+        /// and had no removal path, so it grew for the life of the pod under a
+        /// group-per-restart naming pattern. The sweep must clear an idle entry
+        /// and keep a live one — losing a live one costs that group's next `sync`
+        /// the flat deadline #190 exists to avoid.
+        #[tokio::test]
+        async fn idle_rebalance_windows_are_pruned() -> Result<()> {
+            let storage = storage_container().await?;
+            let stub = StubForward::new(StubBehaviour::Fail);
+
+            let owner_ip = peer(2);
+            let registry = registry_owning_nothing(peer(1), owner_ip);
+            let group_id = (0u32..)
+                .map(|i| format!("pruned-window-{i}"))
+                .find(|group_id| registry.owner(group_id) == owner_ip)
+                .expect("a peer-owned group exists");
+
+            let held = ForwardingCoordinator::with_forward(
+                Controller::with_storage(storage.clone())?,
+                registry.clone(),
+                stub.clone(),
+            )
+            .with_idle_after(Duration::from_secs(3_600));
+
+            _ = join_as_leader(&held, group_id.as_str())
+                .await
+                .expect_err("an unreachable owner refuses a join");
+
+            assert_eq!(1, held.rebalance_windows.lock().unwrap().len());
+            _ = held.prune();
+            assert_eq!(
+                1,
+                held.rebalance_windows.lock().unwrap().len(),
+                "a window learned within the idle span must survive",
+            );
+
+            let idle = ForwardingCoordinator::with_forward(
+                Controller::with_storage(storage)?,
+                registry,
+                stub,
+            )
+            .with_idle_after(Duration::ZERO);
+
+            _ = join_as_leader(&idle, group_id.as_str())
+                .await
+                .expect_err("an unreachable owner refuses a join");
+
+            assert_eq!(1, idle.rebalance_windows.lock().unwrap().len());
+            _ = idle.prune();
+            assert!(idle.rebalance_windows.lock().unwrap().is_empty());
 
             Ok(())
         }

@@ -423,6 +423,22 @@ where
                 }
 
                 _ = interval.tick() => {
+                    // Evict the coordinator's per-group state for groups this
+                    // replica has stopped serving (#283). Outside the in-flight
+                    // guard and outside the spawn: it walks in-memory maps and
+                    // issues no request, so it must not be skipped just because
+                    // a storage pass is still draining — that is precisely the
+                    // loaded pod whose memory this bounds.
+                    //
+                    // `groups` alone covers `internal_groups` too: both are built
+                    // from one `Controller` whose clone shares the maps, and the
+                    // internal coordinator is always the plain local one, so it
+                    // holds nothing of its own to sweep.
+                    let evicted = self.groups.prune();
+                    if evicted > 0 {
+                        debug!(evicted, "pruned idle coordinator group state");
+                    }
+
                     // Skip this tick if the previous maintenance run is still in
                     // flight, rather than spawning a second concurrent run (#8).
                     if maintenance_in_flight

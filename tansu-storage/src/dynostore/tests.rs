@@ -29,6 +29,7 @@ mod group_describe;
 mod group_expiry;
 mod idempotent;
 mod latency;
+mod meta_growth;
 mod metadata_visibility;
 mod offset_assignment;
 mod offset_commit;
@@ -37,6 +38,7 @@ mod reachable_panics;
 mod scaling;
 mod segment;
 mod segment_create;
+mod topic_churn;
 
 pub(crate) fn init_tracing() -> Result<DefaultGuard, Error> {
     _ = dotenv().ok();
