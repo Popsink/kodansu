@@ -306,6 +306,163 @@ where
     decision
 }
 
+/// Warn when the leader's assignment hands one partition to more than one
+/// member — two consumers reading the same partition, which the group protocol
+/// is supposed to make impossible.
+///
+/// Diagnostic only: the assignment is the leader's to make, so this reports
+/// rather than rejects. Lifted out of the `sync` loop because it inspects the
+/// request the caller sent, which does not change between iterations.
+fn warn_on_overlapping_assignments(
+    group_id: &str,
+    generation_id: i32,
+    assignments: Option<&[SyncGroupRequestAssignment]>,
+) {
+    let Some(assignments) = assignments else {
+        return;
+    };
+
+    if assignments.is_empty() {
+        return;
+    }
+
+    if has_unique_elements(
+        assignments
+            .iter()
+            .map(|assignment| assignment.assignment.clone())
+            .filter_map(|assignment| MemberAssignment::try_from(assignment).ok())
+            .map(|ma| ma.assignment)
+            .map(|cpa| cpa.assigned_partitions)
+            .flat_map(|tp| tp.into_iter())
+            .map(|tp| (tp.topic, tp.partitions))
+            .flat_map(|(topic, partitions)| {
+                partitions
+                    .into_iter()
+                    .map(move |partition| (topic.clone(), partition))
+            }),
+    ) {
+        return;
+    }
+
+    warn!(
+        group_id,
+        generation_id,
+        member_count = assignments.len(),
+        non_unique_assignment = assignments
+            .iter()
+            .map(|assignment| (assignment.member_id.clone(), assignment.assignment.clone()))
+            .filter_map(|(member_id, assignment)| {
+                MemberAssignment::try_from(assignment)
+                    .ok()
+                    .map(|ma| (member_id, ma))
+            })
+            .map(|(member, ma)| format!("{member}: {ma}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+}
+
+/// The `COORDINATOR_REQUESTS` labels one API's CAS loop emits, so the shared
+/// driver can count per-API without building a string per iteration — every
+/// member heartbeats every few seconds, so this is a hot path.
+#[derive(Clone, Copy, Debug)]
+struct CasLabels {
+    /// One per loop iteration.
+    iteration: &'static str,
+
+    /// The no-op skip fired: the group object was left alone.
+    noop_skip: &'static str,
+
+    /// The CAS lost to a concurrent writer.
+    outdated: &'static str,
+}
+
+/// The per-API half of [`Controller::run_group_cas_loop`].
+///
+/// The driver owns everything the five group-mutating APIs do identically — the
+/// group lock, the `wrappers` cache, the GET-first reconcile, the CAS and its
+/// five-arm `UpdateError` match, the conflict backoff — and an implementation
+/// supplies only what genuinely differs.
+///
+/// That split is the whole point (#286). The sequence was written out five
+/// times, so #111 and #256 each had to be applied five times, and #273 was the
+/// heartbeat copy of a skip that join and sync had already moved on from: a
+/// `GroupDetail` equality that could never hold, so the skip fired only on
+/// errors and every member wrote a CAS per interval. With one definition a fix
+/// reaches all five by construction, and what an API does differently is
+/// stated in its implementation rather than buried in a pasted branch.
+///
+/// An implementation is built once per request and owns that request's
+/// arguments and its across-iteration state, which is why the hooks take
+/// `&mut self` and the driver holds none of it.
+trait GroupCas<O>: Send
+where
+    O: Storage + Clone,
+{
+    const LABELS: CasLabels;
+
+    /// Read `{group}.json` before evaluating the request (#111), so a change
+    /// made on another replica is observed by a cheap read rather than learnt
+    /// from a failed CAS. It is also what arms [`Self::skip`]: with no persisted
+    /// object there is nothing to be equal to, so the create must go through.
+    ///
+    /// `leave` opts out. It is terminal — nothing to long-poll, no skip to arm —
+    /// so the read would buy nothing the CAS does not already provide.
+    const GET_FIRST: bool = true;
+
+    /// Sleep between CAS conflicts. Only the long-polling APIs do: join and sync
+    /// have every member of a group converging on one object, so an
+    /// un-backed-off retry storm is real. The others answer in a single pass and
+    /// retry immediately.
+    const BACKOFF_ON_CONFLICT: bool = false;
+
+    /// The `Wrapper` to start from when the in-process cache misses.
+    fn seed(&self, storage: O) -> Wrapper<O> {
+        Wrapper::Forming(Inner::new(storage))
+    }
+
+    /// Everything between the reconcile and the CAS: `missed_heartbeat` where
+    /// the API wants it, then the delegation to `Wrapper`.
+    fn apply(
+        &mut self,
+        group_id: &str,
+        now: SystemTime,
+        wrapper: Wrapper<O>,
+    ) -> impl Future<Output = (Wrapper<O>, Body)> + Send;
+
+    /// Report a group that has stopped making progress (#240), from the state
+    /// this iteration read (`before`) or produced (`after`), per API.
+    fn observe(
+        &self,
+        _controller: &Controller<O>,
+        _group_id: &str,
+        _before: &GroupDetail,
+        _after: &GroupDetail,
+        _now: SystemTime,
+    ) {
+    }
+
+    /// Whether this iteration changed nothing worth a PUT (#111). Consulted only
+    /// when the group object was actually read, so an API with
+    /// [`Self::GET_FIRST`] off can never skip.
+    fn skip(&self, _before: &GroupDetail, _after: &GroupDetail, _now: SystemTime) -> bool {
+        false
+    }
+
+    /// What to do now that this iteration's state is settled — whether it was
+    /// settled by the skip or by a landed CAS. The non-polling APIs answer
+    /// immediately; join and sync defer to their long-poll decision.
+    fn settled(
+        &mut self,
+        _updated: &Wrapper<O>,
+        _body: &Body,
+        _after: &GroupDetail,
+        _now: SystemTime,
+    ) -> LongPoll {
+        LongPoll::Respond(None)
+    }
+}
+
 static COORDINATOR_REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_group_coordinator_requests")
@@ -1352,6 +1509,175 @@ where
 
         evicted
     }
+
+    /// Put a group's wrapper back in the in-process cache.
+    ///
+    /// A poisoned mutex propagates rather than being swallowed: the cache is not
+    /// authority — every path re-reads `{group}.json` GET-first — but a poisoned
+    /// lock means another task panicked mid-update, and answering as if nothing
+    /// happened is how that becomes someone else's mystery.
+    fn cache(&self, group_id: &str, wrapper: Wrapper<O>, version: Option<Version>) -> Result<()> {
+        self.wrappers.lock().map(|mut wrappers| {
+            _ = wrappers.insert(group_id.to_owned(), (wrapper, version));
+        })?;
+
+        Ok(())
+    }
+
+    /// The read-modify-CAS loop shared by `join`, `sync`, `leave`,
+    /// `offset_commit` and `heartbeat` (#286). See [`GroupCas`] for the split
+    /// between what lives here and what an API supplies.
+    ///
+    /// One iteration: take the group lock, check the wrapper out of the cache,
+    /// reconcile it against the persisted object, delegate to the API, then
+    /// either skip the write or CAS it. A conflict re-seeds the cache from the
+    /// state that won and iterates; a long-poll decision sleeps and iterates.
+    async fn run_group_cas_loop<C>(&self, group_id: &str, mut op: C) -> Result<Body>
+    where
+        C: GroupCas<O>,
+    {
+        let mut iteration = 0;
+        let mut cas_conflicts = 0u32;
+
+        // Cloned once for the whole call rather than per iteration, which
+        // [`Self::prune`] depends on: it reads `Arc::strong_count` to decide a
+        // group is not being served, so a request that sleeps between iterations
+        // must keep a clone alive across the sleep or the sweep can drop the lock
+        // out from under it and let a second one be created.
+        let group_lock = self.group_lock(group_id);
+
+        loop {
+            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", C::LABELS.iteration)]);
+
+            // Serialize this group's read->CAS window against other in-process
+            // members (see `GroupLocks`). Released below before any sleep, so a
+            // held leader does not block the members it is waiting for.
+            let permit = group_lock.clone().lock_owned().await;
+
+            let now = SystemTime::now();
+
+            let (mut wrapper, mut version) = self
+                .wrappers
+                .lock()
+                .map(|mut wrappers| wrappers.remove(group_id))?
+                .unwrap_or_else(|| {
+                    debug!(?iteration, ?group_id, "group cache miss");
+                    (op.seed(self.storage.clone()), None)
+                });
+
+            // GET-first (#111): see [`GroupCas::GET_FIRST`].
+            let persisted = if C::GET_FIRST {
+                let persisted = self.storage.read_group(group_id).await?;
+
+                if let Some((current, current_version)) = &persisted
+                    && version.as_ref() != Some(current_version)
+                {
+                    wrapper =
+                        Wrapper::with_storage_group_detail(self.storage.clone(), current.clone());
+                    version = Some(current_version.clone());
+                }
+
+                persisted.is_some()
+            } else {
+                false
+            };
+
+            // The persisted projection we are about to (maybe) rewrite.
+            let before = GroupDetail::from(&wrapper);
+
+            debug!(?group_id, %wrapper, ?version, ?iteration);
+
+            let (updated, body) = op.apply(group_id, now, wrapper).await;
+
+            let after = GroupDetail::from(&updated);
+
+            op.observe(self, group_id, &before, &after, now);
+
+            debug!(?group_id, %updated, ?version, ?iteration);
+
+            // Decided once and used by both arms below. The two used to be
+            // separate copies of the same decision, differing only in which of
+            // them had done the writing (#286).
+            let decision = op.settled(&updated, &body, &after, now);
+
+            if persisted && op.skip(&before, &after, now) {
+                COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", C::LABELS.noop_skip)]);
+
+                self.cache(group_id, updated, version)?;
+            } else {
+                match self.storage.update_group(group_id, after, version).await {
+                    Ok(version) => {
+                        debug!(?group_id, ?version, iteration, ?decision);
+
+                        self.cache(group_id, updated, Some(version))?;
+                    }
+
+                    Err(UpdateError::Outdated { current, version }) => {
+                        debug!(?group_id, ?current, ?version, iteration);
+                        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", C::LABELS.outdated)]);
+
+                        self.cache(
+                            group_id,
+                            Wrapper::with_storage_group_detail(self.storage.clone(), *current),
+                            Some(version),
+                        )?;
+
+                        // Release before the backoff sleep. An in-process
+                        // conflict is now rare (members serialize on the group
+                        // lock); this path mainly catches cross-replica writes.
+                        drop(permit);
+
+                        cas_conflicts += 1;
+
+                        if C::BACKOFF_ON_CONFLICT {
+                            if cas_conflicts == CAS_CONFLICT_WARN {
+                                warn!(
+                                    group_id,
+                                    cas_conflicts,
+                                    method = C::LABELS.iteration,
+                                    "repeated group-state CAS conflicts (concurrent members across replicas?)"
+                                );
+                            }
+
+                            sleep(cas_conflict_backoff(cas_conflicts)).await;
+                        }
+
+                        iteration += 1;
+                        continue;
+                    }
+
+                    Err(UpdateError::Error(error)) => return Err(error.into()),
+
+                    Err(UpdateError::SerdeJson(error)) => return Err(error.into()),
+
+                    Err(UpdateError::MissingEtag) => {
+                        return Err(Error::Message(String::from("missing e-tag")));
+                    }
+
+                    Err(UpdateError::Uuid(uuid)) => {
+                        return Err(Error::Message(format!("uuid: {uuid}")));
+                    }
+                }
+            }
+
+            // The read->CAS window is closed either way; release before any
+            // long-poll sleep.
+            drop(permit);
+
+            match decision {
+                LongPoll::Respond(None) => return Ok(body),
+
+                LongPoll::Respond(Some(error_code)) => return Ok(set_error_code(body, error_code)),
+
+                LongPoll::Wait(pause, method) => {
+                    COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", method)]);
+                    sleep(pause).await;
+
+                    iteration += 1;
+                }
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -1404,298 +1730,35 @@ where
 
         COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join")]);
 
-        let started_at = SystemTime::now();
+        self.run_group_cas_loop(
+            group_id,
+            JoinCas {
+                client_id,
+                session_timeout_ms,
+                rebalance_timeout_ms,
+                member_id,
+                group_instance_id,
+                protocol_type,
+                protocols,
+                reason,
 
-        // How long this call has been long-polling, on the MONOTONIC clock
-        // (#256). Deliberately not derived from `started_at`: `SystemTime` is
-        // the wall clock, so a backwards NTP step makes `elapsed()` return
-        // `Err` — which `?` turned into an error response for a member that was
-        // merely waiting — and it cannot be paused, so a test could only buy
-        // determinism by waiting out the real duration. `SystemTime` stays for
-        // everything that is persisted or compared against stored timestamps
-        // (`last_contact`, `inception`, the join-window barrier below).
-        let polling_since = Instant::now();
+                // How long this call has been long-polling, on the MONOTONIC
+                // clock (#256). Deliberately not the wall clock: `SystemTime`
+                // makes `elapsed()` return `Err` after a backwards NTP step —
+                // which `?` turned into an error response for a member that was
+                // merely waiting — and it cannot be paused, so a test could only
+                // buy determinism by waiting out the real duration. `SystemTime`
+                // stays for everything persisted or compared against a stored
+                // timestamp (`last_contact`, `inception`, and the join-window
+                // barrier below).
+                polling_since: Instant::now(),
 
-        let mut iteration = 0;
-        let mut cas_conflicts = 0u32;
-
-        // Join-window barrier state (see `JOIN_QUIESCENCE`): the member set
-        // last observed by this join call, and when it last changed. Inferred
-        // purely from the per-iteration GET-first reads below — no on-disk
-        // format change.
-        let mut join_window_members: Option<BTreeSet<String>> = None;
-        let mut join_window_changed_at = started_at;
-
-        // Serialize this group's read->CAS window against other in-process
-        // members (see `GroupLocks`). Dropped before every long-poll sleep so
-        // the held leader does not block the members it is waiting for.
-        let group_lock = self.group_lock(group_id);
-
-        loop {
-            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_loop")]);
-
-            let permit = group_lock.clone().lock_owned().await;
-
-            let now = SystemTime::now();
-
-            let (mut original, mut version) = self.wrappers.lock().map(|mut wrappers| {
-                wrappers.remove(group_id).unwrap_or_else(|| {
-                    debug!(?iteration, ?group_id);
-
-                    let inner = Inner {
-                        session_timeout_ms,
-                        rebalance_timeout_ms,
-                        members: Default::default(),
-                        generation_id: -1,
-                        state: Forming::default(),
-                        skip_assignment: Some(false),
-                        storage: self.storage.clone(),
-                        inception: SystemTime::now(),
-                    };
-
-                    (Wrapper::Forming(inner), None)
-                })
-            })?;
-
-            // GET-first (#111 pattern, extended to join): observe a rebalance
-            // started on another replica via a cheap read rather than learning it
-            // only from a failed CAS, and evaluate this join against current
-            // persisted state. `before` is that state — what an unconditional
-            // loop iteration would otherwise rewrite with only a `last_contact`
-            // bump. `persisted.is_some()` gates the no-op skip below: without a
-            // persisted object there is nothing to be equal to, so the create
-            // must go through.
-            let persisted = self.storage.read_group(group_id).await?;
-            if let Some((current, current_version)) = &persisted
-                && version.as_ref() != Some(current_version)
-            {
-                original =
-                    Wrapper::with_storage_group_detail(self.storage.clone(), current.clone());
-                version = Some(current_version.clone());
-            }
-
-            let before = GroupDetail::from(&original);
-
-            // Observed here as well as on the heartbeat path (#240).
-            //
-            // Heartbeat alone is blind to the failure this detector exists for.
-            // `AbstractCoordinator$HeartbeatThread` disables itself while the
-            // consumer has not joined — `if (state.hasNotJoinedGroup() ||
-            // isFailed()) { disable(); }` — so a group whose members are stuck
-            // *trying* to join sends no heartbeat at all, and was sampled
-            // nowhere. Measured: a group 90+ minutes in `CompletingRebalance`
-            // with 16 members, all 16 heartbeat threads parked in `wait()`, and
-            // not one line about it across ten broker replicas over two hours.
-            //
-            // Join and sync keep arriving from exactly that consumer — every
-            // `poll()` retries the join — so they are a live sampling source
-            // precisely when heartbeats are not. `before` is the group as read
-            // this iteration, which is the state being waited on.
-            _ = self.observe_rebalance(group_id, &before, now);
-
-            if group_instance_id.is_none() {
-                original = original.missed_heartbeat(group_id, member_id, now);
-            }
-
-            debug!(%original, ?version, ?iteration);
-
-            let original_members = original.members();
-
-            let (updated, body) = original
-                .join(
-                    now,
-                    client_id,
-                    group_id,
-                    session_timeout_ms,
-                    rebalance_timeout_ms,
-                    member_id,
-                    group_instance_id,
-                    protocol_type,
-                    protocols,
-                    reason,
-                )
-                .await;
-
-            let is_stable = original_members == updated.members();
-
-            debug!(%updated, ?version, iteration);
-
-            let after = GroupDetail::from(&updated);
-
-            // Join-window barrier: without it the leader returned as soon as
-            // its own CAS landed, computed assignments for whatever partial
-            // member list it had seen, and every member missing from that list
-            // parked at "stable" with zero partitions — a multi-member group
-            // never converged. Hold the leader (below) until the membership is
-            // quiescent or the rebalance window closes.
-            let members_now = after.members.keys().cloned().collect::<BTreeSet<_>>();
-            if join_window_members.as_ref() != Some(&members_now) {
-                join_window_members = Some(members_now);
-                join_window_changed_at = now;
-            }
-            let membership_quiescent = now
-                .duration_since(join_window_changed_at)
-                .unwrap_or_default()
-                >= JOIN_QUIESCENCE;
-
-            // The rebalance window: `rebalance_timeout_ms` bounds how long the
-            // leader may be held (the Java client allows JoinGroup responses up
-            // to `rebalance_timeout + 5s`), falling back to the session timeout
-            // when unset, as Kafka does for old protocol versions.
-            let join_window_ms = u128::try_from(
-                after
-                    .rebalance_timeout_ms
-                    .or(rebalance_timeout_ms)
-                    .unwrap_or(after.session_timeout_ms),
-            )
-            .unwrap_or_default();
-
-            let is_forming = updated.is_forming();
-
-            // No-op long-poll skip: a member waiting through a rebalance re-joins
-            // once a second, and each re-join changes only its own `last_contact`
-            // (via `missed_heartbeat`). Persisting that is a CAS that churns the
-            // `{group}.json` etag for nothing and, at scale, starves the leader's
-            // assignment write so the group never stabilises. When the rebalance
-            // state is otherwise unchanged and this member's liveness does not yet
-            // need renewing, return without touching the object — keeping the etag
-            // still long enough for the assignment CAS to land.
-            if persisted.is_some()
-                && same_rebalance_state(&before, &after)
-                && !liveness_renewal_due(&before, member_id, now, before.session_timeout_ms)
-            {
-                COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_noop_skip")]);
-
-                let elapsed_ms = polling_since.elapsed().as_millis();
-
-                let decision = join_long_poll(
-                    &updated,
-                    &body,
-                    group_instance_id,
-                    elapsed_ms,
-                    is_forming,
-                    membership_quiescent,
-                    join_window_ms,
-                );
-
-                _ = self
-                    .wrappers
-                    .lock()
-                    .map(|mut wrappers| wrappers.insert(group_id.to_owned(), (updated, version)))?;
-
-                // No storage write happened (no-op skip); the read->CAS window
-                // is closed, so release before any long-poll / join-window
-                // sleep — a held leader must not block the members it awaits.
-                drop(permit);
-
-                match decision {
-                    LongPoll::Wait(pause, method) => {
-                        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", method)]);
-                        sleep(pause).await;
-
-                        iteration += 1;
-                        continue;
-                    }
-
-                    LongPoll::Respond(None) => return Ok(body),
-
-                    LongPoll::Respond(Some(error_code)) => {
-                        return Ok(set_error_code(body, error_code));
-                    }
-                }
-            }
-
-            match self.storage.update_group(group_id, after, version).await {
-                Ok(version) => {
-                    let elapsed_ms = polling_since.elapsed().as_millis();
-
-                    let decision = join_long_poll(
-                        &updated,
-                        &body,
-                        group_instance_id,
-                        elapsed_ms,
-                        is_forming,
-                        membership_quiescent,
-                        join_window_ms,
-                    );
-
-                    debug!(?version, iteration, ?decision, is_stable);
-
-                    _ = self.wrappers.lock().map(|mut wrappers| {
-                        wrappers.insert(group_id.to_owned(), (updated, Some(version)))
-                    })?;
-
-                    // CAS landed; the read->CAS window is closed. Release before
-                    // any long-poll / join-window sleep (see the no-op branch).
-                    drop(permit);
-
-                    match decision {
-                        LongPoll::Wait(pause, method) => {
-                            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", method)]);
-                            sleep(pause).await;
-
-                            iteration += 1;
-                            continue;
-                        }
-
-                        LongPoll::Respond(None) => return Ok(body),
-
-                        LongPoll::Respond(Some(error_code)) => {
-                            return Ok(set_error_code(body, error_code));
-                        }
-                    }
-                }
-
-                Err(UpdateError::Outdated { current, version }) => {
-                    debug!(?current, ?version, iteration);
-
-                    COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_outdated")]);
-
-                    _ = self.wrappers.lock().map(|mut wrappers| {
-                        wrappers.insert(
-                            group_id.to_owned(),
-                            (
-                                Wrapper::with_storage_group_detail(self.storage.clone(), *current),
-                                Some(version),
-                            ),
-                        )
-                    });
-
-                    // Release before the CAS-conflict backoff sleep. An
-                    // in-process conflict is now rare (members serialize on the
-                    // group lock); this path mainly catches cross-replica writes
-                    // from a fallback on another owner.
-                    drop(permit);
-
-                    cas_conflicts += 1;
-                    if cas_conflicts == CAS_CONFLICT_WARN {
-                        warn!(
-                            group_id,
-                            cas_conflicts,
-                            "join: repeated group-state CAS conflicts (concurrent members across replicas?)"
-                        );
-                    }
-                    sleep(cas_conflict_backoff(cas_conflicts)).await;
-
-                    iteration += 1;
-                    continue;
-                }
-
-                Err(UpdateError::Error(error)) => return Err(error.into()),
-
-                Err(UpdateError::SerdeJson(error)) => return Err(error.into()),
-
-                Err(UpdateError::MissingEtag) => {
-                    return Err(Error::Message(String::from("missing e-tag")));
-                }
-
-                Err(UpdateError::Uuid(uuid)) => {
-                    return Err(Error::Message(format!("uuid: {uuid}")));
-                }
-            }
-        }
+                window_members: None,
+                window_changed_at: SystemTime::now(),
+            },
+        )
+        .await
     }
-
     #[instrument(skip(self, group_instance_id, protocol_type, protocol_name, assignments))]
     async fn sync(
         &self,
@@ -1729,244 +1792,28 @@ where
 
         COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sync")]);
 
-        // Monotonic, for the same reasons as `join`'s (#256). Nothing here is
-        // compared against a stored timestamp, so this call needs no wall clock
-        // at all.
-        let polling_since = Instant::now();
-        let mut iteration = 0;
-        let mut cas_conflicts = 0u32;
+        // Once per request, not once per iteration: this inspects the
+        // assignments the caller sent, which do not change between retries.
+        warn_on_overlapping_assignments(group_id, generation_id, assignments);
 
-        // Serialize this group's read->CAS window against other in-process
-        // members (see `GroupLocks`). Dropped before every long-poll sleep.
-        let group_lock = self.group_lock(group_id);
-
-        if let Some(assignments) = assignments
-            && !assignments.is_empty()
-            && !has_unique_elements(
-                assignments
-                    .iter()
-                    .map(|assignment| assignment.assignment.clone())
-                    .filter_map(|assignment| MemberAssignment::try_from(assignment).ok())
-                    .map(|ma| ma.assignment)
-                    .map(|cpa| cpa.assigned_partitions)
-                    .flat_map(|tp| tp.into_iter())
-                    .map(|tp| (tp.topic, tp.partitions))
-                    .flat_map(|(topic, partitions)| {
-                        partitions
-                            .into_iter()
-                            .map(move |partition| (topic.clone(), partition))
-                    }),
-            )
-        {
-            warn!(
-                group_id,
+        self.run_group_cas_loop(
+            group_id,
+            SyncCas {
                 generation_id,
-                member_count = assignments.len(),
-                non_unique_assignment = assignments
-                    .iter()
-                    .map(|assignment| (assignment.member_id.clone(), assignment.assignment.clone()))
-                    .filter_map(|(member_id, assignment)| {
-                        MemberAssignment::try_from(assignment)
-                            .ok()
-                            .map(|ma| (member_id, ma))
-                    })
-                    .map(|(member, ma)| format!("{member}: {ma}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
+                member_id,
+                group_instance_id,
+                protocol_type,
+                protocol_name,
+                assignments,
 
-        loop {
-            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sync_loop")]);
-
-            let permit = group_lock.clone().lock_owned().await;
-
-            let now = SystemTime::now();
-
-            let (mut original, mut version) = self.wrappers.lock().map(|mut wrappers| {
-                wrappers
-                    .remove(group_id)
-                    .unwrap_or_else(|| (Wrapper::Forming(Inner::new(self.storage.clone())), None))
-            })?;
-
-            // GET-first (#111 pattern, extended to sync): see the join loop — a
-            // waiting non-leader sync re-polls once a second and each poll bumps
-            // only `last_contact`, so persisting it churns the etag and starves
-            // the leader's assignment CAS. Read current state, then skip the PUT
-            // below when nothing but `last_contact` would change.
-            let persisted = self.storage.read_group(group_id).await?;
-            if let Some((current, current_version)) = &persisted
-                && version.as_ref() != Some(current_version)
-            {
-                original =
-                    Wrapper::with_storage_group_detail(self.storage.clone(), current.clone());
-                version = Some(current_version.clone());
-            }
-
-            let before = GroupDetail::from(&original);
-
-            // Observed here as well as on the heartbeat path (#240).
-            //
-            // Heartbeat alone is blind to the failure this detector exists for.
-            // `AbstractCoordinator$HeartbeatThread` disables itself while the
-            // consumer has not joined — `if (state.hasNotJoinedGroup() ||
-            // isFailed()) { disable(); }` — so a group whose members are stuck
-            // *trying* to join sends no heartbeat at all, and was sampled
-            // nowhere. Measured: a group 90+ minutes in `CompletingRebalance`
-            // with 16 members, all 16 heartbeat threads parked in `wait()`, and
-            // not one line about it across ten broker replicas over two hours.
-            //
-            // Join and sync keep arriving from exactly that consumer — every
-            // `poll()` retries the join — so they are a live sampling source
-            // precisely when heartbeats are not. `before` is the group as read
-            // this iteration, which is the state being waited on.
-            _ = self.observe_rebalance(group_id, &before, now);
-
-            let original_members = original.members();
-
-            debug!(?group_id, ?original, ?version, ?iteration);
-
-            if group_instance_id.is_none() {
-                original = original.missed_heartbeat(group_id, member_id, now);
-            }
-
-            let (updated, body) = original
-                .sync(
-                    now,
-                    group_id,
-                    generation_id,
-                    member_id,
-                    group_instance_id,
-                    protocol_type,
-                    protocol_name,
-                    assignments,
-                )
-                .await;
-
-            let is_stable = original_members == updated.members();
-
-            debug!(group_id, %updated, ?version, iteration);
-
-            let after = GroupDetail::from(&updated);
-
-            // No-op long-poll skip (see the join loop for the full rationale): a
-            // waiting sync that changes only `last_contact` must not rewrite the
-            // group object. The leader's real Forming->Formed assignment sync
-            // changes `state` + `assignments`, so `same_rebalance_state` is false
-            // for it and it always takes the write path below.
-            if persisted.is_some()
-                && same_rebalance_state(&before, &after)
-                && !liveness_renewal_due(&before, member_id, now, before.session_timeout_ms)
-            {
-                COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sync_noop_skip")]);
-
-                let elapsed_ms = polling_since.elapsed().as_millis();
-
-                let decision = sync_long_poll(&updated, &body, group_instance_id, elapsed_ms);
-
-                _ = self
-                    .wrappers
-                    .lock()
-                    .map(|mut wrappers| wrappers.insert(group_id.to_owned(), (updated, version)))?;
-
-                // No-op skip: no write happened; release before the long poll.
-                drop(permit);
-
-                match decision {
-                    LongPoll::Wait(pause, method) => {
-                        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", method)]);
-                        sleep(pause).await;
-
-                        iteration += 1;
-                        continue;
-                    }
-
-                    LongPoll::Respond(None) => return Ok(body),
-
-                    LongPoll::Respond(Some(error_code)) => {
-                        return Ok(set_error_code(body, error_code));
-                    }
-                }
-            }
-
-            match self.storage.update_group(group_id, after, version).await {
-                Ok(version) => {
-                    let elapsed_ms = polling_since.elapsed().as_millis();
-
-                    let decision = sync_long_poll(&updated, &body, group_instance_id, elapsed_ms);
-
-                    debug!(group_id, ?version, iteration, ?decision, is_stable);
-
-                    _ = self.wrappers.lock().map(|mut wrappers| {
-                        wrappers.insert(group_id.to_owned(), (updated, Some(version)))
-                    })?;
-
-                    // CAS landed; release before any long-poll sleep.
-                    drop(permit);
-
-                    match decision {
-                        LongPoll::Wait(pause, method) => {
-                            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", method)]);
-                            sleep(pause).await;
-
-                            iteration += 1;
-                            continue;
-                        }
-
-                        LongPoll::Respond(None) => return Ok(body),
-
-                        LongPoll::Respond(Some(error_code)) => {
-                            return Ok(set_error_code(body, error_code));
-                        }
-                    }
-                }
-
-                Err(UpdateError::Outdated { current, version }) => {
-                    debug!(?group_id, ?current, ?version);
-                    COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sync_outdated")]);
-
-                    _ = self.wrappers.lock().map(|mut wrappers| {
-                        wrappers.insert(
-                            group_id.to_owned(),
-                            (
-                                Wrapper::with_storage_group_detail(self.storage.clone(), *current),
-                                Some(version),
-                            ),
-                        )
-                    })?;
-
-                    // Release before the CAS-conflict backoff sleep.
-                    drop(permit);
-
-                    cas_conflicts += 1;
-                    if cas_conflicts == CAS_CONFLICT_WARN {
-                        warn!(
-                            group_id,
-                            cas_conflicts,
-                            "sync: repeated group-state CAS conflicts (concurrent members across replicas?)"
-                        );
-                    }
-                    sleep(cas_conflict_backoff(cas_conflicts)).await;
-
-                    iteration += 1;
-                    continue;
-                }
-
-                Err(UpdateError::Error(error)) => return Err(error.into()),
-
-                Err(UpdateError::SerdeJson(error)) => return Err(error.into()),
-
-                Err(UpdateError::MissingEtag) => {
-                    return Err(Error::Message(String::from("missing e-tag")));
-                }
-
-                Err(UpdateError::Uuid(uuid)) => {
-                    return Err(Error::Message(format!("uuid: {uuid}")));
-                }
-            }
-        }
+                // Monotonic, for the same reasons as `join`'s (#256). Nothing
+                // here is compared against a stored timestamp, so this call
+                // needs no wall clock at all.
+                polling_since: Instant::now(),
+            },
+        )
+        .await
     }
-
     #[instrument(skip(self, members))]
     async fn leave(
         &self,
@@ -1978,177 +1825,18 @@ where
 
         COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "leave")]);
 
-        let mut iteration = 0;
-
-        loop {
-            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "leave_loop")]);
-
-            // Serialize this group's read->CAS window (see `GroupLocks`); no
-            // long-poll sleep here, so held for the whole iteration.
-            let _permit = self.group_lock(group_id).lock_owned().await;
-
-            let (wrapper, version) = self.wrappers.lock().map(|mut wrappers| {
-                wrappers
-                    .remove(group_id)
-                    .unwrap_or_else(|| (Wrapper::Forming(Inner::new(self.storage.clone())), None))
-            })?;
-
-            debug!(?group_id, ?wrapper, ?version, ?iteration);
-
-            let now = SystemTime::now();
-            let wrapper = wrapper.missed_heartbeat(group_id, member_id.unwrap_or_default(), now);
-
-            let (wrapper, body) = wrapper.leave(now, group_id, member_id, members).await;
-            debug!(group_id, ?wrapper, ?version, iteration,);
-
-            match self
-                .storage
-                .update_group(group_id, GroupDetail::from(&wrapper), version)
-                .await
-            {
-                Ok(version) => {
-                    debug!(?group_id, ?version);
-
-                    _ = self.wrappers.lock().map(|mut wrappers| {
-                        wrappers.insert(group_id.to_owned(), (wrapper, Some(version)))
-                    })?;
-
-                    return Ok(body);
-                }
-
-                Err(UpdateError::Outdated { current, version }) => {
-                    debug!(?group_id, ?current, ?version);
-                    COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "leave_outdated")]);
-
-                    _ = self.wrappers.lock().map(|mut wrappers| {
-                        wrappers.insert(
-                            group_id.to_owned(),
-                            (
-                                Wrapper::with_storage_group_detail(self.storage.clone(), *current),
-                                Some(version),
-                            ),
-                        )
-                    })?;
-
-                    iteration += 1;
-                    continue;
-                }
-
-                Err(UpdateError::Error(error)) => return Err(error.into()),
-
-                Err(UpdateError::SerdeJson(error)) => return Err(error.into()),
-
-                Err(UpdateError::MissingEtag) => {
-                    return Err(Error::Message(String::from("missing e-tag")));
-                }
-
-                Err(UpdateError::Uuid(uuid)) => {
-                    return Err(Error::Message(format!("uuid: {uuid}")));
-                }
-            }
-        }
+        self.run_group_cas_loop(group_id, LeaveCas { member_id, members })
+            .await
     }
-
     #[instrument(skip(self, offset_commit), fields(group_id = offset_commit.group_id, generation_id = offset_commit.generation_id_or_member_epoch))]
     async fn offset_commit(&self, offset_commit: OffsetCommit<'_>) -> Result<Body> {
         COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "offset_commit")]);
 
         let group_id = offset_commit.group_id;
-        let mut iteration = 0;
 
-        loop {
-            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "offset_commit_loop")]);
-
-            // Serialize this group's read->CAS window (see `GroupLocks`); no
-            // long-poll sleep here, so held for the whole iteration.
-            let _permit = self.group_lock(group_id).lock_owned().await;
-
-            let (mut wrapper, mut version) = self.wrappers.lock().map(|mut wrappers| {
-                wrappers
-                    .remove(group_id)
-                    .unwrap_or_else(|| (Wrapper::Forming(Inner::new(self.storage.clone())), None))
-            })?;
-
-            debug!(?group_id, ?wrapper, ?version, ?iteration);
-
-            // GET-first (#111): observe a cross-replica change with a cheap read
-            // and evaluate the commit against current state; committed offsets go
-            // to their own per-topition objects inside `offset_commit` regardless.
-            let persisted = self.storage.read_group(group_id).await?;
-            if let Some((current, current_version)) = &persisted
-                && version.as_ref() != Some(current_version)
-            {
-                wrapper = Wrapper::with_storage_group_detail(self.storage.clone(), current.clone());
-                version = Some(current_version.clone());
-            }
-
-            let before = GroupDetail::from(&wrapper);
-
-            let now = SystemTime::now();
-
-            let (wrapper, body) = wrapper.offset_commit(now, &offset_commit).await;
-            debug!(group_id, ?wrapper, ?version, iteration,);
-
-            // Skip the redundant group-state PUT when the commit changed nothing
-            // in `GroupDetail` (#111): the offsets were persisted to their own
-            // objects, so re-writing the group object is pure overhead.
-            if persisted.is_some() && GroupDetail::from(&wrapper) == before {
-                _ = self
-                    .wrappers
-                    .lock()
-                    .map(|mut wrappers| wrappers.insert(group_id.to_owned(), (wrapper, version)))?;
-                return Ok(body);
-            }
-
-            match self
-                .storage
-                .update_group(group_id, GroupDetail::from(&wrapper), version)
-                .await
-            {
-                Ok(version) => {
-                    debug!(?group_id, ?version);
-
-                    _ = self.wrappers.lock().map(|mut wrappers| {
-                        wrappers.insert(group_id.to_owned(), (wrapper, Some(version)))
-                    })?;
-
-                    return Ok(body);
-                }
-
-                Err(UpdateError::Outdated { current, version }) => {
-                    debug!(?group_id, ?current, ?version);
-                    COORDINATOR_REQUESTS
-                        .add(1, &[KeyValue::new("method", "offset_commit_outdated")]);
-
-                    _ = self.wrappers.lock().map(|mut wrappers| {
-                        wrappers.insert(
-                            group_id.to_owned(),
-                            (
-                                Wrapper::with_storage_group_detail(self.storage.clone(), *current),
-                                Some(version),
-                            ),
-                        )
-                    })?;
-
-                    iteration += 1;
-                    continue;
-                }
-
-                Err(UpdateError::Error(error)) => return Err(error.into()),
-
-                Err(UpdateError::SerdeJson(error)) => return Err(error.into()),
-
-                Err(UpdateError::MissingEtag) => {
-                    return Err(Error::Message(String::from("missing e-tag")));
-                }
-
-                Err(UpdateError::Uuid(uuid)) => {
-                    return Err(Error::Message(format!("uuid: {uuid}")));
-                }
-            }
-        }
+        self.run_group_cas_loop(group_id, OffsetCommitCas { offset_commit })
+            .await
     }
-
     #[instrument(skip_all)]
     async fn offset_fetch(
         &self,
@@ -2179,148 +1867,442 @@ where
         group_instance_id: Option<&str>,
     ) -> Result<Body> {
         debug!(?group_id, ?generation_id, ?member_id, ?group_instance_id);
+
         COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "heartbeat")]);
 
-        let mut iteration = 0;
-
-        loop {
-            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "heartbeat_loop")]);
-
-            // Serialize this group's read->CAS window (see `GroupLocks`). This
-            // loop has no long-poll sleep — the guard is held for the whole
-            // iteration and released at scope end (return / continue).
-            let _permit = self.group_lock(group_id).lock_owned().await;
-
-            let (mut wrapper, mut version) = self.wrappers.lock().map(|mut wrappers| {
-                wrappers
-                    .remove(group_id)
-                    .unwrap_or_else(|| (Wrapper::Forming(Inner::new(self.storage.clone())), None))
-            })?;
-
-            debug!(?group_id, ?wrapper, ?version, ?iteration);
-
-            // GET-first (#111): read the persisted group so a rebalance triggered
-            // on another replica is observed with a cheap (tier-2) read rather
-            // than an unconditional (tier-1) PUT. If it changed since we cached it
-            // (a different version), adopt it so the heartbeat is evaluated
-            // against current state — this is the cross-replica propagation the
-            // unconditional PUT's `Outdated` path used to be the only source of.
-            let persisted = self.storage.read_group(group_id).await?;
-            if let Some((current, current_version)) = &persisted
-                && version.as_ref() != Some(current_version)
-            {
-                wrapper = Wrapper::with_storage_group_detail(self.storage.clone(), current.clone());
-                version = Some(current_version.clone());
-            }
-
-            // The persisted projection we are about to (maybe) rewrite.
-            let before = GroupDetail::from(&wrapper);
-
-            let now = SystemTime::now();
-
-            if group_instance_id.is_none() {
-                wrapper = wrapper.missed_heartbeat(group_id, member_id, now);
-            }
-
-            let (wrapper, body) = wrapper
-                .heartbeat(now, group_id, generation_id, member_id, group_instance_id)
-                .await;
-
-            debug!(group_id, %wrapper, ?version, iteration,);
-
-            // Every member heartbeats every few seconds, so this is the densest
-            // sampling of a group's state available — which is what makes it the
-            // right place to notice one that has stopped making progress (#240).
-            _ = self.observe_rebalance(group_id, &GroupDetail::from(&wrapper), now);
-
-            let after = GroupDetail::from(&wrapper);
-
-            // Skip the group-state PUT when nothing persistent changed (#111): the
-            // object exists and already holds `before` (just read), so a
-            // steady-state heartbeat — and a heartbeat that merely observed a
-            // rebalance — writes zero tier-1 PUTs. Only a real membership /
-            // generation change falls through to the CAS below.
-            //
-            // This used to be strict equality on `GroupDetail`, which could never
-            // hold (#273): `GroupMember` derives `PartialEq` over `last_contact`,
-            // and the heartbeat path assigns it `now` before we get here — via
-            // `missed_heartbeat` above and `Formed::heartbeat`. So `after !=
-            // before` on every *successful* heartbeat and the skip fired only on
-            // errors, doing precisely what the comment says it does not: 1 GET +
-            // 1 CAS PUT per member per interval, ~100 PUT/s at 300 members.
-            //
-            // `same_rebalance_state` + `liveness_renewal_due` is the join and sync
-            // pattern (`:1246`, `:1579`), and the second half is not optional.
-            // Constant heartbeat PUTs were what kept `{group}.json` mtimes fresh,
-            // and group expiry used to condemn a group on that mtime alone — so
-            // skipping without a liveness floor would have armed offset deletion
-            // for every stable group past the retention window. #272 removed that
-            // coupling by making expiry consult committed-offset activity, which
-            // is why this change is safe now and was not before. The renewal every
-            // `session_timeout/2` still preserves cross-replica member eviction.
-            if persisted.is_some()
-                && same_rebalance_state(&before, &after)
-                && !liveness_renewal_due(&before, member_id, now, before.session_timeout_ms)
-            {
-                COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "heartbeat_noop_skip")]);
-
-                _ = self
-                    .wrappers
-                    .lock()
-                    .map(|mut wrappers| wrappers.insert(group_id.to_owned(), (wrapper, version)))?;
-                return Ok(body);
-            }
-
-            match self
-                .storage
-                .update_group(group_id, GroupDetail::from(&wrapper), version)
-                .await
-            {
-                Ok(version) => {
-                    debug!(?group_id, ?version);
-
-                    _ = self.wrappers.lock().map(|mut wrappers| {
-                        wrappers.insert(group_id.to_owned(), (wrapper, Some(version)))
-                    })?;
-
-                    return Ok(body);
-                }
-
-                Err(UpdateError::Outdated { current, version }) => {
-                    debug!(?group_id, ?current, ?version);
-                    COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "heartbeat_outdated")]);
-
-                    _ = self.wrappers.lock().map(|mut wrappers| {
-                        wrappers.insert(
-                            group_id.to_owned(),
-                            (
-                                Wrapper::with_storage_group_detail(self.storage.clone(), *current),
-                                Some(version),
-                            ),
-                        )
-                    })?;
-
-                    iteration += 1;
-                    continue;
-                }
-
-                Err(UpdateError::Error(error)) => return Err(error.into()),
-
-                Err(UpdateError::SerdeJson(error)) => return Err(error.into()),
-
-                Err(UpdateError::MissingEtag) => {
-                    return Err(Error::Message(String::from("missing e-tag")));
-                }
-
-                Err(UpdateError::Uuid(uuid)) => {
-                    return Err(Error::Message(format!("uuid: {uuid}")));
-                }
-            }
-        }
+        self.run_group_cas_loop(
+            group_id,
+            HeartbeatCas {
+                generation_id,
+                member_id,
+                group_instance_id,
+            },
+        )
+        .await
     }
 
     fn prune(&self) -> usize {
         self.prune_idle_groups()
+    }
+}
+
+/// `join`'s half of [`Controller::run_group_cas_loop`].
+struct JoinCas<'a> {
+    client_id: Option<&'a str>,
+    session_timeout_ms: i32,
+    rebalance_timeout_ms: Option<i32>,
+    member_id: &'a str,
+    group_instance_id: Option<&'a str>,
+    protocol_type: &'a str,
+    protocols: Option<&'a [JoinGroupRequestProtocol]>,
+    reason: Option<&'a str>,
+
+    /// When this call started long-polling, on the monotonic clock (#256).
+    polling_since: Instant,
+
+    /// Join-window barrier state (see `JOIN_QUIESCENCE`): the member set last
+    /// observed by this join call, and when it last changed. Inferred purely
+    /// from the per-iteration GET-first reads — no on-disk format change.
+    window_members: Option<BTreeSet<String>>,
+    window_changed_at: SystemTime,
+}
+
+impl<O> GroupCas<O> for JoinCas<'_>
+where
+    O: Storage + Clone,
+{
+    const LABELS: CasLabels = CasLabels {
+        iteration: "join_loop",
+        noop_skip: "join_noop_skip",
+        outdated: "join_outdated",
+    };
+
+    // Many members converge on one group object during a rebalance, so an
+    // un-backed-off retry storm here is real.
+    const BACKOFF_ON_CONFLICT: bool = true;
+
+    /// A join is the one request that can create a group, so its cache miss
+    /// seeds from the timeouts the joining member declared rather than from
+    /// `Inner::new`'s defaults.
+    fn seed(&self, storage: O) -> Wrapper<O> {
+        Wrapper::Forming(Inner {
+            session_timeout_ms: self.session_timeout_ms,
+            rebalance_timeout_ms: self.rebalance_timeout_ms,
+            members: Default::default(),
+            generation_id: -1,
+            state: Forming::default(),
+            skip_assignment: Some(false),
+            storage,
+            inception: SystemTime::now(),
+        })
+    }
+
+    async fn apply(
+        &mut self,
+        group_id: &str,
+        now: SystemTime,
+        mut wrapper: Wrapper<O>,
+    ) -> (Wrapper<O>, Body) {
+        if self.group_instance_id.is_none() {
+            wrapper = wrapper.missed_heartbeat(group_id, self.member_id, now);
+        }
+
+        let members_before = wrapper.members();
+
+        let (updated, body) = wrapper
+            .join(
+                now,
+                self.client_id,
+                group_id,
+                self.session_timeout_ms,
+                self.rebalance_timeout_ms,
+                self.member_id,
+                self.group_instance_id,
+                self.protocol_type,
+                self.protocols,
+                self.reason,
+            )
+            .await;
+
+        debug!(is_stable = members_before == updated.members());
+
+        (updated, body)
+    }
+
+    // Observed here as well as on the heartbeat path (#240).
+    //
+    // Heartbeat alone is blind to the failure this detector exists for.
+    // `AbstractCoordinator$HeartbeatThread` disables itself while the consumer
+    // has not joined — `if (state.hasNotJoinedGroup() || isFailed()) {
+    // disable(); }` — so a group whose members are stuck *trying* to join sends
+    // no heartbeat at all, and was sampled nowhere. Measured: a group 90+
+    // minutes in `CompletingRebalance` with 16 members, all 16 heartbeat threads
+    // parked in `wait()`, and not one line about it across ten broker replicas
+    // over two hours.
+    //
+    // Join and sync keep arriving from exactly that consumer — every `poll()`
+    // retries the join — so they are a live sampling source precisely when
+    // heartbeats are not. `before` is the group as read this iteration, which is
+    // the state being waited on.
+    fn observe(
+        &self,
+        controller: &Controller<O>,
+        group_id: &str,
+        before: &GroupDetail,
+        _after: &GroupDetail,
+        now: SystemTime,
+    ) {
+        _ = controller.observe_rebalance(group_id, before, now);
+    }
+
+    /// A member waiting through a rebalance re-joins once a second, and each
+    /// re-join changes only its own `last_contact` (via `missed_heartbeat`).
+    /// Persisting that is a CAS that churns the `{group}.json` etag for nothing
+    /// and, at scale, starves the leader's assignment write so the group never
+    /// stabilises. When the rebalance state is otherwise unchanged and this
+    /// member's liveness does not yet need renewing, answer without touching the
+    /// object — keeping the etag still long enough for the assignment CAS to
+    /// land.
+    fn skip(&self, before: &GroupDetail, after: &GroupDetail, now: SystemTime) -> bool {
+        same_rebalance_state(before, after)
+            && !liveness_renewal_due(before, self.member_id, now, before.session_timeout_ms)
+    }
+
+    fn settled(
+        &mut self,
+        updated: &Wrapper<O>,
+        body: &Body,
+        after: &GroupDetail,
+        now: SystemTime,
+    ) -> LongPoll {
+        // Join-window barrier: without it the leader returned as soon as its own
+        // CAS landed, computed assignments for whatever partial member list it
+        // had seen, and every member missing from that list parked at "stable"
+        // with zero partitions — a multi-member group never converged. Hold the
+        // leader until the membership is quiescent or the rebalance window
+        // closes.
+        let members_now = after.members.keys().cloned().collect::<BTreeSet<_>>();
+        if self.window_members.as_ref() != Some(&members_now) {
+            self.window_members = Some(members_now);
+            self.window_changed_at = now;
+        }
+
+        let membership_quiescent = now
+            .duration_since(self.window_changed_at)
+            .unwrap_or_default()
+            >= JOIN_QUIESCENCE;
+
+        // The rebalance window: `rebalance_timeout_ms` bounds how long the leader
+        // may be held (the Java client allows JoinGroup responses up to
+        // `rebalance_timeout + 5s`), falling back to the session timeout when
+        // unset, as Kafka does for old protocol versions.
+        let join_window_ms = u128::try_from(
+            after
+                .rebalance_timeout_ms
+                .or(self.rebalance_timeout_ms)
+                .unwrap_or(after.session_timeout_ms),
+        )
+        .unwrap_or_default();
+
+        join_long_poll(
+            updated,
+            body,
+            self.group_instance_id,
+            self.polling_since.elapsed().as_millis(),
+            updated.is_forming(),
+            membership_quiescent,
+            join_window_ms,
+        )
+    }
+}
+
+/// `sync`'s half of [`Controller::run_group_cas_loop`].
+struct SyncCas<'a> {
+    generation_id: i32,
+    member_id: &'a str,
+    group_instance_id: Option<&'a str>,
+    protocol_type: Option<&'a str>,
+    protocol_name: Option<&'a str>,
+    assignments: Option<&'a [SyncGroupRequestAssignment]>,
+
+    /// When this call started long-polling, on the monotonic clock (#256).
+    polling_since: Instant,
+}
+
+impl<O> GroupCas<O> for SyncCas<'_>
+where
+    O: Storage + Clone,
+{
+    const LABELS: CasLabels = CasLabels {
+        iteration: "sync_loop",
+        noop_skip: "sync_noop_skip",
+        outdated: "sync_outdated",
+    };
+
+    const BACKOFF_ON_CONFLICT: bool = true;
+
+    async fn apply(
+        &mut self,
+        group_id: &str,
+        now: SystemTime,
+        mut wrapper: Wrapper<O>,
+    ) -> (Wrapper<O>, Body) {
+        let members_before = wrapper.members();
+
+        if self.group_instance_id.is_none() {
+            wrapper = wrapper.missed_heartbeat(group_id, self.member_id, now);
+        }
+
+        let (updated, body) = wrapper
+            .sync(
+                now,
+                group_id,
+                self.generation_id,
+                self.member_id,
+                self.group_instance_id,
+                self.protocol_type,
+                self.protocol_name,
+                self.assignments,
+            )
+            .await;
+
+        debug!(is_stable = members_before == updated.members());
+
+        (updated, body)
+    }
+
+    /// Sampled from the state this iteration read, for the same reason as
+    /// [`JoinCas::observe`] — see there.
+    fn observe(
+        &self,
+        controller: &Controller<O>,
+        group_id: &str,
+        before: &GroupDetail,
+        _after: &GroupDetail,
+        now: SystemTime,
+    ) {
+        _ = controller.observe_rebalance(group_id, before, now);
+    }
+
+    /// See [`JoinCas::skip`] for the rationale. The leader's real
+    /// `Forming`->`Formed` assignment sync changes `state` + `assignments`, so
+    /// `same_rebalance_state` is false for it and it always takes the write path.
+    fn skip(&self, before: &GroupDetail, after: &GroupDetail, now: SystemTime) -> bool {
+        same_rebalance_state(before, after)
+            && !liveness_renewal_due(before, self.member_id, now, before.session_timeout_ms)
+    }
+
+    fn settled(
+        &mut self,
+        updated: &Wrapper<O>,
+        body: &Body,
+        _after: &GroupDetail,
+        _now: SystemTime,
+    ) -> LongPoll {
+        sync_long_poll(
+            updated,
+            body,
+            self.group_instance_id,
+            self.polling_since.elapsed().as_millis(),
+        )
+    }
+}
+
+/// `leave`'s half of [`Controller::run_group_cas_loop`].
+struct LeaveCas<'a> {
+    member_id: Option<&'a str>,
+    members: Option<&'a [MemberIdentity]>,
+}
+
+impl<O> GroupCas<O> for LeaveCas<'_>
+where
+    O: Storage + Clone,
+{
+    const LABELS: CasLabels = CasLabels {
+        iteration: "leave_loop",
+        // Never emitted: the skip is gated on the GET-first read, which this API
+        // does not do. Named anyway so turning `GET_FIRST` on is a one-line
+        // change rather than one that also has to invent a label.
+        noop_skip: "leave_noop_skip",
+        outdated: "leave_outdated",
+    };
+
+    // A leave is terminal: there is nothing to long-poll and no skip to arm, so
+    // the read would buy nothing the CAS does not already give.
+    const GET_FIRST: bool = false;
+
+    async fn apply(
+        &mut self,
+        group_id: &str,
+        now: SystemTime,
+        wrapper: Wrapper<O>,
+    ) -> (Wrapper<O>, Body) {
+        // Unconditional, unlike join/sync/heartbeat: a static member's leave is
+        // the one case where its liveness genuinely has to be reconciled.
+        wrapper
+            .missed_heartbeat(group_id, self.member_id.unwrap_or_default(), now)
+            .leave(now, group_id, self.member_id, self.members)
+            .await
+    }
+}
+
+/// `offset_commit`'s half of [`Controller::run_group_cas_loop`].
+struct OffsetCommitCas<'a> {
+    offset_commit: OffsetCommit<'a>,
+}
+
+impl<O> GroupCas<O> for OffsetCommitCas<'_>
+where
+    O: Storage + Clone,
+{
+    const LABELS: CasLabels = CasLabels {
+        iteration: "offset_commit_loop",
+        noop_skip: "offset_commit_noop_skip",
+        outdated: "offset_commit_outdated",
+    };
+
+    /// No `missed_heartbeat`: a commit is not a liveness signal, and the
+    /// committed offsets go to their own per-topition objects inside
+    /// `Wrapper::offset_commit` regardless of what happens to the group object.
+    async fn apply(
+        &mut self,
+        _group_id: &str,
+        now: SystemTime,
+        wrapper: Wrapper<O>,
+    ) -> (Wrapper<O>, Body) {
+        wrapper.offset_commit(now, &self.offset_commit).await
+    }
+
+    /// Skip the redundant group-state PUT when the commit changed nothing in
+    /// `GroupDetail` (#111): the offsets are already persisted to their own
+    /// objects, so re-writing the group object is pure overhead.
+    ///
+    /// Strict equality is right here, and is *not* the #273 mistake: nothing on
+    /// this path assigns `last_contact`, so equality is reachable.
+    fn skip(&self, before: &GroupDetail, after: &GroupDetail, _now: SystemTime) -> bool {
+        before == after
+    }
+}
+
+/// `heartbeat`'s half of [`Controller::run_group_cas_loop`].
+struct HeartbeatCas<'a> {
+    generation_id: i32,
+    member_id: &'a str,
+    group_instance_id: Option<&'a str>,
+}
+
+impl<O> GroupCas<O> for HeartbeatCas<'_>
+where
+    O: Storage + Clone,
+{
+    const LABELS: CasLabels = CasLabels {
+        iteration: "heartbeat_loop",
+        noop_skip: "heartbeat_noop_skip",
+        outdated: "heartbeat_outdated",
+    };
+
+    async fn apply(
+        &mut self,
+        group_id: &str,
+        now: SystemTime,
+        mut wrapper: Wrapper<O>,
+    ) -> (Wrapper<O>, Body) {
+        if self.group_instance_id.is_none() {
+            wrapper = wrapper.missed_heartbeat(group_id, self.member_id, now);
+        }
+
+        wrapper
+            .heartbeat(
+                now,
+                group_id,
+                self.generation_id,
+                self.member_id,
+                self.group_instance_id,
+            )
+            .await
+    }
+
+    /// Every member heartbeats every few seconds, so this is the densest
+    /// sampling of a group's state available — which is what makes it the right
+    /// place to notice one that has stopped making progress (#240). Sampled from
+    /// `after`, unlike join and sync: the heartbeat itself can be what moves the
+    /// group, so the state worth reporting is the one it produced.
+    fn observe(
+        &self,
+        controller: &Controller<O>,
+        group_id: &str,
+        _before: &GroupDetail,
+        after: &GroupDetail,
+        now: SystemTime,
+    ) {
+        _ = controller.observe_rebalance(group_id, after, now);
+    }
+
+    /// Skip the group-state PUT when nothing persistent changed (#111): the
+    /// object exists and already holds `before` (just read), so a steady-state
+    /// heartbeat — and a heartbeat that merely observed a rebalance — writes zero
+    /// tier-1 PUTs. Only a real membership / generation change falls through to
+    /// the CAS.
+    ///
+    /// This used to be strict equality on `GroupDetail`, which could never hold
+    /// (#273): `GroupMember` derives `PartialEq` over `last_contact`, and the
+    /// heartbeat path assigns it `now` before we get here — via
+    /// `missed_heartbeat` and `Formed::heartbeat`. So `after != before` on every
+    /// *successful* heartbeat and the skip fired only on errors, doing precisely
+    /// what the comment said it did not: 1 GET + 1 CAS PUT per member per
+    /// interval, ~100 PUT/s at 300 members. That the drifted copy is now the
+    /// shared one is the point of #286.
+    ///
+    /// The second half is not optional. Constant heartbeat PUTs were what kept
+    /// `{group}.json` mtimes fresh, and group expiry used to condemn a group on
+    /// that mtime alone — so skipping without a liveness floor would have armed
+    /// offset deletion for every stable group past the retention window. #272
+    /// removed that coupling by making expiry consult committed-offset activity,
+    /// which is why this is safe now and was not before. The renewal every
+    /// `session_timeout/2` still preserves cross-replica member eviction.
+    fn skip(&self, before: &GroupDetail, after: &GroupDetail, now: SystemTime) -> bool {
+        same_rebalance_state(before, after)
+            && !liveness_renewal_due(before, self.member_id, now, before.session_timeout_ms)
     }
 }
 
