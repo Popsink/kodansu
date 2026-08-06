@@ -36,6 +36,7 @@ mod prefix_coalesce;
 mod reachable_panics;
 mod scaling;
 mod segment;
+mod segment_create;
 
 pub(crate) fn init_tracing() -> Result<DefaultGuard, Error> {
     _ = dotenv().ok();

@@ -177,6 +177,132 @@ fn liveness_renewal_due(
     }
 }
 
+/// What a `join` or `sync` iteration does once this member's group state is
+/// settled: wait and re-poll, or answer now.
+///
+/// Both APIs reach this decision twice per iteration — once on the no-op
+/// long-poll skip and once after the state CAS — and the two copies differ only
+/// in which of them wrote. Holding it in one place per API means a change to
+/// the hold conditions cannot land on one branch and miss the other (#286),
+/// and leaves the genuine protocol difference between `join` and `sync` stated
+/// where it can be read rather than buried in a pasted `else if` chain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LongPoll {
+    /// Sleep for this long, then run another iteration. The label names the
+    /// wait in `COORDINATOR_REQUESTS`.
+    Wait(Duration, &'static str),
+
+    /// Answer with the body this iteration produced, first overriding its error
+    /// code when `Some`.
+    Respond(Option<ErrorCode>),
+}
+
+/// `join`'s long-poll decision (see [`LongPoll`]).
+///
+/// A static member is paused out to [`PAUSE_MS`] so its rejoin does not spin.
+/// The leader of a still-`Forming` group is then held by the join-window
+/// barrier until membership is quiescent or the rebalance window closes, so it
+/// assigns over the complete member list. Any member with something to act on —
+/// leader, assigned, or told to retry under a broker-issued member id — is
+/// answered immediately; anyone else waits up to **half** its session timeout
+/// and is then answered anyway.
+fn join_long_poll<O>(
+    updated: &Wrapper<O>,
+    body: &Body,
+    group_instance_id: Option<&str>,
+    elapsed_ms: u128,
+    is_forming: bool,
+    membership_quiescent: bool,
+    join_window_ms: u128,
+) -> LongPoll
+where
+    O: Storage,
+{
+    let is_leader = updated.is_leader(body);
+    let is_assigned = updated.is_assigned(body);
+    let is_member_id_required = updated.is_member_id_required(body);
+    let is_ok = updated.is_ok(body);
+    let session_timeout_ms = updated.session_timeout_ms() as u128;
+
+    let decision = if group_instance_id.is_some() && elapsed_ms < PAUSE_MS {
+        LongPoll::Wait(
+            Duration::from_millis(PAUSE_MS.saturating_sub(elapsed_ms) as u64),
+            "join_group_instance_pause",
+        )
+    } else if is_leader && is_forming && !membership_quiescent && elapsed_ms < join_window_ms {
+        LongPoll::Wait(Duration::from_secs(1), "join_window_hold")
+    } else if is_leader || is_assigned || is_member_id_required {
+        LongPoll::Respond(None)
+    } else if elapsed_ms < session_timeout_ms.div(2) {
+        LongPoll::Wait(Duration::from_secs(1), "join_group_instance_pause")
+    } else {
+        LongPoll::Respond(None)
+    };
+
+    debug!(
+        elapsed_ms,
+        is_forming,
+        is_leader,
+        is_assigned,
+        is_member_id_required,
+        is_ok,
+        membership_quiescent,
+        join_window_ms,
+        session_timeout_ms,
+        ?decision,
+    );
+
+    decision
+}
+
+/// `sync`'s long-poll decision (see [`LongPoll`]).
+///
+/// The same static-member pause as [`join_long_poll`]. A member is answered as
+/// soon as the group has fallen back to `Forming` (a fresh rebalance to follow)
+/// or its assignment has arrived. Otherwise it waits up to **eight tenths** of
+/// its session timeout — longer than `join`'s half, because a sync is waiting
+/// on the leader's single assignment write — and is then terminated with
+/// `RebalanceInProgress`, so the client rejoins instead of settling on an empty
+/// assignment.
+fn sync_long_poll<O>(
+    updated: &Wrapper<O>,
+    body: &Body,
+    group_instance_id: Option<&str>,
+    elapsed_ms: u128,
+) -> LongPoll
+where
+    O: Storage,
+{
+    let is_forming = updated.is_forming();
+    let is_assigned = updated.is_assigned(body);
+    let is_ok = updated.is_ok(body);
+    let session_timeout_ms = updated.session_timeout_ms() as u128;
+
+    let decision = if group_instance_id.is_some() && elapsed_ms < PAUSE_MS {
+        LongPoll::Wait(
+            Duration::from_millis(PAUSE_MS.saturating_sub(elapsed_ms) as u64),
+            "sync_group_instance_pause",
+        )
+    } else if is_forming || is_assigned {
+        LongPoll::Respond(None)
+    } else if elapsed_ms < session_timeout_ms.mul(8).div(10) {
+        LongPoll::Wait(Duration::from_secs(1), "sync_group_instance_pause")
+    } else {
+        LongPoll::Respond(Some(ErrorCode::RebalanceInProgress))
+    };
+
+    debug!(
+        elapsed_ms,
+        is_forming,
+        is_assigned,
+        is_ok,
+        session_timeout_ms,
+        ?decision,
+    );
+
+    decision
+}
+
 static COORDINATOR_REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_group_coordinator_requests")
@@ -1250,10 +1376,15 @@ where
 
                 let elapsed_ms = polling_since.elapsed().as_millis();
 
-                let is_leader = updated.is_leader(&body);
-                let is_assigned = updated.is_assigned(&body);
-                let is_member_id_required = updated.is_member_id_required(&body);
-                let session_timeout_ms = updated.session_timeout_ms() as u128;
+                let decision = join_long_poll(
+                    &updated,
+                    &body,
+                    group_instance_id,
+                    elapsed_ms,
+                    is_forming,
+                    membership_quiescent,
+                    join_window_ms,
+                );
 
                 _ = self
                     .wrappers
@@ -1265,39 +1396,20 @@ where
                 // sleep — a held leader must not block the members it awaits.
                 drop(permit);
 
-                if group_instance_id.is_some() && elapsed_ms < PAUSE_MS {
-                    let pause = PAUSE_MS.saturating_sub(elapsed_ms);
-                    COORDINATOR_REQUESTS
-                        .add(1, &[KeyValue::new("method", "join_group_instance_pause")]);
-                    sleep(Duration::from_millis(pause as u64)).await;
+                match decision {
+                    LongPoll::Wait(pause, method) => {
+                        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", method)]);
+                        sleep(pause).await;
 
-                    iteration += 1;
-                    continue;
-                } else if is_leader
-                    && is_forming
-                    && !membership_quiescent
-                    && elapsed_ms < join_window_ms
-                {
-                    // Join-window barrier: the leader of a still-Forming group
-                    // is held until membership is quiescent (or the window
-                    // closes), so its join response carries the complete
-                    // member list before it computes assignments.
-                    COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_window_hold")]);
-                    sleep(Duration::from_secs(1)).await;
+                        iteration += 1;
+                        continue;
+                    }
 
-                    iteration += 1;
-                    continue;
-                } else if is_leader || is_assigned || is_member_id_required {
-                    return Ok(body);
-                } else if elapsed_ms < session_timeout_ms.div(2) {
-                    COORDINATOR_REQUESTS
-                        .add(1, &[KeyValue::new("method", "join_group_instance_pause")]);
-                    sleep(Duration::from_secs(1)).await;
+                    LongPoll::Respond(None) => return Ok(body),
 
-                    iteration += 1;
-                    continue;
-                } else {
-                    return Ok(body);
+                    LongPoll::Respond(Some(error_code)) => {
+                        return Ok(set_error_code(body, error_code));
+                    }
                 }
             }
 
@@ -1305,24 +1417,17 @@ where
                 Ok(version) => {
                     let elapsed_ms = polling_since.elapsed().as_millis();
 
-                    let is_leader = updated.is_leader(&body);
-                    let is_assigned = updated.is_assigned(&body);
-                    let is_member_id_required = updated.is_member_id_required(&body);
-                    let is_ok = updated.is_ok(&body);
-
-                    let session_timeout_ms = updated.session_timeout_ms() as u128;
-
-                    debug!(
-                        ?version,
-                        iteration,
+                    let decision = join_long_poll(
+                        &updated,
+                        &body,
+                        group_instance_id,
                         elapsed_ms,
-                        ?is_forming,
-                        ?is_leader,
-                        ?is_assigned,
-                        ?is_member_id_required,
-                        ?is_ok,
-                        is_stable
+                        is_forming,
+                        membership_quiescent,
+                        join_window_ms,
                     );
+
+                    debug!(?version, iteration, ?decision, is_stable);
 
                     _ = self.wrappers.lock().map(|mut wrappers| {
                         wrappers.insert(group_id.to_owned(), (updated, Some(version)))
@@ -1332,38 +1437,20 @@ where
                     // any long-poll / join-window sleep (see the no-op branch).
                     drop(permit);
 
-                    if group_instance_id.is_some() && elapsed_ms < PAUSE_MS {
-                        let pause = PAUSE_MS.saturating_sub(elapsed_ms);
-                        debug!(pause);
+                    match decision {
+                        LongPoll::Wait(pause, method) => {
+                            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", method)]);
+                            sleep(pause).await;
 
-                        COORDINATOR_REQUESTS
-                            .add(1, &[KeyValue::new("method", "join_group_instance_pause")]);
-                        sleep(Duration::from_millis(pause as u64)).await;
+                            iteration += 1;
+                            continue;
+                        }
 
-                        iteration += 1;
-                        continue;
-                    } else if is_leader
-                        && is_forming
-                        && !membership_quiescent
-                        && elapsed_ms < join_window_ms
-                    {
-                        // Join-window barrier: see the no-op skip branch above.
-                        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_window_hold")]);
-                        sleep(Duration::from_secs(1)).await;
+                        LongPoll::Respond(None) => return Ok(body),
 
-                        iteration += 1;
-                        continue;
-                    } else if is_leader || is_assigned || is_member_id_required {
-                        return Ok(body);
-                    } else if elapsed_ms < session_timeout_ms.div(2) {
-                        COORDINATOR_REQUESTS
-                            .add(1, &[KeyValue::new("method", "join_group_instance_pause")]);
-                        sleep(Duration::from_secs(1)).await;
-
-                        iteration += 1;
-                        continue;
-                    } else {
-                        return Ok(body);
+                        LongPoll::Respond(Some(error_code)) => {
+                            return Ok(set_error_code(body, error_code));
+                        }
                     }
                 }
 
@@ -1583,9 +1670,7 @@ where
 
                 let elapsed_ms = polling_since.elapsed().as_millis();
 
-                let is_forming = updated.is_forming();
-                let is_assigned = updated.is_assigned(&body);
-                let session_timeout_ms = updated.session_timeout_ms() as u128;
+                let decision = sync_long_poll(&updated, &body, group_instance_id, elapsed_ms);
 
                 _ = self
                     .wrappers
@@ -1595,25 +1680,20 @@ where
                 // No-op skip: no write happened; release before the long poll.
                 drop(permit);
 
-                if group_instance_id.is_some() && elapsed_ms < PAUSE_MS {
-                    let pause = PAUSE_MS.saturating_sub(elapsed_ms);
-                    COORDINATOR_REQUESTS
-                        .add(1, &[KeyValue::new("method", "sync_group_instance_pause")]);
-                    sleep(Duration::from_millis(pause as u64)).await;
+                match decision {
+                    LongPoll::Wait(pause, method) => {
+                        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", method)]);
+                        sleep(pause).await;
 
-                    iteration += 1;
-                    continue;
-                } else if is_forming || is_assigned {
-                    return Ok(body);
-                } else if elapsed_ms < session_timeout_ms.mul(8).div(10) {
-                    COORDINATOR_REQUESTS
-                        .add(1, &[KeyValue::new("method", "sync_group_instance_pause")]);
-                    sleep(Duration::from_secs(1)).await;
+                        iteration += 1;
+                        continue;
+                    }
 
-                    iteration += 1;
-                    continue;
-                } else {
-                    return Ok(set_error_code(body, ErrorCode::RebalanceInProgress));
+                    LongPoll::Respond(None) => return Ok(body),
+
+                    LongPoll::Respond(Some(error_code)) => {
+                        return Ok(set_error_code(body, error_code));
+                    }
                 }
             }
 
@@ -1621,22 +1701,9 @@ where
                 Ok(version) => {
                     let elapsed_ms = polling_since.elapsed().as_millis();
 
-                    let is_forming = updated.is_forming();
-                    let is_assigned = updated.is_assigned(&body);
-                    let is_ok = updated.is_ok(&body);
+                    let decision = sync_long_poll(&updated, &body, group_instance_id, elapsed_ms);
 
-                    debug!(
-                        group_id,
-                        ?version,
-                        iteration,
-                        elapsed_ms,
-                        is_forming,
-                        ?is_assigned,
-                        ?is_ok,
-                        is_stable
-                    );
-
-                    let session_timeout_ms = updated.session_timeout_ms() as u128;
+                    debug!(group_id, ?version, iteration, ?decision, is_stable);
 
                     _ = self.wrappers.lock().map(|mut wrappers| {
                         wrappers.insert(group_id.to_owned(), (updated, Some(version)))
@@ -1645,27 +1712,20 @@ where
                     // CAS landed; release before any long-poll sleep.
                     drop(permit);
 
-                    if group_instance_id.is_some() && elapsed_ms < PAUSE_MS {
-                        let pause = PAUSE_MS.saturating_sub(elapsed_ms);
-                        debug!(pause);
+                    match decision {
+                        LongPoll::Wait(pause, method) => {
+                            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", method)]);
+                            sleep(pause).await;
 
-                        COORDINATOR_REQUESTS
-                            .add(1, &[KeyValue::new("method", "sync_group_instance_pause")]);
-                        sleep(Duration::from_millis(pause as u64)).await;
+                            iteration += 1;
+                            continue;
+                        }
 
-                        iteration += 1;
-                        continue;
-                    } else if is_forming || is_assigned {
-                        return Ok(body);
-                    } else if elapsed_ms < session_timeout_ms.mul(8).div(10) {
-                        COORDINATOR_REQUESTS
-                            .add(1, &[KeyValue::new("method", "sync_group_instance_pause")]);
-                        sleep(Duration::from_secs(1)).await;
+                        LongPoll::Respond(None) => return Ok(body),
 
-                        iteration += 1;
-                        continue;
-                    } else {
-                        return Ok(set_error_code(body, ErrorCode::RebalanceInProgress));
+                        LongPoll::Respond(Some(error_code)) => {
+                            return Ok(set_error_code(body, error_code));
+                        }
                     }
                 }
 
