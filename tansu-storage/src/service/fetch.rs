@@ -16,7 +16,7 @@ use std::time::SystemTime;
 
 use rama::{Context, Service};
 use tansu_sans_io::{
-    ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel,
+    ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel, NULL_TOPIC_ID,
     fetch_request::{FetchPartition, FetchTopic},
     fetch_response::{
         AbortedTransaction, EpochEndOffset, FetchableTopicResponse, LeaderIdAndEpoch,
@@ -291,7 +291,7 @@ impl FetchService {
     fn unknown_topic_response(&self, fetch: &FetchTopic) -> Result<FetchableTopicResponse> {
         Ok(FetchableTopicResponse::default()
             .topic(fetch.topic.clone())
-            .topic_id(Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+            .topic_id(Some(NULL_TOPIC_ID))
             .partitions(fetch.partitions.as_ref().map(|partitions| {
                 partitions
                     .iter()
@@ -394,7 +394,13 @@ impl FetchService {
 
                     FetchableTopicResponse::default()
                         .topic(topic.fetch.topic.to_owned())
-                        .topic_id(topic_id.to_owned())
+                        // `topic_id` is not nullable from Fetch v13, where it
+                        // replaces the name as the topic's identity. A resolved
+                        // topic that carries none still has to occupy its 16
+                        // bytes, so fall back to the nil uuid the way
+                        // `unknown_topic_response` does — omitting it shifts the
+                        // whole response under the client (#351).
+                        .topic_id(Some(topic_id.unwrap_or(NULL_TOPIC_ID)))
                         .partitions(Some(partitions))
                 } else {
                     self.unknown_topic_response(topic.fetch)?

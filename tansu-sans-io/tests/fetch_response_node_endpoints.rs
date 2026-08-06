@@ -25,7 +25,7 @@
 //! the underlying serializer behaviour that makes it necessary.
 
 use tansu_sans_io::{
-    FetchResponse, Frame, Header, Result,
+    FetchResponse, Frame, Header, NULL_TOPIC_ID, Result,
     fetch_response::{FetchableTopicResponse, NodeEndpoint, PartitionData},
 };
 
@@ -38,8 +38,11 @@ fn encode(api_version: i16, node_endpoints: Option<Vec<NodeEndpoint>>) -> Result
         .session_id(Some(0))
         .responses(Some(
             [FetchableTopicResponse::default()
+                // `topic` is 0-12 and `topic_id` 13+, neither nullable, and this
+                // encodes across that boundary — so both have to be present for
+                // the frame to be legal at every version swept (#351).
                 .topic(Some("t".into()))
-                .topic_id(None)
+                .topic_id(Some(NULL_TOPIC_ID))
                 .partitions(Some(
                     [PartitionData::default()
                         .partition_index(0)

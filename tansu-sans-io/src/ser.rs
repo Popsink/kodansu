@@ -191,7 +191,6 @@ impl Encoder {
             .or(self.meta.message.and_then(|mm| mm.field(name)))
     }
 
-    #[allow(dead_code)]
     fn field_name(&self) -> String {
         self.containers.iter().fold(
             self.field.map_or_else(String::new, str::to_owned),
@@ -499,7 +498,19 @@ impl Serializer for &mut Encoder {
             } else {
                 Ok(())
             }
+        } else if self.is_valid() {
+            // Valid at this version and not nullable: there is no encoding for
+            // "absent". Writing nothing would not shorten the message, it would
+            // shift every following field left, and the peer would read the
+            // next bytes as this one — decoding into fabricated values as often
+            // as it fails outright (#351).
+            Err(Error::OmittedNonNullableField {
+                field: self.field_name(),
+                api_version: self.api_version,
+            })
         } else {
+            // Not valid at this version: the field genuinely has no bytes here,
+            // and writing nothing is the whole point.
             Ok(())
         }
     }
@@ -1397,6 +1408,18 @@ mod encode_allocation {
         let bytes = fetch_response_v16_bytes();
         let decoded = Frame::response_from_bytes(&bytes[..], api_key, 16)?;
         let body = FetchResponse::try_from(decoded.body)?;
+
+        // The captured vector is v16, which identifies a topic by `topic_id`
+        // and carries no name. Encoding it below v13 needs `topic`, which is
+        // not nullable there — so name it, or the sweep is asking for a frame
+        // that cannot legally exist (#351).
+        let named = body.responses.clone().map(|responses| {
+            responses
+                .into_iter()
+                .map(|response| response.topic(Some("t".into())))
+                .collect()
+        });
+        let body = body.responses(named);
 
         for api_version in 0..=17i16 {
             let header = Header::Response { correlation_id: 8 };
