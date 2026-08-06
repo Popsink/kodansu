@@ -9,11 +9,10 @@
     "storage": "32gb"
   },
 
-  "forwardPorts": [3000, 5432, 9090, 9092],
+  "forwardPorts": [3000, 9090, 9092],
 
   "portsAttributes": {
     "3000": { "label": "grafana" },
-    "5432": { "label": "postgresql" },
     "9090": { "label": "prom" },
     "9092": { "label": "tansu" }
   },

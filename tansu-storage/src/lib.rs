@@ -366,8 +366,6 @@ impl TopitionOffset {
     }
 }
 
-pub type ListOffsetRequest = ListOffset;
-
 #[derive(Copy, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ListOffsetResponse {
     pub error_code: ErrorCode,
@@ -1061,21 +1059,6 @@ impl From<&NamedGroupDetail> for describe_groups_response::DescribedGroup {
     }
 }
 
-/// Topition (topic partition) Detail
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-pub struct TopitionDetail {
-    error: ErrorCode,
-    topic: TopicId,
-    partitions: Option<Vec<PartitionDetail>>,
-}
-
-/// Partition Detail
-#[derive(Copy, Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-pub struct PartitionDetail {
-    error: ErrorCode,
-    partition_index: i32,
-}
-
 /// Version representing an `e_tag` and `version` used in conditional writes to an object store.
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct Version {
@@ -1175,13 +1158,6 @@ impl TxnAddPartitionsResponse {
         match self {
             Self::VersionZeroToThree(result) => result.as_slice(),
             Self::VersionFourPlus(_) => &[][..],
-        }
-    }
-
-    pub fn four_plus(&self) -> &[AddPartitionsToTxnResult] {
-        match self {
-            Self::VersionZeroToThree(_) => &[][..],
-            Self::VersionFourPlus(result) => result.as_slice(),
         }
     }
 }

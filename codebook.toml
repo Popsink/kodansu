@@ -1,7 +1,5 @@
 words = [
     "clippy",
-    "deltalake",
-    "lakekeeper",
     "rdkafka",
     "rustfmt",
     "temporality",

@@ -2,9 +2,6 @@ set dotenv-load := true
 
 default: fmt build test clippy
 
-about:
-    cargo about generate about.hbs > license.html
-
 cargo-build +args:
     cargo build {{ args }}
 
@@ -122,9 +119,6 @@ docker-compose-logs *args:
 
 docker-prune:
     docker system prune --force
-
-docker-run:
-    docker run --detach --name tansu --publish 9092:9092 tansu
 
 docker-rm-f:
     docker rm --force tansu
@@ -306,14 +300,6 @@ flamegraph-null profile="profiling": (build profile "default") (flamegraph-tansu
 flamegraph-memory profile="profiling": (build profile "dynostore") (flamegraph-tansu-broker profile "--storage-engine=memory://tansu/")
 
 flamegraph-s3 profile="profiling": (build profile "dynostore") docker-compose-down minio-up minio-ready-local minio-local-alias minio-tansu-bucket (flamegraph-tansu-broker profile "--storage-engine=s3://tansu/")
-
-samply-produce profile="profiling":
-    cargo build --profile {{ profile }} --bin bench_produce_v11
-    RUST_LOG=warn samply record ./target/{{ replace(profile, "dev", "debug") }}/bench_produce_v11
-
-flamegraph-produce profile="profiling":
-    cargo build --profile {{ profile }} --bin bench_produce_v11
-    RUST_LOG=warn flamegraph -- ./target/{{ replace(profile, "dev", "debug") }}/bench_produce_v11
 
 consumer-perf num_records="1000" topic="test":
     kafka-consumer-perf-test --topic {{ topic }} --num-records {{ num_records }} --bootstrap-server ${ADVERTISED_LISTENER}

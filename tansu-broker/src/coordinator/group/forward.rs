@@ -599,16 +599,6 @@ where
         }
     }
 
-    /// Override the flat forward deadline (#190). A deployment whose pooled
-    /// groups are large enough to need longer than the default can raise it
-    /// without a rebuild.
-    pub fn with_call_timeout(self, call_timeout: Duration) -> Self {
-        Self {
-            call_timeout,
-            ..self
-        }
-    }
-
     /// Override the idle window before [`Coordinator::prune`] drops a learned
     /// rebalance window (#283). Tests set it to zero to sweep without waiting.
     pub fn with_idle_after(self, idle_after: Duration) -> Self {

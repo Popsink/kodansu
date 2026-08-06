@@ -120,7 +120,9 @@ lake feature flags any more.
 
 ## CI Pipeline
 
-GitHub Actions (`.github/workflows/`): check -> fmt -> clippy -> build-storage (the `dynostore` feature) -> test (against the S3/minio object store) -> publish dry-run -> typos -> smoke tests (Java Kafka client, multiple Kafka versions).
+GitHub Actions (`.github/workflows/`): check -> fmt -> clippy -> build-storage (the `dynostore` feature) -> test (against the S3/minio object store) -> publish dry-run -> typos -> package (a build-only container image).
+
+There are no smoke tests. The upstream `smoke` job was gated on `github.actor == 'shortishly'`, so it never ran in this fork; #282 deleted it. `publish.yml` is what pushes `ghcr.io/popsink/tansu`, on `v*` tags.
 
 ## Key Files
 
