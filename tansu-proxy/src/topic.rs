@@ -495,6 +495,7 @@ mod tests {
                                                     .error_code(i16::from(error_code))
                                                     .log_append_time_ms(Some(0))
                                                     .log_start_offset(Some(0))
+                                                    .record_errors(Some([].into()))
                                             })
                                             .collect::<Vec<_>>()
                                     }))

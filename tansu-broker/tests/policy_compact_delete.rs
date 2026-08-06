@@ -465,6 +465,8 @@ where
                         .partitions(Some(vec![
                             FetchPartition::default()
                                 .partition(partition)
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),
                         ])),
@@ -796,6 +798,8 @@ where
                         .partitions(Some(vec![
                             FetchPartition::default()
                                 .partition(partition)
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),
                         ])),
@@ -952,6 +956,8 @@ where
                         .partitions(Some(vec![
                             FetchPartition::default()
                                 .partition(partition)
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),
                         ])),
@@ -1101,6 +1107,8 @@ where
                         .partitions(Some(vec![
                             FetchPartition::default()
                                 .partition(partition)
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),
                         ])),
@@ -1423,6 +1431,8 @@ where
                         .partitions(Some(vec![
                             FetchPartition::default()
                                 .partition(partition)
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),
                         ])),
@@ -1579,6 +1589,8 @@ where
                         .partitions(Some(vec![
                             FetchPartition::default()
                                 .partition(partition)
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),
                         ])),
@@ -1728,6 +1740,8 @@ where
                         .partitions(Some(vec![
                             FetchPartition::default()
                                 .partition(partition)
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),
                         ])),
@@ -2055,6 +2069,8 @@ where
                         .partitions(Some(vec![
                             FetchPartition::default()
                                 .partition(partition)
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),
                         ])),
@@ -2211,6 +2227,8 @@ where
                         .partitions(Some(vec![
                             FetchPartition::default()
                                 .partition(partition)
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),
                         ])),
@@ -2542,6 +2560,8 @@ where
                         .partitions(Some(vec![
                             FetchPartition::default()
                                 .partition(partition)
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),
                         ])),
@@ -2698,6 +2718,8 @@ where
                         .partitions(Some(vec![
                             FetchPartition::default()
                                 .partition(partition)
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),
                         ])),
@@ -2839,6 +2861,8 @@ where
                         .partitions(Some(vec![
                             FetchPartition::default()
                                 .partition(partition)
+                                .current_leader_epoch(Some(-1))
+                                .last_fetched_epoch(Some(-1))
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096),
                         ])),

@@ -380,6 +380,20 @@ pub enum Error {
     NoSuchMessage(&'static str),
     NoSuchRequest(i16),
     NotAuthenticated,
+    /// A field that is valid at the negotiated version, and not nullable, was
+    /// left `None`.
+    ///
+    /// The wire format is positional: there is no encoding for "absent" here,
+    /// so writing nothing does not shorten the message, it shifts everything
+    /// after it. The peer reads the following bytes as this field and either
+    /// fails to decode or — worse — succeeds with fabricated values (#351).
+    ///
+    /// Carries the dotted path to the field and the API version it was being
+    /// encoded at.
+    OmittedNonNullableField {
+        field: String,
+        api_version: Option<i16>,
+    },
     Overflow,
     ParseFilter(Arc<ParseError>),
     ParseScram(String),
