@@ -16,6 +16,7 @@ use rama::{Context, Service};
 use tansu_sans_io::{ApiKey, Frame, Header, OffsetFetchRequest};
 use tracing::instrument;
 
+use super::answer;
 use crate::{Error, Result, coordinator::group::Coordinator};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -46,6 +47,18 @@ where
                 offset_fetch.require_stable,
             )
             .await
+            .or_else(|error| match error {
+                // An `Error::Api` is an answer the broker chose, not a failure.
+                // Answering it here is what stops it from ending the connection
+                // with no response written — `early eof` to the caller (#300). See
+                // [`super::answer`].
+                Error::Api(error_code) => Ok(answer::offset_fetch(
+                    error_code,
+                    offset_fetch.groups.as_deref(),
+                )),
+
+                otherwise => Err(otherwise),
+            })
             .map(|body| Frame {
                 size: 0,
                 header: Header::Response { correlation_id },

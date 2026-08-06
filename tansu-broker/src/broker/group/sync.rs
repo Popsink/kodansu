@@ -16,6 +16,7 @@ use rama::{Context, Service};
 use tansu_sans_io::{ApiKey, Frame, Header, SyncGroupRequest};
 use tracing::instrument;
 
+use super::answer;
 use crate::{Error, Result, coordinator::group::Coordinator};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -49,6 +50,15 @@ where
                 sync_group.assignments.as_deref(),
             )
             .await
+            .or_else(|error| match error {
+                // An `Error::Api` is an answer the broker chose, not a failure.
+                // Answering it here is what stops it from ending the connection
+                // with no response written — `early eof` to the caller (#300). See
+                // [`super::answer`].
+                Error::Api(error_code) => Ok(answer::sync_group(error_code)),
+
+                otherwise => Err(otherwise),
+            })
             .map(|body| Frame {
                 size: 0,
                 header: Header::Response { correlation_id },
