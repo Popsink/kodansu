@@ -29,9 +29,3 @@ license = "Apache-2.0"
 [[linux-raw-sys.clarify.files]]
 path = "LICENSE-APACHE"
 checksum = "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
-
-[deadpool-postgres.clarify]
-license = "Apache-2.0"
-[[deadpool-postgres.clarify.files]]
-path = "LICENSE-APACHE"
-checksum = "23fac4edada8cdd75ecd793864bfb3a60ef59da853425ed3e2b3d030dc730aa6"

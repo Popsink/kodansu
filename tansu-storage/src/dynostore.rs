@@ -1884,22 +1884,6 @@ impl DynoStore {
         }
     }
 
-    /// No-op: compacted topics are always segment-routed to their own dedicated
-    /// prefix (#175), and the per-key pass there is what enforces
-    /// `cleanup.policy=compact`. Retained so the existing call sites still
-    /// compile.
-    pub fn compacted_segments(self, _compacted_segments: bool) -> Self {
-        self
-    }
-
-    /// No-op: the legacy carry-over always runs, which makes it the standing
-    /// reconciliation for any straggler rather than a one-shot migration
-    /// (#175 release 2, widened by #211). Retained so the existing call sites
-    /// still compile.
-    pub fn compacted_carryover(self, _compacted_carryover: bool) -> Self {
-        self
-    }
-
     /// Override the prefix single-writer lease term (#59). Kept above ~1s in
     /// production so lease renewal stays under GCS's per-object mutation cap
     /// (#13); lowered only in tests to exercise failover/fencing quickly.

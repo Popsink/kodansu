@@ -12,7 +12,7 @@ version.workspace = true
 
 [features]
 default = ["dynostore"]
-dynostore = ["dep:object_store", "tansu-storage/dynostore"]
+dynostore = ["tansu-storage/dynostore"]
 
 [lints]
 workspace = true
@@ -23,28 +23,20 @@ bytes.workspace = true
 clap.workspace = true
 console.workspace = true
 futures.workspace = true
-glob.workspace = true
-http-body-util.workspace = true
 humantime.workspace = true
-hyper-util.workspace = true
-hyper.workspace = true
 indicatif.workspace = true
-jsonschema.workspace = true
-object_store = { workspace = true, optional = true }
 opentelemetry-otlp.workspace = true
 opentelemetry-semantic-conventions.workspace = true
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 rama.workspace = true
 rand.workspace = true
-regex.workspace = true
 rsasl.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tansu-auth.workspace = true
 tansu-client.workspace = true
-tansu-model.workspace = true
 tansu-sans-io.workspace = true
 tansu-service.workspace = true
 tansu-storage.workspace = true
@@ -60,6 +52,5 @@ uuid.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
-object_store = { workspace = true }
 pretty_assertions.workspace = true
 tansu-storage = { workspace = true }

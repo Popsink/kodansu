@@ -55,7 +55,6 @@ services:
       --storage-engine ${STORAGE_ENGINE}
     ports:
       - 9092:9092
-      - 9100:9100
   jaeger:
     image: jaegertracing/all-in-one
     ports:

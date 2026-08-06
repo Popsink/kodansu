@@ -630,13 +630,6 @@ impl Message {
     }
 
     #[must_use]
-    #[allow(clippy::missing_panics_doc, clippy::unwrap_used)]
-    pub fn wrapper_new_type(&self, field: &Field) -> Type {
-        syn::parse_str::<Type>(&format!("{}{}", self.name, field.name).to_case(Case::Pascal))
-            .unwrap()
-    }
-
-    #[must_use]
     pub fn common_structs(&self) -> Option<&[CommonStruct]> {
         self.common_structs.as_deref()
     }
@@ -763,14 +756,6 @@ impl<'a> TryFrom<&Wv<'a>> for CommonStruct {
 
         Ok(Self { name, fields })
     }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct HeaderMeta {
-    pub name: &'static str,
-    pub valid: VersionRange,
-    pub flexible: VersionRange,
-    pub fields: &'static [(&'static str, &'static FieldMeta)],
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]

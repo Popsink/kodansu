@@ -13,29 +13,22 @@
 // limitations under the License.
 
 use std::{
-    collections::HashMap,
-    env::vars,
     fmt, io,
     net::AddrParseError,
     num::TryFromIntError,
     result,
-    str::{FromStr, Utf8Error},
-    string::FromUtf8Error,
+    str::FromStr,
     sync::{Arc, LazyLock, PoisonError},
     time::{Duration, SystemTimeError},
 };
 
-use glob::PatternError;
-use jsonschema::ValidationError;
 use opentelemetry::{InstrumentationScope, global, metrics::Meter};
 use opentelemetry_otlp::ExporterBuildError;
 use opentelemetry_semantic_conventions::SCHEMA_URL;
-use regex::{Regex, Replacer};
 use tansu_sans_io::ErrorCode;
 use thiserror::Error;
 use tokio::{sync::broadcast::error::SendError, task::JoinError};
 use tracing_subscriber::filter::ParseError;
-use url::Url;
 
 pub mod broker;
 pub mod coordinator;
@@ -74,46 +67,31 @@ pub enum Error {
     Api(ErrorCode),
     Auth(#[from] tansu_auth::Error),
     Client(#[from] tansu_client::Error),
-    Custom(String),
-    DuplicateApiService(i16),
-    EmptyCoordinatorWrapper,
-    EmptyJoinGroupRequestProtocol,
-    ExpectedJoinGroupRequestProtocol(&'static str),
     ExporterBuild(Arc<ExporterBuildError>),
 
-    Hyper(Arc<hyper::http::Error>),
     Io(Arc<io::Error>),
+
+    // `tansu_service`'s TCP service stack requires `Error: From<JoinError>` to
+    // spawn its per-connection tasks, so this variant is load-bearing even
+    // though nothing in this crate names it.
     Join(Arc<JoinError>),
     Json(Arc<serde_json::Error>),
     KafkaProtocol(#[from] tansu_sans_io::Error),
 
     Message(String),
-    Model(#[from] tansu_model::Error),
-
-    #[cfg(feature = "dynostore")]
-    ObjectStore(Arc<object_store::Error>),
 
     ParseFilter(Arc<ParseError>),
-    ParseInt(#[from] std::num::ParseIntError),
-    Pattern(Arc<PatternError>),
     Poison,
-
-    Regex(#[from] regex::Error),
 
     Service(#[from] tansu_service::Error),
     Storage(#[from] tansu_storage::Error),
-    StringUtf8(#[from] FromUtf8Error),
     SystemTime(#[from] SystemTimeError),
 
     TryFromInt(#[from] TryFromIntError),
 
-    UnsupportedApiService(i16),
-    UnsupportedStorageUrl(Url),
     UnsupportedTracingFormat(String),
     Url(#[from] url::ParseError),
-    Utf8(#[from] Utf8Error),
     Uuid(#[from] uuid::Error),
-    SchemaValidation,
     Send(Arc<SendError<CancelKind>>),
 }
 
@@ -162,30 +140,6 @@ impl tansu_service::Classify for Error {
     }
 }
 
-impl From<PatternError> for Error {
-    fn from(value: PatternError) -> Self {
-        Self::Pattern(Arc::new(value))
-    }
-}
-
-impl From<ExporterBuildError> for Error {
-    fn from(value: ExporterBuildError) -> Self {
-        Self::ExporterBuild(Arc::new(value))
-    }
-}
-
-impl From<SendError<CancelKind>> for Error {
-    fn from(value: SendError<CancelKind>) -> Self {
-        Self::Send(Arc::new(value))
-    }
-}
-
-impl From<hyper::http::Error> for Error {
-    fn from(value: hyper::http::Error) -> Self {
-        Self::Hyper(Arc::new(value))
-    }
-}
-
 impl From<JoinError> for Error {
     fn from(value: JoinError) -> Self {
         Self::Join(Arc::new(value))
@@ -204,17 +158,15 @@ impl From<Arc<serde_json::Error>> for Error {
     }
 }
 
-#[cfg(feature = "dynostore")]
-impl From<object_store::Error> for Error {
-    fn from(value: object_store::Error) -> Self {
-        Self::from(Arc::new(value))
+impl From<ExporterBuildError> for Error {
+    fn from(value: ExporterBuildError) -> Self {
+        Self::ExporterBuild(Arc::new(value))
     }
 }
 
-#[cfg(feature = "dynostore")]
-impl From<Arc<object_store::Error>> for Error {
-    fn from(value: Arc<object_store::Error>) -> Self {
-        Self::ObjectStore(value)
+impl From<SendError<CancelKind>> for Error {
+    fn from(value: SendError<CancelKind>) -> Self {
+        Self::Send(Arc::new(value))
     }
 }
 
@@ -233,12 +185,6 @@ impl From<io::Error> for Error {
 impl<T> From<PoisonError<T>> for Error {
     fn from(_value: PoisonError<T>) -> Self {
         Self::Poison
-    }
-}
-
-impl From<ValidationError<'_>> for Error {
-    fn from(_value: ValidationError<'_>) -> Self {
-        Self::SchemaValidation
     }
 }
 
@@ -265,56 +211,5 @@ impl FromStr for TracingFormat {
             "json" => Ok(Self::Json),
             otherwise => Err(Error::UnsupportedTracingFormat(otherwise.to_owned())),
         }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct VarRep(HashMap<String, String>);
-
-impl From<HashMap<String, String>> for VarRep {
-    fn from(value: HashMap<String, String>) -> Self {
-        Self(value)
-    }
-}
-
-impl VarRep {
-    fn replace(&self, haystack: &str) -> Result<String> {
-        Regex::new(r"\$\{(?<var>[^\}]+)\}")
-            .map(|re| re.replace(haystack, self).into_owned())
-            .map_err(Into::into)
-    }
-}
-
-impl Replacer for &VarRep {
-    fn replace_append(&mut self, caps: &regex::Captures<'_>, dst: &mut String) {
-        if let Some(variable) = caps.name("var")
-            && let Some(value) = self.0.get(variable.as_str())
-        {
-            dst.push_str(value);
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct EnvVarExp<T>(T);
-
-impl<T> EnvVarExp<T> {
-    pub fn into_inner(self) -> T {
-        self.0
-    }
-}
-
-impl<T> FromStr for EnvVarExp<T>
-where
-    T: FromStr,
-    Error: From<<T as FromStr>::Err>,
-{
-    type Err = Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        VarRep::from(vars().collect::<HashMap<_, _>>())
-            .replace(s)
-            .and_then(|s| T::from_str(&s).map_err(Into::into))
-            .map(|t| Self(t))
     }
 }
