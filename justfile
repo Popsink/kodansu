@@ -29,6 +29,40 @@ nextest *args:
 test-doc:
     cargo test --workspace --doc --all-features
 
+# The crates and features coverage is measured over. Deliberately the same set
+# `test-workspace` runs, minus `--all-targets`: measuring a different set to the
+# one CI tests would report a percentage that no run can reproduce.
+#
+# `--all-targets` is dropped because it makes cargo build the benchmark and
+# example targets too, and llvm-cov then counts their lines as uncovered source.
+# `--exclude fuzz` is here for the same reason as in `test-workspace`: the crate
+# needs a C++ libfuzzer toolchain that is not always present.
+coverage-scope := "--workspace --all-features --no-fail-fast --exclude fuzz"
+
+# Line coverage in the terminal.
+coverage *args:
+    cargo llvm-cov nextest {{ coverage-scope }} {{ args }}
+
+# Coverage as a browsable report: the one that answers "what is not covered".
+coverage-html:
+    cargo llvm-cov nextest {{ coverage-scope }} --html --open
+
+# The floor is a ratchet, not a target. It exists so a change cannot quietly
+# delete the tests covering the code it touches; raise it when the real number
+# moves up, never lower it to make a red build green.
+#
+# Instrument once, report three ways off the same profraw set: lcov for Codecov,
+# a summary for the job summary, and HTML for the artifact. See docs/testing.md.
+
+# CI entry point: coverage as lcov + HTML + a summary, failing under floor%.
+coverage-ci floor="0":
+    cargo llvm-cov clean --workspace
+    cargo llvm-cov nextest --no-report {{ coverage-scope }}
+    cargo llvm-cov report --lcov --output-path lcov.info
+    cargo llvm-cov report --html --output-dir coverage-html
+    cargo llvm-cov report --json --summary-only --output-path coverage-summary.json
+    cargo llvm-cov report --summary-only --fail-under-lines {{ floor }}
+
 doc:
     cargo doc --all-features --open
 

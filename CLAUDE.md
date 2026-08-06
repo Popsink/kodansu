@@ -28,6 +28,8 @@ just test-doc        # cargo test --workspace --doc --all-features
 just clippy          # cargo clippy --workspace --all-features --all-targets -- -D warnings
 just fmt             # cargo fmt --all --check
 just check           # cargo check --workspace --all-features --all-targets
+just coverage        # line coverage summary (needs cargo-llvm-cov)
+just coverage-html   # browsable coverage report
 ```
 
 Note: the `fuzz` crate depends on a C++ libfuzzer toolchain that is not always
@@ -114,15 +116,26 @@ lake feature flags any more.
 
 - Tests use `cargo-nextest` (not `cargo test` for workspace tests)
 - Test logs go to `logs/<crate-name>/` (one file per test thread, dirs must exist)
-- Integration tests use minio (S3) started via `just ci`, or the in-memory store
 - Tests load `.env` via `dotenv().ok()`
-- Storage tests run against `DynoStore` over an in-memory/object store
+- **No test needs a running service.** Every one builds its own
+  `StorageContainer` over `memory://`, so `just test` works with no Docker and no
+  minio. The corollary is that the S3 and GCS object stores are untested, and
+  conditional put is exactly where `InMemory` and S3 differ — see
+  `docs/testing.md`.
 
 ## CI Pipeline
 
-GitHub Actions (`.github/workflows/`): check -> fmt -> clippy -> build-storage (the `dynostore` feature) -> test (against the S3/minio object store) -> publish dry-run -> typos -> package (a build-only container image).
+`pr.yml` is the only workflow that runs on pull requests: fmt, clippy,
+check-no-default-features, build-storage, test and coverage in parallel, summed
+up by `all-green`. `ci.yml` is disabled (upstream's, kept for reference) and
+`publish.yml` pushes `ghcr.io/popsink/tansu` on `v*` tags.
 
-There are no smoke tests. The upstream `smoke` job was gated on `github.actor == 'shortishly'`, so it never ran in this fork; #282 deleted it. `publish.yml` is what pushes `ghcr.io/popsink/tansu`, on `v*` tags.
+There is no `check` job — `clippy` runs over the same selection and type-checks
+before it lints. Branch protection still requires `test` alone, which is why
+`test` has a `needs: [fmt, clippy]` gate; `docs/testing.md` has the one command
+that moves it to `all-green` and lets the gate go.
+
+There are no smoke tests. The upstream `smoke` job was gated on `github.actor == 'shortishly'`, so it never ran in this fork; #282 deleted it.
 
 ## Key Files
 

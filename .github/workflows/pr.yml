@@ -6,42 +6,23 @@ on:
     branches:
       - main
 
+# A second push onto a PR branch leaves the run already in flight answering a
+# commit nobody is looking at any more. On a branch pushed twice inside a few
+# minutes this is the difference between two whole CI runs and one.
+concurrency:
+  group: pr-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CLICOLOR: 1
 
 jobs:
-  check:
-    runs-on: ubuntu-latest-8-cores
-    steps:
-      - uses: actions/checkout@v6
-      - uses: extractions/setup-just@v3
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          components: clippy, rustfmt
-          cache: false
-      - run: just check
-
-  check-no-default-features:
-    runs-on: ubuntu-latest-8-cores
-    steps:
-      - uses: actions/checkout@v6
-      - uses: extractions/setup-just@v3
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          components: clippy, rustfmt
-          cache: false
-          # This job asks whether the crates still COMPILE with their optional
-          # features off, not whether they are warning-clean in a configuration
-          # nobody ships. The toolchain action defaults to `-D warnings`, and with
-          # `dynostore` off roughly twenty items in `tansu-storage` are genuinely
-          # unused — the `METER`, the batch gauges, `TopicDefaults::apply` — because
-          # their only consumers live inside the gated module. Cfg-ing all of them
-          # would be churn in service of a build that is never produced.
-          #
-          # The class this job exists for survives the relaxation: #334 was
-          # `error[E0432] unresolved import`, a hard error, and still fails here.
-          rustflags: ""
-      - run: just check-no-default-features
+  # A `check` job used to live here, running `cargo check --workspace
+  # --all-features --all-targets`. `clippy` below runs `cargo clippy` over
+  # exactly that selection, and clippy type-checks everything check does before
+  # it lints it — so the job was a second full compile of the workspace that
+  # could not fail unless clippy had already failed. Deleted; clippy is the
+  # check.
 
   fmt:
     runs-on: ubuntu-latest
@@ -65,6 +46,28 @@ jobs:
           cache: false
       - run: just clippy
 
+  check-no-default-features:
+    runs-on: ubuntu-latest-8-cores
+    steps:
+      - uses: actions/checkout@v6
+      - uses: extractions/setup-just@v3
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy, rustfmt
+          cache: false
+          # This job asks whether the crates still COMPILE with their optional
+          # features off, not whether they are warning-clean in a configuration
+          # nobody ships. The toolchain action defaults to `-D warnings`, and with
+          # `dynostore` off roughly twenty items in `tansu-storage` are genuinely
+          # unused — the `METER`, the batch gauges, `TopicDefaults::apply` —
+          # because their only consumers live inside the gated module. Cfg-ing all
+          # of them would be churn in service of a build that is never produced.
+          #
+          # The class this job exists for survives the relaxation: #334 was
+          # `error[E0432] unresolved import`, a hard error, and still fails here.
+          rustflags: ""
+      - run: just check-no-default-features
+
   build-storage:
     runs-on: ubuntu-latest
     strategy:
@@ -78,34 +81,47 @@ jobs:
         with:
           components: clippy, rustfmt
           cache: false
-      - run: sudo apt-get update && sudo apt-get install -y libclang-dev libkrb5-dev
+      # `sudo apt-get update && sudo apt-get install -y libclang-dev libkrb5-dev`
+      # stood here and in `test`, 46s of the test job measured. Both were for
+      # dependencies this fork no longer has: nothing in Cargo.lock links krb5,
+      # and the only C dependencies left — aws-lc-sys, lz4-sys, zstd-sys — ship
+      # pregenerated bindings on x86_64-linux and so need no libclang. The proof
+      # is that `check` and `clippy` never installed either package and pass:
+      # build scripts run in full under `cargo check`, so a missing libclang
+      # would have failed there first.
       - run: cargo build --features ${{ matrix.storage }}
 
   test:
-    needs: [check, fmt, clippy, build-storage]
+    # Only the two lints that cost seconds, not the jobs that cost minutes.
+    #
+    # `test` is the sole required status check on `main`, so whatever it waits on
+    # is transitively enforced and whatever it does not, is not — which is the
+    # only reason this gate exists at all. `build-storage` used to be in here and
+    # it is the slowest job on the board: the gate held the test job back ~2m50s
+    # on every green PR to enforce a link step that `--all-targets` below
+    # performs anyway.
+    #
+    # Once `all-green` is the required check instead, this line can go entirely
+    # and the tests start at T+0.
+    needs: [fmt, clippy]
     runs-on: ubuntu-latest-8-cores
     env:
-      ADVERTISED_LISTENER_URL: tcp://localhost:9092
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_ALLOW_HTTP: true
-      AWS_DEFAULT_REGION: eu-west-2
-      AWS_ENDPOINT: http://localhost:9000
-      AWS_SECRET_ACCESS_KEY: minioadmin
       CARGO_BUILD_BUILD_DIR: /mnt/build
-      CLUSTER_ID: tansu-ci
       NEXTEST_PROFILE: ci
-      TANSU_IMAGE: ghcr.io/popsink/tansu
       RUST_BACKTRACE: 1
       RUST_LOG: debug,tansu_sans_io=warn,tansu_model=warn
-      STORAGE_ENGINE: s3://tansu/
     steps:
+      # No `just ci` and no AWS_*/STORAGE_ENGINE block here any more. Every test
+      # in the workspace builds its own `StorageContainer` over `memory://`; not
+      # one of them reads AWS_ENDPOINT, opens an `s3://` URL, or so much as
+      # mentions minio. The compose stack was started, waited for, and ignored.
+      #
+      # It follows that the S3 and GCS object stores are untested, which the
+      # minio service made look otherwise. See docs/testing.md.
       - run: sudo mkdir /mnt/build
       - run: sudo chmod a+rwxt /mnt/build
-      - run: df -h
       - uses: actions/checkout@v6
       - uses: extractions/setup-just@v3
-      - run: just ci
-      - run: sudo apt-get update && sudo apt-get install -y libclang-dev libkrb5-dev
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           components: clippy, rustfmt
@@ -114,9 +130,7 @@ jobs:
       # source on every run, 1m37s measured, for something upstream ships (#256).
       - uses: taiki-e/install-action@nextest
       - run: just test
-      - run: df -h
-        if: always()
-      - run: tar --create --verbose --gzip --file=logs.tar.gz logs
+      - run: tar --create --gzip --file=logs.tar.gz logs
         if: always()
       - uses: actions/upload-artifact@v7
         if: always()
@@ -124,3 +138,109 @@ jobs:
           name: logs
           path: logs.tar.gz
           if-no-files-found: error
+
+  coverage:
+    runs-on: ubuntu-latest-8-cores
+    env:
+      CARGO_BUILD_BUILD_DIR: /mnt/build
+      NEXTEST_PROFILE: ci
+      RUST_BACKTRACE: 1
+      # Coverage does not read the logs, and instrumented binaries writing a
+      # debug line per frame to disk is pure overhead on this job.
+      RUST_LOG: warn
+    steps:
+      - run: sudo mkdir /mnt/build
+      - run: sudo chmod a+rwxt /mnt/build
+      - uses: actions/checkout@v6
+      - uses: extractions/setup-just@v3
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: llvm-tools-preview
+          cache: false
+      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # The floor is a ratchet, and 70 is deliberately under the 73.21% measured
+      # at the time it was set: it is there to catch a change that deletes the
+      # tests covering the code it touches, not to police a decimal point. Raise
+      # it when the real number moves up; never lower it to turn a red build
+      # green, which is the one edit that makes this job decorative.
+      - run: just coverage-ci 70
+      - name: Coverage summary
+        if: always()
+        run: |
+          {
+            echo '## Coverage'
+            echo
+            echo '```'
+            cargo llvm-cov report --summary-only 2>/dev/null | tail -n 3 || true
+            echo '```'
+            echo
+            echo 'Full per-file report: the `coverage` artifact on this run.'
+          } >>"${GITHUB_STEP_SUMMARY}"
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: coverage
+          path: |
+            lcov.info
+            coverage-html
+          if-no-files-found: warn
+      # Codecov is optional and stays skipped until someone adds the secret. The
+      # lcov artifact above is the fallback and it needs no third-party account.
+      #
+      # The presence of the secret is turned into a step output rather than
+      # tested inline: neither `secrets` nor a step's own `env` is reliably
+      # readable from that step's `if`, and a condition that silently evaluates
+      # to false is indistinguishable from one that is correctly skipping.
+      - name: Is Codecov configured?
+        id: codecov
+        if: always()
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+        run: |
+          if [ -n "${CODECOV_TOKEN}" ]; then
+            echo 'configured=true' >>"${GITHUB_OUTPUT}"
+          else
+            echo 'no CODECOV_TOKEN secret: skipping upload, see the coverage artifact'
+          fi
+      - uses: codecov/codecov-action@v5
+        if: ${{ !cancelled() && steps.codecov.outputs.configured == 'true' }}
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
+  # One check to require on `main` in place of `test`.
+  #
+  # `test` is what branch protection requires today, which is the only reason it
+  # has to `needs:` the lints — a required check is the sole thing branch
+  # protection enforces, so anything not upstream of it can go red and still
+  # merge. Pointing branch protection at this job instead enforces every job at
+  # once and lets `test` start at T+0:
+  #
+  #   gh api -X PATCH \
+  #     repos/Popsink/tansu/branches/main/protection/required_status_checks \
+  #     -f 'checks[][context]=all-green'
+  all-green:
+    if: always()
+    needs:
+      - fmt
+      - clippy
+      - check-no-default-features
+      - build-storage
+      - test
+      - coverage
+    runs-on: ubuntu-latest
+    steps:
+      # `needs.*.result` reads 'skipped' for a job whose own dependency failed,
+      # and `success()` treats a skipped dependency as fine — so the check has to
+      # be that every result is literally 'success'.
+      - env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "${RESULTS}"
+          failed=$(jq -r 'to_entries[] | select(.value.result != "success") | .key' <<<"${RESULTS}")
+          if [ -n "${failed}" ]; then
+            echo "not successful: ${failed}"
+            exit 1
+          fi

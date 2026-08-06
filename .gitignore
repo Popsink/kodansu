@@ -16,9 +16,12 @@
 .zed
 Cargo.lock
 cargo-flamegraph.trace
+coverage-html
+coverage-summary.json
 debug
 dhat.*
 flamegraph*.svg
+lcov.info
 license.html
 perf.data*
 profile.json*
