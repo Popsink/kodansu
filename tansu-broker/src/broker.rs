@@ -40,7 +40,7 @@ use std::{
         Arc, LazyLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tansu_sans_io::{ErrorCode, RootMessageMeta};
 use tansu_service::{Classify as _, Severity};
@@ -105,6 +105,37 @@ where
              (a run wedged in S3 retries would otherwise disable maintenance until restart)"
         );
     }
+}
+
+/// How long from `now` until the next wall-clock-aligned maintenance tick — the
+/// next instant whose milliseconds since the Unix epoch divide evenly by
+/// `period`.
+///
+/// The point is that the answer does not depend on `now` beyond where it falls
+/// in the period, so two processes asking at different moments still land on the
+/// same tick. That is what makes replicas share a schedule without coordinating,
+/// and what keeps a pod that started 20s after its peers from trailing them
+/// forever (see the call site).
+///
+/// Returns a delay in `(0, period]`: exactly on a boundary it waits a whole
+/// period rather than firing immediately, so a restart loop cannot turn into a
+/// maintenance loop.
+fn until_next_aligned_tick(now: SystemTime, period: Duration) -> Duration {
+    let period_ms = period.as_millis();
+    if period_ms == 0 {
+        return period;
+    }
+
+    let now_ms = now
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+
+    let remaining = period_ms - (now_ms % period_ms);
+
+    // `remaining <= period_ms`, and a `Duration` this came from is expressible,
+    // so the fallback is unreachable rather than a policy.
+    u64::try_from(remaining).map_or(period, Duration::from_millis)
 }
 
 #[derive(Clone, Debug)]
@@ -327,15 +358,34 @@ where
             .saturating_mul(6)
             .clamp(Duration::from_mins(30), Duration::from_mins(60));
 
-        // Desynchronise replicas: every broker pod runs `maintain` on the *same*
-        // bucket, and without this they fire on near-identical schedules from a
-        // shared startup, so N replicas scan+delete the same prefixes at once —
-        // N× the S3 load and N pods spiking memory together (#8). Offset the
-        // first tick by a deterministic, node-derived fraction of the period
-        // (golden-ratio spread) so the runs fan out across the interval.
-        let phase = (self.node_id.unsigned_abs() as f64 * 0.618_033_988_75).fract();
+        // Every replica ticks on the same wall-clock schedule, so the tick a
+        // pod lands on does not depend on when that pod started.
+        //
+        // This used to offset the first tick by a node-derived fraction of the
+        // period — a golden-ratio spread meant to keep N replicas off each
+        // other's schedule, back when a shared startup meant they would all
+        // scan+delete the same prefixes at once (#8). Two things happened to
+        // it. `NODE_ID` is the constant 111 (`crate::NODE_ID`), so the spread
+        // has always given every replica the *same* fraction and desynchronised
+        // nothing; and #126 replaced the property it was protecting — the claim
+        // now takes a per-prefix lease and skips anything a peer stamped within
+        // `maintenance_recency`, so duplicated work is prevented by the claim,
+        // not by the clock.
+        //
+        // What was left was an offset measured from each process's own start,
+        // which turned pod start skew into tick skew. Because the claim stamps
+        // every lease up front, a replica trailing the leader by less than the
+        // recency window finds the whole universe already stamped and skips all
+        // of it — every tick, for the life of the process. Measured in
+        // production: of four maintainers, the two that started in the same
+        // second shared the work and the two that started 20s later did nothing
+        // for six hours but pay one lease GET per prefix per tick.
+        //
+        // Anchoring to the wall clock removes the skew rather than the sharing:
+        // co-ticking replicas contend on the leases and split the universe
+        // between them, which is what the two working replicas already did.
         let mut interval = time::interval_at(
-            Instant::now() + maintenance_period.mul_f64(phase),
+            Instant::now() + until_next_aligned_tick(SystemTime::now(), maintenance_period),
             maintenance_period,
         );
 
@@ -1050,6 +1100,82 @@ mod tests {
             !in_flight.load(Ordering::Acquire),
             "guard must be released after the run completes"
         );
+    }
+
+    mod aligned_tick {
+        use super::*;
+
+        fn at(unix_ms: u64) -> SystemTime {
+            UNIX_EPOCH + Duration::from_millis(unix_ms)
+        }
+
+        // The property the fleet depends on: two pods that started at different
+        // moments must land on the same tick. This is the regression — the old
+        // schedule measured its first tick from each process's own start, so a
+        // replica launched 20s after its peers stayed 20s behind them forever
+        // and the claim's recency skip left it with nothing to do, every tick.
+        #[test]
+        fn replicas_that_start_apart_still_land_on_the_same_tick() {
+            let period = Duration::from_mins(10);
+
+            let leader_started = 1_000_000_000_000;
+            let trailer_started = leader_started + 20_000;
+
+            assert_eq!(
+                at(leader_started) + until_next_aligned_tick(at(leader_started), period),
+                at(trailer_started) + until_next_aligned_tick(at(trailer_started), period),
+            );
+        }
+
+        // Two pods a *whole period* apart land on different ticks, of course —
+        // but still on the same grid, which is the same property stated where it
+        // is easy to get wrong.
+        #[test]
+        fn every_tick_falls_on_the_period_grid() {
+            let period = Duration::from_mins(10);
+
+            for start in [0, 1, 199_999, 1_000_000_000_123, 1_755_000_000_000u64] {
+                let tick =
+                    Duration::from_millis(start) + until_next_aligned_tick(at(start), period);
+
+                assert_eq!(
+                    tick.as_millis() % period.as_millis(),
+                    0,
+                    "tick for start={start} is off the grid"
+                );
+            }
+        }
+
+        // Exactly on a boundary, wait a whole period rather than firing
+        // immediately: a crash-looping pod would otherwise run a full
+        // maintenance pass on every start.
+        #[test]
+        fn a_start_on_the_boundary_waits_a_whole_period() {
+            let period = Duration::from_mins(10);
+
+            assert_eq!(until_next_aligned_tick(at(600_000), period), period);
+        }
+
+        // The "compaction disabled on serving brokers" configuration is a period
+        // of a year, which must not overflow the millisecond arithmetic or
+        // saturate to something short.
+        #[test]
+        fn a_year_long_period_is_expressible() {
+            let period = Duration::from_hours(8760);
+            let delay = until_next_aligned_tick(at(1_755_000_000_000), period);
+
+            assert!(delay > Duration::ZERO && delay <= period, "{delay:?}");
+        }
+
+        // Degenerate rather than reachable — no configuration produces it — but
+        // the modulo below it would divide by zero.
+        #[test]
+        fn a_zero_period_does_not_divide_by_zero() {
+            assert_eq!(
+                until_next_aligned_tick(at(1_755_000_000_000), Duration::ZERO),
+                Duration::ZERO
+            );
+        }
     }
 
     /// Building a broker needs the in-memory object store, which — like the
