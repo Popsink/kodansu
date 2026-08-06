@@ -569,6 +569,14 @@ where
                 // `early eof` shape of #300, and this line is the only evidence
                 // that a request-level error is what caused it. Downgrading the
                 // error code must not take that with it.
+                //
+                // #300 removed the largest population that reached here:
+                // `Error::Api` on a group API, which the coordinator means as a
+                // protocol *answer* (`NOT_COORDINATOR` from a failed forward,
+                // #243) and which was costing a connection instead of being
+                // written back. `broker::group::answer` converts those now, so
+                // what still arrives here is an error the broker has no answer
+                // for — which is what makes this line worth reading.
                 Err(error) => match error.severity() {
                     Severity::Expected => debug!(?error),
 

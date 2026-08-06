@@ -16,6 +16,7 @@ use rama::{Context, Service};
 use tansu_sans_io::{ApiKey, Frame, Header, OffsetCommitRequest};
 use tracing::instrument;
 
+use super::answer;
 use crate::{
     Error, Result,
     coordinator::group::{Coordinator, OffsetCommit},
@@ -56,6 +57,18 @@ where
                 topics: offset_commit.topics.as_deref(),
             })
             .await
+            .or_else(|error| match error {
+                // An `Error::Api` is an answer the broker chose, not a failure.
+                // Answering it here is what stops it from ending the connection
+                // with no response written — `early eof` to the caller (#300). See
+                // [`super::answer`].
+                Error::Api(error_code) => Ok(answer::offset_commit(
+                    error_code,
+                    offset_commit.topics.as_deref(),
+                )),
+
+                otherwise => Err(otherwise),
+            })
             .map(|body| Frame {
                 size: 0,
                 header: Header::Response { correlation_id },
