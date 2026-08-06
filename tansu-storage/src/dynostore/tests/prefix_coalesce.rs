@@ -465,10 +465,11 @@ async fn a_recreated_topic_inherits_nothing_from_a_shared_segment() -> Result<()
 /// fleet, so today this condition is neither counted nor logged.
 ///
 /// The *neighbouring* state — a floor above the surviving segment tail — is
-/// counted (`tansu_watermark_above_segment_tail`, #338) and, when the segment
-/// expiry that created it certified so (`Watermark::served`), its fetches now
+/// counted (`tansu_watermark_above_segment_tail`, #338) and, once certified
+/// (`Watermark::served`) either by the expiry that created it or by
+/// `certify_prefix_served_ends` reconciling one it never saw, its fetches
 /// answer `OffsetOutOfRange` (#290). Neither reaches this test's state: here
-/// the index *covers* the offset and no expiry certified anything, so empty —
+/// the index *covers* the offset, so there is no gap to certify and empty —
 /// bounded, error-free — remains the answer.
 ///
 /// What remains worth pinning is the property that survives the removal — the
@@ -5080,6 +5081,192 @@ async fn transactional_duplicate_reregistration_is_idempotent() -> Result<(), Er
     let stage = store.offset_stage(&a).await?;
     assert_eq!(4, stage.high_watermark());
     assert_eq!(4, stage.last_stable());
+
+    Ok(())
+}
+
+/// A gap left by an expiry that never certified it is certified by the
+/// reconciliation pass, and the fetch inside it goes from empty-forever to
+/// `OFFSET_OUT_OF_RANGE` (#290).
+///
+/// This is the population #343 could not reach. Only the expiry that performed a
+/// delete writes `Watermark::served`, so every gap that predates it carries
+/// none — and the deployment that reported #290 runs `maintenance_interval` at a
+/// year, so no organic expiry will ever come along to certify one. Those
+/// partitions keep answering empty to a parked consumer, which is #290's
+/// original complaint verbatim.
+///
+/// The pre-#343 state is reproduced by stripping the pair the expiry wrote,
+/// rather than by simulating damage: what is left is exactly the bytes an older
+/// binary's expiry leaves behind.
+#[tokio::test]
+async fn an_uncertified_gap_is_certified_by_the_reconciliation_pass() -> Result<(), Error> {
+    let ttl = Duration::from_millis(80);
+    let bucket = InMemory::new();
+
+    let topic = "org.env.conn.tab_a";
+    let a = Topition::new(topic, 0);
+
+    let recent = now_ms();
+    let ancient = 1_000;
+
+    // The process that creates the gap, then forgets to say so — an expiry
+    // running an older binary.
+    {
+        let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_lease_ttl(ttl);
+        create_topic(&store, topic).await?;
+
+        _ = store.produce(None, &a, batch_at(2, recent)?).await?;
+        _ = store.produce(None, &a, batch_at(2, ancient)?).await?;
+        assert_eq!(4, store.high_watermark(&a).await?);
+
+        assert_eq!(
+            1,
+            store.expire_prefix_segments(PREFIX, recent - 1_000).await?
+        );
+
+        store
+            .watermark(&a)?
+            .with_mut(&bucket, |watermark| {
+                watermark.served = None;
+                Ok(())
+            })
+            .await?;
+    }
+
+    // The lease lapses, so the next process may take it over.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // A fresh process: nothing here is answered out of the memory of the store
+    // that did the expiry.
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_lease_ttl(ttl);
+
+    assert_eq!(
+        (4, None),
+        store.persisted_watermark_bounds(&a).await?,
+        "the gap must start out uncertified, as every existing one is"
+    );
+
+    assert_eq!(4, store.high_watermark(&a).await?);
+    assert!(
+        fetch_from(&store, &a, 2).await?.is_empty(),
+        "an uncertified gap answers empty, with no error on either side — #290"
+    );
+
+    assert_eq!(
+        1,
+        store.certify_prefix_served_ends(PREFIX).await?,
+        "the pass must certify the one sub-stream whose floor sits above its tail"
+    );
+
+    assert_eq!(
+        (4, Some(ServedEnd { end: 2, at_high: 4 })),
+        store.persisted_watermark_bounds(&a).await?,
+        "the reconciliation must write the same pair the expiry would have"
+    );
+
+    // The advertised end does not move: the floor is the next offset to assign,
+    // and lowering it under offsets a peer may have acked is the regression
+    // `scaling` forbids. What changes is the answer inside the gap.
+    assert_eq!(4, store.high_watermark(&a).await?);
+
+    for offset in [2, 3] {
+        assert!(
+            matches!(
+                fetch_from(&store, &a, offset).await,
+                Err(Error::Api(ErrorCode::OffsetOutOfRange))
+            ),
+            "offset {offset} is now certified dead and must answer OFFSET_OUT_OF_RANGE"
+        );
+    }
+
+    // The surviving records are untouched: this certifies a gap, it does not
+    // condemn a log.
+    assert!(!fetch_from(&store, &a, 0).await?.is_empty());
+    assert!(fetch_from(&store, &a, 4).await?.is_empty());
+
+    // Once per prefix per process, so the same store does no further work.
+    assert_eq!(0, store.certify_prefix_served_ends(PREFIX).await?);
+
+    // And a cold replica reaches the same answer without running the pass at
+    // all, so the certification is a property of the bucket rather than of the
+    // process that wrote it.
+    let cold = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_lease_ttl(ttl);
+    assert_eq!(4, cold.high_watermark(&a).await?);
+    assert!(
+        matches!(
+            fetch_from(&cold, &a, 2).await,
+            Err(Error::Api(ErrorCode::OffsetOutOfRange))
+        ),
+        "a cold replica must refuse the certified-dead gap too"
+    );
+
+    // A third process running the pass over an already-certified prefix writes
+    // nothing, so a fleet restart does not cost a PUT per sub-stream per pod.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        0,
+        DynoStore::new(CLUSTER, NODE, bucket.clone())
+            .prefix_lease_ttl(ttl)
+            .certify_prefix_served_ends(PREFIX)
+            .await?,
+        "an already-certified prefix must not be rewritten"
+    );
+
+    Ok(())
+}
+
+/// The reconciliation certifies nothing on a healthy prefix, and nothing on a
+/// fully drained partition (#290).
+///
+/// Both halves matter. A pass that certified a healthy sub-stream would make a
+/// live partition answer `OFFSET_OUT_OF_RANGE` — the #303 failure, which reset
+/// consumers on 61 topics. A drained partition legitimately has the floor as its
+/// only authority, and #299 already reports it as a log starting where it ends;
+/// certifying `[0, floor)` there would be a second, redundant answer to a
+/// question already answered.
+#[tokio::test]
+async fn the_reconciliation_leaves_a_healthy_or_drained_partition_alone() -> Result<(), Error> {
+    let ttl = Duration::from_millis(80);
+    let bucket = InMemory::new();
+
+    let healthy = "org.env.conn.tab_a";
+    let drained = "org.env.conn.tab_b";
+    let a = Topition::new(healthy, 0);
+    let b = Topition::new(drained, 0);
+
+    let recent = now_ms();
+    let ancient = 1_000;
+
+    {
+        let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_lease_ttl(ttl);
+        create_topic(&store, healthy).await?;
+        create_topic(&store, drained).await?;
+
+        // `a` keeps everything; `b` loses its only segment, so it has no tail.
+        _ = store.produce(None, &a, batch_at(2, recent)?).await?;
+        _ = store.produce(None, &b, batch_at(2, ancient)?).await?;
+
+        assert_eq!(
+            1,
+            store.expire_prefix_segments(PREFIX, recent - 1_000).await?
+        );
+    }
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_lease_ttl(ttl);
+
+    assert_eq!(
+        0,
+        store.certify_prefix_served_ends(PREFIX).await?,
+        "neither a healthy nor a drained sub-stream is a gap"
+    );
+
+    assert!(
+        !fetch_from(&store, &a, 0).await?.is_empty(),
+        "the healthy partition still serves its records"
+    );
 
     Ok(())
 }
