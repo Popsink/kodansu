@@ -107,6 +107,60 @@ where
     }
 }
 
+/// How often the coordinator's idle group state is evicted (#283).
+///
+/// Fixed, and independent of `maintenance_interval`: this is a bound on memory,
+/// not a storage cadence, and it has to hold on a fleet that runs no storage
+/// maintenance at all.
+const GROUP_PRUNE_INTERVAL: Duration = Duration::from_mins(10);
+
+/// How often this replica runs storage maintenance — retention and compaction.
+///
+/// `Never` is a first-class answer rather than a very large period. A serving
+/// broker fleet that leaves both to a dedicated maintainer used to say so with
+/// `maintenance_interval=8760h`, which is not the same statement: it schedules a
+/// full maintenance pass on every replica at once, a year out, and relies on
+/// pods being replaced before it lands. It also made "never" depend on where the
+/// first tick happened to fall, which is exactly the coupling the wall-clock
+/// anchoring below removed everywhere else.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Maintenance {
+    Every(Duration),
+    Never,
+}
+
+impl Default for Maintenance {
+    fn default() -> Self {
+        Self::Every(Duration::from_mins(10))
+    }
+}
+
+/// Read a `maintenance_interval` query value: `never` disables maintenance, and
+/// anything else is a humantime duration.
+///
+/// `None` means the value was not usable and the caller should fall back to the
+/// default. A silent fallback is how `maintenance_interval=nevr` becomes a
+/// ten-minute full maintenance pass on a fleet that asked for none, so the
+/// caller warns; the parse only reports.
+///
+/// Zero is rejected rather than honoured: `interval_at` panics on a zero period,
+/// so a `0s` here used to take the broker down at startup, and "as often as
+/// possible" is not a cadence this loop can offer anyway.
+fn parse_maintenance(value: &str) -> Option<Maintenance> {
+    let value = value.trim();
+
+    if value.eq_ignore_ascii_case("never") {
+        return Some(Maintenance::Never);
+    }
+
+    value
+        .parse::<humantime::Duration>()
+        .ok()
+        .map(Into::into)
+        .filter(|period| *period > Duration::ZERO)
+        .map(Maintenance::Every)
+}
+
 /// How long from `now` until the next wall-clock-aligned maintenance tick — the
 /// next instant whose milliseconds since the Unix epoch divide evenly by
 /// `period`.
@@ -138,6 +192,18 @@ fn until_next_aligned_tick(now: SystemTime, period: Duration) -> Duration {
     u64::try_from(remaining).map_or(period, Duration::from_millis)
 }
 
+/// The next maintenance tick, or a future that never completes when maintenance
+/// is disabled.
+///
+/// Same shape as `accept_on` below: the `select!` arm stays in the loop and is
+/// inert, rather than the loop having two versions.
+async fn maintenance_tick(interval: Option<&mut time::Interval>) {
+    match interval {
+        Some(interval) => _ = interval.tick().await,
+        None => pending::<()>().await,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Broker<G, S> {
     node_id: i32,
@@ -161,7 +227,7 @@ pub struct Broker<G, S> {
     sasl_config: Option<Arc<SASLConfig>>,
     tls_server_config: Option<Arc<ServerConfig>>,
     silent: bool,
-    maintenance_interval: Option<Duration>,
+    maintenance: Maintenance,
 
     cancellation: CancellationToken,
 }
@@ -198,7 +264,7 @@ where
 
             silent: false,
 
-            maintenance_interval: None,
+            maintenance: Maintenance::default(),
 
             cancellation: CancellationToken::new(),
         }
@@ -337,15 +403,12 @@ where
             _ => None,
         };
 
-        let maintenance_period = self.maintenance_interval.unwrap_or(Duration::from_mins(10));
-
         // Upper bound on a single maintenance run so a *hung* pass cannot hold the
         // in-flight guard forever and disable maintenance pod-wide until restart
-        // (#131). A generous multiple of the interval, clamped so a "never"
-        // interval (compaction disabled on serving brokers) still yields a finite
-        // bound and a short interval still leaves a busy pass room to finish. A
-        // wedge is unbounded, so any finite bound catches it; cancellation is safe
-        // because maintenance is idempotent and resumes on the next tick.
+        // (#131). A generous multiple of the interval, clamped so a short interval
+        // still leaves a busy pass room to finish. A wedge is unbounded, so any
+        // finite bound catches it; cancellation is safe because maintenance is
+        // idempotent and resumes on the next tick.
         //
         // The floor is 30 min because the previous 10 min was cutting *legitimate*
         // runs: at a 2 min interval it bounded a run to 12 min, and a maintainer
@@ -354,9 +417,15 @@ where
         // every tick, so the hottest prefixes never converged (#140). A genuine
         // wedge is unbounded and is still caught 30 min in — far below the
         // multi-hour stall #131 was created to prevent.
-        let maintenance_run_timeout = maintenance_period
-            .saturating_mul(6)
-            .clamp(Duration::from_mins(30), Duration::from_mins(60));
+        let maintenance_run_timeout = match self.maintenance {
+            Maintenance::Every(period) => period
+                .saturating_mul(6)
+                .clamp(Duration::from_mins(30), Duration::from_mins(60)),
+
+            // Never read — nothing spawns a run — but the bound is a `Duration`,
+            // not an `Option<Duration>`, and the floor is the honest stand-in.
+            Maintenance::Never => Duration::from_mins(30),
+        };
 
         // Every replica ticks on the same wall-clock schedule, so the tick a
         // pod lands on does not depend on when that pod started.
@@ -384,15 +453,45 @@ where
         // Anchoring to the wall clock removes the skew rather than the sharing:
         // co-ticking replicas contend on the leases and split the universe
         // between them, which is what the two working replicas already did.
-        let mut interval = time::interval_at(
-            Instant::now() + until_next_aligned_tick(SystemTime::now(), maintenance_period),
-            maintenance_period,
-        );
+        //
+        // `None` under `maintenance_interval=never`: the arm below stays in the
+        // loop and never fires, rather than there being two versions of the loop.
+        let mut interval = match self.maintenance {
+            Maintenance::Every(period) => {
+                let mut interval = time::interval_at(
+                    Instant::now() + until_next_aligned_tick(SystemTime::now(), period),
+                    period,
+                );
 
-        // Don't let a stalled/slow pass burst-fire catch-up ticks the moment it
-        // returns; the overlap guard below already skips while a run is in
-        // flight, and skipping missed ticks keeps maintenance from compounding.
-        interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+                // Don't let a stalled/slow pass burst-fire catch-up ticks the
+                // moment it returns; the overlap guard below already skips while
+                // a run is in flight, and skipping missed ticks keeps maintenance
+                // from compounding.
+                interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+                Some(interval)
+            }
+
+            Maintenance::Never => None,
+        };
+
+        // Evicting idle coordinator group state (#283) is on its own clock, and
+        // deliberately not on the maintenance one it used to share.
+        //
+        // It rode the maintenance tick because that was the only periodic thing
+        // in this loop, which quietly tied a *memory* bound to a *storage*
+        // cadence — so the serving fleet, the one whose group maps grow and the
+        // one configured to leave storage maintenance to a dedicated maintainer,
+        // was the fleet that never evicted anything. Production ran ten brokers
+        // that way, and the eviction #283 added had never run on any of them.
+        //
+        // Start-relative rather than wall-clock-aligned, unlike maintenance
+        // above: this walks in-memory maps, issues no request and contends with
+        // no peer, so there is nothing for replicas to agree on and staggering
+        // them is if anything the better default.
+        let mut prune_interval =
+            time::interval_at(Instant::now() + GROUP_PRUNE_INTERVAL, GROUP_PRUNE_INTERVAL);
+        prune_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         // Guard against overlapping `maintain` runs: under S3 throttling a pass
         // can take longer than the interval, and spawning a second concurrent
@@ -472,13 +571,14 @@ where
                     continue;
                 }
 
-                _ = interval.tick() => {
+                _ = prune_interval.tick() => {
                     // Evict the coordinator's per-group state for groups this
-                    // replica has stopped serving (#283). Outside the in-flight
-                    // guard and outside the spawn: it walks in-memory maps and
-                    // issues no request, so it must not be skipped just because
-                    // a storage pass is still draining — that is precisely the
-                    // loaded pod whose memory this bounds.
+                    // replica has stopped serving (#283). Its own arm, on its own
+                    // interval: it walks in-memory maps and issues no request, so
+                    // it must not be skipped just because a storage pass is still
+                    // draining — that is precisely the loaded pod whose memory
+                    // this bounds — nor because this fleet runs no storage
+                    // maintenance, which is how it came to never run at all.
                     //
                     // `groups` alone covers `internal_groups` too: both are built
                     // from one `Controller` whose clone shares the maps, and the
@@ -489,6 +589,10 @@ where
                         debug!(evicted, "pruned idle coordinator group state");
                     }
 
+                    continue;
+                }
+
+                _ = maintenance_tick(interval.as_mut()) => {
                     // Skip this tick if the previous maintenance run is still in
                     // flight, rather than spawning a second concurrent run (#8).
                     if maintenance_in_flight
@@ -705,7 +809,7 @@ pub struct Builder<N, C, I, A, S, L> {
     authentication: bool,
     tls_server_config: Option<ServerConfig>,
     silent: bool,
-    maintenance_interval: Option<Duration>,
+    maintenance: Maintenance,
     topic_defaults: TopicDefaults,
     group_forwarding: bool,
     group_forward_peer_dns: Option<String>,
@@ -739,7 +843,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
-            maintenance_interval: self.maintenance_interval,
+            maintenance: self.maintenance,
             topic_defaults: self.topic_defaults,
             group_forwarding: self.group_forwarding,
             group_forward_peer_dns: self.group_forward_peer_dns,
@@ -762,7 +866,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
-            maintenance_interval: self.maintenance_interval,
+            maintenance: self.maintenance,
             topic_defaults: self.topic_defaults,
             group_forwarding: self.group_forwarding,
             group_forward_peer_dns: self.group_forward_peer_dns,
@@ -785,7 +889,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
-            maintenance_interval: self.maintenance_interval,
+            maintenance: self.maintenance,
             topic_defaults: self.topic_defaults,
             group_forwarding: self.group_forwarding,
             group_forward_peer_dns: self.group_forward_peer_dns,
@@ -811,7 +915,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
-            maintenance_interval: self.maintenance_interval,
+            maintenance: self.maintenance,
             topic_defaults: self.topic_defaults,
             group_forwarding: self.group_forwarding,
             group_forward_peer_dns: self.group_forward_peer_dns,
@@ -823,13 +927,25 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
     }
 
     pub fn storage(self, mut storage: Url) -> Builder<N, C, I, A, Url, L> {
-        let maintenance_interval = storage.query_pairs().find_map(|(k, v)| {
-            if k == Self::MAINTENANCE_INTERVAL {
-                v.parse::<humantime::Duration>().map(Into::into).ok()
-            } else {
-                None
-            }
-        });
+        // A value that does not parse is worth a `warn!` rather than a silent
+        // fall back to the ten-minute default: on a serving fleet that asked for
+        // `never`, a typo is the difference between no maintenance and a full
+        // pass on every replica, and nothing downstream would say so.
+        let maintenance = storage
+            .query_pairs()
+            .find(|(k, _)| k == Self::MAINTENANCE_INTERVAL)
+            .map_or_else(Maintenance::default, |(_, v)| {
+                parse_maintenance(&v).unwrap_or_else(|| {
+                    let default = Maintenance::default();
+                    warn!(
+                        value = %v,
+                        ?default,
+                        "unusable maintenance_interval, using the default \
+                         (a duration such as `10m`, or `never`)"
+                    );
+                    default
+                })
+            });
 
         let pairs = storage
             .query_pairs()
@@ -848,7 +964,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             _ = storage.query_pairs_mut().clear().extend_pairs(pairs);
         }
 
-        debug!(?maintenance_interval, %storage);
+        debug!(?maintenance, %storage);
 
         Builder {
             node_id: self.node_id,
@@ -861,7 +977,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
-            maintenance_interval,
+            maintenance,
             topic_defaults: self.topic_defaults,
             group_forwarding: self.group_forwarding,
             group_forward_peer_dns: self.group_forward_peer_dns,
@@ -886,7 +1002,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             authentication: self.authentication,
             tls_server_config: self.tls_server_config,
             silent: self.silent,
-            maintenance_interval: self.maintenance_interval,
+            maintenance: self.maintenance,
             topic_defaults: self.topic_defaults,
             group_forwarding: self.group_forwarding,
             group_forward_peer_dns: self.group_forward_peer_dns,
@@ -1056,7 +1172,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             tls_server_config: self.tls_server_config.map(Arc::new),
 
             silent: self.silent,
-            maintenance_interval: self.maintenance_interval,
+            maintenance: self.maintenance,
             cancellation: self.cancellation,
         })
     }
@@ -1100,6 +1216,99 @@ mod tests {
             !in_flight.load(Ordering::Acquire),
             "guard must be released after the run completes"
         );
+    }
+
+    mod maintenance_schedule {
+        use super::*;
+
+        #[test]
+        fn never_is_a_schedule_rather_than_a_very_long_period() {
+            for value in ["never", "NEVER", "  never  "] {
+                assert_eq!(
+                    parse_maintenance(value),
+                    Some(Maintenance::Never),
+                    "{value}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_duration_is_a_cadence() {
+            assert_eq!(
+                parse_maintenance("10m"),
+                Some(Maintenance::Every(Duration::from_mins(10)))
+            );
+            assert_eq!(
+                parse_maintenance("8760h"),
+                Some(Maintenance::Every(Duration::from_hours(8760)))
+            );
+        }
+
+        // The value that used to panic the broker at startup: `interval_at`
+        // requires a non-zero period, and "as often as possible" is not a cadence
+        // this loop can offer.
+        #[test]
+        fn a_zero_interval_is_rejected_rather_than_scheduled() {
+            assert_eq!(parse_maintenance("0s"), None);
+            assert_eq!(parse_maintenance("0ms"), None);
+        }
+
+        // Reported, not guessed at: the caller warns and uses the default, which
+        // is the behaviour a typo on a fleet that asked for `never` needs.
+        #[test]
+        fn an_unusable_value_is_not_a_schedule() {
+            for value in ["nevr", "", "-1", "10 parsecs"] {
+                assert_eq!(parse_maintenance(value), None, "{value}");
+            }
+        }
+
+        // The storage URL is where the setting comes from, and the key is
+        // consumed here — the storage engine must not see it.
+        #[test]
+        fn the_storage_url_carries_the_schedule_and_loses_the_key() {
+            let built = PhantomBuilder::default().storage(
+                Url::parse("s3://bucket/?maintenance_interval=never&coalesce_linger=1s").unwrap(),
+            );
+
+            assert_eq!(built.maintenance, Maintenance::Never);
+            assert_eq!(built.storage.as_str(), "s3://bucket/?coalesce_linger=1s");
+        }
+
+        #[test]
+        fn an_absent_key_leaves_the_default() {
+            let built = PhantomBuilder::default().storage(Url::parse("s3://bucket/").unwrap());
+
+            assert_eq!(built.maintenance, Maintenance::default());
+        }
+
+        // `Never` has to be inert for the whole life of the process, not merely
+        // slow: the `select!` arm stays in the loop and this is what keeps it
+        // from ever being taken.
+        #[tokio::test(start_paused = true)]
+        async fn a_disabled_schedule_never_ticks() {
+            assert!(
+                time::timeout(Duration::from_hours(24 * 365), maintenance_tick(None))
+                    .await
+                    .is_err()
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn an_enabled_schedule_ticks() {
+            let mut interval = time::interval_at(
+                Instant::now() + Duration::from_mins(10),
+                Duration::from_mins(10),
+            );
+
+            assert!(
+                time::timeout(
+                    Duration::from_mins(11),
+                    maintenance_tick(Some(&mut interval))
+                )
+                .await
+                .is_ok()
+            );
+        }
     }
 
     mod aligned_tick {
