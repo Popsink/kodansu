@@ -177,6 +177,16 @@ pub struct DynoStore {
     /// O(prefixes), not O(partitions), in object-store round-trips.
     coalesced_watermark_floors: Arc<Mutex<BTreeMap<Topition, CachedWatermark>>>,
 
+    /// Prefixes this process has already run the served-end reconciliation over
+    /// (#290). See [`DynoStore::certify_prefix_served_ends`].
+    ///
+    /// Once per prefix per process, not once per tick: the pass costs a forced
+    /// listing plus one conditional watermark GET per sub-stream, which is fine
+    /// as a one-shot after a deploy and wasteful every tick. A restart re-arms
+    /// it, which is the right default — a fresh process is exactly when a prefix
+    /// may have picked up a gap under a binary that did not certify.
+    served_end_reconciled: Arc<Mutex<BTreeSet<String>>>,
+
     /// Per-partition memo of the resolved truncation floor (#176), including
     /// the **absence** of one (memoized as `0`). Read paths that do not pass
     /// through the watermark slow path (EARLIEST on a fresh process, the
@@ -802,6 +812,24 @@ static WATERMARK_ABOVE_SEGMENT_TAIL: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .with_description(
             "high watermark resolutions where the persisted floor exceeded the \
              surviving segment tail, by prefix",
+        )
+        .build()
+});
+
+/// Sub-streams whose dead gap was certified by the reconciliation pass rather
+/// than by the expiry that created it (#290), by prefix.
+///
+/// A gap only becomes answerable once something writes `Watermark::served` for
+/// it, and only an expiry did — so every gap that predates #343, and every gap
+/// on a deployment whose `maintenance_interval` means expiry never runs, stayed
+/// silent. This counts the retro-fit: a non-zero value on a prefix is that
+/// prefix admitting it was in the #290 state and is now able to say so.
+static SERVED_END_CERTIFIED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_served_end_certified")
+        .with_description(
+            "sub-streams whose dead offset gap was certified by the reconciliation \
+             pass, by prefix",
         )
         .build()
 });
@@ -1805,6 +1833,7 @@ impl DynoStore {
             watermarks: Arc::new(Mutex::new(BTreeMap::new())),
             next_offsets: Arc::new(Mutex::new(BTreeMap::new())),
             coalesced_watermark_floors: Arc::new(Mutex::new(BTreeMap::new())),
+            served_end_reconciled: Arc::new(Mutex::new(BTreeSet::new())),
             truncate_floors: Arc::new(Mutex::new(BTreeMap::new())),
             prefix_read_sync_locks: Arc::new(Mutex::new(BTreeMap::new())),
             producers: Arc::new(Mutex::new(BTreeMap::new())),
@@ -7314,6 +7343,15 @@ impl DynoStore {
                     0
                 };
 
+                // Retro-certify gaps no expiry will reach (#290). Once per
+                // prefix per process, and after the two passes above so it reads
+                // the tail they left rather than the one they were about to
+                // change. A failure is this prefix's alone, as for the others.
+                _ = self
+                    .certify_prefix_served_ends(&prefix)
+                    .await
+                    .inspect_err(|err| error!(?err, prefix));
+
                 (deleted, compacted)
             }
         }))
@@ -7433,6 +7471,217 @@ impl DynoStore {
         self.expire_prefix_segments(prefix, threshold_ms)
             .await
             .inspect_err(|err| error!(?err, prefix))
+    }
+
+    /// Certify the dead offset gap of every sub-stream in `prefix` whose
+    /// advertised floor sits above the tail of the segments that are actually
+    /// there — the retro-fit #343 could not do (#290).
+    ///
+    /// #343 made a fetch inside a certified-dead gap answer
+    /// `OFFSET_OUT_OF_RANGE` instead of empty-forever, but only the expiry that
+    /// performed the delete writes the certification. Every gap that already
+    /// existed carries none, and a deployment whose `maintenance_interval` is a
+    /// year will never run an expiry that touches one. Those partitions keep
+    /// answering empty to a parked consumer, which is #290's original complaint
+    /// verbatim.
+    ///
+    /// ## Why this is sound, and why the read path could not do it
+    ///
+    /// The read path cannot tell `floor > tail` caused by *retention deleting
+    /// the tail-holder* (certify) from the same shape caused by *a peer acking
+    /// offsets this process has not listed* (must not certify). That was
+    /// established in #290 by implementing the read-side fix and watching
+    /// `coalesced_latest_survives_peer_expiry_via_floor_certification` correctly
+    /// reject it. Three things separate this pass from that attempt:
+    ///
+    /// 1. **The compaction lease**, so there is exactly one certifier per prefix
+    ///    and it is serialized against expiry and compaction on the same
+    ///    segments.
+    /// 2. **A forced full listing**, so "not listed" is not a state this pass can
+    ///    be in. On a strongly-consistent store the listing sees every completed
+    ///    segment PUT, so a peer's segment is either present — and folds into the
+    ///    tail, closing the gap — or it does not exist.
+    /// 3. **The seq-floor fence.** `leaseless_base` folds the persisted floor
+    ///    unconditionally (#287, #316), so a concurrent producer's next segment
+    ///    starts at or above the floor — outside the gap being certified. The gap
+    ///    cannot be filled after the listing, only appended past.
+    ///
+    /// The tail comes from [`Self::valid_substream_segments`], which is the same
+    /// view the fetch path selects from. That is the point rather than an
+    /// implementation detail: the certification says "this range is not
+    /// servable", and deriving it from the predicate that decides what *is*
+    /// servable is what makes `OFFSET_OUT_OF_RANGE` an honest answer rather than
+    /// a guess about the bucket.
+    ///
+    /// A sub-stream with no segments at all is skipped: that is a drained
+    /// partition, not a gap, and #299 already reports it as a log starting where
+    /// it ends.
+    ///
+    /// Writing through the watermark CAS keeps #343's mixed-fleet guard: the pair
+    /// is honored only while `at_high == high`, so a floor moved by anything that
+    /// did not re-certify invalidates it rather than misleading.
+    ///
+    /// ## Cost
+    ///
+    /// Once per prefix per process ([`Self::served_end_reconciled`]) — a forced
+    /// listing plus one conditional watermark GET per sub-stream, which answers
+    /// 304 while the watermark is unchanged. Right as a one-shot after a deploy,
+    /// wasteful every tick. A restart re-arms it, which is the correct default:
+    /// a fresh process is exactly when a prefix may have picked up a gap under a
+    /// binary that did not certify.
+    async fn certify_prefix_served_ends(&self, prefix: &str) -> Result<u64> {
+        if self
+            .served_end_reconciled
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .contains(prefix)
+        {
+            return Ok(0);
+        }
+
+        if self.acquire_compaction_lease(prefix).await.is_err() {
+            debug!(
+                prefix,
+                "yielding served-end reconciliation to the lease holder"
+            );
+            return Ok(0);
+        }
+
+        // Marked before the work, not after: a prefix whose reconciliation fails
+        // must not retry every tick for the life of the process. The next restart
+        // re-arms it, and #338's counter still reports the state meanwhile.
+        _ = self
+            .served_end_reconciled
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .insert(prefix.to_owned());
+
+        self.refresh_prefix_index_forced(prefix).await?;
+
+        let substreams: BTreeSet<(String, i32)> = self
+            .prefix_index
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .get(prefix)
+            .map(|index| {
+                index
+                    .segments
+                    .values()
+                    .flat_map(|cached| {
+                        cached
+                            .footer
+                            .entries
+                            .iter()
+                            .map(|entry| (entry.topic.clone(), entry.partition))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut certified: Vec<Topition> = Vec::new();
+
+        for (topic, partition) in &substreams {
+            let Some(tail) = self
+                .valid_substream_segments(prefix, topic, *partition)?
+                .last()
+                .map(|(_, entry)| entry.base_offset + entry.record_count)
+            else {
+                continue;
+            };
+
+            let tp = Topition::new(topic.clone(), *partition);
+
+            // Read before deciding, for two reasons. `with_mut` starts from the
+            // in-process cached version, which on a cold replica — the one that
+            // most needs this pass — is empty, so a closure that inspected
+            // `watermark.high` there would see 0 and conclude there is no gap.
+            // And a prefix that is already correct pays a conditional GET that
+            // answers 304, rather than a PUT per sub-stream per restart.
+            let Ok((high, served)) = self
+                .watermark(&tp)?
+                .with(&self.object_store, |watermark| {
+                    Ok((watermark.high.unwrap_or(0), watermark.served))
+                })
+                .await
+                .inspect_err(|err| debug!(?err, ?tp))
+            else {
+                continue;
+            };
+
+            if high <= tail
+                || served.is_some_and(|served| served.certifies(high) && served.end == tail)
+            {
+                continue;
+            }
+
+            let wrote = self
+                .watermark(&tp)?
+                .with_mut(&self.object_store, |watermark| {
+                    // Re-checked under the CAS: a floor raised between the read
+                    // above and this write means a peer is producing, and the
+                    // `end` computed from the old listing no longer pairs with
+                    // it. Leaving it alone loses nothing — the next process to
+                    // run this pass re-derives both together.
+                    if watermark.high.unwrap_or(0) != high {
+                        return Ok(false);
+                    }
+
+                    watermark.served = Some(ServedEnd {
+                        end: tail,
+                        at_high: high,
+                    });
+
+                    Ok(true)
+                })
+                .await
+                .inspect_err(|err| debug!(?err, ?tp))
+                .unwrap_or(false);
+
+            if wrote {
+                warn!(
+                    prefix,
+                    topic,
+                    partition,
+                    end = tail,
+                    at_high = high,
+                    "certified an offset gap dead: the advertised end sits above every \
+                     segment present, so a consumer parked in the gap was reading empty \
+                     forever and can now be told (#290)"
+                );
+
+                certified.push(tp);
+            }
+        }
+
+        if certified.is_empty() {
+            return Ok(0);
+        }
+
+        SERVED_END_CERTIFIED.add(
+            certified.len() as u64,
+            &[KeyValue::new("prefix", prefix.to_owned())],
+        );
+
+        // Both caches, and only the sub-streams actually certified — the same
+        // invalidation `expire_prefix_segments` does after its own CAS, and for
+        // the same reason. The next-offset hint has to go too, not just the
+        // watermark floor: `high_watermark` is answered from the hint, so leaving
+        // it would keep the coalesced watermark cache cold, and `certified_dead_gap`
+        // reads exclusively from that cache (it pays no object request). The gap
+        // would stay unanswerable on this replica until the hint aged out. Peers
+        // converge on their own conditional GET.
+        self.next_offsets.lock().map(|mut locked| {
+            for tp in &certified {
+                _ = locked.remove(tp);
+            }
+        })?;
+        self.coalesced_watermark_floors.lock().map(|mut locked| {
+            for tp in &certified {
+                _ = locked.remove(tp);
+            }
+        })?;
+
+        Ok(certified.len() as u64)
     }
 
     /// Delete the given batch object locations.
