@@ -184,7 +184,7 @@ The options that matter in a deployment, each with its environment variable:
 | `--storage-engine` | `STORAGE_ENGINE` | `memory://tansu/` | Storage URL; see below. |
 | `--otlp-endpoint-url` | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | Where metrics and traces are pushed. |
 | `--authentication` | — | off | When present, clients must authenticate. |
-| `--cert` / `--key` | — | — | TLS certificate and key (PEM). |
+| `--cert` / `--key` | — | — | TLS certificate chain and private key (PEM). Both or neither. Given both, `--listener-url` serves TLS only and a plaintext client is refused; an unreadable or mismatched pair fails startup. The broker-to-broker `--internal-listener-url` stays plaintext. |
 | `--default-cleanup-policy` | `DEFAULT_CLEANUP_POLICY` | `delete` | Applied to topics created without one. |
 | `--default-retention-ms` | `DEFAULT_RETENTION` | `7days` | Applied to `delete`-policy topics created without a `retention.ms`. Accepts a duration, or `-1`/`infinite`/`forever`. |
 | `--group-forwarding` | `GROUP_FORWARDING` | off | Forward each consumer group's coordination APIs to its owner replica. |

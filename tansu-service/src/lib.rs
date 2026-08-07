@@ -270,7 +270,7 @@ pub use frame::{
 };
 
 pub use stream::{
-    BytesLayer, BytesService, BytesTcpService, TcpBytesLayer, TcpBytesService, TcpContext,
+    BytesLayer, BytesService, BytesTcpService, Peer, TcpBytesLayer, TcpBytesService, TcpContext,
     TcpContextLayer, TcpContextService, TcpListenerLayer,
 };
 

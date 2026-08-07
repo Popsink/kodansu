@@ -78,12 +78,17 @@ pub(super) struct Arg {
     #[arg(long)]
     authentication: bool,
 
-    /// Transport Layer Security Certificate
-    #[arg(group = "tls", long)]
+    // Each `requires` the other, so a half-configured pair is rejected at parse
+    // time instead of quietly becoming a plaintext listener. These two used to
+    // share `group = "tls"`, and a clap group is mutually exclusive by default:
+    // `--cert x --key y` was *refused*, so TLS was unreachable from the CLI even
+    // before `Broker::listen` dropped the acceptor it had built (#358).
+    /// Transport Layer Security certificate chain (PEM). With --key, the client listener is TLS only.
+    #[arg(long, requires = "key")]
     cert: Option<PathBuf>,
 
-    /// Transport Layer Security Key
-    #[arg(group = "tls", long)]
+    /// Transport Layer Security private key (PEM), for the --cert chain
+    #[arg(long, requires = "cert")]
     key: Option<PathBuf>,
 
     /// Default `cleanup.policy` applied to topics created without one (Kafka default: delete). Set empty to store no policy; note the engine still reads absent as delete, so this does NOT give infinite retention — use retention.ms=-1 per topic for that.
@@ -201,9 +206,17 @@ impl Arg {
         let advertised_listener = self.advertised_listener_url.into_inner();
         let listener = self.listener_url.into_inner();
 
+        // A cert that will not load fails startup. It used to end in `.ok()`,
+        // which turned an unreadable file, a mismatched key or a malformed PEM
+        // into `None` — and `None` is a plaintext broker on the port an operator
+        // just configured for TLS (#358). The same class of defect as building
+        // the acceptor and dropping it: configured, accepted, and inert.
         let tls_server_config = self
             .cert
-            .and_then(|certs| self.key.and_then(|key| server_config(&certs, &key).ok()));
+            .as_deref()
+            .zip(self.key.as_deref())
+            .map(|(certs, key)| server_config(certs, key))
+            .transpose()?;
 
         let topic_defaults = TopicDefaults {
             cleanup_policy: Some(self.default_cleanup_policy.clone())

@@ -53,4 +53,9 @@ uuid.workspace = true
 [dev-dependencies]
 anyhow.workspace = true
 pretty_assertions.workspace = true
+
+# A throwaway self-signed certificate for the TLS listener tests (#358), so the
+# suite needs no checked-in key material and nothing expires.
+rcgen.workspace = true
+
 tansu-storage = { workspace = true }
