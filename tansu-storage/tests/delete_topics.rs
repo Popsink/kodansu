@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{Error, init_tracing};
+use crate::common::{Error, cluster_id, init_tracing, storage_url};
 use assert_matches::assert_matches;
 use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
 use tansu_sans_io::{
@@ -33,10 +33,10 @@ async fn delete_unknown_by_name() -> Result<(), Error> {
     let node_id = 12321;
 
     let storage = StorageContainer::builder()
-        .cluster_id("tansu")
+        .cluster_id(cluster_id())
         .node_id(node_id)
         .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(Url::parse("memory://tansu/")?)
+        .storage(storage_url()?)
         .build()
         .await?;
 
@@ -71,10 +71,10 @@ async fn delete_unknown_by_uuid() -> Result<(), Error> {
     let node_id = 12321;
 
     let storage = StorageContainer::builder()
-        .cluster_id("tansu")
+        .cluster_id(cluster_id())
         .node_id(node_id)
         .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(Url::parse("memory://tansu/")?)
+        .storage(storage_url()?)
         .build()
         .await?;
 
@@ -111,10 +111,10 @@ async fn create_delete_create_by_name() -> Result<(), Error> {
     let node_id = 12321;
 
     let storage = StorageContainer::builder()
-        .cluster_id("tansu")
+        .cluster_id(cluster_id())
         .node_id(node_id)
         .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(Url::parse("memory://tansu/")?)
+        .storage(storage_url()?)
         .build()
         .await?;
 

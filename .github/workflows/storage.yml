@@ -1,0 +1,109 @@
+---
+# The `tansu-storage` suite against a real object store (#357).
+#
+# Deliberately NOT part of `pr.yml`. Everything here needs a service, and `test`
+# in `pr.yml` is the required check — putting a Docker-dependent job upstream of
+# it would add minutes to every PR to establish something that changes only when
+# `object_store` or the store itself changes, which is not per-commit.
+#
+# What DOES run on every PR: the same conformance target against `memory://`,
+# because it is an ordinary test in the workspace and costs ~30ms. This workflow
+# is what re-runs it where the semantics are real — `InMemory` emulates
+# create-only and etag CAS behind a mutex, S3 implements them with
+# `If-None-Match`, and only one of those is what production runs.
+name: storage
+
+on:
+  schedule:
+    # 03:17 UTC. Off the hour: scheduled workflows queue behind everything else
+    # GitHub starts on the hour.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      storage-url:
+        description: 'Storage URL to test (bucket must exist and be writable)'
+        required: false
+        default: 's3://tansu/'
+
+env:
+  CLICOLOR: 1
+
+jobs:
+  # minio is the closest thing to S3 that needs no account, and it implements
+  # conditional put with `If-None-Match` rather than emulating it.
+  minio:
+    runs-on: ubuntu-latest-8-cores
+    env:
+      CARGO_BUILD_BUILD_DIR: /mnt/build
+      NEXTEST_PROFILE: ci
+      RUST_BACKTRACE: 1
+      RUST_LOG: debug,tansu_sans_io=warn,tansu_model=warn
+    steps:
+      - run: sudo mkdir /mnt/build
+      - run: sudo chmod a+rwxt /mnt/build
+      - uses: actions/checkout@v6
+      - uses: extractions/setup-just@v3
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: taiki-e/install-action@nextest
+      # The justfile loads `.env`, and the AWS credentials minio is started with
+      # live there. `test-storage-minio` overrides `AWS_ENDPOINT`, which
+      # `example.env` sets to the in-compose hostname.
+      - run: cp example.env .env
+      - run: just test-storage-minio
+      - run: tar --create --gzip --file=logs.tar.gz logs
+        if: always()
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: logs-minio
+          path: logs.tar.gz
+          if-no-files-found: error
+
+  # Real S3, or any other store the operator names. Skipped unless the secrets
+  # exist, because a fork has no reason to hold them — and a skipped job is
+  # honest, where a job that silently ran against nothing was the arrangement
+  # #357 was filed about.
+  object-store:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest-8-cores
+    env:
+      CARGO_BUILD_BUILD_DIR: /mnt/build
+      NEXTEST_PROFILE: ci
+      RUST_BACKTRACE: 1
+      RUST_LOG: debug,tansu_sans_io=warn,tansu_model=warn
+      TANSU_TEST_STORAGE_URL: ${{ inputs.storage-url }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.STORAGE_TEST_AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.STORAGE_TEST_AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: ${{ vars.STORAGE_TEST_AWS_DEFAULT_REGION }}
+    steps:
+      - run: sudo mkdir /mnt/build
+      - run: sudo chmod a+rwxt /mnt/build
+      - uses: actions/checkout@v6
+      - uses: extractions/setup-just@v3
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: taiki-e/install-action@nextest
+      # As in `pr.yml`'s Codecov step: a secret is turned into a step output
+      # rather than tested inline, because a condition that silently evaluates to
+      # false is indistinguishable from one that is correctly skipping.
+      - name: Are storage credentials configured?
+        id: credentials
+        run: |
+          if [ -n "${AWS_ACCESS_KEY_ID}" ]; then
+            echo 'configured=true' >>"${GITHUB_OUTPUT}"
+          else
+            echo 'no STORAGE_TEST_AWS_* secrets: skipping the real-store run'
+          fi
+      - if: steps.credentials.outputs.configured == 'true'
+        run: just test-storage "${TANSU_TEST_STORAGE_URL}"
+      - if: always() && steps.credentials.outputs.configured == 'true'
+        run: tar --create --gzip --file=logs.tar.gz logs
+      - uses: actions/upload-artifact@v7
+        if: always() && steps.credentials.outputs.configured == 'true'
+        with:
+          name: logs-object-store
+          path: logs.tar.gz
+          if-no-files-found: warn

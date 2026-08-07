@@ -24,22 +24,20 @@ mod doctest_template {
     use tansu_storage::{CreateTopicsService, FetchService, StorageContainer};
     use url::Url;
 
-    use crate::common::{Error, init_tracing};
+    use crate::common::{Error, cluster_id, init_tracing, storage_url};
 
     #[tokio::test]
     async fn req() -> Result<(), Error> {
         let _guard = init_tracing()?;
-
-        const CLUSTER_ID: &str = "tansu";
         const NODE_ID: i32 = 111;
         const HOST: &str = "localhost";
         const PORT: i32 = 9092;
 
         let storage = StorageContainer::builder()
-            .cluster_id(CLUSTER_ID)
+            .cluster_id(cluster_id())
             .node_id(NODE_ID)
             .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-            .storage(Url::parse("memory://tansu/")?)
+            .storage(storage_url()?)
             .build()
             .await?;
 
@@ -121,18 +119,16 @@ mod start_after {
     use tansu_storage::{Storage, StorageContainer, Topition};
     use url::Url;
 
-    use crate::common::{Error, init_tracing};
-
-    const CLUSTER_ID: &str = "tansu";
+    use crate::common::{Error, cluster_id, init_tracing, storage_url};
     const NODE_ID: i32 = 111;
     const MAX_WAIT: Duration = Duration::from_secs(5);
 
-    async fn in_memory_storage() -> Result<Arc<Box<dyn Storage>>, Error> {
+    async fn storage_container() -> Result<Arc<Box<dyn Storage>>, Error> {
         StorageContainer::builder()
-            .cluster_id(CLUSTER_ID)
+            .cluster_id(cluster_id())
             .node_id(NODE_ID)
             .advertised_listener(Url::parse("tcp://localhost:9092")?)
-            .storage(Url::parse("memory://tansu/")?)
+            .storage(storage_url()?)
             .build()
             .await
             .map_err(Into::into)
@@ -167,7 +163,7 @@ mod start_after {
     async fn fetch_from_middle_returns_contiguous_tail() -> Result<(), Error> {
         let _guard = init_tracing()?;
 
-        let storage = in_memory_storage().await?;
+        let storage = storage_container().await?;
         let topition = Topition::new("abcba", 0);
 
         produce_batches(&storage, &topition, 10).await?;
@@ -193,7 +189,7 @@ mod start_after {
     async fn fetch_from_start_returns_all() -> Result<(), Error> {
         let _guard = init_tracing()?;
 
-        let storage = in_memory_storage().await?;
+        let storage = storage_container().await?;
         let topition = Topition::new("abcba", 0);
 
         produce_batches(&storage, &topition, 10).await?;
@@ -219,7 +215,7 @@ mod start_after {
     async fn fetch_is_bounded_by_max_bytes() -> Result<(), Error> {
         let _guard = init_tracing()?;
 
-        let storage = in_memory_storage().await?;
+        let storage = storage_container().await?;
         let topition = Topition::new("abcba", 0);
 
         produce_batches(&storage, &topition, 10).await?;
@@ -247,7 +243,7 @@ mod start_after {
     async fn fetch_at_or_beyond_high_watermark_is_empty() -> Result<(), Error> {
         let _guard = init_tracing()?;
 
-        let storage = in_memory_storage().await?;
+        let storage = storage_container().await?;
         let topition = Topition::new("abcba", 0);
 
         produce_batches(&storage, &topition, 10).await?;
