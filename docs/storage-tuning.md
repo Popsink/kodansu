@@ -114,6 +114,7 @@ prefix's topics).
 | `prefix_compact_min_segments` | `256` | Compact a prefix once it holds more than this many live segments (`0` disables). |
 | `prefix_compact_target_bytes` | `16m` | Target size of a merged segment. Kept modest because the merged create currently shares the producer tail create-CAS namespace (#130); a larger target lengthens each merged PUT, loses the create race more often, and re-uploads its whole payload on retry, amplifying S3 write cost. The live segment count is bounded by `prefix_compact_min_segments` (a count trigger), not by this size. |
 | `prefix_compact_keep_hot` | `16` | Newest segments never compacted (leaves the active tail alone). |
+| `maintenance_interval` | `10m` | How often this replica runs retention + compaction. `never` disables it entirely — the setting for a serving broker fleet that leaves storage maintenance to a dedicated maintainer. Do not spell that as a very large duration: a period still schedules a pass on every replica at once when it comes round. Ticks are wall-clock aligned, so replicas share a schedule whatever time their pods started. Evicting idle coordinator group state is *not* on this clock and keeps running under `never`. |
 | `maintenance_recency` | `9m` | A prefix maintained (compacted/expired) within this window is skipped by other maintainer replicas. Set to ~0.9× your `maintenance_interval`; `0` disables (every maintainer works every prefix). |
 | `flush_max_elapsed` | `10s` | Wall-clock budget for a flush's create-CAS conflict-correction loop. When it runs out the flush yields to the competing writer and the produce is rejected *retriably*. It is a floor on attempts, not a hard deadline: the loop always makes at least 3 real attempts, and will not start an attempt it expects to overshoot. Raise it if you see `leaseless flush exhausted retries` with a small `attempts` and a large `put_ms` — that is a slow bucket, not contention. |
 
@@ -122,9 +123,12 @@ The linger / batch-count / byte thresholds are the `coalesce_linger` /
 
 ### Scaling maintenance across stateless replicas (`maintenance_recency`)
 
-Compaction and segment retention run on the maintenance loop of every replica.
-Without coordination each maintainer would re-list and re-work every prefix each
-tick, so N maintainers duplicate the work N× with no throughput gain.
+Compaction and segment retention run on the maintenance loop of every replica
+that has one — a replica started with `maintenance_interval=never` has no
+maintenance loop at all, which is how a serving broker fleet hands the work to a
+dedicated maintainer deployment. Without coordination each maintainer would
+re-list and re-work every prefix each tick, so N maintainers duplicate the work
+N× with no throughput gain.
 
 The maintainers coordinate **statelessly and coordinator-free** — no ordinal, no
 StatefulSet, no membership list, exactly like the broker (they can be a plain
