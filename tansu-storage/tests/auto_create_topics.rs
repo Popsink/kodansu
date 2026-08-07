@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{Error, init_tracing};
+use crate::common::{Error, cluster_id, init_tracing, storage_url, storage_url_with_query};
 use rama::{Context, Layer as _, Service, layer::MapStateLayer};
 use std::sync::Arc;
 use tansu_sans_io::{
@@ -27,12 +27,12 @@ use url::Url;
 
 mod common;
 
-async fn storage(url: &str) -> Result<Arc<Box<dyn Storage>>, Error> {
+async fn storage(query: &str) -> Result<Arc<Box<dyn Storage>>, Error> {
     StorageContainer::builder()
-        .cluster_id("tansu")
+        .cluster_id(cluster_id())
         .node_id(111)
         .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(Url::parse(url)?)
+        .storage(storage_url_with_query(query)?)
         .build()
         .await
         .map_err(Into::into)
@@ -94,7 +94,7 @@ async fn metadata_many(
 async fn multi_topic_metadata_preserves_order_and_per_topic_status() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let storage = storage("memory://tansu/").await?;
+    let storage = storage("").await?;
 
     // Auto-create 100 known topics.
     for i in 0..100 {
@@ -137,7 +137,7 @@ async fn multi_topic_metadata_preserves_order_and_per_topic_status() -> Result<(
 async fn auto_creates_unknown_topic_by_default() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let response = metadata(storage("memory://tansu/").await?, "abc", true).await?;
+    let response = metadata(storage("").await?, "abc", true).await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
     assert_eq!(1, topics.len());
@@ -154,12 +154,7 @@ async fn auto_creates_unknown_topic_by_default() -> Result<(), Error> {
 async fn disabled_leaves_topic_unknown() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let response = metadata(
-        storage("memory://tansu/?auto_create_topics=false").await?,
-        "abc",
-        true,
-    )
-    .await?;
+    let response = metadata(storage("auto_create_topics=false").await?, "abc", true).await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
     assert_eq!(1, topics.len());
@@ -177,7 +172,7 @@ async fn disabled_leaves_topic_unknown() -> Result<(), Error> {
 async fn request_opt_out_leaves_topic_unknown() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let response = metadata(storage("memory://tansu/").await?, "abc", false).await?;
+    let response = metadata(storage("").await?, "abc", false).await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
     assert_eq!(1, topics.len());
@@ -194,12 +189,7 @@ async fn request_opt_out_leaves_topic_unknown() -> Result<(), Error> {
 async fn honours_configured_partition_count() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let response = metadata(
-        storage("memory://tansu/?num_partitions=3").await?,
-        "abc",
-        true,
-    )
-    .await?;
+    let response = metadata(storage("num_partitions=3").await?, "abc", true).await?;
 
     let topics = response.topics.as_deref().unwrap_or_default();
     assert_eq!(1, topics.len());
@@ -238,10 +228,10 @@ async fn auto_create_applies_broker_topic_defaults() -> Result<(), Error> {
     };
 
     let storage = StorageContainer::builder()
-        .cluster_id("tansu")
+        .cluster_id(cluster_id())
         .node_id(111)
         .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(Url::parse("memory://tansu/")?)
+        .storage(storage_url()?)
         .topic_defaults(defaults.clone())
         .build()
         .await?;
@@ -275,7 +265,7 @@ async fn auto_create_applies_broker_topic_defaults() -> Result<(), Error> {
 async fn auto_create_stores_kafka_defaults_when_unconfigured() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let storage = storage("memory://tansu/").await?;
+    let storage = storage("").await?;
     let name = "auto-kafka-defaults";
 
     _ = metadata(storage.clone(), name, true).await?;
@@ -339,7 +329,7 @@ fn value<'a>(configs: &'a [(String, Option<String>)], name: &str) -> Option<&'a 
 async fn idempotent_on_repeat() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let storage = storage("memory://tansu/").await?;
+    let storage = storage("").await?;
 
     let first = metadata(storage.clone(), "abc", true).await?;
     assert_eq!(

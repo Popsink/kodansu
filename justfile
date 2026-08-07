@@ -29,6 +29,38 @@ nextest *args:
 test-doc:
     cargo test --workspace --doc --all-features
 
+# The `tansu-storage` suite against whatever object store `url` names (#357).
+#
+# `TANSU_TEST_STORAGE_URL` is what every test in the crate builds from, defaulting
+# to `memory://tansu/` — which is what `test-workspace` above runs, and why it
+# needs no service. Isolation comes from a per-`build()` cluster id, so one bucket
+# holds any number of concurrent runs.
+#
+# No `--all-targets`: the criterion benches in this crate are a target, not a
+# test, and building them here buys nothing.
+test-storage url="memory://tansu/":
+    TANSU_TEST_STORAGE_URL="{{ url }}" \
+      cargo nextest run --package tansu-storage --all-features --no-fail-fast
+
+# Just the conditional-put conformance target, which is the whole reason the URL
+# is a parameter: `InMemory` emulates create-only and etag CAS, S3 implements them
+# with `If-None-Match`, and this is where a divergence between the two shows up.
+test-conditional-put url="memory://tansu/":
+    TANSU_TEST_STORAGE_URL="{{ url }}" \
+      cargo nextest run --package tansu-storage --all-features -E 'binary(conditional_put)'
+
+# The storage suite against minio, the closest thing to S3 that runs on a laptop.
+#
+# Deliberately NOT on the PR path: it needs Docker, and `pr.yml`'s `test` job is
+# the required check. `.github/workflows/storage.yml` runs this nightly.
+#
+# `AWS_ENDPOINT` is overridden because `.env` ships the in-compose hostname
+# (`http://minio:9000`), which does not resolve from the host.
+test-storage-minio: s3-up
+    AWS_ENDPOINT="http://localhost:9000" AWS_ALLOW_HTTP="true" \
+      TANSU_TEST_STORAGE_URL="s3://tansu/" \
+      cargo nextest run --package tansu-storage --all-features --no-fail-fast
+
 # The crates and features coverage is measured over. Deliberately the same set
 # `test-workspace` runs, minus `--all-targets`: measuring a different set to the
 # one CI tests would report a percentage that no run can reproduce.

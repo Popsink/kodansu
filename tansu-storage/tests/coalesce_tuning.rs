@@ -22,7 +22,7 @@
 //! is the hole #227 closed for the producer-checkpoint keys, and it is invisible
 //! from either end.
 
-use crate::common::{Error, init_tracing};
+use crate::common::{Error, cluster_id, init_tracing, storage_url_with_query};
 use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,10 +54,10 @@ fn batch() -> Result<deflated::Batch, Error> {
 
 async fn storage_from(query: &str) -> Result<Arc<Box<dyn Storage>>, Error> {
     StorageContainer::builder()
-        .cluster_id("tansu")
+        .cluster_id(cluster_id())
         .node_id(111)
         .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(Url::parse(&format!("memory://tansu/?{query}"))?)
+        .storage(storage_url_with_query(query)?)
         .build()
         .await
         .map_err(Into::into)

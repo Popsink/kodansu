@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{Error, init_tracing};
+use crate::common::{Error, cluster_id, init_tracing, storage_url};
 use rama::{Context, Layer, Service as _, layer::MapStateLayer};
 use tansu_sans_io::{ConsumerGroupDescribeRequest, ErrorCode};
 use tansu_storage::{ConsumerGroupDescribeService, StorageContainer};
@@ -26,10 +26,10 @@ async fn describe_non_existent_group() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
     let storage = StorageContainer::builder()
-        .cluster_id("tansu")
+        .cluster_id(cluster_id())
         .node_id(111)
         .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(Url::parse("memory://tansu/")?)
+        .storage(storage_url()?)
         .build()
         .await?;
 

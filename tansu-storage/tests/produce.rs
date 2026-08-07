@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{Error, init_tracing};
+use crate::common::{Error, cluster_id, init_tracing, storage_url, storage_url_with_query};
 use bytes::Bytes;
 use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
 use rand::{distr::Alphanumeric, prelude::*, rng};
@@ -36,7 +36,6 @@ use tansu_storage::{
 };
 use tracing::debug;
 use url::Url;
-use uuid::Uuid;
 
 mod common;
 
@@ -78,10 +77,10 @@ async fn non_txn_idempotent_unknown_producer_is_admitted() -> Result<(), Error> 
     const NODE_ID: i32 = 111;
 
     let storage = StorageContainer::builder()
-        .cluster_id("tansu")
+        .cluster_id(cluster_id())
         .node_id(NODE_ID)
         .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(Url::parse("memory://tansu/")?)
+        .storage(storage_url()?)
         .build()
         .await?;
 
@@ -148,10 +147,10 @@ async fn non_txn_idempotent() -> Result<(), Error> {
     const NODE_ID: i32 = 111;
 
     let storage = StorageContainer::builder()
-        .cluster_id("tansu")
+        .cluster_id(cluster_id())
         .node_id(NODE_ID)
         .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(Url::parse("memory://tansu/")?)
+        .storage(storage_url()?)
         .build()
         .await?;
 
@@ -331,10 +330,10 @@ async fn non_txn_idempotent_duplicate_is_acked_with_the_original_offset() -> Res
     const NODE_ID: i32 = 111;
 
     let storage = StorageContainer::builder()
-        .cluster_id("tansu")
+        .cluster_id(cluster_id())
         .node_id(NODE_ID)
         .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(Url::parse("memory://tansu/")?)
+        .storage(storage_url()?)
         .build()
         .await?;
 
@@ -462,10 +461,10 @@ async fn non_txn_idempotent_sequence_out_of_order() -> Result<(), Error> {
     const NODE_ID: i32 = 111;
 
     let storage = StorageContainer::builder()
-        .cluster_id("tansu")
+        .cluster_id(cluster_id())
         .node_id(NODE_ID)
         .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(Url::parse("memory://tansu/")?)
+        .storage(storage_url()?)
         .build()
         .await?;
 
@@ -589,17 +588,16 @@ async fn non_txn_idempotent_sequence_out_of_order() -> Result<(), Error> {
 async fn list_offsets() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let cluster_id = Uuid::now_v7().to_string();
     let node_id = rng().random_range(0..i32::MAX);
 
     const HOST: &str = "localhost";
     const PORT: i32 = 9092;
 
     let storage = StorageContainer::builder()
-        .cluster_id(cluster_id)
+        .cluster_id(cluster_id())
         .node_id(node_id)
         .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(Url::parse("memory://tansu/")?)
+        .storage(storage_url()?)
         .build()
         .await?;
 
@@ -871,12 +869,11 @@ async fn url_coalesce_batches_reaches_the_leaseless_flush() -> Result<(), Error>
     const NODE_ID: i32 = 111;
 
     let storage = StorageContainer::builder()
-        .cluster_id("tansu")
+        .cluster_id(cluster_id())
         .node_id(NODE_ID)
         .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(Url::parse(
-            "memory://tansu/\
-             ?prefix_coalesce=true&prefix_leaseless=true\
+        .storage(storage_url_with_query(
+            "prefix_coalesce=true&prefix_leaseless=true\
              &coalesce_linger=1h&coalesce_batches=3",
         )?)
         .build()
@@ -936,10 +933,10 @@ async fn a_plain_url_produces_segments_and_no_legacy_object() -> Result<(), Erro
     let _guard = init_tracing()?;
 
     let storage = StorageContainer::builder()
-        .cluster_id("tansu")
+        .cluster_id(cluster_id())
         .node_id(111)
         .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(Url::parse("memory://tansu/")?)
+        .storage(storage_url()?)
         .build()
         .await?;
 
@@ -1008,22 +1005,20 @@ mod doctest_template {
     use tansu_storage::{CreateTopicsService, ProduceService, StorageContainer};
     use url::Url;
 
-    use crate::common::{Error, init_tracing};
+    use crate::common::{Error, cluster_id, init_tracing, storage_url};
 
     #[tokio::test]
     async fn req() -> Result<(), Error> {
         let _guard = init_tracing()?;
-
-        const CLUSTER_ID: &str = "tansu";
         const NODE_ID: i32 = 111;
         const HOST: &str = "localhost";
         const PORT: i32 = 9092;
 
         let storage = StorageContainer::builder()
-            .cluster_id(CLUSTER_ID)
+            .cluster_id(cluster_id())
             .node_id(NODE_ID)
             .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-            .storage(Url::parse("memory://tansu/")?)
+            .storage(storage_url()?)
             .build()
             .await?;
 
