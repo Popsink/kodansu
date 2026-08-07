@@ -16,8 +16,8 @@
 //!
 //! The CLI is a single statically linked binary that contains:
 //! - Broker
-//! - Proxy: a Kafka API proxy
 //! - Topic: Topic administration
+//! - User: SASL/SCRAM credential administration
 
 use std::process;
 
@@ -27,8 +27,6 @@ use tansu_sans_io::ErrorCode;
 use tracing::debug;
 
 mod broker;
-mod perf;
-mod proxy;
 mod topic;
 mod user;
 
@@ -67,12 +65,6 @@ enum Command {
     /// Apache Kafka compatible broker backed by an object store (S3, GCS or memory) [default if no command supplied]
     Broker(Box<broker::Arg>),
 
-    /// Performance
-    Perf(Box<perf::Arg>),
-
-    /// Apache Kafka compatible proxy
-    Proxy(Box<proxy::Arg>),
-
     /// Create, list or delete topics managed by the broker
     Topic {
         #[command(subcommand)]
@@ -97,16 +89,6 @@ impl Cli {
 
         match cli.command.unwrap_or(Command::Broker(Box::new(cli.broker))) {
             Command::Broker(arg) => arg.main().await,
-            Command::Perf(arg) => arg.main().await,
-            Command::Proxy(arg) => tansu_proxy::Proxy::main(
-                arg.listener_url.into_inner(),
-                arg.advertised_listener_url.into_inner(),
-                arg.origin_url.into_inner(),
-                arg.otlp_endpoint_url
-                    .map(|otlp_endpoint_url| otlp_endpoint_url.into_inner()),
-            )
-            .await
-            .map_err(Into::into),
             Command::Topic { command } => command.main().await,
             Command::User { command } => command.main().await,
         }

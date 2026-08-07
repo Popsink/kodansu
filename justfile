@@ -102,10 +102,10 @@ miri:
     cargo +nightly miri test --no-fail-fast --all-features
 
 docker-build:
-    docker build --tag ghcr.io/tansu-io/tansu --no-cache --progress plain --debug .
+    docker build --tag ghcr.io/popsink/tansu --no-cache --progress plain --debug .
 
 docker-build-cross:
-    docker build --tag ghcr.io/tansu-io/tansu --no-cache --progress plain --platform linux/amd64,linux/arm64 --debug .
+    docker build --tag ghcr.io/popsink/tansu --no-cache --progress plain --platform linux/amd64,linux/arm64 --debug .
 
 minio-up: (docker-compose-up "minio")
 
@@ -300,10 +300,6 @@ broker *args: build docker-compose-down prometheus-up grafana-up minio-up minio-
 
 # run a release broker with configuration from .env
 broker-release *args: release docker-compose-down prometheus-up grafana-up minio-up minio-ready-local minio-local-alias minio-tansu-bucket (tansu-broker "release" args)
-
-# run a proxy with configuration from .env
-proxy *args:
-    target/debug/tansu proxy {{ args }} 2>&1 | tee proxy.log
 
 # teardown compose, rebuild: minio and tansu bucket
 server: (cargo-build "--bin" "tansu") docker-compose-down minio-up minio-ready-local minio-local-alias minio-tansu-bucket

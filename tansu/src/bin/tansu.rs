@@ -46,14 +46,6 @@ async fn main() -> Result<ErrorCode> {
             _ => error!("{}", error_code),
         })
         .inspect_err(|err| match err {
-            tansu_cli::Error::Perf(error) => match error {
-                tansu_perf::Error::Client(_) => error!("{}", CLIENT_ERROR_MESSAGE),
-                _ => error!("Unknown error occurred during command: {}", error),
-            },
-            tansu_cli::Error::Proxy(error) => match error {
-                tansu_proxy::Error::Client(_) => error!("{}", CLIENT_ERROR_MESSAGE),
-                _ => error!("Unknown error occurred during command: {}", error),
-            },
             tansu_cli::Error::Topic(error) => match error {
                 tansu_topic::Error::Client(_) => error!("{}", CLIENT_ERROR_MESSAGE),
                 _ => error!("Unknown error occurred during command: {}", error),

@@ -34,8 +34,6 @@ It ships as one statically linked binary:
 | `broker` | the Kafka API broker — default when no subcommand is given |
 | `topic` | create, list and delete topics |
 | `user` | administer SASL/SCRAM credentials |
-| `proxy` | a Kafka API proxy |
-| `perf` | a produce-side benchmark |
 
 Kodansu is Popsink's fork of [tansu-io/tansu][github-com-tansu-io], driven by one
 workload: **CDC with high topic fan-out** — thousands of topics, a handful of records
@@ -311,6 +309,7 @@ just grafana-ui   # opens http://localhost:3000
 | [docs/design-multiwriter-segments.md](docs/design-multiwriter-segments.md) | Why the create-only segment sequence is the offset arbiter |
 | [docs/migration-scos.md](docs/migration-scos.md) | Operator runbook for the lease → leaseless cutover (historical) |
 | [docs/sarama.md](docs/sarama.md) | Driving the broker with the Go Sarama client |
+| [docs/rename-kodansu.md](docs/rename-kodansu.md) | Checklist for closing the `tansu` → `kodansu` gap described below |
 | [CLAUDE.md](CLAUDE.md) | Repository layout, crate roles, build and test invocations |
 
 ## Development

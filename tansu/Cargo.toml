@@ -18,8 +18,6 @@ dotenv.workspace = true
 mimalloc.workspace = true
 tansu-broker = { workspace = true, default-features = false, optional = true }
 tansu-cli = { workspace = true, default-features = false, optional = true }
-tansu-perf.workspace = true
-tansu-proxy.workspace = true
 tansu-sans-io.workspace = true
 tansu-storage = { workspace = true, default-features = false, optional = true }
 tansu-topic.workspace = true
