@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{Error, init_tracing};
+use crate::common::{Error, cluster_id, init_tracing, storage_url};
 use rama::{Context, Layer as _, Service, layer::MapStateLayer};
 use rand::{distr::Alphanumeric, prelude::*, rng};
 use tansu_sans_io::{
@@ -21,7 +21,6 @@ use tansu_sans_io::{
 };
 use tansu_storage::{CreateTopicsService, DeleteTopicsService, MetadataService, StorageContainer};
 use url::Url;
-use uuid::Uuid;
 
 mod common;
 
@@ -29,17 +28,16 @@ mod common;
 async fn topic_lifecycle() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let cluster_id = Uuid::now_v7().to_string();
     let node_id = rng().random_range(0..i32::MAX);
 
     const HOST: &str = "localhost";
     const PORT: i32 = 9092;
 
     let storage = StorageContainer::builder()
-        .cluster_id(cluster_id)
+        .cluster_id(cluster_id())
         .node_id(node_id)
         .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(Url::parse("memory://tansu/")?)
+        .storage(storage_url()?)
         .build()
         .await?;
 

@@ -19,7 +19,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::common::{Error, init_tracing};
+use crate::common::{Error, cluster_id, init_tracing, storage_url};
 use bytes::Bytes;
 use tansu_sans_io::{
     ErrorCode, IsolationLevel,
@@ -33,12 +33,12 @@ mod common;
 
 type Sc = Arc<Box<dyn Storage>>;
 
-async fn memory_storage() -> Result<Sc, Error> {
+async fn default_storage() -> Result<Sc, Error> {
     StorageContainer::builder()
-        .cluster_id("tansu")
+        .cluster_id(cluster_id())
         .node_id(111)
         .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(Url::parse("memory://tansu/")?)
+        .storage(storage_url()?)
         .build()
         .await
         .map_err(Into::into)
@@ -99,7 +99,7 @@ async fn produce_three(storage: &Sc, topition: &Topition) -> Result<(), Error> {
 async fn retention_ms_expires_old_records() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let storage = memory_storage().await?;
+    let storage = default_storage().await?;
 
     let retention = Duration::from_mins(30);
 
@@ -165,7 +165,7 @@ async fn retention_ms_expires_old_records() -> Result<(), Error> {
 async fn default_retention_keeps_recent_records() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let storage = memory_storage().await?;
+    let storage = default_storage().await?;
 
     // cleanup.policy=delete with no retention.ms falls back to the 7 day default
     create_topic(
@@ -232,7 +232,7 @@ async fn default_retention_keeps_recent_records() -> Result<(), Error> {
 async fn without_cleanup_policy_kafka_defaults_apply() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let storage = memory_storage().await?;
+    let storage = default_storage().await?;
 
     // No cleanup.policy at all: the Kafka default (`delete`) applies.
     create_topic(&storage, "no-policy", vec![]).await?;
@@ -269,7 +269,7 @@ async fn without_cleanup_policy_kafka_defaults_apply() -> Result<(), Error> {
 async fn retention_ms_minus_one_retains_forever() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let storage = memory_storage().await?;
+    let storage = default_storage().await?;
 
     create_topic(
         &storage,

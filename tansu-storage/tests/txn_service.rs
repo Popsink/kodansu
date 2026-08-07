@@ -35,7 +35,7 @@ use tansu_storage::{
 };
 use url::Url;
 
-use crate::common::{Error, init_tracing};
+use crate::common::{Error, cluster_id, init_tracing, storage_url};
 
 mod common;
 
@@ -50,10 +50,10 @@ type Shared = std::sync::Arc<Box<dyn tansu_storage::Storage>>;
 /// rather than on the delegation it is here to check.
 async fn transactional_storage() -> Result<(Shared, i64, i16), Error> {
     let storage = StorageContainer::builder()
-        .cluster_id("tansu")
+        .cluster_id(cluster_id())
         .node_id(NODE_ID)
         .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(Url::parse("memory://tansu/")?)
+        .storage(storage_url()?)
         .silent(true)
         .build()
         .await?;
@@ -180,7 +180,7 @@ async fn add_partitions_v4_plus_fills_the_by_transaction_results() -> Result<(),
     let _guard = init_tracing()?;
 
     let storage = StorageContainer::builder()
-        .cluster_id("tansu")
+        .cluster_id(cluster_id())
         .node_id(NODE_ID)
         .advertised_listener(Url::parse("tcp://localhost:9092")?)
         .storage(Url::parse("null://sink/")?)

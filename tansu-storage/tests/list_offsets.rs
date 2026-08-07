@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{Error, init_tracing};
+use crate::common::{Error, cluster_id, init_tracing, storage_url, storage_url_with_query};
 use bytes::Bytes;
 use rama::{Context, Layer as _, Service, layer::MapStateLayer};
 use tansu_sans_io::{
@@ -36,10 +36,10 @@ async fn req() -> Result<(), Error> {
     const NODE_ID: i32 = 111;
 
     let storage = StorageContainer::builder()
-        .cluster_id("tansu")
+        .cluster_id(cluster_id())
         .node_id(NODE_ID)
         .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(Url::parse("memory://tansu/")?)
+        .storage(storage_url()?)
         .build()
         .await?;
 
@@ -106,10 +106,10 @@ async fn wide_assignment_earliest_and_latest() -> Result<(), Error> {
     const TOPICS: usize = 64;
 
     let storage = StorageContainer::builder()
-        .cluster_id("tansu")
+        .cluster_id(cluster_id())
         .node_id(NODE_ID)
         .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(Url::parse("memory://tansu/")?)
+        .storage(storage_url()?)
         .build()
         .await?;
 
@@ -275,10 +275,10 @@ async fn wide_assignment_earliest_and_latest_prefix_coalesced() -> Result<(), Er
     const PREFIXES: usize = 4;
 
     let storage = StorageContainer::builder()
-        .cluster_id("tansu")
+        .cluster_id(cluster_id())
         .node_id(NODE_ID)
         .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(Url::parse("memory://tansu/?prefix_coalesce=true")?)
+        .storage(storage_url_with_query("prefix_coalesce=true")?)
         .build()
         .await?;
 

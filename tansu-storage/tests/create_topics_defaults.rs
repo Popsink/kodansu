@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use crate::common::{Error, init_tracing};
+use crate::common::{Error, cluster_id, init_tracing, storage_url};
 use rama::{Context, Layer as _, Service, layer::MapStateLayer};
 use tansu_sans_io::{
     ConfigResource, CreateTopicsRequest, DescribeConfigsRequest,
@@ -36,10 +36,10 @@ type DynStorage = Arc<Box<dyn Storage>>;
 /// inherits them (#225).
 async fn storage(defaults: TopicDefaults) -> Result<DynStorage, Error> {
     StorageContainer::builder()
-        .cluster_id("tansu")
+        .cluster_id(cluster_id())
         .node_id(111)
         .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(Url::parse("memory://tansu/")?)
+        .storage(storage_url()?)
         .topic_defaults(defaults)
         .build()
         .await

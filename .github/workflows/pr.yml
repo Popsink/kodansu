@@ -111,13 +111,17 @@ jobs:
       RUST_BACKTRACE: 1
       RUST_LOG: debug,tansu_sans_io=warn,tansu_model=warn
     steps:
-      # No `just ci` and no AWS_*/STORAGE_ENGINE block here any more. Every test
-      # in the workspace builds its own `StorageContainer` over `memory://`; not
-      # one of them reads AWS_ENDPOINT, opens an `s3://` URL, or so much as
-      # mentions minio. The compose stack was started, waited for, and ignored.
+      # No `just ci` and no AWS_*/STORAGE_ENGINE block here. Every test in the
+      # workspace builds its own `StorageContainer` over `memory://`, which is
+      # what `TANSU_TEST_STORAGE_URL` defaults to, so this job needs no service.
+      # The compose stack that used to be started here was waited for and then
+      # ignored by every test.
       #
-      # It follows that the S3 and GCS object stores are untested, which the
-      # minio service made look otherwise. See docs/testing.md.
+      # The S3 run lives in `storage.yml` (nightly + workflow_dispatch), not here:
+      # `test` is the required check, and a Docker-dependent job upstream of it
+      # would cost every PR minutes to establish something that changes only when
+      # `object_store` or the store does. The conditional-put conformance target
+      # does run here — on `memory://`, in ~30ms. See docs/testing.md.
       - run: sudo mkdir /mnt/build
       - run: sudo chmod a+rwxt /mnt/build
       - uses: actions/checkout@v6
