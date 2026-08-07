@@ -74,10 +74,14 @@ each test a unique prefix, since they would otherwise share one bucket and
 collide on topic names. Then the suite can run twice: once on `memory://`, once
 on `s3://` against minio.
 
-**`tansu-topic`, `tansu-perf`, `tansu-otel`.** The `tansu topic` subcommand, the
-produce benchmark and the OTLP exporter are at or near 0%. They are all
-thin shells over code that is covered, but none of them has a test that would
-notice if the shell stopped delegating.
+**`tansu-topic`.** The `tansu topic` subcommand is at or near 0%. It is a thin
+shell over code that is covered, but it has no test that would notice if the
+shell stopped delegating.
+
+`tansu-perf` and `tansu-otel` used to sit in this paragraph alongside it, and
+`tansu-proxy` — 2 800 lines with no integration test — should have. All three
+were deleted instead: nothing in this fork deployed, documented or benchmarked
+with them, so the honest fix for their coverage was removal, not tests.
 
 ## CI layout
 

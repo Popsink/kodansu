@@ -55,7 +55,9 @@ Note: when running tansu directly (not via docker compose), set `AWS_ENDPOINT="h
 
 ## Architecture
 
-Cargo workspace producing a single binary (`tansu`) with subcommands: `broker` (default), `topic`, `user`, `perf`, `proxy`.
+Cargo workspace producing a single binary (`tansu`) with subcommands: `broker` (default), `topic`, `user`.
+
+The `proxy` and `perf` subcommands and their crates (`tansu-proxy`, `tansu-perf`, and `tansu-otel`, which existed only to serve the proxy) were removed — nothing in this fork deployed, documented or benchmarked with them. The broker's OTLP export is its own `tansu-broker/src/otel.rs`.
 
 ### Key Crates
 
@@ -70,9 +72,7 @@ Cargo workspace producing a single binary (`tansu`) with subcommands: `broker` (
 | `tansu-model` | Kafka JSON protocol definitions (used in build.rs) |
 | `tansu-cli` | Clap-based CLI argument parsing |
 | `tansu-auth` | SASL/SCRAM authentication |
-| `tansu-otel` | OTLP metric/trace export (there is no Prometheus scrape endpoint) |
 | `tansu-topic` | Topic administration used by `tansu topic` |
-| `tansu-perf` | Produce-side benchmark used by `tansu perf` |
 
 ### Sans-I/O Code Generation (`tansu-sans-io`)
 

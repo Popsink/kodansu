@@ -2180,17 +2180,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e62e29dfe041afb8ed2a6c9737ab57db4907285d999ef8ad3a59092a36bdc846"
 
 [[package]]
-name = "opentelemetry-stdout"
-version = "0.31.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bc8887887e169414f637b18751487cce4e095be787d23fad13c454e2fb1b3811"
-dependencies = [
- "chrono",
- "opentelemetry",
- "opentelemetry_sdk",
-]
-
-[[package]]
 name = "opentelemetry_sdk"
 version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3576,8 +3565,6 @@ dependencies = [
  "mimalloc",
  "tansu-broker",
  "tansu-cli",
- "tansu-perf",
- "tansu-proxy",
  "tansu-sans-io",
  "tansu-storage",
  "tansu-topic",
@@ -3644,28 +3631,22 @@ version = "0.7.0-beta.39"
 dependencies = [
  "bytes",
  "clap",
- "console",
  "dotenv",
- "human-units",
  "humantime",
  "owo-colors",
  "pbkdf2",
  "rand 0.10.1",
  "regex",
- "rsasl",
  "rustls",
  "sha2",
  "tansu-broker",
  "tansu-client",
- "tansu-perf",
- "tansu-proxy",
  "tansu-sans-io",
  "tansu-storage",
  "tansu-topic",
  "thiserror",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "url",
  "uuid",
 ]
@@ -3707,73 +3688,6 @@ dependencies = [
  "serde_json",
  "syn",
  "tracing",
-]
-
-[[package]]
-name = "tansu-otel"
-version = "0.7.0-beta.39"
-dependencies = [
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry-semantic-conventions",
- "opentelemetry_sdk",
- "thiserror",
- "tracing",
- "url",
-]
-
-[[package]]
-name = "tansu-perf"
-version = "0.7.0-beta.39"
-dependencies = [
- "bytes",
- "futures",
- "futures-core",
- "futures-util",
- "getrandom 0.4.2",
- "governor",
- "human-units",
- "nonzero_ext",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry-semantic-conventions",
- "opentelemetry-stdout",
- "opentelemetry_sdk",
- "rama",
- "serde_json",
- "tansu-client",
- "tansu-sans-io",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
-name = "tansu-proxy"
-version = "0.7.0-beta.39"
-dependencies = [
- "async-trait",
- "bytes",
- "clap",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry-semantic-conventions",
- "opentelemetry_sdk",
- "rama",
- "tansu-client",
- "tansu-otel",
- "tansu-sans-io",
- "tansu-service",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
 ]
 
 [[package]]
