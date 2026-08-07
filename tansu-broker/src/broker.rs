@@ -43,7 +43,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tansu_sans_io::{ErrorCode, RootMessageMeta};
-use tansu_service::{Classify as _, Severity};
+use tansu_service::{Classify as _, Peer, Severity};
 use tansu_storage::{
     ArcDynStorage, BrokerRegistrationRequest, Storage, StorageContainer, TopicDefaults,
 };
@@ -523,7 +523,18 @@ where
             Some(ls)
         };
 
-        let _acceptor = self.tls_server_config.clone().map(TlsAcceptor::from);
+        // The client listener speaks TLS whenever a certificate is configured,
+        // and this is the acceptor that makes it so. It used to be bound to
+        // `_acceptor` and dropped on the spot, so `--cert`/`--key` were
+        // accepted, the certificate was parsed, and every connection was still
+        // plaintext — including the SASL PLAIN password and the SCRAM exchange
+        // an operator had every reason to believe were encrypted (#358).
+        //
+        // Applied to the existing listener rather than bound as a second,
+        // TLS-only one: there is a single advertised listener URL, so a second
+        // port would be one no client is ever told about while the port they all
+        // use stayed in the clear — which is the state being fixed.
+        let acceptor = self.tls_server_config.clone().map(TlsAcceptor::from);
 
         let mut connections = 0;
 
@@ -544,6 +555,7 @@ where
                         self.groups.clone(),
                         stream,
                         addr,
+                        acceptor.clone(),
                     )?;
 
                     continue;
@@ -565,6 +577,17 @@ where
                             internal_groups.clone(),
                             stream,
                             addr,
+                            // Plaintext, deliberately, even when the client
+                            // listener is TLS. Nothing a client authenticates
+                            // with crosses this listener: it carries forwarded
+                            // group frames between replicas of one cluster, on
+                            // a port reachable only through the headless
+                            // Service, and #360 removes the listener outright.
+                            // Encrypting it needs a peer trust store plus a
+                            // client config on the forward side — a real cost,
+                            // spent on a listener with a deletion date.
+                            // Revisit only if #360 is abandoned.
+                            None,
                         )?;
                     }
 
@@ -671,6 +694,11 @@ where
     /// group's owner), the internal listener with the plain local one. The
     /// stacks are otherwise identical — same storage, SASL and topic
     /// defaults.
+    ///
+    /// `acceptor` decides the transport: `Some` wraps the stream in TLS before
+    /// the Kafka stack sees a byte, `None` serves it as it arrived. The two
+    /// accept arms pass different values (#358), which is the whole of the
+    /// per-listener transport policy.
     #[allow(clippy::too_many_arguments)]
     fn spawn_connection(
         &self,
@@ -681,8 +709,14 @@ where
         groups: G,
         stream: TcpStream,
         addr: SocketAddr,
+        acceptor: Option<TlsAcceptor>,
     ) -> Result<()> {
         let mut c = Context::default();
+
+        // What `TcpContextService` used to read off the stream with
+        // `peer_addr()` — the call that made the service stack `TcpStream`-only
+        // and so kept TLS out of it. The accept loop knows the address already.
+        _ = c.insert(Peer(addr));
 
         let pb = if self.silent {
             None
@@ -707,45 +741,22 @@ where
         )?;
 
         let handle = set.spawn(async move {
-            match service.serve(c, stream).await {
-                // Two separate facts, and this arm used to conflate them into one
-                // `error!` (#289).
-                //
-                // *Which* error occurred is classified by the error itself, so a
-                // deliberately retriable answer does not fill the error plane on
-                // every rollout.
-                //
-                // *That the connection is being abandoned with no response
-                // written* is reported whatever the error was, because it is the
-                // part the client experiences and nothing else records it. From
-                // the caller's side an abandoned connection is indistinguishable
-                // from the peer closing mid-frame — which is exactly the
-                // `early eof` shape of #300, and this line is the only evidence
-                // that a request-level error is what caused it. Downgrading the
-                // error code must not take that with it.
-                //
-                // #300 removed the largest population that reached here:
-                // `Error::Api` on a group API, which the coordinator means as a
-                // protocol *answer* (`NOT_COORDINATOR` from a failed forward,
-                // #243) and which was costing a connection instead of being
-                // written back. `broker::group::answer` converts those now, so
-                // what still arrives here is an error the broker has no answer
-                // for — which is what makes this line worth reading.
-                Err(error) => match error.severity() {
-                    Severity::Expected => debug!(?error),
+            match acceptor {
+                // The handshake runs here, in the connection's own task, and not
+                // in `listen`'s accept loop: a peer that opens a socket and then
+                // says nothing must cost itself, not everything queued behind
+                // `accept`.
+                Some(acceptor) => match acceptor.accept(stream).await {
+                    Ok(stream) => report_connection(service.serve(c, stream).await),
 
-                    Severity::Unexpected => {
-                        warn!(?error, "connection ended, no response written")
-                    }
-
-                    Severity::Failure => {
-                        error!(?error, "connection ended, no response written")
-                    }
+                    // Where a plaintext client on a TLS listener arrives, and
+                    // the one event #358's silence left no trace of at all.
+                    // Reported with the address because the handshake failed, so
+                    // no per-connection span was ever entered to carry it.
+                    Err(err) => warn!(%addr, ?err, "TLS handshake failed; refusing the connection"),
                 },
 
-                Ok(response) => {
-                    debug!(?response)
-                }
+                None => report_connection(service.serve(c, stream).await),
             }
 
             if let Some(ref pb) = pb {
@@ -756,6 +767,51 @@ where
         debug!(?handle);
 
         Ok(())
+    }
+}
+
+/// Report how one connection ended.
+///
+/// Two separate facts, and this used to conflate them into one `error!` (#289).
+///
+/// *Which* error occurred is classified by the error itself, so a deliberately
+/// retriable answer does not fill the error plane on every rollout.
+///
+/// *That the connection is being abandoned with no response written* is
+/// reported whatever the error was, because it is the part the client
+/// experiences and nothing else records it. From the caller's side an abandoned
+/// connection is indistinguishable from the peer closing mid-frame — which is
+/// exactly the `early eof` shape of #300, and this line is the only evidence
+/// that a request-level error is what caused it. Downgrading the error code
+/// must not take that with it.
+///
+/// #300 removed the largest population that reached here: `Error::Api` on a
+/// group API, which the coordinator means as a protocol *answer*
+/// (`NOT_COORDINATOR` from a failed forward, #243) and which was costing a
+/// connection instead of being written back. `broker::group::answer` converts
+/// those now, so what still arrives here is an error the broker has no answer
+/// for — which is what makes this line worth reading.
+///
+/// A failed TLS handshake never reaches here: it is reported at the accept site,
+/// because no request was read and there is nothing further to say about the
+/// connection (#358).
+fn report_connection(served: Result<()>) {
+    match served {
+        Err(error) => match error.severity() {
+            Severity::Expected => debug!(?error),
+
+            Severity::Unexpected => {
+                warn!(?error, "connection ended, no response written")
+            }
+
+            Severity::Failure => {
+                error!(?error, "connection ended, no response written")
+            }
+        },
+
+        Ok(response) => {
+            debug!(?response)
+        }
     }
 }
 
