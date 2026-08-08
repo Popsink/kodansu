@@ -61,6 +61,37 @@ jobs:
           path: logs.tar.gz
           if-no-files-found: error
 
+  # Many groups at once (#359). Nightly rather than per-PR for the same reason
+  # as the rest of this workflow: it is minutes of wall clock, and what it
+  # measures — how many group-state writes a group costs, and whether concurrent
+  # replicas collide on them — moves when the coordinator changes, not when a
+  # commit lands.
+  group-scale:
+    runs-on: ubuntu-latest-8-cores
+    env:
+      CARGO_BUILD_BUILD_DIR: /mnt/build
+      NEXTEST_PROFILE: ci
+      RUST_BACKTRACE: 1
+      RUST_LOG: info,tansu_sans_io=warn,tansu_model=warn
+    steps:
+      - run: sudo mkdir /mnt/build
+      - run: sudo chmod a+rwxt /mnt/build
+      - uses: actions/checkout@v6
+      - uses: extractions/setup-just@v3
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: taiki-e/install-action@nextest
+      - run: just test-group-scale
+      - run: tar --create --gzip --file=logs.tar.gz logs
+        if: always()
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: logs-group-scale
+          path: logs.tar.gz
+          if-no-files-found: error
+
   # Real S3, or any other store the operator names. Skipped unless the secrets
   # exist, because a fork has no reason to hold them — and a skipped job is
   # honest, where a job that silently ran against nothing was the arrangement

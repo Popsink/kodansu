@@ -142,6 +142,39 @@ group-state decomposition adds per-generation CAS'd objects, and a small
 `{generation, leader}` object is much likelier to cycle back to a previous
 byte-identical value than `GroupDetail` is.
 
+## Group scale
+
+`just test-group-scale` drives `GROUPS × MEMBERS` consumers through the full
+KIP-394 dance across `REPLICAS` coordinators over one shared store, and asserts
+convergence, zero group-state CAS conflicts, and a per-group write budget. It is
+the exit criterion for the group-state decomposition (#359) — `cg_forward`
+proves *one* group converges, and the deployment that wedged had many.
+
+`#[ignore]`d in the suite: it is wall clock rather than a regression gate, and
+`.github/workflows/storage.yml` runs it nightly. The size is environment-driven,
+so a laptop can run a slice of production:
+
+```shell
+TANSU_SCALE_GROUPS=8 just test-group-scale
+```
+
+| Variable | Default | |
+|---|---|---|
+| `TANSU_SCALE_GROUPS` | 64 | |
+| `TANSU_SCALE_MEMBERS` | 16 | the group size that never converged |
+| `TANSU_SCALE_REPLICAS` | 10 | the deployment's broker count |
+| `TANSU_SCALE_FORWARDING` | true | false runs the same consumers with no owner replica |
+| `TANSU_SCALE_PUT_BUDGET_PER_MEMBER` | 2 | group-state PUTs a group may cost |
+| `TANSU_SCALE_DEADLINE_SECS` | 120 | per-member, only reached on failure |
+
+At the default size the forwarded arrangement converges 1024 members in ~5s for
+1152 group-state PUTs — 18 per 16-member group — with zero CAS conflicts. That
+is the baseline the decomposition is measured against.
+
+`TANSU_SCALE_FORWARDING=false` is the arrangement #360 wants to make the only
+one: every replica drives every group, no owner. **It fails today**, which is
+what the flip has to turn green.
+
 ## What is not covered
 
 **GCS.** `gs://` is a supported target and every test in the conformance target
