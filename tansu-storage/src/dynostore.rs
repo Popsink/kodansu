@@ -80,9 +80,10 @@ mod opticon;
 mod tests;
 
 use crate::{
-    AutoTopicCreate, BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    Result, ScramCredential, Storage, TopicDefaults, TopicId, Topition, TxnAddPartitionsRequest,
+    AssignmentDoc, AssignmentOutcome, AutoTopicCreate, BrokerRegistrationRequest, Error,
+    GenerationDoc, GroupDetail, ListOffsetResponse, METER, MemberDoc, MetadataResponse,
+    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
+    ScramCredential, Storage, TopicDefaults, TopicId, Topition, TxnAddPartitionsRequest,
     TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
     storage_error_code,
 };
@@ -6079,6 +6080,66 @@ impl DynoStore {
         (prefix != self.groups_root()).then_some(prefix)
     }
 
+    /// `members/` under a group's prefix, or `None` for the widening group id
+    /// [`Self::group_prefix`] refuses (#277).
+    fn group_members_prefix(&self, group_id: &str) -> Option<Path> {
+        self.group_prefix(group_id)
+            .map(|prefix| Path::from(format!("{prefix}/members")))
+    }
+
+    /// A member's own document (#359). `None` when either id contributes no
+    /// path component: a member id that normalises away would otherwise write
+    /// the group's `members` prefix itself as an object.
+    fn group_member_location(&self, group_id: &str, member_id: &str) -> Option<Path> {
+        let prefix = self.group_members_prefix(group_id)?;
+        let location = Path::from(format!("{prefix}/{member_id}.json"));
+
+        (location != Path::from(format!("{prefix}/.json"))).then_some(location)
+    }
+
+    /// A group's composition document (#359).
+    fn group_generation_location(&self, group_id: &str) -> Option<Path> {
+        self.group_prefix(group_id)
+            .map(|prefix| Path::from(format!("{prefix}/generation.json")))
+    }
+
+    /// `assignment/` under a group's prefix (#359).
+    fn group_assignments_prefix(&self, group_id: &str) -> Option<Path> {
+        self.group_prefix(group_id)
+            .map(|prefix| Path::from(format!("{prefix}/assignment")))
+    }
+
+    /// A generation's immutable assignment (#359). Zero-padded so the listing
+    /// is in generation order, as `{seq}.seg` is for segments.
+    ///
+    /// `None` for a negative generation: zero-padding one yields `00000000-1`,
+    /// which neither sorts nor parses back, so the housekeeping sweep could
+    /// never remove it. Generations are minted from zero upward, so this is a
+    /// guard against a caller bug rather than a reachable state.
+    fn group_assignment_location(&self, group_id: &str, generation_id: i32) -> Option<Path> {
+        if generation_id < 0 {
+            return None;
+        }
+
+        self.group_assignments_prefix(group_id)
+            .map(|prefix| Path::from(format!("{prefix}/{generation_id:0>10}.json")))
+    }
+
+    /// Read `Option`, not `Result`: an object that is not there is an answer —
+    /// the group has no generation, the member has no document — and only a
+    /// store error is a failure.
+    fn absent_is_none<V>(result: Result<(V, Version)>) -> Result<Option<(V, Version)>> {
+        match result {
+            Ok(pair) => Ok(Some(pair)),
+            Err(Error::ObjectStore(error))
+                if matches!(error.as_ref(), object_store::Error::NotFound { .. }) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// The most recent `last_modified` across everything under `group_id`'s
     /// prefix — its committed offsets — as epoch milliseconds. `None` when the
     /// group has no objects there at all (#272).
@@ -9975,6 +10036,208 @@ impl Storage for DynoStore {
             }
             Err(error) => Err(error),
         }
+    }
+
+    async fn write_group_member(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        member: MemberDoc,
+        version: Option<Version>,
+    ) -> Result<Version, UpdateError<MemberDoc>> {
+        let location = self
+            .group_member_location(group_id, member_id)
+            .ok_or_else(|| UpdateError::Error(Error::Api(ErrorCode::InvalidGroupId)))?;
+
+        self.put(
+            &location,
+            member,
+            json_content_type(),
+            version.map(Into::into),
+        )
+        .await
+        .map(Into::into)
+    }
+
+    async fn read_group_member(
+        &self,
+        group_id: &str,
+        member_id: &str,
+    ) -> Result<Option<(MemberDoc, Version)>> {
+        let Some(location) = self.group_member_location(group_id, member_id) else {
+            return Ok(None);
+        };
+
+        Self::absent_is_none(self.get::<MemberDoc>(&location).await)
+    }
+
+    async fn delete_group_member(&self, group_id: &str, member_id: &str) -> Result<()> {
+        let Some(location) = self.group_member_location(group_id, member_id) else {
+            return Ok(());
+        };
+
+        match self.object_store.delete(&location).await {
+            Ok(()) => Ok(()),
+            // Already gone is the outcome asked for. The caller's contract is
+            // best-effort anyway, and a member document is deleted from more
+            // than one path (its own leave, and the sweep that evicted it).
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn list_group_members(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<String, (MemberDoc, Version)>> {
+        let Some(prefix) = self.group_members_prefix(group_id) else {
+            return Ok(BTreeMap::new());
+        };
+
+        let mut members = BTreeMap::new();
+        let mut listing = self.scan(Scan::Group, &prefix);
+
+        while let Some(meta) = listing.next().await.transpose()? {
+            let Some(member_id) = meta
+                .location
+                .parts()
+                .next_back()
+                .and_then(|name| name.as_ref().strip_suffix(".json").map(ToOwned::to_owned))
+            else {
+                continue;
+            };
+
+            // A document deleted between the listing and the read is a member
+            // that left, not a failure of the listing.
+            if let Some(pair) = Self::absent_is_none(self.get::<MemberDoc>(&meta.location).await)? {
+                _ = members.insert(member_id, pair);
+            }
+        }
+
+        Ok(members)
+    }
+
+    async fn read_group_generation(
+        &self,
+        group_id: &str,
+    ) -> Result<Option<(GenerationDoc, Version)>> {
+        let Some(location) = self.group_generation_location(group_id) else {
+            return Ok(None);
+        };
+
+        Self::absent_is_none(self.get::<GenerationDoc>(&location).await)
+    }
+
+    async fn update_group_generation(
+        &self,
+        group_id: &str,
+        generation: GenerationDoc,
+        version: Option<Version>,
+    ) -> Result<Version, UpdateError<GenerationDoc>> {
+        let location = self
+            .group_generation_location(group_id)
+            .ok_or_else(|| UpdateError::Error(Error::Api(ErrorCode::InvalidGroupId)))?;
+
+        self.put(
+            &location,
+            generation,
+            json_content_type(),
+            version.map(Into::into),
+        )
+        .await
+        .map(Into::into)
+    }
+
+    async fn create_group_assignment(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+        assignment: AssignmentDoc,
+    ) -> Result<AssignmentOutcome> {
+        let location = self
+            .group_assignment_location(group_id, generation_id)
+            .ok_or(Error::Api(ErrorCode::InvalidGroupId))?;
+
+        // `None` is `PutMode::Create`, so this races on the key rather than on
+        // an etag: exactly one writer creates it, and the loser is handed what
+        // is stored.
+        match self
+            .put(&location, assignment, json_content_type(), None)
+            .await
+        {
+            Ok(put_result) => Ok(AssignmentOutcome::Created(put_result.into())),
+
+            Err(UpdateError::Outdated { current, .. }) => {
+                Ok(AssignmentOutcome::AlreadyExists(current))
+            }
+
+            Err(UpdateError::Error(error)) => Err(error),
+            Err(UpdateError::SerdeJson(error)) => Err(Error::SerdeJson(error)),
+            Err(UpdateError::Uuid(error)) => Err(Error::Uuid(error)),
+            // `put` never raises it — nothing here reads an etag back — but the
+            // variant is part of the type, and a silent `unreachable!()` in a
+            // storage path is worse than a named error.
+            Err(UpdateError::MissingEtag) => Err(Error::Message(String::from(
+                "assignment create reported a missing etag",
+            ))),
+        }
+    }
+
+    async fn read_group_assignment(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+    ) -> Result<Option<AssignmentDoc>> {
+        let Some(location) = self.group_assignment_location(group_id, generation_id) else {
+            return Ok(None);
+        };
+
+        Ok(Self::absent_is_none(self.get::<AssignmentDoc>(&location).await)?.map(|(doc, _)| doc))
+    }
+
+    async fn delete_group_assignments_before(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+    ) -> Result<u64> {
+        let Some(prefix) = self.group_assignments_prefix(group_id) else {
+            return Ok(0);
+        };
+
+        // The names are zero-padded, so the listing is in generation order and
+        // `start_after` would do — but a generation that overflowed into a
+        // wider name, or an object written by a future layout, must not stop
+        // the sweep. Decoding the name and comparing is cheap at one object per
+        // rebalance.
+        let mut condemned = vec![];
+        let mut listing = self.scan(Scan::Group, &prefix);
+
+        while let Some(meta) = listing.next().await.transpose()? {
+            let below = meta
+                .location
+                .parts()
+                .next_back()
+                .and_then(|name| {
+                    name.as_ref()
+                        .strip_suffix(".json")
+                        .and_then(|stem| stem.parse::<i32>().ok())
+                })
+                .is_some_and(|generation| generation < generation_id);
+
+            if below {
+                condemned.push(meta.location);
+            }
+        }
+
+        let deleted = self
+            .object_store
+            .delete_stream(futures::stream::iter(condemned.into_iter().map(Ok)).boxed())
+            .try_collect::<Vec<Path>>()
+            .await?;
+
+        debug!(group_id, generation_id, ?deleted);
+
+        Ok(deleted.len() as u64)
     }
 
     async fn init_producer(

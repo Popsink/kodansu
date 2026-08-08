@@ -26,6 +26,7 @@ use super::{DynoStore, ServedEnd, Watermark};
 mod compact_segments;
 mod delete_groups;
 mod group_describe;
+mod group_documents;
 mod group_expiry;
 mod idempotent;
 mod latency;

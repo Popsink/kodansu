@@ -46,10 +46,11 @@ use tansu_sans_io::{
 };
 use tansu_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
 use tansu_storage::{
-    BrokerRegistrationRequest, GroupDetail, ListOffsetResponse, MetadataResponse, NamedGroupDetail,
-    OffsetCommitRequest, OffsetStage, ProducerIdResponse, ScramCredential, Storage, TopicId,
-    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    UpdateError, Version,
+    AssignmentDoc, AssignmentOutcome, BrokerRegistrationRequest, GenerationDoc, GroupDetail,
+    ListOffsetResponse, MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
+    OffsetStage, ProducerIdResponse, ScramCredential, Storage, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
+    Version,
 };
 use tracing::{debug, instrument};
 use url::Url;
@@ -942,6 +943,89 @@ impl Storage for Engine {
         _detail: GroupDetail,
         _version: Option<Version>,
     ) -> tansu_storage::Result<Version, UpdateError<GroupDetail>> {
+        unimplemented!()
+    }
+
+    #[instrument(skip_all)]
+    async fn write_group_member(
+        &self,
+        _group_id: &str,
+        _member_id: &str,
+        _member: MemberDoc,
+        _version: Option<Version>,
+    ) -> tansu_storage::Result<Version, UpdateError<MemberDoc>> {
+        unimplemented!()
+    }
+
+    #[instrument(skip_all)]
+    async fn read_group_member(
+        &self,
+        _group_id: &str,
+        _member_id: &str,
+    ) -> tansu_storage::Result<Option<(MemberDoc, Version)>> {
+        unimplemented!()
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_group_member(
+        &self,
+        _group_id: &str,
+        _member_id: &str,
+    ) -> tansu_storage::Result<()> {
+        unimplemented!()
+    }
+
+    #[instrument(skip_all)]
+    async fn list_group_members(
+        &self,
+        _group_id: &str,
+    ) -> tansu_storage::Result<BTreeMap<String, (MemberDoc, Version)>> {
+        unimplemented!()
+    }
+
+    #[instrument(skip_all)]
+    async fn read_group_generation(
+        &self,
+        _group_id: &str,
+    ) -> tansu_storage::Result<Option<(GenerationDoc, Version)>> {
+        unimplemented!()
+    }
+
+    #[instrument(skip_all)]
+    async fn update_group_generation(
+        &self,
+        _group_id: &str,
+        _generation: GenerationDoc,
+        _version: Option<Version>,
+    ) -> tansu_storage::Result<Version, UpdateError<GenerationDoc>> {
+        unimplemented!()
+    }
+
+    #[instrument(skip_all)]
+    async fn create_group_assignment(
+        &self,
+        _group_id: &str,
+        _generation_id: i32,
+        _assignment: AssignmentDoc,
+    ) -> tansu_storage::Result<AssignmentOutcome> {
+        unimplemented!()
+    }
+
+    #[instrument(skip_all)]
+    async fn read_group_assignment(
+        &self,
+        _group_id: &str,
+        _generation_id: i32,
+    ) -> tansu_storage::Result<Option<AssignmentDoc>> {
+        unimplemented!()
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_group_assignments_before(
+        &self,
+        _group_id: &str,
+        _generation_id: i32,
+    ) -> tansu_storage::Result<u64> {
         unimplemented!()
     }
 

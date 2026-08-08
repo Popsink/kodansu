@@ -60,7 +60,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tansu_sans_io::join_group_response::JoinGroupResponseMember;
 
-use crate::ConsumerGroupState;
+use crate::{ConsumerGroupState, Version};
 
 /// A member's own object, `members/{member_id}.json`.
 ///
@@ -250,6 +250,18 @@ pub struct AssignmentDoc {
     pub protocol_name: String,
     pub assignments: BTreeMap<String, Bytes>,
     pub assigned_at_ms: i64,
+}
+
+/// What a create-only write of `assignment/{generation_id}` did.
+///
+/// `AlreadyExists` is not an error: one leader per generation is guaranteed by
+/// the generation CAS, so the only writer that can find the object already
+/// there is that same leader retrying. Adopting what is stored — rather than
+/// failing, or overwriting — is what makes `SyncGroup` idempotent under retry.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AssignmentOutcome {
+    Created(Version),
+    AlreadyExists(Box<AssignmentDoc>),
 }
 
 #[cfg(test)]

@@ -47,10 +47,11 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    AutoTopicCreate, BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
+    AssignmentDoc, AssignmentOutcome, AutoTopicCreate, BrokerRegistrationRequest, Error,
+    GenerationDoc, GroupDetail, ListOffsetResponse, METER, MemberDoc, MetadataResponse,
+    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
+    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, UpdateError, Version,
 };
 
 static BATCH_REQUESTS_LENGTH: LazyLock<Gauge<u64>> =
@@ -469,6 +470,86 @@ where
 
     async fn read_group(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
         self.storage.read_group(group_id).await
+    }
+
+    async fn write_group_member(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        member: MemberDoc,
+        version: Option<Version>,
+    ) -> Result<Version, UpdateError<MemberDoc>> {
+        self.storage
+            .write_group_member(group_id, member_id, member, version)
+            .await
+    }
+
+    async fn read_group_member(
+        &self,
+        group_id: &str,
+        member_id: &str,
+    ) -> Result<Option<(MemberDoc, Version)>> {
+        self.storage.read_group_member(group_id, member_id).await
+    }
+
+    async fn delete_group_member(&self, group_id: &str, member_id: &str) -> Result<()> {
+        self.storage.delete_group_member(group_id, member_id).await
+    }
+
+    async fn list_group_members(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<String, (MemberDoc, Version)>> {
+        self.storage.list_group_members(group_id).await
+    }
+
+    async fn read_group_generation(
+        &self,
+        group_id: &str,
+    ) -> Result<Option<(GenerationDoc, Version)>> {
+        self.storage.read_group_generation(group_id).await
+    }
+
+    async fn update_group_generation(
+        &self,
+        group_id: &str,
+        generation: GenerationDoc,
+        version: Option<Version>,
+    ) -> Result<Version, UpdateError<GenerationDoc>> {
+        self.storage
+            .update_group_generation(group_id, generation, version)
+            .await
+    }
+
+    async fn create_group_assignment(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+        assignment: AssignmentDoc,
+    ) -> Result<AssignmentOutcome> {
+        self.storage
+            .create_group_assignment(group_id, generation_id, assignment)
+            .await
+    }
+
+    async fn read_group_assignment(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+    ) -> Result<Option<AssignmentDoc>> {
+        self.storage
+            .read_group_assignment(group_id, generation_id)
+            .await
+    }
+
+    async fn delete_group_assignments_before(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+    ) -> Result<u64> {
+        self.storage
+            .delete_group_assignments_before(group_id, generation_id)
+            .await
     }
 
     async fn list_offsets(
@@ -914,6 +995,76 @@ mod tests {
             _detail: GroupDetail,
             _version: Option<Version>,
         ) -> Result<Version, UpdateError<GroupDetail>> {
+            unimplemented!()
+        }
+
+        async fn write_group_member(
+            &self,
+            _group_id: &str,
+            _member_id: &str,
+            _member: MemberDoc,
+            _version: Option<Version>,
+        ) -> Result<Version, UpdateError<MemberDoc>> {
+            unimplemented!()
+        }
+
+        async fn read_group_member(
+            &self,
+            _group_id: &str,
+            _member_id: &str,
+        ) -> Result<Option<(MemberDoc, Version)>> {
+            unimplemented!()
+        }
+
+        async fn delete_group_member(&self, _group_id: &str, _member_id: &str) -> Result<()> {
+            unimplemented!()
+        }
+
+        async fn list_group_members(
+            &self,
+            _group_id: &str,
+        ) -> Result<BTreeMap<String, (MemberDoc, Version)>> {
+            unimplemented!()
+        }
+
+        async fn read_group_generation(
+            &self,
+            _group_id: &str,
+        ) -> Result<Option<(GenerationDoc, Version)>> {
+            unimplemented!()
+        }
+
+        async fn update_group_generation(
+            &self,
+            _group_id: &str,
+            _generation: GenerationDoc,
+            _version: Option<Version>,
+        ) -> Result<Version, UpdateError<GenerationDoc>> {
+            unimplemented!()
+        }
+
+        async fn create_group_assignment(
+            &self,
+            _group_id: &str,
+            _generation_id: i32,
+            _assignment: AssignmentDoc,
+        ) -> Result<AssignmentOutcome> {
+            unimplemented!()
+        }
+
+        async fn read_group_assignment(
+            &self,
+            _group_id: &str,
+            _generation_id: i32,
+        ) -> Result<Option<AssignmentDoc>> {
+            unimplemented!()
+        }
+
+        async fn delete_group_assignments_before(
+            &self,
+            _group_id: &str,
+            _generation_id: i32,
+        ) -> Result<u64> {
             unimplemented!()
         }
 
@@ -1438,6 +1589,94 @@ mod wrapper_parity {
             wrapped.read_group("present").await?,
             "read_group diverges through the wrapper for a group that exists — \
              the default body answers None, which is how #111 was inert",
+        );
+
+        // The decomposed layout (#359). None of these has a default body, so
+        // today the compiler is the guard — but that is exactly what was true
+        // of `read_group` before a default was added to it, and the parity
+        // shape is what survives someone adding one.
+        let group = "decomposed";
+
+        let member = MemberDoc {
+            last_contact_ms: 1_000,
+            session_timeout_ms: 45_000,
+            ..Default::default()
+        };
+
+        _ = bare
+            .write_group_member(group, "m-1", member.clone(), None)
+            .await
+            .expect("seed member document");
+
+        assert_eq!(
+            bare.read_group_member(group, "m-1").await?,
+            wrapped.read_group_member(group, "m-1").await?,
+            "read_group_member diverges through the wrapper",
+        );
+
+        assert_eq!(
+            bare.list_group_members(group).await?,
+            wrapped.list_group_members(group).await?,
+            "list_group_members diverges through the wrapper",
+        );
+
+        _ = bare
+            .update_group_generation(
+                group,
+                GenerationDoc {
+                    generation_id: 7,
+                    session_timeout_ms: 45_000,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("seed generation");
+
+        assert_eq!(
+            bare.read_group_generation(group).await?,
+            wrapped.read_group_generation(group).await?,
+            "read_group_generation diverges through the wrapper",
+        );
+
+        let assignment = AssignmentDoc {
+            generation_id: 7,
+            leader: "m-1".into(),
+            protocol_type: "consumer".into(),
+            protocol_name: "range".into(),
+            assignments: BTreeMap::from([("m-1".to_owned(), Bytes::from_static(&[1, 2]))]),
+            assigned_at_ms: 9,
+        };
+
+        // Create-only: the wrapper must see the *loser*'s outcome, not a
+        // silent success, or `SyncGroup` retries would look like new writes.
+        assert!(matches!(
+            bare.create_group_assignment(group, 7, assignment.clone())
+                .await?,
+            AssignmentOutcome::Created(_)
+        ));
+
+        assert_eq!(
+            AssignmentOutcome::AlreadyExists(Box::new(assignment)),
+            wrapped
+                .create_group_assignment(group, 7, {
+                    AssignmentDoc {
+                        leader: "someone-else".into(),
+                        ..bare
+                            .read_group_assignment(group, 7)
+                            .await?
+                            .expect("assignment")
+                    }
+                })
+                .await?,
+            "create_group_assignment diverges through the wrapper: an existing \
+             assignment must be adopted, never overwritten",
+        );
+
+        assert_eq!(
+            bare.read_group_assignment(group, 7).await?,
+            wrapped.read_group_assignment(group, 7).await?,
+            "read_group_assignment diverges through the wrapper",
         );
 
         Ok(())
