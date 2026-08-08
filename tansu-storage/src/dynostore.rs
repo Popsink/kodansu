@@ -62,9 +62,11 @@ use tansu_sans_io::{
     },
     incremental_alter_configs_request::{AlterConfigsResource, AlterableConfig},
     incremental_alter_configs_response::AlterConfigsResourceResponse,
+    join_group_response::JoinGroupResponseMember,
     list_groups_response::ListedGroup,
     metadata_response::{MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic},
     record::{Record, deflated, inflated},
+    to_system_time,
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
 };
 use tokio::sync::oneshot;
@@ -80,12 +82,12 @@ mod opticon;
 mod tests;
 
 use crate::{
-    AssignmentDoc, AssignmentOutcome, AutoTopicCreate, BrokerRegistrationRequest, Error,
-    GenerationDoc, GroupDetail, ListOffsetResponse, METER, MemberDoc, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
-    ScramCredential, Storage, TopicDefaults, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
-    storage_error_code,
+    AssignmentDoc, AssignmentOutcome, AutoTopicCreate, BrokerRegistrationRequest,
+    ConsumerGroupState, Error, GenerationDoc, GroupDetail, GroupMember, GroupState,
+    ListOffsetResponse, METER, MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
+    OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicDefaults, TopicId,
+    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
+    UpdateError, Version, storage_error_code,
 };
 
 const APPLICATION_JSON: &str = "application/json";
@@ -6125,6 +6127,113 @@ impl DynoStore {
             .map(|prefix| Path::from(format!("{prefix}/{generation_id:0>10}.json")))
     }
 
+    /// A group's decomposed objects, composed back into the [`GroupDetail`]
+    /// every reader already projects from (#359).
+    ///
+    /// `None` when the group has no `generation.json`, which is how a group
+    /// that does not exist and a group still in the legacy layout both read —
+    /// the caller falls back to `{group}.json`.
+    ///
+    /// Deliberately **not** a trait method: the composition is a property of
+    /// this layout, not of storage, and putting it on the trait would oblige
+    /// every engine to reproduce a fan-out it has no objects for.
+    ///
+    /// Torn reads are answered, never failed. Between reading the generation
+    /// and reading the member documents a member can leave, and between
+    /// observing a leader and reading the assignment a rebalance can start.
+    /// So a member the generation names whose document is gone is reported
+    /// with empty metadata rather than dropped — it *is* a member, the
+    /// generation is what says so — and a generation with a leader but no
+    /// assignment reports `CompletingRebalance`, which is true, rather than a
+    /// phantom `Stable`.
+    async fn group_view(&self, group_id: &str) -> Result<Option<GroupDetail>> {
+        /// As `describe_groups`' own fan-out: one round trip per member, and a
+        /// group is tens of members.
+        const MEMBER_FETCH_CONCURRENCY: usize = 32;
+
+        let Some((generation, _)) = self.read_group_generation(group_id).await? else {
+            return Ok(None);
+        };
+
+        let assignment = self
+            .read_group_assignment(group_id, generation.generation_id)
+            .await?;
+
+        // From the generation's member set, not from a listing: the set is
+        // authoritative, and a LIST here would put one on the describe path for
+        // every group an admin client asks about.
+        let members = futures::stream::iter(generation.members.keys().cloned().map(|member_id| {
+            let generation = &generation;
+
+            async move {
+                let held = self
+                    .read_group_member(group_id, &member_id)
+                    .await
+                    .inspect_err(|err| debug!(?err, group_id, member_id))
+                    .ok()
+                    .flatten();
+
+                let join_response = held
+                    .as_ref()
+                    .map(|(doc, _)| doc.join_response.clone())
+                    .unwrap_or_else(|| {
+                        JoinGroupResponseMember::default()
+                            .member_id(member_id.clone())
+                            .group_instance_id(
+                                generation
+                                    .members
+                                    .get(&member_id)
+                                    .and_then(|held| held.group_instance_id.clone()),
+                            )
+                    });
+
+                let last_contact = held
+                    .as_ref()
+                    .and_then(|(doc, _)| to_system_time(doc.last_contact_ms).ok());
+
+                (
+                    member_id,
+                    GroupMember {
+                        join_response,
+                        last_contact,
+                    },
+                )
+            }
+        }))
+        .buffered(MEMBER_FETCH_CONCURRENCY)
+        .collect::<BTreeMap<_, _>>()
+        .await;
+
+        let state = match (generation.leader.clone(), assignment) {
+            (Some(leader), Some(assignment))
+                if assignment.generation_id == generation.generation_id =>
+            {
+                GroupState::Formed {
+                    protocol_type: assignment.protocol_type,
+                    protocol_name: assignment.protocol_name,
+                    leader,
+                    assignments: assignment.assignments,
+                }
+            }
+
+            (leader, _) => GroupState::Forming {
+                protocol_type: generation.protocol_type.clone(),
+                protocol_name: generation.protocol_name.clone(),
+                leader,
+            },
+        };
+
+        Ok(Some(GroupDetail {
+            session_timeout_ms: generation.session_timeout_ms,
+            rebalance_timeout_ms: generation.rebalance_timeout_ms,
+            members,
+            generation_id: generation.generation_id,
+            skip_assignment: generation.skip_assignment,
+            inception: to_system_time(generation.inception_ms).unwrap_or(SystemTime::UNIX_EPOCH),
+            state,
+        }))
+    }
+
     /// Read `Option`, not `Result`: an object that is not there is an answer —
     /// the group has no generation, the member has no document — and only a
     /// store error is a failure.
@@ -9814,29 +9923,99 @@ impl Storage for DynoStore {
         Ok(responses)
     }
 
-    async fn list_groups(&self, _states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-        let location = Path::from(format!("clusters/{}/groups/consumers/", self.cluster,));
+    /// Every group in the cluster, optionally filtered by state.
+    ///
+    /// A group is whatever owns something under the consumer root: a `{group}/`
+    /// common prefix — its committed offsets, and since #359 its member
+    /// documents and generation — or a legacy `{group}.json` state object. Both
+    /// are collected, which fixes a group that has state but has never
+    /// committed an offset being omitted from its own cluster's listing.
+    ///
+    /// `states_filter` costs a read fan-out, because that is what the filter
+    /// means: the state is derived per group, and deriving it is reading the
+    /// group. An **unfiltered** listing stays one delimited listing and reports
+    /// `Unknown`, as it always has — a client that did not ask to filter by
+    /// state should not pay for one read per group in the cluster to be told
+    /// something it did not ask for.
+    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
+        /// As the describe fan-out.
+        const LIST_STATE_CONCURRENCY: usize = 32;
+
+        let root = self.groups_root();
         let list_result = self
-            .scan_delimited(Scan::Group, &location)
+            .scan_delimited(Scan::Group, &root)
             .await
             .inspect(|list_result| debug!(?list_result))
             .inspect_err(|error| error!(?error, cluster = self.cluster))?;
 
-        let mut listed_groups = vec![];
+        let mut group_ids = BTreeSet::new();
 
         for prefix in list_result.common_prefixes {
             if let Some(group_id) = prefix.parts().next_back() {
-                listed_groups.push(
-                    ListedGroup::default()
-                        .group_id(group_id.as_ref().into())
-                        .protocol_type("consumer".into())
-                        .group_state(Some("Unknown".into()))
-                        .group_type(Some("classic".into())),
-                );
+                _ = group_ids.insert(group_id.as_ref().to_owned());
             }
         }
 
-        Ok(listed_groups)
+        for meta in list_result.objects {
+            if let Some(group_id) = Self::group_of(&root, &meta.location) {
+                _ = group_ids.insert(group_id);
+            }
+        }
+
+        let listed = |group_id: String, state: String| {
+            ListedGroup::default()
+                .group_id(group_id)
+                .protocol_type("consumer".into())
+                .group_state(Some(state))
+                .group_type(Some("classic".into()))
+        };
+
+        let Some(states_filter) = states_filter else {
+            return Ok(group_ids
+                .into_iter()
+                .map(|group_id| listed(group_id, String::from("Unknown")))
+                .collect());
+        };
+
+        let wanted = states_filter.iter().cloned().collect::<BTreeSet<_>>();
+
+        Ok(
+            futures::stream::iter(group_ids.into_iter().map(|group_id| async move {
+                let state = self
+                    .group_view(&group_id)
+                    .await
+                    .inspect_err(|err| debug!(?err, group_id))
+                    .ok()
+                    .flatten();
+
+                let state = match state {
+                    Some(detail) => Some(detail),
+                    // Still in the legacy layout, or gone between the listing
+                    // and now.
+                    None => self
+                        .read_group(&group_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(|(d, _)| d),
+                };
+
+                let state = state.as_ref().map_or_else(
+                    || String::from("Unknown"),
+                    |detail| ConsumerGroupState::from(detail).to_string(),
+                );
+
+                (group_id, state)
+            }))
+            .buffered(LIST_STATE_CONCURRENCY)
+            .filter_map(|(group_id, state)| {
+                let keep = wanted.contains(&state);
+
+                async move { keep.then(|| listed(group_id, state)) }
+            })
+            .collect::<Vec<_>>()
+            .await,
+        )
     }
 
     async fn delete_groups(
@@ -9878,34 +10057,47 @@ impl Storage for DynoStore {
                     self.cluster, group_id,
                 ));
 
-                let had_group_state = self
+                // The legacy state object. Deleted for as long as one can
+                // exist; after the cutover this is a 404 per deleted group and
+                // the prefix below is what carries the group.
+                let had_legacy_state = self
                     .object_store
                     .delete(&location)
                     .await
                     .inspect(|outcome| debug!(group_id, ?outcome))
-                    .inspect_err(|err| error!(group_id, ?err))
+                    .inspect_err(|err| debug!(group_id, ?err))
                     .is_ok();
 
-                debug!(group_id, had_group_state);
+                debug!(group_id, had_legacy_state);
 
                 let locations = self
                     .scan(Scan::AdminDelete, &prefix)
                     .map_ok(|m| m.location)
                     .boxed();
 
-                let deleted_committed_offsets = self
+                // Everything the group owns under its prefix: its committed
+                // offsets, and since #359 its member documents, its generation
+                // and every generation's assignment. One sweep covers all of
+                // them because they share the prefix — which is also what makes
+                // `expire_groups` layout-agnostic.
+                let deleted = self
                     .object_store
                     .delete_stream(locations)
                     .try_collect::<Vec<Path>>()
                     .await?;
 
-                debug!(group_id, ?deleted_committed_offsets);
+                debug!(group_id, ?deleted);
 
                 results.push(
                     DeletableGroupResult::default()
                         .group_id(group_id.into())
                         .error_code(
-                            if had_group_state || !deleted_committed_offsets.is_empty() {
+                            // A group existed if anything of it did. Keyed on
+                            // the legacy object alone, a group in the
+                            // decomposed layout with no committed offsets — one
+                            // that has joined but never committed — would be
+                            // reported `GroupIdNotFound` after being deleted.
+                            if had_legacy_state || !deleted.is_empty() {
                                 ErrorCode::None
                             } else {
                                 ErrorCode::GroupIdNotFound
@@ -9944,6 +10136,30 @@ impl Storage for DynoStore {
 
         Ok(
             futures::stream::iter(group_ids.iter().cloned().map(|group_id| async move {
+                // The decomposed layout first (#359), the legacy state object
+                // only when the group has no `generation.json`. Before the
+                // cutover that is every group, so this is one extra 404 per
+                // described group; after it, the legacy read is what never
+                // happens.
+                match self.group_view(&group_id).await {
+                    Ok(Some(group_detail)) => {
+                        return NamedGroupDetail::found(group_id, group_detail);
+                    }
+
+                    Ok(None) => {}
+
+                    // Same reasoning as the legacy arm below: not knowing is
+                    // not the same as empty, and it is retriable.
+                    Err(err) => {
+                        error!(?err, group_id, "could not compose the group view");
+
+                        return NamedGroupDetail::error_code(
+                            group_id,
+                            ErrorCode::CoordinatorLoadInProgress,
+                        );
+                    }
+                }
+
                 let location = Path::from(format!(
                     "clusters/{}/groups/consumers/{}.json",
                     self.cluster, group_id,

@@ -19,9 +19,11 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
 
+use tansu_sans_io::{ErrorCode, join_group_response::JoinGroupResponseMember};
+
 use crate::{
-    AssignmentDoc, AssignmentOutcome, Error, GenerationDoc, MemberDoc, Result, Storage,
-    UpdateError,
+    AssignmentDoc, AssignmentOutcome, ConsumerGroupState, Error, GenerationDoc, GroupDetail,
+    GroupDetailResponse, MemberDoc, MemberRef, NamedGroupDetail, Result, Storage, UpdateError,
     dynostore::{DynoStore, tests::init_tracing},
 };
 
@@ -42,6 +44,20 @@ fn generation(generation_id: i32) -> GenerationDoc {
         session_timeout_ms: 45_000,
         ..Default::default()
     }
+}
+
+/// The detail a describe found, or `None` when it answered an error code.
+/// Reaching into the response is what a test has to do to assert on it —
+/// `NamedGroupDetail` is a projection type with constructors and no readers.
+fn detail_of(named: &NamedGroupDetail) -> Option<GroupDetail> {
+    match &named.response {
+        GroupDetailResponse::Found(detail) => Some(detail.clone()),
+        GroupDetailResponse::ErrorCode(_) => None,
+    }
+}
+
+fn state_of(named: &NamedGroupDetail) -> Option<ConsumerGroupState> {
+    detail_of(named).map(|detail| ConsumerGroupState::from(&detail))
 }
 
 fn assignment(generation_id: i32) -> AssignmentDoc {
@@ -333,25 +349,21 @@ async fn a_group_id_that_normalises_away_owns_no_documents() -> Result<()> {
             storage
                 .write_group_member(group_id, "m-1", member(1_000), None)
                 .await,
-            Err(UpdateError::Error(Error::Api(
-                tansu_sans_io::ErrorCode::InvalidGroupId
-            )))
+            Err(UpdateError::Error(Error::Api(ErrorCode::InvalidGroupId)))
         ));
 
         assert!(matches!(
             storage
                 .update_group_generation(group_id, generation(0), None)
                 .await,
-            Err(UpdateError::Error(Error::Api(
-                tansu_sans_io::ErrorCode::InvalidGroupId
-            )))
+            Err(UpdateError::Error(Error::Api(ErrorCode::InvalidGroupId)))
         ));
 
         assert!(matches!(
             storage
                 .create_group_assignment(group_id, 7, assignment(7))
                 .await,
-            Err(Error::Api(tansu_sans_io::ErrorCode::InvalidGroupId))
+            Err(Error::Api(ErrorCode::InvalidGroupId))
         ));
 
         assert_eq!(None, storage.read_group_generation(group_id).await?);
@@ -380,13 +392,315 @@ async fn a_member_id_that_normalises_away_owns_no_document() -> Result<()> {
             storage
                 .write_group_member("g-1", member_id, member(1_000), None)
                 .await,
-            Err(UpdateError::Error(Error::Api(
-                tansu_sans_io::ErrorCode::InvalidGroupId
-            )))
+            Err(UpdateError::Error(Error::Api(ErrorCode::InvalidGroupId)))
         ));
 
         assert_eq!(None, storage.read_group_member("g-1", member_id).await?);
     }
+
+    Ok(())
+}
+
+/// `DescribeGroups` composes the decomposed objects back into the shape every
+/// admin tool already reads — the generation's membership, each member's
+/// subscription, and the leader's assignment.
+#[tokio::test]
+async fn describe_composes_the_decomposed_objects() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let storage = DynoStore::new(CLUSTER, NODE, InMemory::new());
+
+    for member_id in ["m-1", "m-2"] {
+        _ = storage
+            .write_group_member(
+                "g-1",
+                member_id,
+                MemberDoc {
+                    last_contact_ms: 1_000,
+                    session_timeout_ms: 45_000,
+                    join_response: JoinGroupResponseMember::default()
+                        .member_id(member_id.into())
+                        .metadata(Bytes::from(format!("subscription-{member_id}"))),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .expect("member");
+    }
+
+    _ = storage
+        .update_group_generation(
+            "g-1",
+            GenerationDoc {
+                generation_id: 7,
+                leader: Some("m-1".into()),
+                members: BTreeMap::from([
+                    ("m-1".to_owned(), MemberRef::default()),
+                    ("m-2".to_owned(), MemberRef::default()),
+                ]),
+                session_timeout_ms: 45_000,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("generation");
+
+    // Leader elected, assignment not yet written: CompletingRebalance, never a
+    // phantom Stable.
+    let described = storage
+        .describe_groups(Some(&["g-1".into()]), false)
+        .await?;
+    assert_eq!(
+        Some(ConsumerGroupState::CompletingRebalance),
+        described.first().and_then(state_of)
+    );
+
+    _ = storage
+        .create_group_assignment("g-1", 7, assignment(7))
+        .await?;
+
+    let described = storage
+        .describe_groups(Some(&["g-1".into()]), false)
+        .await?;
+    let detail = detail_of(described.first().expect("described")).expect("found");
+
+    assert_eq!(
+        ConsumerGroupState::Stable,
+        ConsumerGroupState::from(&detail)
+    );
+    assert_eq!(7, detail.generation_id);
+    assert_eq!(
+        vec!["m-1".to_owned(), "m-2".to_owned()],
+        detail.members.keys().cloned().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        Some(Bytes::from_static(b"subscription-m-2")),
+        detail
+            .members
+            .get("m-2")
+            .map(|member| member.join_response.metadata.clone())
+    );
+
+    Ok(())
+}
+
+/// A member the generation names whose document is gone — it left between the
+/// two reads — is reported with empty metadata rather than dropped or failed.
+///
+/// The generation is what says who is a member. Dropping the member would make
+/// a describe disagree with the group's own membership; failing the call would
+/// turn an ordinary race into an error for every admin tool watching.
+#[tokio::test]
+async fn a_member_with_no_document_is_still_a_member() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let storage = DynoStore::new(CLUSTER, NODE, InMemory::new());
+
+    _ = storage
+        .update_group_generation(
+            "g-1",
+            GenerationDoc {
+                generation_id: 1,
+                leader: Some("m-1".into()),
+                members: BTreeMap::from([(
+                    "m-1".to_owned(),
+                    MemberRef {
+                        group_instance_id: Some("static-1".into()),
+                    },
+                )]),
+                session_timeout_ms: 45_000,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("generation");
+
+    let described = storage
+        .describe_groups(Some(&["g-1".into()]), false)
+        .await?;
+    let detail = detail_of(described.first().expect("described")).expect("found");
+
+    let member = detail.members.get("m-1").expect("m-1 is a member");
+    assert!(member.join_response.metadata.is_empty());
+    assert_eq!(
+        Some("static-1".to_owned()),
+        member.join_response.group_instance_id
+    );
+    assert_eq!(None, member.last_contact);
+
+    Ok(())
+}
+
+/// A group in the legacy layout still describes as it always did: the
+/// decomposed read is tried first and falls through on a missing generation.
+#[tokio::test]
+async fn a_legacy_group_still_describes() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let storage = DynoStore::new(CLUSTER, NODE, InMemory::new());
+
+    _ = storage
+        .update_group(
+            "g-legacy",
+            GroupDetail {
+                generation_id: 3,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("legacy group");
+
+    let described = storage
+        .describe_groups(Some(&["g-legacy".into()]), false)
+        .await?;
+
+    assert_eq!(
+        Some(3),
+        detail_of(described.first().expect("described")).map(|detail| detail.generation_id)
+    );
+
+    Ok(())
+}
+
+/// `ListGroups` finds a group by anything it owns, and the state filter is real.
+///
+/// A group with state but no committed offsets used to be omitted from its own
+/// cluster's listing — the listing only read common prefixes, and a group only
+/// has one once it commits.
+#[tokio::test]
+async fn groups_are_listed_by_anything_they_own() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let storage = DynoStore::new(CLUSTER, NODE, InMemory::new());
+
+    // Decomposed, with a leader and no assignment: CompletingRebalance.
+    _ = storage
+        .update_group_generation(
+            "g-rebalancing",
+            GenerationDoc {
+                generation_id: 1,
+                leader: Some("m-1".into()),
+                members: BTreeMap::from([("m-1".to_owned(), MemberRef::default())]),
+                session_timeout_ms: 45_000,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("generation");
+
+    // Decomposed and empty.
+    _ = storage
+        .update_group_generation(
+            "g-empty",
+            GenerationDoc {
+                session_timeout_ms: 45_000,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("generation");
+
+    // Legacy, no committed offsets: the group the old listing could not see.
+    _ = storage
+        .update_group("g-legacy", GroupDetail::default(), None)
+        .await
+        .expect("legacy group");
+
+    let listed = storage.list_groups(None).await?;
+    assert_eq!(
+        vec![
+            "g-empty".to_owned(),
+            "g-legacy".to_owned(),
+            "g-rebalancing".to_owned()
+        ],
+        listed
+            .iter()
+            .map(|group| group.group_id.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // Unfiltered stays cheap and says so: one listing, no per-group read.
+    assert!(
+        listed
+            .iter()
+            .all(|group| group.group_state.as_deref() == Some("Unknown"))
+    );
+
+    let filtered = storage
+        .list_groups(Some(&["CompletingRebalance".into()]))
+        .await?;
+
+    assert_eq!(
+        vec!["g-rebalancing".to_owned()],
+        filtered
+            .iter()
+            .map(|group| group.group_id.clone())
+            .collect::<Vec<_>>()
+    );
+
+    let empty = storage.list_groups(Some(&["Empty".into()])).await?;
+    assert_eq!(
+        vec!["g-empty".to_owned(), "g-legacy".to_owned()],
+        empty
+            .iter()
+            .map(|group| group.group_id.clone())
+            .collect::<Vec<_>>()
+    );
+
+    Ok(())
+}
+
+/// Deleting a group removes everything it owns, and a group that existed only
+/// in the decomposed layout is not reported as never having existed.
+#[tokio::test]
+async fn deleting_a_decomposed_group_removes_all_of_it() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let storage = DynoStore::new(CLUSTER, NODE, InMemory::new());
+
+    _ = storage
+        .write_group_member("g-1", "m-1", member(1_000), None)
+        .await
+        .expect("member");
+
+    _ = storage
+        .update_group_generation("g-1", generation(7), None)
+        .await
+        .expect("generation");
+
+    _ = storage
+        .create_group_assignment("g-1", 7, assignment(7))
+        .await?;
+
+    let deleted = storage.delete_groups(Some(&["g-1".into()])).await?;
+
+    // Keyed on the legacy object alone this answered GroupIdNotFound for a
+    // group it had just deleted.
+    assert_eq!(
+        vec![i16::from(ErrorCode::None)],
+        deleted
+            .iter()
+            .map(|result| result.error_code)
+            .collect::<Vec<_>>()
+    );
+
+    assert_eq!(None, storage.read_group_generation("g-1").await?);
+    assert_eq!(None, storage.read_group_assignment("g-1", 7).await?);
+    assert!(storage.list_group_members("g-1").await?.is_empty());
+    assert!(storage.list_groups(None).await?.is_empty());
+
+    // Deliberately not asserted here: what deleting a group that owns nothing
+    // reports. `InMemory` answers `Ok` to deleting a key that is not there and
+    // S3 answers `404`, so the `GroupIdNotFound` arm reads differently on the
+    // two stores — a store divergence, which belongs in the conditional-put
+    // conformance target where both are exercised, not in a layout test that
+    // only ever sees one of them.
 
     Ok(())
 }
