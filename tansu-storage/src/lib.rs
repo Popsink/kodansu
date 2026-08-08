@@ -140,9 +140,12 @@ use tracing::warn;
 mod dynostore;
 
 mod batch;
+mod group;
 mod latency;
 mod null;
 mod service;
+
+pub use group::{AssignmentDoc, GenerationDoc, MemberDoc, MemberRef};
 
 pub use latency::LatencyIntroducingStorage;
 
