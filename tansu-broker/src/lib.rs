@@ -41,12 +41,24 @@ pub enum CancelKind {
     Terminate,
 }
 
+/// How long the process waits for its own shutdown to finish before it stops
+/// waiting and aborts what is left.
+///
+/// `Terminate` is the autoscaler taking a replica away, and the broker's drain
+/// answers every in-flight request before the accept loop returns (#361) — so
+/// the patience has to outlast the drain, or the abort lands in the middle of
+/// it and undoes the thing it exists for. It is deliberately above
+/// `broker::DRAIN_TIMEOUT` rather than equal to it: the drain is what decides
+/// when to give up, and this is only the backstop for a drain that never
+/// returns at all.
+///
+/// `Interrupt` is a human at a terminal who wants out now, and gets it.
 impl From<CancelKind> for Duration {
     fn from(cancellation: CancelKind) -> Self {
-        Duration::from_millis(match cancellation {
-            CancelKind::Interrupt => 0,
-            CancelKind::Terminate => 5_000,
-        })
+        match cancellation {
+            CancelKind::Interrupt => Duration::ZERO,
+            CancelKind::Terminate => Duration::from_secs(35),
+        }
     }
 }
 

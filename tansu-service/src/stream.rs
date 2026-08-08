@@ -166,6 +166,24 @@ where
 pub struct TcpContext {
     cluster_id: Option<String>,
     maximum_frame_size: Option<usize>,
+
+    /// Cancelled when this process has been asked to stop (#361).
+    ///
+    /// Read only *between* requests, never during one: a connection is closed
+    /// when it is sitting idle waiting for the next frame, and a request
+    /// already being served runs to its response whatever the drain is doing.
+    /// That split is the whole point — closing between requests is a
+    /// reconnect, which every client handles; closing during one is the
+    /// dropped socket #300 is about.
+    ///
+    /// Reading it here rather than in the accept loop is what keeps a scale-in
+    /// fast. A Kafka client keeps its connections open and idle between polls,
+    /// so a drain that waited for connections to *end* would wait out its whole
+    /// grace period on every shutdown and then cut them anyway.
+    ///
+    /// The default is a token nothing cancels, so a stack built without one
+    /// serves connections until the client goes away, as before.
+    drain: CancellationToken,
 }
 
 impl TcpContext {
@@ -178,6 +196,11 @@ impl TcpContext {
             maximum_frame_size,
             ..self
         }
+    }
+
+    /// Watch `drain` for this process being asked to stop (#361).
+    pub fn drain(self, drain: CancellationToken) -> Self {
+        Self { drain, ..self }
     }
 }
 
@@ -425,18 +448,22 @@ where
         w.flush().await.map_err(Into::into)
     }
 
+    /// Everything a request owes its caller once its first four bytes have
+    /// been read: the body, the answer, and the answer written back.
+    ///
+    /// Split from the wait above it so the drain has somewhere to interrupt
+    /// that is not *inside* a request (#361).
     #[instrument(skip_all, fields(id = nanoid!()))]
-    async fn req<R>(
+    async fn answer<R>(
         &self,
         req: &mut R,
-        maximum_frame_size: Option<usize>,
+        size: [u8; 4],
         attributes: &[KeyValue],
         ctx: Context<TcpContext>,
     ) -> Result<(), S::Error>
     where
         R: AsyncReadExt + AsyncWriteExt + Unpin,
     {
-        let size = self.wait(req, maximum_frame_size).await?;
         let request = self.read(req, size).await?;
         let response = self.process(attributes, ctx, request).await?;
         self.write(req, response).await
@@ -473,12 +500,26 @@ where
         };
 
         let maximum_frame_size = ctx.state().maximum_frame_size;
+        let drain = ctx.state().drain.clone();
 
         loop {
-            let ctx = ctx.clone();
-            let attributes = attributes.clone();
+            // The only place a connection may be ended by the drain: between
+            // requests, with nothing owed to the client. `biased` so the drain
+            // wins over a frame that has already arrived — that request is
+            // retried on a connection to a replica that is staying, where a
+            // cut mid-request could not be (#361).
+            let size = tokio::select! {
+                biased;
 
-            self.req(&mut req, maximum_frame_size, &attributes[..], ctx)
+                () = drain.cancelled() => {
+                    debug!("closing an idle connection: this replica is stopping");
+                    return Ok(());
+                }
+
+                size = self.wait(&mut req, maximum_frame_size) => size?,
+            };
+
+            self.answer(&mut req, size, &attributes[..], ctx.clone())
                 .await?
         }
     }

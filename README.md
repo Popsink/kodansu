@@ -286,6 +286,37 @@ The practical consequence: **replicas are interchangeable.** One can be added or
 removed under consumer load and the groups it was serving do not notice — no cold
 owner, no DNS convergence window, no configuration to keep in step.
 
+### Stopping a replica
+
+The broker holds requests open by design: `Fetch` waits out `max.wait.ms`,
+`JoinGroup` and `SyncGroup` long-poll across the rebalance window. On `SIGTERM`
+a replica **drains** rather than dropping what it is holding (#361):
+
+1. it closes its listener, so the load balancer's health check fails and a
+   client arriving anyway is *refused* rather than queued in a backlog nobody
+   will accept;
+2. every in-flight request answers — the group long polls return what they have,
+   which is what they return at their own deadline, and a `Fetch` finishes
+   inside its own `max.wait.ms`;
+3. connections sitting **idle between requests** are closed, which every client
+   handles by reconnecting. That is what keeps the drain fast: a Kafka client
+   keeps its connections open between polls, so a drain that waited for
+   connections to *end* would wait out its whole grace period on every
+   shutdown and then cut them regardless;
+4. the process exits, or gives up after 30 seconds and cuts what is left — with
+   a `WARN` naming how many requests it cut, because from the client side that
+   is indistinguishable from a network fault and nothing else records it.
+
+**Set `terminationGracePeriodSeconds` above 35.** The broker's own patience is
+35 s and its drain gives up at 30; a grace period below that means the kernel
+sends `SIGKILL` while the drain is still running, and the drain is decorative.
+
+Note what it is *not* sized against: the longest long poll. It does not need to
+be, because the polls are cut short by the same signal — a member waiting out
+half its session timeout answers as soon as the replica is asked to stop. A
+scale-in event therefore costs a round trip, not a rebalance: no generation is
+minted, so no client re-partitions.
+
 ## Observability
 
 Metrics and traces are **pushed over OTLP** to `--otlp-endpoint-url`. There is no

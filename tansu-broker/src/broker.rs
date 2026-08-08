@@ -28,6 +28,7 @@ use rsasl::config::SASLConfig;
 use rustls::ServerConfig;
 use std::{
     future::{Future, pending},
+    io,
     marker::PhantomData,
     net::{IpAddr, Ipv6Addr, SocketAddr},
     str::FromStr,
@@ -99,6 +100,30 @@ where
             "maintenance run exceeded its time budget; cancelling so the next tick retries \
              (a run wedged in S3 retries would otherwise disable maintenance until restart)"
         );
+    }
+}
+
+/// How long the drain waits for in-flight requests to answer before the
+/// process stops anyway (#361).
+///
+/// It does not have to cover a long poll: `join` and `sync` watch the same
+/// cancellation token and answer as soon as it fires, and a `Fetch` finishes
+/// inside its own `max.wait.ms`. What it covers is the tail — a slow object
+/// store on the last read of a request that had already started — so it is
+/// sized for a round trip under load, not for a poll window.
+///
+/// **`terminationGracePeriodSeconds` must exceed this**, or the kernel sends
+/// `SIGKILL` while the drain is still running and the drain is decorative. See
+/// the deployment notes in the README.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Accept on `listener` while one is bound. Once the drain has dropped it this
+/// never yields, so the arm it feeds goes quiet rather than having to be
+/// removed from the `select!`.
+async fn accept_on(listener: Option<&TcpListener>) -> io::Result<(TcpStream, SocketAddr)> {
+    match listener {
+        Some(listener) => listener.accept().await,
+        None => pending().await,
     }
 }
 
@@ -366,9 +391,16 @@ where
     pub async fn listen(&self, started: Instant) -> Result<()> {
         debug!(%self.listener, %self.advertised_listener);
 
-        let listener = bind(&self.listener, 9092)
-            .await
-            .inspect_err(|err| error!(?err, %self.advertised_listener))?;
+        // `Option` so the drain below can drop it. A listener left bound while
+        // nothing accepts is worse than one that is gone: the kernel keeps
+        // completing handshakes into the backlog, so a client connecting to a
+        // stopping replica waits for a response that will never be read
+        // instead of being refused and moving on (#361).
+        let mut listener = Some(
+            bind(&self.listener, 9092)
+                .await
+                .inspect_err(|err| error!(?err, %self.advertised_listener))?,
+        );
 
         // Upper bound on a single maintenance run so a *hung* pass cannot hold the
         // in-flight guard forever and disable maintenance pod-wide until restart
@@ -463,7 +495,7 @@ where
             let ls = m.add(ProgressBar::new_spinner());
             ls.set_style(spinner_style.clone());
 
-            if let Ok(local_addr) = listener.local_addr() {
+            if let Some(Ok(local_addr)) = listener.as_ref().map(TcpListener::local_addr) {
                 ls.set_prefix(format!("[{local_addr:?}]"));
             }
 
@@ -495,7 +527,7 @@ where
             }
 
             tokio::select! {
-                Ok((stream, addr)) = listener.accept() => {
+                Ok((stream, addr)) = accept_on(listener.as_ref()) => {
                     self.spawn_connection(
                         &mut set,
                         &m,
@@ -572,10 +604,42 @@ where
             }
         }
 
-        while !set.is_empty() {
-            debug!(len = set.len());
+        // Stop accepting, and stop *appearing* to accept: dropping the listener
+        // closes the socket, so the load balancer's health check fails, new
+        // connections are refused rather than queued, and traffic moves to the
+        // replicas that are staying (#361).
+        drop(listener.take());
 
-            _ = set.join_next().await;
+        // Drain. Every in-flight request finishes and writes its response —
+        // the group long polls answer early because they watch the same token
+        // (`Controller::with_cancellation`), and a fetch finishes inside its
+        // own `max.wait.ms`. Bounded, because a client that holds a connection
+        // open and sends nothing would otherwise hold the shutdown open with
+        // it; the bound is what `terminationGracePeriodSeconds` has to exceed.
+        let draining = Instant::now();
+
+        let drain = async {
+            while !set.is_empty() {
+                debug!(in_flight = set.len());
+
+                _ = set.join_next().await;
+            }
+        };
+
+        tokio::select! {
+            () = drain => debug!(drained_in_ms = draining.elapsed().as_millis() as u64),
+
+            () = sleep(DRAIN_TIMEOUT) => {
+                // Not `debug!`: a drain that ran out of time cut somebody's
+                // request, which is the thing this exists to prevent, and it is
+                // invisible from the client side (a closed socket looks like a
+                // network fault).
+                warn!(
+                    in_flight = set.len(),
+                    drain_timeout_ms = DRAIN_TIMEOUT.as_millis() as u64,
+                    "drain timed out with requests still in flight; they will be cut"
+                );
+            }
         }
 
         Ok(())
@@ -625,6 +689,10 @@ where
             groups,
             self.storage.clone(),
             self.sasl_config.clone(),
+            // So this connection is closed the next time it is idle between
+            // requests, rather than held open until the client goes away and
+            // the drain runs out of patience (#361).
+            self.cancellation.clone(),
         )?;
 
         let handle = set.spawn(async move {
@@ -941,6 +1009,18 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
         Self { silent, ..self }
     }
 
+    /// The token that asks this broker to stop and drain (#361).
+    ///
+    /// `Broker::main` cancels its own on a signal; a caller that drives
+    /// `serve` directly — a test, or an embedder — needs a handle on the same
+    /// token to ask for the drain at all.
+    pub fn cancellation(self, cancellation: CancellationToken) -> Self {
+        Self {
+            cancellation,
+            ..self
+        }
+    }
+
     pub fn topic_defaults(self, topic_defaults: TopicDefaults) -> Self {
         Self {
             topic_defaults,
@@ -975,7 +1055,10 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
         // to elect, no peer set to discover, no second listener to bind — the
         // decomposed group objects (#359) made a group's writes independent, so
         // routing them to one replica bought nothing that the CAS does not.
-        let groups = Controller::with_storage(storage.clone())?;
+        let groups = Controller::with_storage(storage.clone())?
+            // So an in-flight `JoinGroup` or `SyncGroup` answers when this
+            // replica is asked to stop, rather than being cut mid-poll (#361).
+            .with_cancellation(self.cancellation.clone());
 
         let sasl_config = if self.authentication {
             tansu_auth::configuration(storage.clone()).map(Some)?

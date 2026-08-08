@@ -21,6 +21,7 @@ use tansu_service::{
     TcpContext, TcpContextLayer, TcpContextService,
 };
 use tansu_storage::Storage;
+use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::{Error, Result, coordinator::group::Coordinator};
@@ -32,11 +33,18 @@ pub mod storage;
 type TcpRouteFrame =
     TcpContextService<TcpBytesService<BytesFrameService<FrameRouteService<(), Error>>, ()>>;
 
+/// The per-connection service stack.
+///
+/// `drain` is cancelled when this process has been asked to stop: a connection
+/// sitting idle between requests is then closed, and one with a request in
+/// flight answers it first (#361). Pass a fresh token to serve connections
+/// until the client goes away.
 pub fn services<C, S>(
     cluster_id: &str,
     coordinator: C,
     storage: S,
     sasl_config: Option<Arc<SASLConfig>>,
+    drain: CancellationToken,
 ) -> Result<TcpRouteFrame, Error>
 where
     S: Storage + Clone,
@@ -51,7 +59,11 @@ where
         .and_then(|builder| builder.build().map_err(Into::into))
         .map(|route| {
             (
-                TcpContextLayer::new(TcpContext::default().cluster_id(Some(cluster_id.into()))),
+                TcpContextLayer::new(
+                    TcpContext::default()
+                        .cluster_id(Some(cluster_id.into()))
+                        .drain(drain),
+                ),
                 TcpBytesLayer::default(),
                 BytesFrameLayer::default().with_sasl_config(sasl_config),
             )
