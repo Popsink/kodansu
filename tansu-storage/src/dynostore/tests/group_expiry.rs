@@ -26,7 +26,7 @@ use object_store::{
 use tansu_sans_io::{ErrorCode, create_topics_request::CreatableTopic};
 
 use crate::{
-    GroupDetail, OffsetCommitRequest, Result, Storage, Topition,
+    GenerationDoc, GroupDetail, MemberDoc, OffsetCommitRequest, Result, Storage, Topition,
     dynostore::{DynoStore, tests::init_tracing},
 };
 
@@ -100,31 +100,60 @@ async fn read_group_returns_persisted_detail_and_matching_version() -> Result<()
     Ok(())
 }
 
-/// Reports every `{group}.json` directly under the consumer root as written
-/// `age` ago, leaving every other object's timestamp alone.
+/// Which objects a [`Backdate`] store reports as written `age` ago.
 ///
-/// This is the state a commit-only consumer is in, and real mtimes in a test
-/// cannot express it: the state object is created by the first commit and then
-/// never rewritten, while the offsets objects are rewritten on every commit. The
-/// two are milliseconds apart when a test writes them, and eight days apart in
-/// production.
-#[derive(Clone)]
-struct BackdateGroupState<O> {
-    inner: O,
-    age: Duration,
+/// Real mtimes in a test cannot express the states expiry has to tell apart:
+/// everything a test writes lands milliseconds apart, and the cases that matter
+/// are eight days apart in production.
+#[derive(Clone, Debug)]
+enum Aged {
+    /// Every legacy `{group}.json` directly under the consumer root, and
+    /// nothing else — the state a commit-only consumer is in. The state object
+    /// is created by the first commit and then never rewritten, while the
+    /// offsets objects are rewritten on every commit.
+    LegacyStateObjects,
+
+    /// Everything owned by one group, except objects whose path contains
+    /// `spare`. That exception is how a test ages a group's *history* while
+    /// leaving one kind of write current — a member document, say, which is
+    /// what liveness looks like in the decomposed layout (#359).
+    Group {
+        group: &'static str,
+        spare: Option<&'static str>,
+    },
 }
 
-impl<O> BackdateGroupState<O> {
-    /// Rewrite the timestamp of a group state object, and only that.
-    fn backdate(&self, mut meta: ObjectMeta) -> ObjectMeta {
-        let is_group_state = meta
-            .location
-            .parts()
-            .next_back()
-            .is_some_and(|name| name.as_ref().ends_with(".json"))
-            && meta.location.parts().count() == 5;
+/// Reports the objects [`Aged`] selects as written `age` ago, leaving every
+/// other object's timestamp alone.
+#[derive(Clone)]
+struct Backdate<O> {
+    inner: O,
+    age: Duration,
+    aged: Aged,
+}
 
-        if is_group_state {
+impl<O> Backdate<O> {
+    fn selected(&self, location: &Path) -> bool {
+        match self.aged {
+            Aged::LegacyStateObjects => {
+                location
+                    .parts()
+                    .next_back()
+                    .is_some_and(|name| name.as_ref().ends_with(".json"))
+                    && location.parts().count() == 5
+            }
+
+            Aged::Group { group, spare } => {
+                let path = location.as_ref();
+
+                path.contains(&format!("/consumers/{group}"))
+                    && !spare.is_some_and(|spare| path.contains(spare))
+            }
+        }
+    }
+
+    fn backdate(&self, mut meta: ObjectMeta) -> ObjectMeta {
+        if self.selected(&meta.location) {
             meta.last_modified -= chrono::Duration::from_std(self.age).expect("representable");
         }
 
@@ -132,20 +161,20 @@ impl<O> BackdateGroupState<O> {
     }
 }
 
-impl<O> Debug for BackdateGroupState<O> {
+impl<O> Debug for Backdate<O> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BackdateGroupState").finish()
+        f.debug_struct("Backdate").finish()
     }
 }
 
-impl<O> Display for BackdateGroupState<O> {
+impl<O> Display for Backdate<O> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("BackdateGroupState").finish()
+        f.debug_struct("Backdate").finish()
     }
 }
 
 #[async_trait]
-impl<O> ObjectStore for BackdateGroupState<O>
+impl<O> ObjectStore for Backdate<O>
 where
     O: ObjectStore + Clone + 'static,
 {
@@ -270,10 +299,11 @@ async fn a_group_that_only_commits_offsets_survives() -> Result<()> {
     let store = DynoStore::new(
         CLUSTER,
         NODE,
-        BackdateGroupState {
+        Backdate {
             inner: bucket.clone(),
             // Past the 7-day window, so the state object is a candidate.
             age: Duration::from_secs(8 * 24 * 60 * 60),
+            aged: Aged::LegacyStateObjects,
         },
     );
 
@@ -318,9 +348,10 @@ async fn an_abandoned_group_is_still_reclaimed() -> Result<()> {
     let store = DynoStore::new(
         CLUSTER,
         NODE,
-        BackdateGroupState {
+        Backdate {
             inner: bucket.clone(),
             age: Duration::from_secs(8 * 24 * 60 * 60),
+            aged: Aged::LegacyStateObjects,
         },
     );
 
@@ -337,6 +368,143 @@ async fn an_abandoned_group_is_still_reclaimed() -> Result<()> {
     );
 
     assert!(store.read_group("group-abandoned").await?.is_none());
+
+    Ok(())
+}
+
+/// A group in the decomposed layout (#359) — no `{group}.json` anywhere — is
+/// reclaimed when everything it owns has aged out.
+///
+/// The previous rule looked only at `{group}.json`, so after the layout flip it
+/// would have found no candidate at all: every group born under the new layout
+/// would have leaked its member documents, its generation and its committed
+/// offsets forever. That is #45 undone, silently, by a change on a different
+/// path.
+#[tokio::test]
+async fn a_group_with_no_state_object_is_still_reclaimed() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let store = DynoStore::new(
+        CLUSTER,
+        NODE,
+        Backdate {
+            inner: InMemory::new(),
+            age: Duration::from_secs(8 * 24 * 60 * 60),
+            aged: Aged::Group {
+                group: "group-decomposed",
+                spare: None,
+            },
+        },
+    );
+
+    _ = store
+        .write_group_member(
+            "group-decomposed",
+            "m-1",
+            MemberDoc {
+                last_contact_ms: 1_000,
+                session_timeout_ms: 45_000,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("seed member");
+
+    _ = store
+        .update_group_generation(
+            "group-decomposed",
+            GenerationDoc {
+                session_timeout_ms: 45_000,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("seed generation");
+
+    assert!(store.read_group("group-decomposed").await?.is_none());
+
+    assert_eq!(
+        1,
+        store.expire_groups(SystemTime::now()).await?,
+        "a group with no state object is still a group",
+    );
+
+    assert_eq!(None, store.read_group_generation("group-decomposed").await?);
+    assert!(
+        store
+            .list_group_members("group-decomposed")
+            .await?
+            .is_empty()
+    );
+
+    Ok(())
+}
+
+/// The converse for the decomposed layout: a member renewing its liveness keeps
+/// the group, even though nothing else it owns has been touched in the window.
+///
+/// A heartbeating consumer no longer writes group state at all — that is the
+/// point of #359 — so its member document is the only record that anyone is
+/// still there. Expiry counting it is what keeps #272's guarantee true after the
+/// layout change.
+#[tokio::test]
+async fn a_group_whose_only_activity_is_member_liveness_survives() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let store = DynoStore::new(
+        CLUSTER,
+        NODE,
+        Backdate {
+            inner: InMemory::new(),
+            age: Duration::from_secs(8 * 24 * 60 * 60),
+            aged: Aged::Group {
+                group: "group-heartbeating",
+                // Everything but the member documents reads as eight days old.
+                spare: Some("/members/"),
+            },
+        },
+    );
+
+    _ = store
+        .update_group_generation(
+            "group-heartbeating",
+            GenerationDoc {
+                session_timeout_ms: 45_000,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("seed generation");
+
+    _ = store
+        .write_group_member(
+            "group-heartbeating",
+            "m-1",
+            MemberDoc {
+                last_contact_ms: 1_000,
+                session_timeout_ms: 45_000,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("seed member");
+
+    assert_eq!(
+        0,
+        store.expire_groups(SystemTime::now()).await?,
+        "a member writing liveness is activity",
+    );
+
+    assert!(
+        store
+            .read_group_generation("group-heartbeating")
+            .await?
+            .is_some()
+    );
 
     Ok(())
 }

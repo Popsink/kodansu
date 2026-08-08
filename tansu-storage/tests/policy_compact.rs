@@ -23,7 +23,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use crate::common::{Error, init_tracing};
+use crate::common::{Error, cluster_id, init_tracing, storage_url_with_query};
 use bytes::Bytes;
 use tansu_sans_io::{
     IsolationLevel, ListOffset,
@@ -37,26 +37,25 @@ mod common;
 
 type Sc = Arc<Box<dyn Storage>>;
 
-async fn storage_at(url: &str) -> Result<Sc, Error> {
+async fn storage_at(query: &str) -> Result<Sc, Error> {
     StorageContainer::builder()
-        .cluster_id("tansu")
+        .cluster_id(cluster_id())
         .node_id(111)
         .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(Url::parse(url)?)
+        .storage(storage_url_with_query(query)?)
         .build()
         .await
         .map_err(Into::into)
 }
 
-async fn memory_storage() -> Result<Sc, Error> {
-    storage_at("memory://tansu/").await
+async fn default_storage() -> Result<Sc, Error> {
+    storage_at("").await
 }
 
 /// Segment mode (#175): compacted topics are prefix-coalesced into segments
 /// under their own dedicated prefix and per-key compacted there.
 async fn segment_storage() -> Result<Sc, Error> {
-    storage_at("memory://tansu/?prefix_coalesce=true&prefix_leaseless=true&compacted_segments=true")
-        .await
+    storage_at("prefix_coalesce=true&prefix_leaseless=true&compacted_segments=true").await
 }
 
 async fn create_topic(
@@ -167,7 +166,7 @@ async fn keeps_latest_per_key(storage: Sc) -> Result<(), Error> {
 #[tokio::test]
 async fn keeps_latest_per_key_legacy() -> Result<(), Error> {
     let _guard = init_tracing()?;
-    keeps_latest_per_key(memory_storage().await?).await
+    keeps_latest_per_key(default_storage().await?).await
 }
 
 #[tokio::test]
@@ -201,7 +200,7 @@ async fn distinct_keys_are_retained(storage: Sc) -> Result<(), Error> {
 #[tokio::test]
 async fn distinct_keys_are_retained_legacy() -> Result<(), Error> {
     let _guard = init_tracing()?;
-    distinct_keys_are_retained(memory_storage().await?).await
+    distinct_keys_are_retained(default_storage().await?).await
 }
 
 #[tokio::test]
@@ -273,7 +272,7 @@ async fn compacts_within_a_multi_record_batch(storage: Sc) -> Result<(), Error> 
 #[tokio::test]
 async fn compacts_within_a_multi_record_batch_legacy() -> Result<(), Error> {
     let _guard = init_tracing()?;
-    compacts_within_a_multi_record_batch(memory_storage().await?).await
+    compacts_within_a_multi_record_batch(default_storage().await?).await
 }
 
 #[tokio::test]
@@ -306,7 +305,7 @@ async fn without_compact_policy_nothing_is_removed(storage: Sc) -> Result<(), Er
 #[tokio::test]
 async fn without_compact_policy_nothing_is_removed_legacy() -> Result<(), Error> {
     let _guard = init_tracing()?;
-    without_compact_policy_nothing_is_removed(memory_storage().await?).await
+    without_compact_policy_nothing_is_removed(default_storage().await?).await
 }
 
 #[tokio::test]
@@ -403,7 +402,7 @@ async fn earliest_after_compaction_is_the_log_start_not_the_newest_mtime(
 async fn earliest_after_compaction_is_the_log_start_not_the_newest_mtime_legacy()
 -> Result<(), Error> {
     let _guard = init_tracing()?;
-    earliest_after_compaction_is_the_log_start_not_the_newest_mtime(memory_storage().await?).await
+    earliest_after_compaction_is_the_log_start_not_the_newest_mtime(default_storage().await?).await
 }
 
 #[tokio::test]

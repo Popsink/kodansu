@@ -43,10 +43,11 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    BrokerRegistrationRequest, Error, GroupDetail, GroupDetailResponse, ListOffsetResponse,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
+    AssignmentDoc, AssignmentOutcome, BrokerRegistrationRequest, Error, GenerationDoc, GroupDetail,
+    GroupDetailResponse, ListOffsetResponse, MemberDoc, MetadataResponse, NamedGroupDetail,
+    OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    UpdateError, Version,
 };
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -54,6 +55,20 @@ struct Group {
     detail: GroupDetail,
     version: Option<Version>,
 }
+
+/// A stored document with the version identifying it, as the object store
+/// hands the pair back.
+type Held<T> = (T, Version);
+
+/// Member documents keyed `(group, member)`, as their object keys are.
+type MemberDocs = BTreeMap<(String, String), Held<MemberDoc>>;
+
+/// Generation documents keyed by group.
+type GenerationDocs = BTreeMap<String, Held<GenerationDoc>>;
+
+/// Assignment documents keyed `(group, generation)`. No version: they are
+/// immutable, so there is nothing to condition a later write on.
+type AssignmentDocs = BTreeMap<(String, i32), AssignmentDoc>;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Engine {
@@ -63,6 +78,12 @@ pub(crate) struct Engine {
 
     topics: Arc<Mutex<Vec<CreatableTopic>>>,
     groups: Arc<Mutex<BTreeMap<String, Group>>>,
+
+    /// The decomposed group layout (#359), keyed as the object store keys it:
+    /// `(group, member)`, `group`, `(group, generation)`.
+    members: Arc<Mutex<MemberDocs>>,
+    generations: Arc<Mutex<GenerationDocs>>,
+    assignments: Arc<Mutex<AssignmentDocs>>,
 }
 
 impl Engine {
@@ -73,6 +94,19 @@ impl Engine {
             advertised_listener,
             topics: Arc::new(Mutex::new(Vec::new())),
             groups: Arc::new(Mutex::new(BTreeMap::new())),
+            members: Arc::new(Mutex::new(BTreeMap::new())),
+            generations: Arc::new(Mutex::new(BTreeMap::new())),
+            assignments: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    /// A version distinct from every other, as an object store's etag is.
+    fn next_version() -> Version {
+        let id = Uuid::now_v7();
+
+        Version {
+            e_tag: Some(id.to_string()),
+            version: Some(id.to_string()),
         }
     }
 }
@@ -408,6 +442,177 @@ impl Storage for Engine {
                         version: group.version.clone().unwrap_or_default(),
                     })
                 }
+            })
+    }
+
+    #[instrument(skip_all)]
+    async fn write_group_member(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        member: MemberDoc,
+        version: Option<Version>,
+    ) -> Result<Version, UpdateError<MemberDoc>> {
+        let key = (group_id.to_owned(), member_id.to_owned());
+
+        self.members
+            .lock()
+            .map_err(|err| UpdateError::Error(err.into()))
+            .and_then(|mut members| match members.get(&key) {
+                Some((current, held)) if Some(held) != version.as_ref() => {
+                    Err(UpdateError::Outdated {
+                        current: Box::new(current.clone()),
+                        version: held.clone(),
+                    })
+                }
+
+                // An etag CAS against an object that is not there: the store
+                // reports a failed precondition, and there is no `current` to
+                // hand back, so it cannot be an `Outdated`.
+                None if version.is_some() => {
+                    Err(UpdateError::Error(Error::Api(ErrorCode::UnknownMemberId)))
+                }
+
+                _ => {
+                    let version = Self::next_version();
+                    _ = members.insert(key, (member, version.clone()));
+                    Ok(version)
+                }
+            })
+    }
+
+    #[instrument(skip_all)]
+    async fn read_group_member(
+        &self,
+        group_id: &str,
+        member_id: &str,
+    ) -> Result<Option<(MemberDoc, Version)>> {
+        let key = (group_id.to_owned(), member_id.to_owned());
+
+        self.members
+            .lock()
+            .map_err(Into::into)
+            .map(|members| members.get(&key).cloned())
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_group_member(&self, group_id: &str, member_id: &str) -> Result<()> {
+        let key = (group_id.to_owned(), member_id.to_owned());
+
+        self.members.lock().map_err(Into::into).map(|mut members| {
+            _ = members.remove(&key);
+        })
+    }
+
+    #[instrument(skip_all)]
+    async fn list_group_members(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<String, (MemberDoc, Version)>> {
+        self.members.lock().map_err(Into::into).map(|members| {
+            members
+                .iter()
+                .filter(|((group, _), _)| group == group_id)
+                .map(|((_, member_id), held)| (member_id.clone(), held.clone()))
+                .collect()
+        })
+    }
+
+    #[instrument(skip_all)]
+    async fn read_group_generation(
+        &self,
+        group_id: &str,
+    ) -> Result<Option<(GenerationDoc, Version)>> {
+        self.generations
+            .lock()
+            .map_err(Into::into)
+            .map(|generations| generations.get(group_id).cloned())
+    }
+
+    #[instrument(skip_all)]
+    async fn update_group_generation(
+        &self,
+        group_id: &str,
+        generation: GenerationDoc,
+        version: Option<Version>,
+    ) -> Result<Version, UpdateError<GenerationDoc>> {
+        self.generations
+            .lock()
+            .map_err(|err| UpdateError::Error(err.into()))
+            .and_then(|mut generations| match generations.get(group_id) {
+                Some((current, held)) if Some(held) != version.as_ref() => {
+                    Err(UpdateError::Outdated {
+                        current: Box::new(current.clone()),
+                        version: held.clone(),
+                    })
+                }
+
+                None if version.is_some() => {
+                    Err(UpdateError::Error(Error::Api(ErrorCode::GroupIdNotFound)))
+                }
+
+                _ => {
+                    let version = Self::next_version();
+                    _ = generations.insert(group_id.to_owned(), (generation, version.clone()));
+                    Ok(version)
+                }
+            })
+    }
+
+    #[instrument(skip_all)]
+    async fn create_group_assignment(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+        assignment: AssignmentDoc,
+    ) -> Result<AssignmentOutcome> {
+        let key = (group_id.to_owned(), generation_id);
+
+        self.assignments
+            .lock()
+            .map_err(Into::into)
+            .map(|mut assignments| match assignments.get(&key) {
+                Some(current) => AssignmentOutcome::AlreadyExists(Box::new(current.clone())),
+
+                None => {
+                    let version = Self::next_version();
+                    _ = assignments.insert(key, assignment);
+                    AssignmentOutcome::Created(version)
+                }
+            })
+    }
+
+    #[instrument(skip_all)]
+    async fn read_group_assignment(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+    ) -> Result<Option<AssignmentDoc>> {
+        let key = (group_id.to_owned(), generation_id);
+
+        self.assignments
+            .lock()
+            .map_err(Into::into)
+            .map(|assignments| assignments.get(&key).cloned())
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_group_assignments_before(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+    ) -> Result<u64> {
+        self.assignments
+            .lock()
+            .map_err(Into::into)
+            .map(|mut assignments| {
+                let held = assignments.len();
+
+                assignments.retain(|(group, generation), _| {
+                    group != group_id || *generation >= generation_id
+                });
+
+                (held - assignments.len()) as u64
             })
     }
 

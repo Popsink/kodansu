@@ -21,16 +21,16 @@ use tansu_storage::{
 };
 use url::Url;
 
-use crate::common::{Error, init_tracing};
+use crate::common::{Error, cluster_id, init_tracing, storage_url};
 
 mod common;
 
 async fn storage() -> Result<Arc<Box<dyn Storage>>, Error> {
     StorageContainer::builder()
-        .cluster_id("tansu")
+        .cluster_id(cluster_id())
         .node_id(111)
         .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(Url::parse("memory://tansu/")?)
+        .storage(storage_url()?)
         .build()
         .await
         .map_err(Into::into)

@@ -17,6 +17,7 @@ use std::{
     fmt::Debug,
     io,
     marker::PhantomData,
+    net::SocketAddr,
     time::SystemTime,
 };
 
@@ -36,6 +37,18 @@ use crate::{
     BYTES_RECEIVED, BYTES_SENT, Classify, Error, REQUEST_DURATION, REQUEST_SIZE, RESPONSE_SIZE,
     Severity, frame_length,
 };
+
+/// The address of the connected peer, put into the service [`Context`] by
+/// whoever accepted the connection.
+///
+/// It used to be read back off the request — `TcpStream::peer_addr` — inside
+/// [`TcpContextService`], and that one call is what pinned the whole service
+/// stack to a bare [`TcpStream`]: a TLS stream cannot answer it, so TLS could
+/// not be layered underneath (#358). Every accept site already has the address
+/// in hand, so it carries it rather than the stream type having to answer for
+/// it.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Peer(pub SocketAddr);
 
 /// A [`Layer`] that listens for TCP connections
 #[derive(Clone, Debug, Default)]
@@ -97,7 +110,12 @@ where
                     debug!(?req, ?stream, %addr);
 
                     let service = self.inner.clone();
-                    let ctx = ctx.clone();
+
+                    let ctx = {
+                        let mut ctx = ctx.clone();
+                        _ = ctx.insert(Peer(addr));
+                        ctx
+                    };
 
                     let handle = set.spawn(async move {
                             match service.serve(ctx, stream).await {
@@ -199,21 +217,20 @@ impl<S> Debug for TcpContextService<S> {
     }
 }
 
-impl<State, S> Service<State, TcpStream> for TcpContextService<S>
+/// Generic over the stream, and not over [`TcpStream`] alone, so that the same
+/// stack serves a TLS stream (#358). The peer address comes from [`Peer`] in the
+/// context, which is what the stream used to be asked for — see [`Peer`].
+impl<State, S, Stream> Service<State, Stream> for TcpContextService<S>
 where
-    S: Service<TcpContext, TcpStream>,
-    S::Error: From<io::Error>,
+    S: Service<TcpContext, Stream>,
     State: Clone + Send + Sync + 'static,
+    Stream: Send + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;
 
-    #[instrument(skip_all, fields(peer = %req.peer_addr()?))]
-    async fn serve(
-        &self,
-        ctx: Context<State>,
-        req: TcpStream,
-    ) -> Result<Self::Response, Self::Error> {
+    #[instrument(skip_all, fields(peer = ?ctx.get::<Peer>().map(|Peer(peer)| *peer)))]
+    async fn serve(&self, ctx: Context<State>, req: Stream) -> Result<Self::Response, Self::Error> {
         let (ctx, _) = ctx.swap_state(self.state.clone());
 
         self.inner.serve(ctx, req).await

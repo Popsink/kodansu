@@ -80,9 +80,10 @@ mod opticon;
 mod tests;
 
 use crate::{
-    AutoTopicCreate, BrokerRegistrationRequest, Error, GroupDetail, ListOffsetResponse, METER,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    Result, ScramCredential, Storage, TopicDefaults, TopicId, Topition, TxnAddPartitionsRequest,
+    AssignmentDoc, AssignmentOutcome, AutoTopicCreate, BrokerRegistrationRequest, Error,
+    GenerationDoc, GroupDetail, ListOffsetResponse, METER, MemberDoc, MetadataResponse,
+    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
+    ScramCredential, Storage, TopicDefaults, TopicId, Topition, TxnAddPartitionsRequest,
     TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
     storage_error_code,
 };
@@ -6079,28 +6080,89 @@ impl DynoStore {
         (prefix != self.groups_root()).then_some(prefix)
     }
 
-    /// The most recent `last_modified` across everything under `group_id`'s
-    /// prefix — its committed offsets — as epoch milliseconds. `None` when the
-    /// group has no objects there at all (#272).
+    /// `members/` under a group's prefix, or `None` for the widening group id
+    /// [`Self::group_prefix`] refuses (#277).
+    fn group_members_prefix(&self, group_id: &str) -> Option<Path> {
+        self.group_prefix(group_id)
+            .map(|prefix| Path::from(format!("{prefix}/members")))
+    }
+
+    /// A member's own document (#359). `None` when either id contributes no
+    /// path component: a member id that normalises away would otherwise write
+    /// the group's `members` prefix itself as an object.
+    fn group_member_location(&self, group_id: &str, member_id: &str) -> Option<Path> {
+        let prefix = self.group_members_prefix(group_id)?;
+        let location = Path::from(format!("{prefix}/{member_id}.json"));
+
+        (location != Path::from(format!("{prefix}/.json"))).then_some(location)
+    }
+
+    /// A group's composition document (#359).
+    fn group_generation_location(&self, group_id: &str) -> Option<Path> {
+        self.group_prefix(group_id)
+            .map(|prefix| Path::from(format!("{prefix}/generation.json")))
+    }
+
+    /// `assignment/` under a group's prefix (#359).
+    fn group_assignments_prefix(&self, group_id: &str) -> Option<Path> {
+        self.group_prefix(group_id)
+            .map(|prefix| Path::from(format!("{prefix}/assignment")))
+    }
+
+    /// A generation's immutable assignment (#359). Zero-padded so the listing
+    /// is in generation order, as `{seq}.seg` is for segments.
     ///
-    /// This is the liveness signal `expire_groups` was missing. The state
-    /// object's mtime freezes once a group stops rewriting it, which a
-    /// commit-only consumer does after its first commit, so the offsets
-    /// themselves are the only record that anyone is still using the group.
-    async fn group_committed_activity_ms(&self, group_id: &str) -> Result<Option<i64>> {
-        let Some(prefix) = self.group_prefix(group_id) else {
-            return Ok(None);
-        };
-
-        let mut latest: Option<i64> = None;
-        let mut listing = self.scan(Scan::Group, &prefix);
-
-        while let Some(meta) = listing.next().await.transpose()? {
-            let modified = meta.last_modified.timestamp_millis();
-            latest = Some(latest.map_or(modified, |held: i64| held.max(modified)));
+    /// `None` for a negative generation: zero-padding one yields `00000000-1`,
+    /// which neither sorts nor parses back, so the housekeeping sweep could
+    /// never remove it. Generations are minted from zero upward, so this is a
+    /// guard against a caller bug rather than a reachable state.
+    fn group_assignment_location(&self, group_id: &str, generation_id: i32) -> Option<Path> {
+        if generation_id < 0 {
+            return None;
         }
 
-        Ok(latest)
+        self.group_assignments_prefix(group_id)
+            .map(|prefix| Path::from(format!("{prefix}/{generation_id:0>10}.json")))
+    }
+
+    /// Read `Option`, not `Result`: an object that is not there is an answer —
+    /// the group has no generation, the member has no document — and only a
+    /// store error is a failure.
+    fn absent_is_none<V>(result: Result<(V, Version)>) -> Result<Option<(V, Version)>> {
+        match result {
+            Ok(pair) => Ok(Some(pair)),
+            Err(Error::ObjectStore(error))
+                if matches!(error.as_ref(), object_store::Error::NotFound { .. }) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Which group owns an object under [`Self::groups_root`], or `None` for
+    /// one that belongs to no group.
+    ///
+    /// Layout-agnostic on purpose (#359): a group owns `{group}.json` directly
+    /// under the root — the legacy state object — *and* everything under
+    /// `{group}/`: its committed offsets, and now its member documents, its
+    /// generation and its assignments. Keying on the *prefix* rather than on
+    /// any one object is what lets expiry outlive the layout.
+    ///
+    /// An id that normalises to nothing (a stray object named exactly `.json`)
+    /// is refused here rather than passed to `delete_groups`, which would
+    /// otherwise report `InvalidGroupId` once per maintenance tick, forever.
+    fn group_of(root: &Path, location: &Path) -> Option<String> {
+        let mut parts = location.prefix_match(root)?;
+        let first = parts.next()?;
+
+        let group_id = if parts.next().is_some() {
+            first.as_ref().to_owned()
+        } else {
+            first.as_ref().strip_suffix(".json")?.to_owned()
+        };
+
+        (!group_id.is_empty()).then_some(group_id)
     }
 
     /// Enforce the `delete` cleanup policy: for every topic configured with
@@ -6108,19 +6170,41 @@ impl DynoStore {
     /// older than `retention.ms` (defaulting to 7 days, matching the SQL
     /// backends). Returns the number of batches removed.
     #[instrument(skip(self), ret)]
-    /// Expire consumer groups whose state object under
-    /// `clusters/{cluster}/groups/consumers/` has not been modified within
-    /// [`GROUP_RETENTION`]. A live group rewrites its state object on every
-    /// join, heartbeat and offset commit, so an object left untouched for the
-    /// whole window has had no member activity for that long and is treated as
-    /// dead. Age is read from the `last_modified` of the delimiter listing, so
-    /// candidate selection needs no per-group GET.
+    /// Expire consumer groups with no activity anywhere under their prefix
+    /// within [`GROUP_RETENTION`].
+    ///
+    /// One streaming listing of `clusters/{cluster}/groups/consumers/`, folded
+    /// into the most recent `last_modified` per group. A group is condemned
+    /// when *nothing* it owns has been touched inside the window — its state
+    /// object, its committed offsets, its member documents, its generation.
+    ///
+    /// **The signal is the whole prefix, not one object (#272, #359).** The
+    /// legacy state object's mtime freezes once a group stops rewriting it,
+    /// which a commit-only consumer does after its first commit: age on that
+    /// object alone said "abandoned" about a consumer that was still
+    /// committing, and expiry then deleted the group state *and every committed
+    /// offset under it*. The decomposed layout (#359) has no `{group}.json` at
+    /// all, so a rule keyed on that object would have stopped condemning
+    /// anything — the same reasoning, failing the other way, into an unbounded
+    /// leak. Folding the prefix answers both, and is why the rule survives the
+    /// layout change without a flag: a member's liveness write is now activity,
+    /// which is what it always should have been.
+    ///
+    /// The failure direction is deliberate: every way this can be wrong keeps a
+    /// group that would have been deleted. Expiry reclaiming late is #45's
+    /// complaint; expiry reclaiming a live consumer's offsets is data loss.
+    ///
+    /// Cost is one listing page per thousand objects under the consumer tree,
+    /// per tick — where the previous shape paid one delimited listing plus one
+    /// listing *per candidate*, and a candidate was any group old enough to be
+    /// considered.
     ///
     /// Deletions are capped at [`GROUP_EXPIRE_CHUNK`] per tick so a large
     /// accumulated backlog (e.g. groups leaked by a one-group-per-subscription
     /// client model) drains gradually rather than issuing tens of thousands of
     /// deletes at once — the concentrated object-store pressure that degraded
-    /// the broker in #8. See #45.
+    /// the broker in #8. See #45. The oldest go first, so a backlog drains in
+    /// the order it accumulated rather than in listing order.
     async fn expire_groups(&self, now: SystemTime) -> Result<u64> {
         /// Kafka's default `offsets.retention.minutes` is 7 days; match it.
         const GROUP_RETENTION: Duration = Duration::from_hours(7 * 24);
@@ -6135,95 +6219,56 @@ impl DynoStore {
         .unwrap_or(i64::MAX);
         let threshold_ms = now_ms.saturating_sub(GROUP_RETENTION.as_millis() as i64);
 
-        let prefix = Path::from(format!("clusters/{}/groups/consumers/", self.cluster));
+        let root = self.groups_root();
 
-        let listed = self
-            .scan_delimited(Scan::Group, &prefix)
+        // Folded as the listing streams: one entry per group, not one per
+        // object, so the tick's memory is the group count however many objects
+        // each group owns.
+        let mut latest: BTreeMap<String, i64> = BTreeMap::new();
+        let mut listing = self.scan(Scan::Group, &root);
+
+        while let Some(meta) = listing
+            .next()
             .await
-            .inspect_err(|err| error!(?err, cluster = self.cluster))?;
-
-        // The `{group}.json` files directly under the prefix are the group
-        // state objects; the `{group}/` common prefixes hold the per-partition
-        // committed offsets and are removed alongside them by `delete_groups`.
-        let mut candidates: Vec<String> = Vec::new();
-        for meta in listed.objects {
-            if meta.last_modified.timestamp_millis() >= threshold_ms {
-                continue;
-            }
-
-            let Some(name) = meta.location.parts().next_back() else {
+            .transpose()
+            .inspect_err(|err| error!(?err, cluster = self.cluster))?
+        {
+            let Some(group_id) = Self::group_of(&root, &meta.location) else {
                 continue;
             };
 
-            if let Some(group_id) = name.as_ref().strip_suffix(".json") {
-                candidates.push(group_id.to_owned());
+            let modified = meta.last_modified.timestamp_millis();
 
-                if candidates.len() >= GROUP_EXPIRE_CHUNK {
-                    break;
-                }
-            }
+            _ = latest
+                .entry(group_id)
+                .and_modify(|held| *held = (*held).max(modified))
+                .or_insert(modified);
         }
 
-        if candidates.is_empty() {
-            return Ok(0);
-        }
-
-        // The state object's age is a candidate signal, not a verdict (#272).
-        //
-        // A group that commits offsets without rewriting `{group}.json` looks
-        // abandoned: the first commit creates the state object, and every
-        // subsequent one takes the no-op skip, so its mtime freezes at the first
-        // commit. Seven days later this deleted the group state AND every
-        // committed offset under it, while the consumer was still committing.
-        // An actively committing consumer re-created them within a commit
-        // interval, so the loss window was small; a paused or idle one lost its
-        // offsets outright, with no window at all.
-        //
-        // So each candidate's offsets subtree is consulted before it is
-        // condemned. Cost is one listing per *candidate* — a group already old
-        // enough to be considered — rather than per group, which is what makes
-        // this affordable at ~14.7k topics' worth of groups.
-        //
-        // The failure direction is deliberate: every way this can be wrong keeps
-        // a group that would have been deleted. Expiry reclaiming late is #45's
-        // complaint; expiry reclaiming a live consumer's offsets is data loss.
-        // Whether the *candidate* scan hit the per-tick cap. Taken before the
-        // liveness filter, because that is what bounds the tick's work — a tick
-        // that considered 1000 groups and condemned two still left the listing
-        // unfinished.
-        let capped = candidates.len() >= GROUP_EXPIRE_CHUNK;
-
-        let mut stale: Vec<String> = Vec::with_capacity(candidates.len());
-        for group_id in candidates {
-            match self.group_committed_activity_ms(&group_id).await {
-                Ok(Some(latest_ms)) if latest_ms >= threshold_ms => {
-                    debug!(
-                        group_id,
-                        latest_ms, threshold_ms, "group still committing offsets; not expiring"
-                    );
-                }
-
-                Ok(_) => stale.push(group_id),
-
-                // A listing that failed says nothing about liveness, so it must
-                // not read as "abandoned". Keep the group and retry next tick.
-                Err(err) => {
-                    warn!(
-                        ?err,
-                        group_id, "could not read committed-offset activity; not expiring"
-                    );
-                }
-            }
-        }
+        let mut stale = latest
+            .into_iter()
+            .filter(|(_, latest_ms)| *latest_ms < threshold_ms)
+            .collect::<Vec<_>>();
 
         if stale.is_empty() {
             return Ok(0);
         }
 
+        // Oldest first, so a backlog drains in the order it accumulated.
+        stale.sort_by_key(|(_, latest_ms)| *latest_ms);
+
+        let capped = stale.len() > GROUP_EXPIRE_CHUNK;
+        stale.truncate(GROUP_EXPIRE_CHUNK);
+
+        let stale = stale
+            .into_iter()
+            .map(|(group_id, _)| group_id)
+            .collect::<Vec<_>>();
+
         let expired = stale.len() as u64;
 
-        // `delete_groups` removes each state object and every committed-offset
-        // object under the group prefix, logging the per-group outcome.
+        // `delete_groups` removes each state object and every object under the
+        // group prefix, logging the per-group outcome.
         _ = self.delete_groups(Some(&stale)).await?;
 
         if capped {
@@ -9975,6 +10020,208 @@ impl Storage for DynoStore {
             }
             Err(error) => Err(error),
         }
+    }
+
+    async fn write_group_member(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        member: MemberDoc,
+        version: Option<Version>,
+    ) -> Result<Version, UpdateError<MemberDoc>> {
+        let location = self
+            .group_member_location(group_id, member_id)
+            .ok_or_else(|| UpdateError::Error(Error::Api(ErrorCode::InvalidGroupId)))?;
+
+        self.put(
+            &location,
+            member,
+            json_content_type(),
+            version.map(Into::into),
+        )
+        .await
+        .map(Into::into)
+    }
+
+    async fn read_group_member(
+        &self,
+        group_id: &str,
+        member_id: &str,
+    ) -> Result<Option<(MemberDoc, Version)>> {
+        let Some(location) = self.group_member_location(group_id, member_id) else {
+            return Ok(None);
+        };
+
+        Self::absent_is_none(self.get::<MemberDoc>(&location).await)
+    }
+
+    async fn delete_group_member(&self, group_id: &str, member_id: &str) -> Result<()> {
+        let Some(location) = self.group_member_location(group_id, member_id) else {
+            return Ok(());
+        };
+
+        match self.object_store.delete(&location).await {
+            Ok(()) => Ok(()),
+            // Already gone is the outcome asked for. The caller's contract is
+            // best-effort anyway, and a member document is deleted from more
+            // than one path (its own leave, and the sweep that evicted it).
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    async fn list_group_members(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<String, (MemberDoc, Version)>> {
+        let Some(prefix) = self.group_members_prefix(group_id) else {
+            return Ok(BTreeMap::new());
+        };
+
+        let mut members = BTreeMap::new();
+        let mut listing = self.scan(Scan::Group, &prefix);
+
+        while let Some(meta) = listing.next().await.transpose()? {
+            let Some(member_id) = meta
+                .location
+                .parts()
+                .next_back()
+                .and_then(|name| name.as_ref().strip_suffix(".json").map(ToOwned::to_owned))
+            else {
+                continue;
+            };
+
+            // A document deleted between the listing and the read is a member
+            // that left, not a failure of the listing.
+            if let Some(pair) = Self::absent_is_none(self.get::<MemberDoc>(&meta.location).await)? {
+                _ = members.insert(member_id, pair);
+            }
+        }
+
+        Ok(members)
+    }
+
+    async fn read_group_generation(
+        &self,
+        group_id: &str,
+    ) -> Result<Option<(GenerationDoc, Version)>> {
+        let Some(location) = self.group_generation_location(group_id) else {
+            return Ok(None);
+        };
+
+        Self::absent_is_none(self.get::<GenerationDoc>(&location).await)
+    }
+
+    async fn update_group_generation(
+        &self,
+        group_id: &str,
+        generation: GenerationDoc,
+        version: Option<Version>,
+    ) -> Result<Version, UpdateError<GenerationDoc>> {
+        let location = self
+            .group_generation_location(group_id)
+            .ok_or_else(|| UpdateError::Error(Error::Api(ErrorCode::InvalidGroupId)))?;
+
+        self.put(
+            &location,
+            generation,
+            json_content_type(),
+            version.map(Into::into),
+        )
+        .await
+        .map(Into::into)
+    }
+
+    async fn create_group_assignment(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+        assignment: AssignmentDoc,
+    ) -> Result<AssignmentOutcome> {
+        let location = self
+            .group_assignment_location(group_id, generation_id)
+            .ok_or(Error::Api(ErrorCode::InvalidGroupId))?;
+
+        // `None` is `PutMode::Create`, so this races on the key rather than on
+        // an etag: exactly one writer creates it, and the loser is handed what
+        // is stored.
+        match self
+            .put(&location, assignment, json_content_type(), None)
+            .await
+        {
+            Ok(put_result) => Ok(AssignmentOutcome::Created(put_result.into())),
+
+            Err(UpdateError::Outdated { current, .. }) => {
+                Ok(AssignmentOutcome::AlreadyExists(current))
+            }
+
+            Err(UpdateError::Error(error)) => Err(error),
+            Err(UpdateError::SerdeJson(error)) => Err(Error::SerdeJson(error)),
+            Err(UpdateError::Uuid(error)) => Err(Error::Uuid(error)),
+            // `put` never raises it — nothing here reads an etag back — but the
+            // variant is part of the type, and a silent `unreachable!()` in a
+            // storage path is worse than a named error.
+            Err(UpdateError::MissingEtag) => Err(Error::Message(String::from(
+                "assignment create reported a missing etag",
+            ))),
+        }
+    }
+
+    async fn read_group_assignment(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+    ) -> Result<Option<AssignmentDoc>> {
+        let Some(location) = self.group_assignment_location(group_id, generation_id) else {
+            return Ok(None);
+        };
+
+        Ok(Self::absent_is_none(self.get::<AssignmentDoc>(&location).await)?.map(|(doc, _)| doc))
+    }
+
+    async fn delete_group_assignments_before(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+    ) -> Result<u64> {
+        let Some(prefix) = self.group_assignments_prefix(group_id) else {
+            return Ok(0);
+        };
+
+        // The names are zero-padded, so the listing is in generation order and
+        // `start_after` would do — but a generation that overflowed into a
+        // wider name, or an object written by a future layout, must not stop
+        // the sweep. Decoding the name and comparing is cheap at one object per
+        // rebalance.
+        let mut condemned = vec![];
+        let mut listing = self.scan(Scan::Group, &prefix);
+
+        while let Some(meta) = listing.next().await.transpose()? {
+            let below = meta
+                .location
+                .parts()
+                .next_back()
+                .and_then(|name| {
+                    name.as_ref()
+                        .strip_suffix(".json")
+                        .and_then(|stem| stem.parse::<i32>().ok())
+                })
+                .is_some_and(|generation| generation < generation_id);
+
+            if below {
+                condemned.push(meta.location);
+            }
+        }
+
+        let deleted = self
+            .object_store
+            .delete_stream(futures::stream::iter(condemned.into_iter().map(Ok)).boxed())
+            .try_collect::<Vec<Path>>()
+            .await?;
+
+        debug!(group_id, generation_id, ?deleted);
+
+        Ok(deleted.len() as u64)
     }
 
     async fn init_producer(

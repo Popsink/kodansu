@@ -42,10 +42,11 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    AutoTopicCreate, BrokerRegistrationRequest, GroupDetail, ListOffsetResponse, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
-    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, UpdateError, Version,
+    AssignmentDoc, AssignmentOutcome, AutoTopicCreate, BrokerRegistrationRequest, GenerationDoc,
+    GroupDetail, ListOffsetResponse, MemberDoc, MetadataResponse, NamedGroupDetail,
+    OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    UpdateError, Version,
 };
 
 #[derive(Clone, Debug)]
@@ -63,6 +64,22 @@ pub struct LatencyIntroducingStorage<S> {
     /// does not incur — a claim that was false for as long as the heartbeat skip
     /// compared `last_contact` (#273), so a test needs to be able to see it.
     group_updates: Arc<AtomicU64>,
+    /// The decomposed layout's four cost signals (#359), each the counterpart
+    /// of a claim the design makes and a test has to be able to falsify:
+    ///
+    /// - `member_puts`: writes of a member's own document. Bounded by one per
+    ///   member per session/2 — liveness churn, moved off the contended object.
+    /// - `generation_updates`: writes of `generation.json`, won or lost. The
+    ///   claim is that a steady-state group does not write it at all.
+    /// - `generation_cas_conflicts`: how many of those lost the etag CAS. The
+    ///   whole point of the decomposition is that this converges to zero
+    ///   without a per-group owner.
+    /// - `member_lists`: listings of a group's member documents. The claim is
+    ///   that no request path issues one.
+    member_puts: Arc<AtomicU64>,
+    generation_updates: Arc<AtomicU64>,
+    generation_cas_conflicts: Arc<AtomicU64>,
+    member_lists: Arc<AtomicU64>,
 }
 
 impl<S> LatencyIntroducingStorage<S>
@@ -76,7 +93,34 @@ where
             latency: 50..150,
             group_cas_conflicts: Arc::new(AtomicU64::new(0)),
             group_updates: Arc::new(AtomicU64::new(0)),
+            member_puts: Arc::new(AtomicU64::new(0)),
+            generation_updates: Arc::new(AtomicU64::new(0)),
+            generation_cas_conflicts: Arc::new(AtomicU64::new(0)),
+            member_lists: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// A shared handle to this store's count of member-document writes (#359).
+    pub fn member_puts_handle(&self) -> Arc<AtomicU64> {
+        self.member_puts.clone()
+    }
+
+    /// A shared handle to this store's count of `generation.json` writes, won
+    /// or lost (#359).
+    pub fn generation_updates_handle(&self) -> Arc<AtomicU64> {
+        self.generation_updates.clone()
+    }
+
+    /// A shared handle to this store's count of `generation.json` writes that
+    /// lost the etag CAS (#359).
+    pub fn generation_cas_conflicts_handle(&self) -> Arc<AtomicU64> {
+        self.generation_cas_conflicts.clone()
+    }
+
+    /// A shared handle to this store's count of member-document listings
+    /// (#359) — the LIST no request path is supposed to issue.
+    pub fn member_lists_handle(&self) -> Arc<AtomicU64> {
+        self.member_lists.clone()
     }
 
     /// A shared handle to this store's `update_group` etag-CAS conflict
@@ -220,6 +264,119 @@ where
         self.introduce_latency().await?;
 
         self.storage.read_group(group_id).await
+    }
+
+    async fn write_group_member(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        member: MemberDoc,
+        version: Option<Version>,
+    ) -> Result<Version, UpdateError<MemberDoc>> {
+        self.introduce_latency().await?;
+
+        _ = self.member_puts.fetch_add(1, Ordering::Relaxed);
+
+        self.storage
+            .write_group_member(group_id, member_id, member, version)
+            .await
+    }
+
+    async fn read_group_member(
+        &self,
+        group_id: &str,
+        member_id: &str,
+    ) -> Result<Option<(MemberDoc, Version)>> {
+        self.introduce_latency().await?;
+
+        self.storage.read_group_member(group_id, member_id).await
+    }
+
+    async fn delete_group_member(&self, group_id: &str, member_id: &str) -> Result<()> {
+        self.introduce_latency().await?;
+
+        self.storage.delete_group_member(group_id, member_id).await
+    }
+
+    async fn list_group_members(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<String, (MemberDoc, Version)>> {
+        self.introduce_latency().await?;
+
+        _ = self.member_lists.fetch_add(1, Ordering::Relaxed);
+
+        self.storage.list_group_members(group_id).await
+    }
+
+    async fn read_group_generation(
+        &self,
+        group_id: &str,
+    ) -> Result<Option<(GenerationDoc, Version)>> {
+        self.introduce_latency().await?;
+
+        self.storage.read_group_generation(group_id).await
+    }
+
+    async fn update_group_generation(
+        &self,
+        group_id: &str,
+        generation: GenerationDoc,
+        version: Option<Version>,
+    ) -> Result<Version, UpdateError<GenerationDoc>> {
+        self.introduce_latency().await?;
+
+        _ = self.generation_updates.fetch_add(1, Ordering::Relaxed);
+
+        let result = self
+            .storage
+            .update_group_generation(group_id, generation, version)
+            .await;
+
+        if matches!(result, Err(UpdateError::Outdated { .. })) {
+            _ = self
+                .generation_cas_conflicts
+                .fetch_add(1, Ordering::Relaxed);
+        }
+
+        result
+    }
+
+    async fn create_group_assignment(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+        assignment: AssignmentDoc,
+    ) -> Result<AssignmentOutcome> {
+        self.introduce_latency().await?;
+
+        self.storage
+            .create_group_assignment(group_id, generation_id, assignment)
+            .await
+    }
+
+    async fn read_group_assignment(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+    ) -> Result<Option<AssignmentDoc>> {
+        self.introduce_latency().await?;
+
+        self.storage
+            .read_group_assignment(group_id, generation_id)
+            .await
+    }
+
+    async fn delete_group_assignments_before(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+    ) -> Result<u64> {
+        self.introduce_latency().await?;
+
+        self.storage
+            .delete_group_assignments_before(group_id, generation_id)
+            .await
     }
 
     async fn list_offsets(

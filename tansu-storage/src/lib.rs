@@ -140,9 +140,12 @@ use tracing::warn;
 mod dynostore;
 
 mod batch;
+mod group;
 mod latency;
 mod null;
 mod service;
+
+pub use group::{AssignmentDoc, AssignmentOutcome, GenerationDoc, MemberDoc, MemberRef};
 
 pub use latency::LatencyIntroducingStorage;
 
@@ -1408,6 +1411,104 @@ pub trait Storage: Debug + Send + Sync + 'static {
         Ok(None)
     }
 
+    /// Write a member's own document, `members/{member_id}.json` (#359).
+    ///
+    /// `version` is `None` to create and `Some` to CAS, as
+    /// [`Self::update_group`]. A member has one *logical* writer — itself — but
+    /// that writer can have two requests in flight on two replicas at once, and
+    /// the CAS is what stops the later-arriving stale one (a heartbeat carrying
+    /// the subscription as it was before a join changed it) from clobbering the
+    /// newer.
+    ///
+    /// **Required, not defaulted.** Every method here is: a default body is
+    /// silently satisfied by a wrapper that forgets to delegate, which is how
+    /// [`Self::read_group`] shipped inert in every object-store deployment
+    /// (#273) — the `Ok(None)` above is the scar, kept only because callers
+    /// still depend on it.
+    async fn write_group_member(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        member: MemberDoc,
+        version: Option<Version>,
+    ) -> Result<Version, UpdateError<MemberDoc>>;
+
+    /// A member's document and its version, or `None` when the member has none.
+    async fn read_group_member(
+        &self,
+        group_id: &str,
+        member_id: &str,
+    ) -> Result<Option<(MemberDoc, Version)>>;
+
+    /// Remove a member's document. Best-effort by contract: an orphaned
+    /// document is harmless, because the generation's member set is what is
+    /// authoritative, and the sweep reclaims it.
+    async fn delete_group_member(&self, group_id: &str, member_id: &str) -> Result<()>;
+
+    /// Every member document of a group, by member id.
+    ///
+    /// The one LIST on the group path, and deliberately not on the request
+    /// path: joins and sweeps fan out over the generation's member set instead,
+    /// which needs no listing. This exists for the paths that must discover
+    /// documents the generation does not name — reconciliation and the tests
+    /// that assert what was written.
+    async fn list_group_members(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<String, (MemberDoc, Version)>>;
+
+    /// A group's composition and its version, or `None` when the group has no
+    /// generation object — which is how a group that does not exist, and a
+    /// group that exists only in the legacy layout, both read.
+    async fn read_group_generation(
+        &self,
+        group_id: &str,
+    ) -> Result<Option<(GenerationDoc, Version)>>;
+
+    /// Conditionally write a group's composition, `generation.json`.
+    ///
+    /// `version` is `None` to create — which is how a group is born, and why
+    /// two replicas racing to create the same group cannot both win — and
+    /// `Some` to CAS.
+    async fn update_group_generation(
+        &self,
+        group_id: &str,
+        generation: GenerationDoc,
+        version: Option<Version>,
+    ) -> Result<Version, UpdateError<GenerationDoc>>;
+
+    /// Write a generation's assignment, create-only.
+    ///
+    /// The write that liveness churn used to starve, now with no etag to lose:
+    /// there is no read-modify-write, only a key that exactly one writer wins.
+    /// See [`AssignmentOutcome`] for why finding it already there is a success.
+    async fn create_group_assignment(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+        assignment: AssignmentDoc,
+    ) -> Result<AssignmentOutcome>;
+
+    /// A generation's assignment, or `None` when the leader has not written it
+    /// yet. Immutable once present, so a caller may memoize it forever.
+    async fn read_group_assignment(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+    ) -> Result<Option<AssignmentDoc>>;
+
+    /// Drop the assignments of generations below `generation_id`, returning how
+    /// many were removed.
+    ///
+    /// Housekeeping, not correctness: assignment objects are immutable and
+    /// per-generation, so they accumulate one per rebalance until something
+    /// removes them. `delete_groups` remains the backstop.
+    async fn delete_group_assignments_before(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+    ) -> Result<u64>;
+
     /// Initialise a transactional or idempotent producer in this storage.
     async fn init_producer(
         &self,
@@ -1658,6 +1759,86 @@ where
 
     async fn read_group(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
         self.as_ref().read_group(group_id).await
+    }
+
+    async fn write_group_member(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        member: MemberDoc,
+        version: Option<Version>,
+    ) -> Result<Version, UpdateError<MemberDoc>> {
+        self.as_ref()
+            .write_group_member(group_id, member_id, member, version)
+            .await
+    }
+
+    async fn read_group_member(
+        &self,
+        group_id: &str,
+        member_id: &str,
+    ) -> Result<Option<(MemberDoc, Version)>> {
+        self.as_ref().read_group_member(group_id, member_id).await
+    }
+
+    async fn delete_group_member(&self, group_id: &str, member_id: &str) -> Result<()> {
+        self.as_ref().delete_group_member(group_id, member_id).await
+    }
+
+    async fn list_group_members(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<String, (MemberDoc, Version)>> {
+        self.as_ref().list_group_members(group_id).await
+    }
+
+    async fn read_group_generation(
+        &self,
+        group_id: &str,
+    ) -> Result<Option<(GenerationDoc, Version)>> {
+        self.as_ref().read_group_generation(group_id).await
+    }
+
+    async fn update_group_generation(
+        &self,
+        group_id: &str,
+        generation: GenerationDoc,
+        version: Option<Version>,
+    ) -> Result<Version, UpdateError<GenerationDoc>> {
+        self.as_ref()
+            .update_group_generation(group_id, generation, version)
+            .await
+    }
+
+    async fn create_group_assignment(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+        assignment: AssignmentDoc,
+    ) -> Result<AssignmentOutcome> {
+        self.as_ref()
+            .create_group_assignment(group_id, generation_id, assignment)
+            .await
+    }
+
+    async fn read_group_assignment(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+    ) -> Result<Option<AssignmentDoc>> {
+        self.as_ref()
+            .read_group_assignment(group_id, generation_id)
+            .await
+    }
+
+    async fn delete_group_assignments_before(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+    ) -> Result<u64> {
+        self.as_ref()
+            .delete_group_assignments_before(group_id, generation_id)
+            .await
     }
 
     async fn init_producer(
@@ -1929,6 +2110,86 @@ where
 
     async fn read_group(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
         self.as_ref().read_group(group_id).await
+    }
+
+    async fn write_group_member(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        member: MemberDoc,
+        version: Option<Version>,
+    ) -> Result<Version, UpdateError<MemberDoc>> {
+        self.as_ref()
+            .write_group_member(group_id, member_id, member, version)
+            .await
+    }
+
+    async fn read_group_member(
+        &self,
+        group_id: &str,
+        member_id: &str,
+    ) -> Result<Option<(MemberDoc, Version)>> {
+        self.as_ref().read_group_member(group_id, member_id).await
+    }
+
+    async fn delete_group_member(&self, group_id: &str, member_id: &str) -> Result<()> {
+        self.as_ref().delete_group_member(group_id, member_id).await
+    }
+
+    async fn list_group_members(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<String, (MemberDoc, Version)>> {
+        self.as_ref().list_group_members(group_id).await
+    }
+
+    async fn read_group_generation(
+        &self,
+        group_id: &str,
+    ) -> Result<Option<(GenerationDoc, Version)>> {
+        self.as_ref().read_group_generation(group_id).await
+    }
+
+    async fn update_group_generation(
+        &self,
+        group_id: &str,
+        generation: GenerationDoc,
+        version: Option<Version>,
+    ) -> Result<Version, UpdateError<GenerationDoc>> {
+        self.as_ref()
+            .update_group_generation(group_id, generation, version)
+            .await
+    }
+
+    async fn create_group_assignment(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+        assignment: AssignmentDoc,
+    ) -> Result<AssignmentOutcome> {
+        self.as_ref()
+            .create_group_assignment(group_id, generation_id, assignment)
+            .await
+    }
+
+    async fn read_group_assignment(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+    ) -> Result<Option<AssignmentDoc>> {
+        self.as_ref()
+            .read_group_assignment(group_id, generation_id)
+            .await
+    }
+
+    async fn delete_group_assignments_before(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+    ) -> Result<u64> {
+        self.as_ref()
+            .delete_group_assignments_before(group_id, generation_id)
+            .await
     }
 
     async fn init_producer(

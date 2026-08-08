@@ -18,6 +18,43 @@ Run one test by name:
 cargo nextest run --workspace --all-features -E 'test(test_name_here)'
 ```
 
+## Running the storage suite against a real object store
+
+`memory://` is the default, not the only option. Every test in `tansu-storage`
+builds its store from `TANSU_TEST_STORAGE_URL`, which defaults to
+`memory://tansu/` (#357):
+
+```shell
+just test-storage                          # memory://tansu/, same as just test
+just test-storage-minio                    # starts minio in compose, runs on s3://tansu/
+just test-storage s3://my-bucket/          # any bucket, credentials from the AWS_* env
+just test-conditional-put s3://tansu/      # only the conformance target
+```
+
+Two helpers in `tansu-storage/tests/common/mod.rs` make that work, and a new test
+should use both rather than hardcoding a URL:
+
+| helper | what it gives |
+|---|---|
+| `storage_url()` / `storage_url_with_query(q)` | the configured URL, with `q` merged into whatever query it already carries |
+| `cluster_id()` | a fresh uuid per `build()` |
+
+`cluster_id()` is the isolation. Every object the engine writes is keyed under
+`clusters/{cluster}/`, so the cluster id *is* the per-test prefix — without it,
+two tests that both create a topic called `pqr` are the same object in a shared
+bucket. One id per `build()` and not per test, because that is exactly the
+isolation `InMemory` gives today: a test that builds two containers keeps seeing
+two unrelated stores.
+
+`TANSU_TEST_STORAGE_URL` is deliberately not `STORAGE_ENGINE`. That is the
+broker's own variable, `example.env` sets it to `s3://tansu/`, and the tests load
+`.env` — so reusing the name would silently point the suite at a store that is
+not running.
+
+Running against minio by hand needs `AWS_ENDPOINT="http://localhost:9000"` in
+`.env` (`example.env` ships the in-compose hostname, which does not resolve from
+the host). `just test-storage-minio` overrides it for you.
+
 Test logs are written per crate under `logs/`, one file per test thread. The
 directories are tracked (each holds a `.gitignore`) because the test harness
 creates the file, not the directory, and a missing directory fails the test
@@ -55,24 +92,116 @@ lines as uncovered source — a number that moves when you add a benchmark.
 Doc tests are not counted. `cargo llvm-cov` can only instrument them on nightly,
 and this workspace is pinned to a stable toolchain.
 
+## Conditional put
+
+Everything that makes the broker stateless is a conditional put: offset
+assignment is a create-only segment-sequence CAS, group mutation is the etag CAS
+in `update_group`, maintenance work-splitting is a per-prefix lease. `InMemory`
+*emulates* those semantics behind a mutex; S3 implements them with
+`If-None-Match`. `tansu-storage/tests/conditional_put.rs` is the conformance
+target that pins them, and it runs against whichever store
+`TANSU_TEST_STORAGE_URL` names.
+
+Verified green on both `memory://` and `s3://` against minio (`object_store`
+0.14.1, `quay.io/minio/minio`):
+
+| property | how it is pinned |
+|---|---|
+| create-only | 16 concurrent creators of one key: exactly one wins, every loser is `AlreadyExists` |
+| etag CAS | 16 writers race one version: one wins, every loser is `Precondition`, and the spent version stays spent |
+| CAS is not a create | an invented etag, and a CAS against an absent key, are both `Precondition` — never a silent write |
+| etag stability | an unchanged object keeps its etag across repeated `head`/`get` and across unrelated writes in the same prefix, and a CAS against it still succeeds (the #111 GET-first skip depends on this) |
+| conditional read | `If-None-Match` is `NotModified` on an unchanged object and returns the body once it changes |
+| `UpdateError::Outdated` | a stale `update_group` carries the value that won and its version, which is what the coordinator re-derives from rather than retrying blindly (#157) |
+
+The whole `tansu-storage` suite — 324 tests, not just the conformance target —
+also passes on `s3://` against minio, twice in a row against an already-populated
+bucket, which is what establishes that the per-test prefixing actually isolates.
+
+### One divergence between `InMemory` and S3
+
+`InMemory`'s etag is a per-object **write counter**; S3's is the **MD5 of the
+body**. Measured:
+
+| | rewrite the same bytes | two keys, same bytes |
+|---|---|---|
+| `InMemory` | `"2"` becomes `"3"` | `"2"` vs `"4"` |
+| S3 (minio) | `ee0cbdba…` stays `ee0cbdba…` | equal |
+
+So on S3 an etag is content-addressed, and "the etag changed" is not evidence
+that a write happened. The consequence is ABA: an object driven X to Y and back
+to a byte-identical X presents its original etag again, and a CAS still holding
+that etag succeeds despite two intervening writes, where `InMemory` would refuse.
+
+Nothing in the engine depends on the difference today — `GroupDetail` carries
+`inception` and `generation_id`, so byte-identical group state is not a state the
+coordinator returns to — and the conformance target asserts the invariant both
+stores do honour: the version a put hands back is usable for the next CAS
+whichever way the store derives it. It is written down here because the
+group-state decomposition adds per-generation CAS'd objects, and a small
+`{generation, leader}` object is much likelier to cycle back to a previous
+byte-identical value than `GroupDetail` is.
+
+## Group scale
+
+`just test-group-scale` drives `GROUPS × MEMBERS` consumers through the full
+KIP-394 dance across `REPLICAS` coordinators over one shared store, and asserts
+convergence, zero group-state CAS conflicts, and a per-group write budget. It is
+the exit criterion for the group-state decomposition (#359) — `cg_forward`
+proves *one* group converges, and the deployment that wedged had many.
+
+`#[ignore]`d in the suite: it is wall clock rather than a regression gate, and
+`.github/workflows/storage.yml` runs it nightly. The size is environment-driven,
+so a laptop can run a slice of production:
+
+```shell
+TANSU_SCALE_GROUPS=8 just test-group-scale
+```
+
+| Variable | Default | |
+|---|---|---|
+| `TANSU_SCALE_GROUPS` | 64 | |
+| `TANSU_SCALE_MEMBERS` | 16 | the group size that never converged |
+| `TANSU_SCALE_REPLICAS` | 10 | the deployment's broker count |
+| `TANSU_SCALE_FORWARDING` | true | false runs the same consumers with no owner replica |
+| `TANSU_SCALE_PUT_BUDGET_PER_MEMBER` | 2 | group-state PUTs a group may cost |
+| `TANSU_SCALE_DEADLINE_SECS` | 120 | per-member, only reached on failure |
+
+At the default size the forwarded arrangement converges 1024 members in ~5s for
+1152 group-state PUTs — 18 per 16-member group — with zero CAS conflicts. That
+is the baseline the decomposition is measured against.
+
+`TANSU_SCALE_FORWARDING=false` is the arrangement #360 wants to make the only
+one: every replica drives every group, no owner. **It fails today**, which is
+what the flip has to turn green.
+
 ## What is not covered
 
-**The S3 and GCS object stores.** Every test runs against `memory://`, which is
-`object_store`'s `InMemory`. The design leans on conditional put — create-only,
-immutable objects, multi-writer CAS — and `InMemory` emulates that locally while
-S3 implements it with `If-None-Match` and GCS with a generation precondition.
-Those are the semantics most worth testing and the ones nothing tests.
+**GCS.** `gs://` is a supported target and every test in the conformance target
+would run against it unchanged — that is the whole point of the URL being a
+parameter — but none of them ever has. There is no GCS emulator in
+`compose.yaml` and `GoogleCloudStorageBuilder::from_env` needs real credentials,
+so generation preconditions remain assumed rather than observed. Nothing fakes
+them: there is no GCS test rather than a GCS test that proves nothing, which is
+the mistake the removed minio service made.
 
-The CI test job used to start minio via `just ci` and set `AWS_ENDPOINT`,
-`STORAGE_ENGINE=s3://tansu/` and the rest, which made it look as though the S3
-path was covered. No test read any of it. The service was started, waited for and
-ignored, so it was removed.
+Pointing the `object-store` job in `.github/workflows/storage.yml` at a `gs://`
+bucket is what closes it.
 
-Closing this gap means parameterising the storage URL the `tansu-storage` tests
-build — it is hardcoded as `memory://tansu/` in about fifty places — and giving
-each test a unique prefix, since they would otherwise share one bucket and
-collide on topic names. Then the suite can run twice: once on `memory://`, once
-on `s3://` against minio.
+**Real S3, as opposed to minio.** The `object-store` job is
+`workflow_dispatch`-only and skips itself unless `STORAGE_TEST_AWS_*` secrets
+exist, so as things stand the S3 evidence is minio's. minio is a real HTTP
+implementation of `If-None-Match` rather than an emulation in the same process,
+and `object_store` maps the `412` it returns exactly as it maps AWS's, so this is
+a much smaller gap than the one before it — but it is not zero, notably around
+throttling and read-after-write on a bucket under load.
+
+**The engine's own unit tests.** Three sites inside `tansu-storage/src` still
+name `memory://` and should: two in `lib.rs` assert that the `memory://` scheme
+parses and that deprecated URL keys still build, which is a statement about URL
+handling rather than about a store. The one exception is a unit test in
+`src/service/delete_groups.rs`, which builds a real store and cannot reach
+`tests/common`; it runs on `memory://` only.
 
 **`tansu-topic`.** The `tansu topic` subcommand is at or near 0%. It is a thin
 shell over code that is covered, but it has no test that would notice if the
@@ -86,7 +215,16 @@ with them, so the honest fix for their coverage was removal, not tests.
 ## CI layout
 
 `pr.yml` is the only workflow that runs on pull requests. `ci.yml` is disabled
-(it is upstream's, kept for reference), and `publish.yml` runs on `v*` tags.
+(it is upstream's, kept for reference), `publish.yml` runs on `v*` tags, and
+`storage.yml` runs nightly and on `workflow_dispatch`.
+
+`storage.yml` is where the object store gets a service. It is off the PR path on
+purpose: `test` in `pr.yml` is the required check, so a Docker-dependent job
+upstream of it would add minutes to every PR to establish something that only
+changes when `object_store` or the store itself does. The conformance target
+still runs on every PR — against `memory://`, as an ordinary workspace test
+costing ~30ms — and `storage.yml` is what re-runs it where the semantics are
+real.
 
 | job | what it establishes |
 |-----|--------------------|
