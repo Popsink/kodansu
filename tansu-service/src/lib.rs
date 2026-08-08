@@ -238,7 +238,7 @@ use std::{
 
 use opentelemetry::{
     InstrumentationScope, KeyValue, global,
-    metrics::{Counter, Histogram, Meter},
+    metrics::{Counter, Histogram, Meter, UpDownCounter},
 };
 use opentelemetry_semantic_conventions::SCHEMA_URL;
 use rama::{Context, Layer, Service};
@@ -268,6 +268,34 @@ pub use frame::{
     FrameBytesLayer, FrameBytesService, FrameRequestLayer, FrameService, RequestApiKeyMatcher,
     RequestFrameLayer, RequestFrameService, RequestLayer, ResponseService,
 };
+
+/// A request parked in a long poll, counted for as long as this value lives
+/// (#362).
+///
+/// RAII rather than a pair of calls because every parking site is a `select!`
+/// or a `?` away from an early return, and a leaked increment does not decay:
+/// it is an up-down counter, so one missed decrement is a permanent lie about
+/// how loaded this replica is, and a scaler built on it never scales down
+/// again.
+///
+/// Public because the group long polls live in the broker, not here.
+#[derive(Debug)]
+pub struct Parked;
+
+impl Parked {
+    /// Count this request as waiting until the returned value is dropped.
+    #[must_use]
+    pub fn enter() -> Self {
+        REQUESTS_PARKED.add(1, &[]);
+        Self
+    }
+}
+
+impl Drop for Parked {
+    fn drop(&mut self) {
+        REQUESTS_PARKED.add(-1, &[]);
+    }
+}
 
 pub use stream::{
     BytesLayer, BytesService, BytesTcpService, Peer, TcpBytesLayer, TcpBytesService, TcpContext,
@@ -486,6 +514,41 @@ pub(crate) static BYTES_SENT: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_bytes_sent")
         .with_description("The number of bytes sent")
+        .build()
+});
+
+/// Requests being served right now — working *or* parked (#362).
+///
+/// On its own this is the misleading half, and it is the number a scaler would
+/// otherwise reach for: a Kafka broker holds requests open by design, so a
+/// fleet doing nothing but waiting out `max.wait.ms` fetches reports the same
+/// figure as one saturated with produce. Paired with [`REQUESTS_PARKED`] it
+/// becomes the useful one, because the difference is the requests actually
+/// making progress.
+pub(crate) static REQUESTS_IN_FLIGHT: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
+    METER
+        .i64_up_down_counter("tansu_requests_in_flight")
+        .with_description("API requests being served, whether working or parked in a long poll")
+        .build()
+});
+
+/// Requests parked in a long poll: waiting on a clock or on another client,
+/// not on this replica (#362).
+///
+/// A fetch inside `max.wait.ms` with nothing to return, and a `JoinGroup` or
+/// `SyncGroup` waiting out a rebalance window, are parked. A request waiting on
+/// the object store is **not**: that is work in progress, and it is work a
+/// second replica could be doing in parallel, which is what a scaler should be
+/// reacting to.
+///
+/// Emitted from more than one crate — the fetch poll lives in the storage
+/// engine, the group polls in the broker — so the same name arrives under two
+/// instrumentation scopes. `sum()` over it, as the documented scaler
+/// expression does across replicas anyway.
+pub(crate) static REQUESTS_PARKED: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
+    METER
+        .i64_up_down_counter("tansu_requests_parked")
+        .with_description("API requests parked in a long poll, waiting rather than working")
         .build()
 });
 

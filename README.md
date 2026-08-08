@@ -286,6 +286,16 @@ The practical consequence: **replicas are interchangeable.** One can be added or
 removed under consumer load and the groups it was serving do not notice — no cold
 owner, no DNS convergence window, no configuration to keep in step.
 
+### Autoscaling
+
+There is no scrape endpoint, and the two figures a scaler would otherwise reach
+for both lie about a broker: connection count never falls while a client stays
+attached, and requests-in-flight is inflated by long polls that are *waiting*
+rather than working. Kodansu exports both halves of the correction —
+`tansu_requests_in_flight` and `tansu_requests_parked` — and the signal is their
+difference. **[docs/autoscaling.md](docs/autoscaling.md)** has the PromQL, a KEDA
+`ScaledObject`, and the measured cold start against the client's timeout budget.
+
 ### Stopping a replica
 
 The broker holds requests open by design: `Fetch` waits out `max.wait.ms`,

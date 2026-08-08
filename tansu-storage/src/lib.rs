@@ -81,7 +81,10 @@ use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 #[cfg(feature = "dynostore")]
 use object_store::{BackoffConfig, RetryConfig};
 
-use opentelemetry::{InstrumentationScope, global, metrics::Meter};
+use opentelemetry::{
+    InstrumentationScope, global,
+    metrics::{Meter, UpDownCounter},
+};
 use opentelemetry_semantic_conventions::SCHEMA_URL;
 
 use governor::InsufficientCapacity;
@@ -2734,6 +2737,48 @@ pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {
             .build(),
     )
 });
+
+/// Requests parked in a long poll: waiting on a clock, not on this replica
+/// (#362).
+///
+/// The same instrument as `tansu-service`'s, deliberately: the two places a
+/// request parks are in two crates that do not depend on each other — the fetch
+/// poll is here, the group polls are in the broker. OpenTelemetry keys an
+/// instrument by its scope as well as its name, so both arrive and neither
+/// overwrites the other; the documented scaler expression `sum()`s over them,
+/// which it would do across replicas anyway.
+///
+/// Adding a crate dependency to share one counter is the alternative, and it is
+/// the worse trade: this crate is the storage engine and knows nothing about
+/// serving requests.
+pub(crate) static REQUESTS_PARKED: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
+    METER
+        .i64_up_down_counter("tansu_requests_parked")
+        .with_description("API requests parked in a long poll, waiting rather than working")
+        .build()
+});
+
+/// A request parked in a long poll, counted for as long as this value lives.
+///
+/// RAII, for the reason every counter of this shape is: an up-down counter that
+/// leaks an increment does not decay, so one missed decrement is a permanent
+/// lie about how loaded this replica is and a scaler built on it never scales
+/// down again.
+#[derive(Debug)]
+pub(crate) struct Parked;
+
+impl Parked {
+    pub(crate) fn enter() -> Self {
+        REQUESTS_PARKED.add(1, &[]);
+        Self
+    }
+}
+
+impl Drop for Parked {
+    fn drop(&mut self) {
+        REQUESTS_PARKED.add(-1, &[]);
+    }
+}
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ScramCredential {

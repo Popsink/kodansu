@@ -34,9 +34,29 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument, warn};
 
 use crate::{
-    BYTES_RECEIVED, BYTES_SENT, Classify, Error, REQUEST_DURATION, REQUEST_SIZE, RESPONSE_SIZE,
-    Severity, frame_length,
+    BYTES_RECEIVED, BYTES_SENT, Classify, Error, REQUEST_DURATION, REQUEST_SIZE,
+    REQUESTS_IN_FLIGHT, RESPONSE_SIZE, Severity, frame_length,
 };
+
+/// A request being served, counted for as long as this value lives (#362).
+///
+/// RAII for the reason [`crate::Parked`] is: every step between reading a frame
+/// and writing its response can return early, and a leaked increment on an
+/// up-down counter is a permanent lie rather than a blip.
+struct InFlight;
+
+impl InFlight {
+    fn enter() -> Self {
+        REQUESTS_IN_FLIGHT.add(1, &[]);
+        Self
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        REQUESTS_IN_FLIGHT.add(-1, &[]);
+    }
+}
 
 /// The address of the connected peer, put into the service [`Context`] by
 /// whoever accepted the connection.
@@ -464,6 +484,11 @@ where
     where
         R: AsyncReadExt + AsyncWriteExt + Unpin,
     {
+        // From here to the response written: the span over which this replica
+        // owes the client something, which is what "in flight" has to mean for
+        // the difference against `tansu_requests_parked` to be work (#362).
+        let _in_flight = InFlight::enter();
+
         let request = self.read(req, size).await?;
         let response = self.process(attributes, ctx, request).await?;
         self.write(req, response).await

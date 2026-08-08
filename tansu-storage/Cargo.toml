@@ -48,6 +48,11 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+
+# The scaling signal (#362) is an up-down counter, and a counter of that shape
+# fails by leaking rather than by being wrong: the test has to read it back.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+
 assert_matches.workspace = true
 criterion.workspace = true
 dotenv.workspace = true

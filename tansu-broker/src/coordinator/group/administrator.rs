@@ -91,6 +91,7 @@ use tansu_sans_io::{
     sync_group_response::SyncGroupResponse,
     to_timestamp,
 };
+use tansu_service::Parked;
 use tansu_storage::{
     AssignmentDoc, AssignmentOutcome, ConsumerGroupState, GenerationDoc, MemberDoc, MemberRef,
     OffsetCommitRequest, Storage, Topition, UpdateError, Version,
@@ -708,6 +709,11 @@ where
     /// per poll, for every member of every group this replica is serving.
     async fn waited(&self, pause: Duration, method: &'static str) -> bool {
         COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", method)]);
+
+        // Waiting on a rebalance window or on another member, not on this
+        // replica: a fleet full of these is idle, however many requests it is
+        // holding open (#362).
+        let _parked = Parked::enter();
 
         tokio::select! {
             () = sleep(pause) => true,
