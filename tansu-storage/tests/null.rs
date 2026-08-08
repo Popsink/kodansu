@@ -38,7 +38,7 @@ use tansu_sans_io::{
     txn_offset_commit_request::TxnOffsetCommitRequestTopic,
 };
 use tansu_storage::{
-    BrokerRegistrationRequest, Error, GroupDetail, NamedGroupDetail, OffsetCommitRequest,
+    BrokerRegistrationRequest, Error, GenerationDoc, NamedGroupDetail, OffsetCommitRequest,
     ScramCredential, Storage, StorageContainer, TopicId, Topition, TxnAddPartitionsRequest,
     TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
 };
@@ -264,37 +264,31 @@ async fn produce_is_accepted_and_fetch_returns_nothing() -> Result {
     Ok(())
 }
 
-/// Group state is the one thing the sink does keep, because the coordinator
-/// read-modify-writes it under a version and treats a mismatch as a lost race.
-/// A store that handed out versions it then failed to recognise would put the
-/// coordinator in a retry loop it can never leave.
+/// A group's composition is the one thing the sink does keep, because the
+/// coordinator read-modify-writes it under a version and treats a mismatch as a
+/// lost race. A store that handed out versions it then failed to recognise
+/// would put the coordinator in a retry loop it can never leave.
 #[tokio::test]
 async fn a_group_update_round_trips_its_version() -> Result {
     let _guard = init_tracing()?;
 
     let storage = null_storage().await?;
 
-    let detail = GroupDetail {
-        generation_id: 1,
+    let generation = |generation_id| GenerationDoc {
+        generation_id,
+        session_timeout_ms: 45_000,
         ..Default::default()
     };
 
     // `UpdateError` deliberately does not implement `Display`, so `?` cannot
     // convert it — every call here unwraps its own outcome.
     let first = storage
-        .update_group("g1", detail.clone(), None)
+        .update_group_generation("g1", generation(1), None)
         .await
         .expect("create");
 
     let second = storage
-        .update_group(
-            "g1",
-            GroupDetail {
-                generation_id: 2,
-                ..detail.clone()
-            },
-            Some(first.clone()),
-        )
+        .update_group_generation("g1", generation(2), Some(first.clone()))
         .await
         .expect("update");
     assert_ne!(first, second);
@@ -303,7 +297,7 @@ async fn a_group_update_round_trips_its_version() -> Result {
     // it has to come back as `Outdated` carrying what is actually stored — the
     // coordinator merges onto `current` and retries.
     match storage
-        .update_group("g1", detail.clone(), Some(first))
+        .update_group_generation("g1", generation(1), Some(first))
         .await
     {
         Err(UpdateError::Outdated { current, version }) => {

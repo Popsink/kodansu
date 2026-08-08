@@ -46,11 +46,10 @@ use tansu_sans_io::{
 };
 use tansu_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
 use tansu_storage::{
-    AssignmentDoc, AssignmentOutcome, BrokerRegistrationRequest, GenerationDoc, GroupDetail,
-    ListOffsetResponse, MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProducerIdResponse, ScramCredential, Storage, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-    Version,
+    AssignmentDoc, AssignmentOutcome, BrokerRegistrationRequest, GenerationDoc, ListOffsetResponse,
+    MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
+    ProducerIdResponse, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
 };
 use tracing::{debug, instrument};
 use url::Url;
@@ -937,16 +936,6 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
-    async fn update_group(
-        &self,
-        _group_id: &str,
-        _detail: GroupDetail,
-        _version: Option<Version>,
-    ) -> tansu_storage::Result<Version, UpdateError<GroupDetail>> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
     async fn write_group_member(
         &self,
         _group_id: &str,
@@ -984,6 +973,11 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
+    #[instrument(skip_all)]
+    async fn assert_group_schema(&self) -> tansu_storage::Result<()> {
+        unimplemented!()
+    }
+
     async fn read_group_generation(
         &self,
         _group_id: &str,

@@ -95,8 +95,9 @@ and this workspace is pinned to a stable toolchain.
 ## Conditional put
 
 Everything that makes the broker stateless is a conditional put: offset
-assignment is a create-only segment-sequence CAS, group mutation is the etag CAS
-in `update_group`, maintenance work-splitting is a per-prefix lease. `InMemory`
+assignment is a create-only segment-sequence CAS, a group's composition is the
+etag CAS in `update_group_generation` and its assignment a create-only write,
+maintenance work-splitting is a per-prefix lease. `InMemory`
 *emulates* those semantics behind a mutex; S3 implements them with
 `If-None-Match`. `tansu-storage/tests/conditional_put.rs` is the conformance
 target that pins them, and it runs against whichever store
@@ -112,7 +113,7 @@ Verified green on both `memory://` and `s3://` against minio (`object_store`
 | CAS is not a create | an invented etag, and a CAS against an absent key, are both `Precondition` — never a silent write |
 | etag stability | an unchanged object keeps its etag across repeated `head`/`get` and across unrelated writes in the same prefix, and a CAS against it still succeeds (the #111 GET-first skip depends on this) |
 | conditional read | `If-None-Match` is `NotModified` on an unchanged object and returns the body once it changes |
-| `UpdateError::Outdated` | a stale `update_group` carries the value that won and its version, which is what the coordinator re-derives from rather than retrying blindly (#157) |
+| `UpdateError::Outdated` | a stale `update_group_generation` carries the value that won and its version, which is what the coordinator re-derives from rather than retrying blindly (#157) |
 
 The whole `tansu-storage` suite — 324 tests, not just the conformance target —
 also passes on `s3://` against minio, twice in a row against an already-populated
@@ -146,9 +147,10 @@ byte-identical value than `GroupDetail` is.
 
 `just test-group-scale` drives `GROUPS × MEMBERS` consumers through the full
 KIP-394 dance across `REPLICAS` coordinators over one shared store, and asserts
-convergence, zero group-state CAS conflicts, and a per-group write budget. It is
-the exit criterion for the group-state decomposition (#359) — `cg_forward`
-proves *one* group converges, and the deployment that wedged had many.
+convergence, a formation write budget, and a **steady-state window that costs
+nothing**. It is the exit criterion for the group-state decomposition (#359) —
+`cg_forward` proves *one* group converges, and the deployment that wedged had
+many.
 
 `#[ignore]`d in the suite: it is wall clock rather than a regression gate, and
 `.github/workflows/storage.yml` runs it nightly. The size is environment-driven,
@@ -164,16 +166,35 @@ TANSU_SCALE_GROUPS=8 just test-group-scale
 | `TANSU_SCALE_MEMBERS` | 16 | the group size that never converged |
 | `TANSU_SCALE_REPLICAS` | 10 | the deployment's broker count |
 | `TANSU_SCALE_FORWARDING` | true | false runs the same consumers with no owner replica |
-| `TANSU_SCALE_PUT_BUDGET_PER_MEMBER` | 2 | group-state PUTs a group may cost |
+| `TANSU_SCALE_PUT_BUDGET_PER_MEMBER` | 6 | writes of `generation.json` a group may cost to form |
 | `TANSU_SCALE_DEADLINE_SECS` | 120 | per-member, only reached on failure |
 
-At the default size the forwarded arrangement converges 1024 members in ~5s for
-1152 group-state PUTs — 18 per 16-member group — with zero CAS conflicts. That
-is the baseline the decomposition is measured against.
+The object the budget counts is `generation.json`, and it counts **attempts**:
+a conditional PUT the store rejects on its precondition is still a request it
+charged for. `{group}.json` is not written at all any more, so counting it would
+be asserting zero of nothing.
 
-`TANSU_SCALE_FORWARDING=false` is the arrangement #360 wants to make the only
-one: every replica drives every group, no owner. **It fails today**, which is
-what the flip has to turn green.
+Measured at the default size, both arrangements converging 1024 members:
+
+| | formation attempts | landed | steady-state writes |
+|---|---|---|---|
+| `TANSU_SCALE_FORWARDING=true` | ~1100 | 1024 | 0 |
+| `TANSU_SCALE_FORWARDING=false` | ~3830 | 1024 | 0 |
+
+1024 landed writes is 64 groups × 16 members — one CAS per member, which is the
+floor for admitting them one at a time. Scattered, the members race for those
+1024 slots and are rejected ~2800 times on the way; forwarded, the owner
+serializes them in-process and almost none are. **Formation conflicts are
+budgeted rather than forbidden**: N members racing to add themselves to one
+document is a race, and the CAS is what resolves it.
+
+What is asserted as an exact zero is the *steady state*. After convergence every
+member heartbeats several times from the replica it entered through, and across
+all 64 groups that must produce no write of `generation.json` beyond the sweep's
+own stamp, no CAS conflict, and no listing of member documents. That is the
+regime a deployment lives in, and it is the property that used to require an
+owner: `TANSU_SCALE_FORWARDING=false` is the arrangement #360 wants to make the
+only one, and it now holds all three assertions.
 
 ## What is not covered
 

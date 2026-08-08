@@ -43,10 +43,10 @@ use uuid::Uuid;
 
 use crate::{
     AssignmentDoc, AssignmentOutcome, AutoTopicCreate, BrokerRegistrationRequest, GenerationDoc,
-    GroupDetail, ListOffsetResponse, MemberDoc, MetadataResponse, NamedGroupDetail,
-    OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage,
-    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    UpdateError, Version,
+    ListOffsetResponse, MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
+    OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
+    Version,
 };
 
 #[derive(Clone, Debug)]
@@ -54,16 +54,6 @@ pub struct LatencyIntroducingStorage<S> {
     storage: S,
     rng: Arc<Mutex<SmallRng>>,
     latency: Range<u64>,
-    /// Count of `update_group` calls that lost the etag CAS (returned
-    /// `UpdateError::Outdated`). Tests use this to assert that per-group
-    /// in-process serialization at the coordinator eliminates concurrent
-    /// read-modify-write contention on the single `{group}.json` object.
-    group_cas_conflicts: Arc<AtomicU64>,
-    /// Count of `update_group` calls, won or lost. This is the tier-1 PUT rate
-    /// on `{group}.json`, and it is what #111 claims a steady-state heartbeat
-    /// does not incur — a claim that was false for as long as the heartbeat skip
-    /// compared `last_contact` (#273), so a test needs to be able to see it.
-    group_updates: Arc<AtomicU64>,
     /// The decomposed layout's four cost signals (#359), each the counterpart
     /// of a claim the design makes and a test has to be able to falsify:
     ///
@@ -91,8 +81,6 @@ where
             storage,
             rng: Arc::new(Mutex::new(SmallRng::seed_from_u64(0))),
             latency: 50..150,
-            group_cas_conflicts: Arc::new(AtomicU64::new(0)),
-            group_updates: Arc::new(AtomicU64::new(0)),
             member_puts: Arc::new(AtomicU64::new(0)),
             generation_updates: Arc::new(AtomicU64::new(0)),
             generation_cas_conflicts: Arc::new(AtomicU64::new(0)),
@@ -121,20 +109,6 @@ where
     /// (#359) — the LIST no request path is supposed to issue.
     pub fn member_lists_handle(&self) -> Arc<AtomicU64> {
         self.member_lists.clone()
-    }
-
-    /// A shared handle to this store's `update_group` etag-CAS conflict
-    /// counter, cloneable before the store is moved into a coordinator so a
-    /// test can read the count after the run.
-    pub fn cas_conflicts_handle(&self) -> Arc<AtomicU64> {
-        self.group_cas_conflicts.clone()
-    }
-
-    /// A shared handle to this store's total `update_group` count — every PUT of
-    /// `{group}.json`, won or lost — cloneable before the store is moved into a
-    /// coordinator.
-    pub fn group_updates_handle(&self) -> Arc<AtomicU64> {
-        self.group_updates.clone()
     }
 
     pub fn with_seed(self, seed: u64) -> Self {
@@ -260,12 +234,6 @@ where
         self.storage.offset_stage_at(topition, isolation).await
     }
 
-    async fn read_group(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
-        self.introduce_latency().await?;
-
-        self.storage.read_group(group_id).await
-    }
-
     async fn write_group_member(
         &self,
         group_id: &str,
@@ -307,6 +275,12 @@ where
         _ = self.member_lists.fetch_add(1, Ordering::Relaxed);
 
         self.storage.list_group_members(group_id).await
+    }
+
+    async fn assert_group_schema(&self) -> Result<()> {
+        self.introduce_latency().await?;
+
+        self.storage.assert_group_schema().await
     }
 
     async fn read_group_generation(
@@ -515,23 +489,6 @@ where
         self.storage
             .describe_topic_partitions(topics, partition_limit, cursor)
             .await
-    }
-
-    async fn update_group(
-        &self,
-        group_id: &str,
-        detail: GroupDetail,
-        version: Option<Version>,
-    ) -> Result<Version, UpdateError<GroupDetail>> {
-        self.introduce_latency().await?;
-
-        _ = self.group_updates.fetch_add(1, Ordering::Relaxed);
-
-        let result = self.storage.update_group(group_id, detail, version).await;
-        if matches!(result, Err(UpdateError::Outdated { .. })) {
-            _ = self.group_cas_conflicts.fetch_add(1, Ordering::Relaxed);
-        }
-        result
     }
 
     async fn init_producer(

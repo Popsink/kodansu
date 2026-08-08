@@ -145,7 +145,10 @@ mod latency;
 mod null;
 mod service;
 
-pub use group::{AssignmentDoc, AssignmentOutcome, GenerationDoc, MemberDoc, MemberRef};
+pub use group::{
+    AssignmentDoc, AssignmentOutcome, GROUP_SCHEMA_VERSION, GenerationDoc, GroupSchema, MemberDoc,
+    MemberRef,
+};
 
 pub use latency::LatencyIntroducingStorage;
 
@@ -1390,31 +1393,10 @@ pub trait Storage: Debug + Send + Sync + 'static {
         cursor: Option<Topition>,
     ) -> Result<Vec<DescribeTopicPartitionsResponseTopic>>;
 
-    /// Conditionally update the state of a group in this storage.
-    async fn update_group(
-        &self,
-        group_id: &str,
-        detail: GroupDetail,
-        version: Option<Version>,
-    ) -> Result<Version, UpdateError<GroupDetail>>;
-
-    /// The persisted state of a group and its version, or `None` when the group
-    /// has no persisted state. Lets the coordinator detect a cross-replica change
-    /// with a cheap (tier-2) read and skip the group-state PUT when a
-    /// heartbeat/commit changed nothing persistent (#111) — while still observing
-    /// a rebalance another replica triggered, which the unconditional
-    /// [`Self::update_group`]'s `Outdated` path used to be the only source of. The
-    /// default returns `None`, so a backend that does not implement it keeps the
-    /// always-write path unchanged.
-    async fn read_group(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
-        let _ = group_id;
-        Ok(None)
-    }
-
     /// Write a member's own document, `members/{member_id}.json` (#359).
     ///
-    /// `version` is `None` to create and `Some` to CAS, as
-    /// [`Self::update_group`]. A member has one *logical* writer — itself — but
+    /// `version` is `None` to create and `Some` to CAS. A member has one
+    /// *logical* writer — itself — but
     /// that writer can have two requests in flight on two replicas at once, and
     /// the CAS is what stops the later-arriving stale one (a heartbeat carrying
     /// the subscription as it was before a join changed it) from clobbering the
@@ -1422,9 +1404,9 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ///
     /// **Required, not defaulted.** Every method here is: a default body is
     /// silently satisfied by a wrapper that forgets to delegate, which is how
-    /// [`Self::read_group`] shipped inert in every object-store deployment
-    /// (#273) — the `Ok(None)` above is the scar, kept only because callers
-    /// still depend on it.
+    /// the legacy `read_group` shipped inert in every object-store deployment
+    /// for two releases (#273) — its `Ok(None)` default was the scar, and it
+    /// went with the object it read.
     async fn write_group_member(
         &self,
         group_id: &str,
@@ -1508,6 +1490,17 @@ pub trait Storage: Debug + Send + Sync + 'static {
         group_id: &str,
         generation_id: i32,
     ) -> Result<u64>;
+
+    /// Assert that the group layout this binary writes is the one the cluster
+    /// already holds, claiming it when the cluster holds none (#359).
+    ///
+    /// Absent means a cluster that has never run a binary that cares, so the
+    /// version is claimed with a create-only write — two replicas starting
+    /// together race on the key and the loser reads what the winner claimed.
+    /// A different version is a refusal to start: see [`GroupSchema`] for why
+    /// a converter would be all cost and no benefit, and why a mixed fleet is
+    /// the hazard worth a guard rail.
+    async fn assert_group_schema(&self) -> Result<()>;
 
     /// Initialise a transactional or idempotent producer in this storage.
     async fn init_producer(
@@ -1748,19 +1741,6 @@ where
             .await
     }
 
-    async fn update_group(
-        &self,
-        group_id: &str,
-        detail: GroupDetail,
-        version: Option<Version>,
-    ) -> Result<Version, UpdateError<GroupDetail>> {
-        self.as_ref().update_group(group_id, detail, version).await
-    }
-
-    async fn read_group(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
-        self.as_ref().read_group(group_id).await
-    }
-
     async fn write_group_member(
         &self,
         group_id: &str,
@@ -1839,6 +1819,10 @@ where
         self.as_ref()
             .delete_group_assignments_before(group_id, generation_id)
             .await
+    }
+
+    async fn assert_group_schema(&self) -> Result<()> {
+        self.as_ref().assert_group_schema().await
     }
 
     async fn init_producer(
@@ -2099,19 +2083,6 @@ where
             .await
     }
 
-    async fn update_group(
-        &self,
-        group_id: &str,
-        detail: GroupDetail,
-        version: Option<Version>,
-    ) -> Result<Version, UpdateError<GroupDetail>> {
-        self.as_ref().update_group(group_id, detail, version).await
-    }
-
-    async fn read_group(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
-        self.as_ref().read_group(group_id).await
-    }
-
     async fn write_group_member(
         &self,
         group_id: &str,
@@ -2190,6 +2161,10 @@ where
         self.as_ref()
             .delete_group_assignments_before(group_id, generation_id)
             .await
+    }
+
+    async fn assert_group_schema(&self) -> Result<()> {
+        self.as_ref().assert_group_schema().await
     }
 
     async fn init_producer(

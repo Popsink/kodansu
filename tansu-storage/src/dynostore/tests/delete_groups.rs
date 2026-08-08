@@ -16,8 +16,11 @@ use object_store::memory::InMemory;
 use tansu_sans_io::ErrorCode;
 
 use crate::{
-    GroupDetail, Result, Storage,
-    dynostore::{DynoStore, tests::init_tracing},
+    GenerationDoc, Result, Storage,
+    dynostore::{
+        DynoStore,
+        tests::{init_tracing, legacy_group_exists, seed_legacy_group},
+    },
 };
 
 const CLUSTER: &str = "tansu";
@@ -65,14 +68,19 @@ fn group_prefix_refuses_ids_that_normalise_to_the_root() {
 async fn empty_group_id_deletes_nothing() -> Result<()> {
     let _guard = init_tracing()?;
 
-    let store = DynoStore::new(CLUSTER, NODE, InMemory::new());
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
+    // One of each: a group in the layout this binary writes, and a legacy
+    // leftover. The refusal must take neither.
     let bystanders = ["group-a", "group-b"];
     for group in bystanders {
         _ = store
-            .update_group(group, GroupDetail::default(), None)
+            .update_group_generation(group, GenerationDoc::default(), None)
             .await
-            .expect("seed group state");
+            .expect("seed a generation");
+
+        seed_legacy_group(&bucket, CLUSTER, group).await?;
     }
 
     let refused = ["".to_owned(), "/".to_owned(), "///".to_owned()];
@@ -92,8 +100,12 @@ async fn empty_group_id_deletes_nothing() -> Result<()> {
     // The bystanders are still there: nothing was taken with the refusal.
     for group in bystanders {
         assert!(
-            store.read_group(group).await?.is_some(),
+            store.read_group_generation(group).await?.is_some(),
             "{group} was deleted by a refused group id"
+        );
+        assert!(
+            legacy_group_exists(&bucket, CLUSTER, group).await,
+            "{group}'s legacy object was deleted by a refused group id"
         );
     }
 
@@ -105,13 +117,16 @@ async fn empty_group_id_deletes_nothing() -> Result<()> {
 async fn a_named_group_is_still_deleted() -> Result<()> {
     let _guard = init_tracing()?;
 
-    let store = DynoStore::new(CLUSTER, NODE, InMemory::new());
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     for group in ["group-a", "group-b"] {
         _ = store
-            .update_group(group, GroupDetail::default(), None)
+            .update_group_generation(group, GenerationDoc::default(), None)
             .await
-            .expect("seed group state");
+            .expect("seed a generation");
+
+        seed_legacy_group(&bucket, CLUSTER, group).await?;
     }
 
     let results = store.delete_groups(Some(&["group-a".to_owned()])).await?;
@@ -123,8 +138,14 @@ async fn a_named_group_is_still_deleted() -> Result<()> {
         "a named group must still be deletable"
     );
 
-    assert!(store.read_group("group-a").await?.is_none());
-    assert!(store.read_group("group-b").await?.is_some());
+    assert!(store.read_group_generation("group-a").await?.is_none());
+    assert!(
+        !legacy_group_exists(&bucket, CLUSTER, "group-a").await,
+        "deleting a group must take its legacy leftover with it"
+    );
+
+    assert!(store.read_group_generation("group-b").await?.is_some());
+    assert!(legacy_group_exists(&bucket, CLUSTER, "group-b").await);
 
     Ok(())
 }

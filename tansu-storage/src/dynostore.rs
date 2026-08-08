@@ -83,11 +83,12 @@ mod tests;
 
 use crate::{
     AssignmentDoc, AssignmentOutcome, AutoTopicCreate, BrokerRegistrationRequest,
-    ConsumerGroupState, Error, GenerationDoc, GroupDetail, GroupMember, GroupState,
-    ListOffsetResponse, METER, MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicDefaults, TopicId,
-    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
-    UpdateError, Version, storage_error_code,
+    ConsumerGroupState, Error, GROUP_SCHEMA_VERSION, GenerationDoc, GroupDetail, GroupMember,
+    GroupSchema, GroupState, ListOffsetResponse, METER, MemberDoc, MetadataResponse,
+    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
+    ScramCredential, Storage, TopicDefaults, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    storage_error_code,
 };
 
 const APPLICATION_JSON: &str = "application/json";
@@ -9926,10 +9927,11 @@ impl Storage for DynoStore {
     /// Every group in the cluster, optionally filtered by state.
     ///
     /// A group is whatever owns something under the consumer root: a `{group}/`
-    /// common prefix — its committed offsets, and since #359 its member
-    /// documents and generation — or a legacy `{group}.json` state object. Both
-    /// are collected, which fixes a group that has state but has never
-    /// committed an offset being omitted from its own cluster's listing.
+    /// common prefix — its committed offsets, its member documents and its
+    /// generation — or a legacy `{group}.json` state object, which after the
+    /// #359 cutover is an inert leftover that expiry reaps on its own. Both are
+    /// collected, which fixes a group that has state but has never committed an
+    /// offset being omitted from its own cluster's listing.
     ///
     /// `states_filter` costs a read fan-out, because that is what the filter
     /// means: the state is derived per group, and deriving it is reading the
@@ -9981,24 +9983,17 @@ impl Storage for DynoStore {
 
         Ok(
             futures::stream::iter(group_ids.into_iter().map(|group_id| async move {
+                // `Unknown` covers three things a caller cannot act on
+                // differently: a group that went away between the listing and
+                // now, one this replica could not read, and a legacy
+                // `{group}.json` left behind by the cutover, which owns a
+                // listed name and nothing this binary can describe.
                 let state = self
                     .group_view(&group_id)
                     .await
                     .inspect_err(|err| debug!(?err, group_id))
                     .ok()
                     .flatten();
-
-                let state = match state {
-                    Some(detail) => Some(detail),
-                    // Still in the legacy layout, or gone between the listing
-                    // and now.
-                    None => self
-                        .read_group(&group_id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .map(|(d, _)| d),
-                };
 
                 let state = state.as_ref().map_or_else(
                     || String::from("Unknown"),
@@ -10136,106 +10131,41 @@ impl Storage for DynoStore {
 
         Ok(
             futures::stream::iter(group_ids.iter().cloned().map(|group_id| async move {
-                // The decomposed layout first (#359), the legacy state object
-                // only when the group has no `generation.json`. Before the
-                // cutover that is every group, so this is one extra 404 per
-                // described group; after it, the legacy read is what never
-                // happens.
                 match self.group_view(&group_id).await {
-                    Ok(Some(group_detail)) => {
-                        return NamedGroupDetail::found(group_id, group_detail);
-                    }
+                    Ok(Some(group_detail)) => NamedGroupDetail::found(group_id, group_detail),
 
-                    Ok(None) => {}
+                    // No `generation.json` means the group does not exist,
+                    // which is a fact and is reported as an empty group. A
+                    // legacy `{group}.json` left behind by the cutover is not
+                    // consulted: it describes a membership that a quiesce made
+                    // vacuous, and reading it would put a 404 on the describe
+                    // path of every group in the cluster, forever, to answer
+                    // with something less true than "empty".
+                    Ok(None) => NamedGroupDetail::found(group_id, GroupDetail::default()),
 
-                    // Same reasoning as the legacy arm below: not knowing is
-                    // not the same as empty, and it is retriable.
-                    Err(err) => {
-                        error!(?err, group_id, "could not compose the group view");
+                    // Not knowing is not the same as empty, and it is
+                    // retriable. Answering `GroupDetail::default()` here made a
+                    // throttle or a 5xx report a live group as empty — the same
+                    // shape as #214, where an unresolvable topic was reported
+                    // absent and clients could not tell it from a deleted one.
+                    Err(error) => {
+                        error!(?error, group_id, "could not compose the group view");
 
-                        return NamedGroupDetail::error_code(
+                        NamedGroupDetail::error_code(
                             group_id,
-                            ErrorCode::CoordinatorLoadInProgress,
-                        );
+                            if matches!(error, Error::ObjectStore(_)) {
+                                ErrorCode::CoordinatorLoadInProgress
+                            } else {
+                                ErrorCode::UnknownServerError
+                            },
+                        )
                     }
-                }
-
-                let location = Path::from(format!(
-                    "clusters/{}/groups/consumers/{}.json",
-                    self.cluster, group_id,
-                ));
-
-                match self
-                    .get::<GroupDetail>(&location)
-                    .await
-                    .inspect(|o| debug!(?o, group_id))
-                    .inspect_err(|err| error!(?err, group_id))
-                {
-                    Ok((group_detail, _)) => NamedGroupDetail::found(group_id, group_detail),
-
-                    // Absent means the group does not exist, which is a fact and is
-                    // reported as an empty group.
-                    Err(Error::ObjectStore(error))
-                        if matches!(error.as_ref(), object_store::Error::NotFound { .. }) =>
-                    {
-                        NamedGroupDetail::found(group_id, GroupDetail::default())
-                    }
-
-                    // Any other store error means we do not know. This used to
-                    // answer with `GroupDetail::default()` too, so a throttle or a
-                    // 5xx made a live group with members report as empty — the same
-                    // shape as #214, where an unresolvable topic was reported absent
-                    // and clients could not tell it from a deleted one. Retriable is
-                    // both true and actionable.
-                    Err(Error::ObjectStore(_)) => {
-                        NamedGroupDetail::error_code(group_id, ErrorCode::CoordinatorLoadInProgress)
-                    }
-
-                    Err(_) => NamedGroupDetail::error_code(group_id, ErrorCode::UnknownServerError),
                 }
             }))
             .buffered(DESCRIBE_CONCURRENCY)
             .collect::<Vec<_>>()
             .await,
         )
-    }
-
-    async fn update_group(
-        &self,
-        group_id: &str,
-        detail: GroupDetail,
-        version: Option<Version>,
-    ) -> Result<Version, UpdateError<GroupDetail>> {
-        let location = Path::from(format!(
-            "clusters/{}/groups/consumers/{}.json",
-            self.cluster, group_id,
-        ));
-
-        self.put(
-            &location,
-            detail,
-            json_content_type(),
-            version.map(Into::into),
-        )
-        .await
-        .map(Into::into)
-    }
-
-    async fn read_group(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
-        let location = Path::from(format!(
-            "clusters/{}/groups/consumers/{}.json",
-            self.cluster, group_id,
-        ));
-
-        match self.get::<GroupDetail>(&location).await {
-            Ok(pair) => Ok(Some(pair)),
-            Err(Error::ObjectStore(error))
-                if matches!(error.as_ref(), object_store::Error::NotFound { .. }) =>
-            {
-                Ok(None)
-            }
-            Err(error) => Err(error),
-        }
     }
 
     async fn write_group_member(
@@ -10438,6 +10368,78 @@ impl Storage for DynoStore {
         debug!(group_id, generation_id, ?deleted);
 
         Ok(deleted.len() as u64)
+    }
+
+    async fn assert_group_schema(&self) -> Result<()> {
+        let location = Path::from(format!("clusters/{}/schema/groups.json", self.cluster));
+
+        let refuse = |found: u32| {
+            error!(
+                cluster = self.cluster,
+                found,
+                expected = GROUP_SCHEMA_VERSION,
+                "refusing to start: this cluster's consumer groups are in a layout \
+                 this binary does not write (#359)"
+            );
+
+            Err(Error::Message(format!(
+                "cluster {} holds consumer groups in layout version {found}, \
+                 but this binary writes version {GROUP_SCHEMA_VERSION}",
+                self.cluster,
+            )))
+        };
+
+        match self.get::<GroupSchema>(&location).await {
+            Ok((schema, _)) if schema.version == GROUP_SCHEMA_VERSION => Ok(()),
+
+            Ok((schema, _)) => refuse(schema.version),
+
+            Err(Error::ObjectStore(error))
+                if matches!(error.as_ref(), object_store::Error::NotFound { .. }) =>
+            {
+                // Create-only, so two replicas starting together cannot both
+                // claim it: the loser is handed what the winner wrote and
+                // checks that instead.
+                match self
+                    .put(
+                        &location,
+                        GroupSchema {
+                            version: GROUP_SCHEMA_VERSION,
+                        },
+                        json_content_type(),
+                        None,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        info!(
+                            cluster = self.cluster,
+                            version = GROUP_SCHEMA_VERSION,
+                            "claimed the consumer group layout for this cluster (#359)"
+                        );
+
+                        Ok(())
+                    }
+
+                    Err(UpdateError::Outdated { current, .. })
+                        if current.version == GROUP_SCHEMA_VERSION =>
+                    {
+                        Ok(())
+                    }
+
+                    Err(UpdateError::Outdated { current, .. }) => refuse(current.version),
+
+                    Err(UpdateError::Error(error)) => Err(error),
+                    Err(UpdateError::SerdeJson(error)) => Err(Error::SerdeJson(error)),
+                    Err(UpdateError::Uuid(error)) => Err(Error::Uuid(error)),
+                    Err(UpdateError::MissingEtag) => Err(Error::Message(String::from(
+                        "group schema claim reported a missing etag",
+                    ))),
+                }
+            }
+
+            Err(error) => Err(error),
+        }
     }
 
     async fn init_producer(

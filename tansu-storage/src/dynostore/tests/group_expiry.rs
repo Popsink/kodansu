@@ -26,8 +26,11 @@ use object_store::{
 use tansu_sans_io::{ErrorCode, create_topics_request::CreatableTopic};
 
 use crate::{
-    GenerationDoc, GroupDetail, MemberDoc, OffsetCommitRequest, Result, Storage, Topition,
-    dynostore::{DynoStore, tests::init_tracing},
+    GenerationDoc, MemberDoc, OffsetCommitRequest, Result, Storage, Topition,
+    dynostore::{
+        DynoStore,
+        tests::{init_tracing, legacy_group_exists, seed_legacy_group},
+    },
 };
 
 const CLUSTER: &str = "tansu";
@@ -40,13 +43,11 @@ const NODE: i32 = 111;
 async fn expires_only_stale_groups() -> Result<()> {
     let _guard = init_tracing()?;
 
-    let store = DynoStore::new(CLUSTER, NODE, InMemory::new());
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     for group in ["group-a", "group-b"] {
-        _ = store
-            .update_group(group, GroupDetail::default(), None)
-            .await
-            .expect("seed group state");
+        seed_legacy_group(&bucket, CLUSTER, group).await?;
     }
 
     let now = SystemTime::now();
@@ -60,42 +61,6 @@ async fn expires_only_stale_groups() -> Result<()> {
 
     // They were actually removed: a second sweep finds nothing to expire.
     assert_eq!(0, store.expire_groups(later).await?);
-
-    Ok(())
-}
-
-/// `read_group` returns the persisted group detail and the **same version**
-/// `update_group` last returned, and `None` for an absent group (#111). The
-/// coordinator's GET-first heartbeat/commit path relies on this version
-/// matching: it is how a stale replica is detected (version differs → refresh)
-/// and how a no-op is recognised (version equal + detail unchanged → skip the
-/// PUT).
-#[tokio::test]
-async fn read_group_returns_persisted_detail_and_matching_version() -> Result<()> {
-    let _guard = init_tracing()?;
-
-    let store = DynoStore::new(CLUSTER, NODE, InMemory::new());
-
-    // Absent group → None (not a default-valued Some).
-    assert!(store.read_group("absent").await?.is_none());
-
-    // Seed a group with a distinctive field.
-    let detail = GroupDetail {
-        generation_id: 7,
-        ..GroupDetail::default()
-    };
-    let written = store
-        .update_group("group-a", detail.clone(), None)
-        .await
-        .expect("seed group state");
-
-    // read_group round-trips the detail and returns the version update_group gave.
-    let (read_detail, read_version) = store.read_group("group-a").await?.expect("group present");
-    assert_eq!(detail, read_detail);
-    assert_eq!(
-        written, read_version,
-        "read_group version must equal the one update_group returned"
-    );
 
     Ok(())
 }
@@ -248,7 +213,12 @@ where
 
 /// Seed a group with a committed offset, so it has both a state object and an
 /// offsets subtree.
-async fn seed_committing_group(store: &DynoStore, group: &str, topic: &str) -> Result<()> {
+async fn seed_committing_group(
+    store: &DynoStore,
+    bucket: &InMemory,
+    group: &str,
+    topic: &str,
+) -> Result<()> {
     _ = store
         .create_topic(
             CreatableTopic::default()
@@ -261,10 +231,7 @@ async fn seed_committing_group(store: &DynoStore, group: &str, topic: &str) -> R
         )
         .await?;
 
-    _ = store
-        .update_group(group, GroupDetail::default(), None)
-        .await
-        .expect("seed group state");
+    seed_legacy_group(bucket, CLUSTER, group).await?;
 
     let committed = store
         .offset_commit(
@@ -307,7 +274,7 @@ async fn a_group_that_only_commits_offsets_survives() -> Result<()> {
         },
     );
 
-    seed_committing_group(&store, "group-committing", "committed-topic").await?;
+    seed_committing_group(&store, &bucket, "group-committing", "committed-topic").await?;
 
     // The state object reads as 8 days old, the committed offsets as current.
     // Before the fix the first fact decided and the offsets went with it.
@@ -319,7 +286,7 @@ async fn a_group_that_only_commits_offsets_survives() -> Result<()> {
 
     // And it really is intact — both halves.
     assert!(
-        store.read_group("group-committing").await?.is_some(),
+        legacy_group_exists(&bucket, CLUSTER, "group-committing").await,
         "the group state must survive",
     );
     assert_eq!(
@@ -356,10 +323,7 @@ async fn an_abandoned_group_is_still_reclaimed() -> Result<()> {
     );
 
     // State object only: no commits, so no offsets subtree to vouch for it.
-    _ = store
-        .update_group("group-abandoned", GroupDetail::default(), None)
-        .await
-        .expect("seed group state");
+    seed_legacy_group(&bucket, CLUSTER, "group-abandoned").await?;
 
     assert_eq!(
         1,
@@ -367,7 +331,7 @@ async fn an_abandoned_group_is_still_reclaimed() -> Result<()> {
         "a group with no committed-offset activity is still reclaimed",
     );
 
-    assert!(store.read_group("group-abandoned").await?.is_none());
+    assert!(!legacy_group_exists(&bucket, CLUSTER, "group-abandoned").await);
 
     Ok(())
 }
@@ -384,11 +348,12 @@ async fn an_abandoned_group_is_still_reclaimed() -> Result<()> {
 async fn a_group_with_no_state_object_is_still_reclaimed() -> Result<()> {
     let _guard = init_tracing()?;
 
+    let bucket = InMemory::new();
     let store = DynoStore::new(
         CLUSTER,
         NODE,
         Backdate {
-            inner: InMemory::new(),
+            inner: bucket.clone(),
             age: Duration::from_secs(8 * 24 * 60 * 60),
             aged: Aged::Group {
                 group: "group-decomposed",
@@ -423,7 +388,10 @@ async fn a_group_with_no_state_object_is_still_reclaimed() -> Result<()> {
         .await
         .expect("seed generation");
 
-    assert!(store.read_group("group-decomposed").await?.is_none());
+    assert!(
+        !legacy_group_exists(&bucket, CLUSTER, "group-decomposed").await,
+        "this group was never in the legacy layout",
+    );
 
     assert_eq!(
         1,

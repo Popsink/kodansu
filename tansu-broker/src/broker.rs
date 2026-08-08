@@ -364,6 +364,14 @@ where
     }
 
     pub async fn serve(&mut self, started: Instant) -> Result<()> {
+        // Before anything is registered or served: this binary writes the
+        // decomposed consumer group layout (#359), and a cluster holding
+        // another one must stop it rather than have both written into it. See
+        // `tansu_storage::GroupSchema` for why this is an assertion and never
+        // a converter, and `docs/migration-groups.md` for the cutover it
+        // guards.
+        self.storage.assert_group_schema().await?;
+
         self.register().await?;
         self.listen(started).await
     }
