@@ -28,7 +28,7 @@ use tansu_sans_io::{
 use tokio::time::{Duration, Instant, sleep};
 use tracing::{debug, error, instrument};
 
-use crate::{Error, Result, Storage, Topition};
+use crate::{Error, Parked, Result, Storage, Topition};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`FetchRequest`] returning [`FetchResponse`].
 /// ```
@@ -431,7 +431,14 @@ impl FetchService {
                 }
             }
 
-            sleep(remaining / 2).await;
+            {
+                // Waiting out `max.wait.ms` with nothing to return: the single
+                // biggest reason requests-in-flight is a poor load proxy for a
+                // broker, and what a fleet of idle consumers is made of (#362).
+                let _parked = Parked::enter();
+
+                sleep(remaining / 2).await;
+            }
 
             iteration += 1;
         }

@@ -3906,6 +3906,7 @@ dependencies = [
  "object_store",
  "opentelemetry",
  "opentelemetry-semantic-conventions",
+ "opentelemetry_sdk",
  "pretty_assertions",
  "rama",
  "rand 0.10.1",
