@@ -55,7 +55,10 @@ use object_store::{
     memory::InMemory,
     path::Path,
 };
-use tansu_storage::{GroupDetail, GroupState, Storage, StorageContainer, UpdateError, Version};
+use tansu_storage::{
+    AssignmentDoc, AssignmentOutcome, GenerationDoc, GroupDetail, GroupState, MemberDoc, Storage,
+    StorageContainer, UpdateError, Version,
+};
 use url::Url;
 use uuid::Uuid;
 
@@ -626,6 +629,228 @@ async fn a_version_the_store_never_issued_is_refused() -> Result<(), Error> {
         Err(UpdateError::Outdated { current, .. }) => assert_eq!(group_detail(1), *current),
 
         otherwise => panic!("an invented version must not write, got {otherwise:?}"),
+    }
+
+    Ok(())
+}
+
+/// A group whose id no other test — and no other run against the same bucket —
+/// uses. The decomposed objects (#359) are per-group, so a fresh id is what
+/// isolates a run; `update_group`'s tests above can use fixed ids only because
+/// they overwrite one object.
+fn group(test: &str) -> String {
+    format!("conformance-{test}-{}", Uuid::now_v7())
+}
+
+fn member_doc(seq: u64) -> MemberDoc {
+    MemberDoc {
+        seq,
+        last_contact_ms: 1_000,
+        session_timeout_ms: 45_000,
+        ..Default::default()
+    }
+}
+
+fn generation_doc(generation_id: i32) -> GenerationDoc {
+    GenerationDoc {
+        generation_id,
+        session_timeout_ms: 45_000,
+        ..Default::default()
+    }
+}
+
+fn assignment_doc(leader: &str) -> AssignmentDoc {
+    AssignmentDoc {
+        generation_id: 7,
+        leader: leader.into(),
+        protocol_type: "consumer".into(),
+        protocol_name: "range".into(),
+        assignments: BTreeMap::from([(leader.to_owned(), Bytes::from_static(&[1, 2]))]),
+        assigned_at_ms: 9,
+    }
+}
+
+/// The generation CAS is the one contended write left after the decomposition
+/// (#359), and the coordinator's retry loop is written against the same contract
+/// `update_group` has: a loser is `Outdated` and it carries the document that
+/// won, so the retry re-applies its change to that rather than to what it read.
+#[tokio::test]
+async fn a_stale_generation_update_is_outdated_carrying_the_current_value() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = engine().await?;
+    let group = group("generation");
+
+    let first = storage
+        .update_group_generation(&group, generation_doc(0), None)
+        .await
+        .map_err(|error| Error::Message(format!("{error:?}")))?;
+
+    let second = storage
+        .update_group_generation(&group, generation_doc(1), Some(first.clone()))
+        .await
+        .map_err(|error| Error::Message(format!("{error:?}")))?;
+
+    match storage
+        .update_group_generation(&group, generation_doc(2), Some(first))
+        .await
+    {
+        Err(UpdateError::Outdated { current, version }) => {
+            assert_eq!(generation_doc(1), *current);
+            assert_eq!(second, version);
+        }
+
+        otherwise => panic!("a stale generation CAS must be Outdated, got {otherwise:?}"),
+    }
+
+    Ok(())
+}
+
+/// The assignment is create-only, so N writers racing for one generation's
+/// assignment produce one winner and N-1 adoptions — never an overwrite.
+///
+/// This is the write that liveness churn used to starve. It is asserted against
+/// the real store because the whole point is that it no longer depends on an
+/// etag: `InMemory` serialises puts behind a mutex, while S3 resolves this with
+/// `If-None-Match: *`, and only one of those is what production runs.
+#[tokio::test]
+async fn concurrent_assignment_creation_admits_exactly_one_writer() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = engine().await?;
+    let group = group("assignment");
+
+    let outcomes = (0..WRITERS)
+        .map(|writer| {
+            let storage = storage.clone();
+            let group = group.clone();
+            let assignment = assignment_doc(&format!("m-{writer}"));
+
+            async move { storage.create_group_assignment(&group, 7, assignment).await }
+        })
+        .collect::<FuturesUnordered<_>>()
+        .collect::<Vec<_>>()
+        .await;
+
+    let created = outcomes
+        .iter()
+        .filter(|outcome| matches!(outcome, Ok(AssignmentOutcome::Created(_))))
+        .count();
+
+    assert_eq!(1, created, "exactly one create must win: {outcomes:?}");
+
+    let persisted = storage
+        .read_group_assignment(&group, 7)
+        .await?
+        .expect("the winner's assignment is readable");
+
+    for outcome in &outcomes {
+        match outcome {
+            Ok(AssignmentOutcome::Created(_)) => {}
+
+            // The loser is handed what is stored, and adopting it is what makes
+            // a retried `SyncGroup` idempotent: a member's slice must come from
+            // the assignment that won, never from the one this call proposed.
+            Ok(AssignmentOutcome::AlreadyExists(current)) => assert_eq!(persisted, **current),
+
+            otherwise => panic!("a losing create must adopt, got {otherwise:?}"),
+        }
+    }
+
+    Ok(())
+}
+
+/// The ABA property `MemberDoc::seq` exists for, asserted against the store that
+/// makes it necessary.
+///
+/// On S3 an etag is the body's MD5, so a rewrite that reproduces an earlier body
+/// reproduces its etag — and a version that *should* have been spent by that
+/// rewrite would write again. A member renewing liveness twice within the same
+/// millisecond, or on a clock that stepped backwards, reproduces the body; the
+/// counter is what makes each rewrite a distinct object, and so makes a spent
+/// version stay spent on every store.
+#[tokio::test]
+async fn a_spent_member_version_stays_spent_across_a_liveness_rewrite() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = engine().await?;
+    let group = group("member");
+
+    let first = storage
+        .write_group_member(&group, "m-1", member_doc(0), None)
+        .await
+        .map_err(|error| Error::Message(format!("{error:?}")))?;
+
+    // Same content, one millisecond apart or not — only `seq` differs, which is
+    // the whole of the guarantee being asserted.
+    let renewed = member_doc(0).bumped();
+    assert_eq!(member_doc(1), renewed);
+
+    let second = storage
+        .write_group_member(&group, "m-1", renewed.clone(), Some(first.clone()))
+        .await
+        .map_err(|error| Error::Message(format!("{error:?}")))?;
+
+    match storage
+        .write_group_member(&group, "m-1", member_doc(2), Some(first))
+        .await
+    {
+        Err(UpdateError::Outdated { current, version }) => {
+            assert_eq!(renewed, *current);
+            assert_eq!(second, version);
+        }
+
+        otherwise => panic!("a spent member version must be Outdated, got {otherwise:?}"),
+    }
+
+    Ok(())
+}
+
+/// Two replicas racing to birth the same group: `update_group_generation` with
+/// no version is a create, so one wins and every loser is told the generation
+/// that won — the property the first-in leader election rests on.
+#[tokio::test]
+async fn concurrent_generation_creation_admits_exactly_one_writer() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = engine().await?;
+    let group = group("generation-create");
+
+    let outcomes = (0..WRITERS)
+        .map(|writer| {
+            let storage = storage.clone();
+            let group = group.clone();
+            let generation = GenerationDoc {
+                leader: Some(format!("m-{writer}")),
+                ..generation_doc(0)
+            };
+
+            async move {
+                storage
+                    .update_group_generation(&group, generation, None)
+                    .await
+            }
+        })
+        .collect::<FuturesUnordered<_>>()
+        .collect::<Vec<_>>()
+        .await;
+
+    let won = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+    assert_eq!(1, won, "exactly one create must win: {outcomes:?}");
+
+    let (persisted, _) = storage
+        .read_group_generation(&group)
+        .await?
+        .expect("the winner's generation is readable");
+
+    for outcome in &outcomes {
+        match outcome {
+            Ok(_) => {}
+
+            Err(UpdateError::Outdated { current, .. }) => assert_eq!(persisted, **current),
+
+            otherwise => panic!("a losing create must be Outdated, got {otherwise:?}"),
+        }
     }
 
     Ok(())
