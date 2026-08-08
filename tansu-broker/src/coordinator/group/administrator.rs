@@ -41,15 +41,17 @@
 //!   running it concurrently reach identical conclusions and cost one sweep per
 //!   group per session/2 *globally*.
 //!
-//! The per-group in-process lock survives as an optimisation only: it narrows
-//! the window in which two members served by the same replica race on
-//! `generation.json`. The CAS is the correctness mechanism, and every path is
-//! written to be correct without the lock — which is what lets #360 delete
-//! forwarding.
+//! A [`Controller`] holds **no per-group state at all** (#360). There is no
+//! cache to warm, no lock keyed by a client-chosen name, and nothing to sweep,
+//! so every replica is interchangeable: one can be added or removed under load
+//! and the groups it was serving do not notice. That is the whole of what group
+//! forwarding — a deterministic owner replica, discovered over headless-Service
+//! DNS, reachable on a second listener — existed to buy, and it is why that
+//! machinery could be deleted rather than reconfigured.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
-    fmt::Debug,
+    fmt::{self, Debug},
     hash::Hash,
     ops::{Deref, Div as _, Mul},
     sync::{Arc, LazyLock, Mutex},
@@ -58,11 +60,9 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use cached::stores::ExpiringSizedCache;
 use futures::StreamExt as _;
-use opentelemetry::{
-    KeyValue,
-    metrics::{Counter, Gauge},
-};
+use opentelemetry::{KeyValue, metrics::Counter};
 use rand::{prelude::*, rng};
 use tansu_sans_io::{
     Body, ErrorCode,
@@ -409,39 +409,6 @@ static REBALANCE_STALLS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
-/// Per-group state evicted from this replica's in-process maps (#283) — the
-/// numerator whose growth against `tansu_group_coordinator_cached` says whether
-/// the sweep is keeping up with group churn.
-static GROUPS_EVICTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("tansu_group_coordinator_evicted")
-        .with_description("groups whose process-local coordinator state was evicted when idle")
-        .build()
-});
-
-/// Groups whose state this replica still holds in memory after a sweep (#283).
-///
-/// A counter cannot answer the question this exists for: the maps grew
-/// monotonically, so what matters is whether the *level* is flat under churn, not
-/// how many entries were ever made. Unlabelled — thousands of groups, so a
-/// `group` label would be unbounded cardinality.
-static GROUPS_CACHED: LazyLock<Gauge<u64>> = LazyLock::new(|| {
-    METER
-        .u64_gauge("tansu_group_coordinator_cached")
-        .with_description("groups held in this replica's process-local coordinator maps")
-        .build()
-});
-
-/// How long a group must go unserved before its process-local coordinator state
-/// is evicted (#283).
-///
-/// Comfortably above every window a *live* group can be quiet for — the session
-/// timeout, the rebalance timeout, the join long-poll — because the cost of
-/// being wrong in that direction is not a stale answer (nothing evicted here is
-/// authority) but a pointlessly re-created lock on a busy group. Well below the
-/// pod lifetime, which is the window the growth was previously bounded by.
-pub const GROUP_STATE_IDLE_AFTER: Duration = Duration::from_mins(30);
-
 /// Floor for [`stall_after`] — the threshold used when a group declares no
 /// rebalance timeout of its own, and the minimum applied to one that declares
 /// an implausibly short value (#240).
@@ -454,6 +421,16 @@ pub const GROUP_STATE_IDLE_AFTER: Duration = Duration::from_mins(30);
 /// observed tail with margin and is still three orders of magnitude below the
 /// hours the incident ran.
 const REBALANCE_STALL_FLOOR: Duration = Duration::from_secs(120);
+
+/// How often one stalled group may be logged (#240/#360).
+///
+/// The dedup used to be "once per episode, cleared when the group recovers",
+/// held in a map a periodic sweep emptied. Nothing sweeps anything now, so the
+/// memo expires instead — and an hour is the interval that makes that a better
+/// signal rather than merely a cheaper one: the incident this detector exists
+/// for ran for *hours*, and a line emitted once and never again is one an
+/// operator who came on shift after it can never see.
+const REBALANCE_STALL_REPORT_EVERY: Duration = Duration::from_hours(1);
 
 /// How long a group may sit in `CompletingRebalance` before it is reported
 /// (#240).
@@ -627,60 +604,28 @@ fn set_error_code(body: Body, error_code: ErrorCode) -> Body {
     }
 }
 
-/// Per-group in-process serialization of the generation-CAS window, kept as an
-/// **optimisation only** (#359).
-///
-/// It used to be a correctness compensation: all of a group's members were
-/// forwarded to one replica, and without in-process serialization their
-/// read-modify-write cycles against the single `{group}.json` interleaved and
-/// thrashed the etag CAS. Now the contended object changes only when the
-/// group's composition does, and every path is written to be correct under
-/// concurrent replicas — the CAS is the sole correctness mechanism — so this
-/// only narrows the window in which two members served by the *same* replica
-/// collide. It is released before every long-poll sleep, so a held leader never
-/// blocks the members it is waiting for.
-///
-/// The map is keyed by group id, so it grows with the set of groups this replica
-/// has *ever* served rather than the set it currently serves — a
-/// group-per-restart or group-per-subscription naming pattern grew it without
-/// bound. Swept by [`Controller::prune`] (#283); an entry whose `Arc` the map is
-/// not the sole holder of is left alone, see there.
-type GroupLocks = Arc<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>>;
-
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Controller<O> {
     storage: O,
 
-    /// See [`GroupLocks`].
-    generation_locks: GroupLocks,
-
     /// Which groups this replica has already logged a stalled rebalance for
-    /// (#240).
+    /// (#240) — the one thing in this struct keyed by a group id, and the
+    /// reason it is a self-expiring cache rather than a map.
     ///
-    /// Only the *dedup* is in memory now. When the episode started is
+    /// Only the *dedup* is in memory. When the episode started is
     /// `GenerationDoc::state_since_ms`, persisted with the group, so a restart
     /// no longer starts a blind window at exactly the moment a wedge is most
     /// likely to have been created: a fresh `Controller` reports a group that
     /// has been stuck for an hour immediately, where it used to wait out the
     /// threshold again before saying anything.
-    rebalance_stalls: Arc<Mutex<BTreeMap<String, bool>>>,
-
-    /// When each group was last served by this replica — the touch stamp
-    /// [`Self::prune`] evicts on (#283).
     ///
-    /// Written by [`Self::group_lock`], which every request path calls *before*
-    /// it touches any other map. That ordering is what makes the sweep
-    /// leak-free: see [`Self::prune_idle_groups`].
-    ///
-    /// On the MONOTONIC clock: nothing here is persisted or compared against a
-    /// stored timestamp, and a backwards NTP step would otherwise make
-    /// `elapsed()` fail and freeze the sweep (#256).
-    last_seen: Arc<Mutex<BTreeMap<String, Instant>>>,
-
-    /// How long a group must go unserved before [`Self::prune`] evicts its
-    /// state (#283). Lowered in tests so the sweep can be exercised without
-    /// waiting one out.
-    idle_after: Duration,
+    /// It expires rather than being swept, which is what let the sweep go with
+    /// forwarding (#360): a map keyed by a client-chosen name and emptied by a
+    /// periodic pass is state a replica has to be *kept alive* to maintain.
+    /// Expiring also makes a long incident louder in the right way — a group
+    /// stuck for hours is reported once an hour rather than once ever, so an
+    /// operator who missed the first line still sees one.
+    rebalance_stalls: Arc<Mutex<ExpiringSizedCache<String, ()>>>,
 
     /// Where a request's wall-clock reading comes from (#359).
     ///
@@ -700,6 +645,15 @@ pub struct Controller<O> {
     now: fn() -> SystemTime,
 }
 
+/// Hand-written because the stall memo is a cache without a `Debug` impl, and
+/// because there is nothing here worth printing: a `Controller` is its storage
+/// handle and a clock.
+impl<O> Debug for Controller<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Controller").finish_non_exhaustive()
+    }
+}
+
 impl<O> Controller<O>
 where
     O: Storage + Clone,
@@ -707,18 +661,11 @@ where
     pub fn with_storage(storage: O) -> Result<Self> {
         Ok(Self {
             storage,
-            generation_locks: Arc::new(Mutex::new(BTreeMap::new())),
-            rebalance_stalls: Arc::new(Mutex::new(BTreeMap::new())),
-            last_seen: Arc::new(Mutex::new(BTreeMap::new())),
-            idle_after: GROUP_STATE_IDLE_AFTER,
+            rebalance_stalls: Arc::new(Mutex::new(ExpiringSizedCache::new(
+                REBALANCE_STALL_REPORT_EVERY,
+            ))),
             now: SystemTime::now,
         })
-    }
-
-    /// Override the idle window before [`Self::prune`] evicts a group's state
-    /// (#283). Tests set it to zero to sweep without waiting.
-    pub fn with_idle_after(self, idle_after: Duration) -> Self {
-        Self { idle_after, ..self }
     }
 
     /// Override where a request's wall-clock reading comes from (#359). See
@@ -727,149 +674,21 @@ where
         Self { now, ..self }
     }
 
-    /// The serialization lock for `group_id`, created on first use. See
-    /// [`GroupLocks`]. Callers hold the returned guard across a single
-    /// read->CAS window and drop it before any long-poll / rebalance sleep.
-    ///
-    /// Also the single touch point for [`Self::last_seen`] (#283). Every request
-    /// path calls this first, so one stamp here covers the sweep — and covers it
-    /// from *before* any work begins, which is what [`Self::prune_idle_groups`]
-    /// relies on.
-    fn group_lock(&self, group_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        if let Ok(mut last_seen) = self.last_seen.lock() {
-            _ = last_seen.insert(group_id.to_owned(), Instant::now());
-        }
-
-        self.generation_locks
-            .lock()
-            .expect("generation_locks mutex poisoned")
-            .entry(group_id.to_owned())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-    }
-
-    /// The body of [`Coordinator::prune`] for this controller (#283).
-    ///
-    /// The maps swept here are keyed by a client-controlled string and had no
-    /// removal path at all — not even when the group was deleted from the
-    /// object store — so a group-per-restart or group-per-subscription naming
-    /// pattern grew them for the life of the pod. The expensive one, the map of
-    /// per-group `Wrapper`s holding every member's metadata blob, is gone
-    /// entirely with #359: state is composed per request and never held.
-    ///
-    /// **Idle-triggered rather than delete-triggered**, which is a deliberate
-    /// choice and not an approximation of one. The two events the issue names —
-    /// `DeleteGroups` and group expiry — both happen inside the storage engine,
-    /// which has no handle on the broker's coordinator, so wiring either as a
-    /// callback would invert the layering. Idleness needs no such handle and
-    /// covers strictly more: a group nobody deleted and nothing expired, because
-    /// its committed offsets are still there, but whose consumers are gone for
-    /// good, is the shape the observed naming patterns actually produce.
-    ///
-    /// **Safe because none of this is authority.** Nothing evicted here can
-    /// change an answer: a request composes its [`GroupView`] from the store.
-    ///
-    /// **`generation_locks` is the exception, and needs the `Arc` count.**
-    /// Dropping a lock another task holds does not free it — it means the *next*
-    /// request creates a second lock for the same group, and two members then
-    /// run their read->CAS windows concurrently, which is the collision the lock
-    /// exists to narrow. `Arc::strong_count == 1` rules that out: the map is the
-    /// only holder, so no request is between [`Self::group_lock`] and its end.
-    ///
-    /// That check is also what makes the sweep **leak-free**: since the stamp is
-    /// written before any work and the `Arc` is held across it, a group being
-    /// served is skipped whole (stamp included) and reconsidered next sweep.
-    fn prune_idle_groups(&self) -> usize {
-        let now = Instant::now();
-
-        // Candidates decided from `last_seen` alone, then confirmed per group
-        // under the lock below. Collected first so no two of these mutexes are
-        // ever held at once.
-        let Ok(idle) = self.last_seen.lock().map(|last_seen| {
-            last_seen
-                .iter()
-                .filter(|(_, seen)| now.duration_since(**seen) >= self.idle_after)
-                .map(|(group_id, _)| group_id.to_owned())
-                .collect::<Vec<_>>()
-        }) else {
-            return 0;
-        };
-
-        let mut evicted = 0;
-
-        for group_id in idle {
-            // Serving now: leave every one of this group's entries, stamp
-            // included, and reconsider it next sweep.
-            let released =
-                self.generation_locks
-                    .lock()
-                    .is_ok_and(|mut locks| match locks.get(&group_id) {
-                        Some(lock) if Arc::strong_count(lock) == 1 => {
-                            _ = locks.remove(&group_id);
-                            true
-                        }
-
-                        // No lock entry at all: nothing can be mid-request, since
-                        // `group_lock` creates one before anything else happens.
-                        None => true,
-
-                        Some(_) => false,
-                    });
-
-            if !released {
-                continue;
-            }
-
-            if let Ok(mut stalls) = self.rebalance_stalls.lock() {
-                _ = stalls.remove(&group_id);
-            }
-
-            if let Ok(mut last_seen) = self.last_seen.lock() {
-                _ = last_seen.remove(&group_id);
-            }
-
-            evicted += 1;
-        }
-
-        let cached = self
-            .last_seen
-            .lock()
-            .map_or(0, |last_seen| last_seen.len() as u64);
-
-        GROUPS_CACHED.record(cached, &[]);
-
-        if evicted > 0 {
-            GROUPS_EVICTED.add(evicted as u64, &[]);
-            debug!(evicted, cached, "evicted idle group state");
-        }
-
-        evicted
-    }
-
     /// Report a group that has been mid-rebalance too long (#240).
     ///
     /// A group in `CompletingRebalance` — members joined, leader elected, no
     /// assignment distributed — past [`stall_after`] is always a bug:
     /// consumption has stopped and nothing else says so.
     ///
-    /// Reported once per episode rather than per request: members heartbeat
-    /// every few seconds, so an unguarded `warn!` here would emit thousands of
-    /// lines for one stuck group and bury the signal it exists to raise. The
-    /// episode's start is read from the group (`state_since_ms`), so only the
-    /// "already said this" flag is per-replica — and a group that stalls,
-    /// recovers and stalls again is reported each time, because recovery clears
-    /// the flag.
+    /// Reported at most once per [`REBALANCE_STALL_REPORT_EVERY`] rather than
+    /// per request: members heartbeat every few seconds, so an unguarded
+    /// `warn!` here would emit thousands of lines for one stuck group and bury
+    /// the signal it exists to raise. The episode's *start* is read from the
+    /// group (`state_since_ms`), so only the "already said this" memo is
+    /// per-replica — and it expires rather than being swept, which is what let
+    /// this controller stop holding per-group state at all (#360).
     fn observe_rebalance(&self, group_id: &str, view: &GroupView, now: SystemTime) -> bool {
         let stalled = matches!(view.state(), ConsumerGroupState::CompletingRebalance);
-
-        let Ok(mut stalls) = self.rebalance_stalls.lock() else {
-            return false;
-        };
-
-        if !stalled {
-            _ = stalls.remove(group_id);
-            return false;
-        }
 
         let threshold = stall_after(view.generation.rebalance_timeout_ms);
         let stalled_for = Duration::from_millis(
@@ -878,10 +697,26 @@ where
                 .max(0) as u64,
         );
 
-        let reported = stalls.entry(group_id.to_owned()).or_insert(false);
+        let Ok(mut stalls) = self.rebalance_stalls.lock() else {
+            return false;
+        };
 
-        if !*reported && stalled_for >= threshold {
-            *reported = true;
+        // Decided before the key is built, so the healthy path — which is every
+        // request of every group that is not wedged — pays a comparison rather
+        // than an allocation. The cache is keyed by `String` and has no
+        // borrowed lookup, so touching it at all costs one.
+        if !stalled {
+            // A group that recovers is reported afresh if it stalls again,
+            // which is why this is cleared rather than left to expire.
+            if !stalls.is_empty() {
+                _ = stalls.remove(&group_id.to_owned());
+            }
+
+            return false;
+        }
+
+        if stalled_for >= threshold && stalls.get(&group_id.to_owned()).is_none() {
+            _ = stalls.insert_evict(group_id.to_owned(), (), true);
             REBALANCE_STALLS.add(1, &[]);
 
             // `threshold_ms` is in the line on purpose: it is the group's own
@@ -1521,16 +1356,10 @@ where
         // and it cannot be paused, so a test could only buy determinism by
         // waiting out the real duration.
         let polling_since = Instant::now();
-        let group_lock = self.group_lock(group_id);
         let mut conflicts = 0u32;
 
         loop {
             COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_loop")]);
-
-            // Narrow the window in which two of this group's members served by
-            // this replica race on `generation.json`. Released below before any
-            // sleep, so a held leader does not block the members it waits for.
-            let permit = group_lock.clone().lock_owned().await;
 
             let now = (self.now)();
             let now_ms = epoch_ms(now);
@@ -1615,8 +1444,6 @@ where
                     .member_id(minted)
                     .members(Some([].into()))
                     .into();
-
-                drop(permit);
 
                 return Ok(body);
             }
@@ -1789,7 +1616,6 @@ where
                     // member whose two requests are chasing each other does not
                     // spin against the store.
                     Err(UpdateError::Outdated { .. }) => {
-                        drop(permit);
                         self.generation_conflict(group_id, "join_member_outdated", &mut conflicts)
                             .await;
                         continue;
@@ -1820,7 +1646,6 @@ where
                     }
 
                     Err(UpdateError::Outdated { .. }) => {
-                        drop(permit);
                         self.generation_conflict(group_id, "join_outdated", &mut conflicts)
                             .await;
                         continue;
@@ -1882,8 +1707,6 @@ where
                 membership_quiescent,
                 join_window_ms,
             );
-
-            drop(permit);
 
             match decision {
                 LongPoll::Wait(pause, method) => {
@@ -1951,12 +1774,9 @@ where
 
         // Monotonic, for the same reasons as `join`'s (#256).
         let polling_since = Instant::now();
-        let group_lock = self.group_lock(group_id);
 
         loop {
             COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sync_loop")]);
-
-            let permit = group_lock.clone().lock_owned().await;
 
             let now = (self.now)();
             let mut view = self.read_view(group_id).await?;
@@ -1982,8 +1802,6 @@ where
                 group_instance_id,
                 polling_since.elapsed().as_millis(),
             );
-
-            drop(permit);
 
             match decision {
                 LongPoll::Respond(None) => return Ok(body),
@@ -2023,13 +1841,10 @@ where
             |member_id| vec![(member_id.to_owned(), None)],
         );
 
-        let group_lock = self.group_lock(group_id);
         let mut conflicts = 0u32;
 
         loop {
             COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "leave_loop")]);
-
-            let permit = group_lock.clone().lock_owned().await;
 
             let now = (self.now)();
             let now_ms = epoch_ms(now);
@@ -2069,7 +1884,6 @@ where
             );
 
             if left.is_empty() {
-                drop(permit);
                 return Ok(body);
             }
 
@@ -2110,13 +1924,10 @@ where
                             .inspect_err(|error| debug!(?error, group_id, member_id));
                     }
 
-                    drop(permit);
                     return Ok(body);
                 }
 
                 Err(UpdateError::Outdated { .. }) => {
-                    drop(permit);
-
                     if conflicts >= MAX_GENERATION_CAS_ATTEMPTS {
                         return Err(Error::Api(ErrorCode::RebalanceInProgress));
                     }
@@ -2261,10 +2072,6 @@ where
             .throttle_time_ms(Some(0))
             .error_code(error_code.into())
             .into())
-    }
-
-    fn prune(&self) -> usize {
-        self.prune_idle_groups()
     }
 }
 
@@ -2912,10 +2719,13 @@ mod tests {
         let storage = memory_storage().await?;
         let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
 
-        // A group already mid-rebalance: members joined, leader elected, no
-        // assignment distributed. This is what a stuck consumer keeps re-joining
-        // into, and what `CompletingRebalance` maps from.
+        // A group already mid-rebalance and already past its own rebalance
+        // timeout: members joined, leader elected, no assignment distributed,
+        // for longer than the group itself said to wait. This is what a stuck
+        // consumer keeps re-joining into, and what `CompletingRebalance` maps
+        // from.
         let now_ms = epoch_ms(paused_clock());
+        let stalled_since_ms = now_ms - i64::from(REBALANCE_TIMEOUT_MS.unwrap_or(300_000)) * 2;
 
         _ = storage
             .update_group_generation(
@@ -2926,12 +2736,12 @@ mod tests {
                     protocol_name: Some(RANGE.into()),
                     leader: Some("member-1".into()),
                     members: BTreeMap::from([("member-1".to_owned(), MemberRef::default())]),
-                    members_changed_at_ms: now_ms,
-                    state_since_ms: now_ms,
+                    members_changed_at_ms: stalled_since_ms,
+                    state_since_ms: stalled_since_ms,
                     swept_at_ms: now_ms,
                     session_timeout_ms: SESSION_TIMEOUT_MS,
                     rebalance_timeout_ms: REBALANCE_TIMEOUT_MS,
-                    inception_ms: now_ms,
+                    inception_ms: stalled_since_ms,
                     ..Default::default()
                 },
                 None,
@@ -2953,7 +2763,7 @@ mod tests {
         let sampled = controller
             .rebalance_stalls
             .lock()
-            .map(|stalls| stalls.contains_key(GROUP_ID))
+            .map(|stalls| stalls.get(&GROUP_ID.to_owned()).is_some())
             .unwrap_or_default();
 
         assert!(
@@ -3075,7 +2885,9 @@ mod tests {
         // that has never seen this group reports a group that has been stalled
         // for longer than the threshold on its first look at it.
         let restarted = Controller {
-            rebalance_stalls: Arc::new(Mutex::new(BTreeMap::new())),
+            rebalance_stalls: Arc::new(Mutex::new(ExpiringSizedCache::new(
+                REBALANCE_STALL_REPORT_EVERY,
+            ))),
             ..controller.clone()
         };
 
@@ -4204,113 +4016,59 @@ mod tests {
         Ok(())
     }
 
-    /// Every per-group map entry this controller holds, as
-    /// `(generation_locks, rebalance_stalls, last_seen)`.
-    fn cached<O>(controller: &Controller<O>) -> (usize, usize, usize) {
-        (
-            controller.generation_locks.lock().unwrap().len(),
-            controller.rebalance_stalls.lock().unwrap().len(),
-            controller.last_seen.lock().unwrap().len(),
-        )
-    }
-
-    /// #283: none of the per-group maps had a removal path — not even when the
-    /// group was deleted from the object store — so a group-per-restart or
-    /// group-per-subscription naming pattern grew them for the life of the pod.
+    /// #360: a `Controller` holds nothing keyed by a group id that a client can
+    /// grow without bound, and nothing that has to be swept.
     ///
-    /// Written against the *level*: the failure is monotonic growth, so what has
-    /// to hold is that churning many uniquely-named groups returns to zero rather
-    /// than climbing. A zero idle window makes every group a candidate on the
-    /// sweep after it, which is what keeps this deterministic instead of timed.
+    /// This replaces the #283 eviction suite. Those tests pinned four maps and
+    /// the periodic sweep that emptied them — state a replica had to be kept
+    /// alive to maintain, and the reason a replica was not interchangeable. The
+    /// property worth pinning now is that churning uniquely-named groups leaves
+    /// nothing behind at all.
     #[tokio::test(start_paused = true)]
-    async fn group_churn_with_fresh_names_reaches_a_flat_steady_state() -> Result<()> {
+    async fn a_controller_holds_no_per_group_state() -> Result<()> {
         let _guard = init_tracing()?;
 
+        const ROUNDS: usize = 32;
+
         let storage = memory_storage().await?;
-        let controller = Controller::with_storage(storage)?
-            .with_now(paused_clock)
-            .with_idle_after(Duration::ZERO);
-
-        const ROUNDS: usize = 16;
-
+        let controller = Controller::with_storage(storage)?.with_now(paused_clock);
         let metadata = encode_subscription(&["t"], None);
 
         for round in 0..ROUNDS {
-            // A fresh name every round: a same-named re-join would reuse the
-            // entries rather than add to them, so it would not show the growth.
+            // A fresh name every round: a same-named re-join would reuse
+            // whatever was held rather than add to it, so it would not show
+            // growth.
             let group_id = format!("churn-{round}");
 
-            _ = join_group(&controller, &group_id, "", &metadata).await?;
+            let (member_id, join) = register(&controller, &group_id, &metadata).await?;
 
-            // The group is known now — otherwise the sweep below would be
-            // asserting that nothing evicts nothing.
-            let (locks, _, last_seen) = cached(&controller);
-            assert_eq!(1, locks, "generation_locks, round {round}");
-            assert_eq!(1, last_seen, "last_seen, round {round}");
+            _ = sync_group(
+                &controller,
+                &group_id,
+                join.generation_id,
+                &member_id,
+                &[assignment_of(&member_id)],
+            )
+            .await?;
 
-            assert_eq!(1, controller.prune(), "round {round}");
             assert_eq!(
-                (0, 0, 0),
-                cached(&controller),
-                "not flat after round {round}"
+                i16::from(ErrorCode::None),
+                heartbeat(&controller, &group_id, join.generation_id, &member_id)
+                    .await?
+                    .error_code
+            );
+
+            _ = leave_group(&controller, &group_id, &member_id).await?;
+
+            // The stall memo is the only map, and only a group observed
+            // mid-rebalance past its threshold ever enters it. None of these
+            // did.
+            assert_eq!(
+                0,
+                controller.rebalance_stalls.lock().unwrap().len(),
+                "round {round}",
             );
         }
-
-        Ok(())
-    }
-
-    /// #283: the sweep must not drop a lock a request is holding.
-    ///
-    /// Dropping it does not free anything — it means the *next* request for that
-    /// group creates a second lock, and two members then run their read->CAS
-    /// windows concurrently. The `Arc` count is the guard, and it is also what
-    /// makes the sweep leak-free: a request's touch stamp must survive with it,
-    /// or the entry it re-creates would never be a candidate again.
-    #[tokio::test(start_paused = true)]
-    async fn a_group_being_served_is_not_evicted() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let storage = memory_storage().await?;
-        let controller = Controller::with_storage(storage)?.with_idle_after(Duration::ZERO);
-
-        const GROUP_ID: &str = "in-flight";
-
-        // Stand in for a request in flight: `group_lock` is what every path calls
-        // first, and holding its `Arc` is exactly the state a live request is in.
-        let held = controller.group_lock(GROUP_ID);
-
-        assert_eq!(0, controller.prune());
-
-        let (locks, _, last_seen) = cached(&controller);
-        assert_eq!(1, locks, "the held lock must survive");
-        assert_eq!(
-            1, last_seen,
-            "the stamp must survive with it, or the entry becomes unpruneable"
-        );
-
-        // Request over.
-        drop(held);
-
-        assert_eq!(1, controller.prune());
-        assert_eq!((0, 0, 0), cached(&controller));
-
-        Ok(())
-    }
-
-    /// #283: a group served within the idle window keeps its state — the sweep
-    /// bounds growth, it does not throw away what it exists to bound.
-    #[tokio::test(start_paused = true)]
-    async fn a_recently_served_group_is_kept() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let storage = memory_storage().await?;
-        let controller =
-            Controller::with_storage(storage)?.with_idle_after(Duration::from_secs(3_600));
-
-        _ = controller.group_lock("recent");
-
-        assert_eq!(0, controller.prune());
-        assert_eq!(1, cached(&controller).0, "generation_locks");
 
         Ok(())
     }

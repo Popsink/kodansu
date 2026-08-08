@@ -53,11 +53,9 @@ test-conditional-put url="memory://tansu/":
 #
 # `#[ignore]`d in the suite because it is wall clock rather than a regression
 # gate. Size comes from the environment — `TANSU_SCALE_GROUPS`,
-# `TANSU_SCALE_MEMBERS`, `TANSU_SCALE_REPLICAS`, and `TANSU_SCALE_FORWARDING` to
-# choose the arrangement:
+# `TANSU_SCALE_MEMBERS`, `TANSU_SCALE_REPLICAS`:
 #
 #     TANSU_SCALE_GROUPS=8 just test-group-scale
-#     TANSU_SCALE_FORWARDING=false just test-group-scale   # no owner replica
 test-group-scale *args:
     cargo nextest run --package tansu-broker --all-features \
       -E 'binary(group_scale)' --run-ignored all {{ args }}

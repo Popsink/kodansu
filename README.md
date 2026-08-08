@@ -58,8 +58,10 @@ Relative to the tree it forked from:
 - **Retention and compaction are per prefix and whole-segment**, run on the
   maintenance loop of every replica, coordinated by first-arrival recency skip rather
   than by an ordinal or a coordinator.
-- **Consumer groups survive N replicas behind one load balancer**, via optional
-  forward-to-owner coordination over rendezvous hashing on headless-Service DNS.
+- **Consumer groups need no configuration and no pod identity.** A group's state is
+  three objects with three write regimes, so any replica may coordinate any group
+  (#359) — there is no owner to elect, no peer set to discover and no second
+  listener (#360).
 - **Kafka retention semantics.** An absent `cleanup.policy` reads as Kafka's `delete`
   with a 7-day `retention.ms`, and both defaults are settable broker-wide — including
   retain-forever. This is a behaviour change worth reading twice; see
@@ -182,13 +184,9 @@ The options that matter in a deployment, each with its environment variable:
 | `--storage-engine` | `STORAGE_ENGINE` | `memory://tansu/` | Storage URL; see below. |
 | `--otlp-endpoint-url` | `OTEL_EXPORTER_OTLP_ENDPOINT` | — | Where metrics and traces are pushed. |
 | `--authentication` | — | off | When present, clients must authenticate. |
-| `--cert` / `--key` | — | — | TLS certificate chain and private key (PEM). Both or neither. Given both, `--listener-url` serves TLS only and a plaintext client is refused; an unreadable or mismatched pair fails startup. The broker-to-broker `--internal-listener-url` stays plaintext. |
+| `--cert` / `--key` | — | — | TLS certificate chain and private key (PEM). Both or neither. Given both, `--listener-url` serves TLS only and a plaintext client is refused; an unreadable or mismatched pair fails startup. |
 | `--default-cleanup-policy` | `DEFAULT_CLEANUP_POLICY` | `delete` | Applied to topics created without one. |
 | `--default-retention-ms` | `DEFAULT_RETENTION` | `7days` | Applied to `delete`-policy topics created without a `retention.ms`. Accepts a duration, or `-1`/`infinite`/`forever`. |
-| `--group-forwarding` | `GROUP_FORWARDING` | off | Forward each consumer group's coordination APIs to its owner replica. |
-| `--group-forward-peer-dns` | `GROUP_FORWARD_PEER_DNS` | — | Headless-Service hostname whose A/AAAA records list the eligible owners. |
-| `--internal-listener-url` | `INTERNAL_LISTENER_URL` | `tcp://0.0.0.0:9093` | Broker-to-broker listener that forwarded group requests reach. |
-| `--pod-ip` | `POD_IP` | — | This replica's own address; in Kubernetes, from the Downward API. |
 
 The URL and address options accept `${VAR}` references, expanded when the argument is
 parsed.
@@ -268,24 +266,25 @@ Produce, fetch and maintenance need no configuration to scale:
   first arrival rather than duplicating it N×. Set `maintenance_recency` to ~0.9× your
   maintenance interval.
 
-**Consumer groups are the one thing that needs configuring.** A group's state is a
-single object mutated by etag CAS. With N replicas behind one load balancer, a group's
-Join and Sync long-polls scatter across replicas and thrash that CAS, so membership
-never quiesces. Enabling forwarding makes each group's coordination run on exactly one
-deterministic owner:
+**Consumer groups need nothing either**, and that is a change: they used to be the
+one thing on this page that did. A group's state was a single object mutated by etag
+CAS, so with N replicas behind one load balancer its Join and Sync long-polls
+scattered across replicas and thrashed that CAS until membership never quiesced. The
+answer was to route each group to a deterministic owner, which needed stable pod
+identity, headless-Service DNS, pod-to-pod addressability and a second listener — the
+four things an autoscaled fleet has least of.
 
-```shell
-GROUP_FORWARDING=true
-GROUP_FORWARD_PEER_DNS=kodansu-headless.my-namespace.svc.cluster.local
-POD_IP=<the pod's own IP, from the Downward API>
-```
+That is gone. A group is now three objects with three write regimes (#359): each
+member's liveness and subscription in its own document, written by that member alone
+at most once per session/2; the group's composition in one CAS'd object that changes
+only when the membership does; and the leader's assignment written **create-only**,
+so the write that liveness churn used to starve has no etag to lose a race on. There
+is nothing left for concurrent replicas to contend on, so there is nothing to route
+(#360).
 
-Owners are chosen by rendezvous hashing over the peer set discovered from that
-hostname's A/AAAA records, so removing one peer reassigns only that peer's groups.
-Ownership is **soft**: every write stays conditional on the object's etag, so DNS skew
-during a rolling restart degrades to ordinary CAS retries, never to corruption — and
-an empty or unresolvable peer set falls back to purely local coordination. Forwarding
-is off by default.
+The practical consequence: **replicas are interchangeable.** One can be added or
+removed under consumer load and the groups it was serving do not notice — no cold
+owner, no DNS convergence window, no configuration to keep in step.
 
 ## Observability
 

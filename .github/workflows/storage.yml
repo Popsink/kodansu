@@ -67,17 +67,12 @@ jobs:
   # concurrent replicas collide on them — moves when the coordinator changes,
   # not when a commit lands.
   #
-  # Both arrangements, because both have to hold. `forwarding: true` is what
-  # ships today; `false` scatters the same consumers across every replica with
-  # no owner at all, which is the arrangement #360 wants to make the only one.
-  # It is the program's exit criterion, so leaving it to a manual run would mean
-  # the property #360 depends on is guarded by nobody.
+  # Every replica drives every group, with no owner and no configuration —
+  # since #360 that is the only arrangement there is, and it is the program's
+  # exit criterion, so leaving it to a manual run would mean the property the
+  # autoscaling story rests on is guarded by nobody.
   group-scale:
     runs-on: ubuntu-latest-8-cores
-    strategy:
-      fail-fast: false
-      matrix:
-        forwarding: [true, false]
     env:
       CARGO_BUILD_BUILD_DIR: /mnt/build
       NEXTEST_PROFILE: ci
@@ -93,14 +88,12 @@ jobs:
           cache: false
       - uses: taiki-e/install-action@nextest
       - run: just test-group-scale
-        env:
-          TANSU_SCALE_FORWARDING: ${{ matrix.forwarding }}
       - run: tar --create --gzip --file=logs.tar.gz logs
         if: always()
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: logs-group-scale-forwarding-${{ matrix.forwarding }}
+          name: logs-group-scale
           path: logs.tar.gz
           if-no-files-found: error
 

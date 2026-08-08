@@ -26,12 +26,10 @@
 //!   conflicts and no per-member write of `generation.json`;
 //! - forming a group stays inside a per-member write budget.
 //!
-//! Both arrangements have to hold all three. `TANSU_SCALE_FORWARDING=true`
-//! (the default) routes each group to its rendezvous owner — today's shipped
-//! behaviour, and the baseline. `false` scatters the same consumers across
-//! every replica with **no owner at all**: the arrangement #360 wants to make
-//! the only one, and the one that could not converge before #359 decomposed
-//! the group object. That switch is this file's reason to exist.
+//! Every replica drives every group. There is no owner, no forwarding and no
+//! configuration: that arrangement could not converge before #359 decomposed
+//! the group object, it is what this file existed to switch between while the
+//! decomposition landed, and since #360 it is the only one there is.
 //!
 //! `#[ignore]` by default. It is minutes of wall clock at the default size and
 //! it is not a regression gate; `just test-group-scale` runs it, and the size
@@ -46,7 +44,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
-    net::{IpAddr, Ipv4Addr},
     ops::Range,
     str::FromStr,
     sync::{
@@ -57,15 +54,10 @@ use std::{
 };
 
 use anyhow::{Result, anyhow};
-use async_trait::async_trait;
 use bytes::Bytes;
 use tansu_broker::{
     NODE_ID,
-    coordinator::group::{
-        Coordinator,
-        administrator::Controller,
-        forward::{Forward, ForwardingCoordinator, PeerRegistry},
-    },
+    coordinator::group::{Coordinator, administrator::Controller},
 };
 use tansu_sans_io::{
     Body, ErrorCode, join_group_request::JoinGroupRequestProtocol,
@@ -161,20 +153,22 @@ struct Scale {
     groups: usize,
     members: usize,
     replicas: usize,
-    forwarding: bool,
     /// Writes of `generation.json` a single group may cost, formation
     /// included, and won or lost — a conditional PUT the store rejects is
     /// still a request it charged for.
     ///
     /// Formation is inherently one landed CAS per member joining, so the
-    /// budget is per member rather than a constant. The forwarded arrangement
-    /// serializes those in-process and measures close to the floor; scattered
-    /// across ten replicas with no owner, the members race and retry, and
-    /// `cg_forward` measures 72 attempts for 16 members (56 of them rejected,
-    /// so 16 landed — the floor). Six per member covers the scattered case
-    /// with headroom while still catching a *regression in kind*: a path that
-    /// writes the generation per heartbeat, or a retry loop that rewrites it
-    /// once per round, blows through it immediately.
+    /// budget is per member rather than a constant. The rest is the race: 16
+    /// members contending for those 16 slots lose the CAS and re-apply, and
+    /// nothing serializes them any more — the per-group in-process lock went
+    /// with the rest of the per-group state (#360), so members served by the
+    /// same replica race exactly as members on different ones do.
+    ///
+    /// Measured at the default size: **5010 attempts for 1024 members**, 1024
+    /// of them landing — 4.9 per member. Eight leaves ~40% headroom while
+    /// still catching a *regression in kind*: a path that writes the
+    /// generation per heartbeat, or a retry loop that rewrites it once per
+    /// round, blows through it immediately.
     put_budget_per_member: u64,
     /// Per-member deadline. Only reached when a member never converges — a
     /// converged one returns immediately — so it is generous on purpose.
@@ -200,8 +194,7 @@ impl Scale {
             groups: from_env("TANSU_SCALE_GROUPS", 64)?,
             members: from_env("TANSU_SCALE_MEMBERS", 16)?,
             replicas: from_env("TANSU_SCALE_REPLICAS", 10)?,
-            forwarding: from_env("TANSU_SCALE_FORWARDING", true)?,
-            put_budget_per_member: from_env("TANSU_SCALE_PUT_BUDGET_PER_MEMBER", 6)?,
+            put_budget_per_member: from_env("TANSU_SCALE_PUT_BUDGET_PER_MEMBER", 8)?,
             deadline: Duration::from_secs(from_env("TANSU_SCALE_DEADLINE_SECS", 120)?),
         })
     }
@@ -212,96 +205,6 @@ impl Scale {
 
     fn group_id(&self, index: usize) -> String {
         format!("scale-{index:04}")
-    }
-}
-
-/// The fake pod IP of replica `index`.
-fn peer(index: usize) -> IpAddr {
-    IpAddr::V4(Ipv4Addr::new(
-        10,
-        0,
-        u8::try_from(index / 256).expect("replica count fits two IPv4 octets"),
-        u8::try_from(index % 256).expect("replica index fits an IPv4 octet"),
-    ))
-}
-
-/// The in-process stand-in for the internal-listener hop, as `cg_forward`'s:
-/// dispatch a forwarded group API straight into the owner's `Controller`.
-#[derive(Debug)]
-struct InProcessForward {
-    replicas: BTreeMap<IpAddr, Replica>,
-}
-
-#[async_trait]
-impl Forward for InProcessForward {
-    async fn call(
-        &self,
-        owner: IpAddr,
-        _api_key: i16,
-        client_id: Option<&str>,
-        body: Body,
-    ) -> tansu_broker::Result<Body> {
-        let replica = self
-            .replicas
-            .get(&owner)
-            .ok_or_else(|| tansu_broker::Error::Message(format!("no replica at {owner}")))?;
-
-        match body {
-            Body::JoinGroupRequest(join) => {
-                replica
-                    .join(
-                        client_id,
-                        &join.group_id,
-                        join.session_timeout_ms,
-                        join.rebalance_timeout_ms,
-                        &join.member_id,
-                        join.group_instance_id.as_deref(),
-                        &join.protocol_type,
-                        join.protocols.as_deref(),
-                        join.reason.as_deref(),
-                    )
-                    .await
-            }
-
-            Body::SyncGroupRequest(sync) => {
-                replica
-                    .sync(
-                        &sync.group_id,
-                        sync.generation_id,
-                        &sync.member_id,
-                        sync.group_instance_id.as_deref(),
-                        sync.protocol_type.as_deref(),
-                        sync.protocol_name.as_deref(),
-                        sync.assignments.as_deref(),
-                    )
-                    .await
-            }
-
-            Body::HeartbeatRequest(heartbeat) => {
-                replica
-                    .heartbeat(
-                        &heartbeat.group_id,
-                        heartbeat.generation_id,
-                        &heartbeat.member_id,
-                        heartbeat.group_instance_id.as_deref(),
-                    )
-                    .await
-            }
-
-            Body::LeaveGroupRequest(leave) => {
-                replica
-                    .leave(
-                        &leave.group_id,
-                        leave.member_id.as_deref(),
-                        leave.members.as_deref(),
-                    )
-                    .await
-            }
-
-            otherwise => Err(tansu_broker::Error::Message(format!(
-                "unexpected forwarded request: {otherwise:?}"
-            ))),
-        }
     }
 }
 
@@ -591,7 +494,6 @@ async fn groups_converge_within_their_write_budget() -> Result<()> {
         groups = scale.groups,
         members = scale.members,
         replicas = scale.replicas,
-        forwarding = scale.forwarding,
         partitions,
         "group scale run"
     );
@@ -621,43 +523,10 @@ async fn groups_converge_within_their_write_budget() -> Result<()> {
         controllers.push(Controller::with_storage(storage)?);
     }
 
-    let peers = (0..scale.replicas).map(peer).collect::<Vec<_>>();
-
-    // Scattered is the arrangement with no owner: a member's requests land on
-    // whichever replica the load balancer picked, and every replica drives the
-    // group's state itself. Forwarded routes each group to its rendezvous owner
-    // — today's shipped behaviour, and the baseline this measures against.
-    //
-    // `Coordinator` is not dyn-compatible, so the two arrangements cannot share
-    // a boxed vector; they share the driver instead.
-    let converged = if scale.forwarding {
-        let forward = Arc::new(InProcessForward {
-            replicas: peers
-                .iter()
-                .copied()
-                .zip(controllers.iter().cloned())
-                .collect(),
-        });
-
-        let ingresses = controllers
-            .iter()
-            .enumerate()
-            .map(|(index, replica)| {
-                let registry = Arc::new(PeerRegistry::new(
-                    peer(index),
-                    "unused.invalid",
-                    Duration::from_secs(5),
-                ));
-                registry.set_peers(peers.clone());
-
-                ForwardingCoordinator::with_forward(replica.clone(), registry, forward.clone())
-            })
-            .collect::<Vec<_>>();
-
-        drive_groups(&scale, &ingresses).await?
-    } else {
-        drive_groups(&scale, &controllers).await?
-    };
+    // Every member enters through whichever replica the load balancer picked,
+    // and every replica drives the group's state itself. There is nothing else
+    // to arrange.
+    let converged = drive_groups(&scale, &controllers).await?;
 
     for (group, member_ids) in &converged {
         assert_eq!(scale.members, member_ids.len(), "group {group}");
