@@ -83,11 +83,12 @@ mod tests;
 
 use crate::{
     AssignmentDoc, AssignmentOutcome, AutoTopicCreate, BrokerRegistrationRequest,
-    ConsumerGroupState, Error, GenerationDoc, GroupDetail, GroupMember, GroupState,
-    ListOffsetResponse, METER, MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicDefaults, TopicId,
-    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
-    UpdateError, Version, storage_error_code,
+    ConsumerGroupState, Error, GROUP_SCHEMA_VERSION, GenerationDoc, GroupDetail, GroupMember,
+    GroupSchema, GroupState, ListOffsetResponse, METER, MemberDoc, MetadataResponse,
+    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
+    ScramCredential, Storage, TopicDefaults, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    storage_error_code,
 };
 
 const APPLICATION_JSON: &str = "application/json";
@@ -10438,6 +10439,78 @@ impl Storage for DynoStore {
         debug!(group_id, generation_id, ?deleted);
 
         Ok(deleted.len() as u64)
+    }
+
+    async fn assert_group_schema(&self) -> Result<()> {
+        let location = Path::from(format!("clusters/{}/schema/groups.json", self.cluster));
+
+        let refuse = |found: u32| {
+            error!(
+                cluster = self.cluster,
+                found,
+                expected = GROUP_SCHEMA_VERSION,
+                "refusing to start: this cluster's consumer groups are in a layout \
+                 this binary does not write (#359)"
+            );
+
+            Err(Error::Message(format!(
+                "cluster {} holds consumer groups in layout version {found}, \
+                 but this binary writes version {GROUP_SCHEMA_VERSION}",
+                self.cluster,
+            )))
+        };
+
+        match self.get::<GroupSchema>(&location).await {
+            Ok((schema, _)) if schema.version == GROUP_SCHEMA_VERSION => Ok(()),
+
+            Ok((schema, _)) => refuse(schema.version),
+
+            Err(Error::ObjectStore(error))
+                if matches!(error.as_ref(), object_store::Error::NotFound { .. }) =>
+            {
+                // Create-only, so two replicas starting together cannot both
+                // claim it: the loser is handed what the winner wrote and
+                // checks that instead.
+                match self
+                    .put(
+                        &location,
+                        GroupSchema {
+                            version: GROUP_SCHEMA_VERSION,
+                        },
+                        json_content_type(),
+                        None,
+                    )
+                    .await
+                {
+                    Ok(_) => {
+                        info!(
+                            cluster = self.cluster,
+                            version = GROUP_SCHEMA_VERSION,
+                            "claimed the consumer group layout for this cluster (#359)"
+                        );
+
+                        Ok(())
+                    }
+
+                    Err(UpdateError::Outdated { current, .. })
+                        if current.version == GROUP_SCHEMA_VERSION =>
+                    {
+                        Ok(())
+                    }
+
+                    Err(UpdateError::Outdated { current, .. }) => refuse(current.version),
+
+                    Err(UpdateError::Error(error)) => Err(error),
+                    Err(UpdateError::SerdeJson(error)) => Err(Error::SerdeJson(error)),
+                    Err(UpdateError::Uuid(error)) => Err(Error::Uuid(error)),
+                    Err(UpdateError::MissingEtag) => Err(Error::Message(String::from(
+                        "group schema claim reported a missing etag",
+                    ))),
+                }
+            }
+
+            Err(error) => Err(error),
+        }
     }
 
     async fn init_producer(

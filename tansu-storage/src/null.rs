@@ -518,6 +518,14 @@ impl Storage for Engine {
         })
     }
 
+    /// The Null engine holds every group in memory for the life of the
+    /// process, so there is no cluster to have written a layout and nothing to
+    /// disagree with.
+    #[instrument(skip_all)]
+    async fn assert_group_schema(&self) -> Result<()> {
+        Ok(())
+    }
+
     #[instrument(skip_all)]
     async fn read_group_generation(
         &self,

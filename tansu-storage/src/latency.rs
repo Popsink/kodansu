@@ -309,6 +309,12 @@ where
         self.storage.list_group_members(group_id).await
     }
 
+    async fn assert_group_schema(&self) -> Result<()> {
+        self.introduce_latency().await?;
+
+        self.storage.assert_group_schema().await
+    }
+
     async fn read_group_generation(
         &self,
         group_id: &str,

@@ -22,16 +22,16 @@
 //! things:
 //!
 //! - every member of every group ends with a non-empty assignment;
-//! - the group-state CAS conflict count is zero;
-//! - each group's group-state PUTs stay inside a budget.
+//! - once converged, a group's heartbeats cost **zero** generation CAS
+//!   conflicts and no per-member write of `generation.json`;
+//! - forming a group stays inside a per-member write budget.
 //!
-//! **Today this runs the forwarded arrangement**, which is the one that
-//! converges: it is the baseline the decomposition is measured against, and it
-//! is why the harness lands before the flip rather than with it. Set
-//! `TANSU_SCALE_FORWARDING=false` to run the same consumers scattered across
-//! every replica with no owner — the arrangement #360 wants to make the only
-//! one, and the arrangement that fails today. The failure is the point of the
-//! switch: it is what the flip has to turn green.
+//! Both arrangements have to hold all three. `TANSU_SCALE_FORWARDING=true`
+//! (the default) routes each group to its rendezvous owner — today's shipped
+//! behaviour, and the baseline. `false` scatters the same consumers across
+//! every replica with **no owner at all**: the arrangement #360 wants to make
+//! the only one, and the one that could not converge before #359 decomposed
+//! the group object. That switch is this file's reason to exist.
 //!
 //! `#[ignore]` by default. It is minutes of wall clock at the default size and
 //! it is not a regression gate; `just test-group-scale` runs it, and the size
@@ -71,7 +71,7 @@ use tansu_sans_io::{
     Body, ErrorCode, join_group_request::JoinGroupRequestProtocol,
     join_group_response::JoinGroupResponseMember, sync_group_request::SyncGroupRequestAssignment,
 };
-use tansu_storage::{GroupState, LatencyIntroducingStorage, Storage, StorageContainer};
+use tansu_storage::{LatencyIntroducingStorage, Storage, StorageContainer};
 use tokio::{task::JoinSet, time::timeout};
 use tracing::{debug, info};
 use url::Url;
@@ -83,7 +83,18 @@ pub mod common;
 const PROTOCOL_TYPE: &str = "consumer";
 const RANGE: &str = "range";
 
-const SESSION_TIMEOUT_MS: i32 = 45_000;
+/// Deliberately far above a production session timeout, and above any run of
+/// this rig.
+///
+/// The rig forms every group in one batch and only then heartbeats, where a
+/// real deployment interleaves the two: a member that converged in the first
+/// second of a 64-group run would otherwise have gone `SESSION_TIMEOUT_MS`
+/// without contact by the time the last group formed, and the sweep would
+/// evict it — correctly. That is an artifact of the rig's shape, not a
+/// property of the coordinator, and buying determinism by making the window
+/// wide is cheaper than interleaving two schedules to measure one of them.
+const SESSION_TIMEOUT_MS: i32 = 600_000;
+
 const REBALANCE_TIMEOUT_MS: Option<i32> = Some(60_000);
 
 /// Partitions per group's topic. Two per member at the default size, so an
@@ -97,6 +108,10 @@ const PARTITIONS_PER_MEMBER: i32 = 2;
 /// production-latency run of this size is half an hour of mostly sleeping.
 const STORE_LATENCY_MS: Range<u64> = 2..8;
 
+/// Heartbeats per member in the steady-state window. Enough that a
+/// per-heartbeat write of `generation.json` would be unmissable.
+const STEADY_HEARTBEATS: usize = 4;
+
 /// Upper bound on join/sync rounds per member. A converging member needs ~3
 /// (KIP-394 empty join, real join, sync); the bound is what stops a
 /// non-converging arrangement looping forever.
@@ -108,18 +123,36 @@ type Replica = Controller<ReplicaStorage>;
 
 /// One replica's cost counters, kept together so an assertion names what it
 /// read rather than indexing parallel vectors.
+///
+/// The object to count is `generation.json`: since #359 it is the only one a
+/// group's members can contend on, and `{group}.json` — what this used to
+/// count — is not written at all.
 struct Counters {
-    group_updates: Arc<AtomicU64>,
-    cas_conflicts: Arc<AtomicU64>,
+    generation_updates: Arc<AtomicU64>,
+    generation_cas_conflicts: Arc<AtomicU64>,
+    member_lists: Arc<AtomicU64>,
 }
 
 impl Counters {
-    fn group_updates(&self) -> u64 {
-        self.group_updates.load(Ordering::Relaxed)
+    fn updates(counters: &[Self]) -> u64 {
+        counters
+            .iter()
+            .map(|counters| counters.generation_updates.load(Ordering::Relaxed))
+            .sum()
     }
 
-    fn cas_conflicts(&self) -> u64 {
-        self.cas_conflicts.load(Ordering::Relaxed)
+    fn conflicts(counters: &[Self]) -> u64 {
+        counters
+            .iter()
+            .map(|counters| counters.generation_cas_conflicts.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    fn lists(counters: &[Self]) -> u64 {
+        counters
+            .iter()
+            .map(|counters| counters.member_lists.load(Ordering::Relaxed))
+            .sum()
     }
 }
 
@@ -129,15 +162,19 @@ struct Scale {
     members: usize,
     replicas: usize,
     forwarding: bool,
-    /// Group-state PUTs a single group may cost, formation included.
+    /// Writes of `generation.json` a single group may cost, formation
+    /// included, and won or lost — a conditional PUT the store rejects is
+    /// still a request it charged for.
     ///
-    /// Formation is inherently several CASes — one per member joining, plus the
-    /// leader's assignment — so the budget is per member, not a constant. The
-    /// forwarded arrangement measures 18 PUTs for a 16-member group (one per
-    /// join, plus the leader's sync and the birth), so a budget of two per
-    /// member leaves about 78% headroom while still catching a *regression in
-    /// kind*: a path that writes group state per heartbeat, or a retry loop
-    /// that rewrites it once per round, blows through it immediately.
+    /// Formation is inherently one landed CAS per member joining, so the
+    /// budget is per member rather than a constant. The forwarded arrangement
+    /// serializes those in-process and measures close to the floor; scattered
+    /// across ten replicas with no owner, the members race and retry, and
+    /// `cg_forward` measures 72 attempts for 16 members (56 of them rejected,
+    /// so 16 landed — the floor). Six per member covers the scattered case
+    /// with headroom while still catching a *regression in kind*: a path that
+    /// writes the generation per heartbeat, or a retry loop that rewrites it
+    /// once per round, blows through it immediately.
     put_budget_per_member: u64,
     /// Per-member deadline. Only reached when a member never converges — a
     /// converged one returns immediately — so it is generous on purpose.
@@ -164,7 +201,7 @@ impl Scale {
             members: from_env("TANSU_SCALE_MEMBERS", 16)?,
             replicas: from_env("TANSU_SCALE_REPLICAS", 10)?,
             forwarding: from_env("TANSU_SCALE_FORWARDING", true)?,
-            put_budget_per_member: from_env("TANSU_SCALE_PUT_BUDGET_PER_MEMBER", 2)?,
+            put_budget_per_member: from_env("TANSU_SCALE_PUT_BUDGET_PER_MEMBER", 6)?,
             deadline: Duration::from_secs(from_env("TANSU_SCALE_DEADLINE_SECS", 120)?),
         })
     }
@@ -405,35 +442,52 @@ where
     Ok(None)
 }
 
-/// Whether the persisted group is `Formed` over exactly `member_ids`, every
+/// Whether the persisted group is `Stable` over exactly `member_ids`, every
 /// assignment non-empty, their union covering `0..partitions` with no gaps and
 /// no duplicates.
+///
+/// Read from the decomposed objects, not through a projection: what has to
+/// hold is that the generation names exactly these members and that
+/// `assignment/{generation}` exists and covers them.
 async fn persisted_group_converged(
     shared: &SharedStorage,
     group_id: &str,
     member_ids: &BTreeSet<String>,
     partitions: i32,
 ) -> Result<bool> {
-    let Some((detail, _)) = shared.read_group(group_id).await? else {
+    let Some((generation, _)) = shared.read_group_generation(group_id).await? else {
         return Ok(false);
     };
 
-    let GroupState::Formed { assignments, .. } = &detail.state else {
+    if generation.members.keys().cloned().collect::<BTreeSet<_>>() != *member_ids {
+        return Ok(false);
+    }
+
+    let Some(assignment) = shared
+        .read_group_assignment(group_id, generation.generation_id)
+        .await?
+    else {
         return Ok(false);
     };
 
-    if assignments.keys().cloned().collect::<BTreeSet<_>>() != *member_ids {
+    if assignment
+        .assignments
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        != *member_ids
+    {
         return Ok(false);
     }
 
     let mut covered = BTreeSet::new();
 
-    for assignment in assignments.values() {
-        if assignment.is_empty() {
+    for assigned in assignment.assignments.values() {
+        if assigned.is_empty() {
             return Ok(false);
         }
 
-        for partition in decode_partitions(assignment)? {
+        for partition in decode_partitions(assigned)? {
             if !covered.insert(partition) {
                 return Ok(false);
             }
@@ -514,11 +568,17 @@ where
 
 /// `GROUPS × MEMBERS` consumers across `REPLICAS`, all sharing one store.
 ///
-/// The three assertions are convergence, zero group-state CAS conflicts, and a
-/// per-group write budget — in that order of importance, and all three are what
-/// #359 is judged on. The counters come from the store wrapper each replica
-/// sits behind, so the budget is measured at the object store rather than
-/// inferred from the coordinator's intentions.
+/// The assertions are convergence, a formation write budget, and a
+/// **steady-state window that costs nothing** — in that order of importance,
+/// and all of them are what #359 is judged on. The counters come from the store
+/// wrapper each replica sits behind, so the cost is measured at the object
+/// store rather than inferred from the coordinator's intentions.
+///
+/// Formation conflicts are budgeted rather than forbidden: `MEMBERS` members
+/// racing to add themselves to one document is a race, and the CAS is what
+/// resolves it. What must be exactly zero is the *steady state*, because that
+/// is the regime a deployment actually lives in and the one that used to
+/// require an owner.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "scale rig: minutes of wall clock, run with `just test-group-scale`"]
 async fn groups_converge_within_their_write_budget() -> Result<()> {
@@ -553,8 +613,9 @@ async fn groups_converge_within_their_write_budget() -> Result<()> {
             .with_latency(STORE_LATENCY_MS);
 
         counters.push(Counters {
-            group_updates: storage.group_updates_handle(),
-            cas_conflicts: storage.cas_conflicts_handle(),
+            generation_updates: storage.generation_updates_handle(),
+            generation_cas_conflicts: storage.generation_cas_conflicts_handle(),
+            member_lists: storage.member_lists_handle(),
         });
 
         controllers.push(Controller::with_storage(storage)?);
@@ -605,41 +666,128 @@ async fn groups_converge_within_their_write_budget() -> Result<()> {
             persisted_group_converged(&shared, &scale.group_id(*group), member_ids, partitions)
                 .await?,
             "group {group} is not fully converged: {:?}",
-            shared.read_group(&scale.group_id(*group)).await?
+            shared
+                .read_group_generation(&scale.group_id(*group))
+                .await?
         );
     }
 
-    let group_updates = counters.iter().map(Counters::group_updates).sum::<u64>();
-    let cas_conflicts = counters.iter().map(Counters::cas_conflicts).sum::<u64>();
+    let formation_updates = Counters::updates(&counters);
+    let formation_conflicts = Counters::conflicts(&counters);
 
     let budget = scale.put_budget_per_member * scale.members as u64 * scale.groups as u64;
 
     info!(
-        group_updates,
-        cas_conflicts,
+        formation_updates,
+        formation_conflicts,
         budget,
-        per_group = group_updates / scale.groups as u64,
-        "group scale cost"
-    );
-
-    // Zero, not "few". A CAS conflict is a write the store rejected, and the
-    // whole argument for routing a group to one owner — and, after #359, for
-    // taking liveness off the contended object — is that a converging group
-    // does not produce them.
-    assert_eq!(
-        0, cas_conflicts,
-        "group-state CAS conflicts across {} replicas",
-        scale.replicas
+        per_group = formation_updates / scale.groups as u64,
+        "group formation cost"
     );
 
     assert!(
-        group_updates <= budget,
-        "group-state PUTs {group_updates} exceed the budget {budget} \
-         ({} groups × {} members × {})",
+        formation_updates <= budget,
+        "forming {} groups cost {formation_updates} writes of generation.json, over the \
+         budget {budget} ({} groups × {} members × {})",
+        scale.groups,
         scale.groups,
         scale.members,
         scale.put_budget_per_member,
     );
+
+    // The steady state, which is the regime that matters: every member of every
+    // group heartbeats, several times over, from the replica it entered
+    // through. Nothing here may touch `generation.json` — no write, so no
+    // conflict — and nothing may LIST a group's member documents.
+    let lists_before = Counters::lists(&counters);
+    let conflicts_before = Counters::conflicts(&counters);
+    let updates_before = Counters::updates(&counters);
+
+    heartbeat_every_member(&scale, &controllers, &shared, &converged).await?;
+
+    let steady_updates = Counters::updates(&counters) - updates_before;
+
+    info!(
+        steady_updates,
+        steady_conflicts = Counters::conflicts(&counters) - conflicts_before,
+        steady_lists = Counters::lists(&counters) - lists_before,
+        "group steady-state cost"
+    );
+
+    // At most one sweep stamp per group may fall inside the window: the sweep
+    // is deduped through the group's own `swept_at_ms`, so it costs one write
+    // per group per session/2 across the whole fleet rather than one per
+    // member per heartbeat.
+    assert!(
+        steady_updates <= scale.groups as u64,
+        "{STEADY_HEARTBEATS} heartbeats per member wrote generation.json {steady_updates} \
+         times across {} groups; only the sweep stamp may write in steady state",
+        scale.groups,
+    );
+
+    // Zero, not "few". A CAS conflict is a write the store rejected, and the
+    // whole argument for routing a group to one owner — and, after #359, for
+    // taking liveness off the contended object — is that a *converged* group
+    // does not produce them at any replica count.
+    assert_eq!(
+        conflicts_before,
+        Counters::conflicts(&counters),
+        "a converged group's heartbeats contended on generation.json across {} replicas",
+        scale.replicas,
+    );
+
+    // The "no LIST on the request path" promise, stated as a count rather than
+    // as a comment: the sweep and the leader's join both fan out over the
+    // generation's member set, which needs no listing.
+    assert_eq!(
+        lists_before,
+        Counters::lists(&counters),
+        "a request path listed a group's member documents",
+    );
+
+    Ok(())
+}
+
+/// Heartbeats every member of every converged group, [`STEADY_HEARTBEATS`]
+/// times, from the replica it entered through — and requires every one of them
+/// to be accepted, so a window that measured nothing because the group had
+/// fallen apart fails rather than passes.
+async fn heartbeat_every_member(
+    scale: &Scale,
+    replicas: &[Replica],
+    shared: &SharedStorage,
+    converged: &BTreeMap<usize, BTreeSet<String>>,
+) -> Result<()> {
+    for (group, member_ids) in converged {
+        let group_id = scale.group_id(*group);
+
+        let generation_id = shared
+            .read_group_generation(&group_id)
+            .await?
+            .map(|(generation, _)| generation.generation_id)
+            .ok_or_else(|| anyhow!("group {group_id} has no generation"))?;
+
+        for _ in 0..STEADY_HEARTBEATS {
+            for (index, member_id) in member_ids.iter().enumerate() {
+                let replica = &replicas[index % replicas.len()];
+
+                match replica
+                    .heartbeat(&group_id, generation_id, member_id.as_str(), None)
+                    .await?
+                {
+                    Body::HeartbeatResponse(heartbeat) => assert_eq!(
+                        i16::from(ErrorCode::None),
+                        heartbeat.error_code,
+                        "{member_id} was not accepted in {group_id} at generation {generation_id}",
+                    ),
+
+                    otherwise => {
+                        return Err(anyhow!("expecting a heartbeat response: {otherwise:?}"));
+                    }
+                }
+            }
+        }
+    }
 
     Ok(())
 }

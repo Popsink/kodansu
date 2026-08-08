@@ -22,8 +22,9 @@ use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
 use tansu_sans_io::{ErrorCode, join_group_response::JoinGroupResponseMember};
 
 use crate::{
-    AssignmentDoc, AssignmentOutcome, ConsumerGroupState, Error, GenerationDoc, GroupDetail,
-    GroupDetailResponse, MemberDoc, MemberRef, NamedGroupDetail, Result, Storage, UpdateError,
+    AssignmentDoc, AssignmentOutcome, ConsumerGroupState, Error, GROUP_SCHEMA_VERSION,
+    GenerationDoc, GroupDetail, GroupDetailResponse, GroupSchema, MemberDoc, MemberRef,
+    NamedGroupDetail, Result, Storage, UpdateError,
     dynostore::{DynoStore, tests::init_tracing},
 };
 
@@ -701,6 +702,80 @@ async fn deleting_a_decomposed_group_removes_all_of_it() -> Result<()> {
     // two stores — a store divergence, which belongs in the conditional-put
     // conformance target where both are exercised, not in a layout test that
     // only ever sees one of them.
+
+    Ok(())
+}
+
+/// The startup assertion (#359): a cluster that has never held a layout gets
+/// this one claimed, and every later start agrees with what is there.
+#[tokio::test]
+async fn a_cluster_with_no_layout_has_this_one_claimed() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let location = Path::from(format!("clusters/{CLUSTER}/schema/groups.json"));
+
+    // Nothing has claimed it yet.
+    assert!(bucket.get(&location).await.is_err());
+
+    DynoStore::new(CLUSTER, NODE, bucket.clone())
+        .assert_group_schema()
+        .await?;
+
+    let claimed: GroupSchema = serde_json::from_slice(
+        &bucket
+            .get(&location)
+            .await
+            .expect("claimed")
+            .bytes()
+            .await
+            .expect("bytes"),
+    )?;
+
+    assert_eq!(GROUP_SCHEMA_VERSION, claimed.version);
+
+    // Every later start — including a second replica coming up beside the
+    // first, which is why the claim is create-only — agrees rather than
+    // re-claiming.
+    for _ in 0..3 {
+        DynoStore::new(CLUSTER, NODE, bucket.clone())
+            .assert_group_schema()
+            .await?;
+    }
+
+    Ok(())
+}
+
+/// A cluster whose groups are in a layout this binary does not write must stop
+/// it starting.
+///
+/// It cannot prevent the mixed fleet it exists for — an old binary never reads
+/// this object — but it is what makes a *rolled-back-then-forward* cluster fail
+/// loudly instead of having two layouts written into it.
+#[tokio::test]
+async fn a_cluster_in_another_layout_refuses_to_start() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let location = Path::from(format!("clusters/{CLUSTER}/schema/groups.json"));
+
+    for version in [GROUP_SCHEMA_VERSION - 1, GROUP_SCHEMA_VERSION + 1] {
+        _ = bucket
+            .put(
+                &location,
+                serde_json::to_vec(&GroupSchema { version })?.into(),
+            )
+            .await
+            .expect("seed a layout");
+
+        assert!(
+            DynoStore::new(CLUSTER, NODE, bucket.clone())
+                .assert_group_schema()
+                .await
+                .is_err(),
+            "a binary writing layout {GROUP_SCHEMA_VERSION} must refuse a cluster in {version}",
+        );
+    }
 
     Ok(())
 }

@@ -33,9 +33,15 @@
 //! each entering via a rotating ingress replica, exactly like production's
 //! per-connection LB scatter.
 //!
-//! Proof and control share every constant: WITH forwarding the group must
-//! fully converge; WITHOUT it (the pre-fix path, bare `Controller`s) the
-//! same consumers must fail to converge inside the same bounded window.
+//! Both arrangements share every constant, and since #359 both must converge.
+//! The control used to assert the opposite — that the scattered path thrashes
+//! the group CAS — because all of a group's state lived behind one etag, so a
+//! group without an owner could not stop its own members starving the write it
+//! was waiting on. Decomposing that object is what removes the reason for the
+//! owner: the scattered arrangement now converges *and* produces no
+//! steady-state contention, which is the precondition #360 needs to delete
+//! forwarding. Forwarding is still exercised here, and still has to work, until
+//! it does.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -63,7 +69,7 @@ use tansu_sans_io::{
     Body, ErrorCode, join_group_request::JoinGroupRequestProtocol,
     join_group_response::JoinGroupResponseMember, sync_group_request::SyncGroupRequestAssignment,
 };
-use tansu_storage::{GroupState, LatencyIntroducingStorage, Storage, StorageContainer};
+use tansu_storage::{LatencyIntroducingStorage, Storage, StorageContainer};
 use tokio::{task::JoinSet, time::timeout};
 use tracing::debug;
 use url::Url;
@@ -101,19 +107,10 @@ const STORE_LATENCY_MS: Range<u64> = 50..150;
 /// non-converging control from looping forever.
 const MAX_ROUNDS: usize = 32;
 
-/// Per-member deadline for the forwarded (must-converge) arrangement. Only
-/// reached on failure — a converged member returns immediately — so it is
-/// deliberately generous: convergence takes ~25s here, but a loaded CI
-/// worker can double that.
+/// Per-member deadline, in both arrangements. Only reached on failure — a
+/// converged member returns immediately — so it is deliberately generous:
+/// convergence takes ~25s here, but a loaded CI worker can double that.
 const FORWARDED_DEADLINE: Duration = Duration::from_secs(120);
-
-/// The bounded window inside which the scattered (control) arrangement must
-/// fail to converge. Deliberately larger than the forwarded arrangement's
-/// observed convergence time (~25s): given strictly more time than
-/// forwarding needs, the pre-fix path still cannot form the group. Unlike
-/// [`FORWARDED_DEADLINE`] this bound is always paid in wall clock — the
-/// unconverging members run it out.
-const SCATTERED_WINDOW: Duration = Duration::from_secs(60);
 
 /// One shared store = one CAS namespace, exactly like N replicas writing the
 /// same S3 bucket.
@@ -142,27 +139,55 @@ async fn shared_storage() -> Result<SharedStorage> {
         .map_err(Into::into)
 }
 
-/// The 10 replicas: independent `Controller`s (each with its own in-memory
-/// wrapper cache, like a real pod) over the one shared store, each behind
-/// deterministically-seeded store latency.
+/// One replica's cost counters, kept together so an assertion names what it
+/// read rather than indexing parallel vectors.
+struct Counters {
+    generation_updates: Arc<AtomicU64>,
+    generation_cas_conflicts: Arc<AtomicU64>,
+}
+
+impl Counters {
+    fn updates(counters: &[Self]) -> u64 {
+        counters
+            .iter()
+            .map(|counters| counters.generation_updates.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    fn conflicts(counters: &[Self]) -> u64 {
+        counters
+            .iter()
+            .map(|counters| counters.generation_cas_conflicts.load(Ordering::Relaxed))
+            .sum()
+    }
+}
+
+/// The 10 replicas: independent `Controller`s over the one shared store, each
+/// behind deterministically-seeded store latency.
 ///
-/// Also returns, aligned by index, a handle to each replica's `update_group`
-/// etag-CAS conflict counter (shared across the `Controller`'s clones), so a
-/// test can assert how much read-modify-write contention the owner replica
-/// actually saw.
-fn replicas(shared: &SharedStorage) -> Result<(Vec<Replica>, Vec<Arc<AtomicU64>>)> {
+/// Also returns, aligned by index, that replica's counters for the object a
+/// group's members can contend on — `generation.json` — so a test can assert
+/// how much read-modify-write contention there actually was. Before #359 the
+/// counters to read were `update_group`'s; that object is no longer written at
+/// all, so reading it here would assert zero of nothing.
+fn replicas(shared: &SharedStorage) -> Result<(Vec<Replica>, Vec<Counters>)> {
     let mut controllers = Vec::with_capacity(REPLICAS);
-    let mut conflicts = Vec::with_capacity(REPLICAS);
+    let mut counters = Vec::with_capacity(REPLICAS);
 
     for index in 0..REPLICAS {
         let storage = LatencyIntroducingStorage::new(shared.clone())
             .with_seed(index as u64)
             .with_latency(STORE_LATENCY_MS);
-        conflicts.push(storage.cas_conflicts_handle());
+
+        counters.push(Counters {
+            generation_updates: storage.generation_updates_handle(),
+            generation_cas_conflicts: storage.generation_cas_conflicts_handle(),
+        });
+
         controllers.push(Controller::with_storage(storage)?);
     }
 
-    Ok((controllers, conflicts))
+    Ok((controllers, counters))
 }
 
 /// The in-process stand-in for the internal-listener hop: given the owner's
@@ -447,34 +472,53 @@ where
     Ok(results)
 }
 
-/// Whether the persisted group is `Formed` covering exactly `member_ids`,
-/// every assignment non-empty, their union covering partitions
-/// `0..PARTITIONS` with no gaps and no duplicates, at a generation (and
-/// object version) that is stable across two reads.
+/// Whether the persisted group is `Stable` over exactly `member_ids`, every
+/// assignment non-empty, their union covering partitions `0..PARTITIONS` with
+/// no gaps and no duplicates, at a generation (and object version) that is
+/// stable across two reads.
+///
+/// Read from the decomposed objects rather than through a projection: what
+/// this has to prove is that the *layout* converged — the generation names
+/// exactly the members, and `assignment/{generation}` exists and covers them —
+/// and a projection that fell back to the legacy object would report a group
+/// that the new write path never wrote.
 async fn persisted_group_converged(
     shared: &SharedStorage,
     member_ids: &BTreeSet<String>,
 ) -> Result<bool> {
-    let Some((detail, version)) = shared.read_group(GROUP_ID).await? else {
+    let Some((generation, version)) = shared.read_group_generation(GROUP_ID).await? else {
         return Ok(false);
     };
 
-    let GroupState::Formed { assignments, .. } = &detail.state else {
+    if generation.members.keys().cloned().collect::<BTreeSet<_>>() != *member_ids {
+        return Ok(false);
+    }
+
+    let Some(assignment) = shared
+        .read_group_assignment(GROUP_ID, generation.generation_id)
+        .await?
+    else {
         return Ok(false);
     };
 
-    if assignments.keys().cloned().collect::<BTreeSet<_>>() != *member_ids {
+    if assignment
+        .assignments
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        != *member_ids
+    {
         return Ok(false);
     }
 
     let mut covered = BTreeSet::new();
 
-    for assignment in assignments.values() {
-        if assignment.is_empty() {
+    for assigned in assignment.assignments.values() {
+        if assigned.is_empty() {
             return Ok(false);
         }
 
-        for partition in decode_partitions(assignment)? {
+        for partition in decode_partitions(assigned)? {
             if !covered.insert(partition) {
                 return Ok(false);
             }
@@ -485,11 +529,20 @@ async fn persisted_group_converged(
         return Ok(false);
     }
 
-    let Some((again, version_again)) = shared.read_group(GROUP_ID).await? else {
+    let Some((again, version_again)) = shared.read_group_generation(GROUP_ID).await? else {
         return Ok(false);
     };
 
-    Ok(detail.generation_id == again.generation_id && version == version_again)
+    Ok(generation.generation_id == again.generation_id && version == version_again)
+}
+
+/// What the group looks like when a diagnostic wants to print it.
+async fn persisted_group(shared: &SharedStorage) -> String {
+    match shared.read_group_generation(GROUP_ID).await {
+        Ok(Some((generation, _))) => format!("{generation:?}"),
+        Ok(None) => String::from("no generation"),
+        Err(error) => format!("{error:?}"),
+    }
 }
 
 // The proof: with every replica wrapped in a `ForwardingCoordinator` whose
@@ -501,7 +554,7 @@ async fn forwarded_sixteen_members_across_ten_replicas_converge() -> Result<()> 
     let _guard = init_tracing()?;
 
     let shared = shared_storage().await?;
-    let (replicas, cas_conflicts) = replicas(&shared)?;
+    let (replicas, counters) = replicas(&shared)?;
     let peers = (0..REPLICAS).map(peer).collect::<Vec<_>>();
 
     let forward = InProcessForward::new(
@@ -562,102 +615,190 @@ async fn forwarded_sixteen_members_across_ten_replicas_converge() -> Result<()> 
         assert_eq!(0, ingress.fallbacks());
     }
 
-    // The heart of the fix. Every member's group-coordination request is
-    // forwarded to the SAME owner replica, and that owner serializes each
-    // group's read->CAS window in-process (the `Controller` per-group lock).
-    // So the 16 concurrent members never collide on the `{group}.json` etag:
-    // the owner observes ZERO CAS conflicts. Remove the per-group lock and the
-    // same concurrent members thrash the CAS (the pre-fix storm) — this count
-    // climbs into the tens and the assertion fails.
+    // Every member's group-coordination request goes to the SAME owner
+    // replica, and that owner serializes each group's read->CAS window
+    // in-process, so the 16 concurrent members never collide on the
+    // generation: the owner observes ZERO conflicts. This used to be the whole
+    // argument for having an owner at all; it is now one of two arrangements
+    // that hold it, which is the point of the sibling test below.
     let owner_index = peers
         .iter()
         .position(|&candidate| candidate == owner_ip)
         .expect("owner is one of the peers");
     assert_eq!(
         0,
-        cas_conflicts[owner_index].load(Ordering::Relaxed),
-        "owner replica saw in-process group-state CAS conflicts despite \
+        counters[owner_index]
+            .generation_cas_conflicts
+            .load(Ordering::Relaxed),
+        "owner replica saw in-process generation CAS conflicts despite \
          per-group serialization"
     );
 
-    // the persisted group is Formed with a non-empty assignment for all 16
+    // the persisted group is Stable with a non-empty assignment for all 16
     // members, the union of assignments covers the partitions uniquely, and
     // the generation (and object version) is stable.
     let member_ids = assigned.keys().cloned().collect::<BTreeSet<_>>();
 
     assert!(
         persisted_group_converged(&shared, &member_ids).await?,
-        "persisted group is not fully converged: {:?}",
-        shared.read_group(GROUP_ID).await?
+        "persisted group is not fully converged: {}",
+        persisted_group(&shared).await
     );
 
     Ok(())
 }
 
-// The control, proving the proof above is meaningful: the SAME 16 consumers,
+// The sibling, and what #359 exists to make true: the SAME 16 consumers,
 // constants and shared-store latency, scattered across the same 10 replicas
-// WITHOUT forwarding (direct-to-random-`Controller` — the pre-fix production
-// path) thrash the single group object's CAS, which is the contention the
-// forwarded path drives to zero.
+// with NO owner and no forwarding, converge — and once converged, stop writing
+// the one object they can contend on at all.
 //
-// This asserted "must NOT converge" until #273. That was the consequence, not
-// the cause: non-convergence is what contention looks like once it is severe
-// enough to prevent assignment, and asserting it made the control brittle to any
-// improvement anywhere in the CAS path. #273's delegation was that improvement —
-// with #111's GET-first gate finally working, each replica reads the persisted
-// group before writing and refreshes on a version mismatch, so the scattered
-// path now converges while the contention it was standing in for is still there.
+// This test asserted the opposite until now. It drove the same members through
+// bare `Controller`s and required them to *thrash* the group CAS, because with
+// every member's liveness, every subscription, the generation and the
+// assignment behind one etag, that is what a group without an owner did: the
+// once-a-second `last_contact` churn starved the leader's assignment write.
+// Asserting the contention was the honest way to state that forwarding was
+// load-bearing.
 //
-// Measured on this configuration (see the discussion on #310): scattered
-// produces 41 CAS conflicts spread across 9 of the 10 replicas, and converges
-// 16/16 inside the window. The forwarded path pins its owner at exactly 0.
+// It is the decomposition that removes the reason for the owner, so the
+// assertions are what the decomposition claims:
 //
-// So the assertion is the contention itself. The floor is deliberately far below
-// the 41 observed — the point is to prove the conflicts exist without forwarding,
-// not to pin a machine-dependent number — and far enough above zero that a
-// genuine collapse in contention fails the test instead of passing it silently,
-// which is what would have happened here.
+//   1. all 16 members converge with no owner, no forwarding and no lock that
+//      spans replicas;
+//   2. **formation** costs a bounded number of generation CAS conflicts — the
+//      members do race to add themselves, and the CAS is what resolves it, so
+//      this is not zero and pretending otherwise would be pinning luck;
+//   3. **steady state** costs nothing per member. A converged group's
+//      heartbeats do not rewrite `generation.json` and do not contend on it;
+//      the only write left is the sweep's stamp, which is one per group per
+//      session/2 *across the whole fleet* rather than one per member per
+//      heartbeat. That is the property that made forwarding necessary, and its
+//      absence is what makes #360 possible.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn scattered_sixteen_members_across_ten_replicas_thrash_the_group_cas() -> Result<()> {
+async fn scattered_sixteen_members_across_ten_replicas_converge_without_conflicts() -> Result<()> {
     let _guard = init_tracing()?;
 
-    /// Well under the 41 measured, well over the 0 the forwarded path achieves.
-    const MINIMUM_SCATTERED_CONFLICTS: u64 = 5;
+    /// Formation conflicts allowed, as a multiple of the member count.
+    ///
+    /// 16 members racing to add themselves to one document produce conflicts
+    /// in the order of the member count, not its square: a loser re-reads,
+    /// finds the winner's document and re-applies its own add, so every round
+    /// of the race admits somebody and the backoff desynchronises the rest.
+    /// Measured on this configuration: **56 conflicts over 72 attempts**, so
+    /// 16 writes landed — exactly one per member, which is the floor for
+    /// admitting 16 members one CAS at a time. The budget is what separates
+    /// that from a regression *in kind* (a path that CASes per heartbeat, or a
+    /// retry loop that never converges), not a pinned measurement.
+    const FORMATION_CONFLICT_BUDGET: u64 = 6;
+
+    /// Heartbeats per member in the steady-state window. Enough that a
+    /// per-heartbeat write would be unmissable, and the whole window is well
+    /// inside the session timeout, so no sweep is due inside it.
+    const STEADY_HEARTBEATS: usize = 4;
 
     let shared = shared_storage().await?;
-    let (replicas, cas_conflicts) = replicas(&shared)?;
+    let (replicas, counters) = replicas(&shared)?;
 
-    let results = drive_members(&replicas, SCATTERED_WINDOW).await?;
+    let results = drive_members(&replicas, FORWARDED_DEADLINE).await?;
 
-    let unassigned = results.iter().filter(|result| result.is_none()).count();
+    let mut assigned = BTreeMap::new();
 
-    let member_ids = results
-        .iter()
-        .flatten()
-        .map(|(member_id, _)| member_id.clone())
-        .collect::<BTreeSet<_>>();
+    for (index, result) in results.into_iter().enumerate() {
+        let (member_id, partitions) =
+            result.unwrap_or_else(|| panic!("member {index} did not converge without an owner"));
 
-    let per_replica = cas_conflicts
-        .iter()
-        .map(|counter| counter.load(Ordering::Relaxed))
-        .collect::<Vec<_>>();
-    let total: u64 = per_replica.iter().sum();
+        assert!(
+            !partitions.is_empty(),
+            "member {index} converged with an empty assignment"
+        );
+        assert!(
+            assigned.insert(member_id.clone(), partitions).is_none(),
+            "duplicate member id {member_id}"
+        );
+    }
+
+    assert_eq!(MEMBERS, assigned.len());
+
+    let member_ids = assigned.keys().cloned().collect::<BTreeSet<_>>();
+
+    assert!(
+        persisted_group_converged(&shared, &member_ids).await?,
+        "persisted group is not fully converged: {}",
+        persisted_group(&shared).await
+    );
+
+    let formation_conflicts = Counters::conflicts(&counters);
 
     debug!(
-        unassigned,
-        assigned = member_ids.len(),
-        total,
-        ?per_replica,
-        "scattered members contended on the group object"
+        formation_conflicts,
+        formation_updates = Counters::updates(&counters),
+        "scattered members formed the group"
     );
 
     assert!(
-        total >= MINIMUM_SCATTERED_CONFLICTS,
-        "scattered members produced {total} group-state CAS conflicts \
-         (per replica: {per_replica:?}), under the {MINIMUM_SCATTERED_CONFLICTS} this control \
-         exists to demonstrate. Either the contention forwarding removes has \
-         collapsed — in which case #240's justification needs re-reading, not this \
-         floor lowering — or the scattered path is no longer scattering."
+        formation_conflicts <= FORMATION_CONFLICT_BUDGET * MEMBERS as u64,
+        "forming the group scattered cost {formation_conflicts} generation CAS conflicts, \
+         over the {} budgeted for {MEMBERS} members",
+        FORMATION_CONFLICT_BUDGET * MEMBERS as u64,
+    );
+
+    // The steady-state window. Every member heartbeats, from the replica it
+    // entered through, at the generation it converged at.
+    let generation_id = shared
+        .read_group_generation(GROUP_ID)
+        .await?
+        .map(|(generation, _)| generation.generation_id)
+        .expect("the group must have a generation");
+
+    let updates_before = Counters::updates(&counters);
+    let conflicts_before = Counters::conflicts(&counters);
+
+    for _ in 0..STEADY_HEARTBEATS {
+        for (index, member_id) in member_ids.iter().enumerate() {
+            let replica = &replicas[index % replicas.len()];
+
+            match replica
+                .heartbeat(GROUP_ID, generation_id, member_id.as_str(), None)
+                .await?
+            {
+                Body::HeartbeatResponse(heartbeat) => assert_eq!(
+                    i16::from(ErrorCode::None),
+                    heartbeat.error_code,
+                    "member {member_id} was not accepted at generation {generation_id}"
+                ),
+
+                otherwise => return Err(anyhow!("expecting a heartbeat response: {otherwise:?}")),
+            }
+        }
+    }
+
+    // At most the sweep's stamp: the window is shorter than session/2, so one
+    // sweep can fall inside it and a second cannot. 64 heartbeats, one write —
+    // and that write is the group's, not any member's.
+    let steady_updates = Counters::updates(&counters) - updates_before;
+
+    assert!(
+        steady_updates <= 1,
+        "{} heartbeats rewrote generation.json {steady_updates} times; only the \
+         sweep stamp (one per group per session/2) may write in steady state",
+        STEADY_HEARTBEATS * MEMBERS,
+    );
+
+    assert_eq!(
+        conflicts_before,
+        Counters::conflicts(&counters),
+        "a converged group's heartbeats contended on generation.json",
+    );
+
+    assert_eq!(
+        generation_id,
+        shared
+            .read_group_generation(GROUP_ID)
+            .await?
+            .map(|(generation, _)| generation.generation_id)
+            .expect("the group must still have a generation"),
+        "a converged group's heartbeats moved its generation",
     );
 
     Ok(())

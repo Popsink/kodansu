@@ -12,11 +12,45 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! The consumer group coordinator, over the decomposed group objects (#359).
+//!
+//! Every group-mutating API used to read-modify-write one object —
+//! `groups/consumers/{group}.json` — behind one etag. That object carried
+//! per-member liveness (roughly one write-worthy event per second per member),
+//! each member's subscription, the group's generation and leader, and the
+//! leader's assignment map, so liveness churn structurally starved the one
+//! write that had to land. Group forwarding and the per-group in-process lock
+//! exist to compensate for that, which is why replicas need pod identity.
+//!
+//! The state now lives in three objects with three write regimes — see
+//! [`tansu_storage::MemberDoc`], [`tansu_storage::GenerationDoc`] and
+//! [`tansu_storage::AssignmentDoc`] — and this module is what drives them:
+//!
+//! - a request holds **no** cached group state. It composes a [`GroupView`]
+//!   from the store, answers from it, and forgets it: two fresh
+//!   [`Controller`]s answer the same request identically, with no warm-up.
+//! - the only object several members contend on is `generation.json`, and it
+//!   only changes when the group's *composition* does. A member's liveness
+//!   goes to its own document, at most once per session/2.
+//! - the leader's assignment is written **create-only**, so the write that used
+//!   to be starved has no etag to lose a race on: exactly one writer wins the
+//!   key, and `Stable` is derived from that object's existence rather than
+//!   stored.
+//! - a lapsed member is reclaimed by a [sweep](Controller::sweep) whose verdict
+//!   is a pure function of the member documents and the clock, so N replicas
+//!   running it concurrently reach identical conclusions and cost one sweep per
+//!   group per session/2 *globally*.
+//!
+//! The per-group in-process lock survives as an optimisation only: it narrows
+//! the window in which two members served by the same replica race on
+//! `generation.json`. The CAS is the correctness mechanism, and every path is
+//! written to be correct without the lock — which is what lets #360 delete
+//! forwarding.
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
-    fmt::{self, Debug},
-    hash::{Hash, Hasher},
-    marker::PhantomData,
+    fmt::Debug,
+    hash::Hash,
     ops::{Deref, Div as _, Mul},
     sync::{Arc, LazyLock, Mutex},
     time::SystemTime,
@@ -24,6 +58,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::StreamExt as _;
 use opentelemetry::{
     KeyValue,
     metrics::{Counter, Gauge},
@@ -47,10 +82,11 @@ use tansu_sans_io::{
     },
     sync_group_request::SyncGroupRequestAssignment,
     sync_group_response::SyncGroupResponse,
+    to_timestamp,
 };
 use tansu_storage::{
-    ConsumerGroupState, GroupDetail, GroupMember, GroupState, OffsetCommitRequest, Storage,
-    Topition, UpdateError, Version,
+    AssignmentDoc, AssignmentOutcome, ConsumerGroupState, GenerationDoc, MemberDoc, MemberRef,
+    OffsetCommitRequest, Storage, Topition, UpdateError, Version,
 };
 use tokio::time::{Duration, Instant, sleep};
 use tracing::{debug, error, info, instrument, warn};
@@ -67,55 +103,68 @@ const PAUSE_MS: u128 = 3_000;
 /// (now complete) member list. Kafka holds every JoinGroup — the leader above
 /// all — inside a rebalance window (`InitialDelayedJoin` / `DelayedJoin`, with
 /// `group.initial.rebalance.delay.ms` defaulting to 3s) so the leader computes
-/// assignments for the full membership. This broker has no timer state, only
-/// the shared group object, so the window is inferred instead: membership is
-/// quiescent once the successive GET-first reads of the join loop have shown
-/// the same member set for this long. Must exceed the CAS conflict backoff cap
-/// (500ms + 50% jitter, see `cas_conflict_backoff`) plus the 1s long-poll
-/// cadence, so a member mid-retry on another replica is not missed.
+/// assignments for the full membership. This broker has no timer state, so the
+/// window is inferred instead — from `GenerationDoc::members_changed_at_ms`,
+/// which is persisted precisely so that **every replica reaches the same
+/// verdict**: the barrier used to be inferred from what one call had happened
+/// to observe, which is not a property of the group. Must exceed the CAS
+/// conflict backoff cap (500ms + 50% jitter, see `cas_conflict_backoff`) plus
+/// the 1s long-poll cadence, so a member mid-retry on another replica is not
+/// missed.
 const JOIN_QUIESCENCE: Duration = Duration::from_secs(3);
 
-/// After this many consecutive object-store CAS conflicts on a single group's
-/// state object, log a warning: sustained conflicts mean several members of the
-/// same group are landing on different replicas behind a shared endpoint (the
-/// scenario mitigated client-side in #43).
+/// After this many consecutive CAS conflicts on a single group's generation,
+/// log a warning. Sustained conflicts now mean something is genuinely wrong:
+/// the generation only changes when the group's composition does, so a healthy
+/// group in steady state produces none at all.
 const CAS_CONFLICT_WARN: u32 = 16;
 
-/// Backoff before retrying a group-state write that lost the object-store CAS
-/// race (another replica updated the same `{group}.json` first). Without it the
-/// retry loop spins as fast as the store answers, hammering the shared object
-/// and keeping racing replicas in lock-step. Exponential (5ms·2^n) capped at
-/// 500ms, plus up to 50% jitter to desynchronise replicas. See #44.
+/// How many times a non-polling API re-reads and re-applies after losing the
+/// generation CAS before it gives up.
+///
+/// `join` and `sync` need no such bound — they long-poll, so a caller's own
+/// deadline ends the call — but `leave` answers in one pass, and an unbounded
+/// retry against a group being hammered by another replica would hold the
+/// request open indefinitely rather than let the client retry.
+const MAX_GENERATION_CAS_ATTEMPTS: u32 = 64;
+
+/// The session timeout to assume when a group or a member declares none.
+/// Kafka's own default, and the value this coordinator has always fallen back
+/// to when reasoning about liveness.
+const DEFAULT_SESSION_TIMEOUT_MS: i32 = 45_000;
+
+/// Concurrency of the per-member document fan-outs (the leader's join response
+/// and the sweep), matching the fan-outs in the storage engine.
+const MEMBER_FETCH_CONCURRENCY: usize = 32;
+
+/// Backoff before retrying a group write that lost the object-store CAS race
+/// (another replica updated the same object first). Without it the retry loop
+/// spins as fast as the store answers, hammering the shared object and keeping
+/// racing replicas in lock-step. Exponential (5ms·2^n) capped at 500ms, plus up
+/// to 50% jitter to desynchronise replicas. See #44.
 fn cas_conflict_backoff(attempt: u32) -> Duration {
     let base_ms = 5u64.saturating_mul(1u64 << attempt.min(7)).min(500);
     let jitter = rng().random_range(0..=base_ms / 2);
     Duration::from_millis(base_ms + jitter)
 }
 
-/// Two persisted group projections represent the same rebalance state when they
-/// agree on everything except each member's `last_contact` — the liveness
-/// timestamp that `missed_heartbeat` refreshes to `now` on *every* dynamic-member
-/// join/sync (`administrator.rs` `missed_heartbeat`). A waiting member long-polls
-/// join/sync once a second; each poll bumps only its own `last_contact`, so an
-/// unconditional PUT churns the single `{group}.json` etag ~once/sec/member. With
-/// many members that churn structurally starves the one write that matters — the
-/// leader's large SyncGroup assignment CAS — so the group never reaches `Stable`.
-/// The join/sync loops use this to skip the PUT on a no-op poll (mirroring the
-/// heartbeat GET-first skip in #111), leaving the etag still long enough for the
-/// assignment write to land. `members` is a `BTreeMap`, so ordered `zip` is a
-/// valid key/value comparison.
-fn same_rebalance_state(a: &GroupDetail, b: &GroupDetail) -> bool {
-    a.session_timeout_ms == b.session_timeout_ms
-        && a.rebalance_timeout_ms == b.rebalance_timeout_ms
-        && a.generation_id == b.generation_id
-        && a.skip_assignment == b.skip_assignment
-        && a.inception == b.inception
-        && a.state == b.state
-        && a.members.len() == b.members.len()
-        && a.members
-            .iter()
-            .zip(b.members.iter())
-            .all(|((ak, av), (bk, bv))| ak == bk && av.join_response == bv.join_response)
+/// `now` as epoch milliseconds.
+///
+/// Every timestamp this coordinator persists is in this form, because they are
+/// read and compared by replicas that share no monotonic clock: the join
+/// window, a member's session and the sweep stamp are all differences between
+/// two epoch readings, one of which was taken on another machine.
+fn epoch_ms(now: SystemTime) -> i64 {
+    to_timestamp(&now).unwrap_or_default()
+}
+
+/// A declared session timeout, or the default when it is absent or nonsensical.
+fn session_timeout_or_default(session_timeout_ms: i32) -> i32 {
+    if session_timeout_ms > 0 {
+        session_timeout_ms
+    } else {
+        DEFAULT_SESSION_TIMEOUT_MS
+    }
 }
 
 /// Whether two encoded member subscriptions request the SAME set of topics.
@@ -150,45 +199,30 @@ fn same_subscription_topics(a: &Bytes, b: &Bytes) -> bool {
     }
 }
 
-/// Whether `member_id`'s persisted `last_contact` (as seen in the just-read
-/// projection `before`) is stale enough that a no-op poll must still persist a
-/// refreshed timestamp, so a member waiting through a long rebalance is never
-/// spuriously evicted by another replica. Bounded to half the session timeout —
-/// well inside the eviction deadline — this fires at most once per
-/// `session_timeout/2` per member, negligible next to the once-a-second churn it
-/// replaces. An absent member or missing timestamp forces the write.
-fn liveness_renewal_due(
-    before: &GroupDetail,
-    member_id: &str,
-    now: SystemTime,
-    session_timeout_ms: i32,
-) -> bool {
-    if member_id.is_empty() {
-        return false;
-    }
-    match before
-        .members
-        .get(member_id)
-        .and_then(|member| member.last_contact)
-    {
-        Some(last_contact) => {
-            let elapsed = now.duration_since(last_contact).unwrap_or_default();
-            let half = (u64::try_from(session_timeout_ms).unwrap_or(45_000)) / 2;
-            elapsed >= Duration::from_millis(half)
-        }
-        None => true,
-    }
+/// Whether a member's liveness is stale enough that this request must persist a
+/// refreshed timestamp.
+///
+/// Bounded to half the session timeout — well inside the eviction deadline — so
+/// it fires at most once per `session_timeout/2` per member, which is the whole
+/// of what the old once-a-second `last_contact` churn was buying. A member with
+/// no document at all must write one: the sweep reads a missing document as an
+/// expired session.
+fn liveness_renewal_due(member: Option<&MemberDoc>, now_ms: i64, session_timeout_ms: i32) -> bool {
+    let Some(member) = member else {
+        return true;
+    };
+
+    now_ms.saturating_sub(member.last_contact_ms)
+        >= i64::from(session_timeout_or_default(session_timeout_ms)) / 2
 }
 
 /// What a `join` or `sync` iteration does once this member's group state is
 /// settled: wait and re-poll, or answer now.
 ///
-/// Both APIs reach this decision twice per iteration — once on the no-op
-/// long-poll skip and once after the state CAS — and the two copies differ only
-/// in which of them wrote. Holding it in one place per API means a change to
-/// the hold conditions cannot land on one branch and miss the other (#286),
-/// and leaves the genuine protocol difference between `join` and `sync` stated
-/// where it can be read rather than buried in a pasted `else if` chain.
+/// Both APIs reach this decision once per iteration. Holding it in one place
+/// per API means a change to the hold conditions cannot land on one branch and
+/// miss the other (#286), and leaves the genuine protocol difference between
+/// `join` and `sync` stated where it can be read.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LongPoll {
     /// Sleep for this long, then run another iteration. The label names the
@@ -209,18 +243,15 @@ enum LongPoll {
 /// leader, assigned, or told to retry under a broker-issued member id — is
 /// answered immediately; anyone else waits up to **half** its session timeout
 /// and is then answered anyway.
-fn join_long_poll<O>(
-    updated: &Wrapper<O>,
+fn join_long_poll(
+    updated: &GroupView,
     body: &Body,
     group_instance_id: Option<&str>,
     elapsed_ms: u128,
     is_forming: bool,
     membership_quiescent: bool,
     join_window_ms: u128,
-) -> LongPoll
-where
-    O: Storage,
-{
+) -> LongPoll {
     let is_leader = updated.is_leader(body);
     let is_assigned = updated.is_assigned(body);
     let is_member_id_required = updated.is_member_id_required(body);
@@ -267,15 +298,12 @@ where
 /// on the leader's single assignment write — and is then terminated with
 /// `RebalanceInProgress`, so the client rejoins instead of settling on an empty
 /// assignment.
-fn sync_long_poll<O>(
-    updated: &Wrapper<O>,
+fn sync_long_poll(
+    updated: &GroupView,
     body: &Body,
     group_instance_id: Option<&str>,
     elapsed_ms: u128,
-) -> LongPoll
-where
-    O: Storage,
-{
+) -> LongPoll {
     let is_forming = updated.is_forming();
     let is_assigned = updated.is_assigned(body);
     let is_ok = updated.is_ok(body);
@@ -362,107 +390,6 @@ fn warn_on_overlapping_assignments(
     );
 }
 
-/// The `COORDINATOR_REQUESTS` labels one API's CAS loop emits, so the shared
-/// driver can count per-API without building a string per iteration — every
-/// member heartbeats every few seconds, so this is a hot path.
-#[derive(Clone, Copy, Debug)]
-struct CasLabels {
-    /// One per loop iteration.
-    iteration: &'static str,
-
-    /// The no-op skip fired: the group object was left alone.
-    noop_skip: &'static str,
-
-    /// The CAS lost to a concurrent writer.
-    outdated: &'static str,
-}
-
-/// The per-API half of [`Controller::run_group_cas_loop`].
-///
-/// The driver owns everything the five group-mutating APIs do identically — the
-/// group lock, the `wrappers` cache, the GET-first reconcile, the CAS and its
-/// five-arm `UpdateError` match, the conflict backoff — and an implementation
-/// supplies only what genuinely differs.
-///
-/// That split is the whole point (#286). The sequence was written out five
-/// times, so #111 and #256 each had to be applied five times, and #273 was the
-/// heartbeat copy of a skip that join and sync had already moved on from: a
-/// `GroupDetail` equality that could never hold, so the skip fired only on
-/// errors and every member wrote a CAS per interval. With one definition a fix
-/// reaches all five by construction, and what an API does differently is
-/// stated in its implementation rather than buried in a pasted branch.
-///
-/// An implementation is built once per request and owns that request's
-/// arguments and its across-iteration state, which is why the hooks take
-/// `&mut self` and the driver holds none of it.
-trait GroupCas<O>: Send
-where
-    O: Storage + Clone,
-{
-    const LABELS: CasLabels;
-
-    /// Read `{group}.json` before evaluating the request (#111), so a change
-    /// made on another replica is observed by a cheap read rather than learnt
-    /// from a failed CAS. It is also what arms [`Self::skip`]: with no persisted
-    /// object there is nothing to be equal to, so the create must go through.
-    ///
-    /// `leave` opts out. It is terminal — nothing to long-poll, no skip to arm —
-    /// so the read would buy nothing the CAS does not already provide.
-    const GET_FIRST: bool = true;
-
-    /// Sleep between CAS conflicts. Only the long-polling APIs do: join and sync
-    /// have every member of a group converging on one object, so an
-    /// un-backed-off retry storm is real. The others answer in a single pass and
-    /// retry immediately.
-    const BACKOFF_ON_CONFLICT: bool = false;
-
-    /// The `Wrapper` to start from when the in-process cache misses.
-    fn seed(&self, storage: O) -> Wrapper<O> {
-        Wrapper::Forming(Inner::new(storage))
-    }
-
-    /// Everything between the reconcile and the CAS: `missed_heartbeat` where
-    /// the API wants it, then the delegation to `Wrapper`.
-    fn apply(
-        &mut self,
-        group_id: &str,
-        now: SystemTime,
-        wrapper: Wrapper<O>,
-    ) -> impl Future<Output = (Wrapper<O>, Body)> + Send;
-
-    /// Report a group that has stopped making progress (#240), from the state
-    /// this iteration read (`before`) or produced (`after`), per API.
-    fn observe(
-        &self,
-        _controller: &Controller<O>,
-        _group_id: &str,
-        _before: &GroupDetail,
-        _after: &GroupDetail,
-        _now: SystemTime,
-    ) {
-    }
-
-    /// Whether this iteration changed nothing worth a PUT (#111). Consulted only
-    /// when the group object was actually read, so an API with
-    /// [`Self::GET_FIRST`] off can never skip.
-    fn skip(&self, _before: &GroupDetail, _after: &GroupDetail, _now: SystemTime) -> bool {
-        false
-    }
-
-    /// What to do now that this iteration's state is settled — whether it was
-    /// settled by the skip or by a landed CAS. The non-polling APIs answer
-    /// immediately; join and sync defer to their long-poll decision.
-    fn settled(
-        &mut self,
-        _updated: &Wrapper<O>,
-        _body: &Body,
-        _after: &GroupDetail,
-        _now: SystemTime,
-    ) -> LongPoll {
-        LongPoll::Respond(None)
-    }
-}
-
 static COORDINATOR_REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_group_coordinator_requests")
@@ -510,14 +437,9 @@ static GROUPS_CACHED: LazyLock<Gauge<u64>> = LazyLock::new(|| {
 ///
 /// Comfortably above every window a *live* group can be quiet for — the session
 /// timeout, the rebalance timeout, the join long-poll — because the cost of
-/// being wrong in that direction is not a stale answer (every path re-reads the
-/// group object GET-first, so an evicted entry costs a cache miss) but pointless
-/// re-reads on a busy group. Well below the pod lifetime, which is the window
-/// the growth was previously bounded by.
-///
-/// Not tied to the storage engine's group-expiry threshold: this is not a
-/// statement about when a group is dead, only about when this replica has
-/// stopped hearing from one.
+/// being wrong in that direction is not a stale answer (nothing evicted here is
+/// authority) but a pointlessly re-created lock on a busy group. Well below the
+/// pod lifetime, which is the window the growth was previously bounded by.
 pub const GROUP_STATE_IDLE_AFTER: Duration = Duration::from_mins(30);
 
 /// Floor for [`stall_after`] — the threshold used when a group declares no
@@ -533,7 +455,7 @@ pub const GROUP_STATE_IDLE_AFTER: Duration = Duration::from_mins(30);
 /// hours the incident ran.
 const REBALANCE_STALL_FLOOR: Duration = Duration::from_secs(120);
 
-/// How long `group` may sit in `CompletingRebalance` before it is reported
+/// How long a group may sit in `CompletingRebalance` before it is reported
 /// (#240).
 ///
 /// Taken from the group's **own** `rebalance_timeout_ms` where it declares one.
@@ -547,427 +469,85 @@ const REBALANCE_STALL_FLOOR: Duration = Duration::from_secs(120);
 /// this exists for it lasted **hours**, silently: the broker reported the group
 /// as existing with all its members while the clients waited for an assignment
 /// that never came, and the only symptom was "the worker consumes nothing".
-fn stall_after(detail: &GroupDetail) -> Duration {
-    detail
-        .rebalance_timeout_ms
+fn stall_after(rebalance_timeout_ms: Option<i32>) -> Duration {
+    rebalance_timeout_ms
         .filter(|ms| *ms > 0)
         .map_or(REBALANCE_STALL_FLOOR, |ms| {
             Duration::from_millis(ms as u64).max(REBALANCE_STALL_FLOOR)
         })
 }
 
-#[async_trait]
-pub trait Group: Debug + Send {
-    type JoinState;
-    type SyncState;
-    type HeartbeatState;
-    type LeaveState;
-    type OffsetCommitState;
-    type OffsetFetchState;
+/// Everything a request needs to know about a group, composed from the store
+/// each time rather than cached (#359).
+///
+/// This is what replaced the `Wrapper`/`Inner` typestate and the map of them
+/// this controller used to hold. The typestate encoded `Forming`/`Formed` as a
+/// Rust type, which meant the coordinator's idea of a group's state had to be
+/// *maintained*: adopted on a GET-first read, re-adopted on a lost CAS, rebuilt
+/// on a cache miss, and reconciled with whatever another replica had done in
+/// between. Here `Formed` is derived — from the existence of an immutable
+/// object — so there is nothing to maintain and nothing to go stale: a request
+/// is a pure function of the store.
+#[derive(Clone, Debug, Default)]
+struct GroupView {
+    /// The group's composition. `Default` when `generation.json` is absent,
+    /// which — together with a `None` [`Self::version`] — is how a group that
+    /// does not exist reads.
+    generation: GenerationDoc,
 
-    #[allow(clippy::too_many_arguments)]
-    async fn join(
-        self,
-        now: SystemTime,
-        client_id: Option<&str>,
-        group_id: &str,
-        session_timeout_ms: i32,
-        rebalance_timeout_ms: Option<i32>,
-        member_id: &str,
-        group_instance_id: Option<&str>,
-        protocol_type: &str,
-        protocols: Option<&[JoinGroupRequestProtocol]>,
-        reason: Option<&str>,
-    ) -> (Self::JoinState, Body);
+    /// The generation object's version, and so the CAS token for the next write
+    /// of it. `None` means the object is not there, so the next write must
+    /// create it.
+    version: Option<Version>,
 
-    #[allow(clippy::too_many_arguments)]
-    async fn sync(
-        self,
-        now: SystemTime,
-        group_id: &str,
-        generation_id: i32,
-        member_id: &str,
-        group_instance_id: Option<&str>,
-        protocol_type: Option<&str>,
-        protocol_name: Option<&str>,
-        assignments: Option<&[SyncGroupRequestAssignment]>,
-    ) -> (Self::SyncState, Body);
-
-    async fn heartbeat(
-        self,
-        now: SystemTime,
-        group_id: &str,
-        generation_id: i32,
-        member_id: &str,
-        group_instance_id: Option<&str>,
-    ) -> (Self::HeartbeatState, Body);
-
-    async fn leave(
-        self,
-        now: SystemTime,
-        group_id: &str,
-        member_id: Option<&str>,
-        members: Option<&[MemberIdentity]>,
-    ) -> (Self::LeaveState, Body);
-
-    #[allow(clippy::too_many_arguments)]
-    async fn offset_commit(
-        self,
-        now: SystemTime,
-        detail: &OffsetCommit<'_>,
-    ) -> (Self::OffsetCommitState, Body);
-
-    async fn offset_fetch(
-        self,
-        now: SystemTime,
-        group_id: Option<&str>,
-        topics: Option<&[OffsetFetchRequestTopic]>,
-        groups: Option<&[OffsetFetchRequestGroup]>,
-        require_stable: Option<bool>,
-    ) -> (Self::OffsetFetchState, Body);
+    /// `assignment/{generation_id}`, when the leader of that generation has
+    /// written it. Immutable, so its presence is final for that generation.
+    assignment: Option<AssignmentDoc>,
 }
 
-#[derive(Clone, Debug)]
-pub enum Wrapper<O> {
-    Forming(Inner<O, Forming>),
-    Formed(Inner<O, Formed>),
-}
-
-impl<O> fmt::Display for Wrapper<O> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Wrapper::Forming(inner) => write!(f, "wrap: {}", inner),
-            Wrapper::Formed(inner) => write!(f, "wrap: {}", inner),
-        }
-    }
-}
-
-impl<O> PartialEq for Wrapper<O> {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Forming(sinner), Self::Forming(oinner)) => sinner == oinner,
-            (Self::Formed(sinner), Self::Formed(oinner)) => sinner == oinner,
-            _ => false,
-        }
-    }
-}
-
-impl<O> Hash for Wrapper<O>
-where
-    O: Storage,
-{
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        match self {
-            Self::Forming(inner) => {
-                state.write_u8(3);
-                inner.hash(state)
-            }
-            Self::Formed(inner) => {
-                state.write_u8(5);
-                inner.hash(state)
-            }
-        }
-    }
-}
-
-impl<O> From<Inner<O, Forming>> for Wrapper<O>
-where
-    O: Storage,
-{
-    fn from(value: Inner<O, Forming>) -> Self {
-        Self::Forming(value)
-    }
-}
-
-impl<O> From<Inner<O, Formed>> for Wrapper<O>
-where
-    O: Storage,
-{
-    fn from(value: Inner<O, Formed>) -> Self {
-        Self::Formed(value)
-    }
-}
-
-impl<O> From<&Wrapper<O>> for GroupDetail
-where
-    O: Storage,
-{
-    fn from(value: &Wrapper<O>) -> Self {
-        match value {
-            Wrapper::Forming(Inner {
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                members,
-                generation_id,
-                state,
-                skip_assignment,
-                inception,
-                ..
-            }) => GroupDetail {
-                session_timeout_ms: *session_timeout_ms,
-                rebalance_timeout_ms: *rebalance_timeout_ms,
-                members: members
-                    .iter()
-                    .map(|(id, member)| {
-                        (
-                            id.to_owned(),
-                            GroupMember {
-                                join_response: member.join_response.clone(),
-                                last_contact: member.last_contact,
-                            },
-                        )
-                    })
-                    .collect(),
-                generation_id: *generation_id,
-                skip_assignment: *skip_assignment,
-                inception: *inception,
-                state: GroupState::Forming {
-                    protocol_type: state.protocol_type.clone(),
-                    protocol_name: state.protocol_name.clone(),
-                    leader: state.leader.clone(),
-                },
-            },
-            Wrapper::Formed(Inner {
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                members,
-                generation_id,
-                state,
-                skip_assignment,
-                inception,
-                ..
-            }) => GroupDetail {
-                session_timeout_ms: *session_timeout_ms,
-                rebalance_timeout_ms: *rebalance_timeout_ms,
-                members: members
-                    .iter()
-                    .map(|(id, member)| {
-                        (
-                            id.to_owned(),
-                            GroupMember {
-                                join_response: member.join_response.clone(),
-                                last_contact: member.last_contact,
-                            },
-                        )
-                    })
-                    .collect(),
-                generation_id: *generation_id,
-                skip_assignment: *skip_assignment,
-                inception: *inception,
-                state: GroupState::Formed {
-                    protocol_type: state.protocol_type.clone(),
-                    protocol_name: state.protocol_name.clone(),
-                    leader: state.leader.clone(),
-                    assignments: state.assignments.clone(),
-                },
-            },
-        }
-    }
-}
-
-impl<O> Wrapper<O>
-where
-    O: Storage,
-{
-    pub fn with_storage_group_detail(storage: O, gd: GroupDetail) -> Self {
-        match gd.state {
-            GroupState::Forming {
-                protocol_type,
-                protocol_name,
-                mut leader,
-            } => {
-                if let Some(ref leader_id) = leader
-                    && !gd
-                        .members
-                        .iter()
-                        .any(|(member_id, _)| member_id == leader_id)
-                {
-                    _ = leader.take();
-                }
-
-                Self::Forming(Inner {
-                    session_timeout_ms: gd.session_timeout_ms,
-                    rebalance_timeout_ms: gd.rebalance_timeout_ms,
-                    members: gd
-                        .members
-                        .iter()
-                        .map(|(id, member)| {
-                            (
-                                id.to_owned(),
-                                Member {
-                                    join_response: member.join_response.clone(),
-                                    last_contact: member.last_contact,
-                                },
-                            )
-                        })
-                        .collect(),
-                    generation_id: gd.generation_id,
-                    state: Forming {
-                        protocol_type,
-                        protocol_name,
-                        leader,
-                    },
-                    storage,
-                    skip_assignment: gd.skip_assignment,
-                    inception: gd.inception,
-                })
-            }
-            GroupState::Formed {
-                protocol_type,
-                protocol_name,
-                leader,
-                assignments,
-            } => Self::Formed(Inner {
-                session_timeout_ms: gd.session_timeout_ms,
-                rebalance_timeout_ms: gd.rebalance_timeout_ms,
-                members: gd
-                    .members
-                    .iter()
-                    .map(|(id, member)| {
-                        (
-                            id.to_owned(),
-                            Member {
-                                join_response: member.join_response.clone(),
-                                last_contact: member.last_contact,
-                            },
-                        )
-                    })
-                    .collect(),
-                generation_id: gd.generation_id,
-                state: Formed {
-                    protocol_type,
-                    protocol_name,
-                    leader,
-                    assignments,
-                },
-                storage,
-                skip_assignment: gd.skip_assignment,
-                inception: gd.inception,
-            }),
-        }
+impl GroupView {
+    /// Whether the group has a `generation.json` at all.
+    fn exists(&self) -> bool {
+        self.version.is_some()
     }
 
-    pub fn generation_id(&self) -> i32 {
-        match self {
-            Self::Forming(inner) => inner.generation_id,
-            Self::Formed(inner) => inner.generation_id,
-        }
+    fn generation_id(&self) -> i32 {
+        self.generation.generation_id
     }
 
-    pub fn inception(&self) -> SystemTime {
-        match self {
-            Self::Forming(inner) => inner.inception,
-            Self::Formed(inner) => inner.inception,
-        }
+    fn leader(&self) -> Option<&str> {
+        self.generation.leader.as_deref()
     }
 
-    pub fn session_timeout_ms(&self) -> i32 {
-        match self {
-            Self::Forming(inner) => inner.session_timeout_ms,
-            Self::Formed(inner) => inner.session_timeout_ms,
-        }
+    fn session_timeout_ms(&self) -> i32 {
+        session_timeout_or_default(self.generation.session_timeout_ms)
     }
 
-    pub fn rebalance_timeout_ms(&self) -> Option<i32> {
-        match self {
-            Self::Forming(inner) => inner.rebalance_timeout_ms,
-            Self::Formed(inner) => inner.rebalance_timeout_ms,
-        }
+    /// The assignment in force, which is the one written **for this
+    /// generation**. An assignment left behind by an earlier generation is not
+    /// this group's assignment, and reading it as one is how a rebalance in
+    /// progress reports as `Stable`.
+    fn assignments(&self) -> Option<&BTreeMap<String, Bytes>> {
+        self.assignment
+            .as_ref()
+            .filter(|assignment| assignment.generation_id == self.generation.generation_id)
+            .map(|assignment| &assignment.assignments)
     }
 
-    pub fn protocol_type(&self) -> Option<&str> {
-        match self {
-            Self::Forming(inner) => inner.state.protocol_type.as_deref(),
-            Self::Formed(inner) => Some(inner.state.protocol_type.as_str()),
-        }
+    /// The group's state, derived exactly as `DescribeGroups` derives it, so
+    /// the coordinator and every admin tool agree.
+    fn state(&self) -> ConsumerGroupState {
+        self.generation.state(self.assignments().is_some())
     }
 
-    pub fn protocol_name(&self) -> Option<&str> {
-        match self {
-            Self::Forming(inner) => inner.state.protocol_name.as_deref(),
-            Self::Formed(inner) => Some(inner.state.protocol_name.as_str()),
-        }
-    }
-
-    pub fn leader(&self) -> Option<&str> {
-        match self {
-            Self::Forming(inner) => inner.state.leader.as_deref(),
-            Self::Formed(inner) => Some(inner.state.leader.as_str()),
-        }
-    }
-
-    pub fn skip_assignment(&self) -> Option<&bool> {
-        match self {
-            Self::Forming(inner) => inner.skip_assignment.as_ref(),
-            Self::Formed(inner) => inner.skip_assignment.as_ref(),
-        }
-    }
-
-    fn members(&self) -> Vec<JoinGroupResponseMember> {
-        match self {
-            Self::Forming(inner) => inner
-                .members
-                .values()
-                .cloned()
-                .map(|member| member.join_response)
-                .collect(),
-
-            Self::Formed(inner) => inner
-                .members
-                .values()
-                .cloned()
-                .map(|member| member.join_response)
-                .collect(),
-        }
-    }
-
+    /// Whether the group is anything other than `Stable` — the successor to
+    /// `Wrapper::Forming`, and derived rather than held.
     fn is_forming(&self) -> bool {
-        matches!(self, Self::Forming(..))
-    }
-
-    fn assignments(&self) -> Option<BTreeMap<String, Bytes>> {
-        match self {
-            Self::Forming(..) => None,
-            Self::Formed(inner) => Some(inner.state.assignments.clone()),
-        }
-    }
-
-    #[instrument(skip(self, now))]
-    fn missed_heartbeat(self, group_id: &str, member_id: &str, now: SystemTime) -> Self {
-        match self {
-            Self::Forming(mut inner) => {
-                _ = inner.missed_heartbeat(group_id, member_id, now);
-                Self::Forming(inner)
-            }
-            Self::Formed(mut inner) => {
-                if inner.missed_heartbeat(group_id, member_id, now) {
-                    info!("missed heartbeat in generation {}", inner.generation_id);
-
-                    Self::Forming(Inner {
-                        session_timeout_ms: inner.session_timeout_ms,
-                        rebalance_timeout_ms: inner.rebalance_timeout_ms,
-                        members: inner.members,
-                        generation_id: inner.generation_id + 1,
-                        state: Forming {
-                            protocol_type: Some(inner.state.protocol_type),
-                            protocol_name: Some(inner.state.protocol_name),
-                            leader: None,
-                        },
-                        storage: inner.storage,
-                        skip_assignment: inner.skip_assignment,
-                        inception: inner.inception,
-                    })
-                } else {
-                    Self::Formed(inner)
-                }
-            }
-        }
+        self.generation.leader.is_none() || self.assignments().is_none()
     }
 
     fn is_leader(&self, body: &Body) -> bool {
-        if let Body::JoinGroupResponse(response) = body
-            && let JoinGroupResponse { member_id, .. } = response
-        {
+        if let Body::JoinGroupResponse(JoinGroupResponse { member_id, .. }) = body {
             self.leader().is_some_and(|leader| leader == member_id)
         } else {
             false
@@ -1013,14 +593,27 @@ where
 
     #[instrument(skip(self), ret)]
     fn is_member_id_required(&self, body: &Body) -> bool {
-        if let Body::JoinGroupResponse(response) = body
-            && let JoinGroupResponse { error_code, .. } = response
-            && *error_code == i16::from(ErrorCode::MemberIdRequired)
-        {
-            true
-        } else {
-            false
-        }
+        matches!(
+            body,
+            Body::JoinGroupResponse(JoinGroupResponse { error_code, .. })
+                if *error_code == i16::from(ErrorCode::MemberIdRequired)
+        )
+    }
+
+    /// This group's composition with its ABA discriminator advanced and its
+    /// generation moved on, ready for the CAS that changes `members`.
+    ///
+    /// Every composition change goes through here, so the invariants that hold
+    /// the layout together are stated once: a generation is **never reused**
+    /// (`assignment/{gen}` is create-only, so reusing one would adopt a dead
+    /// generation's immutable assignment), the join window is based on when
+    /// membership last moved, and a state episode starts when the group's
+    /// composition does.
+    fn rebalanced(mut generation: GenerationDoc, now_ms: i64) -> GenerationDoc {
+        generation.generation_id = generation.generation_id.saturating_add(1);
+        generation.members_changed_at_ms = now_ms;
+        generation.state_since_ms = now_ms;
+        generation
     }
 }
 
@@ -1034,227 +627,18 @@ fn set_error_code(body: Body, error_code: ErrorCode) -> Body {
     }
 }
 
-#[async_trait]
-impl<O> Group for Wrapper<O>
-where
-    O: Storage,
-{
-    type JoinState = Wrapper<O>;
-    type SyncState = Wrapper<O>;
-    type HeartbeatState = Wrapper<O>;
-    type LeaveState = Wrapper<O>;
-    type OffsetCommitState = Wrapper<O>;
-    type OffsetFetchState = Wrapper<O>;
-
-    #[allow(clippy::too_many_arguments)]
-    async fn join(
-        self,
-        now: SystemTime,
-        client_id: Option<&str>,
-        group_id: &str,
-        session_timeout_ms: i32,
-        rebalance_timeout_ms: Option<i32>,
-        member_id: &str,
-        group_instance_id: Option<&str>,
-        protocol_type: &str,
-        protocols: Option<&[JoinGroupRequestProtocol]>,
-        reason: Option<&str>,
-    ) -> (Wrapper<O>, Body) {
-        match self {
-            Self::Forming(inner) => {
-                let (state, body) = inner
-                    .join(
-                        now,
-                        client_id,
-                        group_id,
-                        session_timeout_ms,
-                        rebalance_timeout_ms,
-                        member_id,
-                        group_instance_id,
-                        protocol_type,
-                        protocols,
-                        reason,
-                    )
-                    .await;
-                (state.into(), body)
-            }
-
-            Self::Formed(inner) => {
-                let (state, body) = inner
-                    .join(
-                        now,
-                        client_id,
-                        group_id,
-                        session_timeout_ms,
-                        rebalance_timeout_ms,
-                        member_id,
-                        group_instance_id,
-                        protocol_type,
-                        protocols,
-                        reason,
-                    )
-                    .await;
-                (state, body)
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn sync(
-        self,
-        now: SystemTime,
-        group_id: &str,
-        generation_id: i32,
-        member_id: &str,
-        group_instance_id: Option<&str>,
-        protocol_type: Option<&str>,
-        protocol_name: Option<&str>,
-        assignments: Option<&[SyncGroupRequestAssignment]>,
-    ) -> (Wrapper<O>, Body) {
-        match self {
-            Wrapper::Forming(inner) => {
-                let (state, body) = inner
-                    .sync(
-                        now,
-                        group_id,
-                        generation_id,
-                        member_id,
-                        group_instance_id,
-                        protocol_type,
-                        protocol_name,
-                        assignments,
-                    )
-                    .await;
-                (state, body)
-            }
-
-            Wrapper::Formed(inner) => {
-                let (state, body) = inner
-                    .sync(
-                        now,
-                        group_id,
-                        generation_id,
-                        member_id,
-                        group_instance_id,
-                        protocol_type,
-                        protocol_name,
-                        assignments,
-                    )
-                    .await;
-                (state.into(), body)
-            }
-        }
-    }
-
-    async fn leave(
-        self,
-        now: SystemTime,
-        group_id: &str,
-        member_id: Option<&str>,
-        members: Option<&[MemberIdentity]>,
-    ) -> (Wrapper<O>, Body) {
-        match self {
-            Wrapper::Forming(inner) => {
-                let (state, body) = inner.leave(now, group_id, member_id, members).await;
-                (state.into(), body)
-            }
-
-            Wrapper::Formed(inner) => {
-                let (state, body) = inner.leave(now, group_id, member_id, members).await;
-                (state, body)
-            }
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn offset_commit(self, now: SystemTime, detail: &OffsetCommit<'_>) -> (Wrapper<O>, Body) {
-        match self {
-            Wrapper::Forming(inner) => {
-                let (state, body) = inner.offset_commit(now, detail).await;
-                (state.into(), body)
-            }
-
-            Wrapper::Formed(inner) => {
-                let (state, body) = inner.offset_commit(now, detail).await;
-                (state.into(), body)
-            }
-        }
-    }
-
-    async fn offset_fetch(
-        self,
-        now: SystemTime,
-        group_id: Option<&str>,
-        topics: Option<&[OffsetFetchRequestTopic]>,
-        groups: Option<&[OffsetFetchRequestGroup]>,
-        require_stable: Option<bool>,
-    ) -> (Wrapper<O>, Body) {
-        match self {
-            Wrapper::Forming(inner) => {
-                let (state, body) = inner
-                    .offset_fetch(now, group_id, topics, groups, require_stable)
-                    .await;
-                (state.into(), body)
-            }
-
-            Wrapper::Formed(inner) => {
-                let (state, body) = inner
-                    .offset_fetch(now, group_id, topics, groups, require_stable)
-                    .await;
-                (state.into(), body)
-            }
-        }
-    }
-
-    async fn heartbeat(
-        self,
-        now: SystemTime,
-        group_id: &str,
-        generation_id: i32,
-        member_id: &str,
-        group_instance_id: Option<&str>,
-    ) -> (Wrapper<O>, Body) {
-        debug!(
-            ?now,
-            ?group_id,
-            ?generation_id,
-            ?member_id,
-            ?group_instance_id
-        );
-
-        match self {
-            Wrapper::Forming(inner) => {
-                let (state, body) = inner
-                    .heartbeat(now, group_id, generation_id, member_id, group_instance_id)
-                    .await;
-                (state.into(), body)
-            }
-
-            Wrapper::Formed(inner) => {
-                let (state, body) = inner
-                    .heartbeat(now, group_id, generation_id, member_id, group_instance_id)
-                    .await;
-                (state.into(), body)
-            }
-        }
-    }
-}
-
-type WrapperMap<O> = Arc<Mutex<BTreeMap<String, (Wrapper<O>, Option<Version>)>>>;
-
-/// Per-group in-process serialization locks. Now that group-coordination
-/// requests are forwarded to a single deterministic owner replica (see
-/// `coordinator::group::forward`), all of a group's members land on the same
-/// `Controller`. Without in-process serialization their read-modify-write
-/// cycles against the single `{group}.json` object interleave and thrash the
-/// etag CAS — 16 members produced a permanent `cas_conflicts` storm and the
-/// group never reached a stable generation. Holding a per-group async lock
-/// across each read->CAS window turns those concurrent RMWs into a sequence of
-/// single successful CAS writes. The lock is *released* before every long poll
-/// / join-window sleep, so a held leader never blocks the very members it is
-/// waiting for. The object-store etag CAS remains the cross-replica correctness
-/// backstop (a forward timeout falls back to local processing on another
-/// replica, which this in-process lock cannot serialize).
+/// Per-group in-process serialization of the generation-CAS window, kept as an
+/// **optimisation only** (#359).
+///
+/// It used to be a correctness compensation: all of a group's members were
+/// forwarded to one replica, and without in-process serialization their
+/// read-modify-write cycles against the single `{group}.json` interleaved and
+/// thrashed the etag CAS. Now the contended object changes only when the
+/// group's composition does, and every path is written to be correct under
+/// concurrent replicas — the CAS is the sole correctness mechanism — so this
+/// only narrows the window in which two members served by the *same* replica
+/// collide. It is released before every long-poll sleep, so a held leader never
+/// blocks the members it is waiting for.
 ///
 /// The map is keyed by group id, so it grows with the set of groups this replica
 /// has *ever* served rather than the set it currently serves — a
@@ -1266,31 +650,31 @@ type GroupLocks = Arc<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>>;
 #[derive(Clone, Debug)]
 pub struct Controller<O> {
     storage: O,
-    wrappers: WrapperMap<O>,
-    group_locks: GroupLocks,
-    /// When each group was first seen mid-rebalance, and whether that has been
-    /// reported yet (#240).
+
+    /// See [`GroupLocks`].
+    generation_locks: GroupLocks,
+
+    /// Which groups this replica has already logged a stalled rebalance for
+    /// (#240).
     ///
-    /// Per-replica and in-process, deliberately: the alternative is a
-    /// state-entry timestamp inside `GroupDetail`, which is a persisted-format
-    /// change, and `inception` cannot stand in for one — it is set once at group
-    /// creation and copied through every transition, so it measures the group's
-    /// age, not how long it has been rebalancing. The cost of staying in memory
-    /// is a blind window after a restart, which is exactly when a wedge is
-    /// created; against a condition that lasted hours that is an acceptable
-    /// trade, and it needs no rolling-deploy care.
-    rebalance_stalls: Arc<Mutex<BTreeMap<String, (SystemTime, bool)>>>,
+    /// Only the *dedup* is in memory now. When the episode started is
+    /// `GenerationDoc::state_since_ms`, persisted with the group, so a restart
+    /// no longer starts a blind window at exactly the moment a wedge is most
+    /// likely to have been created: a fresh `Controller` reports a group that
+    /// has been stuck for an hour immediately, where it used to wait out the
+    /// threshold again before saying anything.
+    rebalance_stalls: Arc<Mutex<BTreeMap<String, bool>>>,
 
     /// When each group was last served by this replica — the touch stamp
     /// [`Self::prune`] evicts on (#283).
     ///
-    /// Written by [`Self::group_lock`], which every request path that populates
-    /// any of the maps above calls *before* it touches them. That ordering is
-    /// what makes the sweep leak-free: see [`Self::prune`].
+    /// Written by [`Self::group_lock`], which every request path calls *before*
+    /// it touches any other map. That ordering is what makes the sweep
+    /// leak-free: see [`Self::prune_idle_groups`].
     ///
-    /// On the MONOTONIC clock, unlike [`Self::rebalance_stalls`]: nothing here is
-    /// persisted or compared against a stored timestamp, and a backwards NTP step
-    /// would otherwise make `elapsed()` fail and freeze the sweep (#256).
+    /// On the MONOTONIC clock: nothing here is persisted or compared against a
+    /// stored timestamp, and a backwards NTP step would otherwise make
+    /// `elapsed()` fail and freeze the sweep (#256).
     last_seen: Arc<Mutex<BTreeMap<String, Instant>>>,
 
     /// How long a group must go unserved before [`Self::prune`] evicts its
@@ -1304,8 +688,8 @@ pub struct Controller<O> {
     /// another reading of the same clock — the join window, a member's session
     /// — never against something already persisted by another replica, which
     /// is why a test may move it without inventing a cross-replica time
-    /// disagreement. `inception` and the timestamps written into group state
-    /// still come from `SystemTime::now()` directly.
+    /// disagreement. Timestamps written into group state still come from
+    /// `SystemTime::now()` directly.
     ///
     /// It exists because `tokio`'s paused clock advances `Instant` and
     /// `sleep`, and cannot touch `SystemTime`. A coordinator test therefore had
@@ -1323,8 +707,7 @@ where
     pub fn with_storage(storage: O) -> Result<Self> {
         Ok(Self {
             storage,
-            wrappers: Arc::new(Mutex::new(BTreeMap::new())),
-            group_locks: Arc::new(Mutex::new(BTreeMap::new())),
+            generation_locks: Arc::new(Mutex::new(BTreeMap::new())),
             rebalance_stalls: Arc::new(Mutex::new(BTreeMap::new())),
             last_seen: Arc::new(Mutex::new(BTreeMap::new())),
             idle_after: GROUP_STATE_IDLE_AFTER,
@@ -1344,92 +727,35 @@ where
         Self { now, ..self }
     }
 
-    /// Report a group that has been mid-rebalance too long (#240).
-    ///
-    /// A group in `CompletingRebalance` — members joined, leader elected, no
-    /// assignment distributed — past [`stall_after`] is always a bug:
-    /// consumption has stopped and nothing else says so. The broker answers
-    /// every request about the group normally, the clients wait, and the
-    /// backlog sits behind it.
-    ///
-    /// Reported once per episode rather than per heartbeat: members heartbeat
-    /// every few seconds, so an unguarded `warn!` here would emit thousands of
-    /// lines for one stuck group and bury the signal it exists to raise. The
-    /// entry clears as soon as the group leaves the state, so a group that
-    /// stalls, recovers and stalls again is reported each time.
-    fn observe_rebalance(&self, group_id: &str, detail: &GroupDetail, now: SystemTime) -> bool {
-        let stalled = matches!(
-            ConsumerGroupState::from(detail),
-            ConsumerGroupState::CompletingRebalance
-        );
-
-        let Ok(mut stalls) = self.rebalance_stalls.lock() else {
-            return false;
-        };
-
-        if !stalled {
-            _ = stalls.remove(group_id);
-            return false;
-        }
-
-        let threshold = stall_after(detail);
-        let (since, reported) = stalls.entry(group_id.to_owned()).or_insert((now, false));
-        let stalled_for = now.duration_since(*since).unwrap_or_default();
-
-        if !*reported && stalled_for >= threshold {
-            *reported = true;
-            REBALANCE_STALLS.add(1, &[]);
-
-            // `threshold_ms` is in the line on purpose: it is the group's own
-            // declared rebalance timeout, so an operator can tell "this group is
-            // stuck" from "this group declares an unusually tight timeout"
-            // without going to read the config.
-            warn!(
-                group_id,
-                members = detail.members.len(),
-                stalled_for_ms = stalled_for.as_millis() as u64,
-                threshold_ms = threshold.as_millis() as u64,
-                "group has not completed its rebalance: members joined, no assignment distributed (#240)"
-            );
-
-            return true;
-        }
-
-        false
-    }
-
     /// The serialization lock for `group_id`, created on first use. See
     /// [`GroupLocks`]. Callers hold the returned guard across a single
     /// read->CAS window and drop it before any long-poll / rebalance sleep.
     ///
     /// Also the single touch point for [`Self::last_seen`] (#283). Every request
-    /// path that populates a per-group map calls this first, so one stamp here
-    /// covers all of them — and covers them from *before* the wrapper is checked
-    /// out, which is what [`Self::prune`] relies on.
+    /// path calls this first, so one stamp here covers the sweep — and covers it
+    /// from *before* any work begins, which is what [`Self::prune_idle_groups`]
+    /// relies on.
     fn group_lock(&self, group_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         if let Ok(mut last_seen) = self.last_seen.lock() {
             _ = last_seen.insert(group_id.to_owned(), Instant::now());
         }
 
-        self.group_locks
+        self.generation_locks
             .lock()
-            .expect("group_locks mutex poisoned")
+            .expect("generation_locks mutex poisoned")
             .entry(group_id.to_owned())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
 
-    /// The body of [`Coordinator::prune`] for this controller (#283) — see there
-    /// for what it evicts and why that is safe.
+    /// The body of [`Coordinator::prune`] for this controller (#283).
     ///
-    /// Inherent so the trait impl below is a one-liner and the reasoning lives
-    /// next to the maps it reasons about.
-    ///
-    /// The four maps swept here were keyed by a client-controlled string and had
-    /// no removal path at all — not even when the group was deleted from the
+    /// The maps swept here are keyed by a client-controlled string and had no
+    /// removal path at all — not even when the group was deleted from the
     /// object store — so a group-per-restart or group-per-subscription naming
-    /// pattern grew them for the life of the pod. `wrappers` is the expensive one:
-    /// it holds each group's full member-metadata byte blobs.
+    /// pattern grew them for the life of the pod. The expensive one, the map of
+    /// per-group `Wrapper`s holding every member's metadata blob, is gone
+    /// entirely with #359: state is composed per request and never held.
     ///
     /// **Idle-triggered rather than delete-triggered**, which is a deliberate
     /// choice and not an approximation of one. The two events the issue names —
@@ -1440,30 +766,19 @@ where
     /// its committed offsets are still there, but whose consumers are gone for
     /// good, is the shape the observed naming patterns actually produce.
     ///
-    /// **Safe because none of this is authority.** Every request path re-reads
-    /// `{group}.json` GET-first and adopts the persisted state whenever its cached
-    /// version differs — and a freshly created wrapper has no version, so it
-    /// always adopts. `inception` (the one field that could not be recomputed) is
-    /// persisted in `GroupDetail`. So an eviction costs one object read on the
-    /// group's next request and can change no answer.
+    /// **Safe because none of this is authority.** Nothing evicted here can
+    /// change an answer: a request composes its [`GroupView`] from the store.
     ///
-    /// **`group_locks` is the exception, and needs the `Arc` count.** Dropping a
-    /// lock another task holds does not free it — it means the *next* request
-    /// creates a second lock for the same group, and two members then run their
-    /// read->CAS windows concurrently, which is exactly the CAS thrash
-    /// [`GroupLocks`] exists to prevent. `Arc::strong_count == 1` rules that out:
-    /// the map is the only holder, so no request is between [`Self::group_lock`]
-    /// and its end (`lock_owned` moves the `Arc` into the guard, and the join/sync
-    /// loops keep their own clone for the whole call, so a live request always
-    /// holds one).
+    /// **`generation_locks` is the exception, and needs the `Arc` count.**
+    /// Dropping a lock another task holds does not free it — it means the *next*
+    /// request creates a second lock for the same group, and two members then
+    /// run their read->CAS windows concurrently, which is the collision the lock
+    /// exists to narrow. `Arc::strong_count == 1` rules that out: the map is the
+    /// only holder, so no request is between [`Self::group_lock`] and its end.
     ///
-    /// That check is also what makes the sweep **leak-free**, which it would not
-    /// otherwise be: a request that has checked its wrapper *out* of `wrappers`
-    /// and not yet put it back would be invisible to a sweep keyed on the map's
-    /// contents, and the re-insert afterwards would strand an entry with no touch
-    /// stamp — never a candidate again. Since the stamp is written before the
-    /// checkout and the `Arc` is held across it, such a group is skipped whole
-    /// (stamp included) and reconsidered on the next sweep.
+    /// That check is also what makes the sweep **leak-free**: since the stamp is
+    /// written before any work and the `Arc` is held across it, a group being
+    /// served is skipped whole (stamp included) and reconsidered next sweep.
     fn prune_idle_groups(&self) -> usize {
         let now = Instant::now();
 
@@ -1485,27 +800,24 @@ where
         for group_id in idle {
             // Serving now: leave every one of this group's entries, stamp
             // included, and reconsider it next sweep.
-            let released = self.group_locks.lock().is_ok_and(|mut group_locks| {
-                match group_locks.get(&group_id) {
-                    Some(lock) if Arc::strong_count(lock) == 1 => {
-                        _ = group_locks.remove(&group_id);
-                        true
-                    }
+            let released =
+                self.generation_locks
+                    .lock()
+                    .is_ok_and(|mut locks| match locks.get(&group_id) {
+                        Some(lock) if Arc::strong_count(lock) == 1 => {
+                            _ = locks.remove(&group_id);
+                            true
+                        }
 
-                    // No lock entry at all: nothing can be mid-request, since
-                    // `group_lock` creates one before anything else happens.
-                    None => true,
+                        // No lock entry at all: nothing can be mid-request, since
+                        // `group_lock` creates one before anything else happens.
+                        None => true,
 
-                    Some(_) => false,
-                }
-            });
+                        Some(_) => false,
+                    });
 
             if !released {
                 continue;
-            }
-
-            if let Ok(mut wrappers) = self.wrappers.lock() {
-                _ = wrappers.remove(&group_id);
             }
 
             if let Ok(mut stalls) = self.rebalance_stalls.lock() {
@@ -1534,1023 +846,305 @@ where
         evicted
     }
 
-    /// Put a group's wrapper back in the in-process cache.
+    /// Report a group that has been mid-rebalance too long (#240).
     ///
-    /// A poisoned mutex propagates rather than being swallowed: the cache is not
-    /// authority — every path re-reads `{group}.json` GET-first — but a poisoned
-    /// lock means another task panicked mid-update, and answering as if nothing
-    /// happened is how that becomes someone else's mystery.
-    fn cache(&self, group_id: &str, wrapper: Wrapper<O>, version: Option<Version>) -> Result<()> {
-        self.wrappers.lock().map(|mut wrappers| {
-            _ = wrappers.insert(group_id.to_owned(), (wrapper, version));
-        })?;
-
-        Ok(())
-    }
-
-    /// The read-modify-CAS loop shared by `join`, `sync`, `leave`,
-    /// `offset_commit` and `heartbeat` (#286). See [`GroupCas`] for the split
-    /// between what lives here and what an API supplies.
+    /// A group in `CompletingRebalance` — members joined, leader elected, no
+    /// assignment distributed — past [`stall_after`] is always a bug:
+    /// consumption has stopped and nothing else says so.
     ///
-    /// One iteration: take the group lock, check the wrapper out of the cache,
-    /// reconcile it against the persisted object, delegate to the API, then
-    /// either skip the write or CAS it. A conflict re-seeds the cache from the
-    /// state that won and iterates; a long-poll decision sleeps and iterates.
-    async fn run_group_cas_loop<C>(&self, group_id: &str, mut op: C) -> Result<Body>
-    where
-        C: GroupCas<O>,
-    {
-        let mut iteration = 0;
-        let mut cas_conflicts = 0u32;
+    /// Reported once per episode rather than per request: members heartbeat
+    /// every few seconds, so an unguarded `warn!` here would emit thousands of
+    /// lines for one stuck group and bury the signal it exists to raise. The
+    /// episode's start is read from the group (`state_since_ms`), so only the
+    /// "already said this" flag is per-replica — and a group that stalls,
+    /// recovers and stalls again is reported each time, because recovery clears
+    /// the flag.
+    fn observe_rebalance(&self, group_id: &str, view: &GroupView, now: SystemTime) -> bool {
+        let stalled = matches!(view.state(), ConsumerGroupState::CompletingRebalance);
 
-        // Cloned once for the whole call rather than per iteration, which
-        // [`Self::prune`] depends on: it reads `Arc::strong_count` to decide a
-        // group is not being served, so a request that sleeps between iterations
-        // must keep a clone alive across the sleep or the sweep can drop the lock
-        // out from under it and let a second one be created.
-        let group_lock = self.group_lock(group_id);
+        let Ok(mut stalls) = self.rebalance_stalls.lock() else {
+            return false;
+        };
 
-        loop {
-            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", C::LABELS.iteration)]);
-
-            // Serialize this group's read->CAS window against other in-process
-            // members (see `GroupLocks`). Released below before any sleep, so a
-            // held leader does not block the members it is waiting for.
-            let permit = group_lock.clone().lock_owned().await;
-
-            let now = (self.now)();
-
-            let (mut wrapper, mut version) = self
-                .wrappers
-                .lock()
-                .map(|mut wrappers| wrappers.remove(group_id))?
-                .unwrap_or_else(|| {
-                    debug!(?iteration, ?group_id, "group cache miss");
-                    (op.seed(self.storage.clone()), None)
-                });
-
-            // GET-first (#111): see [`GroupCas::GET_FIRST`].
-            let persisted = if C::GET_FIRST {
-                let persisted = self.storage.read_group(group_id).await?;
-
-                if let Some((current, current_version)) = &persisted
-                    && version.as_ref() != Some(current_version)
-                {
-                    wrapper =
-                        Wrapper::with_storage_group_detail(self.storage.clone(), current.clone());
-                    version = Some(current_version.clone());
-                }
-
-                persisted.is_some()
-            } else {
-                false
-            };
-
-            // The persisted projection we are about to (maybe) rewrite.
-            let before = GroupDetail::from(&wrapper);
-
-            debug!(?group_id, %wrapper, ?version, ?iteration);
-
-            let (updated, body) = op.apply(group_id, now, wrapper).await;
-
-            let after = GroupDetail::from(&updated);
-
-            op.observe(self, group_id, &before, &after, now);
-
-            debug!(?group_id, %updated, ?version, ?iteration);
-
-            // Decided once and used by both arms below. The two used to be
-            // separate copies of the same decision, differing only in which of
-            // them had done the writing (#286).
-            let decision = op.settled(&updated, &body, &after, now);
-
-            if persisted && op.skip(&before, &after, now) {
-                COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", C::LABELS.noop_skip)]);
-
-                self.cache(group_id, updated, version)?;
-            } else {
-                match self.storage.update_group(group_id, after, version).await {
-                    Ok(version) => {
-                        debug!(?group_id, ?version, iteration, ?decision);
-
-                        self.cache(group_id, updated, Some(version))?;
-                    }
-
-                    Err(UpdateError::Outdated { current, version }) => {
-                        debug!(?group_id, ?current, ?version, iteration);
-                        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", C::LABELS.outdated)]);
-
-                        self.cache(
-                            group_id,
-                            Wrapper::with_storage_group_detail(self.storage.clone(), *current),
-                            Some(version),
-                        )?;
-
-                        // Release before the backoff sleep. An in-process
-                        // conflict is now rare (members serialize on the group
-                        // lock); this path mainly catches cross-replica writes.
-                        drop(permit);
-
-                        cas_conflicts += 1;
-
-                        if C::BACKOFF_ON_CONFLICT {
-                            if cas_conflicts == CAS_CONFLICT_WARN {
-                                warn!(
-                                    group_id,
-                                    cas_conflicts,
-                                    method = C::LABELS.iteration,
-                                    "repeated group-state CAS conflicts (concurrent members across replicas?)"
-                                );
-                            }
-
-                            sleep(cas_conflict_backoff(cas_conflicts)).await;
-                        }
-
-                        iteration += 1;
-                        continue;
-                    }
-
-                    Err(UpdateError::Error(error)) => return Err(error.into()),
-
-                    Err(UpdateError::SerdeJson(error)) => return Err(error.into()),
-
-                    Err(UpdateError::MissingEtag) => {
-                        return Err(Error::Message(String::from("missing e-tag")));
-                    }
-
-                    Err(UpdateError::Uuid(uuid)) => {
-                        return Err(Error::Message(format!("uuid: {uuid}")));
-                    }
-                }
-            }
-
-            // The read->CAS window is closed either way; release before any
-            // long-poll sleep.
-            drop(permit);
-
-            match decision {
-                LongPoll::Respond(None) => return Ok(body),
-
-                LongPoll::Respond(Some(error_code)) => return Ok(set_error_code(body, error_code)),
-
-                LongPoll::Wait(pause, method) => {
-                    COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", method)]);
-                    sleep(pause).await;
-
-                    iteration += 1;
-                }
-            }
+        if !stalled {
+            _ = stalls.remove(group_id);
+            return false;
         }
-    }
-}
 
-#[async_trait]
-impl<O> Coordinator for Controller<O>
-where
-    O: Storage + Clone,
-{
-    #[instrument(skip(
-        self,
-        client_id,
-        session_timeout_ms,
-        rebalance_timeout_ms,
-        group_instance_id,
-        protocol_type,
-        protocols,
-        reason
-    ))]
-    async fn join(
-        &self,
-        client_id: Option<&str>,
-        group_id: &str,
-        session_timeout_ms: i32,
-        rebalance_timeout_ms: Option<i32>,
-        member_id: &str,
-        group_instance_id: Option<&str>,
-        protocol_type: &str,
-        protocols: Option<&[JoinGroupRequestProtocol]>,
-        reason: Option<&str>,
-    ) -> Result<Body> {
-        debug!(
-            ?client_id,
-            ?session_timeout_ms,
-            ?rebalance_timeout_ms,
-            ?group_instance_id,
-            ?protocol_type,
-            protocols = ?protocols
-                .map(|protocols| {
-                    protocols
-                        .iter()
-                        .filter_map(|protocol| {
-                            MemberMetadata::try_from(protocol.metadata.clone())
-                                .ok()
-                                .map(|metadata| (protocol.name.clone(), metadata.to_string()))
-                        })
-                        .collect::<BTreeMap<_, _>>()
-                })
-                .unwrap_or_default(),
-            ?reason,
+        let threshold = stall_after(view.generation.rebalance_timeout_ms);
+        let stalled_for = Duration::from_millis(
+            epoch_ms(now)
+                .saturating_sub(view.generation.state_since_ms)
+                .max(0) as u64,
         );
 
-        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join")]);
+        let reported = stalls.entry(group_id.to_owned()).or_insert(false);
 
-        self.run_group_cas_loop(
-            group_id,
-            JoinCas {
-                client_id,
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                member_id,
-                group_instance_id,
-                protocol_type,
-                protocols,
-                reason,
+        if !*reported && stalled_for >= threshold {
+            *reported = true;
+            REBALANCE_STALLS.add(1, &[]);
 
-                // How long this call has been long-polling, on the MONOTONIC
-                // clock (#256). Deliberately not the wall clock: `SystemTime`
-                // makes `elapsed()` return `Err` after a backwards NTP step —
-                // which `?` turned into an error response for a member that was
-                // merely waiting — and it cannot be paused, so a test could only
-                // buy determinism by waiting out the real duration. `SystemTime`
-                // stays for everything persisted or compared against a stored
-                // timestamp (`last_contact`, `inception`, and the join-window
-                // barrier below).
-                polling_since: Instant::now(),
+            // `threshold_ms` is in the line on purpose: it is the group's own
+            // declared rebalance timeout, so an operator can tell "this group is
+            // stuck" from "this group declares an unusually tight timeout"
+            // without going to read the config.
+            warn!(
+                group_id,
+                members = view.generation.members.len(),
+                generation_id = view.generation.generation_id,
+                stalled_for_ms = stalled_for.as_millis() as u64,
+                threshold_ms = threshold.as_millis() as u64,
+                "group has not completed its rebalance: members joined, no assignment distributed (#240)"
+            );
 
-                window_members: None,
-                window_changed_at: (self.now)(),
-            },
-        )
-        .await
-    }
-    #[instrument(skip(self, group_instance_id, protocol_type, protocol_name, assignments))]
-    async fn sync(
-        &self,
-        group_id: &str,
-        generation_id: i32,
-        member_id: &str,
-        group_instance_id: Option<&str>,
-        protocol_type: Option<&str>,
-        protocol_name: Option<&str>,
-        assignments: Option<&[SyncGroupRequestAssignment]>,
-    ) -> Result<Body> {
-        debug!(
-            ?group_instance_id,
-            ?protocol_type,
-            ?protocol_name,
-            assignments = ?assignments
-                .map(|assignments| {
-                    assignments
-                        .iter()
-                        .filter_map(|request| {
-                            MemberAssignment::try_from(request.assignment.clone())
-                                .ok()
-                                .map(|member_assignment| {
-                                    (request.member_id.clone(), member_assignment.to_string())
-                                })
-                        })
-                        .collect::<BTreeMap<_, _>>()
-                })
-                .unwrap_or_default(),
-        );
+            return true;
+        }
 
-        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sync")]);
-
-        // Once per request, not once per iteration: this inspects the
-        // assignments the caller sent, which do not change between retries.
-        warn_on_overlapping_assignments(group_id, generation_id, assignments);
-
-        self.run_group_cas_loop(
-            group_id,
-            SyncCas {
-                generation_id,
-                member_id,
-                group_instance_id,
-                protocol_type,
-                protocol_name,
-                assignments,
-
-                // Monotonic, for the same reasons as `join`'s (#256). Nothing
-                // here is compared against a stored timestamp, so this call
-                // needs no wall clock at all.
-                polling_since: Instant::now(),
-            },
-        )
-        .await
-    }
-    #[instrument(skip(self, members))]
-    async fn leave(
-        &self,
-        group_id: &str,
-        member_id: Option<&str>,
-        members: Option<&[MemberIdentity]>,
-    ) -> Result<Body> {
-        debug!(?members);
-
-        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "leave")]);
-
-        self.run_group_cas_loop(group_id, LeaveCas { member_id, members })
-            .await
-    }
-    #[instrument(skip(self, offset_commit), fields(group_id = offset_commit.group_id, generation_id = offset_commit.generation_id_or_member_epoch))]
-    async fn offset_commit(&self, offset_commit: OffsetCommit<'_>) -> Result<Body> {
-        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "offset_commit")]);
-
-        let group_id = offset_commit.group_id;
-
-        self.run_group_cas_loop(group_id, OffsetCommitCas { offset_commit })
-            .await
-    }
-    #[instrument(skip_all)]
-    async fn offset_fetch(
-        &self,
-        group_id: Option<&str>,
-        topics: Option<&[OffsetFetchRequestTopic]>,
-        groups: Option<&[OffsetFetchRequestGroup]>,
-        require_stable: Option<bool>,
-    ) -> Result<Body> {
-        debug!(?group_id, ?topics, ?groups, ?require_stable);
-
-        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "offset_fetch")]);
-
-        let wrapper = Wrapper::Forming(Inner::new(self.storage.clone()));
-
-        let now = (self.now)();
-        let (_wrapper, body) = wrapper
-            .offset_fetch(now, group_id, topics, groups, require_stable)
-            .await;
-        Ok(body)
+        false
     }
 
-    #[instrument(skip(self, group_instance_id))]
-    async fn heartbeat(
-        &self,
-        group_id: &str,
-        generation_id: i32,
-        member_id: &str,
-        group_instance_id: Option<&str>,
-    ) -> Result<Body> {
-        debug!(?group_id, ?generation_id, ?member_id, ?group_instance_id);
+    /// Compose a group from its decomposed objects.
+    ///
+    /// Two reads at most, and the second only when there can be something to
+    /// find: with no leader there is no assignment, so probing for one would be
+    /// a 404 on every read of a forming group.
+    async fn read_view(&self, group_id: &str) -> Result<GroupView> {
+        let Some((generation, version)) = self.storage.read_group_generation(group_id).await?
+        else {
+            return Ok(GroupView::default());
+        };
 
-        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "heartbeat")]);
+        let assignment = if generation.leader.is_some() && generation.generation_id >= 0 {
+            self.storage
+                .read_group_assignment(group_id, generation.generation_id)
+                .await?
+        } else {
+            None
+        };
 
-        self.run_group_cas_loop(
-            group_id,
-            HeartbeatCas {
-                generation_id,
-                member_id,
-                group_instance_id,
-            },
-        )
-        .await
-    }
-
-    fn prune(&self) -> usize {
-        self.prune_idle_groups()
-    }
-}
-
-/// `join`'s half of [`Controller::run_group_cas_loop`].
-struct JoinCas<'a> {
-    client_id: Option<&'a str>,
-    session_timeout_ms: i32,
-    rebalance_timeout_ms: Option<i32>,
-    member_id: &'a str,
-    group_instance_id: Option<&'a str>,
-    protocol_type: &'a str,
-    protocols: Option<&'a [JoinGroupRequestProtocol]>,
-    reason: Option<&'a str>,
-
-    /// When this call started long-polling, on the monotonic clock (#256).
-    polling_since: Instant,
-
-    /// Join-window barrier state (see `JOIN_QUIESCENCE`): the member set last
-    /// observed by this join call, and when it last changed. Inferred purely
-    /// from the per-iteration GET-first reads — no on-disk format change.
-    window_members: Option<BTreeSet<String>>,
-    window_changed_at: SystemTime,
-}
-
-impl<O> GroupCas<O> for JoinCas<'_>
-where
-    O: Storage + Clone,
-{
-    const LABELS: CasLabels = CasLabels {
-        iteration: "join_loop",
-        noop_skip: "join_noop_skip",
-        outdated: "join_outdated",
-    };
-
-    // Many members converge on one group object during a rebalance, so an
-    // un-backed-off retry storm here is real.
-    const BACKOFF_ON_CONFLICT: bool = true;
-
-    /// A join is the one request that can create a group, so its cache miss
-    /// seeds from the timeouts the joining member declared rather than from
-    /// `Inner::new`'s defaults.
-    fn seed(&self, storage: O) -> Wrapper<O> {
-        Wrapper::Forming(Inner {
-            session_timeout_ms: self.session_timeout_ms,
-            rebalance_timeout_ms: self.rebalance_timeout_ms,
-            members: Default::default(),
-            generation_id: -1,
-            state: Forming::default(),
-            skip_assignment: Some(false),
-            storage,
-            inception: SystemTime::now(),
+        Ok(GroupView {
+            generation,
+            version: Some(version),
+            assignment,
         })
     }
 
-    async fn apply(
-        &mut self,
-        group_id: &str,
-        now: SystemTime,
-        mut wrapper: Wrapper<O>,
-    ) -> (Wrapper<O>, Body) {
-        if self.group_instance_id.is_none() {
-            wrapper = wrapper.missed_heartbeat(group_id, self.member_id, now);
-        }
+    /// Account for a lost generation CAS and back off before the caller
+    /// re-reads and re-applies.
+    ///
+    /// The retry is always a full re-read: a decision computed against the
+    /// document that lost must never be replayed onto the one that won.
+    async fn generation_conflict(&self, group_id: &str, method: &'static str, conflicts: &mut u32) {
+        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", method)]);
 
-        let members_before = wrapper.members();
+        *conflicts += 1;
 
-        let (updated, body) = wrapper
-            .join(
-                now,
-                self.client_id,
+        if *conflicts == CAS_CONFLICT_WARN {
+            warn!(
                 group_id,
-                self.session_timeout_ms,
-                self.rebalance_timeout_ms,
-                self.member_id,
-                self.group_instance_id,
-                self.protocol_type,
-                self.protocols,
-                self.reason,
-            )
-            .await;
-
-        debug!(is_stable = members_before == updated.members());
-
-        (updated, body)
-    }
-
-    // Observed here as well as on the heartbeat path (#240).
-    //
-    // Heartbeat alone is blind to the failure this detector exists for.
-    // `AbstractCoordinator$HeartbeatThread` disables itself while the consumer
-    // has not joined — `if (state.hasNotJoinedGroup() || isFailed()) {
-    // disable(); }` — so a group whose members are stuck *trying* to join sends
-    // no heartbeat at all, and was sampled nowhere. Measured: a group 90+
-    // minutes in `CompletingRebalance` with 16 members, all 16 heartbeat threads
-    // parked in `wait()`, and not one line about it across ten broker replicas
-    // over two hours.
-    //
-    // Join and sync keep arriving from exactly that consumer — every `poll()`
-    // retries the join — so they are a live sampling source precisely when
-    // heartbeats are not. `before` is the group as read this iteration, which is
-    // the state being waited on.
-    fn observe(
-        &self,
-        controller: &Controller<O>,
-        group_id: &str,
-        before: &GroupDetail,
-        _after: &GroupDetail,
-        now: SystemTime,
-    ) {
-        _ = controller.observe_rebalance(group_id, before, now);
-    }
-
-    /// A member waiting through a rebalance re-joins once a second, and each
-    /// re-join changes only its own `last_contact` (via `missed_heartbeat`).
-    /// Persisting that is a CAS that churns the `{group}.json` etag for nothing
-    /// and, at scale, starves the leader's assignment write so the group never
-    /// stabilises. When the rebalance state is otherwise unchanged and this
-    /// member's liveness does not yet need renewing, answer without touching the
-    /// object — keeping the etag still long enough for the assignment CAS to
-    /// land.
-    fn skip(&self, before: &GroupDetail, after: &GroupDetail, now: SystemTime) -> bool {
-        same_rebalance_state(before, after)
-            && !liveness_renewal_due(before, self.member_id, now, before.session_timeout_ms)
-    }
-
-    fn settled(
-        &mut self,
-        updated: &Wrapper<O>,
-        body: &Body,
-        after: &GroupDetail,
-        now: SystemTime,
-    ) -> LongPoll {
-        // Join-window barrier: without it the leader returned as soon as its own
-        // CAS landed, computed assignments for whatever partial member list it
-        // had seen, and every member missing from that list parked at "stable"
-        // with zero partitions — a multi-member group never converged. Hold the
-        // leader until the membership is quiescent or the rebalance window
-        // closes.
-        let members_now = after.members.keys().cloned().collect::<BTreeSet<_>>();
-        if self.window_members.as_ref() != Some(&members_now) {
-            self.window_members = Some(members_now);
-            self.window_changed_at = now;
+                cas_conflicts = *conflicts,
+                method,
+                "repeated generation CAS conflicts"
+            );
         }
 
-        let membership_quiescent = now
-            .duration_since(self.window_changed_at)
-            .unwrap_or_default()
-            >= JOIN_QUIESCENCE;
-
-        // The rebalance window: `rebalance_timeout_ms` bounds how long the leader
-        // may be held (the Java client allows JoinGroup responses up to
-        // `rebalance_timeout + 5s`), falling back to the session timeout when
-        // unset, as Kafka does for old protocol versions.
-        let join_window_ms = u128::try_from(
-            after
-                .rebalance_timeout_ms
-                .or(self.rebalance_timeout_ms)
-                .unwrap_or(after.session_timeout_ms),
-        )
-        .unwrap_or_default();
-
-        join_long_poll(
-            updated,
-            body,
-            self.group_instance_id,
-            self.polling_since.elapsed().as_millis(),
-            updated.is_forming(),
-            membership_quiescent,
-            join_window_ms,
-        )
+        sleep(cas_conflict_backoff(*conflicts)).await;
     }
-}
 
-/// `sync`'s half of [`Controller::run_group_cas_loop`].
-struct SyncCas<'a> {
-    generation_id: i32,
-    member_id: &'a str,
-    group_instance_id: Option<&'a str>,
-    protocol_type: Option<&'a str>,
-    protocol_name: Option<&'a str>,
-    assignments: Option<&'a [SyncGroupRequestAssignment]>,
-
-    /// When this call started long-polling, on the monotonic clock (#256).
-    polling_since: Instant,
-}
-
-impl<O> GroupCas<O> for SyncCas<'_>
-where
-    O: Storage + Clone,
-{
-    const LABELS: CasLabels = CasLabels {
-        iteration: "sync_loop",
-        noop_skip: "sync_noop_skip",
-        outdated: "sync_outdated",
-    };
-
-    const BACKOFF_ON_CONFLICT: bool = true;
-
-    async fn apply(
-        &mut self,
+    /// Refresh this member's liveness, if it is due.
+    ///
+    /// This is the write that used to churn the shared `{group}.json` etag once
+    /// a second per member and starve the leader's assignment CAS. It now goes
+    /// to the member's own object, at most once per session/2, and contends
+    /// with nothing.
+    async fn renew_member(
+        &self,
         group_id: &str,
+        member_id: &str,
+        session_timeout_ms: i32,
         now: SystemTime,
-        mut wrapper: Wrapper<O>,
-    ) -> (Wrapper<O>, Body) {
-        let members_before = wrapper.members();
-
-        if self.group_instance_id.is_none() {
-            wrapper = wrapper.missed_heartbeat(group_id, self.member_id, now);
+    ) -> Result<()> {
+        if member_id.is_empty() {
+            return Ok(());
         }
 
-        let (updated, body) = wrapper
-            .sync(
-                now,
-                group_id,
-                self.generation_id,
-                self.member_id,
-                self.group_instance_id,
-                self.protocol_type,
-                self.protocol_name,
-                self.assignments,
-            )
-            .await;
+        let Some((member, version)) = self.storage.read_group_member(group_id, member_id).await?
+        else {
+            // Nothing to renew: a member with no document is one this request
+            // is not registering either (a heartbeat from a stranger, a commit
+            // from a simple consumer). The sweep reclaims the membership.
+            return Ok(());
+        };
 
-        debug!(is_stable = members_before == updated.members());
+        let now_ms = epoch_ms(now);
 
-        (updated, body)
-    }
+        if !liveness_renewal_due(Some(&member), now_ms, session_timeout_ms) {
+            return Ok(());
+        }
 
-    /// Sampled from the state this iteration read, for the same reason as
-    /// [`JoinCas::observe`] — see there.
-    fn observe(
-        &self,
-        controller: &Controller<O>,
-        group_id: &str,
-        before: &GroupDetail,
-        _after: &GroupDetail,
-        now: SystemTime,
-    ) {
-        _ = controller.observe_rebalance(group_id, before, now);
-    }
+        let renewed = MemberDoc {
+            last_contact_ms: now_ms,
+            ..member
+        }
+        .bumped();
 
-    /// See [`JoinCas::skip`] for the rationale. The leader's real
-    /// `Forming`->`Formed` assignment sync changes `state` + `assignments`, so
-    /// `same_rebalance_state` is false for it and it always takes the write path.
-    fn skip(&self, before: &GroupDetail, after: &GroupDetail, now: SystemTime) -> bool {
-        same_rebalance_state(before, after)
-            && !liveness_renewal_due(before, self.member_id, now, before.session_timeout_ms)
-    }
-
-    fn settled(
-        &mut self,
-        updated: &Wrapper<O>,
-        body: &Body,
-        _after: &GroupDetail,
-        _now: SystemTime,
-    ) -> LongPoll {
-        sync_long_poll(
-            updated,
-            body,
-            self.group_instance_id,
-            self.polling_since.elapsed().as_millis(),
-        )
-    }
-}
-
-/// `leave`'s half of [`Controller::run_group_cas_loop`].
-struct LeaveCas<'a> {
-    member_id: Option<&'a str>,
-    members: Option<&'a [MemberIdentity]>,
-}
-
-impl<O> GroupCas<O> for LeaveCas<'_>
-where
-    O: Storage + Clone,
-{
-    const LABELS: CasLabels = CasLabels {
-        iteration: "leave_loop",
-        // Never emitted: the skip is gated on the GET-first read, which this API
-        // does not do. Named anyway so turning `GET_FIRST` on is a one-line
-        // change rather than one that also has to invent a label.
-        noop_skip: "leave_noop_skip",
-        outdated: "leave_outdated",
-    };
-
-    // A leave is terminal: there is nothing to long-poll and no skip to arm, so
-    // the read would buy nothing the CAS does not already give.
-    const GET_FIRST: bool = false;
-
-    async fn apply(
-        &mut self,
-        group_id: &str,
-        now: SystemTime,
-        wrapper: Wrapper<O>,
-    ) -> (Wrapper<O>, Body) {
-        // Unconditional, unlike join/sync/heartbeat: a static member's leave is
-        // the one case where its liveness genuinely has to be reconciled.
-        wrapper
-            .missed_heartbeat(group_id, self.member_id.unwrap_or_default(), now)
-            .leave(now, group_id, self.member_id, self.members)
+        match self
+            .storage
+            .write_group_member(group_id, member_id, renewed, Some(version))
             .await
-    }
-}
+        {
+            Ok(_) => Ok(()),
 
-/// `offset_commit`'s half of [`Controller::run_group_cas_loop`].
-struct OffsetCommitCas<'a> {
-    offset_commit: OffsetCommit<'a>,
-}
+            // Lost to this member's own other in-flight request, on this
+            // replica or another. That write carried a reading at least as
+            // fresh as this one, so there is nothing to redo.
+            Err(UpdateError::Outdated { .. }) => Ok(()),
 
-impl<O> GroupCas<O> for OffsetCommitCas<'_>
-where
-    O: Storage + Clone,
-{
-    const LABELS: CasLabels = CasLabels {
-        iteration: "offset_commit_loop",
-        noop_skip: "offset_commit_noop_skip",
-        outdated: "offset_commit_outdated",
-    };
-
-    /// No `missed_heartbeat`: a commit is not a liveness signal, and the
-    /// committed offsets go to their own per-topition objects inside
-    /// `Wrapper::offset_commit` regardless of what happens to the group object.
-    async fn apply(
-        &mut self,
-        _group_id: &str,
-        now: SystemTime,
-        wrapper: Wrapper<O>,
-    ) -> (Wrapper<O>, Body) {
-        wrapper.offset_commit(now, &self.offset_commit).await
-    }
-
-    /// Skip the redundant group-state PUT when the commit changed nothing in
-    /// `GroupDetail` (#111): the offsets are already persisted to their own
-    /// objects, so re-writing the group object is pure overhead.
-    ///
-    /// Strict equality is right here, and is *not* the #273 mistake: nothing on
-    /// this path assigns `last_contact`, so equality is reachable.
-    fn skip(&self, before: &GroupDetail, after: &GroupDetail, _now: SystemTime) -> bool {
-        before == after
-    }
-}
-
-/// `heartbeat`'s half of [`Controller::run_group_cas_loop`].
-struct HeartbeatCas<'a> {
-    generation_id: i32,
-    member_id: &'a str,
-    group_instance_id: Option<&'a str>,
-}
-
-impl<O> GroupCas<O> for HeartbeatCas<'_>
-where
-    O: Storage + Clone,
-{
-    const LABELS: CasLabels = CasLabels {
-        iteration: "heartbeat_loop",
-        noop_skip: "heartbeat_noop_skip",
-        outdated: "heartbeat_outdated",
-    };
-
-    async fn apply(
-        &mut self,
-        group_id: &str,
-        now: SystemTime,
-        mut wrapper: Wrapper<O>,
-    ) -> (Wrapper<O>, Body) {
-        if self.group_instance_id.is_none() {
-            wrapper = wrapper.missed_heartbeat(group_id, self.member_id, now);
+            Err(error) => Err(update_error(error)),
         }
-
-        wrapper
-            .heartbeat(
-                now,
-                group_id,
-                self.generation_id,
-                self.member_id,
-                self.group_instance_id,
-            )
-            .await
     }
 
-    /// Every member heartbeats every few seconds, so this is the densest
-    /// sampling of a group's state available — which is what makes it the right
-    /// place to notice one that has stopped making progress (#240). Sampled from
-    /// `after`, unlike join and sync: the heartbeat itself can be what moves the
-    /// group, so the state worth reporting is the one it produced.
-    fn observe(
+    /// The dead-member sweep, which replaces `missed_heartbeat` (#359).
+    ///
+    /// Every join, sync and heartbeat runs this, and it does something only when
+    /// the group's own `swept_at_ms` says the last sweep was more than
+    /// session/2 ago — so N replicas serving a group cost **one** sweep per
+    /// group per session/2 between them, not one each.
+    ///
+    /// The verdict is a pure function of the member documents and the clock
+    /// ([`MemberDoc::is_expired`]), which is what makes racing replicas safe:
+    /// identical inputs give identical verdicts, so the first CAS to land is
+    /// the one they were all trying to make and the losers see a fresh stamp
+    /// and stop. A member the generation names but whose document is gone is
+    /// expired — the document is written before the generation admits the
+    /// member, so its absence cannot be a member that has not arrived yet.
+    ///
+    /// Returns the group as it now stands when it wrote, so the caller
+    /// continues against the state it produced rather than the one it read.
+    async fn sweep(
         &self,
-        controller: &Controller<O>,
         group_id: &str,
-        _before: &GroupDetail,
-        after: &GroupDetail,
+        view: &GroupView,
         now: SystemTime,
-    ) {
-        _ = controller.observe_rebalance(group_id, after, now);
+    ) -> Result<Option<GroupView>> {
+        if !view.exists() || view.generation.members.is_empty() {
+            return Ok(None);
+        }
+
+        let now_ms = epoch_ms(now);
+        let due_after = i64::from(view.session_timeout_ms()) / 2;
+
+        if now_ms.saturating_sub(view.generation.swept_at_ms) < due_after {
+            return Ok(None);
+        }
+
+        // From the generation's member set, never a LIST: the set is
+        // authoritative, and listing would put one on the request path.
+        let expired = futures::stream::iter(view.generation.members.keys().cloned().map(
+            |member_id| async move {
+                let held = self
+                    .storage
+                    .read_group_member(group_id, &member_id)
+                    .await
+                    .inspect_err(|error| debug!(?error, group_id, member_id))
+                    .ok()
+                    .flatten();
+
+                held.is_none_or(|(member, _)| member.is_expired(now_ms))
+                    .then_some(member_id)
+            },
+        ))
+        .buffered(MEMBER_FETCH_CONCURRENCY)
+        .filter_map(|expired| async move { expired })
+        .collect::<BTreeSet<_>>()
+        .await;
+
+        let mut next = view.generation.clone();
+        next.swept_at_ms = now_ms;
+
+        if !expired.is_empty() {
+            for member_id in &expired {
+                _ = next.members.remove(member_id);
+            }
+
+            // A membership change is a rebalance, and the leader is re-elected
+            // by the first member to join: the same rule that heals an orphan,
+            // rather than a second one that has to agree with it.
+            next = GroupView::rebalanced(next, now_ms);
+            next.leader = None;
+
+            info!(
+                group_id,
+                generation_id = next.generation_id,
+                evicted = ?expired,
+                "evicting members whose sessions lapsed",
+            );
+        }
+
+        match self
+            .storage
+            .update_group_generation(group_id, next.bumped(), view.version.clone())
+            .await
+        {
+            Ok(_) => {
+                // Best-effort: an orphaned document is harmless, since the
+                // generation's member set is what is authoritative.
+                for member_id in &expired {
+                    _ = self
+                        .storage
+                        .delete_group_member(group_id, member_id)
+                        .await
+                        .inspect_err(|error| debug!(?error, group_id, member_id));
+                }
+            }
+
+            // Another replica swept first, or the group moved. Either way its
+            // verdict was computed from the same documents as ours.
+            Err(UpdateError::Outdated { .. }) => (),
+
+            Err(error) => return Err(update_error(error)),
+        }
+
+        self.read_view(group_id).await.map(Some)
     }
 
-    /// Skip the group-state PUT when nothing persistent changed (#111): the
-    /// object exists and already holds `before` (just read), so a steady-state
-    /// heartbeat — and a heartbeat that merely observed a rebalance — writes zero
-    /// tier-1 PUTs. Only a real membership / generation change falls through to
-    /// the CAS.
+    /// The member list a leader's `JoinGroup` response carries.
     ///
-    /// This used to be strict equality on `GroupDetail`, which could never hold
-    /// (#273): `GroupMember` derives `PartialEq` over `last_contact`, and the
-    /// heartbeat path assigns it `now` before we get here — via
-    /// `missed_heartbeat` and `Formed::heartbeat`. So `after != before` on every
-    /// *successful* heartbeat and the skip fired only on errors, doing precisely
-    /// what the comment said it did not: 1 GET + 1 CAS PUT per member per
-    /// interval, ~100 PUT/s at 300 members. That the drifted copy is now the
-    /// shared one is the point of #286.
-    ///
-    /// The second half is not optional. Constant heartbeat PUTs were what kept
-    /// `{group}.json` mtimes fresh, and group expiry used to condemn a group on
-    /// that mtime alone — so skipping without a liveness floor would have armed
-    /// offset deletion for every stable group past the retention window. #272
-    /// removed that coupling by making expiry consult committed-offset activity,
-    /// which is why this is safe now and was not before. The renewal every
-    /// `session_timeout/2` still preserves cross-replica member eviction.
-    fn skip(&self, before: &GroupDetail, after: &GroupDetail, now: SystemTime) -> bool {
-        same_rebalance_state(before, after)
-            && !liveness_renewal_due(before, self.member_id, now, before.session_timeout_ms)
+    /// One document per member the generation names — no listing, and only on
+    /// the response that needs it, which is one member's join per rebalance.
+    /// A member named by the generation whose document has gone is reported
+    /// with empty metadata rather than dropped: the generation is what says it
+    /// is a member.
+    async fn join_members(
+        &self,
+        group_id: &str,
+        generation: &GenerationDoc,
+    ) -> Vec<JoinGroupResponseMember> {
+        futures::stream::iter(generation.members.clone().into_iter().map(
+            |(member_id, held)| async move {
+                self.storage
+                    .read_group_member(group_id, &member_id)
+                    .await
+                    .inspect_err(|error| debug!(?error, group_id, member_id))
+                    .ok()
+                    .flatten()
+                    .map_or_else(
+                        || {
+                            JoinGroupResponseMember::default()
+                                .member_id(member_id.clone())
+                                .group_instance_id(held.group_instance_id.clone())
+                        },
+                        |(member, _)| member.join_response,
+                    )
+            },
+        ))
+        .buffered(MEMBER_FETCH_CONCURRENCY)
+        .collect::<Vec<_>>()
+        .await
     }
-}
 
-#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct Forming {
-    protocol_type: Option<String>,
-    protocol_name: Option<String>,
-    leader: Option<String>,
-}
-
-impl fmt::Display for Forming {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Forming({}/{}/{})",
-            self.protocol_type.as_deref().unwrap_or("?"),
-            self.protocol_name.as_deref().unwrap_or("?"),
-            self.leader.as_deref().unwrap_or("?")
-        )
-    }
-}
-
-#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct Formed {
-    protocol_type: String,
-    protocol_name: String,
-    leader: String,
-    assignments: BTreeMap<String, Bytes>,
-}
-
-impl fmt::Display for Formed {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Formed({}/{}/{}/[{}])",
-            self.protocol_type,
-            self.protocol_name,
-            self.leader,
-            self.assignments
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct Inner<O, S> {
-    session_timeout_ms: i32,
-    rebalance_timeout_ms: Option<i32>,
-    members: BTreeMap<String, Member>,
-    generation_id: i32,
-    state: S,
-    storage: O,
-    skip_assignment: Option<bool>,
-    inception: SystemTime,
-}
-
-impl<O, S> fmt::Display for Inner<O, S>
-where
-    S: fmt::Display,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "state: {}, generation: {}",
-            self.state, self.generation_id
-        )
-    }
-}
-
-impl<O, S> PartialEq for Inner<O, S>
-where
-    S: PartialEq,
-{
-    fn eq(&self, other: &Self) -> bool {
-        self.session_timeout_ms == other.session_timeout_ms
-            && self.rebalance_timeout_ms == other.rebalance_timeout_ms
-            && self.members == other.members
-            && self.generation_id == other.generation_id
-            && self.state == other.state
-            && self.skip_assignment == other.skip_assignment
-            && self.inception == other.inception
-    }
-}
-
-impl<O, S> Hash for Inner<O, S>
-where
-    S: Hash,
-{
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.session_timeout_ms.hash(state);
-        self.rebalance_timeout_ms.hash(state);
-        self.members.hash(state);
-        self.generation_id.hash(state);
-        self.state.hash(state);
-        self.skip_assignment.hash(state);
-        self.inception.hash(state);
-    }
-}
-
-impl<O> Inner<O, PhantomData<Forming>>
-where
-    O: Storage,
-{
-    pub fn new(storage: O) -> Inner<O, Forming> {
-        Inner {
-            session_timeout_ms: Default::default(),
-            rebalance_timeout_ms: Default::default(),
-            members: Default::default(),
-            generation_id: -1,
-            state: Forming::default(),
-            skip_assignment: Some(false),
-            storage,
-            inception: SystemTime::now(),
-        }
-    }
-}
-
-impl<O> Inner<O, Forming>
-where
-    O: Storage,
-{
-    #[instrument(skip(self, now))]
-    fn missed_heartbeat(&mut self, group_id: &str, member_id: &str, now: SystemTime) -> bool {
-        let original = self.members.len();
-
-        if !member_id.is_empty() {
-            _ = self
-                .members
-                .get_mut(member_id)
-                .map(|member| member.last_contact.replace(now))
-        }
-
-        self.members.retain(|member_id, member| {
-            member
-                .last_contact
-                .map(|last_contact| now.duration_since(last_contact).unwrap_or_default())
-                .is_some_and(|duration| {
-                    if duration.as_millis()
-                        > u128::try_from(self.session_timeout_ms).unwrap_or(45_000)
-                    {
-                        if self
-                            .state
-                            .leader
-                            .as_ref()
-                            .is_some_and(|leader| leader == member_id)
-                        {
-                            info!(
-                                "eviction of leader: {member_id}, in generation: {}, after {}ms",
-                                self.generation_id,
-                                duration.as_millis()
-                            );
-
-                            _ = self.state.leader.take();
-                        } else {
-                            info!(
-                                "eviction of: {member_id}, in generation: {}, after {}ms",
-                                self.generation_id,
-                                duration.as_millis()
-                            );
-                        }
-
-                        false
-                    } else {
-                        true
-                    }
-                })
-        });
-
-        original > self.members.len()
-    }
-}
-
-impl<O> Inner<O, Formed>
-where
-    O: Storage,
-{
-    #[instrument(skip(self, now))]
-    fn missed_heartbeat(&mut self, group_id: &str, member_id: &str, now: SystemTime) -> bool {
-        let original = self.members.len();
-
-        if !member_id.is_empty() {
-            _ = self
-                .members
-                .get_mut(member_id)
-                .map(|member| member.last_contact.replace(now))
-        }
-
-        self.members.retain(|member_id, member| {
-            debug!(?member_id, ?member);
-
-            member
-                .last_contact
-                .map(|last_contact| now.duration_since(last_contact).unwrap_or_default())
-                .is_some_and(|duration| {
-                    if duration.as_millis()
-                        > u128::try_from(self.session_timeout_ms).unwrap_or(45_000)
-                    {
-                        info!(
-                            "eviction of: {member_id}, in generation: {}, after {}ms",
-                            self.generation_id,
-                            duration.as_millis()
-                        );
-
-                        false
-                    } else {
-                        true
-                    }
-                })
-        });
-
-        original > self.members.len()
-    }
-}
-
-impl<O, S> Inner<O, S>
-where
-    O: Storage,
-    S: Debug,
-{
     async fn fetch_offset(
-        &mut self,
+        &self,
         group_id: Option<&str>,
         topics: Option<&[OffsetFetchRequestTopic]>,
         groups: Option<&[OffsetFetchRequestGroup]>,
@@ -2715,7 +1309,7 @@ where
             .into())
     }
 
-    async fn commit_offset(&mut self, detail: &OffsetCommit<'_>) -> Result<Body> {
+    async fn commit_offset(&self, detail: &OffsetCommit<'_>) -> Result<Body> {
         let retention_time_ms = detail.retention_time_ms.map_or(Ok(None), |ms| {
             u64::try_from(ms)
                 .map(Duration::from_millis)
@@ -2723,109 +1317,170 @@ where
                 .map(Some)
         })?;
 
-        if let Some(topics) = detail.topics {
-            let mut offsets = vec![];
+        let Some(topics) = detail.topics else {
+            return Ok(offset_commit_error(detail, ErrorCode::UnknownMemberId));
+        };
 
-            for topic in topics {
-                if let Some(ref partitions) = topic.partitions {
-                    for partition in partitions {
-                        let topition = Topition::new(topic.name.clone(), partition.partition_index);
-                        let offset = OffsetCommitRequest::try_from(partition)?;
+        let mut offsets = vec![];
 
-                        offsets.push((topition, offset));
-                    }
+        for topic in topics {
+            if let Some(ref partitions) = topic.partitions {
+                for partition in partitions {
+                    let topition = Topition::new(topic.name.clone(), partition.partition_index);
+                    let offset = OffsetCommitRequest::try_from(partition)?;
+
+                    offsets.push((topition, offset));
                 }
             }
-
-            self.storage
-                .offset_commit(detail.group_id, retention_time_ms, offsets.deref())
-                .await
-                .map(|value| {
-                    let topics = value
-                        .iter()
-                        .fold(BTreeSet::new(), |mut topics, (topition, _)| {
-                            _ = topics.insert(topition.topic());
-                            topics
-                        })
-                        .iter()
-                        .map(|topic_name| {
-                            OffsetCommitResponseTopic::default()
-                                .name((*topic_name).into())
-                                .partitions(Some(
-                                    value
-                                        .iter()
-                                        .filter_map(|(topition, error_code)| {
-                                            if topition.topic() == *topic_name {
-                                                Some(
-                                                    OffsetCommitResponsePartition::default()
-                                                        .partition_index(topition.partition())
-                                                        .error_code(i16::from(*error_code)),
-                                                )
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .collect(),
-                                ))
-                        })
-                        .collect();
-
-                    OffsetCommitResponse::default()
-                        .throttle_time_ms(Some(0))
-                        .topics(Some(topics))
-                        .into()
-                })
-                .inspect_err(|err| error!(?err))
-                .map_err(Into::into)
-        } else {
-            Ok(OffsetCommitResponse::default()
-                .throttle_time_ms(Some(0))
-                .topics(detail.topics.map(|topics| {
-                    topics
-                        .as_ref()
-                        .iter()
-                        .map(|topic| {
-                            OffsetCommitResponseTopic::default()
-                                .name(topic.name.clone())
-                                .partitions(topic.partitions.as_ref().map(|partitions| {
-                                    partitions
-                                        .iter()
-                                        .map(|partition| {
-                                            OffsetCommitResponsePartition::default()
-                                                .partition_index(partition.partition_index)
-                                                .error_code(ErrorCode::UnknownMemberId.into())
-                                        })
-                                        .collect()
-                                }))
-                        })
-                        .collect()
-                }))
-                .into())
         }
+
+        self.storage
+            .offset_commit(detail.group_id, retention_time_ms, offsets.deref())
+            .await
+            .map(|value| {
+                let topics = value
+                    .iter()
+                    .fold(BTreeSet::new(), |mut topics, (topition, _)| {
+                        _ = topics.insert(topition.topic());
+                        topics
+                    })
+                    .iter()
+                    .map(|topic_name| {
+                        OffsetCommitResponseTopic::default()
+                            .name((*topic_name).into())
+                            .partitions(Some(
+                                value
+                                    .iter()
+                                    .filter_map(|(topition, error_code)| {
+                                        if topition.topic() == *topic_name {
+                                            Some(
+                                                OffsetCommitResponsePartition::default()
+                                                    .partition_index(topition.partition())
+                                                    .error_code(i16::from(*error_code)),
+                                            )
+                                        } else {
+                                            None
+                                        }
+                                    })
+                                    .collect(),
+                            ))
+                    })
+                    .collect();
+
+                OffsetCommitResponse::default()
+                    .throttle_time_ms(Some(0))
+                    .topics(Some(topics))
+                    .into()
+            })
+            .inspect_err(|err| error!(?err))
+            .map_err(Into::into)
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct Member {
-    join_response: JoinGroupResponseMember,
-    last_contact: Option<SystemTime>,
+/// Every partition of an `OffsetCommit` answered with the same error.
+fn offset_commit_error(detail: &OffsetCommit<'_>, error_code: ErrorCode) -> Body {
+    OffsetCommitResponse::default()
+        .throttle_time_ms(Some(0))
+        .topics(detail.topics.map(|topics| {
+            topics
+                .iter()
+                .map(|topic| {
+                    OffsetCommitResponseTopic::default()
+                        .name(topic.name.clone())
+                        .partitions(topic.partitions.as_ref().map(|partitions| {
+                            partitions
+                                .iter()
+                                .map(|partition| {
+                                    OffsetCommitResponsePartition::default()
+                                        .partition_index(partition.partition_index)
+                                        .error_code(error_code.into())
+                                })
+                                .collect()
+                        }))
+                })
+                .collect()
+        }))
+        .into()
 }
 
-#[async_trait::async_trait]
-impl<O> Group for Inner<O, Forming>
-where
-    O: Storage,
-{
-    type JoinState = Inner<O, Forming>;
-    type SyncState = Wrapper<O>;
-    type HeartbeatState = Inner<O, Forming>;
-    type LeaveState = Inner<O, Forming>;
-    type OffsetCommitState = Inner<O, Forming>;
-    type OffsetFetchState = Inner<O, Forming>;
+/// A failed conditional write, as this crate's error.
+///
+/// `Outdated` never reaches here: every caller that can lose a CAS handles the
+/// conflict itself, because re-reading and re-applying is the whole point.
+fn update_error<T>(error: UpdateError<T>) -> Error {
+    match error {
+        UpdateError::Error(error) => error.into(),
+        UpdateError::SerdeJson(error) => error.into(),
+        UpdateError::Uuid(uuid) => Error::Message(format!("uuid: {uuid}")),
+        UpdateError::MissingEtag => Error::Message(String::from("missing e-tag")),
+        UpdateError::Outdated { .. } => Error::Message(String::from("outdated")),
+    }
+}
 
+/// A `SyncGroup` answer carrying only an error.
+fn sync_error(view: &GroupView, error_code: ErrorCode) -> Body {
+    SyncGroupResponse::default()
+        .throttle_time_ms(Some(0))
+        .error_code(error_code.into())
+        .protocol_type(view.generation.protocol_type.clone())
+        .protocol_name(view.generation.protocol_name.clone())
+        .assignment(Bytes::from_static(b""))
+        .into()
+}
+
+/// A `JoinGroup` answer carrying only an error, reported against the group as
+/// it stands.
+///
+/// `protocol_type` falls back to the one the request declared: a group that
+/// does not exist yet has none of its own, and a client that is told nothing
+/// about the protocol cannot tell an unknown group from a disagreement over it.
+fn join_error(
+    view: &GroupView,
+    error_code: ErrorCode,
+    member_id: &str,
+    protocol_type: &str,
+) -> Body {
+    JoinGroupResponse::default()
+        .throttle_time_ms(Some(0))
+        .error_code(error_code.into())
+        .generation_id(if view.exists() {
+            view.generation_id()
+        } else {
+            -1
+        })
+        .protocol_type(
+            view.generation
+                .protocol_type
+                .clone()
+                .or_else(|| Some(protocol_type.to_owned())),
+        )
+        .protocol_name(Some(
+            view.generation.protocol_name.clone().unwrap_or_default(),
+        ))
+        .leader("".into())
+        .skip_assignment(view.generation.skip_assignment.or(Some(false)))
+        .member_id(member_id.to_owned())
+        .members(Some([].into()))
+        .into()
+}
+
+#[async_trait]
+impl<O> Coordinator for Controller<O>
+where
+    O: Storage + Clone,
+{
+    #[instrument(skip(
+        self,
+        client_id,
+        session_timeout_ms,
+        rebalance_timeout_ms,
+        group_instance_id,
+        protocol_type,
+        protocols,
+        reason
+    ))]
     async fn join(
-        mut self,
-        now: SystemTime,
+        &self,
         client_id: Option<&str>,
         group_id: &str,
         session_timeout_ms: i32,
@@ -2835,250 +1490,431 @@ where
         protocol_type: &str,
         protocols: Option<&[JoinGroupRequestProtocol]>,
         reason: Option<&str>,
-    ) -> (Self::JoinState, Body) {
+    ) -> Result<Body> {
         debug!(
-            client_id,
-            group_id,
-            session_timeout_ms,
-            rebalance_timeout_ms,
-            member_id,
-            group_instance_id,
-            protocol_type,
-            ?protocols,
-            reason
+            ?client_id,
+            ?session_timeout_ms,
+            ?rebalance_timeout_ms,
+            ?group_instance_id,
+            ?protocol_type,
+            protocols = ?protocols
+                .map(|protocols| {
+                    protocols
+                        .iter()
+                        .filter_map(|protocol| {
+                            MemberMetadata::try_from(protocol.metadata.clone())
+                                .ok()
+                                .map(|metadata| (protocol.name.clone(), metadata.to_string()))
+                        })
+                        .collect::<BTreeMap<_, _>>()
+                })
+                .unwrap_or_default(),
+            ?reason,
         );
 
-        let Some(protocols) = protocols else {
-            debug!(join_outcome = ?ErrorCode::InvalidRequest);
+        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join")]);
 
-            let join_group_response = JoinGroupResponse::default()
-                .throttle_time_ms(Some(0))
-                .error_code(ErrorCode::InvalidRequest.into())
-                .generation_id(self.generation_id)
-                .protocol_type(self.state.protocol_type.clone())
-                .protocol_name(Some("".into()))
-                .leader("".into())
-                .skip_assignment(self.skip_assignment)
-                .member_id("".into())
-                .members(Some([].into()));
+        // How long this call has been long-polling, on the MONOTONIC clock
+        // (#256). Deliberately not the wall clock: `SystemTime` makes
+        // `elapsed()` return `Err` after a backwards NTP step — which `?`
+        // turned into an error response for a member that was merely waiting —
+        // and it cannot be paused, so a test could only buy determinism by
+        // waiting out the real duration.
+        let polling_since = Instant::now();
+        let group_lock = self.group_lock(group_id);
+        let mut conflicts = 0u32;
 
-            return (self, join_group_response.into());
-        };
+        loop {
+            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_loop")]);
 
-        let protocol = if let Some(protocol_name) = self.state.protocol_name.as_deref() {
-            debug!(protocol_name);
+            // Narrow the window in which two of this group's members served by
+            // this replica race on `generation.json`. Released below before any
+            // sleep, so a held leader does not block the members it waits for.
+            let permit = group_lock.clone().lock_owned().await;
 
-            if let Some(protocol) = protocols
-                .iter()
-                .find(|protocol| protocol.name == protocol_name)
-            {
-                debug!(?protocol);
+            let now = (self.now)();
+            let now_ms = epoch_ms(now);
 
-                protocol
-            } else {
-                debug!(join_outcome = ?ErrorCode::InconsistentGroupProtocol);
+            let mut view = self.read_view(group_id).await?;
 
-                let join_group_response = JoinGroupResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .error_code(ErrorCode::InconsistentGroupProtocol.into())
-                    .generation_id(self.generation_id)
-                    .protocol_type(Some(protocol_type.into()))
-                    .protocol_name(self.state.protocol_name.clone())
-                    .leader("".into())
-                    .skip_assignment(self.skip_assignment)
-                    .member_id("".into())
-                    .members(Some([].into()));
-
-                return (self, join_group_response.into());
+            if let Some(swept) = self.sweep(group_id, &view, now).await? {
+                view = swept;
             }
-        } else {
-            self.state.protocol_type = Some(protocol_type.to_owned());
-            self.state.protocol_name = Some(protocols[0].name.as_str().to_owned());
 
-            self.session_timeout_ms = session_timeout_ms;
-            self.rebalance_timeout_ms = rebalance_timeout_ms;
+            // Sampled here as well as on the heartbeat path (#240).
+            //
+            // Heartbeat alone is blind to the failure this detector exists for.
+            // `AbstractCoordinator$HeartbeatThread` disables itself while the
+            // consumer has not joined, so a group whose members are stuck
+            // *trying* to join sends no heartbeat at all. Join keeps arriving
+            // from exactly that consumer — every `poll()` retries it — so it is
+            // a live sampling source precisely when heartbeats are not.
+            _ = self.observe_rebalance(group_id, &view, now);
 
-            &protocols[0]
-        };
-
-        if member_id.is_empty() && group_instance_id.is_none() {
-            let member_id = if let Some(client_id) = client_id {
-                format!("{client_id}-{}", Uuid::new_v4())
-            } else {
-                format!("{}", Uuid::new_v4())
+            let Some(protocols) = protocols.filter(|protocols| !protocols.is_empty()) else {
+                debug!(join_outcome = ?ErrorCode::InvalidRequest);
+                return Ok(join_error(
+                    &view,
+                    ErrorCode::InvalidRequest,
+                    "",
+                    protocol_type,
+                ));
             };
-            debug!(?member_id, join_outcome = ?ErrorCode::MemberIdRequired);
 
-            let join_group_response = JoinGroupResponse::default()
-                .throttle_time_ms(Some(0))
-                .error_code(ErrorCode::MemberIdRequired.into())
-                .generation_id(-1)
-                .protocol_type(self.state.protocol_type.clone())
-                .protocol_name(Some("".into()))
-                .leader("".into())
-                .skip_assignment(self.skip_assignment)
-                .member_id(member_id)
-                .members(Some([].into()));
+            // The group's protocol, once it has one, is what every later member
+            // must speak. The first member to join settles it, along with the
+            // timeouts the group is run on.
+            let protocol = match view.generation.protocol_name.as_deref() {
+                Some(protocol_name) => {
+                    let Some(protocol) = protocols
+                        .iter()
+                        .find(|protocol| protocol.name == protocol_name)
+                    else {
+                        debug!(join_outcome = ?ErrorCode::InconsistentGroupProtocol);
+                        return Ok(join_error(
+                            &view,
+                            ErrorCode::InconsistentGroupProtocol,
+                            "",
+                            protocol_type,
+                        ));
+                    };
 
-            // KIP-394: reply with the generated member id but leave the group
-            // untouched — the member only registers (and the generation only
-            // moves) when it re-joins with this id. Registering a phantom
-            // member here would rebalance the group for a client that may
-            // never come back.
-            return (self, join_group_response.into());
-        }
-
-        let member_id = group_instance_id.map_or(member_id.to_owned(), |group_instance_id| {
-            if member_id.is_empty() {
-                if let Some((member_id, _)) = self.members.iter().find(|(_, member)| {
-                    member.join_response.group_instance_id.as_deref() == Some(group_instance_id)
-                }) {
-                    member_id.into()
-                } else {
-                    format!("{group_instance_id}-{}", Uuid::new_v4())
+                    protocol
                 }
-            } else {
-                member_id.into()
-            }
-        });
 
-        debug!(?member_id, ?self.members);
+                None => &protocols[0],
+            };
 
-        if let Some(member) = self.members.get_mut(&member_id) {
-            if member.join_response.metadata == protocol.metadata {
-                debug!(
-                    member_metadata = "existing",
-                    member_id,
-                    generation_id = self.generation_id
+            if member_id.is_empty() && group_instance_id.is_none() {
+                // KIP-394: reply with a generated member id but leave the group
+                // untouched — the member only registers (and the generation
+                // only moves) when it re-joins with this id. Registering a
+                // phantom member here would rebalance the group for a client
+                // that may never come back. Zero object writes, and on this
+                // path zero reads of anything but the generation.
+                let minted = client_id.map_or_else(
+                    || format!("{}", Uuid::new_v4()),
+                    |client_id| format!("{client_id}-{}", Uuid::new_v4()),
                 );
-                member.last_contact = Some(now);
-            } else if group_instance_id.is_some()
-                || same_subscription_topics(&member.join_response.metadata, &protocol.metadata)
-            {
+
+                debug!(?minted, join_outcome = ?ErrorCode::MemberIdRequired);
+
+                let body = JoinGroupResponse::default()
+                    .throttle_time_ms(Some(0))
+                    .error_code(ErrorCode::MemberIdRequired.into())
+                    .generation_id(-1)
+                    .protocol_type(
+                        view.generation
+                            .protocol_type
+                            .clone()
+                            .or_else(|| Some(protocol_type.to_owned())),
+                    )
+                    .protocol_name(Some("".into()))
+                    .leader("".into())
+                    .skip_assignment(view.generation.skip_assignment.or(Some(false)))
+                    .member_id(minted)
+                    .members(Some([].into()))
+                    .into();
+
+                drop(permit);
+
+                return Ok(body);
+            }
+
+            // A static member reuses the id it already holds in the group, so
+            // its restart is not a membership change.
+            let member_id = group_instance_id.map_or_else(
+                || member_id.to_owned(),
+                |group_instance_id| {
+                    if !member_id.is_empty() {
+                        return member_id.to_owned();
+                    }
+
+                    view.generation
+                        .members
+                        .iter()
+                        .find(|(_, held)| {
+                            held.group_instance_id.as_deref() == Some(group_instance_id)
+                        })
+                        .map_or_else(
+                            || format!("{group_instance_id}-{}", Uuid::new_v4()),
+                            |(member_id, _)| member_id.to_owned(),
+                        )
+                },
+            );
+
+            let held = self
+                .storage
+                .read_group_member(group_id, member_id.as_str())
+                .await?;
+
+            let join_response = JoinGroupResponseMember::default()
+                .member_id(member_id.clone())
+                .group_instance_id(group_instance_id.map(ToOwned::to_owned))
+                .metadata(protocol.metadata.clone());
+
+            let mut next = view.generation.clone();
+            let mut write = !view.exists();
+
+            if next.protocol_name.is_none() {
+                next.protocol_type = Some(protocol_type.to_owned());
+                next.protocol_name = Some(protocol.name.clone());
+                next.session_timeout_ms = session_timeout_ms;
+                next.rebalance_timeout_ms = rebalance_timeout_ms;
+                write = true;
+            }
+
+            if !view.exists() {
+                next.inception_ms = now_ms;
+                next.state_since_ms = now_ms;
+                next.swept_at_ms = now_ms;
+                next.skip_assignment = Some(false);
+
+                // A brand-new group is born one below its first generation, so
+                // the membership change below mints generation 0 — the same
+                // arithmetic every later join does, rather than a special case
+                // that has to agree with it.
+                next.generation_id = -1;
+            }
+
+            let membership_changed = match view.generation.members.get(member_id.as_str()) {
+                None => true,
+
                 // The encoded metadata changed but the subscribed topic set did
                 // not: a static member's soft update, or a cooperative
                 // consumer's KIP-792-only rejoin (fresh generationId /
-                // ownedPartitions / sticky userData, same topics). Record the
-                // new metadata as the leader's sticky input WITHOUT bumping the
-                // generation — bumping here would invalidate any in-flight
-                // SyncGroup and, with many members re-joining, keep the group
-                // from ever converging.
-                debug!(
-                    member_metadata = "soft_update",
-                    member_id,
-                    ?group_instance_id,
-                    updated = ?protocol.metadata,
-                    existing = ?member.join_response.metadata,
-                    generation_id = self.generation_id
+                // ownedPartitions / sticky userData, same topics). The new
+                // metadata is recorded in the member's own document — which is
+                // what the leader reads — WITHOUT bumping the generation.
+                // Bumping here would invalidate any in-flight SyncGroup and,
+                // with many members re-joining, keep the group from ever
+                // converging.
+                Some(_) if group_instance_id.is_some() => false,
+
+                Some(_) => held.as_ref().is_none_or(|(member, _)| {
+                    member.join_response.metadata != protocol.metadata
+                        && !same_subscription_topics(
+                            &member.join_response.metadata,
+                            &protocol.metadata,
+                        )
+                }),
+            };
+
+            if membership_changed {
+                _ = next.members.insert(
+                    member_id.clone(),
+                    MemberRef {
+                        group_instance_id: group_instance_id.map(ToOwned::to_owned),
+                    },
                 );
 
-                member.join_response.metadata = protocol.metadata.clone();
-                member.last_contact = Some(now);
-            } else {
-                self.generation_id += 1;
-
-                debug!(
-                    member_metadata = "update",
-                    member_id,
-                    updated = ?protocol.metadata,
-                    existing = ?member.join_response.metadata,
-                    generation_id = self.generation_id
-                );
-
-                member.join_response.metadata = protocol.metadata.clone();
-                member.last_contact = Some(now);
+                next = GroupView::rebalanced(next, now_ms);
+                write = true;
             }
-        } else {
-            self.generation_id += 1;
 
-            debug!(
-                member_metadata = "new",
-                member_id,
-                generation_id = self.generation_id
-            );
+            // Heal an orphaned leader before considering a promotion: a leader
+            // that is no longer a member deadlocks the group — every live
+            // member is told someone else leads, so nobody ever sends
+            // assignments (#240).
+            if next
+                .leader
+                .as_ref()
+                .is_some_and(|leader| !next.members.contains_key(leader))
+            {
+                warn!(
+                    group_id,
+                    orphaned_leader = next.leader.as_deref(),
+                    generation_id = next.generation_id,
+                    "leader is no longer a member; clearing so a live member is promoted (#240)"
+                );
 
-            _ = self.members.insert(
-                member_id.clone(),
-                Member {
-                    join_response: JoinGroupResponseMember::default()
-                        .member_id(member_id.to_string())
-                        .group_instance_id(group_instance_id.map(|s| s.to_owned()))
-                        .metadata(protocol.metadata.clone()),
-                    last_contact: Some(now),
-                },
-            );
-        }
+                _ = next.leader.take();
+            }
 
-        debug!(?member_id, ?self.members);
+            // First in elects itself. One rule covers the group's first
+            // leader, the promotion after a leader leaves, and the healing
+            // above; the CAS resolves the race, because a loser re-reads, sees
+            // a leader and re-applies as an add.
+            if next.leader.is_none() {
+                info!(member_id, group_id, generation_id = next.generation_id);
 
-        // Heal an orphaned leader before considering a promotion: group state
-        // written before the `Forming::leave` fix-up (or by any other path
-        // that forgot the invariant) can carry a leader that is no longer a
-        // member. Left in place it deadlocks the group — every live member is
-        // told someone else is the leader, so nobody ever sends assignments —
-        // and only an owner change would clear it, via the fix-up in
-        // `with_storage_group_detail` (#240).
-        if self
-            .state
-            .leader
-            .as_ref()
-            .is_some_and(|leader| !self.members.contains_key(leader))
-        {
-            warn!(
-                group_id,
-                orphaned_leader = self.state.leader.as_deref(),
-                generation_id = self.generation_id,
-                "leader is no longer a member; clearing so a live member is promoted (#240)"
-            );
+                _ = next.leader.replace(member_id.clone());
+                next.state_since_ms = now_ms;
+                write = true;
+            }
 
-            _ = self.state.leader.take();
-        }
-
-        if self.state.leader.is_none() {
-            info!(member_id, group_id, self.generation_id);
-
-            _ = self.state.leader.replace(member_id.clone());
-        }
-
-        let join_group_response = JoinGroupResponse::default()
-            .throttle_time_ms(Some(0))
-            .error_code(ErrorCode::None.into())
-            .generation_id(self.generation_id)
-            .protocol_type(self.state.protocol_type.clone())
-            .protocol_name(self.state.protocol_name.clone())
-            .leader(
-                self.state
-                    .leader
+            // The member's own document, written **before** the generation
+            // admits it: a member the generation names must always have one,
+            // because the sweep reads a missing document as a lapsed session
+            // and the leader's join response reads it for the subscription.
+            let member = MemberDoc {
+                seq: held.as_ref().map_or(0, |(member, _)| member.seq),
+                last_contact_ms: now_ms,
+                session_timeout_ms: next.session_timeout_ms,
+                rebalance_timeout_ms: next.rebalance_timeout_ms,
+                group_instance_id: group_instance_id.map(ToOwned::to_owned),
+                join_response: join_response.clone(),
+                rest: held
                     .as_ref()
-                    .map_or(String::from(""), |leader| leader.clone()),
-            )
-            .skip_assignment(self.skip_assignment)
-            .members(Some(
-                if self
-                    .state
-                    .leader
-                    .as_ref()
-                    .is_some_and(|leader| leader == member_id.as_str())
+                    .map(|(member, _)| member.rest.clone())
+                    .unwrap_or_default(),
+            };
+
+            let member_changed = held
+                .as_ref()
+                .is_none_or(|(held, _)| held.join_response != join_response);
+
+            if member_changed
+                || liveness_renewal_due(
+                    held.as_ref().map(|(member, _)| member),
+                    now_ms,
+                    next.session_timeout_ms,
+                )
+            {
+                match self
+                    .storage
+                    .write_group_member(
+                        group_id,
+                        member_id.as_str(),
+                        member.bumped(),
+                        held.as_ref().map(|(_, version)| version.clone()),
+                    )
+                    .await
                 {
-                    self.members
-                        .values()
-                        .cloned()
-                        .map(|member| member.join_response)
-                        .collect()
-                } else {
-                    [].into()
-                },
-            ))
-            .member_id(member_id);
+                    Ok(_) => (),
 
-        debug!(join_outcome = ?ErrorCode::None);
+                    // This member's other in-flight request won. Re-read
+                    // everything rather than reason about which is newer —
+                    // through the same backoff as a generation conflict, so a
+                    // member whose two requests are chasing each other does not
+                    // spin against the store.
+                    Err(UpdateError::Outdated { .. }) => {
+                        drop(permit);
+                        self.generation_conflict(group_id, "join_member_outdated", &mut conflicts)
+                            .await;
+                        continue;
+                    }
 
-        (self, join_group_response.into())
+                    Err(error) => return Err(update_error(error)),
+                }
+            }
+
+            if write {
+                match self
+                    .storage
+                    .update_group_generation(group_id, next.clone().bumped(), view.version.clone())
+                    .await
+                {
+                    Ok(version) => {
+                        // A membership change mints a generation, and
+                        // `assignment/{gen}` for it cannot exist yet.
+                        let carried = (next.generation_id == view.generation_id())
+                            .then_some(view.assignment)
+                            .flatten();
+
+                        view = GroupView {
+                            generation: next.bumped(),
+                            version: Some(version),
+                            assignment: carried,
+                        };
+                    }
+
+                    Err(UpdateError::Outdated { .. }) => {
+                        drop(permit);
+                        self.generation_conflict(group_id, "join_outdated", &mut conflicts)
+                            .await;
+                        continue;
+                    }
+
+                    Err(error) => return Err(update_error(error)),
+                }
+            } else {
+                COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_noop_skip")]);
+            }
+
+            let is_leader = view.leader() == Some(member_id.as_str());
+
+            // Built without the member list: the long-poll decision does not
+            // need it, and a leader held by the join window would otherwise pay
+            // a per-member read for every second it waits.
+            let body = Body::from(
+                JoinGroupResponse::default()
+                    .throttle_time_ms(Some(0))
+                    .error_code(ErrorCode::None.into())
+                    .generation_id(view.generation_id())
+                    .protocol_type(view.generation.protocol_type.clone())
+                    .protocol_name(view.generation.protocol_name.clone())
+                    .leader(view.leader().unwrap_or_default().to_owned())
+                    .skip_assignment(view.generation.skip_assignment)
+                    .member_id(member_id.clone())
+                    .members(Some([].into())),
+            );
+
+            // The join window is derived from the group, not from what this
+            // call has happened to see: `members_changed_at_ms` is persisted, so
+            // every replica reaches the same verdict about the same group at the
+            // same instant — which is what makes the barrier hold when a
+            // group's members are scattered across replicas.
+            let membership_quiescent = Duration::from_millis(
+                now_ms
+                    .saturating_sub(view.generation.members_changed_at_ms)
+                    .max(0) as u64,
+            ) >= JOIN_QUIESCENCE;
+
+            // `rebalance_timeout_ms` bounds how long the leader may be held
+            // (the Java client allows JoinGroup responses up to
+            // `rebalance_timeout + 5s`), falling back to the session timeout
+            // when unset, as Kafka does for old protocol versions.
+            let join_window_ms = u128::try_from(
+                view.generation
+                    .rebalance_timeout_ms
+                    .or(rebalance_timeout_ms)
+                    .unwrap_or(view.session_timeout_ms()),
+            )
+            .unwrap_or_default();
+
+            let decision = join_long_poll(
+                &view,
+                &body,
+                group_instance_id,
+                polling_since.elapsed().as_millis(),
+                view.is_forming(),
+                membership_quiescent,
+                join_window_ms,
+            );
+
+            drop(permit);
+
+            match decision {
+                LongPoll::Wait(pause, method) => {
+                    COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", method)]);
+                    sleep(pause).await;
+                }
+
+                LongPoll::Respond(_) => {
+                    debug!(join_outcome = ?ErrorCode::None, generation_id = view.generation_id());
+
+                    let Body::JoinGroupResponse(response) = body else {
+                        unreachable!()
+                    };
+
+                    // Only the leader is handed the membership, and only now
+                    // that it is being answered.
+                    return Ok(response
+                        .members(Some(if is_leader {
+                            self.join_members(group_id, &view.generation).await
+                        } else {
+                            [].into()
+                        }))
+                        .into());
+                }
+            }
+        }
     }
 
+    #[instrument(skip(self, group_instance_id, protocol_type, protocol_name, assignments))]
     async fn sync(
-        mut self,
-        _now: SystemTime,
+        &self,
         group_id: &str,
         generation_id: i32,
         member_id: &str,
@@ -3086,965 +1922,505 @@ where
         protocol_type: Option<&str>,
         protocol_name: Option<&str>,
         assignments: Option<&[SyncGroupRequestAssignment]>,
-    ) -> (Self::SyncState, Body) {
+    ) -> Result<Body> {
         debug!(
-            group_id,
-            generation_id,
-            member_id,
-            group_instance_id,
-            protocol_type,
-            protocol_name,
-            ?assignments
+            ?group_instance_id,
+            ?protocol_type,
+            ?protocol_name,
+            assignments = ?assignments
+                .map(|assignments| {
+                    assignments
+                        .iter()
+                        .filter_map(|request| {
+                            MemberAssignment::try_from(request.assignment.clone())
+                                .ok()
+                                .map(|member_assignment| {
+                                    (request.member_id.clone(), member_assignment.to_string())
+                                })
+                        })
+                        .collect::<BTreeMap<_, _>>()
+                })
+                .unwrap_or_default(),
         );
 
-        if !self.members.contains_key(member_id) {
-            debug!(?self.members, sync_outcome = ?ErrorCode::UnknownMemberId);
+        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sync")]);
 
-            let sync_group_response = SyncGroupResponse::default()
-                .throttle_time_ms(Some(0))
-                .error_code(ErrorCode::UnknownMemberId.into())
-                .protocol_type(self.state.protocol_type.clone())
-                .protocol_name(self.state.protocol_name.clone())
-                .assignment(Bytes::from_static(b""));
+        // Once per request, not once per iteration: this inspects the
+        // assignments the caller sent, which do not change between retries.
+        warn_on_overlapping_assignments(group_id, generation_id, assignments);
 
-            return (self.into(), sync_group_response.into());
+        // Monotonic, for the same reasons as `join`'s (#256).
+        let polling_since = Instant::now();
+        let group_lock = self.group_lock(group_id);
+
+        loop {
+            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sync_loop")]);
+
+            let permit = group_lock.clone().lock_owned().await;
+
+            let now = (self.now)();
+            let mut view = self.read_view(group_id).await?;
+
+            if let Some(swept) = self.sweep(group_id, &view, now).await? {
+                view = swept;
+            }
+
+            // Sampled from the state this iteration read, for the same reason
+            // as `join`'s — see there.
+            _ = self.observe_rebalance(group_id, &view, now);
+
+            let (view, body) = self
+                .sync_once(group_id, generation_id, member_id, view, assignments, now)
+                .await?;
+
+            self.renew_member(group_id, member_id, view.session_timeout_ms(), now)
+                .await?;
+
+            let decision = sync_long_poll(
+                &view,
+                &body,
+                group_instance_id,
+                polling_since.elapsed().as_millis(),
+            );
+
+            drop(permit);
+
+            match decision {
+                LongPoll::Respond(None) => return Ok(body),
+
+                LongPoll::Respond(Some(error_code)) => return Ok(set_error_code(body, error_code)),
+
+                LongPoll::Wait(pause, method) => {
+                    COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", method)]);
+                    sleep(pause).await;
+                }
+            }
+        }
+    }
+
+    #[instrument(skip(self, members))]
+    async fn leave(
+        &self,
+        group_id: &str,
+        member_id: Option<&str>,
+        members: Option<&[MemberIdentity]>,
+    ) -> Result<Body> {
+        debug!(?members);
+
+        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "leave")]);
+
+        // Who the request names, in the two shapes LeaveGroup has: the older
+        // single-member form, and the batched one.
+        let departing = member_id.map_or_else(
+            || {
+                members.map_or_else(Vec::new, |members| {
+                    members
+                        .iter()
+                        .map(|member| (member.member_id.clone(), member.group_instance_id.clone()))
+                        .collect()
+                })
+            },
+            |member_id| vec![(member_id.to_owned(), None)],
+        );
+
+        let group_lock = self.group_lock(group_id);
+        let mut conflicts = 0u32;
+
+        loop {
+            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "leave_loop")]);
+
+            let permit = group_lock.clone().lock_owned().await;
+
+            let now = (self.now)();
+            let now_ms = epoch_ms(now);
+            let view = self.read_view(group_id).await?;
+
+            let mut next = view.generation.clone();
+            let mut left = BTreeSet::new();
+
+            let responses = departing
+                .iter()
+                .map(|(member_id, group_instance_id)| {
+                    let known = next.members.remove(member_id).is_some();
+
+                    if known {
+                        _ = left.insert(member_id.clone());
+                    }
+
+                    MemberResponse::default()
+                        .member_id(member_id.clone())
+                        .group_instance_id(group_instance_id.clone())
+                        .error_code(
+                            if known {
+                                ErrorCode::None
+                            } else {
+                                ErrorCode::UnknownMemberId
+                            }
+                            .into(),
+                        )
+                })
+                .collect::<Vec<_>>();
+
+            let body = Body::from(
+                LeaveGroupResponse::default()
+                    .throttle_time_ms(Some(0))
+                    .error_code(ErrorCode::None.into())
+                    .members(Some(responses)),
+            );
+
+            if left.is_empty() {
+                drop(permit);
+                return Ok(body);
+            }
+
+            next = GroupView::rebalanced(next, now_ms);
+
+            // The departing member may be the elected leader. Left in place it
+            // freezes the group: `join` never promotes anyone else, and every
+            // follower sync is refused as not-leader (#240).
+            if next
+                .leader
+                .as_ref()
+                .is_some_and(|leader| !next.members.contains_key(leader))
+            {
+                info!(
+                    group_id,
+                    departed_leader = next.leader.as_deref(),
+                    generation_id = next.generation_id,
+                    "leader left; clearing so a live member is promoted (#240)"
+                );
+
+                _ = next.leader.take();
+            }
+
+            match self
+                .storage
+                .update_group_generation(group_id, next.bumped(), view.version.clone())
+                .await
+            {
+                Ok(_) => {
+                    // Best-effort, and after the generation has stopped naming
+                    // them: an orphaned document is harmless, a document still
+                    // there for a member the generation names is not.
+                    for member_id in &left {
+                        _ = self
+                            .storage
+                            .delete_group_member(group_id, member_id)
+                            .await
+                            .inspect_err(|error| debug!(?error, group_id, member_id));
+                    }
+
+                    drop(permit);
+                    return Ok(body);
+                }
+
+                Err(UpdateError::Outdated { .. }) => {
+                    drop(permit);
+
+                    if conflicts >= MAX_GENERATION_CAS_ATTEMPTS {
+                        return Err(Error::Api(ErrorCode::RebalanceInProgress));
+                    }
+
+                    self.generation_conflict(group_id, "leave_outdated", &mut conflicts)
+                        .await;
+                }
+
+                Err(error) => return Err(update_error(error)),
+            }
+        }
+    }
+
+    #[instrument(skip(self, offset_commit), fields(group_id = offset_commit.group_id, generation_id = offset_commit.generation_id_or_member_epoch))]
+    async fn offset_commit(&self, offset_commit: OffsetCommit<'_>) -> Result<Body> {
+        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "offset_commit")]);
+
+        let group_id = offset_commit.group_id;
+        let member_id = offset_commit.member_id.unwrap_or_default();
+        let generation_id = offset_commit.generation_id_or_member_epoch.unwrap_or(-1);
+
+        let now = (self.now)();
+
+        // Kafka's own rule: a commit that claims no generation, or names no
+        // member, is a simple consumer managing its own offsets. It is fenced
+        // by nothing and reads nothing about the group — which is also what
+        // stops the commit path creating group state for a group that has
+        // none (#272).
+        if generation_id >= 0 && !member_id.is_empty() {
+            let Some((generation, _)) = self.storage.read_group_generation(group_id).await? else {
+                debug!(group_id, member_id, offset_commit_outcome = ?ErrorCode::UnknownMemberId);
+                return Ok(offset_commit_error(
+                    &offset_commit,
+                    ErrorCode::UnknownMemberId,
+                ));
+            };
+
+            if !generation.members.contains_key(member_id) {
+                debug!(group_id, member_id, offset_commit_outcome = ?ErrorCode::UnknownMemberId);
+                return Ok(offset_commit_error(
+                    &offset_commit,
+                    ErrorCode::UnknownMemberId,
+                ));
+            }
+
+            if generation.generation_id != generation_id {
+                debug!(
+                    group_id,
+                    member_id,
+                    generation_id,
+                    current = generation.generation_id,
+                    offset_commit_outcome = ?ErrorCode::IllegalGeneration,
+                );
+
+                return Ok(offset_commit_error(
+                    &offset_commit,
+                    ErrorCode::IllegalGeneration,
+                ));
+            }
+
+            // A member that commits is a member that is alive. Folding liveness
+            // into the commit path — commits arrive every ~5s — makes most
+            // heartbeat renewals no-ops, and it goes to the member's own
+            // document rather than to the offsets object, so nothing about
+            // group expiry changes.
+            self.renew_member(group_id, member_id, generation.session_timeout_ms, now)
+                .await?;
         }
 
-        debug!(?member_id);
+        match self.commit_offset(&offset_commit).await {
+            Ok(body) => Ok(body),
 
-        if generation_id > self.generation_id {
-            debug!(self.generation_id, sync_outcome = ?ErrorCode::IllegalGeneration);
+            Err(reason) => {
+                debug!(?reason);
+                Ok(offset_commit_error(
+                    &offset_commit,
+                    ErrorCode::UnknownMemberId,
+                ))
+            }
+        }
+    }
 
-            let sync_group_response = SyncGroupResponse::default()
-                .throttle_time_ms(Some(0))
-                .error_code(ErrorCode::IllegalGeneration.into())
-                .protocol_type(self.state.protocol_type.clone())
-                .protocol_name(self.state.protocol_name.clone())
-                .assignment(Bytes::from_static(b""));
+    #[instrument(skip_all)]
+    async fn offset_fetch(
+        &self,
+        group_id: Option<&str>,
+        topics: Option<&[OffsetFetchRequestTopic]>,
+        groups: Option<&[OffsetFetchRequestGroup]>,
+        require_stable: Option<bool>,
+    ) -> Result<Body> {
+        debug!(?group_id, ?topics, ?groups, ?require_stable);
 
-            return (self.into(), sync_group_response.into());
+        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "offset_fetch")]);
+
+        self.fetch_offset(group_id, topics, groups, require_stable)
+            .await
+    }
+
+    #[instrument(skip(self, group_instance_id))]
+    async fn heartbeat(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+        member_id: &str,
+        group_instance_id: Option<&str>,
+    ) -> Result<Body> {
+        debug!(?group_id, ?generation_id, ?member_id, ?group_instance_id);
+
+        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "heartbeat")]);
+
+        let now = (self.now)();
+        let mut view = self.read_view(group_id).await?;
+
+        if let Some(swept) = self.sweep(group_id, &view, now).await? {
+            view = swept;
         }
 
-        if generation_id < self.generation_id {
-            debug!(self.generation_id, sync_outcome = ?ErrorCode::RebalanceInProgress);
+        // Every member heartbeats every few seconds, so this is the densest
+        // sampling of a group's state available (#240).
+        _ = self.observe_rebalance(group_id, &view, now);
 
-            let sync_group_response = SyncGroupResponse::default()
-                .throttle_time_ms(Some(0))
-                .error_code(ErrorCode::RebalanceInProgress.into())
-                .protocol_type(self.state.protocol_type.clone())
-                .protocol_name(self.state.protocol_name.clone())
-                .assignment(Bytes::from_static(b""));
+        let error_code = if !view.exists() || !view.generation.members.contains_key(member_id) {
+            ErrorCode::UnknownMemberId
+        } else if generation_id > view.generation_id() {
+            ErrorCode::IllegalGeneration
+        } else if generation_id < view.generation_id() {
+            // Someone joined, left or was swept: the member's generation is
+            // behind, so it must re-join.
+            ErrorCode::RebalanceInProgress
+        } else {
+            // Steady state: two reads, and one member-document write per
+            // session/2. No LIST, no shared CAS, no forwarding.
+            self.renew_member(group_id, member_id, view.session_timeout_ms(), now)
+                .await?;
 
-            return (self.into(), sync_group_response.into());
-        }
-
-        if self
-            .state
-            .leader
-            .as_ref()
-            .is_some_and(|leader_id| member_id != leader_id.as_str())
-        {
-            debug!(?self.state.leader, sync_outcome = ?ErrorCode::RebalanceInProgress);
-
-            let sync_group_response = SyncGroupResponse::default()
-                .throttle_time_ms(Some(0))
-                .error_code(ErrorCode::RebalanceInProgress.into())
-                .protocol_type(self.state.protocol_type.clone())
-                .protocol_name(self.state.protocol_name.clone())
-                .assignment(Bytes::from_static(b""));
-
-            return (self.into(), sync_group_response.into());
-        }
-
-        let Some(assignments) = assignments else {
-            debug!(sync_outcome = ?ErrorCode::RebalanceInProgress);
-
-            let sync_group_response = SyncGroupResponse::default()
-                .throttle_time_ms(Some(0))
-                .error_code(ErrorCode::RebalanceInProgress.into())
-                .protocol_type(self.state.protocol_type.clone())
-                .protocol_name(self.state.protocol_name.clone())
-                .assignment(Bytes::from_static(b""));
-
-            return (self.into(), sync_group_response.into());
+            ErrorCode::None
         };
 
-        let assignments = assignments
+        debug!(?error_code, generation_id = view.generation_id());
+
+        Ok(HeartbeatResponse::default()
+            .throttle_time_ms(Some(0))
+            .error_code(error_code.into())
+            .into())
+    }
+
+    fn prune(&self) -> usize {
+        self.prune_idle_groups()
+    }
+}
+
+impl<O> Controller<O>
+where
+    O: Storage + Clone,
+{
+    /// One `SyncGroup` iteration against the group as read.
+    ///
+    /// Returns the group as it stands afterwards — which the leader's own
+    /// create moves — so the long-poll decision is taken against what this
+    /// iteration produced rather than what it started from.
+    async fn sync_once(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+        member_id: &str,
+        view: GroupView,
+        assignments: Option<&[SyncGroupRequestAssignment]>,
+        now: SystemTime,
+    ) -> Result<(GroupView, Body)> {
+        if !view.exists() || !view.generation.members.contains_key(member_id) {
+            debug!(?member_id, sync_outcome = ?ErrorCode::UnknownMemberId);
+            let body = sync_error(&view, ErrorCode::UnknownMemberId);
+            return Ok((view, body));
+        }
+
+        if generation_id > view.generation_id() {
+            debug!(current = view.generation_id(), sync_outcome = ?ErrorCode::IllegalGeneration);
+            let body = sync_error(&view, ErrorCode::IllegalGeneration);
+            return Ok((view, body));
+        }
+
+        if generation_id < view.generation_id() {
+            debug!(current = view.generation_id(), sync_outcome = ?ErrorCode::RebalanceInProgress);
+            let body = sync_error(&view, ErrorCode::RebalanceInProgress);
+            return Ok((view, body));
+        }
+
+        // The assignment is immutable and create-only, so if it is there it is
+        // the answer — for the leader retrying as much as for a follower.
+        if let Some(assignments) = view.assignments() {
+            // A member of this generation that the leader's assignment does not
+            // cover must re-join, not park on "stable" with zero partitions:
+            // `error=None` plus an empty assignment reads to the client as a
+            // valid empty assignment, and it then sits idle forever.
+            let Some(assignment) = assignments.get(member_id).cloned() else {
+                debug!(sync_outcome = ?ErrorCode::RebalanceInProgress, "not in the assignment");
+                let body = sync_error(&view, ErrorCode::RebalanceInProgress);
+                return Ok((view, body));
+            };
+
+            debug!(sync_outcome = ?ErrorCode::None, sync_assignment = true);
+
+            let body = SyncGroupResponse::default()
+                .throttle_time_ms(Some(0))
+                .error_code(ErrorCode::None.into())
+                .protocol_type(view.generation.protocol_type.clone())
+                .protocol_name(view.generation.protocol_name.clone())
+                .assignment(assignment)
+                .into();
+
+            return Ok((view, body));
+        }
+
+        // No assignment for this generation yet, so only the leader has
+        // anything to do here.
+        if view.leader() != Some(member_id) {
+            debug!(leader = ?view.leader(), sync_outcome = ?ErrorCode::RebalanceInProgress);
+            let body = sync_error(&view, ErrorCode::RebalanceInProgress);
+            return Ok((view, body));
+        }
+
+        let requested = assignments
+            .unwrap_or_default()
             .iter()
-            .inspect(|assignment| {
-                debug!(
-                    member_id = assignment.member_id,
-                    assignment = MemberAssignment::try_from(assignment.assignment.clone())
-                        .map(|assignment| assignment.to_string())
-                        .unwrap_or_default()
-                )
-            })
             .map(|assignment| (assignment.member_id.clone(), assignment.assignment.clone()))
             .collect::<BTreeMap<_, _>>();
 
         // A sync whose assignments do not cover the syncing member must not
-        // form the group: answering `error=None` with an empty assignment
-        // parks the client at "stable" with zero partitions. Rebalance instead
-        // so the member re-joins and a complete assignment is computed.
-        if !assignments.contains_key(member_id) {
-            debug!(?self.members, sync_outcome = ?ErrorCode::RebalanceInProgress);
-
-            let sync_group_response = SyncGroupResponse::default()
-                .throttle_time_ms(Some(0))
-                .error_code(ErrorCode::RebalanceInProgress.into())
-                .protocol_type(self.state.protocol_type.clone())
-                .protocol_name(self.state.protocol_name.clone())
-                .assignment(Bytes::from_static(b""));
-
-            return (self.into(), sync_group_response.into());
+        // form the group, for the same reason as above.
+        if !requested.contains_key(member_id) {
+            debug!(sync_outcome = ?ErrorCode::RebalanceInProgress, "leader not in its own assignment");
+            let body = sync_error(&view, ErrorCode::RebalanceInProgress);
+            return Ok((view, body));
         }
 
-        let sync_group_response = SyncGroupResponse::default()
-            .throttle_time_ms(Some(0))
-            .error_code(ErrorCode::None.into())
-            .protocol_type(self.state.protocol_type.clone())
-            .protocol_name(self.state.protocol_name.clone())
-            .assignment(
-                assignments
-                    .get(member_id)
-                    .cloned()
-                    .unwrap_or(Bytes::from_static(b"")),
-            );
-
-        debug!(sync_outcome = ?ErrorCode::None, sync_assignment = assignments.contains_key(member_id));
-
-        let state = Inner {
-            session_timeout_ms: self.session_timeout_ms,
-            rebalance_timeout_ms: self.rebalance_timeout_ms,
-
-            members: self.members,
-            generation_id: self.generation_id,
-            state: Formed {
-                protocol_name: self.state.protocol_name.expect("protocol_name"),
-                protocol_type: self.state.protocol_type.expect("protocol_type"),
-                leader: member_id.to_owned(),
-                assignments,
-            },
-            storage: self.storage,
-            skip_assignment: self.skip_assignment,
-            inception: self.inception,
+        let assignment = AssignmentDoc {
+            generation_id: view.generation_id(),
+            leader: member_id.to_owned(),
+            protocol_type: view
+                .generation
+                .protocol_type
+                .clone()
+                .unwrap_or_else(|| String::from("consumer")),
+            protocol_name: view.generation.protocol_name.clone().unwrap_or_default(),
+            assignments: requested,
+            assigned_at_ms: epoch_ms(now),
         };
 
-        (state.into(), sync_group_response.into())
-    }
+        // The write liveness churn used to starve, now with no etag to lose:
+        // one key, one winner. Finding it already there is that same leader
+        // retrying — one leader per generation is guaranteed by the generation
+        // CAS — so what is stored is adopted rather than overwritten.
+        let assignment = match self
+            .storage
+            .create_group_assignment(group_id, view.generation_id(), assignment.clone())
+            .await?
+        {
+            AssignmentOutcome::Created(_) => assignment,
+            AssignmentOutcome::AlreadyExists(stored) => *stored,
+        };
 
-    async fn heartbeat(
-        mut self,
-        now: SystemTime,
-        group_id: &str,
-        generation_id: i32,
-        member_id: &str,
-        group_instance_id: Option<&str>,
-    ) -> (Self::HeartbeatState, Body) {
-        debug!(
-            ?now,
-            ?group_id,
-            ?generation_id,
-            ?member_id,
-            ?group_instance_id
-        );
+        // Fence against a rebalance that started while the create was in
+        // flight: the assignment just written is then for a generation the
+        // group has left, and answering from it would hand out an assignment
+        // nobody else will honour.
+        let after = self.read_view(group_id).await?;
 
-        let _ = group_instance_id;
-
-        if !self.members.contains_key(member_id) {
-            debug!(?self.members);
-
-            return (
-                self,
-                HeartbeatResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .error_code(ErrorCode::UnknownMemberId.into())
-                    .into(),
+        if after.generation_id() != view.generation_id() {
+            debug!(
+                assigned = view.generation_id(),
+                current = after.generation_id(),
+                sync_outcome = ?ErrorCode::RebalanceInProgress,
             );
+
+            let body = sync_error(&after, ErrorCode::RebalanceInProgress);
+            return Ok((after, body));
         }
 
-        if generation_id > self.generation_id {
-            debug!(?self.generation_id);
-
-            return (
-                self,
-                HeartbeatResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .error_code(ErrorCode::IllegalGeneration.into())
-                    .into(),
-            );
-        }
-
+        // Housekeeping, not correctness: keep this generation and the one
+        // before it, so a member still finishing its sync against N-1 finds it.
+        // `delete_groups` remains the backstop.
         _ = self
-            .members
-            .entry(member_id.to_owned())
-            .and_modify(|member| _ = member.last_contact.replace(now));
-
-        if self.missed_heartbeat(group_id, member_id, now) || (generation_id < self.generation_id) {
-            debug!(self.generation_id);
-
-            return (
-                self,
-                HeartbeatResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .error_code(ErrorCode::RebalanceInProgress.into())
-                    .into(),
-            );
-        }
-
-        let body = HeartbeatResponse::default()
-            .throttle_time_ms(Some(0))
-            .error_code(ErrorCode::None.into())
-            .into();
-
-        (self, body)
-    }
-
-    async fn leave(
-        mut self,
-        now: SystemTime,
-        group_id: &str,
-        member_id: Option<&str>,
-        members: Option<&[MemberIdentity]>,
-    ) -> (Self::LeaveState, Body) {
-        let _ = now;
-        debug!(?group_id, member_id, ?members);
-
-        let members = if let Some(member_id) = member_id {
-            debug!(member_id);
-
-            vec![
-                MemberResponse::default()
-                    .member_id(member_id.to_owned())
-                    .group_instance_id(None)
-                    .error_code({
-                        if self.members.remove(member_id).is_some() {
-                            ErrorCode::None.into()
-                        } else {
-                            ErrorCode::UnknownMemberId.into()
-                        }
-                    }),
-            ]
-        } else {
-            members.map_or(vec![], |members| {
-                members
-                    .iter()
-                    .map(|member| {
-                        MemberResponse::default()
-                            .member_id(member.member_id.clone())
-                            .group_instance_id(member.group_instance_id.clone())
-                            .error_code({
-                                if self.members.remove(&member.member_id).is_some() {
-                                    ErrorCode::None.into()
-                                } else {
-                                    ErrorCode::UnknownMemberId.into()
-                                }
-                            })
-                    })
-                    .collect::<Vec<MemberResponse>>()
-            })
-        };
-
-        if members.iter().any(|member| {
-            let error_code = i16::from(ErrorCode::None);
-
-            member.error_code == error_code
-        }) {
-            self.generation_id += 1;
-        }
-
-        // The departing member may be the elected leader. `Formed::leave`
-        // already re-checks this (leader no longer a member -> `None`);
-        // without the same fix-up here, a leader that leaves while the group
-        // is still forming stays behind as a phantom: `join` never promotes
-        // anyone else (`state.leader.is_none()` never holds), every follower
-        // sync is refused as not-leader, and the group freezes silently with
-        // no writes and nothing to evict (#240).
-        if self
-            .state
-            .leader
-            .as_ref()
-            .is_some_and(|leader| !self.members.contains_key(leader))
-        {
-            info!(
-                group_id,
-                departed_leader = self.state.leader.as_deref(),
-                generation_id = self.generation_id,
-                "leader left while forming; clearing so a live member is promoted (#240)"
-            );
-
-            _ = self.state.leader.take();
-        }
-
-        let body = LeaveGroupResponse::default()
-            .throttle_time_ms(Some(0))
-            .error_code(ErrorCode::None.into())
-            .members(Some(members))
-            .into();
-
-        (self, body)
-    }
-
-    async fn offset_commit(
-        mut self,
-        now: SystemTime,
-        detail: &OffsetCommit<'_>,
-    ) -> (Self::OffsetCommitState, Body) {
-        let _ = now;
-        debug!(?detail);
-
-        match self.commit_offset(detail).await {
-            Ok(body) => (self, body),
-            Err(reason) => {
-                debug!(?reason);
-                (
-                    self,
-                    OffsetCommitResponse::default()
-                        .throttle_time_ms(Some(0))
-                        .topics(detail.topics.map(|topics| {
-                            topics
-                                .as_ref()
-                                .iter()
-                                .map(|topic| {
-                                    OffsetCommitResponseTopic::default()
-                                        .name(topic.name.clone())
-                                        .partitions(topic.partitions.as_ref().map(|partitions| {
-                                            partitions
-                                                .iter()
-                                                .map(|partition| {
-                                                    OffsetCommitResponsePartition::default()
-                                                        .partition_index(partition.partition_index)
-                                                        .error_code(
-                                                            ErrorCode::UnknownMemberId.into(),
-                                                        )
-                                                })
-                                                .collect()
-                                        }))
-                                })
-                                .collect()
-                        }))
-                        .into(),
-                )
-            }
-        }
-    }
-
-    async fn offset_fetch(
-        mut self,
-        now: SystemTime,
-        group_id: Option<&str>,
-        topics: Option<&[OffsetFetchRequestTopic]>,
-        groups: Option<&[OffsetFetchRequestGroup]>,
-        require_stable: Option<bool>,
-    ) -> (Self::OffsetFetchState, Body) {
-        let _ = now;
-        debug!(group_id, ?topics, ?groups, ?require_stable);
-        match self
-            .fetch_offset(group_id, topics, groups, require_stable)
+            .storage
+            .delete_group_assignments_before(group_id, view.generation_id().saturating_sub(1))
             .await
-        {
-            Ok(body) => (self, body),
-            Err(error) => {
-                debug!(?error);
-                todo!()
-            }
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl<O> Group for Inner<O, Formed>
-where
-    O: Storage,
-{
-    type JoinState = Wrapper<O>;
-    type SyncState = Inner<O, Formed>;
-    type HeartbeatState = Inner<O, Formed>;
-    type LeaveState = Wrapper<O>;
-    type OffsetCommitState = Inner<O, Formed>;
-    type OffsetFetchState = Inner<O, Formed>;
-
-    async fn join(
-        mut self,
-        now: SystemTime,
-        client_id: Option<&str>,
-        group_id: &str,
-        session_timeout_ms: i32,
-        rebalance_timeout_ms: Option<i32>,
-        member_id: &str,
-        group_instance_id: Option<&str>,
-        protocol_type: &str,
-        protocols: Option<&[JoinGroupRequestProtocol]>,
-        reason: Option<&str>,
-    ) -> (Self::JoinState, Body) {
-        debug!(
-            client_id,
-            group_id,
-            session_timeout_ms,
-            rebalance_timeout_ms,
-            member_id,
-            group_instance_id,
-            protocol_type,
-            ?protocols,
-            reason
-        );
-
-        let Some(protocols) = protocols else {
-            debug!(join_outcome = ?ErrorCode::InvalidRequest);
-
-            let join_group_response = JoinGroupResponse::default()
-                .throttle_time_ms(Some(0))
-                .error_code(ErrorCode::InvalidRequest.into())
-                .generation_id(self.generation_id)
-                .protocol_type(Some(protocol_type.into()))
-                .protocol_name(Some("".into()))
-                .leader("".into())
-                .skip_assignment(self.skip_assignment)
-                .member_id("".into())
-                .members(Some([].into()));
-
-            return (self.into(), join_group_response.into());
-        };
-
-        let Some(protocol) = protocols
-            .iter()
-            .find(|protocol| protocol.name == self.state.protocol_name)
-        else {
-            debug!(join_outcome = ?ErrorCode::InconsistentGroupProtocol);
-
-            let join_group_response = JoinGroupResponse::default()
-                .throttle_time_ms(Some(0))
-                .error_code(ErrorCode::InconsistentGroupProtocol.into())
-                .generation_id(self.generation_id)
-                .protocol_type(Some(protocol_type.into()))
-                .protocol_name(Some(self.state.protocol_name.clone()))
-                .leader("".into())
-                .skip_assignment(self.skip_assignment)
-                .member_id("".into())
-                .members(Some([].into()));
-
-            return (self.into(), join_group_response.into());
-        };
-
-        if member_id.is_empty() && group_instance_id.is_none() {
-            let member_id = if let Some(client_id) = client_id {
-                format!("{client_id}-{}", Uuid::new_v4())
-            } else {
-                format!("{}", Uuid::new_v4())
-            };
-            debug!(?member_id, join_outcome = ?ErrorCode::MemberIdRequired);
-
-            let join_group_response = JoinGroupResponse::default()
-                .throttle_time_ms(Some(0))
-                .error_code(ErrorCode::MemberIdRequired.into())
-                .generation_id(-1)
-                .protocol_type(None)
-                .protocol_name(Some("".into()))
-                .leader("".into())
-                .skip_assignment(self.skip_assignment)
-                .member_id(member_id)
-                .members(Some([].into()));
-
-            // KIP-394: reply with the generated member id but leave the group
-            // untouched — no phantom member, no generation bump, and the
-            // group stays Formed. The rebalance only starts when the member
-            // re-joins with this id.
-            return (self.into(), join_group_response.into());
-        }
-
-        let member_id = group_instance_id.map_or(member_id.to_owned(), |group_instance_id| {
-            if member_id.is_empty() {
-                if let Some((member_id, _)) = self.members.iter().find(|(_, member)| {
-                    member.join_response.group_instance_id.as_deref() == Some(group_instance_id)
-                }) {
-                    member_id.into()
-                } else {
-                    format!("{group_instance_id}-{}", Uuid::new_v4())
-                }
-            } else {
-                member_id.into()
-            }
-        });
-
-        debug!(?member_id, ?self.members);
-
-        match self.members.get_mut(&member_id) {
-            Some(Member {
-                join_response: JoinGroupResponseMember { metadata, .. },
-                ..
-            }) if *metadata == protocol.metadata => {
-                debug!(
-                    member_metadata = "existing",
-                    member_id,
-                    generation_id = self.generation_id
-                );
-
-                let state: Wrapper<O> = self.into();
-
-                let body = {
-                    let members = Some(
-                        if state.leader().is_some_and(|leader| leader == member_id) {
-                            state.members()
-                        } else {
-                            [].into()
-                        },
-                    );
-                    let protocol_type = state.protocol_type().map(ToOwned::to_owned);
-                    let protocol_name = state.protocol_name().map(ToOwned::to_owned);
-
-                    JoinGroupResponse::default()
-                        .throttle_time_ms(Some(0))
-                        .error_code(ErrorCode::None.into())
-                        .generation_id(state.generation_id())
-                        .protocol_type(protocol_type)
-                        .protocol_name(protocol_name)
-                        .leader(
-                            state
-                                .leader()
-                                .map(|s| s.to_owned())
-                                .unwrap_or("".to_owned()),
-                        )
-                        .skip_assignment(state.skip_assignment().map(ToOwned::to_owned))
-                        .member_id(member_id)
-                        .members(members)
-                        .into()
-                };
-
-                debug!(join_outcome = ?ErrorCode::None);
-
-                (state, body)
-            }
-
-            Some(Member {
-                join_response: JoinGroupResponseMember { metadata, .. },
-                ..
-            }) => {
-                debug!(
-                    member_metadata = if group_instance_id.is_none() {"update"} else { "soft_update"},
-                    member_id,
-                    updated = ?protocol.metadata,
-                    existing = ?metadata,
-                );
-
-                *metadata = protocol.metadata.clone();
-
-                let state: Wrapper<O> = Inner {
-                    generation_id: if group_instance_id.is_none() {
-                        self.generation_id + 1
-                    } else {
-                        self.generation_id
-                    },
-                    session_timeout_ms: self.session_timeout_ms,
-                    rebalance_timeout_ms: self.rebalance_timeout_ms,
-
-                    members: self.members,
-                    state: Forming {
-                        protocol_type: Some(self.state.protocol_type),
-                        protocol_name: Some(self.state.protocol_name),
-                        leader: Some(self.state.leader),
-                    },
-                    storage: self.storage,
-                    skip_assignment: self.skip_assignment,
-                    inception: self.inception,
-                }
-                .into();
-
-                let body = {
-                    let members = Some(
-                        if state.leader().is_some_and(|leader| leader == member_id) {
-                            state.members()
-                        } else {
-                            [].into()
-                        },
-                    );
-                    let protocol_type = state.protocol_type().map(|s| s.to_owned());
-                    let protocol_name = state.protocol_name().map(|s| s.to_owned());
-
-                    JoinGroupResponse::default()
-                        .throttle_time_ms(Some(0))
-                        .error_code(ErrorCode::None.into())
-                        .generation_id(state.generation_id())
-                        .protocol_type(protocol_type)
-                        .protocol_name(protocol_name)
-                        .leader(
-                            state
-                                .leader()
-                                .map(|s| s.to_owned())
-                                .unwrap_or("".to_owned()),
-                        )
-                        .skip_assignment(self.skip_assignment)
-                        .member_id(member_id)
-                        .members(members)
-                        .into()
-                };
-
-                debug!(join_outcome = ?ErrorCode::None);
-
-                (state, body)
-            }
-
-            None => {
-                debug!(
-                    member_metadata = "new",
-                    member_id,
-                    generation_id = self.generation_id + 1
-                );
-
-                _ = self.members.insert(
-                    member_id.clone(),
-                    Member {
-                        join_response: JoinGroupResponseMember::default()
-                            .member_id(member_id.to_string())
-                            .group_instance_id(group_instance_id.map(|s| s.to_owned()))
-                            .metadata(protocol.metadata.clone()),
-                        last_contact: Some(now),
-                    },
-                );
-
-                let state: Wrapper<O> = Inner {
-                    generation_id: self.generation_id + 1,
-                    session_timeout_ms: self.session_timeout_ms,
-                    rebalance_timeout_ms: self.rebalance_timeout_ms,
-
-                    members: self.members,
-                    state: Forming {
-                        protocol_type: Some(self.state.protocol_type),
-                        protocol_name: Some(self.state.protocol_name),
-                        leader: Some(self.state.leader),
-                    },
-                    storage: self.storage,
-                    skip_assignment: self.skip_assignment,
-                    inception: self.inception,
-                }
-                .into();
-
-                let body = {
-                    let members = Some(
-                        if state.leader().is_some_and(|leader| leader == member_id) {
-                            state.members()
-                        } else {
-                            [].into()
-                        },
-                    );
-
-                    let protocol_type = state.protocol_type().map(|s| s.to_owned());
-                    let protocol_name = state.protocol_name().map(|s| s.to_owned());
-
-                    JoinGroupResponse::default()
-                        .throttle_time_ms(Some(0))
-                        .error_code(ErrorCode::None.into())
-                        .generation_id(state.generation_id())
-                        .protocol_type(protocol_type)
-                        .protocol_name(protocol_name)
-                        .leader(
-                            state
-                                .leader()
-                                .map(|s| s.to_owned())
-                                .unwrap_or("".to_owned()),
-                        )
-                        .skip_assignment(self.skip_assignment)
-                        .member_id(member_id)
-                        .members(members)
-                        .into()
-                };
-
-                debug!(join_outcome = ?ErrorCode::None);
-
-                (state, body)
-            }
-        }
-    }
-
-    async fn sync(
-        mut self,
-        _now: SystemTime,
-        group_id: &str,
-        generation_id: i32,
-        member_id: &str,
-        group_instance_id: Option<&str>,
-        protocol_type: Option<&str>,
-        protocol_name: Option<&str>,
-        assignments: Option<&[SyncGroupRequestAssignment]>,
-    ) -> (Self::SyncState, Body) {
-        let _ = group_id;
-        let _ = group_instance_id;
-        let _ = protocol_type;
-        let _ = protocol_name;
-        let _ = assignments;
-
-        if !self.members.contains_key(member_id) {
-            debug!(sync_outcome = ?ErrorCode::UnknownMemberId);
-
-            let body = SyncGroupResponse::default()
-                .throttle_time_ms(Some(0))
-                .error_code(ErrorCode::UnknownMemberId.into())
-                .protocol_type(Some(self.state.protocol_type.clone()))
-                .protocol_name(Some(self.state.protocol_name.clone()))
-                .assignment(Bytes::from_static(b""))
-                .into();
-
-            return (self, body);
-        }
-
-        debug!(?member_id);
-
-        if generation_id > self.generation_id {
-            debug!(sync_outcome = ?ErrorCode::IllegalGeneration);
-
-            let body = SyncGroupResponse::default()
-                .throttle_time_ms(Some(0))
-                .error_code(ErrorCode::IllegalGeneration.into())
-                .protocol_type(Some(self.state.protocol_type.clone()))
-                .protocol_name(Some(self.state.protocol_name.clone()))
-                .assignment(Bytes::from_static(b""))
-                .into();
-
-            return (self, body);
-        }
-
-        if generation_id < self.generation_id {
-            debug!(sync_outcome = ?ErrorCode::RebalanceInProgress);
-
-            let body = SyncGroupResponse::default()
-                .throttle_time_ms(Some(0))
-                .error_code(ErrorCode::RebalanceInProgress.into())
-                .protocol_type(Some(self.state.protocol_type.clone()))
-                .protocol_name(Some(self.state.protocol_name.clone()))
-                .assignment(Bytes::from_static(b""))
-                .into();
-
-            return (self, body);
-        }
-
-        // A member of the current generation that is missing from the leader's
-        // assignment must re-join, not park on "stable" with zero partitions:
-        // `error=None` plus an empty assignment reads as a valid (empty)
-        // assignment to the client, which then sits idle forever.
-        let Some(assignment) = self.state.assignments.get(member_id).cloned() else {
-            debug!(?self.state.assignments, sync_outcome = ?ErrorCode::RebalanceInProgress);
-
-            let body = SyncGroupResponse::default()
-                .throttle_time_ms(Some(0))
-                .error_code(ErrorCode::RebalanceInProgress.into())
-                .protocol_type(Some(self.state.protocol_type.clone()))
-                .protocol_name(Some(self.state.protocol_name.clone()))
-                .assignment(Bytes::from_static(b""))
-                .into();
-
-            return (self, body);
-        };
+            .inspect_err(|error| debug!(?error, group_id));
 
         let body = SyncGroupResponse::default()
             .throttle_time_ms(Some(0))
             .error_code(ErrorCode::None.into())
-            .protocol_type(Some(self.state.protocol_type.clone()))
-            .protocol_name(Some(self.state.protocol_name.clone()))
-            .assignment(assignment)
+            .protocol_type(after.generation.protocol_type.clone())
+            .protocol_name(after.generation.protocol_name.clone())
+            .assignment(
+                assignment
+                    .assignments
+                    .get(member_id)
+                    .cloned()
+                    .unwrap_or_else(|| Bytes::from_static(b"")),
+            )
             .into();
 
-        debug!(sync_outcome = ?ErrorCode::None, sync_assignment = true);
+        debug!(sync_outcome = ?ErrorCode::None, generation_id = after.generation_id());
 
-        (self, body)
-    }
-
-    async fn heartbeat(
-        mut self,
-        now: SystemTime,
-        group_id: &str,
-        generation_id: i32,
-        member_id: &str,
-        group_instance_id: Option<&str>,
-    ) -> (Self::HeartbeatState, Body) {
-        debug!(?group_id, ?generation_id, ?member_id, ?group_instance_id);
-
-        if !self.members.contains_key(member_id) {
-            return (
-                self,
-                HeartbeatResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .error_code(ErrorCode::UnknownMemberId.into())
-                    .into(),
-            );
-        }
-
-        if generation_id > self.generation_id {
-            return (
-                self,
-                HeartbeatResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .error_code(ErrorCode::IllegalGeneration.into())
-                    .into(),
-            );
-        }
-
-        if self.missed_heartbeat(group_id, member_id, now) || (generation_id < self.generation_id) {
-            return (
-                self,
-                HeartbeatResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .error_code(ErrorCode::RebalanceInProgress.into())
-                    .into(),
-            );
-        }
-
-        _ = self
-            .members
-            .entry(member_id.to_owned())
-            .and_modify(|member| _ = member.last_contact.replace(now));
-
-        let body = HeartbeatResponse::default()
-            .throttle_time_ms(Some(0))
-            .error_code(ErrorCode::None.into())
-            .into();
-
-        (self, body)
-    }
-
-    async fn leave(
-        mut self,
-        now: SystemTime,
-        group_id: &str,
-        member_id: Option<&str>,
-        members: Option<&[MemberIdentity]>,
-    ) -> (Self::LeaveState, Body) {
-        let _ = now;
-        let _ = group_id;
-
-        let members = if let Some(member_id) = member_id {
-            vec![
-                MemberResponse::default()
-                    .member_id(member_id.to_owned())
-                    .group_instance_id(None)
-                    .error_code({
-                        if self.members.remove(member_id).is_some() {
-                            ErrorCode::None.into()
-                        } else {
-                            ErrorCode::UnknownMemberId.into()
-                        }
-                    }),
-            ]
-        } else {
-            members.map_or(vec![], |members| {
-                members
-                    .iter()
-                    .map(|member| {
-                        MemberResponse::default()
-                            .member_id(member.member_id.clone())
-                            .group_instance_id(member.group_instance_id.clone())
-                            .error_code({
-                                if self.members.remove(&member.member_id).is_some() {
-                                    ErrorCode::None.into()
-                                } else {
-                                    ErrorCode::UnknownMemberId.into()
-                                }
-                            })
-                    })
-                    .collect::<Vec<MemberResponse>>()
-            })
-        };
-
-        let state: Wrapper<O> = if members
-            .iter()
-            .any(|member| member.error_code == i16::from(ErrorCode::None))
-        {
-            let leader = if self.members.contains_key(&self.state.leader) {
-                Some(self.state.leader)
-            } else {
-                None
-            };
-
-            Inner {
-                generation_id: self.generation_id + 1,
-                session_timeout_ms: self.session_timeout_ms,
-                rebalance_timeout_ms: self.rebalance_timeout_ms,
-
-                members: self.members,
-                state: Forming {
-                    protocol_type: Some(self.state.protocol_type),
-                    protocol_name: Some(self.state.protocol_name),
-                    leader,
-                },
-                storage: self.storage,
-                skip_assignment: self.skip_assignment,
-                inception: self.inception,
-            }
-            .into()
-        } else {
-            self.into()
-        };
-
-        let body = LeaveGroupResponse::default()
-            .throttle_time_ms(Some(0))
-            .error_code(ErrorCode::None.into())
-            .members(Some(members))
-            .into();
-
-        (state, body)
-    }
-
-    async fn offset_commit(
-        mut self,
-        now: SystemTime,
-        detail: &OffsetCommit<'_>,
-    ) -> (Self::OffsetCommitState, Body) {
-        let _ = now;
-
-        match self.commit_offset(detail).await {
-            Ok(body) => (self, body),
-            Err(reason) => {
-                debug!(?reason);
-                (
-                    self,
-                    OffsetCommitResponse::default()
-                        .throttle_time_ms(Some(0))
-                        .topics(detail.topics.map(|topics| {
-                            topics
-                                .as_ref()
-                                .iter()
-                                .map(|topic| {
-                                    OffsetCommitResponseTopic::default()
-                                        .name(topic.name.clone())
-                                        .partitions(topic.partitions.as_ref().map(|partitions| {
-                                            partitions
-                                                .iter()
-                                                .map(|partition| {
-                                                    OffsetCommitResponsePartition::default()
-                                                        .partition_index(partition.partition_index)
-                                                        .error_code(
-                                                            ErrorCode::UnknownMemberId.into(),
-                                                        )
-                                                })
-                                                .collect()
-                                        }))
-                                })
-                                .collect()
-                        }))
-                        .into(),
-                )
-            }
-        }
-    }
-
-    async fn offset_fetch(
-        mut self,
-        now: SystemTime,
-        group_id: Option<&str>,
-        topics: Option<&[OffsetFetchRequestTopic]>,
-        groups: Option<&[OffsetFetchRequestGroup]>,
-        require_stable: Option<bool>,
-    ) -> (Self::OffsetFetchState, Body) {
-        let _ = now;
-
-        match self
-            .fetch_offset(group_id, topics, groups, require_stable)
-            .await
-        {
-            Ok(body) => (self, body),
-            Err(error) => {
-                debug!(?error);
-                todo!()
-            }
-        }
+        Ok((after, body))
     }
 }
 
@@ -4061,275 +2437,56 @@ where
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use std::sync::OnceLock;
     use tansu_sans_io::{
-        consumer::{
-            Assignor, CONSUMER, ConsumerProtocolAssignment, ConsumerProtocolSubscription,
-            TopicPartition,
-        },
+        consumer::{CONSUMER, ConsumerProtocolSubscription},
         offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
     };
-    use tansu_storage::StorageContainer;
+    use tansu_storage::{LatencyIntroducingStorage, StorageContainer};
+    use tokio::time::advance;
     use tracing::subscriber::DefaultGuard;
     use url::Url;
 
-    /// #240: a group whose members never finish joining must still be reported.
-    ///
-    /// The detector was hooked only to the heartbeat path, on the reasoning that
-    /// members heartbeat every few seconds so it is the densest sampling
-    /// available. That is true of a group whose members are *in* the group, and
-    /// false of the failure this exists for. `AbstractCoordinator$HeartbeatThread`
-    /// disables itself while the consumer has not joined:
-    ///
-    /// ```java
-    /// if (state.hasNotJoinedGroup() || isFailed()) { disable(); continue; }
-    /// ```
-    ///
-    /// So a consumer stuck trying to join sends no heartbeat at all. Measured in
-    /// production: a group 90+ minutes in `CompletingRebalance` with 16 members,
-    /// every heartbeat thread parked in `wait()`, and not one line about it
-    /// across ten replicas over two hours — the detector silent on precisely the
-    /// case it was written for.
-    ///
-    /// `join` keeps arriving from that consumer (each `poll()` retries), so it is
-    /// a live sampling source when heartbeat is not. This drives joins only, and
-    /// never a heartbeat.
-    #[tokio::test]
-    async fn a_group_that_never_joins_is_still_observed() -> Result<()> {
-        let _guard = init_tracing()?;
+    const CLIENT_ID: &str = "console-consumer";
+    const RANGE: &str = "range";
+    const SESSION_TIMEOUT_MS: i32 = 45_000;
+    const REBALANCE_TIMEOUT_MS: Option<i32> = Some(300_000);
 
-        let storage = StorageContainer::builder()
+    /// A wall clock derived from `tokio`'s paused one, so that a coordinator
+    /// comparing a persisted epoch reading against `now` moves with the test
+    /// instead of standing still while `sleep` races ahead. See
+    /// [`Controller::now`] for what may be moved this way.
+    fn paused_clock() -> SystemTime {
+        /// Far enough from the epoch that a duration subtracted from a reading
+        /// stays representable.
+        const ORIGIN: Duration = Duration::from_secs(1_700_000_000);
+
+        static STARTED: OnceLock<Instant> = OnceLock::new();
+
+        SystemTime::UNIX_EPOCH
+            + ORIGIN
+            + Instant::now().duration_since(*STARTED.get_or_init(Instant::now))
+    }
+
+    async fn memory_storage() -> Result<Arc<Box<dyn Storage>>> {
+        StorageContainer::builder()
             .cluster_id("test")
             .node_id(111)
             .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
             .storage(Url::parse("memory://")?)
             .build()
-            .await?;
-
-        let s = Controller::with_storage(storage.clone())?;
-
-        const GROUP_ID: &str = "never-joins";
-        const CONSUMER: &str = "consumer";
-        const RANGE: &str = "range";
-
-        // A group already mid-rebalance: members joined, leader elected, no
-        // assignment distributed. This is what a stuck consumer keeps re-joining
-        // into, and what `CompletingRebalance` maps from.
-        let mut members = BTreeMap::new();
-        _ = members.insert(
-            String::from("member-1"),
-            GroupMember {
-                join_response: JoinGroupResponseMember::default().member_id("member-1".into()),
-                last_contact: None,
-            },
-        );
-
-        _ = storage
-            .update_group(
-                GROUP_ID,
-                GroupDetail {
-                    rebalance_timeout_ms: Some(300_000),
-                    members,
-                    generation_id: 1,
-                    state: GroupState::Forming {
-                        protocol_type: Some(String::from(CONSUMER)),
-                        protocol_name: Some(String::from(RANGE)),
-                        leader: Some(String::from("member-1")),
-                    },
-                    ..Default::default()
-                },
-                None,
-            )
-            .await;
-
-        let protocols = [JoinGroupRequestProtocol::default()
-            .name(RANGE.into())
-            .metadata(encode_subscription(&["test"], None))];
-
-        _ = s
-            .join(
-                Some("a-consumer"),
-                GROUP_ID,
-                45_000,
-                Some(300_000),
-                "",
-                None,
-                CONSUMER,
-                Some(&protocols[..]),
-                None,
-            )
-            .await?;
-
-        // The join alone must have sampled the group. Reading the memo directly
-        // rather than the log: what is under test is that the forming path
-        // observes at all, which is the hook a refactor could silently drop —
-        // and did, for the whole of beta.31 and beta.32.
-        let sampled = s
-            .rebalance_stalls
-            .lock()
-            .map(|stalls| stalls.contains_key(GROUP_ID))
-            .unwrap_or_default();
-
-        assert!(
-            sampled,
-            "a group mid-rebalance was not observed on the join path, so a consumer \
-             that never joins — and therefore never heartbeats — is invisible",
-        );
-
-        Ok(())
+            .await
+            .map_err(Into::into)
     }
 
-    /// #240: the stall threshold comes from the group, not from a constant.
-    ///
-    /// The first version of this detector used a flat 60s, on the assumption
-    /// that a healthy rebalance takes seconds. Production contradicted that in
-    /// under an hour: 9-14 member groups routinely completed in **just over a
-    /// minute** (60.1s, 60.4s, 62.9s, 67.2s, 81.2s observed, each recovering),
-    /// so the warning fired ~2 per minute on healthy groups — which is how a
-    /// signal becomes one operators scroll past, the failure this was meant to
-    /// prevent.
-    ///
-    /// A group's own `rebalance_timeout_ms` is the honest bound: it is what its
-    /// members told the coordinator to wait, so exceeding it is anomalous by the
-    /// group's own definition, and it scales with the group where a constant
-    /// cannot.
-    #[test]
-    fn the_stall_threshold_follows_the_group() {
-        let declared = |ms: Option<i32>| {
-            stall_after(&GroupDetail {
-                rebalance_timeout_ms: ms,
-                ..Default::default()
-            })
-        };
+    /// The store every cost assertion runs over: it counts what was written
+    /// without pretending to be a different engine.
+    type Counted = LatencyIntroducingStorage<Arc<Box<dyn Storage>>>;
 
-        assert_eq!(
-            Duration::from_secs(300),
-            declared(Some(300_000)),
-            "a declared timeout is the threshold",
-        );
-
-        assert_eq!(
-            REBALANCE_STALL_FLOOR,
-            declared(None),
-            "a group that declares none gets the floor",
-        );
-
-        // Below the floor the floor wins, in both the implausible and the merely
-        // tight case: the observed healthy tail is ~81s, so a threshold under
-        // that reports groups doing nothing wrong.
-        assert_eq!(REBALANCE_STALL_FLOOR, declared(Some(1)));
-        assert_eq!(REBALANCE_STALL_FLOOR, declared(Some(60_000)));
-        assert_eq!(REBALANCE_STALL_FLOOR, declared(Some(0)));
-        assert_eq!(REBALANCE_STALL_FLOOR, declared(Some(-1)));
-
-        assert!(
-            REBALANCE_STALL_FLOOR > Duration::from_millis(81_203),
-            "the floor must clear the slowest healthy rebalance measured in production",
-        );
-    }
-
-    /// #240: a group that stops making progress mid-rebalance must say so.
-    ///
-    /// The incident this exists for ran for hours with no signal at all — the
-    /// broker answered every request about the group normally while its members
-    /// waited for an assignment that never arrived, and tens of millions of
-    /// records sat behind eight such groups. A group in `CompletingRebalance`
-    /// past a bounded time is always a bug; the only question was how to notice.
-    ///
-    /// Pins the three properties that make it useful rather than noisy: it does
-    /// not fire early, it fires once per episode (members heartbeat every few
-    /// seconds, so per-call reporting would bury itself), and a group that
-    /// recovers and stalls again is reported again.
-    #[tokio::test]
-    async fn a_stalled_rebalance_is_reported_once_per_episode() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let storage = StorageContainer::builder()
-            .cluster_id("test")
-            .node_id(111)
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await?;
-
-        let s = Controller::with_storage(storage)?;
-
-        const GROUP_ID: &str = "stalled-group";
-
-        // Members joined, a leader elected, no assignment distributed: exactly
-        // what `ConsumerGroupState` maps to `CompletingRebalance`.
-        let mut members = BTreeMap::new();
-        _ = members.insert(
-            String::from("member-1"),
-            GroupMember {
-                join_response: JoinGroupResponseMember::default().member_id("member-1".into()),
-                last_contact: None,
-            },
-        );
-
-        // Declares its own rebalance timeout, so the threshold is derived from
-        // the group rather than from a constant.
-        const REBALANCE_TIMEOUT_MS: i32 = 300_000;
-        let threshold = Duration::from_millis(REBALANCE_TIMEOUT_MS as u64);
-
-        let stalling = GroupDetail {
-            rebalance_timeout_ms: Some(REBALANCE_TIMEOUT_MS),
-            members: members.clone(),
-            state: GroupState::Forming {
-                protocol_type: Some(String::from("consumer")),
-                protocol_name: Some(String::from("range")),
-                leader: Some(String::from("member-1")),
-            },
-            ..Default::default()
-        };
-
-        // The same group once the assignment lands.
-        let progressed = GroupDetail {
-            rebalance_timeout_ms: Some(REBALANCE_TIMEOUT_MS),
-            members,
-            state: GroupState::Formed {
-                protocol_type: String::from("consumer"),
-                protocol_name: String::from("range"),
-                leader: String::from("member-1"),
-                assignments: BTreeMap::new(),
-            },
-            ..Default::default()
-        };
-
-        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
-
-        assert!(
-            !s.observe_rebalance(GROUP_ID, &stalling, t0),
-            "not on first sight"
-        );
-        assert!(
-            !s.observe_rebalance(GROUP_ID, &stalling, t0 + threshold - Duration::from_secs(1)),
-            "not before the threshold",
-        );
-
-        assert!(
-            s.observe_rebalance(GROUP_ID, &stalling, t0 + threshold),
-            "reported once the threshold is reached",
-        );
-        assert!(
-            !s.observe_rebalance(GROUP_ID, &stalling, t0 + threshold * 10),
-            "and not again for the same episode",
-        );
-
-        // Recovery clears the episode ...
-        assert!(!s.observe_rebalance(GROUP_ID, &progressed, t0 + threshold * 11));
-
-        // ... so a fresh stall is a fresh episode, reported on its own clock.
-        let t1 = t0 + threshold * 12;
-        assert!(
-            !s.observe_rebalance(GROUP_ID, &stalling, t1),
-            "new episode starts quiet"
-        );
-        assert!(
-            s.observe_rebalance(GROUP_ID, &stalling, t1 + threshold),
-            "and is reported in its own right",
-        );
-
-        Ok(())
+    async fn counted_storage() -> Result<Counted> {
+        memory_storage()
+            .await
+            .map(|storage| LatencyIntroducingStorage::new(storage).with_latency(0..1))
     }
 
     fn encode_subscription(topics: &[&str], generation_id: Option<i32>) -> Bytes {
@@ -4343,34 +2500,203 @@ mod tests {
         .expect("encode member metadata")
     }
 
-    // A cooperative consumer (KIP-792) re-encodes its subscription on every
-    // rejoin with a fresh generationId, so the raw bytes differ while the topic
-    // set is unchanged. `same_subscription_topics` must see through that churn
-    // (else the group generation bumps on every rejoin and never converges),
-    // yet still flag a genuine topic change and stay conservative on garbage.
-    #[test]
-    fn same_subscription_topics_ignores_kip792_churn() {
-        let a = encode_subscription(&["t.a", "t.b"], Some(41));
-        let b = encode_subscription(&["t.a", "t.b"], Some(42));
-        assert_ne!(a, b, "raw metadata must differ (KIP-792 generationId)");
-        assert!(same_subscription_topics(&a, &b), "same topics -> no-op");
+    fn protocols(metadata: &Bytes) -> Vec<JoinGroupRequestProtocol> {
+        vec![
+            JoinGroupRequestProtocol::default()
+                .name(RANGE.into())
+                .metadata(metadata.clone()),
+        ]
+    }
 
-        let c = encode_subscription(&["t.b", "t.a"], None);
-        assert!(
-            same_subscription_topics(&a, &c),
-            "topic order must not matter"
+    async fn join_group<O>(
+        controller: &Controller<O>,
+        group_id: &str,
+        member_id: &str,
+        metadata: &Bytes,
+    ) -> Result<JoinGroupResponse>
+    where
+        O: Storage + Clone,
+    {
+        match controller
+            .join(
+                Some(CLIENT_ID),
+                group_id,
+                SESSION_TIMEOUT_MS,
+                REBALANCE_TIMEOUT_MS,
+                member_id,
+                None,
+                CONSUMER,
+                Some(&protocols(metadata)[..]),
+                None,
+            )
+            .await?
+        {
+            Body::JoinGroupResponse(join) => Ok(join),
+            otherwise => panic!("{otherwise:?}"),
+        }
+    }
+
+    /// The KIP-394 dance, as far as a registered member: mint an id, then join
+    /// with it.
+    async fn register<O>(
+        controller: &Controller<O>,
+        group_id: &str,
+        metadata: &Bytes,
+    ) -> Result<(String, JoinGroupResponse)>
+    where
+        O: Storage + Clone,
+    {
+        let minted = join_group(controller, group_id, "", metadata).await?;
+
+        assert_eq!(
+            i16::from(ErrorCode::MemberIdRequired),
+            minted.error_code,
+            "a first join must mint a member id"
         );
 
-        let d = encode_subscription(&["t.a", "t.b", "t.c"], Some(42));
-        assert!(
-            !same_subscription_topics(&a, &d),
-            "a real topic change must NOT be treated as a no-op"
-        );
+        let join = join_group(controller, group_id, &minted.member_id, metadata).await?;
 
-        assert!(
-            !same_subscription_topics(&a, &Bytes::from_static(b"garbage")),
-            "undecodable metadata must be conservatively treated as changed"
-        );
+        Ok((minted.member_id, join))
+    }
+
+    async fn sync_group<O>(
+        controller: &Controller<O>,
+        group_id: &str,
+        generation_id: i32,
+        member_id: &str,
+        assignments: &[SyncGroupRequestAssignment],
+    ) -> Result<SyncGroupResponse>
+    where
+        O: Storage + Clone,
+    {
+        match controller
+            .sync(
+                group_id,
+                generation_id,
+                member_id,
+                None,
+                Some(CONSUMER),
+                Some(RANGE),
+                Some(assignments),
+            )
+            .await?
+        {
+            Body::SyncGroupResponse(sync) => Ok(sync),
+            otherwise => panic!("{otherwise:?}"),
+        }
+    }
+
+    async fn heartbeat<O>(
+        controller: &Controller<O>,
+        group_id: &str,
+        generation_id: i32,
+        member_id: &str,
+    ) -> Result<HeartbeatResponse>
+    where
+        O: Storage + Clone,
+    {
+        match controller
+            .heartbeat(group_id, generation_id, member_id, None)
+            .await?
+        {
+            Body::HeartbeatResponse(heartbeat) => Ok(heartbeat),
+            otherwise => panic!("{otherwise:?}"),
+        }
+    }
+
+    async fn leave_group<O>(
+        controller: &Controller<O>,
+        group_id: &str,
+        member_id: &str,
+    ) -> Result<LeaveGroupResponse>
+    where
+        O: Storage + Clone,
+    {
+        match controller.leave(group_id, Some(member_id), None).await? {
+            Body::LeaveGroupResponse(leave) => Ok(leave),
+            otherwise => panic!("{otherwise:?}"),
+        }
+    }
+
+    /// The group's composition as persisted, which is what every assertion
+    /// about the layout reads.
+    async fn generation_of<O>(storage: &O, group_id: &str) -> Result<GenerationDoc>
+    where
+        O: Storage,
+    {
+        storage
+            .read_group_generation(group_id)
+            .await
+            .map(|held| held.expect("the group must have a generation").0)
+            .map_err(Into::into)
+    }
+
+    async fn generation_version<O>(storage: &O, group_id: &str) -> Result<Version>
+    where
+        O: Storage,
+    {
+        storage
+            .read_group_generation(group_id)
+            .await
+            .map(|held| held.expect("the group must have a generation").1)
+            .map_err(Into::into)
+    }
+
+    fn assignment_of(member_id: &str) -> SyncGroupRequestAssignment {
+        SyncGroupRequestAssignment::default()
+            .member_id(member_id.to_owned())
+            .assignment(Bytes::from(format!("assignment-{member_id}")))
+    }
+
+    /// Drive one consumer against `controller` until it holds a non-empty
+    /// assignment, the way a Kafka client would: mint an id, join, and — if it
+    /// is the leader — sync an assignment covering every member of its join
+    /// response. `RebalanceInProgress` or an empty assignment means re-join.
+    async fn drive_member<O>(
+        controller: Controller<O>,
+        group_id: &'static str,
+        index: usize,
+    ) -> Result<(String, Bytes)>
+    where
+        O: Storage + Clone,
+    {
+        let metadata = encode_subscription(&["t"], Some(index as i32));
+        let mut member_id = String::new();
+
+        loop {
+            let join = join_group(&controller, group_id, member_id.as_str(), &metadata).await?;
+
+            if join.error_code == i16::from(ErrorCode::MemberIdRequired) {
+                member_id = join.member_id.clone();
+                continue;
+            }
+
+            assert_eq!(i16::from(ErrorCode::None), join.error_code);
+
+            let assignments = if join.leader == join.member_id {
+                join.members
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|member| assignment_of(&member.member_id))
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+
+            let sync = sync_group(
+                &controller,
+                group_id,
+                join.generation_id,
+                member_id.as_str(),
+                &assignments[..],
+            )
+            .await?;
+
+            if sync.error_code == i16::from(ErrorCode::None) && !sync.assignment.is_empty() {
+                return Ok((member_id, sync.assignment));
+            }
+        }
     }
 
     #[cfg(miri)]
@@ -4424,1818 +2750,549 @@ mod tests {
         }
     }
 
-    fn group_detail_with(
-        members: &[(&str, Option<SystemTime>)],
-        state: GroupState,
-        generation_id: i32,
-    ) -> GroupDetail {
-        GroupDetail {
-            session_timeout_ms: 45_000,
-            rebalance_timeout_ms: Some(300_000),
-            members: members
-                .iter()
-                .map(|(id, last_contact)| {
-                    (
-                        (*id).to_owned(),
-                        GroupMember {
-                            join_response: Default::default(),
-                            last_contact: *last_contact,
-                        },
-                    )
-                })
-                .collect(),
-            generation_id,
-            skip_assignment: Some(false),
-            inception: SystemTime::UNIX_EPOCH,
-            state,
-        }
+    // A cooperative consumer (KIP-792) re-encodes its subscription on every
+    // rejoin with a fresh generationId, so the raw bytes differ while the topic
+    // set is unchanged. `same_subscription_topics` must see through that churn
+    // (else the group generation bumps on every rejoin and never converges),
+    // yet still flag a genuine topic change and stay conservative on garbage.
+    #[test]
+    fn same_subscription_topics_ignores_kip792_churn() {
+        let a = encode_subscription(&["t.a", "t.b"], Some(41));
+        let b = encode_subscription(&["t.a", "t.b"], Some(42));
+        assert_ne!(a, b, "raw metadata must differ (KIP-792 generationId)");
+        assert!(same_subscription_topics(&a, &b), "same topics -> no-op");
+
+        let c = encode_subscription(&["t.b", "t.a"], None);
+        assert!(
+            same_subscription_topics(&a, &c),
+            "topic order must not matter"
+        );
+
+        let d = encode_subscription(&["t.a", "t.b", "t.c"], Some(42));
+        assert!(
+            !same_subscription_topics(&a, &d),
+            "a real topic change must NOT be treated as a no-op"
+        );
+
+        assert!(
+            !same_subscription_topics(&a, &Bytes::from_static(b"garbage")),
+            "undecodable metadata must be conservatively treated as changed"
+        );
+    }
+
+    /// #240: the stall threshold comes from the group, not from a constant.
+    ///
+    /// The first version of this detector used a flat 60s, on the assumption
+    /// that a healthy rebalance takes seconds. Production contradicted that in
+    /// under an hour: 9-14 member groups routinely completed in **just over a
+    /// minute** (60.1s, 60.4s, 62.9s, 67.2s, 81.2s observed, each recovering),
+    /// so the warning fired ~2 per minute on healthy groups — which is how a
+    /// signal becomes one operators scroll past.
+    #[test]
+    fn the_stall_threshold_follows_the_group() {
+        assert_eq!(
+            Duration::from_secs(300),
+            stall_after(Some(300_000)),
+            "a declared timeout is the threshold",
+        );
+
+        assert_eq!(
+            REBALANCE_STALL_FLOOR,
+            stall_after(None),
+            "a group that declares none gets the floor",
+        );
+
+        // Below the floor the floor wins, in both the implausible and the merely
+        // tight case: the observed healthy tail is ~81s, so a threshold under
+        // that reports groups doing nothing wrong.
+        assert_eq!(REBALANCE_STALL_FLOOR, stall_after(Some(1)));
+        assert_eq!(REBALANCE_STALL_FLOOR, stall_after(Some(60_000)));
+        assert_eq!(REBALANCE_STALL_FLOOR, stall_after(Some(0)));
+        assert_eq!(REBALANCE_STALL_FLOOR, stall_after(Some(-1)));
+
+        assert!(
+            REBALANCE_STALL_FLOOR > Duration::from_millis(81_203),
+            "the floor must clear the slowest healthy rebalance measured in production",
+        );
     }
 
     #[test]
-    fn same_rebalance_state_ignores_last_contact() {
-        let t0 = SystemTime::UNIX_EPOCH;
-        let t1 = t0 + Duration::from_secs(30);
-
-        let forming = GroupState::Forming {
-            protocol_type: Some("consumer".into()),
-            protocol_name: Some("range".into()),
-            leader: Some("m1".into()),
+    fn liveness_renewal_is_due_at_half_the_session() {
+        let member = |last_contact_ms| MemberDoc {
+            last_contact_ms,
+            session_timeout_ms: 30_000,
+            ..Default::default()
         };
 
-        // Same members, same state, same generation — only last_contact differs
-        // (including present vs absent). This is the no-op poll we must skip.
-        let a = group_detail_with(&[("m1", Some(t0)), ("m2", Some(t0))], forming.clone(), 3);
-        let b = group_detail_with(&[("m1", Some(t1)), ("m2", None)], forming.clone(), 3);
-        assert!(same_rebalance_state(&a, &b));
+        // Half of 30s is 15s.
+        assert!(!liveness_renewal_due(Some(&member(1_000)), 1_000, 30_000));
+        assert!(!liveness_renewal_due(Some(&member(1_000)), 15_999, 30_000));
+        assert!(liveness_renewal_due(Some(&member(1_000)), 16_000, 30_000));
 
-        // A bumped generation is a real rebalance — must not be skipped.
-        let new_gen = group_detail_with(&[("m1", Some(t0)), ("m2", Some(t0))], forming.clone(), 4);
-        assert!(!same_rebalance_state(&a, &new_gen));
+        // A member with no document at all must write one: the sweep reads a
+        // missing document as a lapsed session, so declining to write here
+        // would evict a member that has just joined.
+        assert!(liveness_renewal_due(None, 1_000, 30_000));
 
-        // A changed member set — must not be skipped.
-        let fewer = group_detail_with(&[("m1", Some(t0))], forming.clone(), 3);
-        assert!(!same_rebalance_state(&a, &fewer));
-
-        // The Forming -> Formed assignment write (same members, same generation,
-        // last_contact could even match) MUST be detected as a change, otherwise
-        // the group would never stabilise. This is the write we protect.
-        let formed = GroupState::Formed {
-            protocol_type: "consumer".into(),
-            protocol_name: "range".into(),
-            leader: "m1".into(),
-            assignments: [("m1".to_owned(), Bytes::from_static(b"assignment"))]
-                .into_iter()
-                .collect(),
-        };
-        let assigned = group_detail_with(&[("m1", Some(t0)), ("m2", Some(t0))], formed, 3);
-        assert!(!same_rebalance_state(&a, &assigned));
-    }
-
-    #[test]
-    fn liveness_renewal_due_threshold() {
-        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000);
-        let state = GroupState::default();
-        let session_timeout_ms = 30_000; // half == 15s
-
-        // Just contacted -> not due.
-        let fresh = group_detail_with(&[("m1", Some(now))], state.clone(), 1);
-        assert!(!liveness_renewal_due(&fresh, "m1", now, session_timeout_ms));
-
-        // Under half the session timeout -> still not due.
-        let recent = group_detail_with(
-            &[("m1", Some(now - Duration::from_secs(14)))],
-            state.clone(),
-            1,
-        );
-        assert!(!liveness_renewal_due(
-            &recent,
-            "m1",
-            now,
-            session_timeout_ms
-        ));
-
-        // Past half the session timeout -> a no-op poll must still refresh.
-        let stale = group_detail_with(
-            &[("m1", Some(now - Duration::from_secs(20)))],
-            state.clone(),
-            1,
-        );
-        assert!(liveness_renewal_due(&stale, "m1", now, session_timeout_ms));
-
-        // Member not yet persisted, or persisted without a timestamp -> write.
+        // A group that declares no session timeout still has to renew on some
+        // cadence, or nothing is ever written and everyone is swept.
         assert!(liveness_renewal_due(
-            &fresh,
-            "ghost",
-            now,
-            session_timeout_ms
+            Some(&member(1_000)),
+            1_000 + i64::from(DEFAULT_SESSION_TIMEOUT_MS) / 2,
+            0,
         ));
-        let no_ts = group_detail_with(&[("m1", None)], state, 1);
-        assert!(liveness_renewal_due(&no_ts, "m1", now, session_timeout_ms));
-
-        // Empty member id has nothing to renew.
-        assert!(!liveness_renewal_due(&fresh, "", now, session_timeout_ms));
     }
 
-    // End-to-end proof of the no-op skip: once a group is Formed and its member
-    // assigned, a re-sync by that member (which only refreshes `last_contact`)
-    // must not rewrite the group object. The persisted version (etag) staying
-    // put is exactly what stops the rebalance-time churn that starves a large
-    // group's assignment write. Without the skip this re-sync bumps the version.
-    #[tokio::test]
-    async fn noop_resync_does_not_bump_persisted_version() -> Result<()> {
+    /// The state a request derives must be the state `DescribeGroups` reports,
+    /// or the coordinator and every admin tool disagree about the same group.
+    #[test]
+    fn a_view_derives_the_state_it_reports() {
+        let empty = GroupView {
+            generation: GenerationDoc {
+                session_timeout_ms: SESSION_TIMEOUT_MS,
+                ..Default::default()
+            },
+            version: Some(Version::default()),
+            assignment: None,
+        };
+        assert_eq!(ConsumerGroupState::Empty, empty.state());
+        assert!(empty.is_forming());
+
+        let mut joined = empty.clone();
+        joined.generation.members = BTreeMap::from([("m-1".to_owned(), MemberRef::default())]);
+        assert_eq!(ConsumerGroupState::Assigning, joined.state());
+        assert!(joined.is_forming());
+
+        let mut led = joined.clone();
+        led.generation.leader = Some("m-1".into());
+        assert_eq!(ConsumerGroupState::CompletingRebalance, led.state());
+        assert!(led.is_forming());
+
+        let mut stable = led.clone();
+        stable.assignment = Some(AssignmentDoc {
+            generation_id: 0,
+            leader: "m-1".into(),
+            protocol_type: CONSUMER.into(),
+            protocol_name: RANGE.into(),
+            assignments: BTreeMap::from([("m-1".to_owned(), Bytes::from_static(b"a"))]),
+            assigned_at_ms: 0,
+        });
+        assert_eq!(ConsumerGroupState::Stable, stable.state());
+        assert!(!stable.is_forming());
+
+        // An assignment left behind by an earlier generation is not this
+        // generation's assignment. Reading it as one is how a rebalance in
+        // progress reports as `Stable` and a client parks on a dead assignment.
+        let mut moved_on = stable.clone();
+        moved_on.generation.generation_id = 1;
+        assert_eq!(
+            ConsumerGroupState::CompletingRebalance,
+            moved_on.state(),
+            "an assignment from a dead generation must not make a group stable",
+        );
+        assert!(moved_on.is_forming());
+    }
+
+    /// #240: a group whose members never finish joining must still be reported.
+    ///
+    /// The detector was hooked only to the heartbeat path, on the reasoning that
+    /// members heartbeat every few seconds so it is the densest sampling
+    /// available. That is true of a group whose members are *in* the group, and
+    /// false of the failure this exists for: `AbstractCoordinator$HeartbeatThread`
+    /// disables itself while the consumer has not joined, so a consumer stuck
+    /// trying to join sends no heartbeat at all. Measured in production as a
+    /// group 90+ minutes in `CompletingRebalance` with 16 members and not one
+    /// line about it across ten replicas.
+    #[tokio::test(start_paused = true)]
+    async fn a_group_that_never_joins_is_still_observed() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let session_timeout_ms = 45_000;
-        let rebalance_timeout_ms = Some(300_000);
-        let group_instance_id = None;
-        let reason = None;
+        const GROUP_ID: &str = "never-joins";
 
-        const CLIENT_ID: &str = "console-consumer";
-        const GROUP_ID: &str = "noop-resync-group";
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+
+        // A group already mid-rebalance: members joined, leader elected, no
+        // assignment distributed. This is what a stuck consumer keeps re-joining
+        // into, and what `CompletingRebalance` maps from.
+        let now_ms = epoch_ms(paused_clock());
+
+        _ = storage
+            .update_group_generation(
+                GROUP_ID,
+                GenerationDoc {
+                    generation_id: 1,
+                    protocol_type: Some(CONSUMER.into()),
+                    protocol_name: Some(RANGE.into()),
+                    leader: Some("member-1".into()),
+                    members: BTreeMap::from([("member-1".to_owned(), MemberRef::default())]),
+                    members_changed_at_ms: now_ms,
+                    state_since_ms: now_ms,
+                    swept_at_ms: now_ms,
+                    session_timeout_ms: SESSION_TIMEOUT_MS,
+                    rebalance_timeout_ms: REBALANCE_TIMEOUT_MS,
+                    inception_ms: now_ms,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .map_err(update_error)?;
+
+        _ = join_group(
+            &controller,
+            GROUP_ID,
+            "",
+            &encode_subscription(&["t"], None),
+        )
+        .await?;
+
+        // Reading the memo directly rather than the log: what is under test is
+        // that the forming path observes at all, which is the hook a refactor
+        // could silently drop — and did, for the whole of beta.31 and beta.32.
+        let sampled = controller
+            .rebalance_stalls
+            .lock()
+            .map(|stalls| stalls.contains_key(GROUP_ID))
+            .unwrap_or_default();
+
+        assert!(
+            sampled,
+            "a group mid-rebalance was not observed on the join path, so a consumer \
+             that never joins — and therefore never heartbeats — is invisible",
+        );
+
+        Ok(())
+    }
+
+    /// #240: a group that stops making progress mid-rebalance must say so, once
+    /// per episode — and must say so from the moment the *group* stalled, not
+    /// from the moment this replica first looked at it.
+    ///
+    /// The episode's start used to be an in-memory stamp, so a restart began a
+    /// blind window exactly when a wedge is most likely to have been created:
+    /// the incident this exists for ran for hours across ten replicas, and a
+    /// replica that came up mid-incident would have waited out the threshold
+    /// again before saying anything. It is read from `state_since_ms` now, so a
+    /// fresh `Controller` reports a group that has been stuck for an hour
+    /// immediately.
+    #[test]
+    fn a_stalled_rebalance_is_reported_once_per_episode() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "stalled-group";
+        const REBALANCE_TIMEOUT_MS: i32 = 300_000;
 
         let storage = StorageContainer::builder()
             .cluster_id("test")
             .node_id(111)
             .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await?;
-
-        let s = Controller::with_storage(storage.clone())?;
-
-        let range_meta = Bytes::try_from(
-            &MemberMetadata::default().version(3).subscription(
-                ConsumerProtocolSubscription::default()
-                    .generation_id(Some(0))
-                    .owned_partitions(
-                        [TopicPartition::default().topic("a").partitions(0..3)].into_iter(),
-                    ),
-            ),
-        )?;
-
-        let protocols = [JoinGroupRequestProtocol::default()
-            .name(Assignor::RANGE.into())
-            .metadata(range_meta.clone())];
-
-        // First join with an empty member id returns the assigned member id.
-        let member_id = match s
-            .join(
-                Some(CLIENT_ID),
-                GROUP_ID,
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                "",
-                group_instance_id,
-                CONSUMER,
-                Some(&protocols[..]),
-                reason,
-            )
-            .await?
-        {
-            Body::JoinGroupResponse(JoinGroupResponse { member_id, .. }) => member_id,
-            otherwise => panic!("{otherwise:?}"),
-        };
-
-        // Second join with that id makes this the (single) leader.
-        let generation_id = match s
-            .join(
-                Some(CLIENT_ID),
-                GROUP_ID,
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                &member_id,
-                group_instance_id,
-                CONSUMER,
-                Some(&protocols[..]),
-                reason,
-            )
-            .await?
-        {
-            Body::JoinGroupResponse(JoinGroupResponse { generation_id, .. }) => generation_id,
-            otherwise => panic!("{otherwise:?}"),
-        };
-
-        // Sync with an assignment forms the group (Forming -> Formed).
-        let assignment = Bytes::try_from(&MemberAssignment::default().assignment(
-            ConsumerProtocolAssignment::default().assigned_partitions(
-                [TopicPartition::default().topic("a").partitions(0..3)].into_iter(),
-            ),
-        ))?;
-        let assignments = [SyncGroupRequestAssignment::default()
-            .member_id(member_id.clone())
-            .assignment(assignment.clone())];
-
-        _ = s
-            .sync(
-                GROUP_ID,
-                generation_id,
-                &member_id,
-                group_instance_id,
-                Some(CONSUMER),
-                Some(Assignor::RANGE),
-                Some(&assignments[..]),
-            )
-            .await?;
-
-        let (detail, v1) = storage
-            .read_group(GROUP_ID)
-            .await?
-            .expect("group must be persisted after sync");
-        assert!(
-            matches!(detail.state, GroupState::Formed { .. }),
-            "expected Formed, got {:?}",
-            detail.state
-        );
-
-        // No-op re-sync by the assigned member: only `last_contact` would change,
-        // so the object must not be rewritten and its version must be stable.
-        _ = s
-            .sync(
-                GROUP_ID,
-                generation_id,
-                &member_id,
-                group_instance_id,
-                Some(CONSUMER),
-                Some(Assignor::RANGE),
-                Some(&assignments[..]),
-            )
-            .await?;
-
-        let (_, v2) = storage
-            .read_group(GROUP_ID)
-            .await?
-            .expect("group still persisted");
-
-        assert_eq!(
-            v1, v2,
-            "a no-op re-sync must not rewrite the group object (etag must stay stable)"
-        );
-
-        Ok(())
-    }
-
-    #[ignore]
-    #[tokio::test]
-    async fn lifecycle() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let session_timeout_ms = 45_000;
-        let rebalance_timeout_ms = Some(300_000);
-        let group_instance_id = None;
-        let reason = None;
-
-        let cluster = "abc";
-        let node = 12321;
-
-        const CLIENT_ID: &str = "console-consumer";
-        const GROUP_ID: &str = "test-consumer-group";
-        const TOPIC: &str = "test";
-
-        let storage = StorageContainer::builder()
-            .cluster_id(cluster)
-            .node_id(node)
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await?;
-
-        let s = Controller::with_storage(storage)?;
-
-        let first_member_range_meta = Bytes::try_from(
-            &MemberMetadata::default().version(3).subscription(
-                ConsumerProtocolSubscription::default()
-                    .generation_id(Some(0))
-                    .owned_partitions(
-                        [TopicPartition::default().topic("a").partitions(0..3)].into_iter(),
-                    ),
-            ),
-        )?;
-
-        let first_member_sticky_meta = Bytes::try_from(
-            &MemberMetadata::default().version(3).subscription(
-                ConsumerProtocolSubscription::default()
-                    .generation_id(Some(0))
-                    .owned_partitions(
-                        [TopicPartition::default().topic("b").partitions(0..3)].into_iter(),
-                    ),
-            ),
-        )?;
-
-        let protocols = [
-            JoinGroupRequestProtocol::default()
-                .name(Assignor::RANGE.into())
-                .metadata(first_member_range_meta.clone()),
-            JoinGroupRequestProtocol::default()
-                .name(Assignor::COOPERATIVE_STICKY.into())
-                .metadata(first_member_sticky_meta),
-        ];
-
-        let first_member_id = match s
-            .join(
-                Some(CLIENT_ID),
-                GROUP_ID,
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                "",
-                group_instance_id,
-                CONSUMER,
-                Some(&protocols[..]),
-                reason,
-            )
-            .await?
-        {
-            Body::JoinGroupResponse(JoinGroupResponse {
-                throttle_time_ms: Some(0),
-                error_code,
-                generation_id: -1,
-                protocol_type: Some(protocol_type),
-                protocol_name: Some(protocol_name),
-                leader,
-                skip_assignment: Some(false),
-                members: Some(members),
-                member_id,
-                ..
-            }) => {
-                assert_eq!(error_code, i16::from(ErrorCode::MemberIdRequired));
-                assert_eq!("consumer", protocol_type);
-                assert_eq!("", protocol_name);
-                assert!(leader.is_empty());
-                assert!(member_id.starts_with(CLIENT_ID));
-                assert_eq!(0, members.len());
-
-                let join_response = s
-                    .join(
-                        Some(CLIENT_ID),
-                        GROUP_ID,
-                        session_timeout_ms,
-                        rebalance_timeout_ms,
-                        &member_id,
-                        group_instance_id,
-                        CONSUMER,
-                        Some(&protocols[..]),
-                        reason,
-                    )
-                    .await?;
-
-                let join_response_expected = Body::from(
-                    JoinGroupResponse::default()
-                        .throttle_time_ms(Some(0))
-                        .error_code(ErrorCode::None.into())
-                        .generation_id(0)
-                        .protocol_type(Some(CONSUMER.into()))
-                        .protocol_name(Some(Assignor::RANGE.into()))
-                        .leader(member_id.clone())
-                        .skip_assignment(Some(false))
-                        .member_id(member_id.clone())
-                        .members(Some(
-                            [JoinGroupResponseMember::default()
-                                .member_id(member_id.clone())
-                                .group_instance_id(None)
-                                .metadata(first_member_range_meta.clone())]
-                            .into(),
-                        )),
-                );
-
-                assert_eq!(join_response_expected, join_response);
-
-                member_id
-            }
-
-            otherwise => panic!("{otherwise:?}"),
-        };
-
-        let first_member_assignment_01 = Bytes::try_from(&MemberAssignment::default().assignment(
-            ConsumerProtocolAssignment::default().assigned_partitions(
-                [TopicPartition::default().topic("x").partitions(3..6)].into_iter(),
-            ),
-        ))?;
-
-        let assignments = [SyncGroupRequestAssignment::default()
-            .member_id(first_member_id.clone())
-            .assignment(first_member_assignment_01.clone())];
-
-        assert_eq!(
-            Body::from(
-                SyncGroupResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .error_code(0)
-                    .protocol_type(Some(CONSUMER.into()))
-                    .protocol_name(Some(Assignor::RANGE.into()))
-                    .assignment(first_member_assignment_01)
-            ),
-            s.sync(
-                GROUP_ID,
-                0,
-                &first_member_id,
-                group_instance_id,
-                Some(CONSUMER),
-                Some(Assignor::RANGE),
-                Some(&assignments[..]),
-            )
-            .await?
-        );
-
-        assert_eq!(
-            Body::from(
-                HeartbeatResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .error_code(ErrorCode::None.into())
-            ),
-            s.heartbeat(GROUP_ID, 0, &first_member_id, group_instance_id)
-                .await?
-        );
-
-        let second_member_range_meta = Bytes::try_from(
-            &MemberMetadata::default().version(3).subscription(
-                ConsumerProtocolSubscription::default()
-                    .generation_id(Some(0))
-                    .owned_partitions(
-                        [TopicPartition::default().topic("p").partitions(0..3)].into_iter(),
-                    ),
-            ),
-        )?;
-
-        let second_member_sticky_meta = Bytes::try_from(
-            &MemberMetadata::default().version(3).subscription(
-                ConsumerProtocolSubscription::default()
-                    .generation_id(Some(0))
-                    .owned_partitions(
-                        [TopicPartition::default().topic("q").partitions(0..3)].into_iter(),
-                    ),
-            ),
-        )?;
-
-        let protocols = [
-            JoinGroupRequestProtocol::default()
-                .name(Assignor::RANGE.into())
-                .metadata(second_member_range_meta.clone()),
-            JoinGroupRequestProtocol::default()
-                .name(Assignor::COOPERATIVE_STICKY.into())
-                .metadata(second_member_sticky_meta.clone()),
-        ];
-
-        let second_member_id = match s
-            .join(
-                Some(CLIENT_ID),
-                GROUP_ID,
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                "",
-                group_instance_id,
-                CONSUMER,
-                Some(&protocols[..]),
-                reason,
-            )
-            .await?
-        {
-            Body::JoinGroupResponse(JoinGroupResponse {
-                throttle_time_ms: Some(0),
-                error_code,
-                generation_id: -1,
-                protocol_type: None,
-                protocol_name: Some(protocol_name),
-                leader,
-                skip_assignment: Some(false),
-                members: Some(members),
-                member_id,
-                ..
-            }) => {
-                assert_eq!(error_code, i16::from(ErrorCode::MemberIdRequired));
-                assert_eq!("", protocol_name);
-                assert!(leader.is_empty());
-                assert!(member_id.starts_with(CLIENT_ID));
-                assert_eq!(0, members.len());
-
-                let join_response = s
-                    .join(
-                        Some(CLIENT_ID),
-                        GROUP_ID,
-                        session_timeout_ms,
-                        rebalance_timeout_ms,
-                        &member_id,
-                        group_instance_id,
-                        CONSUMER,
-                        Some(&protocols[..]),
-                        reason,
-                    )
-                    .await?;
-
-                let join_response_expected = Body::from(
-                    JoinGroupResponse::default()
-                        .throttle_time_ms(Some(0))
-                        .error_code(ErrorCode::None.into())
-                        // The joining member observes the in-progress rebalance's
-                        // generation (1): admitting it moved the group off the
-                        // stable generation 0. It only advances to 2 once the
-                        // leader re-joins with a new subscription further down.
-                        .generation_id(1)
-                        .protocol_type(Some(CONSUMER.into()))
-                        .protocol_name(Some(Assignor::RANGE.into()))
-                        .leader(first_member_id.clone())
-                        .skip_assignment(Some(false))
-                        .member_id(member_id.clone())
-                        .members(Some([].into())),
-                );
-
-                assert_eq!(join_response_expected, join_response);
-
-                member_id
-            }
-
-            otherwise => panic!("{otherwise:?}"),
-        };
-
-        assert_eq!(
-            Body::from(
-                HeartbeatResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .error_code(i16::from(ErrorCode::RebalanceInProgress))
-            ),
-            s.heartbeat(GROUP_ID, 0, &first_member_id, group_instance_id,)
-                .await?
-        );
-
-        assert_eq!(
-            Body::from(
-                OffsetCommitResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .topics(Some(
-                        [OffsetCommitResponseTopic::default()
-                            .name(TOPIC.into())
-                            .partitions(Some(
-                                (0..=2)
-                                    .map(|partition_index| OffsetCommitResponsePartition::default()
-                                        .partition_index(partition_index)
-                                        .error_code(ErrorCode::UnknownTopicOrPartition.into()))
-                                    .collect(),
-                            )),]
-                        .into()
-                    ))
-            ),
-            s.offset_commit(OffsetCommit {
-                group_id: GROUP_ID,
-                generation_id_or_member_epoch: Some(0),
-                member_id: Some(&first_member_id),
-                group_instance_id,
-                retention_time_ms: None,
-                topics: Some(&[OffsetCommitRequestTopic::default()
-                    .name(TOPIC.into())
-                    .partitions(Some(
-                        (0..=2)
-                            .map(|partition_index| OffsetCommitRequestPartition::default()
-                                .partition_index(partition_index)
-                                .committed_offset(1)
-                                .committed_leader_epoch(Some(0))
-                                .commit_timestamp(None)
-                                .committed_metadata(Some("".into())))
-                            .collect(),
-                    )),]),
-            })
-            .await?
-        );
-
-        {
-            let first_member_range_meta = Bytes::try_from(
-                &MemberMetadata::default().version(3).subscription(
-                    ConsumerProtocolSubscription::default()
-                        .generation_id(Some(0))
-                        .owned_partitions(
-                            [TopicPartition::default().topic("f").partitions(0..3)].into_iter(),
-                        ),
-                ),
-            )?;
-
-            let first_member_sticky_meta = Bytes::try_from(
-                &MemberMetadata::default().version(3).subscription(
-                    ConsumerProtocolSubscription::default()
-                        .generation_id(Some(0))
-                        .owned_partitions(
-                            [TopicPartition::default().topic("g").partitions(0..3)].into_iter(),
-                        ),
-                ),
-            )?;
-
-            let protocols = [
-                JoinGroupRequestProtocol::default()
-                    .name(Assignor::RANGE.into())
-                    .metadata(first_member_range_meta.clone()),
-                JoinGroupRequestProtocol::default()
-                    .name(Assignor::COOPERATIVE_STICKY.into())
-                    .metadata(first_member_sticky_meta),
-            ];
-
-            match s
-                .join(
-                    Some(CLIENT_ID),
-                    GROUP_ID,
-                    session_timeout_ms,
-                    rebalance_timeout_ms,
-                    &first_member_id,
-                    group_instance_id,
-                    CONSUMER,
-                    Some(&protocols[..]),
-                    reason,
-                )
-                .await?
-            {
-                Body::JoinGroupResponse(JoinGroupResponse {
-                    throttle_time_ms: Some(0),
-                    error_code,
-                    generation_id,
-                    protocol_type,
-                    protocol_name,
-                    leader,
-                    skip_assignment: Some(false),
-                    member_id,
-                    members: Some(members),
-                    ..
-                }) => {
-                    assert_eq!(i16::from(ErrorCode::None), error_code);
-                    assert_eq!(2, generation_id);
-                    assert_eq!(Some(CONSUMER.into()), protocol_type);
-                    assert_eq!(Some(Assignor::RANGE.into()), protocol_name);
-                    assert_eq!(first_member_id, leader);
-                    assert_eq!(first_member_id, member_id);
-
-                    assert_eq!(
-                        Some(first_member_range_meta),
-                        members
-                            .iter()
-                            .find(|member| member.member_id == first_member_id)
-                            .map(|member| member.metadata.clone())
-                    );
-
-                    assert_eq!(
-                        Some(second_member_range_meta.clone()),
-                        members
-                            .iter()
-                            .find(|member| member.member_id == second_member_id)
-                            .map(|member| member.metadata.clone())
-                    );
-                }
-
-                otherwise => panic!("{otherwise:?}"),
-            }
-        }
-
-        {
-            let protocols = [
-                JoinGroupRequestProtocol::default()
-                    .name(Assignor::RANGE.into())
-                    .metadata(second_member_range_meta.clone()),
-                JoinGroupRequestProtocol::default()
-                    .name(Assignor::COOPERATIVE_STICKY.into())
-                    .metadata(second_member_sticky_meta.clone()),
-            ];
-
-            match s
-                .join(
-                    Some(CLIENT_ID),
-                    GROUP_ID,
-                    session_timeout_ms,
-                    rebalance_timeout_ms,
-                    &second_member_id,
-                    group_instance_id,
-                    CONSUMER,
-                    Some(&protocols[..]),
-                    reason,
-                )
-                .await?
-            {
-                Body::JoinGroupResponse(JoinGroupResponse {
-                    throttle_time_ms: Some(0),
-                    error_code,
-                    generation_id,
-                    protocol_type: Some(protocol_type),
-                    protocol_name: Some(protocol_name),
-                    leader,
-                    skip_assignment: Some(false),
-                    member_id,
-                    members: Some(members),
-                    ..
-                }) => {
-                    assert_eq!(i16::from(ErrorCode::None), error_code);
-                    assert_eq!(2, generation_id);
-                    assert_eq!(CONSUMER, protocol_type);
-                    assert_eq!(Assignor::RANGE, protocol_name);
-                    assert_eq!(first_member_id, leader);
-                    assert_eq!(second_member_id, member_id);
-                    assert_eq!(0, members.len());
-                }
-
-                otherwise => panic!("{otherwise:?}"),
-            }
-        }
-
-        let second_member_assignment_02 =
-            Bytes::try_from(&MemberAssignment::default().assignment(
-                ConsumerProtocolAssignment::default().assigned_partitions(
-                    [TopicPartition::default().topic("y").partitions(3..6)].into_iter(),
-                ),
-            ))?;
-
-        {
-            let first_member_assignment_02 =
-                Bytes::try_from(&MemberAssignment::default().assignment(
-                    ConsumerProtocolAssignment::default().assigned_partitions(
-                        [TopicPartition::default().topic("z").partitions(0..3)].into_iter(),
-                    ),
-                ))?;
-
-            let assignments = [
-                SyncGroupRequestAssignment::default()
-                    .member_id(first_member_id.clone())
-                    .assignment(first_member_assignment_02.clone()),
-                SyncGroupRequestAssignment::default()
-                    .member_id(second_member_id.clone())
-                    .assignment(second_member_assignment_02.clone()),
-            ];
-
-            assert_eq!(
-                Body::from(
-                    SyncGroupResponse::default()
-                        .throttle_time_ms(Some(0))
-                        .error_code(ErrorCode::None.into())
-                        .protocol_type(Some(CONSUMER.into()))
-                        .protocol_name(Some(Assignor::RANGE.into()))
-                        .assignment(first_member_assignment_02)
-                ),
-                s.sync(
-                    GROUP_ID,
-                    2,
-                    &first_member_id,
-                    group_instance_id,
-                    Some(CONSUMER),
-                    Some(Assignor::RANGE),
-                    Some(&assignments[..]),
-                )
-                .await?
-            );
-        }
-
-        assert_eq!(
-            Body::from(
-                SyncGroupResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .error_code(ErrorCode::None.into())
-                    .protocol_type(Some(CONSUMER.into()))
-                    .protocol_name(Some(Assignor::RANGE.into()))
-                    .assignment(second_member_assignment_02)
-            ),
-            s.sync(
-                GROUP_ID,
-                2,
-                &second_member_id,
-                group_instance_id,
-                Some(CONSUMER),
-                Some(Assignor::RANGE),
-                Some(&[]),
-            )
-            .await?
-        );
-
-        assert_eq!(
-            Body::from(
-                HeartbeatResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .error_code(ErrorCode::None.into())
-            ),
-            s.heartbeat(GROUP_ID, 2, &first_member_id, group_instance_id,)
-                .await?
-        );
-
-        assert_eq!(
-            Body::from(
-                HeartbeatResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .error_code(ErrorCode::None.into())
-            ),
-            s.heartbeat(GROUP_ID, 2, &second_member_id, group_instance_id,)
-                .await?
-        );
-
-        assert_eq!(
-            Body::from(
-                LeaveGroupResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .error_code(ErrorCode::None.into())
-                    .members(Some(
-                        [MemberResponse::default()
-                            .member_id(first_member_id.clone())
-                            .group_instance_id(None)
-                            .error_code(ErrorCode::None.into())]
-                        .into()
-                    ))
-            ),
-            s.leave(
-                GROUP_ID,
-                None,
-                Some(&[MemberIdentity::default()
-                    .member_id(first_member_id.clone())
-                    .group_instance_id(None)
-                    .reason(Some("the consumer is being closed".into()))]),
-            )
-            .await?
-        );
-
-        assert_eq!(
-            Body::from(
-                HeartbeatResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .error_code(ErrorCode::RebalanceInProgress.into())
-            ),
-            s.heartbeat(GROUP_ID, 2, &second_member_id, group_instance_id,)
-                .await?
-        );
-
-        {
-            let protocols = [
-                JoinGroupRequestProtocol::default()
-                    .name(Assignor::RANGE.into())
-                    .metadata(second_member_range_meta.clone()),
-                JoinGroupRequestProtocol::default()
-                    .name(Assignor::COOPERATIVE_STICKY.into())
-                    .metadata(second_member_sticky_meta.clone()),
-            ];
-
-            assert_eq!(
-                Body::from(
-                    JoinGroupResponse::default()
-                        .throttle_time_ms(Some(0))
-                        .error_code(ErrorCode::None.into())
-                        .generation_id(3)
-                        .protocol_type(Some(CONSUMER.into()))
-                        .protocol_name(Some(Assignor::RANGE.into()))
-                        .leader(second_member_id.clone())
-                        .skip_assignment(Some(false))
-                        .member_id(second_member_id.clone())
-                        .members(Some(
-                            [JoinGroupResponseMember::default()
-                                .member_id(second_member_id.clone())
-                                .group_instance_id(None)
-                                .metadata(second_member_range_meta.clone())]
-                            .into()
-                        ))
-                ),
-                s.join(
-                    Some(CLIENT_ID),
-                    GROUP_ID,
-                    session_timeout_ms,
-                    rebalance_timeout_ms,
-                    &second_member_id,
-                    group_instance_id,
-                    CONSUMER,
-                    Some(&protocols[..]),
-                    reason,
-                )
-                .await?
-            );
-        }
-
-        {
-            let second_member_assignment_03 =
-                Bytes::try_from(&MemberAssignment::default().assignment(
-                    ConsumerProtocolAssignment::default().assigned_partitions(
-                        [TopicPartition::default().topic("x").partitions(6..9)].into_iter(),
-                    ),
-                ))?;
-
-            let assignments = [SyncGroupRequestAssignment::default()
-                .member_id(second_member_id.clone())
-                .assignment(second_member_assignment_03.clone())];
-
-            assert_eq!(
-                Body::from(
-                    SyncGroupResponse::default()
-                        .throttle_time_ms(Some(0))
-                        .error_code(ErrorCode::None.into())
-                        .protocol_type(Some(CONSUMER.into()))
-                        .protocol_name(Some(Assignor::RANGE.into()))
-                        .assignment(second_member_assignment_03)
-                ),
-                s.sync(
-                    GROUP_ID,
-                    3,
-                    &second_member_id,
-                    group_instance_id,
-                    Some(CONSUMER),
-                    Some(Assignor::RANGE),
-                    Some(&assignments[..]),
-                )
-                .await?
-            );
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn rejoin() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let session_timeout_ms = 10_000;
-        let rebalance_timeout_ms = Some(60_000);
-        let group_instance_id = None;
-        let reason = None;
-
-        let cluster = "abc";
-        let node = 12321;
-
-        const CLIENT_ID: &str = "console-consumer";
-        const GROUP_ID: &str = "test-consumer-group";
-
-        let storage = StorageContainer::builder()
-            .cluster_id(cluster)
-            .node_id(node)
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await?;
-
-        let s = Controller::with_storage(storage)?;
-
-        let first_member_range_meta = Bytes::try_from(
-            &MemberMetadata::default().version(3).subscription(
-                ConsumerProtocolSubscription::default()
-                    .generation_id(Some(0))
-                    .owned_partitions(
-                        [TopicPartition::default().topic("a").partitions(0..3)].into_iter(),
-                    ),
-            ),
-        )?;
-
-        let first_member_sticky_meta = Bytes::try_from(
-            &MemberMetadata::default().version(3).subscription(
-                ConsumerProtocolSubscription::default()
-                    .generation_id(Some(0))
-                    .owned_partitions(
-                        [TopicPartition::default().topic("b").partitions(0..3)].into_iter(),
-                    ),
-            ),
-        )?;
-
-        let first_member_protocols = [
-            JoinGroupRequestProtocol::default()
-                .name(Assignor::RANGE.into())
-                .metadata(first_member_range_meta.clone()),
-            JoinGroupRequestProtocol::default()
-                .name(Assignor::COOPERATIVE_STICKY.into())
-                .metadata(first_member_sticky_meta),
-        ];
-
-        let first_member_id = match s
-            .join(
-                Some(CLIENT_ID),
-                GROUP_ID,
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                "",
-                group_instance_id,
-                CONSUMER,
-                Some(&first_member_protocols[..]),
-                reason,
-            )
-            .await?
-        {
-            Body::JoinGroupResponse(JoinGroupResponse {
-                throttle_time_ms: Some(0),
-                error_code,
-                generation_id: -1,
-                leader,
-                skip_assignment: Some(false),
-                members: Some(members),
-                member_id,
-                ..
-            }) => {
-                assert_eq!(error_code, i16::from(ErrorCode::MemberIdRequired));
-                assert!(leader.is_empty());
-                assert!(member_id.starts_with(CLIENT_ID));
-                assert_eq!(0, members.len());
-
-                assert_eq!(
-                    Body::from(
-                        JoinGroupResponse::default()
-                            .throttle_time_ms(Some(0))
-                            .error_code(ErrorCode::None.into())
-                            .generation_id(0)
-                            .protocol_type(Some(CONSUMER.into()))
-                            .protocol_name(Some(Assignor::RANGE.into()))
-                            .leader(member_id.clone())
-                            .skip_assignment(Some(false))
-                            .member_id(member_id.clone())
-                            .members(Some(
-                                [JoinGroupResponseMember::default()
-                                    .member_id(member_id.clone())
-                                    .group_instance_id(None)
-                                    .metadata(first_member_range_meta.clone())]
-                                .into()
-                            ))
-                    ),
-                    s.join(
-                        Some(CLIENT_ID),
-                        GROUP_ID,
-                        session_timeout_ms,
-                        rebalance_timeout_ms,
-                        &member_id,
-                        group_instance_id,
-                        CONSUMER,
-                        Some(&first_member_protocols[..]),
-                        reason,
-                    )
-                    .await?
-                );
-
-                member_id
-            }
-
-            otherwise => panic!("{otherwise:?}"),
-        };
-
-        let second_member_range_meta = Bytes::try_from(
-            &MemberMetadata::default().version(3).subscription(
-                ConsumerProtocolSubscription::default()
-                    .generation_id(Some(0))
-                    .owned_partitions(
-                        [TopicPartition::default().topic("p").partitions(0..3)].into_iter(),
-                    ),
-            ),
-        )?;
-
-        let second_member_sticky_meta = Bytes::try_from(
-            &MemberMetadata::default().version(3).subscription(
-                ConsumerProtocolSubscription::default()
-                    .generation_id(Some(0))
-                    .owned_partitions(
-                        [TopicPartition::default().topic("q").partitions(0..3)].into_iter(),
-                    ),
-            ),
-        )?;
-
-        let second_member_protocols = [
-            JoinGroupRequestProtocol::default()
-                .name(Assignor::RANGE.into())
-                .metadata(second_member_range_meta.clone()),
-            JoinGroupRequestProtocol::default()
-                .name(Assignor::COOPERATIVE_STICKY.into())
-                .metadata(second_member_sticky_meta),
-        ];
-
-        let second_member_id = match s
-            .join(
-                Some(CLIENT_ID),
-                GROUP_ID,
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                "",
-                group_instance_id,
-                CONSUMER,
-                Some(&second_member_protocols[..]),
-                reason,
-            )
-            .await?
-        {
-            Body::JoinGroupResponse(JoinGroupResponse {
-                throttle_time_ms: Some(0),
-                error_code,
-                generation_id: -1,
-                leader,
-                skip_assignment: Some(false),
-                members: Some(members),
-                member_id,
-                ..
-            }) => {
-                assert_eq!(error_code, i16::from(ErrorCode::MemberIdRequired));
-                assert!(leader.is_empty());
-                assert!(member_id.starts_with(CLIENT_ID));
-                assert_eq!(0, members.len());
-
-                assert_eq!(
-                    Body::from(
-                        JoinGroupResponse::default()
-                            .throttle_time_ms(Some(0))
-                            .error_code(ErrorCode::None.into())
-                            .generation_id(1)
-                            .protocol_type(Some(CONSUMER.into()))
-                            .protocol_name(Some(Assignor::RANGE.into()))
-                            .leader(first_member_id.clone())
-                            .skip_assignment(Some(false))
-                            .member_id(member_id.clone())
-                            .members(Some([].into()))
-                    ),
-                    s.join(
-                        Some(CLIENT_ID),
-                        GROUP_ID,
-                        session_timeout_ms,
-                        rebalance_timeout_ms,
-                        &member_id,
-                        group_instance_id,
-                        CONSUMER,
-                        Some(&second_member_protocols[..]),
-                        reason,
-                    )
-                    .await?
-                );
-
-                member_id
-            }
-
-            otherwise => panic!("{otherwise:?}"),
-        };
-
-        match s
-            .join(
-                Some(CLIENT_ID),
-                GROUP_ID,
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                &first_member_id,
-                group_instance_id,
-                CONSUMER,
-                Some(&first_member_protocols[..]),
-                reason,
-            )
-            .await?
-        {
-            Body::JoinGroupResponse(JoinGroupResponse {
-                throttle_time_ms: Some(0),
-                error_code,
-                generation_id: 1,
-                protocol_type,
-                protocol_name,
-                leader,
-                skip_assignment: Some(false),
-                member_id,
-                members: Some(members),
-                ..
-            }) => {
-                assert_eq!(i16::from(ErrorCode::None), error_code);
-                assert_eq!(Some(CONSUMER.into()), protocol_type);
-                assert_eq!(Some(Assignor::RANGE.into()), protocol_name);
-                assert_eq!(first_member_id.clone(), leader);
-                assert_eq!(first_member_id.clone(), member_id);
-                assert_eq!(2, members.len());
-                assert!(
-                    members.contains(
-                        &JoinGroupResponseMember::default()
-                            .member_id(second_member_id.clone())
-                            .group_instance_id(None)
-                            .metadata(second_member_range_meta.clone())
-                    )
-                );
-                assert!(
-                    members.contains(
-                        &JoinGroupResponseMember::default()
-                            .member_id(first_member_id.clone())
-                            .group_instance_id(None)
-                            .metadata(first_member_range_meta.clone())
-                    )
-                );
-            }
-
-            otherwise => panic!("{otherwise:?}"),
-        }
-
-        assert_eq!(
-            Body::from(
-                JoinGroupResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .error_code(ErrorCode::None.into())
-                    .generation_id(1)
-                    .protocol_type(Some(CONSUMER.into()))
-                    .protocol_name(Some(Assignor::RANGE.into()))
-                    .leader(first_member_id.clone())
-                    .skip_assignment(Some(false))
-                    .member_id(second_member_id.clone())
-                    .members(Some([].into(),))
-            ),
-            s.join(
-                Some(CLIENT_ID),
-                GROUP_ID,
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                &second_member_id,
-                group_instance_id,
-                CONSUMER,
-                Some(&second_member_protocols[..]),
-                reason,
-            )
-            .await?
-        );
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn member_id_required_error_code_joins_group() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let session_timeout_ms = 45_000;
-        let rebalance_timeout_ms = Some(300_000);
-        let group_instance_id = None;
-        let reason = None;
-
-        let cluster = "abc";
-        let node = 12321;
-
-        const CLIENT_ID: &str = "console-consumer";
-        const GROUP_ID: &str = "test-consumer-group";
-        const RANGE: &str = "range";
-        const COOPERATIVE_STICKY: &str = "cooperative-sticky";
-
-        const PROTOCOL_TYPE: &str = "consumer";
-
-        let storage = StorageContainer::builder()
-            .cluster_id(cluster)
-            .node_id(node)
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await?;
-
-        let s = Wrapper::with_storage_group_detail(
-            storage,
-            GroupDetail {
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                state: GroupState::Forming {
-                    protocol_type: Some(PROTOCOL_TYPE.into()),
-                    protocol_name: Some(RANGE.into()),
-                    leader: None,
-                },
+            .storage(Url::parse("memory://")?);
+
+        let threshold = Duration::from_millis(REBALANCE_TIMEOUT_MS as u64);
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+
+        // Members joined, a leader elected, no assignment distributed: exactly
+        // what `ConsumerGroupState` maps to `CompletingRebalance`.
+        let stalling = |since: SystemTime| GroupView {
+            generation: GenerationDoc {
+                leader: Some("member-1".into()),
+                members: BTreeMap::from([("member-1".to_owned(), MemberRef::default())]),
+                state_since_ms: epoch_ms(since),
+                session_timeout_ms: SESSION_TIMEOUT_MS,
+                rebalance_timeout_ms: Some(REBALANCE_TIMEOUT_MS),
                 ..Default::default()
             },
-        );
-
-        let now = SystemTime::now();
-
-        let first_member_range_meta = Bytes::from_static(b"first_member_range_meta_01");
-        let first_member_sticky_meta = Bytes::from_static(b"first_member_sticky_meta_01");
-
-        let first_member_protocols = [
-            JoinGroupRequestProtocol::default()
-                .name(RANGE.into())
-                .metadata(first_member_range_meta.clone()),
-            JoinGroupRequestProtocol::default()
-                .name(COOPERATIVE_STICKY.into())
-                .metadata(first_member_sticky_meta),
-        ];
-
-        assert!(s.members().is_empty());
-
-        match s
-            .join(
-                now,
-                Some(CLIENT_ID),
-                GROUP_ID,
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                "",
-                group_instance_id,
-                PROTOCOL_TYPE,
-                Some(&first_member_protocols[..]),
-                reason,
-            )
-            .await
-        {
-            (
-                s,
-                Body::JoinGroupResponse(JoinGroupResponse {
-                    error_code,
-                    generation_id,
-                    leader,
-                    member_id,
-                    members,
-                    ..
-                }),
-            ) => {
-                assert_eq!(-1, generation_id);
-                assert_eq!(i16::from(ErrorCode::MemberIdRequired), error_code);
-                assert_eq!("", leader);
-                assert_eq!(Some([].into()), members);
-                assert!(member_id.starts_with(CLIENT_ID));
-                // KIP-394: the MemberIdRequired reply parks the generated id —
-                // the member only registers when it re-joins with that id.
-                assert_eq!(0, s.members().len());
-                assert_eq!(-1, s.generation_id());
-            }
-
-            otherwise => panic!("{otherwise:?}"),
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn forming_leader_leaves_group() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let session_timeout_ms = 45_000;
-        let rebalance_timeout_ms = Some(300_000);
-        let group_instance_id = None;
-        let reason = None;
-
-        let cluster = "abc";
-        let node = 12321;
-
-        const CLIENT_ID: &str = "console-consumer";
-        const GROUP_ID: &str = "test-consumer-group";
-        const RANGE: &str = "range";
-        const COOPERATIVE_STICKY: &str = "cooperative-sticky";
-
-        const PROTOCOL_TYPE: &str = "consumer";
-
-        let storage = StorageContainer::builder()
-            .cluster_id(cluster)
-            .node_id(node)
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await?;
-
-        let s = Wrapper::with_storage_group_detail(
-            storage,
-            GroupDetail {
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                state: GroupState::Forming {
-                    protocol_type: Some(PROTOCOL_TYPE.into()),
-                    protocol_name: Some(RANGE.into()),
-                    leader: None,
-                },
-                ..Default::default()
-            },
-        );
-
-        let now = SystemTime::now();
-
-        let first_member_range_meta = Bytes::from_static(b"first_member_range_meta_01");
-        let first_member_sticky_meta = Bytes::from_static(b"first_member_sticky_meta_01");
-
-        let first_member_protocols = [
-            JoinGroupRequestProtocol::default()
-                .name(RANGE.into())
-                .metadata(first_member_range_meta.clone()),
-            JoinGroupRequestProtocol::default()
-                .name(COOPERATIVE_STICKY.into())
-                .metadata(first_member_sticky_meta),
-        ];
-
-        assert!(s.members().is_empty());
-
-        let (s, member_id) = match s
-            .join(
-                now,
-                Some(CLIENT_ID),
-                GROUP_ID,
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                "",
-                group_instance_id,
-                PROTOCOL_TYPE,
-                Some(&first_member_protocols[..]),
-                reason,
-            )
-            .await
-        {
-            (
-                s,
-                Body::JoinGroupResponse(JoinGroupResponse {
-                    error_code,
-                    generation_id,
-                    leader,
-                    member_id,
-                    members,
-                    ..
-                }),
-            ) => {
-                assert_eq!(-1, generation_id);
-                assert_eq!(i16::from(ErrorCode::MemberIdRequired), error_code);
-                assert_eq!("", leader);
-                assert_eq!(Some([].into()), members);
-                assert!(member_id.starts_with(CLIENT_ID));
-                // KIP-394: the MemberIdRequired reply must not register the
-                // member; it joins for real with the generated id below.
-                assert_eq!(0, s.members().len());
-
-                (s, member_id)
-            }
-
-            otherwise => panic!("{otherwise:?}"),
+            version: Some(Version::default()),
+            assignment: None,
         };
 
-        let (s, _) = s
-            .join(
-                now,
-                Some(CLIENT_ID),
+        // The same group once the assignment lands.
+        let progressed = |since: SystemTime| GroupView {
+            assignment: Some(AssignmentDoc {
+                generation_id: 0,
+                leader: "member-1".into(),
+                protocol_type: CONSUMER.into(),
+                protocol_name: RANGE.into(),
+                assignments: BTreeMap::from([(
+                    "member-1".to_owned(),
+                    Bytes::from_static(b"assignment"),
+                )]),
+                assigned_at_ms: 0,
+            }),
+            ..stalling(since)
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+
+        let controller = runtime.block_on(async {
+            storage
+                .build()
+                .await
+                .map_err(Error::from)
+                .and_then(Controller::with_storage)
+        })?;
+
+        assert!(
+            !controller.observe_rebalance(GROUP_ID, &stalling(t0), t0),
+            "not on first sight"
+        );
+        assert!(
+            !controller.observe_rebalance(
                 GROUP_ID,
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                member_id.as_str(),
-                group_instance_id,
-                PROTOCOL_TYPE,
-                Some(&first_member_protocols[..]),
-                reason,
-            )
-            .await;
+                &stalling(t0),
+                t0 + threshold - Duration::from_secs(1)
+            ),
+            "not before the threshold",
+        );
 
-        assert_eq!(1, s.members().len());
+        assert!(
+            controller.observe_rebalance(GROUP_ID, &stalling(t0), t0 + threshold),
+            "reported once the threshold is reached",
+        );
+        assert!(
+            !controller.observe_rebalance(GROUP_ID, &stalling(t0), t0 + threshold * 10),
+            "and not again for the same episode",
+        );
 
-        let assignments = [SyncGroupRequestAssignment::default()
-            .member_id(member_id.clone())
-            .assignment(Bytes::from_static(b"assignment_01"))];
+        // Recovery clears the episode ...
+        assert!(!controller.observe_rebalance(GROUP_ID, &progressed(t0), t0 + threshold * 11));
 
-        let (s, _) = s
-            .sync(
-                now,
-                GROUP_ID,
-                0,
-                member_id.as_str(),
-                group_instance_id,
-                Some(PROTOCOL_TYPE),
-                Some(RANGE),
-                Some(&assignments[..]),
-            )
-            .await;
+        // ... so a fresh stall is a fresh episode, on its own persisted clock.
+        let t1 = t0 + threshold * 12;
+        assert!(
+            !controller.observe_rebalance(GROUP_ID, &stalling(t1), t1),
+            "new episode starts quiet"
+        );
+        assert!(
+            controller.observe_rebalance(GROUP_ID, &stalling(t1), t1 + threshold),
+            "and is reported in its own right",
+        );
 
-        assert_eq!(Some(member_id.as_str()), s.leader());
+        // The restart case, which used to be a blind window: a `Controller`
+        // that has never seen this group reports a group that has been stalled
+        // for longer than the threshold on its first look at it.
+        let restarted = Controller {
+            rebalance_stalls: Arc::new(Mutex::new(BTreeMap::new())),
+            ..controller.clone()
+        };
 
-        let (s, _) = s.leave(now, GROUP_ID, Some(member_id.as_str()), None).await;
-
-        assert_eq!(None, s.leader());
+        assert!(
+            restarted.observe_rebalance(GROUP_ID, &stalling(t0), t0 + threshold * 20),
+            "a fresh Controller must report a group that was already stalled",
+        );
 
         Ok(())
     }
 
-    #[tokio::test]
-    async fn sync_from_member_while_forming() -> Result<()> {
+    /// KIP-394: a first join with an empty member id replies with a generated
+    /// id and must leave the group entirely alone — no phantom member, no
+    /// generation bump, no object written at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_minted_member_id_writes_nothing() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let session_timeout_ms = 45_000;
-        let rebalance_timeout_ms = Some(300_000);
-        let group_instance_id = None;
-        let reason = None;
+        const GROUP_ID: &str = "member-id-required-group";
 
-        let cluster = "abc";
-        let node = 12321;
+        let storage = counted_storage().await?;
+        let generation_updates = storage.generation_updates_handle();
+        let member_puts = storage.member_puts_handle();
 
-        const CLIENT_ID: &str = "console-consumer";
-        const GROUP_ID: &str = "test-consumer-group";
-        const RANGE: &str = "range";
-        const COOPERATIVE_STICKY: &str = "cooperative-sticky";
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+        let metadata = encode_subscription(&["t"], None);
 
-        const PROTOCOL_TYPE: &str = "consumer";
+        let (member_id, join) = register(&controller, GROUP_ID, &metadata).await?;
+        assert_eq!(i16::from(ErrorCode::None), join.error_code);
 
-        let storage = StorageContainer::builder()
-            .cluster_id(cluster)
-            .node_id(node)
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await?;
+        _ = sync_group(
+            &controller,
+            GROUP_ID,
+            join.generation_id,
+            &member_id,
+            &[assignment_of(&member_id)],
+        )
+        .await?;
 
-        let s = Wrapper::with_storage_group_detail(
-            storage,
-            GroupDetail {
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                state: GroupState::Forming {
-                    protocol_type: Some(PROTOCOL_TYPE.into()),
-                    protocol_name: Some(RANGE.into()),
-                    leader: None,
-                },
-                ..Default::default()
-            },
-        );
+        let before = generation_version(&storage, GROUP_ID).await?;
+        let updates = generation_updates.load(std::sync::atomic::Ordering::Relaxed);
+        let puts = member_puts.load(std::sync::atomic::Ordering::Relaxed);
 
-        let now = SystemTime::now();
+        let minted = join_group(&controller, GROUP_ID, "", &metadata).await?;
 
-        let first_member_range_meta = Bytes::from_static(b"first_member_range_meta_01");
-        let first_member_sticky_meta = Bytes::from_static(b"first_member_sticky_meta_01");
-
-        let second_member_range_meta = Bytes::from_static(b"second_member_range_meta_01");
-        let second_member_sticky_meta = Bytes::from_static(b"second_member_sticky_meta_01");
-
-        assert!(s.members().is_empty());
-        assert_eq!(None, s.leader());
-        assert_eq!(None, s.assignments());
-
-        let first_member_id = format!("{}-{}", CLIENT_ID, Uuid::new_v4());
-
-        let (s, _) = s
-            .join(
-                now,
-                Some(CLIENT_ID),
-                GROUP_ID,
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                first_member_id.as_str(),
-                group_instance_id,
-                PROTOCOL_TYPE,
-                Some(
-                    &[
-                        JoinGroupRequestProtocol::default()
-                            .name(RANGE.into())
-                            .metadata(first_member_range_meta.clone()),
-                        JoinGroupRequestProtocol::default()
-                            .name(COOPERATIVE_STICKY.into())
-                            .metadata(first_member_sticky_meta),
-                    ][..],
-                ),
-                reason,
-            )
-            .await;
-
-        assert_eq!(0, s.generation_id());
-        assert_eq!(1, s.members().len());
-        assert!(
-            s.members().contains(
-                &JoinGroupResponseMember::default()
-                    .member_id(first_member_id.clone())
-                    .group_instance_id(None)
-                    .metadata(first_member_range_meta.clone())
-            )
-        );
-        assert_eq!(Some(first_member_id.as_str()), s.leader());
-
-        let second_member_id = format!("{}-{}", CLIENT_ID, Uuid::new_v4());
-
-        let (s, _) = s
-            .join(
-                now,
-                Some(CLIENT_ID),
-                GROUP_ID,
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                second_member_id.as_str(),
-                group_instance_id,
-                PROTOCOL_TYPE,
-                Some(
-                    &[
-                        JoinGroupRequestProtocol::default()
-                            .name(RANGE.into())
-                            .metadata(second_member_range_meta.clone()),
-                        JoinGroupRequestProtocol::default()
-                            .name(COOPERATIVE_STICKY.into())
-                            .metadata(second_member_sticky_meta),
-                    ][..],
-                ),
-                reason,
-            )
-            .await;
-
-        assert_eq!(1, s.generation_id());
-        assert_eq!(2, s.members().len());
-        assert_eq!(None, s.assignments());
-
-        assert!(
-            s.members().contains(
-                &JoinGroupResponseMember::default()
-                    .member_id(first_member_id.clone())
-                    .group_instance_id(None)
-                    .metadata(first_member_range_meta.clone())
-            )
-        );
-
-        assert!(
-            s.members().contains(
-                &JoinGroupResponseMember::default()
-                    .member_id(second_member_id.clone())
-                    .group_instance_id(None)
-                    .metadata(second_member_range_meta.clone())
-            )
-        );
-
-        assert_eq!(Some(first_member_id.as_str()), s.leader());
-
-        let (s, _) = s
-            .sync(
-                now,
-                GROUP_ID,
-                1,
-                second_member_id.as_str(),
-                group_instance_id,
-                Some(PROTOCOL_TYPE),
-                Some(RANGE),
-                Some(&[]),
-            )
-            .await;
-
-        assert_eq!(1, s.generation_id());
-        assert_eq!(Some(first_member_id.as_str()), s.leader());
-        assert_eq!(Some(first_member_id.as_str()), s.leader());
-        assert_eq!(None, s.assignments());
-
-        let assignments = [SyncGroupRequestAssignment::default()
-            .member_id(first_member_id.clone())
-            .assignment(Bytes::from_static(b"first_assignment_01"))];
-
-        let (s, _) = s
-            .sync(
-                now,
-                GROUP_ID,
-                0,
-                first_member_id.as_str(),
-                group_instance_id,
-                Some(PROTOCOL_TYPE),
-                Some(RANGE),
-                Some(&assignments[..]),
-            )
-            .await;
-
-        assert_eq!(1, s.generation_id());
-        assert_eq!(Some(first_member_id.as_str()), s.leader());
-        assert_eq!(None, s.assignments());
-
-        let first_member_assignment = Bytes::from_static(b"first_assignment_02");
-        let second_member_assignment = Bytes::from_static(b"second_assignment_02");
-
-        let mut assignments = BTreeMap::new();
-        _ = assignments.insert(first_member_id.clone(), first_member_assignment.clone());
-        _ = assignments.insert(second_member_id.clone(), second_member_assignment.clone());
-
-        let (s, _) = s
-            .sync(
-                now,
-                GROUP_ID,
-                1,
-                first_member_id.as_str(),
-                group_instance_id,
-                Some(PROTOCOL_TYPE),
-                Some(RANGE),
-                Some(
-                    &assignments
-                        .iter()
-                        .map(|(member_id, assignment)| {
-                            SyncGroupRequestAssignment::default()
-                                .member_id(member_id.to_owned())
-                                .assignment(assignment.to_owned())
-                        })
-                        .collect::<Vec<_>>()[..],
-                ),
-            )
-            .await;
-
-        assert_eq!(1, s.generation_id());
-        assert_eq!(Some(first_member_id.as_str()), s.leader());
-        assert_eq!(Some(first_member_id.as_str()), s.leader());
+        assert_eq!(i16::from(ErrorCode::MemberIdRequired), minted.error_code);
+        assert!(minted.member_id.starts_with(CLIENT_ID));
+        assert_eq!(-1, minted.generation_id);
+        assert!(minted.leader.is_empty());
+        assert_eq!(Some(vec![]), minted.members);
 
         assert_eq!(
-            Some(first_member_assignment),
-            s.assignments()
-                .map(|assignments| assignments.get(first_member_id.as_str()).cloned())
-                .unwrap()
+            before,
+            generation_version(&storage, GROUP_ID).await?,
+            "a MemberIdRequired reply must not rewrite the generation"
+        );
+        assert_eq!(
+            updates,
+            generation_updates.load(std::sync::atomic::Ordering::Relaxed),
+            "a MemberIdRequired reply must not even attempt a generation write"
+        );
+        assert_eq!(
+            puts,
+            member_puts.load(std::sync::atomic::Ordering::Relaxed),
+            "a MemberIdRequired reply must not write a member document"
         );
 
+        // And the member it minted is not in the group.
         assert_eq!(
-            Some(second_member_assignment),
-            s.assignments()
-                .map(|assignments| assignments.get(second_member_id.as_str()).cloned())
-                .unwrap()
+            BTreeSet::from([member_id]),
+            generation_of(&storage, GROUP_ID)
+                .await?
+                .members
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>()
         );
 
         Ok(())
     }
 
-    /// Drive one consumer through the join/sync protocol against `controller`
-    /// until it holds a non-empty assignment, the way a Kafka client would:
-    /// first join (empty member id) → MemberIdRequired → re-join with the
-    /// generated id; the leader syncs an assignment covering every member of
-    /// its join response; RebalanceInProgress (or an empty assignment) means
-    /// re-join the next round.
-    async fn drive_member<O>(
-        controller: Controller<O>,
-        group_id: &'static str,
-        index: usize,
-    ) -> Result<(String, Bytes)>
-    where
-        O: Storage + Clone,
-    {
-        const SESSION_TIMEOUT_MS: i32 = 10_000;
-        const REBALANCE_TIMEOUT_MS: Option<i32> = Some(15_000);
+    /// The no-op poll, end to end. A member re-joining or re-syncing a settled
+    /// group must rewrite nothing: not the generation — whose etag is what the
+    /// leader's assignment write used to lose races on — and not its own
+    /// document, until its liveness is actually due.
+    #[tokio::test(start_paused = true)]
+    async fn a_noop_poll_writes_nothing_until_liveness_is_due() -> Result<()> {
+        let _guard = init_tracing()?;
 
-        let client_id = format!("member-{index:02}");
+        const GROUP_ID: &str = "noop-resync-group";
 
-        let metadata = Bytes::try_from(
-            &MemberMetadata::default().version(3).subscription(
-                ConsumerProtocolSubscription::default()
-                    .generation_id(Some(0))
-                    .owned_partitions(
-                        [TopicPartition::default().topic("t").partitions(0..3)].into_iter(),
-                    ),
-            ),
-        )?;
+        let storage = counted_storage().await?;
+        let generation_updates = storage.generation_updates_handle();
+        let member_puts = storage.member_puts_handle();
 
-        let protocols = [JoinGroupRequestProtocol::default()
-            .name(Assignor::RANGE.into())
-            .metadata(metadata)];
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+        let metadata = encode_subscription(&["t"], None);
 
-        let mut member_id = String::new();
+        let (member_id, join) = register(&controller, GROUP_ID, &metadata).await?;
 
-        loop {
-            let join = match controller
-                .join(
-                    Some(client_id.as_str()),
-                    group_id,
-                    SESSION_TIMEOUT_MS,
-                    REBALANCE_TIMEOUT_MS,
-                    member_id.as_str(),
-                    None,
-                    CONSUMER,
-                    Some(&protocols[..]),
-                    None,
-                )
-                .await?
-            {
-                Body::JoinGroupResponse(join) => join,
-                otherwise => panic!("{otherwise:?}"),
-            };
+        let sync = sync_group(
+            &controller,
+            GROUP_ID,
+            join.generation_id,
+            &member_id,
+            &[assignment_of(&member_id)],
+        )
+        .await?;
+        assert_eq!(i16::from(ErrorCode::None), sync.error_code);
 
-            if join.error_code == i16::from(ErrorCode::MemberIdRequired) {
-                member_id = join.member_id.clone();
-                continue;
-            }
+        let version = generation_version(&storage, GROUP_ID).await?;
+        let updates = generation_updates.load(std::sync::atomic::Ordering::Relaxed);
+        let puts = member_puts.load(std::sync::atomic::Ordering::Relaxed);
 
+        // A settled member polling: re-join, re-sync, heartbeat. None of it
+        // changes anything about the group, and the member was last heard from
+        // a moment ago.
+        for _ in 0..4 {
+            let join = join_group(&controller, GROUP_ID, &member_id, &metadata).await?;
             assert_eq!(i16::from(ErrorCode::None), join.error_code);
 
-            let assignments = if join.leader == join.member_id {
-                join.members
-                    .as_deref()
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|member| {
-                        SyncGroupRequestAssignment::default()
-                            .member_id(member.member_id.clone())
-                            .assignment(Bytes::from(format!("assignment-{}", member.member_id)))
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                Vec::new()
-            };
+            let sync = sync_group(
+                &controller,
+                GROUP_ID,
+                join.generation_id,
+                &member_id,
+                &[assignment_of(&member_id)],
+            )
+            .await?;
+            assert_eq!(i16::from(ErrorCode::None), sync.error_code);
 
-            let sync = match controller
-                .sync(
-                    group_id,
-                    join.generation_id,
-                    member_id.as_str(),
-                    None,
-                    Some(CONSUMER),
-                    Some(Assignor::RANGE),
-                    Some(&assignments[..]),
-                )
-                .await?
-            {
-                Body::SyncGroupResponse(sync) => sync,
-                otherwise => panic!("{otherwise:?}"),
-            };
-
-            if sync.error_code == i16::from(ErrorCode::None) && !sync.assignment.is_empty() {
-                return Ok((member_id, sync.assignment));
-            }
+            let beat = heartbeat(&controller, GROUP_ID, join.generation_id, &member_id).await?;
+            assert_eq!(i16::from(ErrorCode::None), beat.error_code);
         }
+
+        assert_eq!(
+            version,
+            generation_version(&storage, GROUP_ID).await?,
+            "a no-op poll must leave the generation's etag alone"
+        );
+        assert_eq!(
+            updates,
+            generation_updates.load(std::sync::atomic::Ordering::Relaxed),
+            "a no-op poll must not write the generation"
+        );
+        assert_eq!(
+            puts,
+            member_puts.load(std::sync::atomic::Ordering::Relaxed),
+            "a no-op poll must not renew liveness that is not due"
+        );
+
+        // Past half the session, one write — and one only, however many polls
+        // follow it. That cadence is the whole of what the old once-a-second
+        // `last_contact` churn was buying.
+        advance(Duration::from_millis(SESSION_TIMEOUT_MS as u64 / 2 + 1)).await;
+
+        let before = generation_of(&storage, GROUP_ID).await?;
+
+        for _ in 0..4 {
+            let beat = heartbeat(&controller, GROUP_ID, join.generation_id, &member_id).await?;
+            assert_eq!(i16::from(ErrorCode::None), beat.error_code);
+        }
+
+        assert_eq!(
+            puts + 1,
+            member_puts.load(std::sync::atomic::Ordering::Relaxed),
+            "liveness must be renewed once per session/2, not once per request"
+        );
+
+        // The sweep comes due on the same cadence, so the generation is written
+        // — once, by the first of these four heartbeats, and by that heartbeat
+        // on behalf of the *group* rather than the member. What must not change
+        // is the composition.
+        assert_eq!(
+            updates + 1,
+            generation_updates.load(std::sync::atomic::Ordering::Relaxed),
+            "only the sweep may write the generation in steady state"
+        );
+
+        let after = generation_of(&storage, GROUP_ID).await?;
+
+        assert_eq!(before.generation_id, after.generation_id);
+        assert_eq!(before.members, after.members);
+        assert_eq!(before.leader, after.leader);
+        assert!(
+            after.swept_at_ms > before.swept_at_ms,
+            "the write must be the sweep's stamp"
+        );
+
+        Ok(())
     }
 
-    // Two `Controller`s sharing one `memory://` store model two broker
-    // replicas behind a single load balancer: every join/sync races CAS
-    // updates of the same `{group}.json` object. This is the scenario that
-    // never converged before the join-window barrier — the leader's join
-    // returned as soon as its own CAS landed, it computed assignments for a
-    // partial member list, and everyone missing from that list parked at
-    // "stable" with zero partitions.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn multi_member_group_converges_across_replicas() -> Result<()> {
+    /// Two `Controller`s sharing one store model two broker replicas behind a
+    /// load balancer: every join and sync of the same group races the others.
+    #[tokio::test(start_paused = true)]
+    async fn a_multi_member_group_converges_across_replicas() -> Result<()> {
         let _guard = init_tracing()?;
 
         const GROUP_ID: &str = "convergence-group";
         const MEMBERS: usize = 8;
 
-        let storage = StorageContainer::builder()
-            .cluster_id("test")
-            .node_id(111)
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await?;
+        let storage = memory_storage().await?;
 
         let replicas = [
-            Controller::with_storage(storage.clone())?,
-            Controller::with_storage(storage.clone())?,
+            Controller::with_storage(storage.clone())?.with_now(paused_clock),
+            Controller::with_storage(storage.clone())?.with_now(paused_clock),
         ];
 
         let handles = (0..MEMBERS)
             .map(|index| {
                 let controller = replicas[index % replicas.len()].clone();
-                tokio::spawn(async move {
-                    tokio::time::timeout(
-                        Duration::from_secs(60),
-                        drive_member(controller, GROUP_ID, index),
-                    )
-                    .await
-                    .expect("member timed out before converging")
-                })
+                tokio::spawn(async move { drive_member(controller, GROUP_ID, index).await })
             })
             .collect::<Vec<_>>();
 
         let mut assigned = BTreeMap::new();
+
         for handle in handles {
             let (member_id, assignment) = handle.await.expect("member task panicked")?;
             assert!(!assignment.is_empty());
@@ -6244,611 +3301,760 @@ mod tests {
 
         assert_eq!(MEMBERS, assigned.len());
 
-        // The persisted group must be Formed with a non-empty assignment for
-        // every one of the members, at a generation that is now stable.
-        let (detail, version) = storage
-            .read_group(GROUP_ID)
+        // The persisted layout: the generation names exactly these members, and
+        // the assignment of that generation covers all of them.
+        let generation = generation_of(&storage, GROUP_ID).await?;
+        let member_ids = assigned.keys().cloned().collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            member_ids,
+            generation.members.keys().cloned().collect::<BTreeSet<_>>()
+        );
+
+        let assignment = storage
+            .read_group_assignment(GROUP_ID, generation.generation_id)
             .await?
-            .expect("group must be persisted");
-        let GroupState::Formed { assignments, .. } = detail.state else {
-            panic!("expected Formed, got {:?}", detail.state);
-        };
-        for member_id in assigned.keys() {
+            .expect("the generation must have an assignment");
+
+        assert_eq!(
+            member_ids,
+            assignment
+                .assignments
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        );
+
+        for member_id in &member_ids {
             assert!(
-                assignments
+                assignment
+                    .assignments
                     .get(member_id)
-                    .is_some_and(|assignment| !assignment.is_empty()),
-                "no assignment for {member_id}: {:?}",
-                assignments.keys().collect::<Vec<_>>()
+                    .is_some_and(|assigned| !assigned.is_empty()),
+                "no assignment for {member_id}"
             );
         }
 
-        let (again, version_again) = storage
-            .read_group(GROUP_ID)
-            .await?
-            .expect("group still persisted");
-        assert_eq!(detail.generation_id, again.generation_id);
-        assert_eq!(version, version_again);
+        // And it has settled: reading twice gives the same generation at the
+        // same version.
+        let version = generation_version(&storage, GROUP_ID).await?;
+        assert_eq!(generation, generation_of(&storage, GROUP_ID).await?);
+        assert_eq!(version, generation_version(&storage, GROUP_ID).await?);
 
         Ok(())
     }
 
-    // KIP-394 focused test: a first join with an empty member id replies
-    // MemberIdRequired and parks the generated id — it must not register a
-    // phantom member, bump the generation, or rewrite the persisted group.
-    #[tokio::test]
-    async fn member_id_required_join_leaves_persisted_group_unchanged() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let session_timeout_ms = 45_000;
-        let rebalance_timeout_ms = Some(300_000);
-        let group_instance_id = None;
-        let reason = None;
-
-        const CLIENT_ID: &str = "console-consumer";
-        const GROUP_ID: &str = "member-id-required-group";
-
-        let storage = StorageContainer::builder()
-            .cluster_id("test")
-            .node_id(111)
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await?;
-
-        let s = Controller::with_storage(storage.clone())?;
-
-        let range_meta = Bytes::try_from(
-            &MemberMetadata::default().version(3).subscription(
-                ConsumerProtocolSubscription::default()
-                    .generation_id(Some(0))
-                    .owned_partitions(
-                        [TopicPartition::default().topic("a").partitions(0..3)].into_iter(),
-                    ),
-            ),
-        )?;
-
-        let protocols = [JoinGroupRequestProtocol::default()
-            .name(Assignor::RANGE.into())
-            .metadata(range_meta.clone())];
-
-        // Establish a single-member Formed group.
-        let member_id = match s
-            .join(
-                Some(CLIENT_ID),
-                GROUP_ID,
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                "",
-                group_instance_id,
-                CONSUMER,
-                Some(&protocols[..]),
-                reason,
-            )
-            .await?
-        {
-            Body::JoinGroupResponse(JoinGroupResponse { member_id, .. }) => member_id,
-            otherwise => panic!("{otherwise:?}"),
-        };
-
-        let generation_id = match s
-            .join(
-                Some(CLIENT_ID),
-                GROUP_ID,
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                &member_id,
-                group_instance_id,
-                CONSUMER,
-                Some(&protocols[..]),
-                reason,
-            )
-            .await?
-        {
-            Body::JoinGroupResponse(JoinGroupResponse { generation_id, .. }) => generation_id,
-            otherwise => panic!("{otherwise:?}"),
-        };
-
-        let assignments = [SyncGroupRequestAssignment::default()
-            .member_id(member_id.clone())
-            .assignment(Bytes::from_static(b"assignment_01"))];
-
-        _ = s
-            .sync(
-                GROUP_ID,
-                generation_id,
-                &member_id,
-                group_instance_id,
-                Some(CONSUMER),
-                Some(Assignor::RANGE),
-                Some(&assignments[..]),
-            )
-            .await?;
-
-        let (before, v1) = storage
-            .read_group(GROUP_ID)
-            .await?
-            .expect("group must be persisted after sync");
-        assert!(matches!(before.state, GroupState::Formed { .. }));
-
-        // A second client's first join (empty member id) replies with a
-        // generated id but must leave the persisted group untouched.
-        match s
-            .join(
-                Some("other-client"),
-                GROUP_ID,
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                "",
-                group_instance_id,
-                CONSUMER,
-                Some(&protocols[..]),
-                reason,
-            )
-            .await?
-        {
-            Body::JoinGroupResponse(JoinGroupResponse {
-                error_code,
-                member_id,
-                ..
-            }) => {
-                assert_eq!(i16::from(ErrorCode::MemberIdRequired), error_code);
-                assert!(member_id.starts_with("other-client"));
-            }
-            otherwise => panic!("{otherwise:?}"),
-        }
-
-        let (after, v2) = storage
-            .read_group(GROUP_ID)
-            .await?
-            .expect("group still persisted");
-
-        assert_eq!(before.generation_id, after.generation_id);
-        assert_eq!(
-            before.members.keys().collect::<Vec<_>>(),
-            after.members.keys().collect::<Vec<_>>()
-        );
-        assert!(matches!(after.state, GroupState::Formed { .. }));
-        assert_eq!(
-            v1, v2,
-            "a MemberIdRequired reply must not rewrite the group object"
-        );
-
-        Ok(())
-    }
-
-    // A member of the current generation that is missing from the assignments
-    // map must be sent RebalanceInProgress so it re-joins — answering
-    // `error=None` with an empty assignment parks the client at "stable" with
-    // zero partitions.
-    #[tokio::test]
-    async fn sync_missing_from_assignments_is_rebalance_in_progress() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        const GROUP_ID: &str = "missing-assignment-group";
-        const RANGE: &str = "range";
-        const PROTOCOL_TYPE: &str = "consumer";
-
-        let now = SystemTime::now();
-
-        let storage = StorageContainer::builder()
-            .cluster_id("test")
-            .node_id(111)
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await?;
-
-        // Formed group where the assignments cover m1 but not m2.
-        let formed = GroupState::Formed {
-            protocol_type: PROTOCOL_TYPE.into(),
-            protocol_name: RANGE.into(),
-            leader: "m1".into(),
-            assignments: [("m1".to_owned(), Bytes::from_static(b"assignment-m1"))]
-                .into_iter()
-                .collect(),
-        };
-        let s = Wrapper::with_storage_group_detail(
-            storage.clone(),
-            group_detail_with(&[("m1", Some(now)), ("m2", Some(now))], formed, 5),
-        );
-
-        let (s, body) = s
-            .sync(
-                now,
-                GROUP_ID,
-                5,
-                "m2",
-                None,
-                Some(PROTOCOL_TYPE),
-                Some(RANGE),
-                Some(&[]),
-            )
-            .await;
-
-        match body {
-            Body::SyncGroupResponse(SyncGroupResponse {
-                error_code,
-                assignment,
-                ..
-            }) => {
-                assert_eq!(i16::from(ErrorCode::RebalanceInProgress), error_code);
-                assert!(assignment.is_empty());
-            }
-            otherwise => panic!("{otherwise:?}"),
-        }
-
-        // The group itself is untouched: still Formed at the same generation.
-        assert!(matches!(s, Wrapper::Formed(_)));
-        assert_eq!(5, s.generation_id());
-
-        // While Forming, a leader sync whose assignments miss the syncing
-        // member must not form the group either.
-        let forming = GroupState::Forming {
-            protocol_type: Some(PROTOCOL_TYPE.into()),
-            protocol_name: Some(RANGE.into()),
-            leader: Some("m1".into()),
-        };
-        let s = Wrapper::with_storage_group_detail(
-            storage,
-            group_detail_with(&[("m1", Some(now)), ("m2", Some(now))], forming, 6),
-        );
-
-        let assignments = [SyncGroupRequestAssignment::default()
-            .member_id("m2".into())
-            .assignment(Bytes::from_static(b"assignment-m2"))];
-
-        let (s, body) = s
-            .sync(
-                now,
-                GROUP_ID,
-                6,
-                "m1",
-                None,
-                Some(PROTOCOL_TYPE),
-                Some(RANGE),
-                Some(&assignments[..]),
-            )
-            .await;
-
-        match body {
-            Body::SyncGroupResponse(SyncGroupResponse {
-                error_code,
-                assignment,
-                ..
-            }) => {
-                assert_eq!(i16::from(ErrorCode::RebalanceInProgress), error_code);
-                assert!(assignment.is_empty());
-            }
-            otherwise => panic!("{otherwise:?}"),
-        }
-
-        assert!(s.is_forming());
-        assert_eq!(6, s.generation_id());
-
-        Ok(())
-    }
-
-    /// #240: the leader leaving a still-Forming group must not stay behind as
-    /// a phantom leader.
+    /// A request answers from the store and from nothing else.
     ///
-    /// `Formed::leave` re-checks the leader against the remaining members;
-    /// `Forming::leave` did not. A leader that left mid-rebalance (a
-    /// connector pod's graceful shutdown sends LeaveGroup) therefore kept
-    /// `state.leader = Some(departed)`: `join` never promoted anyone else,
-    /// every follower sync was refused as not-leader, no write ever happened,
-    /// and the group froze silently — until the owning broker restarted and
-    /// `with_storage_group_detail`'s fix-up cleared the orphan. Measured in
-    /// production as a 16-member group held in `CompletingRebalance` for
-    /// hours with zero broker log lines.
-    #[tokio::test]
-    async fn leave_of_leader_while_forming_clears_leader() -> Result<()> {
+    /// This is what replaces the eviction tests that pinned the per-group
+    /// `Wrapper` cache: there is no cache to evict, so the property worth
+    /// pinning is the one that made the cache deletable. Two `Controller`s that
+    /// have never seen this group answer a mid-lifecycle request identically to
+    /// each other and to the one that built it, with no warm-up.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_is_a_pure_function_of_the_store() -> Result<()> {
         let _guard = init_tracing()?;
 
-        const CLIENT_ID: &str = "console-consumer";
-        const GROUP_ID: &str = "leader-leaves-while-forming";
-        const RANGE: &str = "range";
-        const PROTOCOL_TYPE: &str = "consumer";
+        const GROUP_ID: &str = "pure-function-group";
 
-        let session_timeout_ms = 45_000;
-        let rebalance_timeout_ms = Some(300_000);
-        let group_instance_id = None;
-        let reason = None;
+        let storage = memory_storage().await?;
+        let built = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+        let metadata = encode_subscription(&["t"], None);
 
-        let storage = StorageContainer::builder()
-            .cluster_id("test")
-            .node_id(111)
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await?;
+        // Mid-lifecycle on purpose: members joined, a leader elected, no
+        // assignment distributed. That is the state the old typestate had to
+        // *maintain* across a cache miss, a GET-first read and a lost CAS.
+        let (leader_id, _) = register(&built, GROUP_ID, &metadata).await?;
+        let follower = encode_subscription(&["t", "u"], None);
+        let (follower_id, _) = register(&built, GROUP_ID, &follower).await?;
 
-        let s = Wrapper::with_storage_group_detail(
-            storage,
-            GroupDetail {
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                state: GroupState::Forming {
-                    protocol_type: Some(PROTOCOL_TYPE.into()),
-                    protocol_name: Some(RANGE.into()),
-                    leader: None,
-                },
-                ..Default::default()
-            },
+        assert_eq!(
+            ConsumerGroupState::CompletingRebalance,
+            built.read_view(GROUP_ID).await?.state()
         );
 
-        let now = SystemTime::now();
+        let generation_id = generation_of(&storage, GROUP_ID).await?.generation_id;
 
-        let leader_id = format!("{CLIENT_ID}-{}", Uuid::new_v4());
-        let follower_id = format!("{CLIENT_ID}-{}", Uuid::new_v4());
+        let fresh = || {
+            Controller::with_storage(storage.clone())
+                .expect("controller")
+                .with_now(paused_clock)
+        };
 
-        let protocols = [JoinGroupRequestProtocol::default()
-            .name(RANGE.into())
-            .metadata(Bytes::from_static(b"leader_meta"))];
+        // The leader's join carries the whole membership, which is the answer
+        // that used to come from the cached wrapper.
+        let a = join_group(&fresh(), GROUP_ID, &leader_id, &metadata).await?;
+        let b = join_group(&fresh(), GROUP_ID, &leader_id, &metadata).await?;
+        let c = join_group(&built, GROUP_ID, &leader_id, &metadata).await?;
 
-        let (s, _) = s
-            .join(
-                now,
-                Some(CLIENT_ID),
-                GROUP_ID,
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                leader_id.as_str(),
-                group_instance_id,
-                PROTOCOL_TYPE,
-                Some(&protocols[..]),
-                reason,
-            )
-            .await;
+        assert_eq!(a, b, "two fresh controllers must answer identically");
+        assert_eq!(a, c, "and identically to the one that built the group");
+        assert_eq!(2, a.members.as_deref().unwrap_or_default().len());
 
-        let follower_protocols = [JoinGroupRequestProtocol::default()
-            .name(RANGE.into())
-            .metadata(Bytes::from_static(b"follower_meta"))];
-
-        let (s, _) = s
-            .join(
-                now,
-                Some(CLIENT_ID),
-                GROUP_ID,
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                follower_id.as_str(),
-                group_instance_id,
-                PROTOCOL_TYPE,
-                Some(&follower_protocols[..]),
-                reason,
-            )
-            .await;
-
-        assert_eq!(Some(leader_id.as_str()), s.leader());
-        assert_eq!(2, s.members().len());
-
-        // The leader leaves while the group is still forming.
-        let (s, _) = s.leave(now, GROUP_ID, Some(leader_id.as_str()), None).await;
-
-        assert_eq!(1, s.members().len());
+        // As must a follower's sync, and a heartbeat.
         assert_eq!(
-            None,
-            s.leader(),
+            sync_group(&fresh(), GROUP_ID, generation_id, &follower_id, &[]).await?,
+            sync_group(&fresh(), GROUP_ID, generation_id, &follower_id, &[]).await?,
+        );
+
+        assert_eq!(
+            heartbeat(&fresh(), GROUP_ID, generation_id, &follower_id).await?,
+            heartbeat(&fresh(), GROUP_ID, generation_id, &follower_id).await?,
+        );
+
+        Ok(())
+    }
+
+    /// A generation is never reused — including across the group emptying.
+    ///
+    /// `assignment/{generation}` is create-only and immutable, so a reused
+    /// generation would adopt a dead generation's assignment: the members of
+    /// the new generation would be handed partitions computed for a set of
+    /// members that no longer exists, and the leader's create would silently
+    /// find the object already there and succeed.
+    #[tokio::test(start_paused = true)]
+    async fn a_generation_is_never_reused() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "monotonic-generation";
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+        let metadata = encode_subscription(&["t"], None);
+
+        let mut seen = Vec::new();
+
+        for _ in 0..3 {
+            let (member_id, join) = register(&controller, GROUP_ID, &metadata).await?;
+            seen.push(join.generation_id);
+
+            _ = sync_group(
+                &controller,
+                GROUP_ID,
+                join.generation_id,
+                &member_id,
+                &[assignment_of(&member_id)],
+            )
+            .await?;
+
+            let leave = leave_group(&controller, GROUP_ID, &member_id).await?;
+            assert_eq!(i16::from(ErrorCode::None), leave.error_code);
+
+            let generation = generation_of(&storage, GROUP_ID).await?;
+            assert!(generation.members.is_empty(), "the group must be empty");
+            assert_eq!(None, generation.leader, "and have no leader");
+
+            seen.push(generation.generation_id);
+        }
+
+        assert!(
+            seen.windows(2).all(|pair| pair[0] < pair[1]),
+            "generations must strictly increase across the group emptying: {seen:?}",
+        );
+
+        Ok(())
+    }
+
+    /// #240: a leader that leaves must not stay behind as a phantom.
+    ///
+    /// Left in place, `leader = Some(departed)` freezes the group: `join` never
+    /// promotes anyone else, every follower sync is refused as not-leader, no
+    /// write ever happens, and there is nothing to evict. Measured in
+    /// production as a 16-member group held in `CompletingRebalance` for hours
+    /// with zero broker log lines.
+    #[tokio::test(start_paused = true)]
+    async fn a_departed_leader_is_replaced_by_the_next_to_join() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "leader-leaves";
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+
+        let leader_meta = encode_subscription(&["t"], None);
+        let follower_meta = encode_subscription(&["t", "u"], None);
+
+        let (leader_id, _) = register(&controller, GROUP_ID, &leader_meta).await?;
+        let (follower_id, join) = register(&controller, GROUP_ID, &follower_meta).await?;
+
+        assert_eq!(leader_id, join.leader);
+        assert_eq!(2, generation_of(&storage, GROUP_ID).await?.members.len());
+
+        _ = leave_group(&controller, GROUP_ID, &leader_id).await?;
+
+        let generation = generation_of(&storage, GROUP_ID).await?;
+        assert_eq!(
+            BTreeSet::from([follower_id.clone()]),
+            generation.members.keys().cloned().collect::<BTreeSet<_>>()
+        );
+        assert_eq!(
+            None, generation.leader,
             "a departed leader must not remain elected"
         );
 
-        // The next join from the surviving member must promote it...
-        let (s, body) = s
-            .join(
-                now,
-                Some(CLIENT_ID),
-                GROUP_ID,
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                follower_id.as_str(),
-                group_instance_id,
-                PROTOCOL_TYPE,
-                Some(&follower_protocols[..]),
-                reason,
-            )
-            .await;
+        // The next join promotes the survivor ...
+        let join = join_group(&controller, GROUP_ID, &follower_id, &follower_meta).await?;
+        assert_eq!(i16::from(ErrorCode::None), join.error_code);
+        assert_eq!(follower_id, join.leader);
 
-        assert_eq!(Some(follower_id.as_str()), s.leader());
+        // ... and its assignment forms the group.
+        let sync = sync_group(
+            &controller,
+            GROUP_ID,
+            join.generation_id,
+            &follower_id,
+            &[assignment_of(&follower_id)],
+        )
+        .await?;
 
-        let Body::JoinGroupResponse(join_response) = body else {
-            panic!("expected a join response");
-        };
-        assert_eq!(i16::from(ErrorCode::None), join_response.error_code);
-        assert_eq!(follower_id, join_response.leader);
-
-        // ...and its assignment sync must form the group.
-        let generation_id = s.generation_id();
-        let assignments = [SyncGroupRequestAssignment::default()
-            .member_id(follower_id.clone())
-            .assignment(Bytes::from_static(b"assignment"))];
-
-        let (s, body) = s
-            .sync(
-                now,
-                GROUP_ID,
-                generation_id,
-                follower_id.as_str(),
-                group_instance_id,
-                Some(PROTOCOL_TYPE),
-                Some(RANGE),
-                Some(&assignments[..]),
-            )
-            .await;
-
-        let Body::SyncGroupResponse(sync_response) = body else {
-            panic!("expected a sync response");
-        };
-        assert_eq!(i16::from(ErrorCode::None), sync_response.error_code);
-        assert!(!s.is_forming());
+        assert_eq!(i16::from(ErrorCode::None), sync.error_code);
+        assert!(!controller.read_view(GROUP_ID).await?.is_forming());
 
         Ok(())
     }
 
-    /// #240: a persisted group can already carry an orphaned leader (written
-    /// before the `Forming::leave` fix-up existed, or by a replica still
-    /// running without it). A join must heal it — clear the orphan and
-    /// promote a live member — rather than keep answering "the leader is
-    /// someone else" to every live member forever.
-    #[tokio::test]
-    async fn join_heals_an_orphaned_leader() -> Result<()> {
+    /// #240: a persisted group can already carry a leader that is not a member
+    /// — written before the leave fix-up existed, or by a replica still running
+    /// without it. A join must heal it rather than keep answering "the leader
+    /// is someone else" to every live member forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_join_heals_an_orphaned_leader() -> Result<()> {
         let _guard = init_tracing()?;
 
-        const CLIENT_ID: &str = "console-consumer";
         const GROUP_ID: &str = "orphaned-leader-group";
-        const RANGE: &str = "range";
-        const PROTOCOL_TYPE: &str = "consumer";
 
-        let session_timeout_ms = 45_000;
-        let rebalance_timeout_ms = Some(300_000);
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+        let metadata = encode_subscription(&["t"], None);
 
-        let storage = StorageContainer::builder()
-            .cluster_id("test")
-            .node_id(111)
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await?;
+        let (member_id, _) = register(&controller, GROUP_ID, &metadata).await?;
 
-        let now = SystemTime::now();
-        let member_id = format!("{CLIENT_ID}-{}", Uuid::new_v4());
+        // Orphan the leader behind the coordinator's back, which is the shape a
+        // replica running the old code could leave behind.
+        let (generation, version) = storage
+            .read_group_generation(GROUP_ID)
+            .await?
+            .expect("generation");
 
-        // Built directly rather than through `with_storage_group_detail`,
-        // whose own fix-up would already clear the orphan: this is the shape
-        // an owner replica holds in memory after the departed leader was
-        // removed from `members` with `state.leader` left in place.
-        let s = Wrapper::Forming(Inner {
-            session_timeout_ms,
-            rebalance_timeout_ms,
-            members: BTreeMap::from([(
-                member_id.clone(),
-                Member {
-                    join_response: JoinGroupResponseMember::default()
-                        .member_id(member_id.clone())
-                        .metadata(Bytes::from_static(b"member_meta")),
-                    last_contact: Some(now),
-                },
-            )]),
-            generation_id: 7,
-            state: Forming {
-                protocol_type: Some(PROTOCOL_TYPE.into()),
-                protocol_name: Some(RANGE.into()),
-                leader: Some(format!("{CLIENT_ID}-{}", Uuid::new_v4())),
-            },
-            storage,
-            skip_assignment: Some(false),
-            inception: now,
-        });
-
-        let protocols = [JoinGroupRequestProtocol::default()
-            .name(RANGE.into())
-            .metadata(Bytes::from_static(b"member_meta"))];
-
-        let (s, body) = s
-            .join(
-                now,
-                Some(CLIENT_ID),
+        _ = storage
+            .update_group_generation(
                 GROUP_ID,
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                member_id.as_str(),
-                None,
-                PROTOCOL_TYPE,
-                Some(&protocols[..]),
-                None,
+                GenerationDoc {
+                    leader: Some(String::from("a-leader-that-left")),
+                    ..generation
+                },
+                Some(version),
             )
-            .await;
+            .await
+            .map_err(update_error)?;
 
+        let join = join_group(&controller, GROUP_ID, &member_id, &metadata).await?;
+
+        assert_eq!(i16::from(ErrorCode::None), join.error_code);
         assert_eq!(
-            Some(member_id.as_str()),
-            s.leader(),
+            member_id, join.leader,
             "the live member must be promoted over the orphan"
         );
-
-        let Body::JoinGroupResponse(join_response) = body else {
-            panic!("expected a join response");
-        };
-        assert_eq!(i16::from(ErrorCode::None), join_response.error_code);
-        assert_eq!(member_id, join_response.leader);
+        assert_eq!(
+            Some(member_id),
+            generation_of(&storage, GROUP_ID).await?.leader
+        );
 
         Ok(())
     }
 
-    async fn memory_storage() -> Result<Arc<Box<dyn Storage>>> {
-        StorageContainer::builder()
-            .cluster_id("test")
-            .node_id(111)
-            .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-            .storage(Url::parse("memory://")?)
-            .build()
+    /// A member of the current generation that the assignment does not cover
+    /// must be told to re-join, on both sides of the write: answering
+    /// `error=None` with an empty assignment reads to the client as a valid
+    /// empty assignment, and it then sits idle forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_sync_that_misses_the_syncing_member_is_a_rebalance() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "missing-assignment-group";
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+        let metadata = encode_subscription(&["t"], None);
+
+        let (leader_id, _) = register(&controller, GROUP_ID, &metadata).await?;
+        let follower_meta = encode_subscription(&["t", "u"], None);
+        let (follower_id, join) = register(&controller, GROUP_ID, &follower_meta).await?;
+
+        assert_eq!(leader_id, join.leader);
+        let generation_id = join.generation_id;
+
+        // The leader's assignment covers the follower but not itself: the group
+        // must not form on it.
+        let sync = sync_group(
+            &controller,
+            GROUP_ID,
+            generation_id,
+            &leader_id,
+            &[assignment_of(&follower_id)],
+        )
+        .await?;
+
+        assert_eq!(i16::from(ErrorCode::RebalanceInProgress), sync.error_code);
+        assert!(sync.assignment.is_empty());
+        assert_eq!(
+            None,
+            storage
+                .read_group_assignment(GROUP_ID, generation_id)
+                .await?,
+            "a refused sync must not have written an assignment"
+        );
+
+        // Now it covers itself but not the follower, so the group forms — and
+        // the follower is sent back to re-join rather than parked on nothing.
+        let sync = sync_group(
+            &controller,
+            GROUP_ID,
+            generation_id,
+            &leader_id,
+            &[assignment_of(&leader_id)],
+        )
+        .await?;
+        assert_eq!(i16::from(ErrorCode::None), sync.error_code);
+
+        let sync = sync_group(&controller, GROUP_ID, generation_id, &follower_id, &[]).await?;
+
+        assert_eq!(i16::from(ErrorCode::RebalanceInProgress), sync.error_code);
+        assert!(sync.assignment.is_empty());
+        assert_eq!(
+            generation_id,
+            generation_of(&storage, GROUP_ID).await?.generation_id,
+            "a refused sync must not move the generation"
+        );
+
+        Ok(())
+    }
+
+    /// The leader's assignment is create-only, so a leader retrying its own
+    /// sync — which is what a lost response or a re-drive looks like — must
+    /// adopt what is stored rather than fail or overwrite it.
+    #[tokio::test(start_paused = true)]
+    async fn a_leader_retrying_its_sync_adopts_what_is_stored() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "retried-sync";
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+        let metadata = encode_subscription(&["t"], None);
+
+        let (member_id, join) = register(&controller, GROUP_ID, &metadata).await?;
+
+        let first = sync_group(
+            &controller,
+            GROUP_ID,
+            join.generation_id,
+            &member_id,
+            &[assignment_of(&member_id)],
+        )
+        .await?;
+        assert_eq!(i16::from(ErrorCode::None), first.error_code);
+
+        // The same leader, same generation, a *different* assignment. The
+        // stored one wins: it is what every other member has already been
+        // handed, and two members holding assignments from different rounds of
+        // the same generation is the overlap the protocol exists to prevent.
+        let retried = sync_group(
+            &controller,
+            GROUP_ID,
+            join.generation_id,
+            &member_id,
+            &[SyncGroupRequestAssignment::default()
+                .member_id(member_id.clone())
+                .assignment(Bytes::from_static(b"a-different-assignment"))],
+        )
+        .await?;
+
+        assert_eq!(i16::from(ErrorCode::None), retried.error_code);
+        assert_eq!(first.assignment, retried.assignment);
+
+        Ok(())
+    }
+
+    /// The dead-member sweep, which replaces `missed_heartbeat`: a member that
+    /// stops making requests is evicted, the generation moves on, and its
+    /// document is reclaimed.
+    ///
+    /// Seeded rather than driven, so the only clock in the test is the one the
+    /// sweep reads. Driving it through joins would make the verdict depend on
+    /// how long a follower's long-poll happened to hold, which is a property of
+    /// the join window and not of the sweep.
+    #[tokio::test(start_paused = true)]
+    async fn a_lapsed_member_is_swept_and_the_generation_moves_on() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "swept-group";
+        const LEADER: &str = "m-1";
+        const LAPSED: &str = "m-2";
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+
+        let now_ms = epoch_ms(paused_clock());
+        let session = i64::from(SESSION_TIMEOUT_MS);
+
+        let member = |member_id: &str, last_contact_ms: i64| MemberDoc {
+            last_contact_ms,
+            session_timeout_ms: SESSION_TIMEOUT_MS,
+            rebalance_timeout_ms: REBALANCE_TIMEOUT_MS,
+            join_response: JoinGroupResponseMember::default()
+                .member_id(member_id.to_owned())
+                .metadata(encode_subscription(&["t"], None)),
+            ..Default::default()
+        };
+
+        for (member_id, last_contact_ms) in [(LEADER, now_ms), (LAPSED, now_ms - session - 1)] {
+            _ = storage
+                .write_group_member(
+                    GROUP_ID,
+                    member_id,
+                    member(member_id, last_contact_ms),
+                    None,
+                )
+                .await
+                .map_err(update_error)?;
+        }
+
+        // Swept a full session ago, so the next request runs one.
+        _ = storage
+            .update_group_generation(
+                GROUP_ID,
+                GenerationDoc {
+                    generation_id: 7,
+                    protocol_type: Some(CONSUMER.into()),
+                    protocol_name: Some(RANGE.into()),
+                    leader: Some(LEADER.into()),
+                    members: BTreeMap::from([
+                        (LEADER.to_owned(), MemberRef::default()),
+                        (LAPSED.to_owned(), MemberRef::default()),
+                    ]),
+                    members_changed_at_ms: now_ms - session,
+                    state_since_ms: now_ms - session,
+                    swept_at_ms: now_ms - session,
+                    session_timeout_ms: SESSION_TIMEOUT_MS,
+                    rebalance_timeout_ms: REBALANCE_TIMEOUT_MS,
+                    inception_ms: now_ms - session,
+                    ..Default::default()
+                },
+                None,
+            )
             .await
-            .map_err(Into::into)
+            .map_err(update_error)?;
+
+        let beat = heartbeat(&controller, GROUP_ID, 7, LEADER).await?;
+
+        // The sweep evicted the lapsed member before this heartbeat was
+        // answered, so the surviving member's own generation is now behind.
+        assert_eq!(i16::from(ErrorCode::RebalanceInProgress), beat.error_code);
+
+        let generation = generation_of(&storage, GROUP_ID).await?;
+
+        assert_eq!(
+            BTreeSet::from([LEADER.to_owned()]),
+            generation.members.keys().cloned().collect::<BTreeSet<_>>(),
+            "the lapsed member must be evicted"
+        );
+        assert!(
+            generation.generation_id > 7,
+            "an eviction is a rebalance, so the generation must move on"
+        );
+        assert_eq!(
+            None, generation.leader,
+            "the leader is re-elected by the first member to join"
+        );
+        assert_eq!(
+            None,
+            storage.read_group_member(GROUP_ID, LAPSED).await?,
+            "the evicted member's document must be reclaimed"
+        );
+        assert!(
+            storage.read_group_member(GROUP_ID, LEADER).await?.is_some(),
+            "a live member's document must be left alone"
+        );
+
+        // The survivor rejoins and takes the group on.
+        let join = join_group(
+            &controller,
+            GROUP_ID,
+            LEADER,
+            &encode_subscription(&["t"], None),
+        )
+        .await?;
+
+        assert_eq!(i16::from(ErrorCode::None), join.error_code);
+        assert_eq!(LEADER, join.leader);
+
+        Ok(())
+    }
+
+    /// A member the generation names but whose document has gone is a lapsed
+    /// session, not a member that has yet to arrive: the document is written
+    /// *before* the generation admits the member, so its absence can only mean
+    /// it was reclaimed.
+    #[tokio::test(start_paused = true)]
+    async fn a_member_with_no_document_is_swept() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "orphan-membership";
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+        let metadata = encode_subscription(&["t"], None);
+
+        let (member_id, join) = register(&controller, GROUP_ID, &metadata).await?;
+
+        _ = sync_group(
+            &controller,
+            GROUP_ID,
+            join.generation_id,
+            &member_id,
+            &[assignment_of(&member_id)],
+        )
+        .await?;
+
+        // Behind the coordinator's back, as a partial `delete_groups` or a
+        // half-finished leave would leave it.
+        storage.delete_group_member(GROUP_ID, &member_id).await?;
+
+        let (generation, version) = storage
+            .read_group_generation(GROUP_ID)
+            .await?
+            .expect("generation");
+
+        _ = storage
+            .update_group_generation(
+                GROUP_ID,
+                GenerationDoc {
+                    swept_at_ms: generation.swept_at_ms - i64::from(SESSION_TIMEOUT_MS),
+                    ..generation
+                },
+                Some(version),
+            )
+            .await
+            .map_err(update_error)?;
+
+        let beat = heartbeat(&controller, GROUP_ID, join.generation_id, &member_id).await?;
+
+        assert_eq!(i16::from(ErrorCode::UnknownMemberId), beat.error_code);
+        assert!(
+            generation_of(&storage, GROUP_ID).await?.members.is_empty(),
+            "a membership with no document must be reclaimed"
+        );
+
+        Ok(())
+    }
+
+    /// The sweep costs one write per group per session/2 across the fleet, not
+    /// one per replica: its verdict is a pure function of the documents and the
+    /// clock, and `swept_at_ms` is what stops every replica repeating it.
+    #[tokio::test(start_paused = true)]
+    async fn a_sweep_is_deduped_across_replicas() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "deduped-sweep";
+        const REPLICAS: usize = 4;
+
+        let storage = counted_storage().await?;
+        let generation_updates = storage.generation_updates_handle();
+
+        let replicas = (0..REPLICAS)
+            .map(|_| {
+                Controller::with_storage(storage.clone())
+                    .expect("controller")
+                    .with_now(paused_clock)
+            })
+            .collect::<Vec<_>>();
+
+        let metadata = encode_subscription(&["t"], None);
+        let (member_id, join) = register(&replicas[0], GROUP_ID, &metadata).await?;
+
+        _ = sync_group(
+            &replicas[0],
+            GROUP_ID,
+            join.generation_id,
+            &member_id,
+            &[assignment_of(&member_id)],
+        )
+        .await?;
+
+        // Past the sweep interval, with nobody to evict: the group's own stamp
+        // is what makes this one write rather than four.
+        advance(Duration::from_millis(SESSION_TIMEOUT_MS as u64 / 2 + 1)).await;
+
+        let before = generation_updates.load(std::sync::atomic::Ordering::Relaxed);
+
+        for replica in &replicas {
+            let beat = heartbeat(replica, GROUP_ID, join.generation_id, &member_id).await?;
+            assert_eq!(i16::from(ErrorCode::None), beat.error_code);
+        }
+
+        assert_eq!(
+            before + 1,
+            generation_updates.load(std::sync::atomic::Ordering::Relaxed),
+            "{REPLICAS} replicas serving one group must cost one sweep between them",
+        );
+
+        Ok(())
+    }
+
+    /// Kafka's fencing rules on the commit path (#359), which this broker did
+    /// not apply at all: a commit claiming a generation the group has left, or
+    /// naming a member the group does not know, is a zombie and must be
+    /// refused. **Behaviour change** — a commit that used to be accepted now
+    /// fails.
+    #[tokio::test(start_paused = true)]
+    async fn a_zombie_commit_is_fenced() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "fenced-commits";
+        const TOPIC: &str = "t";
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+        let metadata = encode_subscription(&[TOPIC], None);
+
+        let (member_id, join) = register(&controller, GROUP_ID, &metadata).await?;
+
+        let commit = |generation_id: Option<i32>, member_id: Option<String>| {
+            let controller = controller.clone();
+
+            async move {
+                let topics = [OffsetCommitRequestTopic::default()
+                    .name(TOPIC.into())
+                    .partitions(Some(vec![
+                        OffsetCommitRequestPartition::default()
+                            .partition_index(0)
+                            .committed_offset(1)
+                            .committed_leader_epoch(Some(0))
+                            .commit_timestamp(None)
+                            .committed_metadata(Some("".into())),
+                    ]))];
+
+                let body = controller
+                    .offset_commit(OffsetCommit {
+                        group_id: GROUP_ID,
+                        generation_id_or_member_epoch: generation_id,
+                        member_id: member_id.as_deref(),
+                        group_instance_id: None,
+                        retention_time_ms: None,
+                        topics: Some(&topics[..]),
+                    })
+                    .await?;
+
+                let Body::OffsetCommitResponse(response) = body else {
+                    panic!("{body:?}");
+                };
+
+                Ok::<_, Error>(
+                    response
+                        .topics
+                        .and_then(|topics| {
+                            topics.first().and_then(|topic| {
+                                topic
+                                    .partitions
+                                    .as_ref()
+                                    .and_then(|partitions| partitions.first().cloned())
+                            })
+                        })
+                        .map(|partition| partition.error_code)
+                        .expect("a partition response"),
+                )
+            }
+        };
+
+        // A member of the current generation commits.
+        assert_ne!(
+            i16::from(ErrorCode::UnknownMemberId),
+            commit(Some(join.generation_id), Some(member_id.clone())).await?,
+        );
+
+        // A generation the group has left.
+        assert_eq!(
+            i16::from(ErrorCode::IllegalGeneration),
+            commit(Some(join.generation_id + 1), Some(member_id.clone())).await?,
+            "a commit from a stale generation must be fenced",
+        );
+
+        // A member the group does not know.
+        assert_eq!(
+            i16::from(ErrorCode::UnknownMemberId),
+            commit(Some(join.generation_id), Some(String::from("a-stranger"))).await?,
+            "a commit from an unknown member must be fenced",
+        );
+
+        // The simple consumer, which manages its own offsets: Kafka's own
+        // escape, and the reason this cannot simply reject everything it does
+        // not recognise.
+        assert_ne!(
+            i16::from(ErrorCode::UnknownMemberId),
+            commit(Some(-1), None).await?,
+            "a simple consumer's commit must not be fenced",
+        );
+
+        // ... and it must read nothing about a group that does not exist.
+        assert_ne!(
+            i16::from(ErrorCode::UnknownMemberId),
+            commit(Some(-1), None).await?,
+        );
+
+        Ok(())
     }
 
     /// Every per-group map entry this controller holds, as
-    /// `(wrappers, group_locks, rebalance_stalls, last_seen)`.
-    fn cached<O>(controller: &Controller<O>) -> (usize, usize, usize, usize) {
+    /// `(generation_locks, rebalance_stalls, last_seen)`.
+    fn cached<O>(controller: &Controller<O>) -> (usize, usize, usize) {
         (
-            controller.wrappers.lock().unwrap().len(),
-            controller.group_locks.lock().unwrap().len(),
+            controller.generation_locks.lock().unwrap().len(),
             controller.rebalance_stalls.lock().unwrap().len(),
             controller.last_seen.lock().unwrap().len(),
         )
     }
 
-    /// #283: none of the four per-group maps had a removal path — not even when
-    /// the group was deleted from the object store — so a group-per-restart or
+    /// #283: none of the per-group maps had a removal path — not even when the
+    /// group was deleted from the object store — so a group-per-restart or
     /// group-per-subscription naming pattern grew them for the life of the pod.
-    /// `wrappers` is the expensive one: it holds each group's full
-    /// member-metadata byte blobs.
     ///
     /// Written against the *level*: the failure is monotonic growth, so what has
     /// to hold is that churning many uniquely-named groups returns to zero rather
     /// than climbing. A zero idle window makes every group a candidate on the
     /// sweep after it, which is what keeps this deterministic instead of timed.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn group_churn_with_fresh_names_reaches_a_flat_steady_state() -> Result<()> {
         let _guard = init_tracing()?;
 
         let storage = memory_storage().await?;
-        let s = Controller::with_storage(storage)?.with_idle_after(Duration::ZERO);
+        let controller = Controller::with_storage(storage)?
+            .with_now(paused_clock)
+            .with_idle_after(Duration::ZERO);
 
         const ROUNDS: usize = 16;
-        const RANGE: &str = "range";
-        const PROTOCOL_TYPE: &str = "consumer";
 
-        let protocols = [JoinGroupRequestProtocol::default()
-            .name(RANGE.into())
-            .metadata(encode_subscription(&["test"], None))];
+        let metadata = encode_subscription(&["t"], None);
 
         for round in 0..ROUNDS {
             // A fresh name every round: a same-named re-join would reuse the
             // entries rather than add to them, so it would not show the growth.
             let group_id = format!("churn-{round}");
 
-            _ = s
-                .join(
-                    Some("a-consumer"),
-                    &group_id,
-                    45_000,
-                    Some(300_000),
-                    "",
-                    None,
-                    PROTOCOL_TYPE,
-                    Some(&protocols[..]),
-                    None,
-                )
-                .await?;
+            _ = join_group(&controller, &group_id, "", &metadata).await?;
 
             // The group is known now — otherwise the sweep below would be
             // asserting that nothing evicts nothing.
-            let (wrappers, locks, _, last_seen) = cached(&s);
-            assert_eq!(1, wrappers, "wrappers, round {round}");
-            assert_eq!(1, locks, "group_locks, round {round}");
+            let (locks, _, last_seen) = cached(&controller);
+            assert_eq!(1, locks, "generation_locks, round {round}");
             assert_eq!(1, last_seen, "last_seen, round {round}");
 
-            assert_eq!(1, s.prune(), "round {round}");
-            assert_eq!((0, 0, 0, 0), cached(&s), "not flat after round {round}");
+            assert_eq!(1, controller.prune(), "round {round}");
+            assert_eq!(
+                (0, 0, 0),
+                cached(&controller),
+                "not flat after round {round}"
+            );
         }
 
         Ok(())
@@ -6858,28 +4064,25 @@ mod tests {
     ///
     /// Dropping it does not free anything — it means the *next* request for that
     /// group creates a second lock, and two members then run their read->CAS
-    /// windows concurrently against one `{group}.json`, which is the CAS thrash
-    /// [`GroupLocks`] exists to prevent (#240). The `Arc` count is the guard, and
-    /// it is also what makes the sweep leak-free: a request that has checked its
-    /// wrapper out of `wrappers` and not yet put it back is invisible to a sweep
-    /// keyed on the map's contents, so its stamp must survive too or the
-    /// re-inserted entry would never be a candidate again.
-    #[tokio::test]
+    /// windows concurrently. The `Arc` count is the guard, and it is also what
+    /// makes the sweep leak-free: a request's touch stamp must survive with it,
+    /// or the entry it re-creates would never be a candidate again.
+    #[tokio::test(start_paused = true)]
     async fn a_group_being_served_is_not_evicted() -> Result<()> {
         let _guard = init_tracing()?;
 
         let storage = memory_storage().await?;
-        let s = Controller::with_storage(storage)?.with_idle_after(Duration::ZERO);
+        let controller = Controller::with_storage(storage)?.with_idle_after(Duration::ZERO);
 
         const GROUP_ID: &str = "in-flight";
 
         // Stand in for a request in flight: `group_lock` is what every path calls
         // first, and holding its `Arc` is exactly the state a live request is in.
-        let held = s.group_lock(GROUP_ID);
+        let held = controller.group_lock(GROUP_ID);
 
-        assert_eq!(0, s.prune());
+        assert_eq!(0, controller.prune());
 
-        let (_, locks, _, last_seen) = cached(&s);
+        let (locks, _, last_seen) = cached(&controller);
         assert_eq!(1, locks, "the held lock must survive");
         assert_eq!(
             1, last_seen,
@@ -6889,99 +4092,26 @@ mod tests {
         // Request over.
         drop(held);
 
-        assert_eq!(1, s.prune());
-        assert_eq!((0, 0, 0, 0), cached(&s));
+        assert_eq!(1, controller.prune());
+        assert_eq!((0, 0, 0), cached(&controller));
 
         Ok(())
     }
 
     /// #283: a group served within the idle window keeps its state — the sweep
-    /// bounds growth, it does not throw away the cache it exists to be.
-    #[tokio::test]
+    /// bounds growth, it does not throw away what it exists to bound.
+    #[tokio::test(start_paused = true)]
     async fn a_recently_served_group_is_kept() -> Result<()> {
         let _guard = init_tracing()?;
 
         let storage = memory_storage().await?;
-        let s = Controller::with_storage(storage)?.with_idle_after(Duration::from_secs(3_600));
+        let controller =
+            Controller::with_storage(storage)?.with_idle_after(Duration::from_secs(3_600));
 
-        _ = s.group_lock("recent");
+        _ = controller.group_lock("recent");
 
-        assert_eq!(0, s.prune());
-        assert_eq!(1, cached(&s).1, "group_locks");
-
-        Ok(())
-    }
-
-    /// #283: an evicted group is a cache miss and nothing more.
-    ///
-    /// Every request path reads `{group}.json` GET-first and adopts the persisted
-    /// state whenever its cached version differs — and a freshly created wrapper
-    /// has no version, so it always adopts. `inception` is persisted in
-    /// `GroupDetail`, so it survives too. This drives a group to a generation,
-    /// evicts it, and re-joins: the coordinator must answer from the object store
-    /// as if it had never forgotten.
-    #[tokio::test]
-    async fn an_evicted_group_is_rebuilt_from_the_object_store() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let storage = memory_storage().await?;
-        let s = Controller::with_storage(storage.clone())?.with_idle_after(Duration::ZERO);
-
-        const GROUP_ID: &str = "rebuilt";
-        const RANGE: &str = "range";
-        const PROTOCOL_TYPE: &str = "consumer";
-
-        let protocols = [JoinGroupRequestProtocol::default()
-            .name(RANGE.into())
-            .metadata(encode_subscription(&["test"], None))];
-
-        let join = async || {
-            s.join(
-                Some("a-consumer"),
-                GROUP_ID,
-                45_000,
-                Some(300_000),
-                "",
-                None,
-                PROTOCOL_TYPE,
-                Some(&protocols[..]),
-                None,
-            )
-            .await
-        };
-
-        let Body::JoinGroupResponse(before) = join().await? else {
-            panic!("expected a join response");
-        };
-
-        let persisted = storage
-            .read_group(GROUP_ID)
-            .await?
-            .map(|(detail, _)| detail)
-            .expect("the group must be persisted");
-
-        assert_eq!(1, s.prune());
-        assert_eq!((0, 0, 0, 0), cached(&s));
-
-        let Body::JoinGroupResponse(after) = join().await? else {
-            panic!("expected a join response");
-        };
-
-        // Same generation and same leader as before the eviction: the state came
-        // back from the object, it was not re-formed from nothing.
-        assert_eq!(before.generation_id, after.generation_id);
-        assert_eq!(before.leader, after.leader);
-
-        // `inception` is the one field a fresh `Inner` would invent rather than
-        // recompute, so it is the one worth pinning.
-        assert_eq!(
-            persisted.inception,
-            storage
-                .read_group(GROUP_ID)
-                .await?
-                .map(|(detail, _)| detail.inception)
-                .expect("the group must still be persisted"),
-        );
+        assert_eq!(0, controller.prune());
+        assert_eq!(1, cached(&controller).0, "generation_locks");
 
         Ok(())
     }

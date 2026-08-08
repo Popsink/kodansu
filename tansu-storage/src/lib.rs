@@ -145,7 +145,10 @@ mod latency;
 mod null;
 mod service;
 
-pub use group::{AssignmentDoc, AssignmentOutcome, GenerationDoc, MemberDoc, MemberRef};
+pub use group::{
+    AssignmentDoc, AssignmentOutcome, GROUP_SCHEMA_VERSION, GenerationDoc, GroupSchema, MemberDoc,
+    MemberRef,
+};
 
 pub use latency::LatencyIntroducingStorage;
 
@@ -1509,6 +1512,17 @@ pub trait Storage: Debug + Send + Sync + 'static {
         generation_id: i32,
     ) -> Result<u64>;
 
+    /// Assert that the group layout this binary writes is the one the cluster
+    /// already holds, claiming it when the cluster holds none (#359).
+    ///
+    /// Absent means a cluster that has never run a binary that cares, so the
+    /// version is claimed with a create-only write — two replicas starting
+    /// together race on the key and the loser reads what the winner claimed.
+    /// A different version is a refusal to start: see [`GroupSchema`] for why
+    /// a converter would be all cost and no benefit, and why a mixed fleet is
+    /// the hazard worth a guard rail.
+    async fn assert_group_schema(&self) -> Result<()>;
+
     /// Initialise a transactional or idempotent producer in this storage.
     async fn init_producer(
         &self,
@@ -1839,6 +1853,10 @@ where
         self.as_ref()
             .delete_group_assignments_before(group_id, generation_id)
             .await
+    }
+
+    async fn assert_group_schema(&self) -> Result<()> {
+        self.as_ref().assert_group_schema().await
     }
 
     async fn init_producer(
@@ -2190,6 +2208,10 @@ where
         self.as_ref()
             .delete_group_assignments_before(group_id, generation_id)
             .await
+    }
+
+    async fn assert_group_schema(&self) -> Result<()> {
+        self.as_ref().assert_group_schema().await
     }
 
     async fn init_producer(

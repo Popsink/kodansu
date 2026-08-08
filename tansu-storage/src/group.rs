@@ -252,6 +252,28 @@ pub struct AssignmentDoc {
     pub assigned_at_ms: i64,
 }
 
+/// The group layout a cluster's objects are in, `schema/groups.json`.
+///
+/// An **assertion, never a converter** (#359). The decomposition is deployed by
+/// quiescing the old ReplicaSet and starting the new one — group state is soft
+/// state about live members, and after a quiesce there are none, so there is
+/// nothing to migrate. What there *is* to prevent is a mixed fleet: an old pod
+/// drives `{group}.json` while a new one drives `{group}/generation.json`, two
+/// disjoint views of the same group hand the same partitions out twice, and
+/// both sides commit to the same per-partition offset objects.
+///
+/// This object cannot remove that hazard — an old binary never reads it — but
+/// it makes the half-migrated state impossible to be *confused* about at 3am: a
+/// binary that writes a layout the cluster does not hold refuses to start
+/// rather than writing into it.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GroupSchema {
+    pub version: u32,
+}
+
+/// The layout this binary writes: the decomposed objects above.
+pub const GROUP_SCHEMA_VERSION: u32 = 2;
+
 /// What a create-only write of `assignment/{generation_id}` did.
 ///
 /// `AlreadyExists` is not an error: one leader per generation is guaranteed by

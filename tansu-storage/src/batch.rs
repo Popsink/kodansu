@@ -503,6 +503,10 @@ where
         self.storage.list_group_members(group_id).await
     }
 
+    async fn assert_group_schema(&self) -> Result<()> {
+        self.storage.assert_group_schema().await
+    }
+
     async fn read_group_generation(
         &self,
         group_id: &str,
@@ -1024,6 +1028,10 @@ mod tests {
             &self,
             _group_id: &str,
         ) -> Result<BTreeMap<String, (MemberDoc, Version)>> {
+            unimplemented!()
+        }
+
+        async fn assert_group_schema(&self) -> Result<()> {
             unimplemented!()
         }
 
@@ -1678,6 +1686,12 @@ mod wrapper_parity {
             wrapped.read_group_assignment(group, 7).await?,
             "read_group_assignment diverges through the wrapper",
         );
+
+        // The startup assertion. A wrapper that swallowed it would let a
+        // binary start against a cluster in a layout it does not write, which
+        // is the one thing this object exists to stop.
+        bare.assert_group_schema().await?;
+        wrapped.assert_group_schema().await?;
 
         Ok(())
     }

@@ -984,6 +984,11 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
+    #[instrument(skip_all)]
+    async fn assert_group_schema(&self) -> tansu_storage::Result<()> {
+        unimplemented!()
+    }
+
     async fn read_group_generation(
         &self,
         _group_id: &str,
