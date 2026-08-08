@@ -41,6 +41,40 @@ mod segment;
 mod segment_create;
 mod topic_churn;
 
+/// Write a legacy `{group}.json` — the single group object the #359 cutover
+/// left behind.
+///
+/// Through the bucket, because the storage trait no longer has a method for it:
+/// nothing writes this object any more, and what these tests are about is what
+/// happens to one that is already there. Seeding it through an API that no
+/// longer exists would have meant keeping the API for the tests.
+pub(crate) async fn seed_legacy_group(
+    bucket: &InMemory,
+    cluster: &str,
+    group_id: &str,
+) -> Result<()> {
+    _ = bucket
+        .put(
+            &Path::from(format!(
+                "clusters/{cluster}/groups/consumers/{group_id}.json"
+            )),
+            PutPayload::from(serde_json::to_vec(&crate::GroupDetail::default())?),
+        )
+        .await?;
+
+    Ok(())
+}
+
+/// Whether a legacy `{group}.json` is still there.
+pub(crate) async fn legacy_group_exists(bucket: &InMemory, cluster: &str, group_id: &str) -> bool {
+    bucket
+        .get(&Path::from(format!(
+            "clusters/{cluster}/groups/consumers/{group_id}.json"
+        )))
+        .await
+        .is_ok()
+}
+
 pub(crate) fn init_tracing() -> Result<DefaultGuard, Error> {
     _ = dotenv().ok();
 

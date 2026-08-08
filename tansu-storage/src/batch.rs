@@ -48,10 +48,10 @@ use uuid::Uuid;
 
 use crate::{
     AssignmentDoc, AssignmentOutcome, AutoTopicCreate, BrokerRegistrationRequest, Error,
-    GenerationDoc, GroupDetail, ListOffsetResponse, METER, MemberDoc, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
-    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, UpdateError, Version,
+    GenerationDoc, ListOffsetResponse, METER, MemberDoc, MetadataResponse, NamedGroupDetail,
+    OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    UpdateError, Version,
 };
 
 static BATCH_REQUESTS_LENGTH: LazyLock<Gauge<u64>> =
@@ -449,13 +449,13 @@ where
         self.storage.offset_stage(topition).await
     }
 
-    /// Delegated explicitly (#273). Both of these have default bodies on
-    /// `Storage`, and this wrapper is applied **unconditionally** in the `s3` and
-    /// `gs` builder arms — so the defaults silently absorbed them in every
-    /// object-store deployment: `offset_stage_at` fell back to `offset_stage`
-    /// and its `meta.json` read, defeating #109, while `read_group` always
-    /// answered `None`, so #111's GET-first gate never opened. Both shipped and
-    /// neither ran.
+    /// Delegated explicitly (#273). This has a default body on `Storage`, and
+    /// this wrapper is applied **unconditionally** in the `s3` and `gs` builder
+    /// arms — so the default silently absorbed it in every object-store
+    /// deployment: `offset_stage_at` fell back to `offset_stage` and its
+    /// `meta.json` read, defeating #109. It shipped and it never ran. The
+    /// legacy `read_group` was the other half of that, and went with the object
+    /// it read (#359).
     ///
     /// The `memory://` arm is not wrapped, which is why the suite could not see
     /// it: in-memory tests exercised the optimised paths that production never
@@ -466,10 +466,6 @@ where
         isolation: IsolationLevel,
     ) -> Result<OffsetStage> {
         self.storage.offset_stage_at(topition, isolation).await
-    }
-
-    async fn read_group(&self, group_id: &str) -> Result<Option<(GroupDetail, Version)>> {
-        self.storage.read_group(group_id).await
     }
 
     async fn write_group_member(
@@ -666,15 +662,6 @@ where
         self.storage
             .describe_topic_partitions(topics, partition_limit, cursor)
             .await
-    }
-
-    async fn update_group(
-        &self,
-        group_id: &str,
-        detail: GroupDetail,
-        version: Option<Version>,
-    ) -> Result<Version, UpdateError<GroupDetail>> {
-        self.storage.update_group(group_id, detail, version).await
     }
 
     async fn init_producer(
@@ -990,15 +977,6 @@ mod tests {
             _group_ids: Option<&[String]>,
             _include_authorized_operations: bool,
         ) -> Result<Vec<NamedGroupDetail>> {
-            unimplemented!()
-        }
-
-        async fn update_group(
-            &self,
-            _group_id: &str,
-            _detail: GroupDetail,
-            _version: Option<Version>,
-        ) -> Result<Version, UpdateError<GroupDetail>> {
             unimplemented!()
         }
 
@@ -1579,30 +1557,10 @@ mod wrapper_parity {
             );
         }
 
-        // `read_group`: the default body answers `None` unconditionally, which is
-        // what kept #111's GET-first gate shut in production.
-        assert_eq!(
-            bare.read_group("absent").await?.is_some(),
-            wrapped.read_group("absent").await?.is_some(),
-            "read_group diverges through the wrapper for an absent group",
-        );
-
-        _ = bare
-            .update_group("present", GroupDetail::default(), None)
-            .await
-            .expect("seed group state");
-
-        assert_eq!(
-            bare.read_group("present").await?,
-            wrapped.read_group("present").await?,
-            "read_group diverges through the wrapper for a group that exists — \
-             the default body answers None, which is how #111 was inert",
-        );
-
         // The decomposed layout (#359). None of these has a default body, so
         // today the compiler is the guard — but that is exactly what was true
-        // of `read_group` before a default was added to it, and the parity
-        // shape is what survives someone adding one.
+        // of the legacy `read_group` before a default was added to it, and the
+        // parity shape is what survives someone adding one.
         let group = "decomposed";
 
         let member = MemberDoc {

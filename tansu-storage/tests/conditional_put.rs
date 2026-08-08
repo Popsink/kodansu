@@ -16,8 +16,9 @@
 //! (#357).
 //!
 //! Everything that makes the broker stateless is a conditional put: offset
-//! assignment is a create-only segment-sequence CAS, group mutation is the etag
-//! CAS in `update_group`, maintenance work-splitting is a per-prefix lease.
+//! assignment is a create-only segment-sequence CAS, a group's composition is
+//! the etag CAS in `update_group_generation` and its assignment a create-only
+//! write, maintenance work-splitting is a per-prefix lease.
 //! `InMemory` *emulates* those semantics behind a mutex; S3 implements them with
 //! `If-None-Match` and GCS with a generation precondition. The two stores anyone
 //! runs in production were therefore the two nothing tested, and a divergence
@@ -31,7 +32,7 @@
 //! Two levels, because the interesting failure lives between them:
 //!
 //! - the raw `ObjectStore`, asserting the error *class* a losing writer gets;
-//! - `Storage::update_group`, asserting the engine maps that class onto
+//! - the `Storage` trait, asserting the engine maps that class onto
 //!   `UpdateError::Outdated` carrying the current value, which is the contract
 //!   the group coordinator's retry loop is written against.
 //!
@@ -44,7 +45,7 @@
 
 #![cfg(feature = "dynostore")]
 
-use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
+use std::{collections::BTreeMap, sync::Arc};
 
 use bytes::Bytes;
 use futures::{StreamExt as _, stream::FuturesUnordered};
@@ -56,8 +57,8 @@ use object_store::{
     path::Path,
 };
 use tansu_storage::{
-    AssignmentDoc, AssignmentOutcome, GenerationDoc, GroupDetail, GroupState, MemberDoc, Storage,
-    StorageContainer, UpdateError, Version,
+    AssignmentDoc, AssignmentOutcome, GenerationDoc, MemberDoc, Storage, StorageContainer,
+    UpdateError, Version,
 };
 use url::Url;
 use uuid::Uuid;
@@ -380,13 +381,12 @@ async fn an_unchanged_object_keeps_its_etag() -> Result<(), Error> {
 /// original etag again on S3, and a CAS still holding that etag succeeds despite
 /// two intervening writes, where `InMemory` would refuse it.
 ///
-/// Nothing in the engine depends on the difference today: `GroupDetail` carries
-/// `inception` and `generation_id`, so byte-identical group state is not a state
-/// the coordinator returns to. What is asserted here is the invariant that *is*
-/// depended on and that both stores honour — the version a put hands back is
-/// usable for the next CAS however the store derives it — so the per-generation
-/// CAS'd objects the group-state decomposition adds inherit a test rather than an
-/// assumption.
+/// Nothing in the engine depends on the difference, because the documents the
+/// coordinator CASes carry a `seq` counter that is incremented on every rewrite
+/// precisely so that no rewrite can reproduce an earlier body. What is asserted
+/// here is the invariant that *is* depended on and that both stores honour — the
+/// version a put hands back is usable for the next CAS however the store derives
+/// it.
 #[tokio::test]
 async fn a_no_op_rewrite_still_yields_a_usable_version() -> Result<(), Error> {
     let _guard = init_tracing()?;
@@ -486,32 +486,6 @@ async fn if_none_match_is_not_modified_until_the_object_changes() -> Result<(), 
 /// `inception` is pinned rather than `SystemTime::now()`: two details that
 /// differed by a timestamp would make the value assertions below pass whatever
 /// the store did.
-fn group_detail(generation_id: i32) -> GroupDetail {
-    GroupDetail {
-        session_timeout_ms: 45_000,
-        rebalance_timeout_ms: None,
-        members: BTreeMap::new(),
-        generation_id,
-        skip_assignment: Some(false),
-        inception: SystemTime::UNIX_EPOCH,
-        state: GroupState::Forming {
-            protocol_type: None,
-            protocol_name: None,
-            leader: None,
-        },
-    }
-}
-
-/// The version a write that is fixture rather than assertion must have produced.
-///
-/// [`UpdateError`] is generic in the value it carries, so it cannot be a variant
-/// of the suite-wide [`Error`]. The tests below match on it where it is the
-/// subject and flatten it here, where a failure means the fixture never got
-/// built.
-fn must_write(result: Result<Version, UpdateError<GroupDetail>>) -> Result<Version, Error> {
-    result.map_err(|error| Error::Message(format!("{error:?}")))
-}
-
 async fn engine() -> Result<Arc<Box<dyn Storage>>, Error> {
     StorageContainer::builder()
         .cluster_id(cluster_id())
@@ -521,88 +495,6 @@ async fn engine() -> Result<Arc<Box<dyn Storage>>, Error> {
         .build()
         .await
         .map_err(Into::into)
-}
-
-/// The engine's own contract: a stale `update_group` is [`UpdateError::Outdated`]
-/// and it carries the value that won, not just a failure.
-///
-/// The group coordinator does not retry blindly — it re-derives its next action
-/// from `current`. An `Outdated` without the winning value, or a bare
-/// `UpdateError::Error` wrapping the store's conflict, would leave it retrying
-/// the same stale generation until the budget is gone (#157).
-#[tokio::test]
-async fn a_stale_update_group_is_outdated_carrying_the_current_value() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let storage = engine().await?;
-    let group = "conformance";
-
-    let first = must_write(storage.update_group(group, group_detail(1), None).await)?;
-
-    let second = must_write(
-        storage
-            .update_group(group, group_detail(2), Some(first.clone()))
-            .await,
-    )?;
-
-    match storage
-        .update_group(group, group_detail(3), Some(first))
-        .await
-    {
-        Err(UpdateError::Outdated { current, version }) => {
-            assert_eq!(group_detail(2), *current);
-            assert_eq!(second, version);
-        }
-
-        otherwise => panic!("a stale CAS must be Outdated, got {otherwise:?}"),
-    }
-
-    Ok(())
-}
-
-/// The engine's create-only path: `update_group` with no version is a create, so
-/// N replicas forming the same group concurrently produce one winner, and every
-/// loser is told the state that won.
-#[tokio::test]
-async fn concurrent_group_creation_admits_exactly_one_writer() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let storage = engine().await?;
-    let group = "conformance-create";
-
-    let outcomes = (0..WRITERS)
-        .map(|generation| {
-            let storage = storage.clone();
-            let detail = group_detail(i32::try_from(generation).expect("WRITERS fits in i32"));
-
-            async move { storage.update_group(group, detail, None).await }
-        })
-        .collect::<FuturesUnordered<_>>()
-        .collect::<Vec<_>>()
-        .await;
-
-    let won = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
-    assert_eq!(1, won, "exactly one create must win: {outcomes:?}");
-
-    let (persisted, _) = storage
-        .read_group(group)
-        .await?
-        .expect("the winner's state is readable");
-
-    for outcome in &outcomes {
-        match outcome {
-            Ok(_) => {}
-
-            // The loser is told what is there now, and it is what a subsequent
-            // read sees: an `Outdated` carrying an already-stale value would
-            // send the coordinator round the loop again.
-            Err(UpdateError::Outdated { current, .. }) => assert_eq!(persisted, **current),
-
-            otherwise => panic!("a losing create must be Outdated, got {otherwise:?}"),
-        }
-    }
-
-    Ok(())
 }
 
 /// A `Version` the store never issued must not write.
@@ -616,17 +508,20 @@ async fn a_version_the_store_never_issued_is_refused() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
     let storage = engine().await?;
-    let group = "conformance-invented";
+    let group = group("invented");
 
-    _ = must_write(storage.update_group(group, group_detail(1), None).await)?;
+    _ = storage
+        .update_group_generation(&group, generation_doc(0), None)
+        .await
+        .map_err(|error| Error::Message(format!("{error:?}")))?;
 
     let invented = Version::from(&Uuid::now_v7());
 
     match storage
-        .update_group(group, group_detail(2), Some(invented))
+        .update_group_generation(&group, generation_doc(1), Some(invented))
         .await
     {
-        Err(UpdateError::Outdated { current, .. }) => assert_eq!(group_detail(1), *current),
+        Err(UpdateError::Outdated { current, .. }) => assert_eq!(generation_doc(0), *current),
 
         otherwise => panic!("an invented version must not write, got {otherwise:?}"),
     }
@@ -635,9 +530,9 @@ async fn a_version_the_store_never_issued_is_refused() -> Result<(), Error> {
 }
 
 /// A group whose id no other test — and no other run against the same bucket —
-/// uses. The decomposed objects (#359) are per-group, so a fresh id is what
-/// isolates a run; `update_group`'s tests above can use fixed ids only because
-/// they overwrite one object.
+/// uses. The decomposed objects (#359) are per-group and the assignment is
+/// create-only, so a fresh id is what isolates a run: a fixed one would make the
+/// second run of any create-only assertion find the first run's object.
 fn group(test: &str) -> String {
     format!("conformance-{test}-{}", Uuid::now_v7())
 }
@@ -671,9 +566,9 @@ fn assignment_doc(leader: &str) -> AssignmentDoc {
 }
 
 /// The generation CAS is the one contended write left after the decomposition
-/// (#359), and the coordinator's retry loop is written against the same contract
-/// `update_group` has: a loser is `Outdated` and it carries the document that
-/// won, so the retry re-applies its change to that rather than to what it read.
+/// (#359), and the coordinator's retry loop is written against it: a loser is
+/// `Outdated` and it carries the document that won, so the retry re-applies its
+/// change to that rather than to what it read.
 #[tokio::test]
 async fn a_stale_generation_update_is_outdated_carrying_the_current_value() -> Result<(), Error> {
     let _guard = init_tracing()?;

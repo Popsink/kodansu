@@ -95,8 +95,9 @@ and this workspace is pinned to a stable toolchain.
 ## Conditional put
 
 Everything that makes the broker stateless is a conditional put: offset
-assignment is a create-only segment-sequence CAS, group mutation is the etag CAS
-in `update_group`, maintenance work-splitting is a per-prefix lease. `InMemory`
+assignment is a create-only segment-sequence CAS, a group's composition is the
+etag CAS in `update_group_generation` and its assignment a create-only write,
+maintenance work-splitting is a per-prefix lease. `InMemory`
 *emulates* those semantics behind a mutex; S3 implements them with
 `If-None-Match`. `tansu-storage/tests/conditional_put.rs` is the conformance
 target that pins them, and it runs against whichever store
@@ -112,7 +113,7 @@ Verified green on both `memory://` and `s3://` against minio (`object_store`
 | CAS is not a create | an invented etag, and a CAS against an absent key, are both `Precondition` — never a silent write |
 | etag stability | an unchanged object keeps its etag across repeated `head`/`get` and across unrelated writes in the same prefix, and a CAS against it still succeeds (the #111 GET-first skip depends on this) |
 | conditional read | `If-None-Match` is `NotModified` on an unchanged object and returns the body once it changes |
-| `UpdateError::Outdated` | a stale `update_group` carries the value that won and its version, which is what the coordinator re-derives from rather than retrying blindly (#157) |
+| `UpdateError::Outdated` | a stale `update_group_generation` carries the value that won and its version, which is what the coordinator re-derives from rather than retrying blindly (#157) |
 
 The whole `tansu-storage` suite — 324 tests, not just the conformance target —
 also passes on `s3://` against minio, twice in a row against an already-populated

@@ -50,11 +50,12 @@ async fn stack() -> Result<(), Error> {
         .build()
         .await?;
 
-    // Wrapped so the test can see every `{group}.json` PUT. Latency is left at
-    // near-zero here — the service stack already introduces its own, and this
-    // wrapper is present for its counter, not its delay.
+    // Wrapped so the test can see every write of the one object a group's
+    // members can contend on. Latency is left at near-zero here — the service
+    // stack already introduces its own, and this wrapper is present for its
+    // counter, not its delay.
     let storage = LatencyIntroducingStorage::new(storage).with_latency(0..1);
-    let group_updates = storage.group_updates_handle();
+    let generation_updates = storage.generation_updates_handle();
 
     let coordinator = Controller::with_storage(storage)?;
 
@@ -136,19 +137,20 @@ async fn stack() -> Result<(), Error> {
     let heartbeat = HeartbeatRequest::try_from(next_action)?;
     assert_eq!(0, heartbeat.generation_id);
 
-    // #111's actual claim, which was false until #273: a steady-state heartbeat
-    // writes ZERO tier-1 PUTs on `{group}.json`.
+    // #111's actual claim, false until #273 and structural since #359: a
+    // steady-state heartbeat writes ZERO tier-1 PUTs on the contended object.
     //
-    // The skip compared `GroupDetail` for strict equality, and `GroupMember`
-    // derives `PartialEq` over `last_contact`, which the heartbeat path assigns
+    // The old skip compared `GroupDetail` for strict equality, and `GroupMember`
+    // derives `PartialEq` over `last_contact`, which the heartbeat path assigned
     // `now` before the comparison. So it could never hold, and every heartbeat
     // cost 1 GET + 1 CAS PUT per member per interval — ~100 PUT/s at 300 members
-    // fleet-wide, precisely what the code comment asserted it avoided.
+    // fleet-wide, precisely what the code comment asserted it avoided. The
+    // claim no longer rests on a skip being right: liveness is a different
+    // object now, so a heartbeat has nothing to write here.
     //
     // The group is Stable and this member has just been assigned, so nothing
-    // about the rebalance state changes from here: the only field a heartbeat
-    // touches is its own `last_contact`.
-    let settled = group_updates.load(atomic::Ordering::Relaxed);
+    // about the composition changes from here.
+    let settled = generation_updates.load(atomic::Ordering::Relaxed);
 
     for _ in 0..3 {
         let response = sut.serve(context.clone(), heartbeat.clone()).await?;
@@ -157,8 +159,8 @@ async fn stack() -> Result<(), Error> {
 
     assert_eq!(
         settled,
-        group_updates.load(atomic::Ordering::Relaxed),
-        "a steady-state heartbeat must not rewrite {{group}}.json (#111/#273)",
+        generation_updates.load(atomic::Ordering::Relaxed),
+        "a steady-state heartbeat must not rewrite generation.json (#111/#273/#359)",
     );
 
     Ok(())

@@ -25,7 +25,10 @@ use crate::{
     AssignmentDoc, AssignmentOutcome, ConsumerGroupState, Error, GROUP_SCHEMA_VERSION,
     GenerationDoc, GroupDetail, GroupDetailResponse, GroupSchema, MemberDoc, MemberRef,
     NamedGroupDetail, Result, Storage, UpdateError,
-    dynostore::{DynoStore, tests::init_tracing},
+    dynostore::{
+        DynoStore,
+        tests::{init_tracing, legacy_group_exists, seed_legacy_group},
+    },
 };
 
 const CLUSTER: &str = "tansu";
@@ -535,33 +538,36 @@ async fn a_member_with_no_document_is_still_a_member() -> Result<()> {
     Ok(())
 }
 
-/// A group in the legacy layout still describes as it always did: the
-/// decomposed read is tried first and falls through on a missing generation.
+/// A leftover `{group}.json` describes as an **empty group**, not as whatever
+/// it says.
+///
+/// The read used to fall back to it, which cost a 404 on the describe path of
+/// every group in the cluster forever and, once the cutover had happened, paid
+/// that to answer with something *less* true: the object records a membership
+/// that the quiesce made vacuous, and nothing rewrites it again. Empty is both
+/// the honest answer and the cheap one. The object is not deleted here —
+/// `delete_groups` takes it with the group and expiry reaps it on its own.
 #[tokio::test]
-async fn a_legacy_group_still_describes() -> Result<()> {
+async fn a_legacy_leftover_describes_as_an_empty_group() -> Result<()> {
     let _guard = init_tracing()?;
 
-    let storage = DynoStore::new(CLUSTER, NODE, InMemory::new());
+    let bucket = InMemory::new();
+    let storage = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
-    _ = storage
-        .update_group(
-            "g-legacy",
-            GroupDetail {
-                generation_id: 3,
-                ..Default::default()
-            },
-            None,
-        )
-        .await
-        .expect("legacy group");
+    seed_legacy_group(&bucket, CLUSTER, "g-legacy").await?;
 
     let described = storage
         .describe_groups(Some(&["g-legacy".into()]), false)
         .await?;
 
-    assert_eq!(
-        Some(3),
-        detail_of(described.first().expect("described")).map(|detail| detail.generation_id)
+    let detail = detail_of(described.first().expect("described")).expect("described");
+
+    assert!(detail.members.is_empty(), "{detail:?}");
+    assert_eq!(ConsumerGroupState::Empty, ConsumerGroupState::from(&detail));
+
+    assert!(
+        legacy_group_exists(&bucket, CLUSTER, "g-legacy").await,
+        "describing must not delete anything"
     );
 
     Ok(())
@@ -576,7 +582,8 @@ async fn a_legacy_group_still_describes() -> Result<()> {
 async fn groups_are_listed_by_anything_they_own() -> Result<()> {
     let _guard = init_tracing()?;
 
-    let storage = DynoStore::new(CLUSTER, NODE, InMemory::new());
+    let bucket = InMemory::new();
+    let storage = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
     // Decomposed, with a leader and no assignment: CompletingRebalance.
     _ = storage
@@ -607,11 +614,9 @@ async fn groups_are_listed_by_anything_they_own() -> Result<()> {
         .await
         .expect("generation");
 
-    // Legacy, no committed offsets: the group the old listing could not see.
-    _ = storage
-        .update_group("g-legacy", GroupDetail::default(), None)
-        .await
-        .expect("legacy group");
+    // A leftover `{group}.json`, which owns a listed name and nothing this
+    // binary can describe.
+    seed_legacy_group(&bucket, CLUSTER, "g-legacy").await?;
 
     let listed = storage.list_groups(None).await?;
     assert_eq!(
@@ -647,8 +652,21 @@ async fn groups_are_listed_by_anything_they_own() -> Result<()> {
 
     let empty = storage.list_groups(Some(&["Empty".into()])).await?;
     assert_eq!(
-        vec!["g-empty".to_owned(), "g-legacy".to_owned()],
+        vec!["g-empty".to_owned()],
         empty
+            .iter()
+            .map(|group| group.group_id.clone())
+            .collect::<Vec<_>>()
+    );
+
+    // The leftover is still *named* — it owns an object under the root, so an
+    // unfiltered listing has to report it or the name would look free — but it
+    // has no state this binary can derive, and `Unknown` is what a caller can
+    // act on: it is not a group that is Empty, it is a group that is not there.
+    let unknown = storage.list_groups(Some(&["Unknown".into()])).await?;
+    assert_eq!(
+        vec!["g-legacy".to_owned()],
+        unknown
             .iter()
             .map(|group| group.group_id.clone())
             .collect::<Vec<_>>()

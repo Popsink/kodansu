@@ -168,8 +168,8 @@ impl Counters {
 /// Also returns, aligned by index, that replica's counters for the object a
 /// group's members can contend on — `generation.json` — so a test can assert
 /// how much read-modify-write contention there actually was. Before #359 the
-/// counters to read were `update_group`'s; that object is no longer written at
-/// all, so reading it here would assert zero of nothing.
+/// counters to read were the single group object's; that object is neither
+/// written nor read any more, so counting it here would assert zero of nothing.
 fn replicas(shared: &SharedStorage) -> Result<(Vec<Replica>, Vec<Counters>)> {
     let mut controllers = Vec::with_capacity(REPLICAS);
     let mut counters = Vec::with_capacity(REPLICAS);

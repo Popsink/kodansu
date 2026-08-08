@@ -93,9 +93,15 @@ Symmetric and free, precisely because offsets are never touched:
 3. **Start the old binary.** Groups re-form from the legacy `{group}.json`
    layout, with the same committed offsets.
 
-The decomposed objects are left behind, inert, under each group's prefix. They
-cost storage and nothing else; `delete_groups` removes them along with
-everything else the group owns, and expiry sweeps them with the group.
+The decomposed objects are left behind, inert, under each group's prefix — the
+mirror image of what the forward cutover leaves behind. They cost storage and
+nothing else; `delete_groups` removes them along with everything else the group
+owns, and expiry sweeps them with the group.
+
+**Rollback is only free while the old binary is still deployable.** The new
+binary can no longer read or write `{group}.json` at all, so the leftover is what
+the *old* one reads — keep the old image available for as long as you would want
+to roll back, which is the same discipline as `docs/migration-scos.md`.
 
 Rolling *forward again* after a rollback works unchanged: the schema object
 still reads `2`, so the assertion passes and the groups re-form.
@@ -112,16 +118,21 @@ still reads `2`, so the assertion passes and the groups re-form.
   error codes by rejoining.
 - **Group state is no longer written on the commit path at all**, which removes
   the `{group}.json` mtime churn behind #272.
-- `DescribeGroups`, `ListGroups` and `DeleteGroups` read both layouts, so an
-  admin tool sees the same answers across the flip. `ListGroups` gains a real
-  `states_filter` — it used to report `Unknown` for every group.
+- **`{group}.json` is not read either.** Between the quiesce and a group's first
+  join, `DescribeGroups` reports it as **empty** rather than reporting the
+  membership the old object records — which is the honest answer, because the
+  quiesce made that membership vacuous. `ListGroups` still *names* such a group
+  (it owns an object under the consumer root) with state `Unknown`. Both
+  converge on the truth the moment the group re-forms.
+- `ListGroups` gains a real `states_filter` — it used to report `Unknown` for
+  every group.
 
 ## Quick reference
 
 | Object | Role |
 |---|---|
 | `clusters/{cluster}/schema/groups.json` | The layout assertion. `{"version":2}` is the decomposed layout. |
-| `groups/consumers/{group}.json` | The **legacy** single group object. Read for as long as one can exist; never written. |
+| `groups/consumers/{group}.json` | The **legacy** single group object. Neither read nor written; deleted with the group and reaped by expiry. |
 | `groups/consumers/{group}/generation.json` | The group's composition. The only object several members contend on, CAS'd, and only when membership changes. |
 | `groups/consumers/{group}/members/{member}.json` | One member's liveness and subscription. One logical writer, at most once per session/2. |
 | `groups/consumers/{group}/assignment/{generation}.json` | A generation's assignment. Create-only and immutable; its existence is what makes a group `Stable`. |
@@ -129,5 +140,6 @@ still reads `2`, so the assertion passes and the groups re-form.
 
 - Cutover and rollback are **quiesce-and-flip**; never mix the two layouts.
 - Nothing is migrated: groups re-form, offsets stay where they are.
+- One release, not two: this binary reads only the layout it writes.
 - The schema object is an assertion, not a converter, and never a substitute for
   checking that the whole fleet is on one binary.
