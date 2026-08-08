@@ -48,6 +48,13 @@
 //! forwarding — a deterministic owner replica, discovered over headless-Service
 //! DNS, reachable on a second listener — existed to buy, and it is why that
 //! machinery could be deleted rather than reconfigured.
+//!
+//! Interchangeable also means *removable*, which is what the long polls have to
+//! answer for: `join` and `sync` hold a request open for tens of seconds, and a
+//! replica that goes away mid-poll used to take the connection with it. They
+//! watch a [`CancellationToken`] now and answer early when the process is asked
+//! to stop (#361) — an answer being the whole difference between a scale-in
+//! event a client absorbs and one it reports as a broker that dropped it.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -89,6 +96,7 @@ use tansu_storage::{
     OffsetCommitRequest, Storage, Topition, UpdateError, Version,
 };
 use tokio::time::{Duration, Instant, sleep};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
@@ -627,6 +635,19 @@ pub struct Controller<O> {
     /// operator who missed the first line still sees one.
     rebalance_stalls: Arc<Mutex<ExpiringSizedCache<String, ()>>>,
 
+    /// Cancelled when this process has been asked to stop (#361).
+    ///
+    /// Only the long polls read it, and only to stop *waiting*: a cancelled
+    /// poll answers with what it has, exactly as it would at its own deadline,
+    /// rather than being abandoned. Nothing here refuses work — a request that
+    /// arrives during the drain is served normally, because the connection it
+    /// arrived on was accepted before the drain began and the client is owed a
+    /// response either way.
+    ///
+    /// Defaults to a token nothing cancels, so a `Controller` built without one
+    /// long-polls to its deadline as before.
+    cancellation: CancellationToken,
+
     /// Where a request's wall-clock reading comes from (#359).
     ///
     /// **Sampling only.** Every value this produces is compared against
@@ -664,8 +685,39 @@ where
             rebalance_stalls: Arc::new(Mutex::new(ExpiringSizedCache::new(
                 REBALANCE_STALL_REPORT_EVERY,
             ))),
+            cancellation: CancellationToken::new(),
             now: SystemTime::now,
         })
+    }
+
+    /// Watch `cancellation` for this process being asked to stop, so an
+    /// in-flight long poll answers instead of being cut (#361).
+    pub fn with_cancellation(self, cancellation: CancellationToken) -> Self {
+        Self {
+            cancellation,
+            ..self
+        }
+    }
+
+    /// Sleep out a long poll's wait, unless this process is stopping.
+    ///
+    /// `false` means the caller must answer now. The two are raced rather than
+    /// checked before the sleep because the wait is up to a second and the
+    /// drain is what is waiting on it: checking first would still leave a
+    /// request holding the shutdown open for the length of one poll interval,
+    /// per poll, for every member of every group this replica is serving.
+    async fn waited(&self, pause: Duration, method: &'static str) -> bool {
+        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", method)]);
+
+        tokio::select! {
+            () = sleep(pause) => true,
+
+            () = self.cancellation.cancelled() => {
+                debug!(method, "answering a long poll early: this replica is stopping");
+                COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "long_poll_drained")]);
+                false
+            }
+        }
     }
 
     /// Override where a request's wall-clock reading comes from (#359). See
@@ -1709,12 +1761,12 @@ where
             );
 
             match decision {
-                LongPoll::Wait(pause, method) => {
-                    COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", method)]);
-                    sleep(pause).await;
-                }
+                // A cancelled wait falls through to the answer this iteration
+                // already produced, which is exactly what the poll would have
+                // returned at its own deadline (#361).
+                LongPoll::Wait(pause, method) if self.waited(pause, method).await => continue,
 
-                LongPoll::Respond(_) => {
+                LongPoll::Wait(..) | LongPoll::Respond(_) => {
                     debug!(join_outcome = ?ErrorCode::None, generation_id = view.generation_id());
 
                     let Body::JoinGroupResponse(response) = body else {
@@ -1809,8 +1861,19 @@ where
                 LongPoll::Respond(Some(error_code)) => return Ok(set_error_code(body, error_code)),
 
                 LongPoll::Wait(pause, method) => {
-                    COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", method)]);
-                    sleep(pause).await;
+                    if self.waited(pause, method).await {
+                        continue;
+                    }
+
+                    // Stopping. A sync that has not been assigned yet is told
+                    // to rebalance — the same answer it gets at its own
+                    // deadline — so the member re-joins against a replica that
+                    // is staying rather than reading a closed socket (#361).
+                    return Ok(if view.is_assigned(&body) {
+                        body
+                    } else {
+                        set_error_code(body, ErrorCode::RebalanceInProgress)
+                    });
                 }
             }
         }
@@ -2250,7 +2313,7 @@ mod tests {
         offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
     };
     use tansu_storage::{LatencyIntroducingStorage, StorageContainer};
-    use tokio::time::advance;
+    use tokio::time::{advance, timeout};
     use tracing::subscriber::DefaultGuard;
     use url::Url;
 
@@ -4012,6 +4075,180 @@ mod tests {
             i16::from(ErrorCode::UnknownMemberId),
             commit(Some(-1), None).await?,
         );
+
+        Ok(())
+    }
+
+    /// #361: a long poll cut short by a shutdown must *answer*.
+    ///
+    /// `join` holds a member for up to half its session timeout waiting for
+    /// something to act on. At a fixed replica count that only ever happened on
+    /// deploy; under an autoscaler taking a replica away it is routine. A poll
+    /// abandoned mid-flight is a closed socket to the client, which is
+    /// indistinguishable from a network fault and costs a reconnect plus a
+    /// coordinator round trip — the same neighbourhood as #289 and #300: a
+    /// retriable condition must be answered, not dropped.
+    ///
+    /// What it answers with is what it would have answered at its own deadline,
+    /// which is the point: no new client behaviour, and no generation bump, so
+    /// a scale-in event causes no rebalance.
+    #[tokio::test(start_paused = true)]
+    async fn a_join_long_poll_answers_when_this_replica_is_stopping() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "draining-join";
+
+        let storage = memory_storage().await?;
+        let cancellation = CancellationToken::new();
+        let controller = Controller::with_storage(storage.clone())?
+            .with_now(paused_clock)
+            .with_cancellation(cancellation.clone());
+
+        let metadata = encode_subscription(&["t"], None);
+
+        // A leader, so the group exists and the member below is a follower with
+        // nothing to act on — the shape that long-polls.
+        let (leader_id, _) = register(&controller, GROUP_ID, &metadata).await?;
+
+        let generation_id = generation_of(&storage, GROUP_ID).await?.generation_id;
+
+        let minted = join_group(&controller, GROUP_ID, "", &metadata).await?;
+        assert_eq!(i16::from(ErrorCode::MemberIdRequired), minted.error_code);
+
+        let follower = {
+            let controller = controller.clone();
+            let metadata = metadata.clone();
+            let member_id = minted.member_id.clone();
+
+            tokio::spawn(
+                async move { join_group(&controller, GROUP_ID, &member_id, &metadata).await },
+            )
+        };
+
+        // Let the follower reach its wait: it has joined, it is not the leader,
+        // and no assignment exists, so `join_long_poll` holds it.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(!follower.is_finished(), "the follower must be long-polling");
+
+        cancellation.cancel();
+
+        let answered = timeout(Duration::from_secs(5), follower)
+            .await
+            .expect("a cancelled long poll must answer rather than hang")
+            .expect("the join task must not panic")?;
+
+        assert_eq!(
+            i16::from(ErrorCode::None),
+            answered.error_code,
+            "a drained poll answers what it had, not an error the client has to interpret",
+        );
+        assert_eq!(leader_id, answered.leader);
+
+        // And it moved nothing: the group is at the generation the follower's
+        // own join minted, and the shutdown added no rebalance of its own.
+        assert_eq!(
+            generation_id + 1,
+            generation_of(&storage, GROUP_ID).await?.generation_id,
+            "a drain must not cost a rebalance",
+        );
+
+        Ok(())
+    }
+
+    /// The same for `sync`, which waits longer — eight tenths of the session
+    /// timeout — because it is waiting on the leader's single assignment write.
+    ///
+    /// A member with no assignment is told to rebalance, which is what it is
+    /// told at its own deadline: the client re-joins, against a replica that is
+    /// staying.
+    #[tokio::test(start_paused = true)]
+    async fn a_sync_long_poll_answers_when_this_replica_is_stopping() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "draining-sync";
+
+        let storage = memory_storage().await?;
+        let cancellation = CancellationToken::new();
+        let controller = Controller::with_storage(storage.clone())?
+            .with_now(paused_clock)
+            .with_cancellation(cancellation.clone());
+
+        let leader_meta = encode_subscription(&["t"], None);
+        let follower_meta = encode_subscription(&["t", "u"], None);
+
+        let (leader_id, _) = register(&controller, GROUP_ID, &leader_meta).await?;
+        let (follower_id, join) = register(&controller, GROUP_ID, &follower_meta).await?;
+
+        // The leader assigns itself and nobody else, so the follower is a
+        // member of a `Stable` generation with no slice of its own: the state
+        // `sync_long_poll` waits in rather than answering.
+        let sync = sync_group(
+            &controller,
+            GROUP_ID,
+            join.generation_id,
+            &leader_id,
+            &[assignment_of(&leader_id)],
+        )
+        .await?;
+        assert_eq!(i16::from(ErrorCode::None), sync.error_code);
+
+        let follower = {
+            let controller = controller.clone();
+            let member_id = follower_id.clone();
+            let generation_id = join.generation_id;
+
+            tokio::spawn(async move {
+                sync_group(&controller, GROUP_ID, generation_id, &member_id, &[]).await
+            })
+        };
+
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(!follower.is_finished(), "the follower must be long-polling");
+
+        cancellation.cancel();
+
+        let answered = timeout(Duration::from_secs(5), follower)
+            .await
+            .expect("a cancelled long poll must answer rather than hang")
+            .expect("the sync task must not panic")?;
+
+        assert_eq!(
+            i16::from(ErrorCode::RebalanceInProgress),
+            answered.error_code,
+            "an unassigned sync is sent to re-join, as it is at its own deadline",
+        );
+
+        Ok(())
+    }
+
+    /// A `Controller` built without a token long-polls to its own deadline, so
+    /// nothing that does not opt in changes behaviour.
+    #[tokio::test(start_paused = true)]
+    async fn a_controller_with_no_token_polls_to_its_deadline() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "no-token";
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage)?.with_now(paused_clock);
+        let metadata = encode_subscription(&["t"], None);
+
+        let (_, _) = register(&controller, GROUP_ID, &metadata).await?;
+
+        let minted = join_group(&controller, GROUP_ID, "", &metadata).await?;
+
+        // Half the session timeout, which is what `join_long_poll` allows a
+        // member with nothing to act on. Under the paused clock the sleeps are
+        // free, so this is a bound on virtual time rather than on the run.
+        let answered = join_group(&controller, GROUP_ID, &minted.member_id, &metadata).await?;
+
+        assert_eq!(i16::from(ErrorCode::None), answered.error_code);
 
         Ok(())
     }
