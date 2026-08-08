@@ -1297,6 +1297,23 @@ pub struct Controller<O> {
     /// state (#283). Lowered in tests so the sweep can be exercised without
     /// waiting one out.
     idle_after: Duration,
+
+    /// Where a request's wall-clock reading comes from (#359).
+    ///
+    /// **Sampling only.** Every value this produces is compared against
+    /// another reading of the same clock — the join window, a member's session
+    /// — never against something already persisted by another replica, which
+    /// is why a test may move it without inventing a cross-replica time
+    /// disagreement. `inception` and the timestamps written into group state
+    /// still come from `SystemTime::now()` directly.
+    ///
+    /// It exists because `tokio`'s paused clock advances `Instant` and
+    /// `sleep`, and cannot touch `SystemTime`. A coordinator test therefore had
+    /// to buy its determinism by waiting out real session timeouts: seven of
+    /// the eight `new_cg` cases ran on the real clock, and the binary's floor
+    /// was 58 seconds. With the reading injectable, a test derives it from the
+    /// paused clock and the whole binary runs in the time it takes to schedule.
+    now: fn() -> SystemTime,
 }
 
 impl<O> Controller<O>
@@ -1311,6 +1328,7 @@ where
             rebalance_stalls: Arc::new(Mutex::new(BTreeMap::new())),
             last_seen: Arc::new(Mutex::new(BTreeMap::new())),
             idle_after: GROUP_STATE_IDLE_AFTER,
+            now: SystemTime::now,
         })
     }
 
@@ -1318,6 +1336,12 @@ where
     /// (#283). Tests set it to zero to sweep without waiting.
     pub fn with_idle_after(self, idle_after: Duration) -> Self {
         Self { idle_after, ..self }
+    }
+
+    /// Override where a request's wall-clock reading comes from (#359). See
+    /// [`Self::now`] for what may and may not be moved this way.
+    pub fn with_now(self, now: fn() -> SystemTime) -> Self {
+        Self { now, ..self }
     }
 
     /// Report a group that has been mid-rebalance too long (#240).
@@ -1554,7 +1578,7 @@ where
             // held leader does not block the members it is waiting for.
             let permit = group_lock.clone().lock_owned().await;
 
-            let now = SystemTime::now();
+            let now = (self.now)();
 
             let (mut wrapper, mut version) = self
                 .wrappers
@@ -1754,7 +1778,7 @@ where
                 polling_since: Instant::now(),
 
                 window_members: None,
-                window_changed_at: SystemTime::now(),
+                window_changed_at: (self.now)(),
             },
         )
         .await
@@ -1851,7 +1875,7 @@ where
 
         let wrapper = Wrapper::Forming(Inner::new(self.storage.clone()));
 
-        let now = SystemTime::now();
+        let now = (self.now)();
         let (_wrapper, body) = wrapper
             .offset_fetch(now, group_id, topics, groups, require_stable)
             .await;

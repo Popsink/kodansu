@@ -395,3 +395,36 @@ where
         .await
         .map_err(Into::into)
 }
+
+/// A wall-clock reading derived from `tokio`'s clock, for a test that runs
+/// under `#[tokio::test(start_paused = true)]` (#359).
+///
+/// `tokio`'s paused clock advances `Instant` and `sleep` — by auto-advance when
+/// every task is idle, and by `advance()` — but it cannot touch `SystemTime`.
+/// A coordinator comparing a member's session against `SystemTime::now()`
+/// therefore saw a frozen wall clock while its own long-poll raced ahead, so a
+/// test could only buy determinism by waiting out the real duration. Handing
+/// this to [`Controller::with_now`] makes the two agree, and the whole `new_cg`
+/// binary drops from just under a minute to the time it takes to schedule.
+///
+/// The origin is captured on first use rather than being a constant: `Instant`
+/// has no absolute zero, and `nextest` runs each test in its own process, so
+/// "first use" is this test's start.
+pub(crate) fn paused_clock() -> std::time::SystemTime {
+    use std::{
+        sync::OnceLock,
+        time::{Duration, SystemTime},
+    };
+
+    use tokio::time::Instant;
+
+    /// Far enough from the epoch that a duration subtracted from a reading —
+    /// a session timeout, a rebalance timeout — stays representable.
+    const ORIGIN: Duration = Duration::from_secs(1_700_000_000);
+
+    static STARTED: OnceLock<Instant> = OnceLock::new();
+
+    SystemTime::UNIX_EPOCH
+        + ORIGIN
+        + Instant::now().duration_since(*STARTED.get_or_init(Instant::now))
+}

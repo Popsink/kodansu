@@ -50,7 +50,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, instrument, warn};
 use url::Url;
 
-use crate::common::init_tracing;
+use crate::common::{init_tracing, paused_clock};
 
 pub mod common;
 
@@ -93,7 +93,7 @@ pub async fn one_consumer_session_delay_after_initial_join() -> Result<()> {
         .build()
         .await?;
 
-    let coordinator = Controller::with_storage(storage)?;
+    let coordinator = Controller::with_storage(storage)?.with_now(paused_clock);
 
     let route = services(
         FrameRouteService::<(), tansu_broker::Error>::builder(),
@@ -180,7 +180,7 @@ pub async fn one_consumer_session_delay_after_initial_join() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 pub async fn one_consumer_next_action() -> Result<()> {
     let _guard = init_tracing()?;
 
@@ -219,7 +219,7 @@ pub async fn one_consumer_next_action() -> Result<()> {
         .build()
         .await?;
 
-    let coordinator = Controller::with_storage(storage)?;
+    let coordinator = Controller::with_storage(storage)?.with_now(paused_clock);
 
     let route = services(
         FrameRouteService::<(), tansu_broker::Error>::builder(),
@@ -263,7 +263,7 @@ pub async fn one_consumer_next_action() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 pub async fn two_consumer_next_action() -> Result<()> {
     let _guard = init_tracing()?;
 
@@ -301,7 +301,7 @@ pub async fn two_consumer_next_action() -> Result<()> {
         .build()
         .await?;
 
-    let coordinator = Controller::with_storage(storage)?;
+    let coordinator = Controller::with_storage(storage)?.with_now(paused_clock);
 
     let route = services(
         FrameRouteService::<(), tansu_broker::Error>::builder(),
@@ -408,28 +408,28 @@ pub async fn two_consumer_next_action() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 pub async fn consumer_next_action_08c() -> Result<()> {
     let _guard = init_tracing()?;
 
     group_consumer_next_action(0..8).await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 pub async fn consumer_next_action_16c() -> Result<()> {
     let _guard = init_tracing()?;
 
     group_consumer_next_action(0..16).await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 pub async fn consumer_next_action_24c() -> Result<()> {
     let _guard = init_tracing()?;
 
     group_consumer_next_action(0..24).await
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 pub async fn consumer_next_action_32c() -> Result<()> {
     let _guard = init_tracing()?;
 
@@ -457,7 +457,7 @@ async fn group_consumer_next_action(consumers: Range<i32>) -> Result<()> {
         .build()
         .await?;
 
-    let coordinator = Controller::with_storage(storage)?;
+    let coordinator = Controller::with_storage(storage)?.with_now(paused_clock);
 
     let route = services(
         FrameRouteService::<(), tansu_broker::Error>::builder(),
@@ -571,7 +571,7 @@ async fn group_consumer_next_action(consumers: Range<i32>) -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 pub async fn two_consumer_interleave_join() -> Result<()> {
     let _guard = init_tracing()?;
 
@@ -610,7 +610,7 @@ pub async fn two_consumer_interleave_join() -> Result<()> {
         .build()
         .await?;
 
-    let coordinator = Controller::with_storage(storage)?;
+    let coordinator = Controller::with_storage(storage)?.with_now(paused_clock);
 
     let route = services(
         FrameRouteService::<(), tansu_broker::Error>::builder(),
