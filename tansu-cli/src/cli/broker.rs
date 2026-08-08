@@ -12,10 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    net::IpAddr,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use crate::{EnvVarExp, Result, cli::storage_engines};
 
@@ -29,7 +26,7 @@ use rustls::{
         pem::{Error as TlsPkiPemError, PemObject as _},
     },
 };
-use tansu_broker::{NODE_ID, broker::Broker, coordinator::group::forward::GroupCoordinator};
+use tansu_broker::{NODE_ID, broker::Broker, coordinator::group::administrator::Controller};
 use tansu_sans_io::ErrorCode;
 use tansu_storage::{ArcDynStorage, DEFAULT_CLEANUP_POLICY, TopicDefaults};
 use tokio::time::Instant;
@@ -98,31 +95,6 @@ pub(super) struct Arg {
     /// Default `retention.ms` applied to delete-policy topics created without one (Kafka default: 7 days). Accepts a duration (7days, 12h), or -1/infinite/forever to retain forever.
     #[arg(long, env = "DEFAULT_RETENTION", value_parser = parse_retention_ms, default_value = "7days")]
     default_retention_ms: i64,
-
-    /// Forward each consumer group's coordination APIs to the group's deterministic owner replica (default: off, pure-local coordination)
-    #[arg(
-        long,
-        env = "GROUP_FORWARDING",
-        action = clap::ArgAction::SetTrue,
-        value_parser = clap::builder::FalseyValueParser::new()
-    )]
-    group_forwarding: bool,
-
-    /// Headless-Service hostname whose A/AAAA records list the peer replicas eligible to own consumer groups
-    #[arg(long, env = "GROUP_FORWARD_PEER_DNS")]
-    group_forward_peer_dns: Option<String>,
-
-    /// The internal (broker-to-broker) listener URL; forwarded group requests are sent to each owner at this port
-    #[arg(
-        long,
-        env = "INTERNAL_LISTENER_URL",
-        default_value = "tcp://0.0.0.0:9093"
-    )]
-    internal_listener_url: EnvVarExp<Url>,
-
-    /// This replica's own IP address (in Kubernetes, the pod IP via the Downward API)
-    #[arg(long, env = "POD_IP")]
-    pod_ip: Option<EnvVarExp<IpAddr>>,
 
     /// Silent
     #[arg(long)]
@@ -195,7 +167,7 @@ impl Arg {
             .map_err(Into::into)
     }
 
-    async fn build(self) -> Result<Broker<GroupCoordinator<ArcDynStorage>, ArcDynStorage>> {
+    async fn build(self) -> Result<Broker<Controller<ArcDynStorage>, ArcDynStorage>> {
         let cluster_id = self.cluster_id;
         let incarnation_id = Uuid::now_v7();
         let otlp_endpoint_url = self
@@ -224,7 +196,7 @@ impl Arg {
             retention_ms: self.default_retention_ms,
         };
 
-        let broker = Broker::<GroupCoordinator<ArcDynStorage>, ArcDynStorage>::builder()
+        let broker = Broker::<Controller<ArcDynStorage>, ArcDynStorage>::builder()
             .node_id(NODE_ID)
             .cluster_id(cluster_id)
             .incarnation_id(incarnation_id)
@@ -235,10 +207,6 @@ impl Arg {
             .authentication(self.authentication)
             .tls_server_config(tls_server_config)
             .topic_defaults(topic_defaults)
-            .group_forwarding(self.group_forwarding)
-            .group_forward_peer_dns(self.group_forward_peer_dns)
-            .internal_listener_url(Some(self.internal_listener_url.into_inner()))
-            .pod_ip(self.pod_ip.map(|env_var_exp| env_var_exp.into_inner()))
             .silent(self.silent);
 
         if !self.silent {
@@ -297,7 +265,45 @@ impl Default for Sheet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory as _;
     use tansu_storage::DEFAULT_RETENTION_MS;
+
+    /// #360's acceptance criterion, as a test: **no configuration option
+    /// mentions a peer, a pod IP, or a DNS name.**
+    ///
+    /// Consumer group coordination used to need stable pod identity, a
+    /// headless-Service hostname, pod-to-pod addressability and a second
+    /// listener — the four things an autoscaled fleet has least of, and the
+    /// reason a replica could not be added or removed on demand. Deleting the
+    /// machinery is what removed them; this is what stops one coming back
+    /// without the argument being made again.
+    #[test]
+    fn no_option_asks_the_operator_where_the_other_replicas_are() {
+        const FORBIDDEN: [&str; 4] = ["peer", "pod-ip", "pod_ip", "internal-listener"];
+
+        let command = Arg::command();
+        let command = command.get_arguments().filter_map(|argument| {
+            argument
+                .get_long()
+                .map(ToOwned::to_owned)
+                .into_iter()
+                .chain(
+                    argument
+                        .get_env()
+                        .map(|env| env.to_string_lossy().into_owned()),
+                )
+                .find(|name| {
+                    let name = name.to_lowercase();
+                    FORBIDDEN.iter().any(|forbidden| name.contains(forbidden))
+                })
+        });
+
+        assert_eq!(
+            Vec::<String>::new(),
+            command.collect::<Vec<_>>(),
+            "a replica must not have to be told about its peers",
+        );
+    }
 
     #[test]
     fn retention_accepts_the_humantime_grammar() {

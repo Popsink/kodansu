@@ -16,11 +16,7 @@ pub mod group;
 
 use crate::{
     CancelKind, METER, Result,
-    coordinator::group::{
-        Coordinator,
-        administrator::Controller,
-        forward::{DEFAULT_INTERNAL_PORT, GroupCoordinator, PEER_REFRESH_INTERVAL, PeerRegistry},
-    },
+    coordinator::group::{Coordinator, administrator::Controller},
     otel,
     service::services,
 };
@@ -32,7 +28,6 @@ use rsasl::config::SASLConfig;
 use rustls::ServerConfig;
 use std::{
     future::{Future, pending},
-    io,
     marker::PhantomData,
     net::{IpAddr, Ipv6Addr, SocketAddr},
     str::FromStr,
@@ -106,13 +101,6 @@ where
         );
     }
 }
-
-/// How often the coordinator's idle group state is evicted (#283).
-///
-/// Fixed, and independent of `maintenance_interval`: this is a bound on memory,
-/// not a storage cadence, and it has to hold on a fleet that runs no storage
-/// maintenance at all.
-const GROUP_PRUNE_INTERVAL: Duration = Duration::from_mins(10);
 
 /// How often this replica runs storage maintenance — retention and compaction.
 ///
@@ -214,16 +202,6 @@ pub struct Broker<G, S> {
     storage: S,
     groups: G,
 
-    // The receive side of the forward-to-owner hop: when group forwarding is
-    // enabled, `internal_listener` is bound alongside the public listener and
-    // its connections are served with `internal_groups` — always the plain
-    // local coordinator, never the forwarding wrapper — so a forwarded frame
-    // is processed locally by construction and can never be forwarded again
-    // (the structural one-hop guarantee). Both are `None` when forwarding is
-    // off: no extra listener, bit-for-bit today's behaviour.
-    internal_listener: Option<Url>,
-    internal_groups: Option<G>,
-
     sasl_config: Option<Arc<SASLConfig>>,
     tls_server_config: Option<Arc<ServerConfig>>,
     silent: bool,
@@ -255,9 +233,6 @@ where
             advertised_listener,
             storage,
             groups,
-
-            internal_listener: None,
-            internal_groups: None,
 
             sasl_config: None,
             tls_server_config: None,
@@ -395,22 +370,6 @@ where
             .await
             .inspect_err(|err| error!(?err, %self.advertised_listener))?;
 
-        // The receive side of the forward-to-owner hop. Bound only when group
-        // forwarding is enabled (both fields are populated by the builder in
-        // that case alone); its connections are served with the plain local
-        // coordinator — never the forwarding wrapper — so a forwarded frame is
-        // processed locally by construction and cannot be forwarded again,
-        // even when peer views are skewed mid-rollout (the structural one-hop
-        // guarantee).
-        let internal = match (&self.internal_listener, &self.internal_groups) {
-            (Some(internal_listener), Some(internal_groups)) => Some((
-                bind(internal_listener, DEFAULT_INTERNAL_PORT).await?,
-                internal_groups.clone(),
-            )),
-
-            _ => None,
-        };
-
         // Upper bound on a single maintenance run so a *hung* pass cannot hold the
         // in-flight guard forever and disable maintenance pod-wide until restart
         // (#131). A generous multiple of the interval, clamped so a short interval
@@ -483,24 +442,6 @@ where
             Maintenance::Never => None,
         };
 
-        // Evicting idle coordinator group state (#283) is on its own clock, and
-        // deliberately not on the maintenance one it used to share.
-        //
-        // It rode the maintenance tick because that was the only periodic thing
-        // in this loop, which quietly tied a *memory* bound to a *storage*
-        // cadence — so the serving fleet, the one whose group maps grow and the
-        // one configured to leave storage maintenance to a dedicated maintainer,
-        // was the fleet that never evicted anything. Production ran ten brokers
-        // that way, and the eviction #283 added had never run on any of them.
-        //
-        // Start-relative rather than wall-clock-aligned, unlike maintenance
-        // above: this walks in-memory maps, issues no request and contends with
-        // no peer, so there is nothing for replicas to agree on and staggering
-        // them is if anything the better default.
-        let mut prune_interval =
-            time::interval_at(Instant::now() + GROUP_PRUNE_INTERVAL, GROUP_PRUNE_INTERVAL);
-        prune_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
         // Guard against overlapping `maintain` runs: under S3 throttling a pass
         // can take longer than the interval, and spawning a second concurrent
         // run compounds the memory + S3 pressure (#8).
@@ -565,60 +506,6 @@ where
                         addr,
                         acceptor.clone(),
                     )?;
-
-                    continue;
-                }
-
-                // A forwarded group request from a peer replica: served with
-                // the plain local coordinator, so it is processed here and
-                // never re-forwarded (one hop by construction). This arm is
-                // inert — `accept_on(None)` never yields — unless forwarding
-                // is enabled; both accept loops share this `select!`, so they
-                // run concurrently and shut down together on cancellation.
-                Ok((stream, addr)) = accept_on(internal.as_ref().map(|(listener, _)| listener)) => {
-                    if let Some((_, internal_groups)) = &internal {
-                        self.spawn_connection(
-                            &mut set,
-                            &m,
-                            &spinner_style,
-                            connections,
-                            internal_groups.clone(),
-                            stream,
-                            addr,
-                            // Plaintext, deliberately, even when the client
-                            // listener is TLS. Nothing a client authenticates
-                            // with crosses this listener: it carries forwarded
-                            // group frames between replicas of one cluster, on
-                            // a port reachable only through the headless
-                            // Service, and #360 removes the listener outright.
-                            // Encrypting it needs a peer trust store plus a
-                            // client config on the forward side — a real cost,
-                            // spent on a listener with a deletion date.
-                            // Revisit only if #360 is abandoned.
-                            None,
-                        )?;
-                    }
-
-                    continue;
-                }
-
-                _ = prune_interval.tick() => {
-                    // Evict the coordinator's per-group state for groups this
-                    // replica has stopped serving (#283). Its own arm, on its own
-                    // interval: it walks in-memory maps and issues no request, so
-                    // it must not be skipped just because a storage pass is still
-                    // draining — that is precisely the loaded pod whose memory
-                    // this bounds — nor because this fleet runs no storage
-                    // maintenance, which is how it came to never run at all.
-                    //
-                    // `groups` alone covers `internal_groups` too: both are built
-                    // from one `Controller` whose clone shares the maps, and the
-                    // internal coordinator is always the plain local one, so it
-                    // holds nothing of its own to sweep.
-                    let evicted = self.groups.prune();
-                    if evicted > 0 {
-                        debug!(evicted, "pruned idle coordinator group state");
-                    }
 
                     continue;
                 }
@@ -697,16 +584,8 @@ where
     /// Serve one accepted connection on `set`, with `groups` as the group
     /// coordinator for its service stack.
     ///
-    /// Shared by both accept arms of [`Broker::listen`]: the public listener
-    /// serves with the broker's own coordinator (which may forward to the
-    /// group's owner), the internal listener with the plain local one. The
-    /// stacks are otherwise identical — same storage, SASL and topic
-    /// defaults.
-    ///
     /// `acceptor` decides the transport: `Some` wraps the stream in TLS before
-    /// the Kafka stack sees a byte, `None` serves it as it arrived. The two
-    /// accept arms pass different values (#358), which is the whole of the
-    /// per-listener transport policy.
+    /// the Kafka stack sees a byte, `None` serves it as it arrived (#358).
     #[allow(clippy::too_many_arguments)]
     fn spawn_connection(
         &self,
@@ -851,16 +730,6 @@ async fn bind(url: &Url, default_port: u16) -> Result<TcpListener> {
     .map_err(Into::into)
 }
 
-/// Accept on `listener` when one is bound; an absent listener never yields,
-/// so the `select!` arm it feeds is simply inert (used for the internal
-/// listener, which only exists when group forwarding is enabled).
-async fn accept_on(listener: Option<&TcpListener>) -> io::Result<(TcpStream, SocketAddr)> {
-    match listener {
-        Some(listener) => listener.accept().await,
-        None => pending().await,
-    }
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct Builder<N, C, I, A, S, L> {
     node_id: N,
@@ -875,11 +744,6 @@ pub struct Builder<N, C, I, A, S, L> {
     silent: bool,
     maintenance: Maintenance,
     topic_defaults: TopicDefaults,
-    group_forwarding: bool,
-    group_forward_peer_dns: Option<String>,
-    internal_listener_url: Option<Url>,
-    pod_ip: Option<IpAddr>,
-
     cancellation: CancellationToken,
 }
 
@@ -909,10 +773,6 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             silent: self.silent,
             maintenance: self.maintenance,
             topic_defaults: self.topic_defaults,
-            group_forwarding: self.group_forwarding,
-            group_forward_peer_dns: self.group_forward_peer_dns,
-            internal_listener_url: self.internal_listener_url,
-            pod_ip: self.pod_ip,
 
             cancellation: self.cancellation,
         }
@@ -932,10 +792,6 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             silent: self.silent,
             maintenance: self.maintenance,
             topic_defaults: self.topic_defaults,
-            group_forwarding: self.group_forwarding,
-            group_forward_peer_dns: self.group_forward_peer_dns,
-            internal_listener_url: self.internal_listener_url,
-            pod_ip: self.pod_ip,
 
             cancellation: self.cancellation,
         }
@@ -955,10 +811,6 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             silent: self.silent,
             maintenance: self.maintenance,
             topic_defaults: self.topic_defaults,
-            group_forwarding: self.group_forwarding,
-            group_forward_peer_dns: self.group_forward_peer_dns,
-            internal_listener_url: self.internal_listener_url,
-            pod_ip: self.pod_ip,
 
             cancellation: self.cancellation,
         }
@@ -981,10 +833,6 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             silent: self.silent,
             maintenance: self.maintenance,
             topic_defaults: self.topic_defaults,
-            group_forwarding: self.group_forwarding,
-            group_forward_peer_dns: self.group_forward_peer_dns,
-            internal_listener_url: self.internal_listener_url,
-            pod_ip: self.pod_ip,
 
             cancellation: self.cancellation,
         }
@@ -1043,10 +891,6 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             silent: self.silent,
             maintenance,
             topic_defaults: self.topic_defaults,
-            group_forwarding: self.group_forwarding,
-            group_forward_peer_dns: self.group_forward_peer_dns,
-            internal_listener_url: self.internal_listener_url,
-            pod_ip: self.pod_ip,
 
             cancellation: self.cancellation,
         }
@@ -1068,10 +912,6 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             silent: self.silent,
             maintenance: self.maintenance,
             topic_defaults: self.topic_defaults,
-            group_forwarding: self.group_forwarding,
-            group_forward_peer_dns: self.group_forward_peer_dns,
-            internal_listener_url: self.internal_listener_url,
-            pod_ip: self.pod_ip,
 
             cancellation: self.cancellation,
         }
@@ -1107,42 +947,10 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             ..self
         }
     }
-
-    /// Enable forward-to-owner group coordination (default: off, pure-local).
-    pub fn group_forwarding(self, group_forwarding: bool) -> Self {
-        Self {
-            group_forwarding,
-            ..self
-        }
-    }
-
-    /// Headless-Service hostname whose A/AAAA records are the peer replicas
-    /// eligible to own consumer groups.
-    pub fn group_forward_peer_dns(self, group_forward_peer_dns: Option<String>) -> Self {
-        Self {
-            group_forward_peer_dns,
-            ..self
-        }
-    }
-
-    /// URL of the internal (broker-to-broker) listener; forwarded group
-    /// requests are sent to each owner at this URL's port.
-    pub fn internal_listener_url(self, internal_listener_url: Option<Url>) -> Self {
-        Self {
-            internal_listener_url,
-            ..self
-        }
-    }
-
-    /// This replica's own address (in Kubernetes, the pod IP from the
-    /// Downward API), used to recognise itself in the peer set.
-    pub fn pod_ip(self, pod_ip: Option<IpAddr>) -> Self {
-        Self { pod_ip, ..self }
-    }
 }
 
 impl Builder<i32, String, Uuid, Url, Url, Url> {
-    pub async fn build(self) -> Result<Broker<GroupCoordinator<ArcDynStorage>, ArcDynStorage>> {
+    pub async fn build(self) -> Result<Broker<Controller<ArcDynStorage>, ArcDynStorage>> {
         if let Some(otlp_endpoint_url) = self
             .otlp_endpoint_url
             .clone()
@@ -1162,59 +970,12 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             .await
             .map(|storage| Arc::new(storage) as ArcDynStorage)?;
 
-        let controller = Controller::with_storage(storage.clone())?;
-
-        // Local (pure-local group coordination, bit-for-bit today's
-        // behaviour) unless forwarding is explicitly enabled AND the peer
-        // discovery inputs are both present; anything less degrades to
-        // Local, never to a broken half-configuration. Only the
-        // fully-configured forwarding arm produces the internal listener —
-        // the receive side of the forward hop — and its coordinator is
-        // always the plain local one, so a forwarded frame is served
-        // locally by construction (one hop, no forwarding loop possible).
-        let (groups, internal_listener, internal_groups) = match (
-            self.group_forwarding,
-            self.group_forward_peer_dns.as_deref(),
-            self.pod_ip,
-        ) {
-            (true, Some(peer_dns), Some(pod_ip)) => {
-                let internal_listener = match self.internal_listener_url {
-                    Some(internal_listener_url) => internal_listener_url,
-                    None => Url::parse(&format!("tcp://0.0.0.0:{DEFAULT_INTERNAL_PORT}"))?,
-                };
-
-                let internal_port = internal_listener.port().unwrap_or(DEFAULT_INTERNAL_PORT);
-
-                debug!(%peer_dns, %pod_ip, internal_port, "group forwarding enabled");
-
-                let registry = Arc::new(PeerRegistry::new(pod_ip, peer_dns, PEER_REFRESH_INTERVAL));
-                _ = registry.clone().spawn_refresh();
-
-                // Both coordinators are built from the same `Controller`
-                // (whose clone shares the in-memory group cache), so
-                // owner-local calls arriving on the public listener and
-                // forwarded calls arriving on the internal listener see the
-                // same group state.
-                (
-                    GroupCoordinator::forwarding(controller.clone(), registry, internal_port),
-                    Some(internal_listener),
-                    Some(GroupCoordinator::local(controller)),
-                )
-            }
-
-            (true, peer_dns, pod_ip) => {
-                warn!(
-                    ?peer_dns,
-                    ?pod_ip,
-                    "group forwarding enabled without peer dns and pod ip; \
-                     using local group coordination"
-                );
-
-                (GroupCoordinator::local(controller), None, None)
-            }
-
-            (false, _, _) => (GroupCoordinator::local(controller), None, None),
-        };
+        // One coordinator, and nothing to choose between: a group is coordinated
+        // by whichever replica the request arrived at (#360). There is no owner
+        // to elect, no peer set to discover, no second listener to bind — the
+        // decomposed group objects (#359) made a group's writes independent, so
+        // routing them to one replica bought nothing that the CAS does not.
+        let groups = Controller::with_storage(storage.clone())?;
 
         let sasl_config = if self.authentication {
             tansu_auth::configuration(storage.clone()).map(Some)?
@@ -1230,8 +991,6 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             advertised_listener: self.advertised_listener,
             storage,
             groups,
-            internal_listener,
-            internal_groups,
             sasl_config,
             tls_server_config: self.tls_server_config.map(Arc::new),
 
@@ -1448,182 +1207,6 @@ mod tests {
                 until_next_aligned_tick(at(1_755_000_000_000), Duration::ZERO),
                 Duration::ZERO
             );
-        }
-    }
-
-    /// Building a broker needs the in-memory object store, which — like the
-    /// existing `tests/cg*.rs` in-memory suites — is only built
-    /// workspace-wide with `--all-features` (the `dynostore` feature of
-    /// `tansu-storage` is enabled through the `tansu` crate).
-    #[cfg(feature = "dynostore")]
-    mod group_coordination {
-        use super::*;
-        use crate::coordinator::group::forward::{Forward, FrameForwarder};
-        use bytes::Bytes;
-        use tansu_sans_io::{
-            ApiKey as _, Body, JoinGroupRequest, join_group_request::JoinGroupRequestProtocol,
-        };
-
-        fn builder() -> Builder<i32, String, Uuid, Url, Url, Url> {
-            Broker::<GroupCoordinator<ArcDynStorage>, ArcDynStorage>::builder()
-                .node_id(111)
-                .cluster_id(Uuid::now_v7().to_string())
-                .incarnation_id(Uuid::now_v7())
-                .advertised_listener(Url::parse("tcp://localhost:9092").unwrap())
-                .storage(Url::parse("memory://").unwrap())
-                .listener(Url::parse("tcp://localhost:9092").unwrap())
-                .silent(true)
-        }
-
-        // The default is pure-local group coordination: without the
-        // forwarding flag the broker is built with `GroupCoordinator::Local`,
-        // bit-for-bit today's behaviour — and no internal listener.
-        #[tokio::test]
-        async fn build_defaults_to_local_group_coordination() -> Result<()> {
-            let broker = builder().build().await?;
-
-            assert!(matches!(broker.groups, GroupCoordinator::Local(_)));
-            assert!(broker.internal_listener.is_none());
-            assert!(broker.internal_groups.is_none());
-
-            Ok(())
-        }
-
-        // Forwarding requires the flag AND both discovery inputs. Only then
-        // is the internal listener constructed, and its coordinator is the
-        // plain local one — never the forwarding wrapper — so a forwarded
-        // frame is served locally by construction (the one-hop guarantee).
-        #[tokio::test]
-        async fn build_with_forwarding_flag_and_discovery_is_forwarding() -> Result<()> {
-            let broker = builder()
-                .group_forwarding(true)
-                .group_forward_peer_dns(Some("peers.example.invalid".into()))
-                .pod_ip(Some(IpAddr::from_str("10.0.0.1")?))
-                .build()
-                .await?;
-
-            assert!(matches!(broker.groups, GroupCoordinator::Forwarding(_)));
-            assert!(matches!(
-                broker.internal_listener.as_ref().and_then(Url::port),
-                Some(DEFAULT_INTERNAL_PORT)
-            ));
-            assert!(matches!(
-                broker.internal_groups,
-                Some(GroupCoordinator::Local(_))
-            ));
-
-            Ok(())
-        }
-
-        // A half-configuration (flag set, discovery inputs missing) degrades
-        // to Local rather than to a broken forwarding setup — and binds no
-        // internal listener.
-        #[tokio::test]
-        async fn build_with_forwarding_flag_but_no_discovery_is_local() -> Result<()> {
-            let broker = builder().group_forwarding(true).build().await?;
-
-            assert!(matches!(broker.groups, GroupCoordinator::Local(_)));
-            assert!(broker.internal_listener.is_none());
-            assert!(broker.internal_groups.is_none());
-
-            Ok(())
-        }
-
-        fn free_port() -> Result<u16> {
-            std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-                .and_then(|listener| listener.local_addr())
-                .map(|local_addr| local_addr.port())
-                .map_err(Into::into)
-        }
-
-        // The receive side of the forward hop, end to end: with forwarding
-        // enabled the broker binds the internal listener, and a frame-level
-        // JoinGroup delivered to it — by the production `FrameForwarder`,
-        // exactly what a peer replica sends to the group's owner — is served
-        // locally. The KIP-394 member-id-required response proves both that
-        // the local `Controller` processed the join and that the member's
-        // own client id survived the hop (the member id is derived from it).
-        #[tokio::test]
-        async fn internal_listener_serves_a_forwarded_group_request_locally() -> Result<()> {
-            let main_port = free_port()?;
-            let internal_port = free_port()?;
-
-            let mut broker = builder()
-                .listener(Url::parse(&format!("tcp://127.0.0.1:{main_port}"))?)
-                .group_forwarding(true)
-                // resolution failure leaves the peer set empty; discovery is
-                // not what this test exercises — the internal listener is
-                // dialled directly below.
-                .group_forward_peer_dns(Some("peers.example.invalid".into()))
-                .pod_ip(Some(IpAddr::from_str("127.0.0.1")?))
-                .internal_listener_url(Some(Url::parse(&format!(
-                    "tcp://127.0.0.1:{internal_port}"
-                ))?))
-                .build()
-                .await?;
-
-            assert!(matches!(broker.groups, GroupCoordinator::Forwarding(_)));
-
-            let serving = tokio::spawn(async move { broker.serve(Instant::now()).await });
-
-            let forwarder = FrameForwarder::new(internal_port);
-            let owner = IpAddr::from_str("127.0.0.1")?;
-
-            let request = JoinGroupRequest::default()
-                .group_id("pr3-internal-listener".into())
-                .session_timeout_ms(45_000)
-                .rebalance_timeout_ms(Some(60_000))
-                .member_id("".into())
-                .protocol_type("consumer".into())
-                .protocols(Some(vec![
-                    JoinGroupRequestProtocol::default()
-                        .name("range".into())
-                        .metadata(Bytes::from_static(b"pr3_meta")),
-                ]));
-
-            // retry until the spawned broker is accepting on the internal
-            // listener.
-            let mut response = None;
-
-            for _ in 0..50 {
-                match forwarder
-                    .call(
-                        owner,
-                        JoinGroupRequest::KEY,
-                        Some("pr3-member"),
-                        request.clone().into(),
-                    )
-                    .await
-                {
-                    Ok(body) => {
-                        response = Some(body);
-                        break;
-                    }
-
-                    Err(_) => sleep(Duration::from_millis(100)).await,
-                }
-            }
-
-            serving.abort();
-
-            match response {
-                Some(Body::JoinGroupResponse(join)) => {
-                    assert_eq!(
-                        ErrorCode::MemberIdRequired,
-                        ErrorCode::try_from(join.error_code)?
-                    );
-
-                    assert!(
-                        join.member_id.starts_with("pr3-member-"),
-                        "member id must be derived from the forwarded client id: {}",
-                        join.member_id
-                    );
-
-                    Ok(())
-                }
-
-                otherwise => panic!("expected a join group response, got: {otherwise:?}"),
-            }
         }
     }
 }

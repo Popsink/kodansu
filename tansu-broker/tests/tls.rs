@@ -37,7 +37,7 @@ use rustls::{
     ClientConfig, RootCertStore, ServerConfig,
     pki_types::{PrivateKeyDer, ServerName},
 };
-use tansu_broker::{NODE_ID, broker::Broker, coordinator::group::forward::GroupCoordinator};
+use tansu_broker::{NODE_ID, broker::Broker, coordinator::group::administrator::Controller};
 use tansu_sans_io::{
     ApiKey as _, ApiVersionsRequest, ApiVersionsResponse, Body, ErrorCode, Frame, Header,
 };
@@ -113,7 +113,7 @@ async fn free_port() -> Result<u16> {
 async fn listening(tls: Option<ServerConfig>) -> Result<u16> {
     let port = free_port().await?;
 
-    let broker = Broker::<GroupCoordinator<ArcDynStorage>, ArcDynStorage>::builder()
+    let broker = Broker::<Controller<ArcDynStorage>, ArcDynStorage>::builder()
         .node_id(NODE_ID)
         .cluster_id(Uuid::now_v7().to_string())
         .incarnation_id(Uuid::now_v7())

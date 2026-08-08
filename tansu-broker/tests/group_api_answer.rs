@@ -16,37 +16,41 @@
 //! socket (#300).
 //!
 //! `Error::Api(NOT_COORDINATOR)` is what #243 added so a failed forward hop
-//! tells the client to retry against the real owner rather than being processed
+//! told the client to retry against the real owner rather than being processed
 //! locally and splitting the group. Nothing converted it into a response: it
 //! propagated through the whole service stack into the per-connection task,
 //! which abandons the connection **without writing anything**. To the caller
 //! that is a read that ends before a response frame arrives — `early eof`.
 //!
-//! This exercises the real stack over a real socket, with the production
-//! forward client on the other end, because that is the only place the
-//! difference between "answered" and "connection dropped" exists. A unit test
-//! on the service alone cannot see it: the service returns `Err` either way,
-//! and it is the connection loop above that turns the `Err` into a dropped
-//! socket.
+//! Forwarding is gone (#360) and `NOT_COORDINATOR` with it, but the property is
+//! not about forwarding: *any* `Error::Api` a service returns must reach the
+//! caller as a response frame. `NOT_COORDINATOR` stays as the specimen because
+//! it is the one the incident was reported on.
+//!
+//! This exercises the real stack over a real socket, because that is the only
+//! place the difference between "answered" and "connection dropped" exists. A
+//! unit test on the service alone cannot see it: the service returns `Err`
+//! either way, and it is the connection loop above that turns the `Err` into a
+//! dropped socket. The client used to be the production forward client — the
+//! only thing in the tree that spoke frames to a broker — and is now a local
+//! one, so the assertion did not follow the deleted code out.
 
-use std::{
-    io,
-    net::{IpAddr, Ipv4Addr},
-    sync::Arc,
-    time::Duration,
-};
+use std::{io, net::Ipv4Addr, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use rama::{Context, Service as _};
+use rama::{Context, Layer as _, Service as _};
 use tansu_broker::{
     Error,
-    coordinator::group::{Coordinator, OffsetCommit, forward::Forward, forward::FrameForwarder},
+    coordinator::group::{Coordinator, OffsetCommit},
     service::services,
 };
+use tansu_client::{
+    BytesConnectionService, ConnectionManager, FrameConnectionLayer, FramePoolLayer, Pool,
+};
 use tansu_sans_io::{
-    ApiKey as _, Body, ErrorCode, HeartbeatRequest, JoinGroupRequest, LeaveGroupRequest,
-    OffsetCommitRequest, OffsetFetchRequest, SyncGroupRequest,
+    ApiKey as _, Body, ErrorCode, Frame, Header, HeartbeatRequest, JoinGroupRequest,
+    LeaveGroupRequest, OffsetCommitRequest, OffsetFetchRequest, SyncGroupRequest,
     join_group_request::JoinGroupRequestProtocol,
     leave_group_request::MemberIdentity,
     offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
@@ -55,9 +59,69 @@ use tansu_sans_io::{
     },
     sync_group_request::SyncGroupRequestAssignment,
 };
+use tansu_service::FrameBytesLayer;
 use tansu_storage::{Storage, StorageContainer};
 use tokio::{net::TcpListener, time::timeout};
 use url::Url;
+
+/// A frame-level Kafka client over a real socket.
+///
+/// Frame level rather than `Client::call` for the same reason the forward hop
+/// was: the typed client stamps the *pool's* client id on every request, and
+/// the frame path takes it from the frame, which is what lets one connection
+/// speak for several notional callers.
+struct FrameClient {
+    pool: Pool,
+}
+
+impl FrameClient {
+    async fn connect(port: u16) -> Result<Self> {
+        ConnectionManager::builder(Url::parse(&format!("tcp://127.0.0.1:{port}"))?)
+            .client_id(Some("group-api-answer".into()))
+            .max_size(Some(1))
+            .build()
+            .await
+            .map(|pool| Self { pool })
+            .map_err(Into::into)
+    }
+
+    async fn call(&self, api_key: i16, client_id: Option<&str>, body: Body) -> Result<Body> {
+        let negotiated = self.pool.manager().api_version(api_key)?;
+
+        // `OffsetFetch` in its pre-v8 shape (`group_id` + `topics`) only
+        // encodes at v7 and below: v8 restructured the request around a
+        // `groups` array, so sending a legacy-shaped call at v8+ would
+        // silently drop the group.
+        let api_version = match &body {
+            Body::OffsetFetchRequest(request) if request.group_id.is_some() => negotiated.min(7),
+            _ => negotiated,
+        };
+
+        let frame = Frame {
+            size: 0,
+            header: Header::Request {
+                api_key,
+                api_version,
+                // swapped for the pooled connection's own correlation id by
+                // `FrameConnectionService`.
+                correlation_id: 0,
+                client_id: client_id.map(ToOwned::to_owned),
+            },
+            body,
+        };
+
+        (
+            FramePoolLayer::new(self.pool.clone()),
+            FrameConnectionLayer,
+            FrameBytesLayer,
+        )
+            .into_layer(BytesConnectionService)
+            .serve(Context::default(), frame)
+            .await
+            .map(|response| response.body)
+            .map_err(Into::into)
+    }
+}
 use uuid::Uuid;
 
 /// A coordinator that answers every API the way a failed forward hop does.
@@ -169,16 +233,15 @@ async fn serve_broker_stack() -> Result<u16> {
     Ok(port)
 }
 
-/// Every forwarded group API answers `NOT_COORDINATOR` in a decodable frame.
+/// Every group API answers its `Error::Api` in a decodable frame.
 ///
 /// Before #300 each of these returned a transport error instead — the caller's
-/// read ended with no response frame — and `FrameForwarder::call` surfaced it as
-/// `Io(UnexpectedEof)`, which the original report saw as `early eof`.
+/// read ended with no response frame — surfacing as `Io(UnexpectedEof)`, which
+/// the original report saw as `early eof`.
 #[tokio::test]
-async fn a_forwarded_group_api_error_is_answered_not_dropped() -> Result<()> {
+async fn a_group_api_error_is_answered_not_dropped() -> Result<()> {
     let port = serve_broker_stack().await?;
-    let forwarder = FrameForwarder::new(port);
-    let owner = IpAddr::from(Ipv4Addr::LOCALHOST);
+    let client = FrameClient::connect(port).await?;
 
     let requests: Vec<(&str, i16, Body)> = vec![
         (
@@ -278,10 +341,10 @@ async fn a_forwarded_group_api_error_is_answered_not_dropped() -> Result<()> {
     for (api, api_key, body) in requests {
         let response = timeout(
             Duration::from_secs(10),
-            forwarder.call(owner, api_key, Some("c-300"), body),
+            client.call(api_key, Some("c-300"), body),
         )
         .await?
-        .unwrap_or_else(|error| panic!("{api}: forward failed instead of answering: {error:?}"));
+        .unwrap_or_else(|error| panic!("{api}: failed instead of answering: {error:?}"));
 
         match response {
             Body::JoinGroupResponse(join) => assert_eq!(not_coordinator, join.error_code, "{api}"),
@@ -417,8 +480,7 @@ async fn a_non_api_error_still_ends_the_connection() -> Result<()> {
         }
     });
 
-    let forwarder = FrameForwarder::new(port);
-    let owner = IpAddr::from(Ipv4Addr::LOCALHOST);
+    let client = FrameClient::connect(port).await?;
 
     let request: Body = JoinGroupRequest::default()
         .group_id("g-300".into())
@@ -439,7 +501,7 @@ async fn a_non_api_error_still_ends_the_connection() -> Result<()> {
     // before the JoinGroup that must not be answered.
     let outcome = timeout(
         Duration::from_secs(10),
-        forwarder.call(owner, JoinGroupRequest::KEY, Some("c-300"), request),
+        client.call(JoinGroupRequest::KEY, Some("c-300"), request),
     )
     .await?;
 

@@ -148,9 +148,10 @@ byte-identical value than `GroupDetail` is.
 `just test-group-scale` drives `GROUPS × MEMBERS` consumers through the full
 KIP-394 dance across `REPLICAS` coordinators over one shared store, and asserts
 convergence, a formation write budget, and a **steady-state window that costs
-nothing**. It is the exit criterion for the group-state decomposition (#359) —
-`cg_forward` proves *one* group converges, and the deployment that wedged had
-many.
+nothing**. Every replica drives every group: there is no owner and no
+configuration (#360). It is the exit criterion for the group-state
+decomposition (#359), on the shape that made the 1500-topic deployment wedge —
+many groups at once, not one.
 
 `#[ignore]`d in the suite: it is wall clock rather than a regression gate, and
 `.github/workflows/storage.yml` runs it nightly. The size is environment-driven,
@@ -165,8 +166,7 @@ TANSU_SCALE_GROUPS=8 just test-group-scale
 | `TANSU_SCALE_GROUPS` | 64 | |
 | `TANSU_SCALE_MEMBERS` | 16 | the group size that never converged |
 | `TANSU_SCALE_REPLICAS` | 10 | the deployment's broker count |
-| `TANSU_SCALE_FORWARDING` | true | false runs the same consumers with no owner replica |
-| `TANSU_SCALE_PUT_BUDGET_PER_MEMBER` | 6 | writes of `generation.json` a group may cost to form |
+| `TANSU_SCALE_PUT_BUDGET_PER_MEMBER` | 8 | writes of `generation.json` a group may cost to form |
 | `TANSU_SCALE_DEADLINE_SECS` | 120 | per-member, only reached on failure |
 
 The object the budget counts is `generation.json`, and it counts **attempts**:
@@ -174,27 +174,25 @@ a conditional PUT the store rejects on its precondition is still a request it
 charged for. `{group}.json` is not written at all any more, so counting it would
 be asserting zero of nothing.
 
-Measured at the default size, both arrangements converging 1024 members:
-
-| | formation attempts | landed | steady-state writes |
-|---|---|---|---|
-| `TANSU_SCALE_FORWARDING=true` | ~1100 | 1024 | 0 |
-| `TANSU_SCALE_FORWARDING=false` | ~3830 | 1024 | 0 |
+Measured at the default size, 1024 members converging: **~5010 formation
+attempts, 1024 landed, 0 steady-state writes.**
 
 1024 landed writes is 64 groups × 16 members — one CAS per member, which is the
-floor for admitting them one at a time. Scattered, the members race for those
-1024 slots and are rejected ~2800 times on the way; forwarded, the owner
-serializes them in-process and almost none are. **Formation conflicts are
-budgeted rather than forbidden**: N members racing to add themselves to one
-document is a race, and the CAS is what resolves it.
+floor for admitting them one at a time. The members race for those 1024 slots
+and are rejected ~4000 times on the way. **Formation conflicts are budgeted
+rather than forbidden**: N members racing to add themselves to one document is a
+race, and the CAS is what resolves it. Nothing serializes them any more — the
+per-group in-process lock went with the rest of the per-group state (#360), so
+members served by the same replica race exactly as members on different ones do.
+That is the trade the autoscaling story is bought with, and it is paid once per
+rebalance rather than continuously.
 
 What is asserted as an exact zero is the *steady state*. After convergence every
 member heartbeats several times from the replica it entered through, and across
 all 64 groups that must produce no write of `generation.json` beyond the sweep's
 own stamp, no CAS conflict, and no listing of member documents. That is the
 regime a deployment lives in, and it is the property that used to require an
-owner: `TANSU_SCALE_FORWARDING=false` is the arrangement #360 wants to make the
-only one, and it now holds all three assertions.
+owner.
 
 ## What is not covered
 

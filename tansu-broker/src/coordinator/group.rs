@@ -13,7 +13,6 @@
 // limitations under the License.
 
 pub mod administrator;
-pub mod forward;
 
 use crate::Result;
 use async_trait::async_trait;
@@ -89,25 +88,4 @@ pub trait Coordinator: Clone + Debug + Send + Sync + 'static {
         groups: Option<&[OffsetFetchRequestGroup]>,
         require_stable: Option<bool>,
     ) -> Result<Body>;
-
-    /// Evict process-local per-group state this replica no longer needs,
-    /// returning how many groups were evicted (#283).
-    ///
-    /// Called from the broker's maintenance tick, which is the only place that
-    /// holds both the coordinator and a periodic clock. It is *not* driven by
-    /// `DeleteGroups` or by group expiry, even though those are the events that
-    /// end a group's life: both happen inside the storage engine, which has no
-    /// handle on the coordinator, so either would have to be a callback pointing
-    /// the wrong way through the layering. `Controller::prune_idle_groups` carries
-    /// the rest of that argument, including what idleness covers that deletion
-    /// does not.
-    ///
-    /// Synchronous and cheap by design — it walks in-memory maps and issues no
-    /// request — so the maintenance tick can call it unconditionally.
-    ///
-    /// Defaults to evicting nothing, for a coordinator that holds no per-group
-    /// state.
-    fn prune(&self) -> usize {
-        0
-    }
 }

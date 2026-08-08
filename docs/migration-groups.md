@@ -72,6 +72,15 @@ with two layouts written into it by accident, and that the failure says so at
    `generation.json` is absent, so it is created, and members register their own
    documents as they join. There is no pass to run and nothing to pre-provision.
 
+**The old `{group}.json` objects stay where they are, indefinitely.** Expiry
+condemns a *group* on the newest `last_modified` of anything it owns, and a live
+group always has something fresh under `{group}/` — so nothing reaps the
+leftover while the group is alive. It is inert: not read, not written, not
+listed as a group of its own (it shares its group's name). It goes when the
+group does, via `DeleteGroups` or expiry of the whole group. Budget for one
+small object per group you ever had, forever, or sweep the prefix by hand once
+you are past wanting to roll back.
+
 Expect, in the first minutes:
 
 - every consumer group rebalancing once, which is what a coordinator restart
@@ -94,9 +103,8 @@ Symmetric and free, precisely because offsets are never touched:
    layout, with the same committed offsets.
 
 The decomposed objects are left behind, inert, under each group's prefix — the
-mirror image of what the forward cutover leaves behind. They cost storage and
-nothing else; `delete_groups` removes them along with everything else the group
-owns, and expiry sweeps them with the group.
+mirror image of what the forward cutover leaves behind, and with the same
+lifetime: they survive as long as the group does, and go with it.
 
 **Rollback is only free while the old binary is still deployable.** The new
 binary can no longer read or write `{group}.json` at all, so the leftover is what
@@ -132,7 +140,7 @@ still reads `2`, so the assertion passes and the groups re-form.
 | Object | Role |
 |---|---|
 | `clusters/{cluster}/schema/groups.json` | The layout assertion. `{"version":2}` is the decomposed layout. |
-| `groups/consumers/{group}.json` | The **legacy** single group object. Neither read nor written; deleted with the group and reaped by expiry. |
+| `groups/consumers/{group}.json` | The **legacy** single group object. Neither read nor written. Survives for as long as the group does; removed only with the whole group. |
 | `groups/consumers/{group}/generation.json` | The group's composition. The only object several members contend on, CAS'd, and only when membership changes. |
 | `groups/consumers/{group}/members/{member}.json` | One member's liveness and subscription. One logical writer, at most once per session/2. |
 | `groups/consumers/{group}/assignment/{generation}.json` | A generation's assignment. Create-only and immutable; its existence is what makes a group `Stable`. |
