@@ -142,11 +142,14 @@ use tracing::warn;
 #[cfg(feature = "dynostore")]
 mod dynostore;
 
+mod acl;
 mod batch;
 mod group;
 mod latency;
 mod null;
 mod service;
+
+pub use acl::{AclBinding, AclFilter, Acls, WILDCARD_HOST, WILDCARD_PRINCIPAL, WILDCARD_RESOURCE};
 
 pub use group::{
     AssignmentDoc, AssignmentOutcome, GROUP_SCHEMA_VERSION, GenerationDoc, GroupSchema, MemberDoc,
@@ -157,11 +160,11 @@ pub use latency::LatencyIntroducingStorage;
 
 pub use service::{
     AlterUserScramCredentialsService, ConsumerGroupDescribeService, CreateAclsService,
-    CreateTopicsService, DeleteGroupsService, DeleteRecordsService, DeleteTopicsService,
-    DescribeAclsService, DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
-    DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
-    FindCoordinatorService, GetTelemetrySubscriptionsService, IncrementalAlterConfigsService,
-    InitProducerIdService, ListGroupsService, ListOffsetsService,
+    CreateTopicsService, DeleteAclsService, DeleteGroupsService, DeleteRecordsService,
+    DeleteTopicsService, DescribeAclsService, DescribeClusterService, DescribeConfigsService,
+    DescribeGroupsService, DescribeTopicPartitionsService, DescribeUserScramCredentialsService,
+    FetchService, FindCoordinatorService, GetTelemetrySubscriptionsService,
+    IncrementalAlterConfigsService, InitProducerIdService, ListGroupsService, ListOffsetsService,
     ListPartitionReassignmentsService, MetadataService, ProduceService, TxnAddOffsetsService,
     TxnAddPartitionService, TxnOffsetCommitService,
 };
@@ -1494,6 +1497,25 @@ pub trait Storage: Debug + Send + Sync + 'static {
         generation_id: i32,
     ) -> Result<u64>;
 
+    /// Create each ACL, answering one error code per creation **in request
+    /// order** (#363).
+    ///
+    /// Creating a rule that already exists is success: `kafka-acls.sh` is run
+    /// from configuration management, so re-applying the same file must not
+    /// start reporting failures on the second run.
+    async fn create_acls(&self, bindings: &[AclBinding]) -> Result<Vec<ErrorCode>>;
+
+    /// Every ACL `filter` selects.
+    async fn describe_acls(&self, filter: &AclFilter) -> Result<Vec<AclBinding>>;
+
+    /// Delete every ACL each filter selects, answering what each one removed,
+    /// in request order.
+    ///
+    /// The removed bindings rather than a count, because that is what
+    /// `DeleteAcls` reports back and what an operator reads to confirm they
+    /// deleted what they meant to.
+    async fn delete_acls(&self, filters: &[AclFilter]) -> Result<Vec<Vec<AclBinding>>>;
+
     /// Assert that the group layout this binary writes is the one the cluster
     /// already holds, claiming it when the cluster holds none (#359).
     ///
@@ -1822,6 +1844,18 @@ where
         self.as_ref()
             .delete_group_assignments_before(group_id, generation_id)
             .await
+    }
+
+    async fn create_acls(&self, bindings: &[AclBinding]) -> Result<Vec<ErrorCode>> {
+        self.as_ref().create_acls(bindings).await
+    }
+
+    async fn describe_acls(&self, filter: &AclFilter) -> Result<Vec<AclBinding>> {
+        self.as_ref().describe_acls(filter).await
+    }
+
+    async fn delete_acls(&self, filters: &[AclFilter]) -> Result<Vec<Vec<AclBinding>>> {
+        self.as_ref().delete_acls(filters).await
     }
 
     async fn assert_group_schema(&self) -> Result<()> {
@@ -2164,6 +2198,18 @@ where
         self.as_ref()
             .delete_group_assignments_before(group_id, generation_id)
             .await
+    }
+
+    async fn create_acls(&self, bindings: &[AclBinding]) -> Result<Vec<ErrorCode>> {
+        self.as_ref().create_acls(bindings).await
+    }
+
+    async fn describe_acls(&self, filter: &AclFilter) -> Result<Vec<AclBinding>> {
+        self.as_ref().describe_acls(filter).await
+    }
+
+    async fn delete_acls(&self, filters: &[AclFilter]) -> Result<Vec<Vec<AclBinding>>> {
+        self.as_ref().delete_acls(filters).await
     }
 
     async fn assert_group_schema(&self) -> Result<()> {

@@ -21,10 +21,12 @@ use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
 
 use tansu_sans_io::{ErrorCode, join_group_response::JoinGroupResponseMember};
 
+use tansu_sans_io::{acl, resource};
+
 use crate::{
-    AssignmentDoc, AssignmentOutcome, ConsumerGroupState, Error, GROUP_SCHEMA_VERSION,
-    GenerationDoc, GroupDetail, GroupDetailResponse, GroupSchema, MemberDoc, MemberRef,
-    NamedGroupDetail, Result, Storage, UpdateError,
+    AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, ConsumerGroupState, Error,
+    GROUP_SCHEMA_VERSION, GenerationDoc, GroupDetail, GroupDetailResponse, GroupSchema, MemberDoc,
+    MemberRef, NamedGroupDetail, Result, Storage, UpdateError, WILDCARD_HOST,
     dynostore::{
         DynoStore,
         tests::{init_tracing, legacy_group_exists, seed_legacy_group},
@@ -794,6 +796,69 @@ async fn a_cluster_in_another_layout_refuses_to_start() -> Result<()> {
             "a binary writing layout {GROUP_SCHEMA_VERSION} must refuse a cluster in {version}",
         );
     }
+
+    Ok(())
+}
+
+/// ACLs live in the object store, not in the process that applied them (#363).
+///
+/// The property that makes them worth having on a stateless fleet: a replica
+/// that did not apply a rule enforces it, and a restart does not lose it. Two
+/// `DynoStore`s over one bucket is what stands in for that here — the same
+/// shape the cutover and the multi-writer tests use — because a
+/// `StorageContainer` over `memory://` builds its *own* bucket, so sharing one
+/// through that API would be sharing a process rather than a store.
+#[tokio::test]
+async fn acls_are_readable_by_a_replica_that_did_not_apply_them() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+
+    let applied = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    let other = DynoStore::new(CLUSTER, NODE + 1, bucket.clone());
+
+    let everything = AclFilter {
+        resource_type: acl::Resource::Any,
+        pattern: resource::Pattern::Any,
+        operation: acl::Operation::Any,
+        permission: acl::Permission::Any,
+        ..Default::default()
+    };
+
+    assert!(
+        other.describe_acls(&everything).await?.is_empty(),
+        "a cluster with no ACLs has none",
+    );
+
+    let binding = AclBinding {
+        resource_type: acl::Resource::Topic,
+        resource_name: "tenant-a.".into(),
+        pattern: resource::Pattern::Prefixed,
+        principal: "User:alice".into(),
+        host: WILDCARD_HOST.into(),
+        operation: acl::Operation::Read,
+        permission: acl::Permission::Allow,
+    };
+
+    assert_eq!(
+        vec![ErrorCode::None],
+        applied.create_acls(std::slice::from_ref(&binding)).await?,
+    );
+
+    assert_eq!(
+        vec![binding.clone()],
+        other.describe_acls(&everything).await?,
+        "a replica that did not apply the rule must read it",
+    );
+
+    // And a delete from the other replica is seen by the first: one object,
+    // one CAS, whoever writes it.
+    assert_eq!(
+        vec![vec![binding]],
+        other.delete_acls(std::slice::from_ref(&everything)).await?,
+    );
+
+    assert!(applied.describe_acls(&everything).await?.is_empty());
 
     Ok(())
 }

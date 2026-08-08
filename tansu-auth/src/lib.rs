@@ -103,6 +103,26 @@ impl Authentication {
         }
     }
 
+    /// Who authenticated on this connection, once one has (#363).
+    ///
+    /// Captured all along — `Stage::Finished` has held the SASL authentication
+    /// id since authentication was added — and never exposed, because nothing
+    /// downstream had a use for it: the broker asked *whether* a client had
+    /// authenticated and never *who* it was. Authorization is the first thing
+    /// that needs the second question answered.
+    ///
+    /// `None` on a connection that has not authenticated, which on a broker
+    /// started without `--authentication` is every connection.
+    pub fn principal(&self) -> Option<String> {
+        self.stage
+            .lock()
+            .ok()
+            .and_then(|guard| match guard.as_ref() {
+                Some(Stage::Finished(Some(success))) => Some(success.auth_id().to_owned()),
+                _ => None,
+            })
+    }
+
     pub fn is_authenticated(&self) -> bool {
         self.stage
             .lock()
@@ -146,6 +166,14 @@ impl fmt::Display for AuthError {
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Success {
     auth_id: String,
+}
+
+impl Success {
+    /// The authenticated user: the SASL authentication id, which is what a
+    /// Kafka principal is built from (#363).
+    pub fn auth_id(&self) -> &str {
+        self.auth_id.as_str()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]

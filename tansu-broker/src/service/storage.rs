@@ -19,8 +19,8 @@ use rama::{
 use tansu_sans_io::{
     AddOffsetsToTxnRequest, AddPartitionsToTxnRequest, AlterUserScramCredentialsRequest,
     ApiKey as _, ConsumerGroupDescribeRequest, CreateAclsRequest, CreateTopicsRequest,
-    DeleteGroupsRequest, DeleteRecordsRequest, DeleteTopicsRequest, DescribeAclsRequest,
-    DescribeClusterRequest, DescribeConfigsRequest, DescribeGroupsRequest,
+    DeleteAclsRequest, DeleteGroupsRequest, DeleteRecordsRequest, DeleteTopicsRequest,
+    DescribeAclsRequest, DescribeClusterRequest, DescribeConfigsRequest, DescribeGroupsRequest,
     DescribeTopicPartitionsRequest, DescribeUserScramCredentialsRequest, FetchRequest,
     FindCoordinatorRequest, GetTelemetrySubscriptionsRequest, IncrementalAlterConfigsRequest,
     InitProducerIdRequest, ListGroupsRequest, ListOffsetsRequest,
@@ -29,11 +29,11 @@ use tansu_sans_io::{
 use tansu_service::{FrameRequestLayer, FrameRouteBuilder};
 use tansu_storage::{
     AlterUserScramCredentialsService, ConsumerGroupDescribeService, CreateAclsService,
-    CreateTopicsService, DeleteGroupsService, DeleteRecordsService, DeleteTopicsService,
-    DescribeAclsService, DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
-    DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
-    FindCoordinatorService, GetTelemetrySubscriptionsService, IncrementalAlterConfigsService,
-    InitProducerIdService, ListGroupsService, ListOffsetsService,
+    CreateTopicsService, DeleteAclsService, DeleteGroupsService, DeleteRecordsService,
+    DeleteTopicsService, DescribeAclsService, DescribeClusterService, DescribeConfigsService,
+    DescribeGroupsService, DescribeTopicPartitionsService, DescribeUserScramCredentialsService,
+    FetchService, FindCoordinatorService, GetTelemetrySubscriptionsService,
+    IncrementalAlterConfigsService, InitProducerIdService, ListGroupsService, ListOffsetsService,
     ListPartitionReassignmentsService, MetadataService, ProduceService, Storage,
     TxnAddOffsetsService, TxnAddPartitionService, TxnOffsetCommitService,
 };
@@ -54,6 +54,7 @@ where
         consumer_group_describe,
         create_acls,
         create_topics,
+        delete_acls,
         delete_groups,
         delete_records,
         delete_topics,
@@ -139,6 +140,27 @@ where
                 FrameRequestLayer::<CreateAclsRequest>::new(),
             )
                 .into_layer(CreateAclsService)
+                .boxed(),
+        )
+        .map_err(Into::into)
+}
+
+pub fn delete_acls<S>(
+    builder: FrameRouteBuilder<(), Error>,
+    storage: S,
+) -> Result<FrameRouteBuilder<(), Error>, Error>
+where
+    S: Storage + Clone,
+{
+    builder
+        .with_route(
+            DeleteAclsRequest::KEY,
+            (
+                MapErrLayer::new(Error::from),
+                MapStateLayer::new(|_| storage),
+                FrameRequestLayer::<DeleteAclsRequest>::new(),
+            )
+                .into_layer(DeleteAclsService)
                 .boxed(),
         )
         .map_err(Into::into)

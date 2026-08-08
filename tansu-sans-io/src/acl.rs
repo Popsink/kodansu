@@ -12,8 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use serde::{Deserialize, Serialize};
+
 /// Represents whether an ACL grants or denies permissions
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
 #[repr(i8)]
 pub enum Permission {
     /// Represents any permission which this client cannot understand,
@@ -58,7 +63,10 @@ impl From<i8> for Permission {
 ///
 /// <li>[`Allow`] [`AlterConfigs`] implies [`Allow`] [`DescribeConfigs`]
 /// </ul>
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
 #[repr(i8)]
 pub enum Operation {
     #[default]
@@ -106,7 +114,10 @@ impl From<i8> for Operation {
 }
 
 /// Represents a type of resource which an ACL can be applied to.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
 #[repr(i8)]
 pub enum Resource {
     /// Represents any ResourceType which this client cannot understand,
@@ -149,5 +160,26 @@ impl From<i8> for Resource {
 
             _ => Resource::Unknown,
         }
+    }
+}
+
+/// The wire representation. `as i8` on the discriminant rather than a match,
+/// because `#[repr(i8)]` is what makes that the definition rather than a
+/// parallel table to keep in step with it.
+impl From<Permission> for i8 {
+    fn from(value: Permission) -> Self {
+        value as i8
+    }
+}
+
+impl From<Operation> for i8 {
+    fn from(value: Operation) -> Self {
+        value as i8
+    }
+}
+
+impl From<Resource> for i8 {
+    fn from(value: Resource) -> Self {
+        value as i8
     }
 }

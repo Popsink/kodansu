@@ -47,11 +47,11 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    AssignmentDoc, AssignmentOutcome, AutoTopicCreate, BrokerRegistrationRequest, Error,
-    GenerationDoc, ListOffsetResponse, METER, MemberDoc, MetadataResponse, NamedGroupDetail,
-    OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage,
-    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    UpdateError, Version,
+    AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
+    BrokerRegistrationRequest, Error, GenerationDoc, ListOffsetResponse, METER, MemberDoc,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
+    Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
 };
 
 static BATCH_REQUESTS_LENGTH: LazyLock<Gauge<u64>> =
@@ -497,6 +497,18 @@ where
         group_id: &str,
     ) -> Result<BTreeMap<String, (MemberDoc, Version)>> {
         self.storage.list_group_members(group_id).await
+    }
+
+    async fn create_acls(&self, bindings: &[AclBinding]) -> Result<Vec<ErrorCode>> {
+        self.storage.create_acls(bindings).await
+    }
+
+    async fn describe_acls(&self, filter: &AclFilter) -> Result<Vec<AclBinding>> {
+        self.storage.describe_acls(filter).await
+    }
+
+    async fn delete_acls(&self, filters: &[AclFilter]) -> Result<Vec<Vec<AclBinding>>> {
+        self.storage.delete_acls(filters).await
     }
 
     async fn assert_group_schema(&self) -> Result<()> {
@@ -1009,6 +1021,18 @@ mod tests {
             unimplemented!()
         }
 
+        async fn create_acls(&self, _bindings: &[AclBinding]) -> Result<Vec<ErrorCode>> {
+            unimplemented!()
+        }
+
+        async fn describe_acls(&self, _filter: &AclFilter) -> Result<Vec<AclBinding>> {
+            unimplemented!()
+        }
+
+        async fn delete_acls(&self, _filters: &[AclFilter]) -> Result<Vec<Vec<AclBinding>>> {
+            unimplemented!()
+        }
+
         async fn assert_group_schema(&self) -> Result<()> {
             unimplemented!()
         }
@@ -1503,6 +1527,8 @@ mod wrapper_parity {
     use bytes::Bytes;
     use object_store::memory::InMemory;
 
+    use tansu_sans_io::{acl, resource};
+
     use super::*;
     use crate::dynostore::DynoStore;
 
@@ -1650,6 +1676,53 @@ mod wrapper_parity {
         // is the one thing this object exists to stop.
         bare.assert_group_schema().await?;
         wrapped.assert_group_schema().await?;
+
+        // The ACLs (#363). A wrapper that swallowed `describe_acls` would
+        // report a cluster as having no rules — which on a fail-closed broker
+        // is not "no opinion", it is the most consequential answer there is,
+        // and the shape the whole ACL API shipped in until now.
+        let acl = AclBinding {
+            resource_type: acl::Resource::Topic,
+            resource_name: "parity".into(),
+            pattern: resource::Pattern::Literal,
+            principal: "User:alice".into(),
+            host: crate::WILDCARD_HOST.into(),
+            operation: acl::Operation::Read,
+            permission: acl::Permission::Allow,
+        };
+
+        let everything = AclFilter {
+            resource_type: acl::Resource::Any,
+            pattern: resource::Pattern::Any,
+            operation: acl::Operation::Any,
+            permission: acl::Permission::Any,
+            ..Default::default()
+        };
+
+        _ = bare.create_acls(&[acl]).await?;
+
+        assert_eq!(
+            bare.describe_acls(&everything).await?,
+            wrapped.describe_acls(&everything).await?,
+            "describe_acls diverges through the wrapper",
+        );
+
+        // Deleting *through the wrapper* must remove what a describe through it
+        // reported, and the bare engine must then agree that it is gone.
+        let seen = wrapped.describe_acls(&everything).await?;
+
+        assert_eq!(
+            vec![seen],
+            wrapped
+                .delete_acls(std::slice::from_ref(&everything))
+                .await?,
+            "delete_acls diverges through the wrapper",
+        );
+
+        assert!(
+            bare.describe_acls(&everything).await?.is_empty(),
+            "a delete through the wrapper must reach the engine",
+        );
 
         Ok(())
     }
