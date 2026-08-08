@@ -3405,6 +3405,205 @@ mod tests {
         Ok(())
     }
 
+    /// The whole arc, at the `Coordinator` level: a group forms, admits a
+    /// second member, re-forms, commits, loses its leader and re-forms again.
+    ///
+    /// Deliberately written against what a client observes — error codes,
+    /// generations, who leads, who is assigned — and not against the objects
+    /// underneath. That is what makes it the test the decomposition had to pass
+    /// *unchanged*: it says nothing about how the state is stored, so it is
+    /// evidence that the storage changed and the protocol did not.
+    #[tokio::test(start_paused = true)]
+    async fn lifecycle() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "lifecycle-group";
+        const TOPIC: &str = "t";
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+
+        let first_meta = encode_subscription(&[TOPIC], None);
+        let second_meta = encode_subscription(&[TOPIC, "u"], None);
+
+        // One member: it forms the group and leads it.
+        let (first, join) = register(&controller, GROUP_ID, &first_meta).await?;
+
+        assert_eq!(i16::from(ErrorCode::None), join.error_code);
+        assert_eq!(0, join.generation_id, "a group is born at generation 0");
+        assert_eq!(first, join.leader);
+        assert_eq!(Some(CONSUMER.into()), join.protocol_type);
+        assert_eq!(Some(RANGE.into()), join.protocol_name);
+        assert_eq!(
+            vec![first.clone()],
+            join.members
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|member| member.member_id.clone())
+                .collect::<Vec<_>>(),
+            "the leader is handed the membership"
+        );
+
+        let sync = sync_group(&controller, GROUP_ID, 0, &first, &[assignment_of(&first)]).await?;
+        assert_eq!(i16::from(ErrorCode::None), sync.error_code);
+        assert!(!sync.assignment.is_empty());
+        assert_eq!(
+            ConsumerGroupState::Stable,
+            controller.read_view(GROUP_ID).await?.state()
+        );
+
+        assert_eq!(
+            i16::from(ErrorCode::None),
+            heartbeat(&controller, GROUP_ID, 0, &first)
+                .await?
+                .error_code
+        );
+
+        // A second member admits itself, which is a rebalance.
+        let (second, join) = register(&controller, GROUP_ID, &second_meta).await?;
+
+        assert_eq!(i16::from(ErrorCode::None), join.error_code);
+        assert_eq!(1, join.generation_id);
+        assert_eq!(first, join.leader, "admitting a member does not re-elect");
+        assert_eq!(
+            Some(vec![]),
+            join.members,
+            "a follower is handed no membership"
+        );
+
+        assert_eq!(
+            i16::from(ErrorCode::RebalanceInProgress),
+            heartbeat(&controller, GROUP_ID, 0, &first)
+                .await?
+                .error_code,
+            "the leader's generation is behind now",
+        );
+
+        // The leader re-joins, sees both members, and assigns over them.
+        let join = join_group(&controller, GROUP_ID, &first, &first_meta).await?;
+
+        assert_eq!(1, join.generation_id);
+        assert_eq!(first, join.leader);
+        assert_eq!(
+            BTreeSet::from([first.clone(), second.clone()]),
+            join.members
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|member| member.member_id.clone())
+                .collect::<BTreeSet<_>>(),
+        );
+
+        let sync = sync_group(
+            &controller,
+            GROUP_ID,
+            1,
+            &first,
+            &[assignment_of(&first), assignment_of(&second)],
+        )
+        .await?;
+        assert_eq!(i16::from(ErrorCode::None), sync.error_code);
+
+        let follower = sync_group(&controller, GROUP_ID, 1, &second, &[]).await?;
+        assert_eq!(i16::from(ErrorCode::None), follower.error_code);
+        assert_eq!(
+            Bytes::from(format!("assignment-{second}")),
+            follower.assignment,
+            "a follower is handed the slice the leader computed for it",
+        );
+
+        for member_id in [&first, &second] {
+            assert_eq!(
+                i16::from(ErrorCode::None),
+                heartbeat(&controller, GROUP_ID, 1, member_id)
+                    .await?
+                    .error_code
+            );
+        }
+
+        // A member of the current generation commits.
+        let topics = [OffsetCommitRequestTopic::default()
+            .name(TOPIC.into())
+            .partitions(Some(vec![
+                OffsetCommitRequestPartition::default()
+                    .partition_index(0)
+                    .committed_offset(1)
+                    .committed_leader_epoch(Some(0))
+                    .commit_timestamp(None)
+                    .committed_metadata(Some("".into())),
+            ]))];
+
+        let Body::OffsetCommitResponse(committed) = controller
+            .offset_commit(OffsetCommit {
+                group_id: GROUP_ID,
+                generation_id_or_member_epoch: Some(1),
+                member_id: Some(second.as_str()),
+                group_instance_id: None,
+                retention_time_ms: None,
+                topics: Some(&topics[..]),
+            })
+            .await?
+        else {
+            panic!("expecting an offset commit response");
+        };
+
+        assert!(
+            committed
+                .topics
+                .unwrap_or_default()
+                .iter()
+                .flat_map(|topic| topic.partitions.clone().unwrap_or_default())
+                .all(|partition| partition.error_code != i16::from(ErrorCode::UnknownMemberId)),
+            "a member of the current generation must not be fenced",
+        );
+
+        // The leader leaves.
+        let leave = leave_group(&controller, GROUP_ID, &first).await?;
+        assert_eq!(i16::from(ErrorCode::None), leave.error_code);
+        assert_eq!(
+            vec![i16::from(ErrorCode::None)],
+            leave
+                .members
+                .unwrap_or_default()
+                .iter()
+                .map(|member| member.error_code)
+                .collect::<Vec<_>>(),
+        );
+
+        assert_eq!(
+            i16::from(ErrorCode::RebalanceInProgress),
+            heartbeat(&controller, GROUP_ID, 1, &second)
+                .await?
+                .error_code,
+        );
+
+        // The survivor is promoted and re-forms the group on its own.
+        let join = join_group(&controller, GROUP_ID, &second, &second_meta).await?;
+
+        assert_eq!(i16::from(ErrorCode::None), join.error_code);
+        assert_eq!(2, join.generation_id);
+        assert_eq!(second, join.leader, "the survivor is promoted");
+        assert_eq!(
+            vec![second.clone()],
+            join.members
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|member| member.member_id.clone())
+                .collect::<Vec<_>>(),
+        );
+
+        let sync = sync_group(&controller, GROUP_ID, 2, &second, &[assignment_of(&second)]).await?;
+        assert_eq!(i16::from(ErrorCode::None), sync.error_code);
+        assert_eq!(
+            ConsumerGroupState::Stable,
+            controller.read_view(GROUP_ID).await?.state()
+        );
+
+        Ok(())
+    }
+
     /// A generation is never reused — including across the group emptying.
     ///
     /// `assignment/{generation}` is create-only and immutable, so a reused
