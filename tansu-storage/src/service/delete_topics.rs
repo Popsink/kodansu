@@ -14,11 +14,14 @@
 
 use rama::{Context, Service};
 use tansu_sans_io::{
-    ApiKey, DeleteTopicsRequest, DeleteTopicsResponse, delete_topics_response::DeletableTopicResult,
+    ApiKey, DeleteTopicsRequest, DeleteTopicsResponse, ErrorCode,
+    delete_topics_response::DeletableTopicResult,
 };
 use tracing::instrument;
 
-use crate::{Error, Result, Storage};
+use tansu_sans_io::acl::{Operation, Resource};
+
+use crate::{Error, Result, Storage, authorized, enforcing};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`DeleteTopicsRequest`] returning [`DeleteTopicsResponse`].
 /// ```
@@ -86,7 +89,26 @@ where
         let mut responses = vec![];
 
         for topic in req.topics.unwrap_or_default() {
-            let error_code = ctx.state().delete_topic(&topic.clone().into()).await?;
+            // Per topic, because that is where the response carries a code —
+            // and a delete refused for one topic must not fail the rest of the
+            // request (#363).
+            //
+            // A topic named by id alone cannot be authorized: an ACL is written
+            // on a name, and resolving the id to one would itself be a read
+            // this principal may not be allowed. Refusing is the answer that
+            // cannot leak — but only where authorization is on at all, or a
+            // broker without `--authentication` would stop serving a request
+            // it has always served.
+            let error_code = match topic.name.as_deref() {
+                Some(name) if !authorized(&ctx, Resource::Topic, name, Operation::Delete).await => {
+                    ErrorCode::TopicAuthorizationFailed
+                }
+
+                None if enforcing(&ctx) => ErrorCode::TopicAuthorizationFailed,
+
+                _ => ctx.state().delete_topic(&topic.clone().into()).await?,
+            };
+
             responses.push(
                 DeletableTopicResult::default()
                     .name(topic.name.clone())
@@ -97,7 +119,12 @@ where
         }
 
         for topic in req.topic_names.unwrap_or_default() {
-            let error_code = ctx.state().delete_topic(&topic.clone().into()).await?;
+            let error_code = if !authorized(&ctx, Resource::Topic, &topic, Operation::Delete).await
+            {
+                ErrorCode::TopicAuthorizationFailed
+            } else {
+                ctx.state().delete_topic(&topic.clone().into()).await?
+            };
 
             responses.push(
                 DeletableTopicResult::default()

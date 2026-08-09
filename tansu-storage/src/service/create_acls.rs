@@ -20,7 +20,9 @@ use tansu_sans_io::{
     create_acls_response::AclCreationResult,
 };
 
-use crate::{AclBinding, Error, Storage};
+use tansu_sans_io::acl::Operation;
+
+use crate::{AclBinding, Error, Storage, authorized_cluster};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CreateAclsService;
@@ -42,6 +44,25 @@ where
         req: CreateAclsRequest,
     ) -> Result<Self::Response, Self::Error> {
         let creations = req.creations.unwrap_or_default();
+
+        // `ALTER` on the cluster, as Kafka requires — and the hole that made
+        // every other rule provisional: an authenticated principal that can
+        // delete the ACLs can grant itself anything, so enforcing everything
+        // else while leaving this open enforces nothing (#363).
+        if !authorized_cluster(&ctx, Operation::Alter).await {
+            return Ok(CreateAclsResponse::default()
+                .throttle_time_ms(0)
+                .results(Some(
+                    creations
+                        .iter()
+                        .map(|_| {
+                            AclCreationResult::default()
+                                .error_code(ErrorCode::ClusterAuthorizationFailed.into())
+                                .error_message(None)
+                        })
+                        .collect(),
+                )));
+        }
 
         let bindings = creations
             .iter()

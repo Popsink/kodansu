@@ -150,9 +150,14 @@ mod latency;
 mod null;
 mod service;
 
-pub use acl::{AclBinding, AclFilter, Acls, WILDCARD_HOST, WILDCARD_PRINCIPAL, WILDCARD_RESOURCE};
+pub use acl::{
+    AclBinding, AclFilter, Acls, CLUSTER_RESOURCE, WILDCARD_HOST, WILDCARD_PRINCIPAL,
+    WILDCARD_RESOURCE,
+};
 
-pub use authorizer::{ACL_SNAPSHOT_TTL, Authorizer, Requester, authorized};
+pub use authorizer::{
+    ACL_SNAPSHOT_TTL, Authorizer, Requester, authorized, authorized_cluster, enforcing,
+};
 
 pub use group::{
     AssignmentDoc, AssignmentOutcome, GROUP_SCHEMA_VERSION, GenerationDoc, GroupSchema, MemberDoc,

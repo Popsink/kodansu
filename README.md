@@ -360,8 +360,20 @@ A grant of `READ` also grants `DESCRIBE` — a client that may read a topic must
 be able to see it exists — but a *denial* of `READ` does not deny `DESCRIBE`.
 Implication runs one way, as it does in Kafka.
 
-Currently enforced on **produce and fetch**; the topic and group admin APIs and
-the filtering of `Metadata` and `ListGroups` are still open (see #363).
+Enforced today on **produce**, **fetch**, **CreateTopics**, **DeleteTopics** and
+the three **ACL APIs** themselves. Two things follow from Kafka's model and
+surprise people:
+
+- **Creating a topic needs `CREATE` on the cluster**, not on the topic. The
+  topic does not exist yet, so there is nothing for a topic rule to select — and
+  a rule on a name nobody has taken would be a rule on the whole namespace. On a
+  mutualised fleet, creating topics is an operator's job.
+- **Reading the ACLs needs `DESCRIBE` on the cluster.** The rules say what every
+  principal may do, which on a mutualised fleet names the other tenants.
+
+Still open (see #363): the **consumer group APIs**, and the filtering of
+`Metadata` and `ListGroups` — a principal can still *see* topic and group names
+it cannot read.
 
 ## Observability
 
