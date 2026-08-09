@@ -41,7 +41,7 @@ use std::{
 use tansu_sans_io::{ErrorCode, RootMessageMeta};
 use tansu_service::{Classify as _, Peer, Severity};
 use tansu_storage::{
-    ArcDynStorage, BrokerRegistrationRequest, Storage, StorageContainer, TopicDefaults,
+    ArcDynStorage, Authorizer, BrokerRegistrationRequest, Storage, StorageContainer, TopicDefaults,
 };
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -228,6 +228,13 @@ pub struct Broker<G, S> {
     groups: G,
 
     sasl_config: Option<Arc<SASLConfig>>,
+
+    /// The ACL decision, when this broker enforces one (#363).
+    ///
+    /// `None` without `--authentication`: there are no principals, so there is
+    /// nothing to evaluate, and enforcing would refuse every request on every
+    /// deployment that has never turned authentication on.
+    authorizer: Option<Authorizer>,
     tls_server_config: Option<Arc<ServerConfig>>,
     silent: bool,
     maintenance: Maintenance,
@@ -260,6 +267,7 @@ where
             groups,
 
             sasl_config: None,
+            authorizer: None,
             tls_server_config: None,
 
             silent: false,
@@ -693,6 +701,7 @@ where
             // requests, rather than held open until the client goes away and
             // the drain runs out of patience (#361).
             self.cancellation.clone(),
+            self.authorizer.clone(),
         )?;
 
         let handle = set.spawn(async move {
@@ -812,6 +821,13 @@ pub struct Builder<N, C, I, A, S, L> {
     silent: bool,
     maintenance: Maintenance,
     topic_defaults: TopicDefaults,
+
+    /// Principals allowed everything without consulting a rule (#363).
+    ///
+    /// Without at least one, a cluster with no ACLs can never be given any:
+    /// a fail-closed broker denies `CreateAcls` like everything else.
+    super_users: Vec<String>,
+
     cancellation: CancellationToken,
 }
 
@@ -842,6 +858,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             maintenance: self.maintenance,
             topic_defaults: self.topic_defaults,
 
+            super_users: self.super_users,
             cancellation: self.cancellation,
         }
     }
@@ -861,6 +878,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             maintenance: self.maintenance,
             topic_defaults: self.topic_defaults,
 
+            super_users: self.super_users,
             cancellation: self.cancellation,
         }
     }
@@ -880,6 +898,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             maintenance: self.maintenance,
             topic_defaults: self.topic_defaults,
 
+            super_users: self.super_users,
             cancellation: self.cancellation,
         }
     }
@@ -902,6 +921,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             maintenance: self.maintenance,
             topic_defaults: self.topic_defaults,
 
+            super_users: self.super_users,
             cancellation: self.cancellation,
         }
     }
@@ -960,6 +980,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             maintenance,
             topic_defaults: self.topic_defaults,
 
+            super_users: self.super_users,
             cancellation: self.cancellation,
         }
     }
@@ -981,6 +1002,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             maintenance: self.maintenance,
             topic_defaults: self.topic_defaults,
 
+            super_users: self.super_users,
             cancellation: self.cancellation,
         }
     }
@@ -1007,6 +1029,15 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
     }
     pub fn silent(self, silent: bool) -> Self {
         Self { silent, ..self }
+    }
+
+    /// Principals allowed everything without consulting an ACL (#363), in
+    /// Kafka's `User:name` spelling.
+    pub fn super_users(self, super_users: Vec<String>) -> Self {
+        Self {
+            super_users,
+            ..self
+        }
     }
 
     /// The token that asks this broker to stop and drain (#361).
@@ -1066,6 +1097,13 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             None
         };
 
+        // Enforcement follows authentication: without it there are no
+        // principals, so there is nothing to evaluate and every request on
+        // every existing deployment would be refused (#363).
+        let authorizer = self
+            .authentication
+            .then(|| Authorizer::new(storage.clone(), self.super_users.clone()));
+
         Ok(Broker {
             node_id: self.node_id,
             cluster_id: self.cluster_id.clone(),
@@ -1075,6 +1113,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             storage,
             groups,
             sasl_config,
+            authorizer,
             tls_server_config: self.tls_server_config.map(Arc::new),
 
             silent: self.silent,

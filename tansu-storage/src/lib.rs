@@ -152,7 +152,7 @@ mod service;
 
 pub use acl::{AclBinding, AclFilter, Acls, WILDCARD_HOST, WILDCARD_PRINCIPAL, WILDCARD_RESOURCE};
 
-pub use authorizer::{ACL_SNAPSHOT_TTL, Authorizer};
+pub use authorizer::{ACL_SNAPSHOT_TTL, Authorizer, Requester, authorized};
 
 pub use group::{
     AssignmentDoc, AssignmentOutcome, GROUP_SCHEMA_VERSION, GenerationDoc, GroupSchema, MemberDoc,

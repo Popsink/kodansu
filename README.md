@@ -187,6 +187,7 @@ The options that matter in a deployment, each with its environment variable:
 | `--cert` / `--key` | — | — | TLS certificate chain and private key (PEM). Both or neither. Given both, `--listener-url` serves TLS only and a plaintext client is refused; an unreadable or mismatched pair fails startup. |
 | `--default-cleanup-policy` | `DEFAULT_CLEANUP_POLICY` | `delete` | Applied to topics created without one. |
 | `--default-retention-ms` | `DEFAULT_RETENTION` | `7days` | Applied to `delete`-policy topics created without a `retention.ms`. Accepts a duration, or `-1`/`infinite`/`forever`. |
+| `--super-users` | `SUPER_USERS` | — | Principals allowed everything without consulting an ACL, comma separated (`User:admin,User:ops`). Only meaningful with `--authentication`. |
 
 The URL and address options accept `${VAR}` references, expanded when the argument is
 parsed.
@@ -326,6 +327,41 @@ be, because the polls are cut short by the same signal — a member waiting out
 half its session timeout answers as soon as the replica is asked to stop. A
 scale-in event therefore costs a round trip, not a rebalance: no generation is
 minted, so no client re-partitions.
+
+### Authorization
+
+ACLs are Kafka's own — resource type, name, pattern type, principal, host,
+operation, permission — so `kafka-acls.sh` and every operator tool work
+unchanged, and `PREFIXED` is what scopes a principal to one namespace:
+
+```shell
+kafka-acls.sh --add --allow-principal User:alice \
+  --operation Read --operation Write \
+  --topic tenant-a. --resource-pattern-type prefixed
+```
+
+The broker has **no notion of a tenant**. It knows that a principal may touch
+the resources a pattern selects; whether `alice` "is" tenant A is a convention
+in the rules you write.
+
+Three things follow from Kafka's model and are worth knowing before turning it
+on:
+
+- **Enforcement follows `--authentication`.** Without it there are no
+  principals, so there is nothing to evaluate and nothing is refused. That is
+  also why turning authentication on is what arms authorization.
+- **No rule is not permission.** A principal with nothing written about it is
+  refused, which is the only tenable default for a mutualised fleet.
+- **Set `--super-users`.** Those two together mean a cluster with no ACLs
+  refuses `CreateAcls` like everything else, and can never be given any. A super
+  user is the way in. The broker warns at startup if none is configured.
+
+A grant of `READ` also grants `DESCRIBE` — a client that may read a topic must
+be able to see it exists — but a *denial* of `READ` does not deny `DESCRIBE`.
+Implication runs one way, as it does in Kafka.
+
+Currently enforced on **produce and fetch**; the topic and group admin APIs and
+the filtering of `Metadata` and `ListGroups` are still open (see #363).
 
 ## Observability
 

@@ -33,11 +33,27 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use rama::Context;
 use tansu_sans_io::acl::{Operation, Resource};
 use tokio::time::{Duration, Instant};
 use tracing::{debug, error, warn};
 
 use crate::{AclFilter, Acls, ArcDynStorage};
+
+/// Who is asking, and from where.
+///
+/// Put into the request context by whoever knows — the broker, which is the
+/// only crate that can see both the SASL session and the peer address. This
+/// crate holds the rules and takes the decision; it has no way to authenticate
+/// anyone and deliberately does not try.
+///
+/// `principal` is `None` on a connection that has not authenticated, which on
+/// a broker started without `--authentication` is every connection.
+#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Requester {
+    pub principal: Option<String>,
+    pub host: String,
+}
 
 /// How long a snapshot of the ACLs is served before it is re-read.
 ///
@@ -208,6 +224,63 @@ impl Authorizer {
             })
         })
     }
+}
+
+/// Whether this request may perform `operation` against the named resource.
+///
+/// **Allowed when there is no [`Authorizer`] in the context**, which is what a
+/// broker started without `--authentication` produces: there are no principals,
+/// so there is nothing to evaluate, and denying would refuse every request on
+/// every deployment that has never turned authentication on. The broker inserts
+/// one exactly when authentication is on, and that is the switch.
+///
+/// A request that reaches an authorizer without a principal is denied. It
+/// should be unreachable — the frame layer refuses an unauthenticated request
+/// for every API but `ApiVersions` and the SASL pair — and if it ever is
+/// reachable, refusing is the failure that can be noticed rather than the one
+/// that cannot.
+pub async fn authorized<S>(
+    ctx: &Context<S>,
+    resource_type: Resource,
+    resource_name: &str,
+    operation: Operation,
+) -> bool {
+    let Some(authorizer) = ctx.get::<Authorizer>() else {
+        return true;
+    };
+
+    let Some(requester) = ctx.get::<Requester>() else {
+        error!(
+            ?resource_type,
+            resource_name,
+            ?operation,
+            "denying: authorization is on but nothing said who is asking"
+        );
+
+        return false;
+    };
+
+    let Some(principal) = requester.principal.as_deref() else {
+        error!(
+            host = requester.host,
+            ?resource_type,
+            resource_name,
+            ?operation,
+            "denying: authorization is on and this connection has no principal"
+        );
+
+        return false;
+    };
+
+    authorizer
+        .allows(
+            principal,
+            requester.host.as_str(),
+            resource_type,
+            resource_name,
+            operation,
+        )
+        .await
 }
 
 #[cfg(all(test, feature = "dynostore"))]
