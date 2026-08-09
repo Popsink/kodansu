@@ -198,14 +198,33 @@ owner.
 
 **GCS.** `gs://` is a supported target and every test in the conformance target
 would run against it unchanged — that is the whole point of the URL being a
-parameter — but none of them ever has. There is no GCS emulator in
-`compose.yaml` and `GoogleCloudStorageBuilder::from_env` needs real credentials,
-so generation preconditions remain assumed rather than observed. Nothing fakes
-them: there is no GCS test rather than a GCS test that proves nothing, which is
-the mistake the removed minio service made.
+parameter — but none of them ever has. Generation preconditions remain assumed
+rather than observed.
 
-Pointing the `object-store` job in `.github/workflows/storage.yml` at a `gs://`
-bucket is what closes it.
+An emulator was tried and does not work, which is worth recording so nobody
+tries it twice (#357):
+
+- `object_store` **does** support pointing at one with no code change: a service
+  account file containing `{"gcs_base_url": "...", "disable_oauth": true}` is
+  read by `GoogleCloudStorageBuilder::from_env`, so `GOOGLE_SERVICE_ACCOUNT`
+  alone would redirect the engine.
+- `fake-gcs-server` gained generation preconditions in July 2026 (upstream
+  fsouza/fake-gcs-server#2260, #2308), so the semantics under test are no longer
+  the obstacle.
+- **The obstacle is the API.** `object_store` 0.14's GCS client writes through
+  the **XML** API — `PUT /{bucket}/{object}` with `x-goog-if-generation-match` —
+  and `fake-gcs-server` answers every such write `400 invalid uploadType`. It
+  implements the JSON upload API. Measured against
+  `fsouza/fake-gcs-server:latest` on 2026-08-09: 10 of 10 conformance tests
+  fail, all on the write, none of them reaching a precondition.
+
+So an emulator would not fake the assertions — it cannot run them at all. The
+route that closes this is pointing the `object-store` job in
+`.github/workflows/storage.yml` at a real `gs://` bucket, which needs
+credentials this repository does not have.
+
+Worth re-checking if `object_store` moves its GCS writes to the JSON API, or if
+`fake-gcs-server` implements the XML upload path.
 
 **Real S3, as opposed to minio.** The `object-store` job is
 `workflow_dispatch`-only and skips itself unless `STORAGE_TEST_AWS_*` secrets
