@@ -143,6 +143,7 @@ use tracing::warn;
 mod dynostore;
 
 mod acl;
+mod authorizer;
 mod batch;
 mod group;
 mod latency;
@@ -150,6 +151,8 @@ mod null;
 mod service;
 
 pub use acl::{AclBinding, AclFilter, Acls, WILDCARD_HOST, WILDCARD_PRINCIPAL, WILDCARD_RESOURCE};
+
+pub use authorizer::{ACL_SNAPSHOT_TTL, Authorizer};
 
 pub use group::{
     AssignmentDoc, AssignmentOutcome, GROUP_SCHEMA_VERSION, GenerationDoc, GroupSchema, MemberDoc,

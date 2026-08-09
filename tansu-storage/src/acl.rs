@@ -27,9 +27,9 @@
 //! principal to one tenant's `tenant-a.` namespace without the broker needing
 //! a notion of a tenant at all.
 //!
-//! This module is the *model and its storage*. Nothing here is enforced yet —
-//! evaluation on the request path is the next slice — which is why adding it
-//! changes no existing behaviour.
+//! The model, its storage, and the decision taken against it. Where that
+//! decision is *applied* is the request path; see [`crate::Authorizer`] for the
+//! cache that makes asking it cheap.
 
 use std::collections::BTreeSet;
 
@@ -126,16 +126,47 @@ impl AclBinding {
         self.host == host || self.host == WILDCARD_HOST
     }
 
-    /// Whether this binding speaks to `operation`.
+    /// Whether this binding speaks to `operation`, exactly.
     ///
     /// `ALL` covers everything, which is the only implication resolved here.
-    /// The rest of Kafka's implication table — `READ` implies `DESCRIBE`,
-    /// `ALTER` implies `DESCRIBE`, `ALTER_CONFIGS` implies `DESCRIBE_CONFIGS`
-    /// — belongs with evaluation rather than with a binding, because it is a
-    /// property of the *question* being asked and not of the rule.
+    /// The rest of Kafka's table — `READ` implies `DESCRIBE` and so on — is
+    /// [`implied_by`], and it is deliberately *not* here: implication holds for
+    /// grants and not for denials, so a rule cannot answer it without knowing
+    /// which of the two it is being asked about.
     #[must_use]
     pub fn covers(&self, operation: Operation) -> bool {
         self.operation == Operation::All || self.operation == operation
+    }
+
+    /// Whether this binding **grants** `operation`, following Kafka's
+    /// implication table.
+    #[must_use]
+    pub fn grants(&self, operation: Operation) -> bool {
+        self.covers(operation) || implied_by(operation).contains(&self.operation)
+    }
+}
+
+/// The operations that, when granted, also grant `operation` (Kafka's
+/// implication table).
+///
+/// Asymmetric on purpose, and this is the part that is easy to get wrong:
+/// **implication holds for `ALLOW` and not for `DENY`.** Granting `READ`
+/// grants `DESCRIBE`, because a client that may read a topic must be able to
+/// see it exists. Denying `READ` does *not* deny `DESCRIBE` — a principal can
+/// be told a topic exists while being refused its contents, and reading the
+/// table symmetrically would silently widen every `DENY` an operator wrote.
+fn implied_by(operation: Operation) -> &'static [Operation] {
+    match operation {
+        Operation::Describe => &[
+            Operation::Read,
+            Operation::Write,
+            Operation::Delete,
+            Operation::Alter,
+        ],
+
+        Operation::DescribeConfigs => &[Operation::AlterConfigs],
+
+        _ => &[],
     }
 }
 
@@ -172,6 +203,25 @@ pub struct AclFilter {
 }
 
 impl AclFilter {
+    /// The filter that selects everything.
+    ///
+    /// `Default` cannot be it: the derived default is `UNKNOWN` for every
+    /// enum, which selects nothing. Spelling "everything" out is what stops a
+    /// caller reaching for `Default::default()` and quietly getting the
+    /// opposite.
+    #[must_use]
+    pub fn any() -> Self {
+        Self {
+            resource_type: Resource::Any,
+            resource_name: None,
+            pattern: Pattern::Any,
+            principal: None,
+            host: None,
+            operation: Operation::Any,
+            permission: Permission::Any,
+        }
+    }
+
     /// Whether `binding` is selected by this filter.
     #[must_use]
     pub fn matches(&self, binding: &AclBinding) -> bool {
@@ -253,6 +303,51 @@ impl Acls {
         self.bindings
             .iter()
             .filter(move |binding| filter.matches(binding))
+    }
+
+    /// Whether `principal`, connecting from `host`, may perform `operation`
+    /// against the named resource.
+    ///
+    /// Kafka's evaluation order, and the order matters at every step:
+    ///
+    /// 1. **`DENY` wins.** Any matching denial ends it, whatever else is
+    ///    written, so an operator can carve an exception out of a broad grant
+    ///    and be sure it holds.
+    /// 2. **then `ALLOW`**, following the implication table — a grant of `READ`
+    ///    answers a question about `DESCRIBE`.
+    /// 3. **otherwise deny.** No rule is not permission. On a mutualised fleet
+    ///    the alternative is that every resource nobody has written a rule
+    ///    about is readable by every tenant, which is the state this whole
+    ///    issue is about.
+    ///
+    /// Super users are not consulted here: they never reach this function.
+    /// See [`crate::Authorizer`].
+    #[must_use]
+    pub fn allows(
+        &self,
+        principal: &str,
+        host: &str,
+        resource_type: Resource,
+        resource_name: &str,
+        operation: Operation,
+    ) -> bool {
+        let applicable = || {
+            self.bindings.iter().filter(move |binding| {
+                binding.applies_to(principal)
+                    && binding.applies_at(host)
+                    && binding.selects(resource_type, resource_name)
+            })
+        };
+
+        // Exact, not implied: denying `READ` must not deny `DESCRIBE`.
+        if applicable()
+            .any(|binding| binding.permission == Permission::Deny && binding.covers(operation))
+        {
+            return false;
+        }
+
+        applicable()
+            .any(|binding| binding.permission == Permission::Allow && binding.grants(operation))
     }
 }
 
@@ -466,5 +561,201 @@ mod tests {
             serde_json::to_string(&one).unwrap(),
             serde_json::to_string(&other).unwrap(),
         );
+    }
+
+    /// No rule is not permission.
+    ///
+    /// On a mutualised fleet the alternative is that every resource nobody has
+    /// written a rule about is readable by every tenant, which is the state
+    /// #363 is about.
+    #[test]
+    fn nothing_is_allowed_by_default() {
+        let none = Acls::default();
+
+        assert!(!none.allows(
+            "User:alice",
+            "10.0.0.1",
+            Resource::Topic,
+            "orders",
+            Operation::Read
+        ));
+    }
+
+    /// The rule that makes a mutualised fleet safe: one tenant's prefix grants
+    /// nothing outside it.
+    #[test]
+    fn a_prefixed_grant_does_not_reach_another_prefix() {
+        let acls = Acls {
+            bindings: BTreeSet::from([binding("tenant-a.", Pattern::Prefixed)]),
+        };
+
+        assert!(acls.allows(
+            "User:alice",
+            "10.0.0.1",
+            Resource::Topic,
+            "tenant-a.orders",
+            Operation::Read,
+        ));
+
+        assert!(!acls.allows(
+            "User:alice",
+            "10.0.0.1",
+            Resource::Topic,
+            "tenant-b.orders",
+            Operation::Read,
+        ));
+
+        // Another principal gets nothing from it.
+        assert!(!acls.allows(
+            "User:bob",
+            "10.0.0.1",
+            Resource::Topic,
+            "tenant-a.orders",
+            Operation::Read,
+        ));
+    }
+
+    /// A denial ends it, whatever else is written — which is what lets an
+    /// operator carve an exception out of a broad grant and be sure it holds.
+    #[test]
+    fn deny_beats_allow_however_broad_the_grant() {
+        let acls = Acls {
+            bindings: BTreeSet::from([
+                AclBinding {
+                    resource_name: WILDCARD_RESOURCE.into(),
+                    operation: Operation::All,
+                    ..binding(WILDCARD_RESOURCE, Pattern::Literal)
+                },
+                AclBinding {
+                    permission: Permission::Deny,
+                    ..binding("secrets", Pattern::Literal)
+                },
+            ]),
+        };
+
+        assert!(acls.allows(
+            "User:alice",
+            "10.0.0.1",
+            Resource::Topic,
+            "orders",
+            Operation::Read
+        ));
+
+        assert!(
+            !acls.allows(
+                "User:alice",
+                "10.0.0.1",
+                Resource::Topic,
+                "secrets",
+                Operation::Read
+            ),
+            "a denial must not be outvoted by a wildcard grant",
+        );
+    }
+
+    /// Implication is asymmetric, and this is the half that is easy to get
+    /// wrong: reading the table symmetrically would silently widen every
+    /// `DENY` an operator wrote.
+    #[test]
+    fn implication_grants_but_never_denies() {
+        let granted = Acls {
+            bindings: BTreeSet::from([binding("orders", Pattern::Literal)]),
+        };
+
+        assert!(
+            granted.allows(
+                "User:alice",
+                "10.0.0.1",
+                Resource::Topic,
+                "orders",
+                Operation::Describe
+            ),
+            "a client allowed to read a topic must be able to see it exists",
+        );
+
+        assert!(!granted.allows(
+            "User:alice",
+            "10.0.0.1",
+            Resource::Topic,
+            "orders",
+            Operation::Write
+        ));
+
+        // Denying READ and separately allowing DESCRIBE leaves DESCRIBE
+        // allowed: the denial speaks to READ alone.
+        let denied = Acls {
+            bindings: BTreeSet::from([
+                AclBinding {
+                    permission: Permission::Deny,
+                    ..binding("orders", Pattern::Literal)
+                },
+                AclBinding {
+                    operation: Operation::Describe,
+                    ..binding("orders", Pattern::Literal)
+                },
+            ]),
+        };
+
+        assert!(
+            denied.allows(
+                "User:alice",
+                "10.0.0.1",
+                Resource::Topic,
+                "orders",
+                Operation::Describe
+            ),
+            "denying READ must not deny DESCRIBE",
+        );
+
+        assert!(!denied.allows(
+            "User:alice",
+            "10.0.0.1",
+            Resource::Topic,
+            "orders",
+            Operation::Read
+        ));
+
+        assert!(
+            Acls {
+                bindings: BTreeSet::from([AclBinding {
+                    operation: Operation::AlterConfigs,
+                    ..binding("orders", Pattern::Literal)
+                }]),
+            }
+            .allows(
+                "User:alice",
+                "10.0.0.1",
+                Resource::Topic,
+                "orders",
+                Operation::DescribeConfigs
+            ),
+        );
+    }
+
+    /// A host-scoped rule applies where it says and nowhere else.
+    #[test]
+    fn a_host_scoped_grant_is_scoped_to_its_host() {
+        let acls = Acls {
+            bindings: BTreeSet::from([AclBinding {
+                host: "10.0.0.1".into(),
+                ..binding("orders", Pattern::Literal)
+            }]),
+        };
+
+        assert!(acls.allows(
+            "User:alice",
+            "10.0.0.1",
+            Resource::Topic,
+            "orders",
+            Operation::Read
+        ));
+
+        assert!(!acls.allows(
+            "User:alice",
+            "10.0.0.2",
+            Resource::Topic,
+            "orders",
+            Operation::Read
+        ));
     }
 }
