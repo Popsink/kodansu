@@ -29,9 +29,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
 use tansu_sans_io::{
-    CreateAclsRequest, CreateTopicsRequest, DeleteAclsRequest, DeleteGroupsRequest,
-    DeleteTopicsRequest, DescribeAclsRequest, ErrorCode, FetchRequest, IsolationLevel,
-    ListGroupsRequest, MetadataRequest, NULL_TOPIC_ID, ProduceRequest,
+    ApiKey as _, Body, CreateAclsRequest, CreateTopicsRequest, CreateTopicsResponse,
+    DeleteAclsRequest, DeleteGroupsRequest, DeleteTopicsRequest, DescribeAclsRequest, ErrorCode,
+    FetchRequest, Frame, Header, IsolationLevel, ListGroupsRequest, MetadataRequest, NULL_TOPIC_ID,
+    ProduceRequest,
     acl::{Operation, Permission, Resource},
     create_acls_request::AclCreation,
     create_topics_request::CreatableTopic,
@@ -53,6 +54,10 @@ use url::Url;
 
 const ALICE: &str = "User:alice";
 const BOB: &str = "User:bob";
+
+/// The newest `CreateTopicsResponse` this protocol carries, and so the one a
+/// current client asks for.
+const LATEST_CREATE_TOPICS_VERSION: i16 = 7;
 const HOST: &str = "10.0.0.1";
 
 async fn storage() -> Result<Arc<Box<dyn Storage>>, Error> {
@@ -574,11 +579,44 @@ async fn creating_a_topic_needs_the_cluster() -> Result<(), Error> {
         vec![i16::from(ErrorCode::ClusterAuthorizationFailed)],
         response
             .topics
+            .clone()
             .unwrap_or_default()
             .into_iter()
             .map(|topic| topic.error_code)
             .collect::<Vec<_>>(),
     );
+
+    // And it has to survive the wire, which is a separate claim.
+    //
+    // `NumPartitions` and `ReplicationFactor` are `int32`/`int16` and not
+    // nullable from v5, so a refusal that left them `None` produced a response
+    // the client could not parse: the refusal never arrived, the AdminClient
+    // waited out its timeout, and a definitive "no" looked like a broker that
+    // had stopped answering. Asserting the error code on the struct alone —
+    // which is all the assertion above does — cannot see that.
+    let round_tripped = Frame::response(
+        Header::Response { correlation_id: 0 },
+        Body::CreateTopicsResponse(response),
+        CreateTopicsRequest::KEY,
+        LATEST_CREATE_TOPICS_VERSION,
+    )
+    .and_then(|encoded| {
+        Frame::response_from_bytes(
+            encoded,
+            CreateTopicsRequest::KEY,
+            LATEST_CREATE_TOPICS_VERSION,
+        )
+    })
+    .and_then(|frame| CreateTopicsResponse::try_from(frame.body))?;
+
+    let topics = round_tripped.topics.unwrap_or_default();
+    assert_eq!(1, topics.len());
+    assert_eq!(
+        i16::from(ErrorCode::ClusterAuthorizationFailed),
+        topics[0].error_code,
+    );
+    assert_eq!(Some(-1), topics[0].num_partitions);
+    assert_eq!(Some(-1), topics[0].replication_factor);
 
     Ok(())
 }

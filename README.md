@@ -252,6 +252,20 @@ tansu user delete alice --mechanism scram512
 
 `scram256` and `scram512` are supported; `scram512` is the default.
 
+Credentials are stored under the cluster's own prefix, one object per principal
+per mechanism, so every replica sees a user the moment it is created and a
+deletion takes effect everywhere without waiting anything out. What is stored is
+what SCRAM checks a proof against, never the password — but it is still enough
+to impersonate the user, so **the bucket's access control is what protects it**,
+exactly as it is for the committed offsets beside it.
+
+> **Create the first users before turning `--authentication` on.** `tansu user`
+> speaks plaintext and has no SASL options, so it cannot talk to a broker that
+> is already refusing unauthenticated clients — and a broker with authentication
+> on and no users is one nobody can connect to. Start the cluster without the
+> flag, create the users, then restart with it. The same order applies to
+> `--super-users`: the principal named there has to exist.
+
 ## Running more than one replica
 
 Produce, fetch and maintenance need no configuration to scale:
@@ -354,7 +368,9 @@ on:
   refused, which is the only tenable default for a mutualised fleet.
 - **Set `--super-users`.** Those two together mean a cluster with no ACLs
   refuses `CreateAcls` like everything else, and can never be given any. A super
-  user is the way in. The broker warns at startup if none is configured.
+  user is the way in. The broker warns at startup if none is configured. Write
+  it the way a rule is written — `User:admin`, not `admin` — because it is
+  compared against the same principal a rule names.
 
 A grant of `READ` also grants `DESCRIBE` — a client that may read a topic must
 be able to see it exists — but a *denial* of `READ` does not deny `DESCRIBE`.

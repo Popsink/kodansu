@@ -23,6 +23,12 @@ use tansu_sans_io::acl::Operation;
 
 use crate::{Error, Result, Storage, authorized_cluster};
 
+/// What `NumPartitions` and `ReplicationFactor` carry when there is no topic to
+/// report them for — the defaults `CreateTopicsResponse.json` gives the two
+/// fields, which are `int32`/`int16` and **not** nullable from v5 onwards.
+const UNKNOWN_PARTITIONS: i32 = -1;
+const UNKNOWN_REPLICATION_FACTOR: i16 = -1;
+
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`CreateTopicsRequest`] returning [`CreateTopicsResponse`].
 ///
 /// Broker-level [`crate::TopicDefaults`] are applied by the engine, inside
@@ -117,8 +123,16 @@ where
                         .topic_id(Some(NULL_TOPIC_ID))
                         .error_code(ErrorCode::ClusterAuthorizationFailed.into())
                         .error_message(None)
-                        .num_partitions(None)
-                        .replication_factor(None)
+                        // `-1`, the schema's own default, and not `None`:
+                        // `NumPartitions` and `ReplicationFactor` are not
+                        // nullable from v5, so a null here does not encode. The
+                        // client cannot parse the response it gets, so a
+                        // refusal that should have been immediate and final
+                        // arrives as a request timeout instead — which reads as
+                        // a broker that has stopped answering rather than one
+                        // that said no (#363).
+                        .num_partitions(Some(UNKNOWN_PARTITIONS))
+                        .replication_factor(Some(UNKNOWN_REPLICATION_FACTOR))
                         .topic_config_error_code(None)
                         .configs(None),
                 );
@@ -185,8 +199,11 @@ where
                             .error_code(ErrorCode::UnknownServerError.into())
                             .error_message(None)
                             .topic_config_error_code(None)
-                            .num_partitions(None)
-                            .replication_factor(None)
+                            // As above: not nullable, so the failure has to be
+                            // reported with the schema's default rather than
+                            // with nothing.
+                            .num_partitions(Some(UNKNOWN_PARTITIONS))
+                            .replication_factor(Some(UNKNOWN_REPLICATION_FACTOR))
                             .configs(Some([].into())),
                     )
                 }

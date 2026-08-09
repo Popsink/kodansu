@@ -6245,6 +6245,30 @@ impl DynoStore {
         Path::from(format!("clusters/{}/acls.json", self.cluster))
     }
 
+    /// One object per principal per mechanism.
+    ///
+    /// The opposite choice to `acls.json` above, and for the opposite reason:
+    /// the ACLs are read all-at-once to answer any question, whereas a handshake
+    /// knows exactly whose credential it wants and never needs another's. One
+    /// key per user means the handshake is a GET of a known key rather than a
+    /// LIST, and two administrators changing two passwords do not contend.
+    ///
+    /// The mechanism is in the key because SCRAM-SHA-256 and SCRAM-SHA-512
+    /// derive different keys from the same password: they are two credentials
+    /// for one user, and a client picks which to present.
+    fn user_scram_credential_location(&self, user: &str, mechanism: ScramMechanism) -> Path {
+        // `Path::from` percent-encodes what it must, so a user name with a
+        // slash in it stays one path segment rather than silently becoming two.
+        Path::from(format!(
+            "clusters/{}/users/{user}/{}.json",
+            self.cluster,
+            match mechanism {
+                ScramMechanism::Scram256 => "scram-sha-256",
+                ScramMechanism::Scram512 => "scram-sha-512",
+            }
+        ))
+    }
+
     /// The cluster's ACLs and the version to CAS the next write against.
     ///
     /// A cluster that has never had an ACL applied has no object, which reads
@@ -11352,30 +11376,80 @@ impl Storage for DynoStore {
         Ok(self.advertised_listener.clone())
     }
 
+    /// Deleting a credential nobody has is not a failure.
+    ///
+    /// The same reasoning as `create_acls`: credentials are applied from
+    /// configuration management, and a delete that has already taken effect
+    /// must not start reporting an error on the second run.
     #[instrument(skip_all)]
     async fn delete_user_scram_credential(
         &self,
-        _user: &str,
-        _mechanism: ScramMechanism,
+        user: &str,
+        mechanism: ScramMechanism,
     ) -> Result<()> {
-        Ok(())
+        match self
+            .object_store
+            .delete(&self.user_scram_credential_location(user, mechanism))
+            .await
+        {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
     }
 
+    /// Last writer wins, as it does in Kafka.
+    ///
+    /// No CAS: two administrators setting one user's password at once is not a
+    /// state worth preserving half of, and a read-modify-write would only make
+    /// the loser's password win at a different moment.
+    #[instrument(skip_all)]
     async fn upsert_user_scram_credential(
         &self,
-        _user: &str,
-        _mechanism: ScramMechanism,
-        _credential: ScramCredential,
+        user: &str,
+        mechanism: ScramMechanism,
+        credential: ScramCredential,
     ) -> Result<()> {
-        Ok(())
+        let payload = serde_json::to_vec(&credential)
+            .map(Bytes::from)
+            .map(PutPayload::from)?;
+
+        self.object_store
+            .put_opts(
+                &self.user_scram_credential_location(user, mechanism),
+                payload,
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    attributes: json_content_type(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|_| ())
+            .map_err(Into::into)
     }
 
+    /// A principal nobody has written a credential for is `None`, not an error.
+    ///
+    /// That is what the handshake turns into `unknown-user`, and it must be
+    /// distinguishable from a store that could not answer — which stays an
+    /// error, so a throttled bucket fails the handshake loudly rather than
+    /// quietly telling every client their password is wrong.
+    ///
+    /// One GET per handshake, uncached on purpose: a cache here would keep a
+    /// deleted principal working for its lifetime, and revoking access is the
+    /// one operation that must not be eventually consistent. Handshakes are per
+    /// connection, not per request, and connections are long-lived.
+    #[instrument(skip_all)]
     async fn user_scram_credential(
         &self,
-        _user: &str,
-        _mechanism: ScramMechanism,
+        user: &str,
+        mechanism: ScramMechanism,
     ) -> Result<Option<ScramCredential>> {
-        Ok(None)
+        Self::absent_is_none(
+            self.get::<ScramCredential>(&self.user_scram_credential_location(user, mechanism))
+                .await,
+        )
+        .map(|found| found.map(|(credential, _version)| credential))
     }
 
     #[instrument(skip_all)]

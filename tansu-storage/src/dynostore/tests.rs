@@ -37,6 +37,7 @@ mod offset_commit;
 mod prefix_coalesce;
 mod reachable_panics;
 mod scaling;
+mod scram_credentials;
 mod segment;
 mod segment_create;
 mod topic_churn;
