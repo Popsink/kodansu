@@ -50,6 +50,14 @@ pub const WILDCARD_HOST: &str = "*";
 /// written against.
 pub const WILDCARD_RESOURCE: &str = "*";
 
+/// The name every [`Resource::Cluster`] rule is written against.
+///
+/// Kafka's own literal, and it is not the cluster's id: an ACL on the cluster
+/// names `kafka-cluster` whatever the cluster is called, so a rule written by
+/// `kafka-acls.sh --cluster` against one deployment reads the same against the
+/// next. A rule named after `--cluster-id` would match nothing.
+pub const CLUSTER_RESOURCE: &str = "kafka-cluster";
+
 /// One ACL: a principal, on a host, may or may not perform an operation
 /// against the resources a pattern selects.
 ///

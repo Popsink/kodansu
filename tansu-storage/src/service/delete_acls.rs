@@ -20,7 +20,9 @@ use tansu_sans_io::{
     delete_acls_response::{DeleteAclsFilterResult, DeleteAclsMatchingAcl},
 };
 
-use crate::{AclFilter, Error, Storage};
+use tansu_sans_io::acl::Operation;
+
+use crate::{AclFilter, Error, Storage, authorized_cluster};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DeleteAclsService;
@@ -42,6 +44,24 @@ where
         req: DeleteAclsRequest,
     ) -> Result<Self::Response, Self::Error> {
         let requested = req.filters.unwrap_or_default();
+
+        // See `CreateAcls`: a principal that can delete the rules can grant
+        // itself anything (#363).
+        if !authorized_cluster(&ctx, Operation::Alter).await {
+            return Ok(DeleteAclsResponse::default()
+                .throttle_time_ms(0)
+                .filter_results(Some(
+                    requested
+                        .iter()
+                        .map(|_| {
+                            DeleteAclsFilterResult::default()
+                                .error_code(ErrorCode::ClusterAuthorizationFailed.into())
+                                .error_message(None)
+                                .matching_acls(Some([].into()))
+                        })
+                        .collect(),
+                )));
+        }
 
         let filters = requested
             .iter()

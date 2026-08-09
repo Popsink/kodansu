@@ -21,7 +21,9 @@ use tansu_sans_io::{
     describe_acls_response::{AclDescription, DescribeAclsResource},
 };
 
-use crate::{AclBinding, AclFilter, Error, Storage};
+use tansu_sans_io::acl::Operation;
+
+use crate::{AclBinding, AclFilter, Error, Storage, authorized_cluster};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DescribeAclsService;
@@ -42,6 +44,16 @@ where
         ctx: Context<G>,
         req: DescribeAclsRequest,
     ) -> Result<Self::Response, Self::Error> {
+        // Reading the rules tells a principal what every other principal may
+        // do, which on a mutualised fleet names the other tenants (#363).
+        if !authorized_cluster(&ctx, Operation::Describe).await {
+            return Ok(DescribeAclsResponse::default()
+                .throttle_time_ms(0)
+                .error_code(ErrorCode::ClusterAuthorizationFailed.into())
+                .error_message(None)
+                .resources(Some([].into())));
+        }
+
         let filter = AclFilter {
             resource_type: req.resource_type_filter.into(),
             resource_name: req.resource_name_filter.clone(),

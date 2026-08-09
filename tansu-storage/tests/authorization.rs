@@ -29,17 +29,22 @@ use std::sync::Arc;
 use bytes::Bytes;
 use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
 use tansu_sans_io::{
-    CreateTopicsRequest, ErrorCode, FetchRequest, IsolationLevel, ProduceRequest,
+    CreateAclsRequest, CreateTopicsRequest, DeleteAclsRequest, DeleteTopicsRequest,
+    DescribeAclsRequest, ErrorCode, FetchRequest, IsolationLevel, NULL_TOPIC_ID, ProduceRequest,
     acl::{Operation, Permission, Resource},
+    create_acls_request::AclCreation,
     create_topics_request::CreatableTopic,
+    delete_acls_request::DeleteAclsFilter,
+    delete_topics_request::DeleteTopicState,
     fetch_request::{FetchPartition, FetchTopic},
     produce_request::{PartitionProduceData, TopicProduceData},
     record::{Record, deflated, inflated},
     resource::Pattern,
 };
 use tansu_storage::{
-    AclBinding, Authorizer, CreateTopicsService, Error, FetchService, ProduceService, Requester,
-    Storage, StorageContainer, WILDCARD_HOST,
+    AclBinding, AclFilter, Authorizer, CLUSTER_RESOURCE, CreateAclsService, CreateTopicsService,
+    DeleteAclsService, DeleteTopicsService, DescribeAclsService, Error, FetchService,
+    ProduceService, Requester, Storage, StorageContainer, WILDCARD_HOST,
 };
 use url::Url;
 
@@ -340,6 +345,235 @@ async fn without_an_authorizer_nothing_is_refused() -> Result<(), Error> {
             .into_iter()
             .flat_map(|topic| topic.partition_responses.unwrap_or_default())
             .map(|partition| partition.error_code)
+            .collect::<Vec<_>>(),
+    );
+
+    Ok(())
+}
+
+/// A principal that can delete the ACLs can grant itself anything, so
+/// enforcing everything else while leaving the ACL APIs open enforces nothing.
+///
+/// This was the last hole of consequence: after #375 a tenant could no longer
+/// read another's *data*, but any authenticated principal could still wipe the
+/// rules that said so.
+#[tokio::test]
+async fn only_a_cluster_admin_may_read_or_change_the_acls() -> Result<(), Error> {
+    let storage = storage().await?;
+
+    // Alice may read her own prefix, and nothing else — in particular, nothing
+    // about the cluster.
+    _ = storage
+        .create_acls(&[allow("tenant-a.", ALICE, Operation::Read)])
+        .await?;
+
+    let creation = || {
+        AclCreation::default()
+            .resource_type(Resource::Topic.into())
+            .resource_name("tenant-b.".into())
+            .resource_pattern_type(Some(i8::from(Pattern::Prefixed)))
+            .principal(ALICE.into())
+            .host(WILDCARD_HOST.into())
+            .operation(Operation::Read.into())
+            .permission_type(Permission::Allow.into())
+    };
+
+    // Granting herself another tenant's prefix.
+    let created = CreateAclsService
+        .serve(
+            asking(&storage, ALICE),
+            CreateAclsRequest::default().creations(Some(vec![creation()])),
+        )
+        .await?;
+
+    assert_eq!(
+        vec![i16::from(ErrorCode::ClusterAuthorizationFailed)],
+        created
+            .results
+            .unwrap_or_default()
+            .into_iter()
+            .map(|result| result.error_code)
+            .collect::<Vec<_>>(),
+    );
+
+    // Reading the rules tells her what every other principal may do, which on
+    // a mutualised fleet names the other tenants.
+    let described = DescribeAclsService
+        .serve(
+            asking(&storage, ALICE),
+            DescribeAclsRequest::default()
+                .resource_type_filter(Resource::Any.into())
+                .resource_name_filter(None)
+                .pattern_type_filter(Some(i8::from(Pattern::Any)))
+                .principal_filter(None)
+                .host_filter(None)
+                .operation(Operation::Any.into())
+                .permission_type(Permission::Any.into()),
+        )
+        .await?;
+
+    assert_eq!(
+        i16::from(ErrorCode::ClusterAuthorizationFailed),
+        described.error_code,
+    );
+    assert!(described.resources.unwrap_or_default().is_empty());
+
+    // And wiping them, which is the one that would undo everything else.
+    let deleted = DeleteAclsService
+        .serve(
+            asking(&storage, ALICE),
+            DeleteAclsRequest::default().filters(Some(vec![
+                DeleteAclsFilter::default()
+                    .resource_type_filter(Resource::Any.into())
+                    .resource_name_filter(None)
+                    .pattern_type_filter(Some(i8::from(Pattern::Any)))
+                    .principal_filter(None)
+                    .host_filter(None)
+                    .operation(Operation::Any.into())
+                    .permission_type(Permission::Any.into()),
+            ])),
+        )
+        .await?;
+
+    assert_eq!(
+        vec![i16::from(ErrorCode::ClusterAuthorizationFailed)],
+        deleted
+            .filter_results
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|result| result.error_code)
+            .collect::<Vec<_>>(),
+    );
+
+    assert!(
+        deleted
+            .filter_results
+            .unwrap_or_default()
+            .into_iter()
+            .all(|result| result.matching_acls.unwrap_or_default().is_empty()),
+        "a refused delete must not report what it would have removed",
+    );
+
+    // Her own rule is still there.
+    assert_eq!(1, storage.describe_acls(&AclFilter::any()).await?.len());
+
+    // An `ALTER` on the cluster is what makes an operator an operator.
+    _ = storage
+        .create_acls(&[AclBinding {
+            resource_type: Resource::Cluster,
+            resource_name: CLUSTER_RESOURCE.into(),
+            pattern: Pattern::Literal,
+            principal: BOB.into(),
+            host: WILDCARD_HOST.into(),
+            operation: Operation::Alter,
+            permission: Permission::Allow,
+        }])
+        .await?;
+
+    let created = CreateAclsService
+        .serve(
+            asking(&storage, BOB),
+            CreateAclsRequest::default().creations(Some(vec![creation()])),
+        )
+        .await?;
+
+    assert_eq!(
+        vec![i16::from(ErrorCode::None)],
+        created
+            .results
+            .unwrap_or_default()
+            .into_iter()
+            .map(|result| result.error_code)
+            .collect::<Vec<_>>(),
+    );
+
+    Ok(())
+}
+
+/// Deleting a topic is refused per topic, so one refusal does not fail the
+/// rest of the request.
+#[tokio::test]
+async fn deleting_a_topic_needs_a_rule_on_that_topic() -> Result<(), Error> {
+    let storage = storage().await?;
+
+    create_topic(&storage, "tenant-a.orders").await?;
+    create_topic(&storage, "tenant-b.orders").await?;
+
+    _ = storage
+        .create_acls(&[allow("tenant-a.", ALICE, Operation::Delete)])
+        .await?;
+
+    let response = DeleteTopicsService
+        .serve(
+            asking(&storage, ALICE),
+            DeleteTopicsRequest::default().topics(Some(vec![
+                DeleteTopicState::default()
+                    .name(Some("tenant-a.orders".into()))
+                    .topic_id(NULL_TOPIC_ID),
+                DeleteTopicState::default()
+                    .name(Some("tenant-b.orders".into()))
+                    .topic_id(NULL_TOPIC_ID),
+            ])),
+        )
+        .await?;
+
+    assert_eq!(
+        vec![
+            (
+                Some("tenant-a.orders".to_owned()),
+                i16::from(ErrorCode::None)
+            ),
+            (
+                Some("tenant-b.orders".to_owned()),
+                i16::from(ErrorCode::TopicAuthorizationFailed)
+            ),
+        ],
+        response
+            .responses
+            .unwrap_or_default()
+            .into_iter()
+            .map(|result| (result.name, result.error_code))
+            .collect::<Vec<_>>(),
+        "a refusal on one topic must not fail the other",
+    );
+
+    Ok(())
+}
+
+/// Creating a topic is a cluster operation, because the topic does not exist
+/// yet and there is nothing for a topic rule to select.
+#[tokio::test]
+async fn creating_a_topic_needs_the_cluster() -> Result<(), Error> {
+    let storage = storage().await?;
+
+    // A prefix grant is not enough, and that is the point: a rule on a name
+    // nobody has taken yet would be a rule on the whole namespace.
+    _ = storage
+        .create_acls(&[allow("tenant-a.", ALICE, Operation::Create)])
+        .await?;
+
+    let response = CreateTopicsService
+        .serve(
+            asking(&storage, ALICE),
+            CreateTopicsRequest::default().topics(Some(vec![
+                CreatableTopic::default()
+                    .name("tenant-a.new".into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+            ])),
+        )
+        .await?;
+
+    assert_eq!(
+        vec![i16::from(ErrorCode::ClusterAuthorizationFailed)],
+        response
+            .topics
+            .unwrap_or_default()
+            .into_iter()
+            .map(|topic| topic.error_code)
             .collect::<Vec<_>>(),
     );
 

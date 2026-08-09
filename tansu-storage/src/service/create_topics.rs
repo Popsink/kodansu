@@ -19,7 +19,9 @@ use tansu_sans_io::{
 };
 use tracing::{debug, instrument};
 
-use crate::{Error, Result, Storage};
+use tansu_sans_io::acl::Operation;
+
+use crate::{Error, Result, Storage, authorized_cluster};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`CreateTopicsRequest`] returning [`CreateTopicsResponse`].
 ///
@@ -98,8 +100,31 @@ where
     ) -> Result<Self::Response, Self::Error> {
         let mut topics = vec![];
 
+        // `CREATE` on the cluster, as Kafka requires: the topic does not exist
+        // yet, so there is nothing for a topic rule to select. A tenant scoped
+        // to `tenant-a.` therefore cannot create topics at all — creating them
+        // is an operator's job on a mutualised fleet, and a rule on a name
+        // nobody has taken yet would be a rule on the whole namespace (#363).
+        let allowed = authorized_cluster(&ctx, Operation::Create).await;
+
         for mut topic in req.topics.unwrap_or_default() {
             let name = topic.name.clone();
+
+            if !allowed {
+                topics.push(
+                    CreatableTopicResult::default()
+                        .name(name)
+                        .topic_id(Some(NULL_TOPIC_ID))
+                        .error_code(ErrorCode::ClusterAuthorizationFailed.into())
+                        .error_message(None)
+                        .num_partitions(None)
+                        .replication_factor(None)
+                        .topic_config_error_code(None)
+                        .configs(None),
+                );
+
+                continue;
+            }
 
             let num_partitions = Some(match topic.num_partitions {
                 -1 => {

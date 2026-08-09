@@ -38,7 +38,7 @@ use tansu_sans_io::acl::{Operation, Resource};
 use tokio::time::{Duration, Instant};
 use tracing::{debug, error, warn};
 
-use crate::{AclFilter, Acls, ArcDynStorage};
+use crate::{AclFilter, Acls, ArcDynStorage, CLUSTER_RESOURCE};
 
 /// Who is asking, and from where.
 ///
@@ -226,6 +226,23 @@ impl Authorizer {
     }
 }
 
+/// Whether this request path authorizes anything at all.
+///
+/// For the handful of decisions that cannot be expressed as a question about a
+/// named resource — a `DeleteTopics` naming a topic by id alone, where an ACL
+/// is written on a *name* and resolving the id would itself be a read this
+/// principal may not be allowed. Such a request is refused when authorization
+/// is on and served as before when it is off.
+pub fn enforcing<S>(ctx: &Context<S>) -> bool {
+    ctx.get::<Authorizer>().is_some()
+}
+
+/// Whether this request may perform `operation` against the cluster itself —
+/// the resource an ACL on administration is written against.
+pub async fn authorized_cluster<S>(ctx: &Context<S>, operation: Operation) -> bool {
+    authorized(ctx, Resource::Cluster, CLUSTER_RESOURCE, operation).await
+}
+
 /// Whether this request may perform `operation` against the named resource.
 ///
 /// **Allowed when there is no [`Authorizer`] in the context**, which is what a
@@ -337,7 +354,7 @@ mod tests {
                     "User:admin",
                     HOST,
                     Resource::Cluster,
-                    "kafka-cluster",
+                    CLUSTER_RESOURCE,
                     Operation::Alter
                 )
                 .await,
