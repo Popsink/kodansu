@@ -96,6 +96,10 @@ pub(super) struct Arg {
     #[arg(long, env = "DEFAULT_RETENTION", value_parser = parse_retention_ms, default_value = "7days")]
     default_retention_ms: i64,
 
+    /// Principals allowed everything without consulting an ACL, comma separated, e.g. "User:admin,User:ops". Only meaningful with --authentication; without at least one, a cluster with no ACLs can never be given any.
+    #[arg(long, env = "SUPER_USERS", value_delimiter = ',')]
+    super_users: Vec<String>,
+
     /// Silent
     #[arg(long)]
     silent: bool,
@@ -207,6 +211,7 @@ impl Arg {
             .authentication(self.authentication)
             .tls_server_config(tls_server_config)
             .topic_defaults(topic_defaults)
+            .super_users(self.super_users)
             .silent(self.silent);
 
         if !self.silent {

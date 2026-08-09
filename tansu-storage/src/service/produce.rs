@@ -22,7 +22,9 @@ use tansu_sans_io::{
 };
 use tracing::{debug, error, instrument, warn};
 
-use crate::{Error, Result, Storage, Topition, storage_error_code};
+use tansu_sans_io::acl::{Operation, Resource};
+
+use crate::{Error, Result, Storage, Topition, authorized, storage_error_code};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`ProduceRequest`] returning [`ProduceResponse`].
 /// ```
@@ -300,14 +302,30 @@ impl ProduceService {
     where
         G: Storage,
     {
+        // Per topic, and refused per partition, because that is the shape the
+        // response has: a client reads a partition's error code, and a blanket
+        // failure at the top would tell it every partition of every topic in
+        // the request had failed (#363).
+        let allowed = authorized(ctx, Resource::Topic, &topic.name, Operation::Write).await;
+
         let mut partitions = vec![];
 
         if let Some(partition_data) = topic.partition_data {
             for partition in partition_data {
-                partitions.push(
+                partitions.push(if allowed {
                     self.partition(ctx, transaction_id, &topic.name, partition)
-                        .await,
-                )
+                        .await
+                } else {
+                    PartitionProduceResponse::default()
+                        .index(partition.index)
+                        .error_code(ErrorCode::TopicAuthorizationFailed.into())
+                        .base_offset(-1)
+                        .log_append_time_ms(Some(-1))
+                        .log_start_offset(Some(-1))
+                        .record_errors(Some([].into()))
+                        .error_message(None)
+                        .current_leader(None)
+                })
             }
         }
 

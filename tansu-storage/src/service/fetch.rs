@@ -28,7 +28,9 @@ use tansu_sans_io::{
 use tokio::time::{Duration, Instant, sleep};
 use tracing::{debug, error, instrument};
 
-use crate::{Error, Parked, Result, Storage, Topition};
+use tansu_sans_io::acl::{Operation, Resource};
+
+use crate::{Error, Parked, Result, Storage, Topition, authorized};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`FetchRequest`] returning [`FetchResponse`].
 /// ```
@@ -288,7 +290,29 @@ impl FetchService {
         .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed()))
     }
 
+    /// A topic this principal may not read, refused the way an unknown one is
+    /// refused: per partition, because that is where a client reads an error
+    /// code (#363).
+    ///
+    /// A *distinct* code from `UNKNOWN_TOPIC_OR_PARTITION`, deliberately.
+    /// Answering "no such topic" would hide the topic's existence, which is
+    /// the stronger property — and the one namespace isolation is for — but it
+    /// would also tell a client with a genuine configuration error to go and
+    /// create the topic. Kafka draws the line here, and drawing it elsewhere is
+    /// a decision for the namespace work rather than a side effect of this.
+    fn unauthorized_topic_response(&self, fetch: &FetchTopic) -> Result<FetchableTopicResponse> {
+        self.refused_topic_response(fetch, ErrorCode::TopicAuthorizationFailed)
+    }
+
     fn unknown_topic_response(&self, fetch: &FetchTopic) -> Result<FetchableTopicResponse> {
+        self.refused_topic_response(fetch, ErrorCode::UnknownTopicOrPartition)
+    }
+
+    fn refused_topic_response(
+        &self,
+        fetch: &FetchTopic,
+        error_code: ErrorCode,
+    ) -> Result<FetchableTopicResponse> {
         Ok(FetchableTopicResponse::default()
             .topic(fetch.topic.clone())
             .topic_id(Some(NULL_TOPIC_ID))
@@ -298,7 +322,7 @@ impl FetchService {
                     .map(|partition| {
                         PartitionData::default()
                             .partition_index(partition.partition)
-                            .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                            .error_code(error_code.into())
                             .high_watermark(0)
                             .last_stable_offset(Some(0))
                             .log_start_offset(Some(-1))
@@ -356,7 +380,31 @@ impl FetchService {
                 None
             };
 
-            resolved.push(ResolvedTopic { fetch, known });
+            // Decided here, once, with the resolution — not inside the poll
+            // loop below. A long poll iterates for as long as `max.wait.ms`,
+            // and re-asking per iteration would make the authorization cost of
+            // an idle consumer proportional to how long it waits (#363).
+            //
+            // Against the *resolved* name where there is one: from Fetch v13 a
+            // client may name a topic by id alone, and the ACL is written on
+            // the name.
+            let allowed = authorized(
+                ctx,
+                Resource::Topic,
+                known
+                    .as_ref()
+                    .map(|(name, _)| name.as_str())
+                    .or(fetch.topic.as_deref())
+                    .unwrap_or_default(),
+                Operation::Read,
+            )
+            .await;
+
+            resolved.push(ResolvedTopic {
+                fetch,
+                known,
+                allowed,
+            });
         }
 
         let started_at = SystemTime::now();
@@ -371,7 +419,9 @@ impl FetchService {
 
             let fetch_started_at = SystemTime::now();
             for topic in resolved.iter() {
-                let fetch_response = if let Some((name, topic_id)) = topic.known.as_ref() {
+                let fetch_response = if !topic.allowed {
+                    self.unauthorized_topic_response(topic.fetch)?
+                } else if let Some((name, topic_id)) = topic.known.as_ref() {
                     let mut partitions = Vec::new();
 
                     for fetch_partition in topic.fetch.partitions.as_ref().unwrap_or(&Vec::new()) {
@@ -453,6 +503,10 @@ impl FetchService {
 struct ResolvedTopic<'a> {
     fetch: &'a FetchTopic,
     known: Option<(String, Option<[u8; 16]>)>,
+
+    /// Whether this request's principal may read it (#363), decided once with
+    /// the resolution rather than on every long-poll iteration.
+    allowed: bool,
 }
 
 impl<G> Service<G, FetchRequest> for FetchService
