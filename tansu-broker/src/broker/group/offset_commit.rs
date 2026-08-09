@@ -17,6 +17,12 @@ use tansu_sans_io::{ApiKey, Frame, Header, OffsetCommitRequest};
 use tracing::instrument;
 
 use super::answer;
+use tansu_sans_io::{
+    ErrorCode,
+    acl::{Operation, Resource},
+};
+use tansu_storage::authorized;
+
 use crate::{
     Error, Result,
     coordinator::group::{Coordinator, OffsetCommit},
@@ -39,13 +45,31 @@ where
     #[instrument(skip(ctx, req))]
     async fn serve(&self, mut ctx: Context<C>, req: Frame) -> Result<Self::Response, Self::Error> {
         let correlation_id = req.correlation_id()?;
-        let coordinator = ctx.state_mut();
-
         let mut offset_commit = OffsetCommitRequest::try_from(req.body)?;
 
         _ = offset_commit
             .retention_time_ms
             .take_if(|retention_ms| retention_ms.is_negative());
+
+        if !authorized(
+            &ctx,
+            Resource::Group,
+            &offset_commit.group_id,
+            Operation::Read,
+        )
+        .await
+        {
+            return Ok(Frame {
+                size: 0,
+                header: Header::Response { correlation_id },
+                body: answer::offset_commit(
+                    ErrorCode::GroupAuthorizationFailed,
+                    offset_commit.topics.as_deref(),
+                ),
+            });
+        }
+
+        let coordinator = ctx.state_mut();
 
         coordinator
             .offset_commit(OffsetCommit {

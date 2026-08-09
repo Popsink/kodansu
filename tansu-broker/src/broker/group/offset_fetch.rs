@@ -17,6 +17,12 @@ use tansu_sans_io::{ApiKey, Frame, Header, OffsetFetchRequest};
 use tracing::instrument;
 
 use super::answer;
+use tansu_sans_io::{
+    ErrorCode,
+    acl::{Operation, Resource},
+};
+use tansu_storage::authorized;
+
 use crate::{Error, Result, coordinator::group::Coordinator};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -36,8 +42,38 @@ where
     #[instrument(skip(ctx, req))]
     async fn serve(&self, mut ctx: Context<C>, req: Frame) -> Result<Self::Response, Self::Error> {
         let correlation_id = req.correlation_id()?;
-        let coordinator = ctx.state_mut();
         let offset_fetch = OffsetFetchRequest::try_from(req.body)?;
+
+        // Every group the request names, in either shape: `group_id` below v8,
+        // the `groups` array from v8. Refused as a whole rather than per group,
+        // because the answer carries one code across all of them — a mixed
+        // request would need a response shape that does not exist here, and
+        // stamping the refusal on the allowed groups too would be worse than
+        // refusing the call the client can retry one group at a time.
+        let mut named = offset_fetch.group_id.iter().cloned().collect::<Vec<_>>();
+
+        named.extend(
+            offset_fetch
+                .groups
+                .iter()
+                .flatten()
+                .map(|group| group.group_id.clone()),
+        );
+
+        for group_id in &named {
+            if !authorized(&ctx, Resource::Group, group_id, Operation::Describe).await {
+                return Ok(Frame {
+                    size: 0,
+                    header: Header::Response { correlation_id },
+                    body: answer::offset_fetch(
+                        ErrorCode::GroupAuthorizationFailed,
+                        offset_fetch.groups.as_deref(),
+                    ),
+                });
+            }
+        }
+
+        let coordinator = ctx.state_mut();
 
         coordinator
             .offset_fetch(
