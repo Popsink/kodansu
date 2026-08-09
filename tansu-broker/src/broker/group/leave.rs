@@ -17,6 +17,12 @@ use tansu_sans_io::{ApiKey, Frame, Header, LeaveGroupRequest};
 use tracing::instrument;
 
 use super::answer;
+use tansu_sans_io::{
+    ErrorCode,
+    acl::{Operation, Resource},
+};
+use tansu_storage::authorized;
+
 use crate::{Error, Result, coordinator::group::Coordinator};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -36,8 +42,17 @@ where
     #[instrument(skip(ctx, req))]
     async fn serve(&self, mut ctx: Context<C>, req: Frame) -> Result<Self::Response, Self::Error> {
         let correlation_id = req.correlation_id()?;
-        let coordinator = ctx.state_mut();
         let leave = LeaveGroupRequest::try_from(req.body)?;
+
+        if !authorized(&ctx, Resource::Group, &leave.group_id, Operation::Read).await {
+            return Ok(Frame {
+                size: 0,
+                header: Header::Response { correlation_id },
+                body: answer::leave_group(ErrorCode::GroupAuthorizationFailed),
+            });
+        }
+
+        let coordinator = ctx.state_mut();
 
         coordinator
             .leave(

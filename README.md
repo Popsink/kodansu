@@ -379,8 +379,15 @@ answers them: a topic a client **named** comes back with
 and send it to create the topic instead of fixing its ACLs; a request that
 lists **everything** simply omits what it may not see.
 
-Still open (see #363): the **consumer group APIs** — `JoinGroup`, `SyncGroup`,
-`OffsetCommit` and the rest are not yet authorized.
+The consumer group APIs take `READ` on the group — `JoinGroup`, `SyncGroup`,
+`Heartbeat`, `LeaveGroup`, `OffsetCommit`, and `DESCRIBE` for `OffsetFetch`.
+`DeleteGroups` takes `DELETE`, because a principal that may participate in a
+group has no business destroying it.
+
+One coarseness worth knowing: `OffsetFetch` naming several groups is refused as
+a whole if any one of them is, because its response carries a single error code
+across every group it answers. Ask for one group at a time to see them
+individually.
 
 ## Observability
 

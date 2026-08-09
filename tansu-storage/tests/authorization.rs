@@ -29,9 +29,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
 use tansu_sans_io::{
-    CreateAclsRequest, CreateTopicsRequest, DeleteAclsRequest, DeleteTopicsRequest,
-    DescribeAclsRequest, ErrorCode, FetchRequest, IsolationLevel, ListGroupsRequest,
-    MetadataRequest, NULL_TOPIC_ID, ProduceRequest,
+    CreateAclsRequest, CreateTopicsRequest, DeleteAclsRequest, DeleteGroupsRequest,
+    DeleteTopicsRequest, DescribeAclsRequest, ErrorCode, FetchRequest, IsolationLevel,
+    ListGroupsRequest, MetadataRequest, NULL_TOPIC_ID, ProduceRequest,
     acl::{Operation, Permission, Resource},
     create_acls_request::AclCreation,
     create_topics_request::CreatableTopic,
@@ -45,9 +45,9 @@ use tansu_sans_io::{
 };
 use tansu_storage::{
     AclBinding, AclFilter, Authorizer, CLUSTER_RESOURCE, CreateAclsService, CreateTopicsService,
-    DeleteAclsService, DeleteTopicsService, DescribeAclsService, Error, FetchService,
-    ListGroupsService, MetadataService, ProduceService, Requester, Storage, StorageContainer,
-    WILDCARD_HOST,
+    DeleteAclsService, DeleteGroupsService, DeleteTopicsService, DescribeAclsService, Error,
+    FetchService, ListGroupsService, MetadataService, ProduceService, Requester, Storage,
+    StorageContainer, WILDCARD_HOST,
 };
 use url::Url;
 
@@ -692,6 +692,75 @@ async fn list_groups_omits_the_groups_a_principal_may_not_describe() -> Result<(
             .map(|group| group.group_id)
             .collect::<Vec<_>>(),
         "a group a principal may not describe must not be named to it",
+    );
+
+    Ok(())
+}
+
+/// Deleting a group is `DELETE` on it, refused per group.
+///
+/// The coordination APIs take `READ`; deleting is not coordination, and a
+/// principal that may participate in a group has no business destroying it.
+#[tokio::test]
+async fn deleting_a_group_needs_a_rule_on_that_group() -> Result<(), Error> {
+    let storage = storage().await?;
+
+    for group in ["tenant-a.workers", "tenant-b.workers"] {
+        _ = storage
+            .update_group_generation(group, Default::default(), None)
+            .await
+            .map_err(|error| Error::Message(format!("{error:?}")))?;
+    }
+
+    _ = storage
+        .create_acls(&[AclBinding {
+            resource_type: Resource::Group,
+            resource_name: "tenant-a.".into(),
+            pattern: Pattern::Prefixed,
+            principal: ALICE.into(),
+            host: WILDCARD_HOST.into(),
+            operation: Operation::Delete,
+            permission: Permission::Allow,
+        }])
+        .await?;
+
+    let response = DeleteGroupsService
+        .serve(
+            asking(&storage, ALICE),
+            DeleteGroupsRequest::default().groups_names(Some(vec![
+                "tenant-a.workers".into(),
+                "tenant-b.workers".into(),
+            ])),
+        )
+        .await?;
+
+    let mut results = response
+        .results
+        .unwrap_or_default()
+        .into_iter()
+        .map(|result| (result.group_id, result.error_code))
+        .collect::<Vec<_>>();
+
+    results.sort();
+
+    assert_eq!(
+        vec![
+            ("tenant-a.workers".to_owned(), i16::from(ErrorCode::None)),
+            (
+                "tenant-b.workers".to_owned(),
+                i16::from(ErrorCode::GroupAuthorizationFailed)
+            ),
+        ],
+        results,
+        "a refusal on one group must not fail the other",
+    );
+
+    // And the refused group is still there.
+    assert!(
+        storage
+            .read_group_generation("tenant-b.workers")
+            .await?
+            .is_some(),
     );
 
     Ok(())

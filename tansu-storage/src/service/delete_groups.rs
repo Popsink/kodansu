@@ -16,7 +16,13 @@ use rama::{Context, Service};
 use tansu_sans_io::{ApiKey, DeleteGroupsRequest, DeleteGroupsResponse};
 use tracing::instrument;
 
-use crate::{Error, Result, Storage};
+use tansu_sans_io::{
+    ErrorCode,
+    acl::{Operation, Resource},
+    delete_groups_response::DeletableGroupResult,
+};
+
+use crate::{Error, Result, Storage, authorized};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`DeleteGroupsRequest`] returning [`DeleteGroupsResponse`].
 /// ```
@@ -73,15 +79,30 @@ where
         ctx: Context<G>,
         req: DeleteGroupsRequest,
     ) -> Result<Self::Response, Self::Error> {
-        ctx.state()
-            .delete_groups(req.groups_names.as_deref())
-            .await
-            .map(Some)
-            .map(|results| {
-                DeleteGroupsResponse::default()
-                    .throttle_time_ms(0)
-                    .results(results)
-            })
+        // Per group, so a refusal on one does not fail the rest of the
+        // request — and deleting a group is `DELETE` on it, not `READ` like
+        // the coordination APIs (#363).
+        let mut deletable = vec![];
+        let mut refused = vec![];
+
+        for group_id in req.groups_names.unwrap_or_default() {
+            if authorized(&ctx, Resource::Group, &group_id, Operation::Delete).await {
+                deletable.push(group_id);
+            } else {
+                refused.push(
+                    DeletableGroupResult::default()
+                        .group_id(group_id)
+                        .error_code(ErrorCode::GroupAuthorizationFailed.into()),
+                );
+            }
+        }
+
+        let mut results = ctx.state().delete_groups(Some(&deletable[..])).await?;
+        results.append(&mut refused);
+
+        Ok(DeleteGroupsResponse::default()
+            .throttle_time_ms(0)
+            .results(Some(results)))
     }
 }
 

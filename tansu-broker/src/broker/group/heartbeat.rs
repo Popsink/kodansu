@@ -17,6 +17,12 @@ use tansu_sans_io::{ApiKey, Frame, Header, HeartbeatRequest};
 use tracing::instrument;
 
 use super::answer;
+use tansu_sans_io::{
+    ErrorCode,
+    acl::{Operation, Resource},
+};
+use tansu_storage::authorized;
+
 use crate::{Error, Result, coordinator::group::Coordinator};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -37,9 +43,21 @@ where
     async fn serve(&self, mut ctx: Context<C>, req: Frame) -> Result<Self::Response, Self::Error> {
         let correlation_id = req.correlation_id()?;
 
-        let coordinator = ctx.state_mut();
-
         let req = HeartbeatRequest::try_from(req.body)?;
+
+        // `READ` on the group, as Kafka requires (#363). Without it a principal
+        // could join another tenant's group and be handed partitions of topics
+        // it cannot read — refused at the fetch, but only after it had
+        // disturbed the group's membership to find out.
+        if !authorized(&ctx, Resource::Group, &req.group_id, Operation::Read).await {
+            return Ok(Frame {
+                size: 0,
+                header: Header::Response { correlation_id },
+                body: answer::heartbeat(ErrorCode::GroupAuthorizationFailed),
+            });
+        }
+
+        let coordinator = ctx.state_mut();
 
         coordinator
             .heartbeat(
