@@ -18,7 +18,9 @@ use tansu_sans_io::{
 };
 use tracing::{error, instrument, warn};
 
-use crate::{Error, Result, Storage, TopicId};
+use tansu_sans_io::acl::{Operation, Resource};
+
+use crate::{Error, Result, Storage, TopicId, authorized, enforcing};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`MetadataRequest`] returning [`MetadataRequest`].
 /// ```
@@ -145,7 +147,48 @@ where
         let brokers = Some(response.brokers().to_owned());
         let cluster_id = response.cluster().map(|s| s.into());
         let controller_id = response.controller();
-        let topics = Some(response.topics().to_owned());
+
+        // Metadata is where a namespace leaks (#363). Refusing to *read* a
+        // topic still leaves its name visible here, and on a mutualised fleet
+        // the list of topics is the list of tenants.
+        //
+        // The two shapes are answered differently, as Kafka answers them:
+        //
+        // - **asked for by name**, the topic is reported with
+        //   `TOPIC_AUTHORIZATION_FAILED`, because a client that named it is
+        //   owed an answer about it and silence reads as "does not exist" —
+        //   which sends it to create the topic instead of fixing its ACLs;
+        // - **listing everything** (`topics` absent), an unauthorized topic is
+        //   simply **omitted**. There is no client expectation to violate, and
+        //   returning an entry per refused topic would enumerate the namespace
+        //   as thoroughly as returning them.
+        let named = topics.is_some();
+        let mut visible = Vec::with_capacity(response.topics().len());
+
+        for topic in response.topics() {
+            let allowed = match topic.name.as_deref() {
+                Some(name) => authorized(&ctx, Resource::Topic, name, Operation::Describe).await,
+
+                // Resolved by id and nameless: an ACL is written on a name, so
+                // there is nothing to ask about. Only reachable when
+                // authorization is on, where refusing is the answer that
+                // cannot leak.
+                None => !enforcing(&ctx),
+            };
+
+            if allowed {
+                visible.push(topic.to_owned());
+            } else if named {
+                visible.push(
+                    topic
+                        .to_owned()
+                        .error_code(ErrorCode::TopicAuthorizationFailed.into())
+                        .partitions(Some([].into())),
+                );
+            }
+        }
+
+        let topics = Some(visible);
         let cluster_authorized_operations = Some(-1);
 
         let throttle_time_ms = Some(0);
