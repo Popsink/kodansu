@@ -47,11 +47,18 @@ async fn describe_non_existent_group() -> Result<(), Error> {
         .await
         .inspect(|response| debug!(?response))?;
 
+    // `GROUP_ID_NOT_FOUND` is what this API answers for anything it cannot
+    // describe as a KIP-848 group — a group that does not exist, and equally a
+    // classic group that does. Kafka answers the same for both, and the
+    // AdminClient reads it as "ask `DescribeGroups` instead".
     let groups = response.groups.unwrap_or_default();
     assert_eq!(1, groups.len());
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(groups[0].error_code)?);
+    assert_eq!(
+        ErrorCode::GroupIdNotFound,
+        ErrorCode::try_from(groups[0].error_code)?
+    );
     assert_eq!(group_id, groups[0].group_id.as_str());
-    assert_eq!("Empty", groups[0].group_state.as_str());
+    assert_eq!("Unknown", groups[0].group_state.as_str());
 
     Ok(())
 }

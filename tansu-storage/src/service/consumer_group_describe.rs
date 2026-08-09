@@ -22,6 +22,11 @@ use tracing::{debug, instrument};
 use crate::{Error, Result, Storage};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`ConsumerGroupDescribeRequest`] returning [`ConsumerGroupDescribeResponse`].
+///
+/// This engine holds classic groups only, so every group is answered
+/// [`ErrorCode::GroupIdNotFound`] here — the code that sends an AdminClient to
+/// [`DescribeGroups`](crate::DescribeGroupsService), which is the path that
+/// carries the membership.
 /// ```
 /// use rama::{Context, Layer, Service as _, layer::MapStateLayer};
 /// use tansu_sans_io::{ConsumerGroupDescribeRequest, ErrorCode};
@@ -53,9 +58,9 @@ use crate::{Error, Result, Storage};
 ///
 /// let groups = response.groups.unwrap_or_default();
 /// assert_eq!(1, groups.len());
-/// assert_eq!(ErrorCode::None, ErrorCode::try_from(groups[0].error_code)?);
+/// assert_eq!(ErrorCode::GroupIdNotFound, ErrorCode::try_from(groups[0].error_code)?);
 /// assert_eq!(group_id, groups[0].group_id.as_str());
-/// assert_eq!("Empty", groups[0].group_state.as_str());
+/// assert_eq!("Unknown", groups[0].group_state.as_str());
 /// # Ok(())
 /// # }
 /// ```
