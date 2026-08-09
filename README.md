@@ -371,9 +371,16 @@ surprise people:
 - **Reading the ACLs needs `DESCRIBE` on the cluster.** The rules say what every
   principal may do, which on a mutualised fleet names the other tenants.
 
-Still open (see #363): the **consumer group APIs**, and the filtering of
-`Metadata` and `ListGroups` — a principal can still *see* topic and group names
-it cannot read.
+`Metadata` and `ListGroups` are filtered, so a principal does not see the names
+of topics and groups it may not describe — on a mutualised fleet, the list of
+topics is the list of tenants. The two shapes answer differently, as Kafka
+answers them: a topic a client **named** comes back with
+`TOPIC_AUTHORIZATION_FAILED`, because silence would read as "does not exist"
+and send it to create the topic instead of fixing its ACLs; a request that
+lists **everything** simply omits what it may not see.
+
+Still open (see #363): the **consumer group APIs** — `JoinGroup`, `SyncGroup`,
+`OffsetCommit` and the rest are not yet authorized.
 
 ## Observability
 

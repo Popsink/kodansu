@@ -16,7 +16,9 @@ use rama::{Context, Service};
 use tansu_sans_io::{ApiKey, ErrorCode, ListGroupsRequest, ListGroupsResponse};
 use tracing::instrument;
 
-use crate::{Error, Result, Storage};
+use tansu_sans_io::acl::{Operation, Resource};
+
+use crate::{Error, Result, Storage, authorized};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`ListGroupsRequest`] returning [`ListGroupsResponse`].
 /// ```
@@ -73,15 +75,34 @@ where
         ctx: Context<G>,
         req: ListGroupsRequest,
     ) -> Result<Self::Response, Self::Error> {
-        ctx.state()
+        let listed = ctx
+            .state()
             .list_groups(req.states_filter.as_deref())
+            .await?;
+
+        // Omitted rather than reported, unlike a named `Metadata` topic: this
+        // request names nothing, so there is no client expectation to answer,
+        // and an entry per refused group would enumerate the namespace as
+        // thoroughly as returning them (#363). On a mutualised fleet the list
+        // of groups is a list of the other tenants' workloads.
+        let mut groups = Vec::with_capacity(listed.len());
+
+        for group in listed {
+            if authorized(
+                &ctx,
+                Resource::Group,
+                group.group_id.as_str(),
+                Operation::Describe,
+            )
             .await
-            .map(Some)
-            .map(|groups| {
-                ListGroupsResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .error_code(ErrorCode::None.into())
-                    .groups(groups)
-            })
+            {
+                groups.push(group);
+            }
+        }
+
+        Ok(ListGroupsResponse::default()
+            .throttle_time_ms(Some(0))
+            .error_code(ErrorCode::None.into())
+            .groups(Some(groups)))
     }
 }

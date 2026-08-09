@@ -30,13 +30,15 @@ use bytes::Bytes;
 use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
 use tansu_sans_io::{
     CreateAclsRequest, CreateTopicsRequest, DeleteAclsRequest, DeleteTopicsRequest,
-    DescribeAclsRequest, ErrorCode, FetchRequest, IsolationLevel, NULL_TOPIC_ID, ProduceRequest,
+    DescribeAclsRequest, ErrorCode, FetchRequest, IsolationLevel, ListGroupsRequest,
+    MetadataRequest, NULL_TOPIC_ID, ProduceRequest,
     acl::{Operation, Permission, Resource},
     create_acls_request::AclCreation,
     create_topics_request::CreatableTopic,
     delete_acls_request::DeleteAclsFilter,
     delete_topics_request::DeleteTopicState,
     fetch_request::{FetchPartition, FetchTopic},
+    metadata_request::MetadataRequestTopic,
     produce_request::{PartitionProduceData, TopicProduceData},
     record::{Record, deflated, inflated},
     resource::Pattern,
@@ -44,7 +46,8 @@ use tansu_sans_io::{
 use tansu_storage::{
     AclBinding, AclFilter, Authorizer, CLUSTER_RESOURCE, CreateAclsService, CreateTopicsService,
     DeleteAclsService, DeleteTopicsService, DescribeAclsService, Error, FetchService,
-    ProduceService, Requester, Storage, StorageContainer, WILDCARD_HOST,
+    ListGroupsService, MetadataService, ProduceService, Requester, Storage, StorageContainer,
+    WILDCARD_HOST,
 };
 use url::Url;
 
@@ -575,6 +578,120 @@ async fn creating_a_topic_needs_the_cluster() -> Result<(), Error> {
             .into_iter()
             .map(|topic| topic.error_code)
             .collect::<Vec<_>>(),
+    );
+
+    Ok(())
+}
+
+/// Refusing to read a topic still leaves its name visible, and on a mutualised
+/// fleet the list of topics is the list of tenants (#363).
+///
+/// The two shapes of the request are answered differently, as Kafka answers
+/// them, and the difference is the point: a client that *named* a topic is owed
+/// an answer about it, and a client listing everything is owed nothing about
+/// what it may not see.
+#[tokio::test]
+async fn metadata_answers_a_named_topic_and_omits_an_unnamed_one() -> Result<(), Error> {
+    let storage = storage().await?;
+
+    create_topic(&storage, "tenant-a.orders").await?;
+    create_topic(&storage, "tenant-b.orders").await?;
+
+    _ = storage
+        .create_acls(&[allow("tenant-a.", ALICE, Operation::Read)])
+        .await?;
+
+    // Listing everything: the other tenant's topic is simply not there. An
+    // entry per refused topic would enumerate the namespace as thoroughly as
+    // returning them.
+    let listed = MetadataService
+        .serve(
+            asking(&storage, ALICE),
+            MetadataRequest::default().topics(None),
+        )
+        .await?;
+
+    assert_eq!(
+        vec![Some("tenant-a.orders".to_owned())],
+        listed
+            .topics
+            .unwrap_or_default()
+            .into_iter()
+            .map(|topic| topic.name)
+            .collect::<Vec<_>>(),
+    );
+
+    // Named: reported, and refused. Silence here would read as "does not
+    // exist", which sends a client to create the topic instead of fixing its
+    // ACLs.
+    let named = MetadataService
+        .serve(
+            asking(&storage, ALICE),
+            MetadataRequest::default().topics(Some(vec![
+                MetadataRequestTopic::default()
+                    .name(Some("tenant-b.orders".into()))
+                    .topic_id(None),
+            ])),
+        )
+        .await?;
+
+    assert_eq!(
+        vec![(
+            Some("tenant-b.orders".to_owned()),
+            i16::from(ErrorCode::TopicAuthorizationFailed)
+        )],
+        named
+            .topics
+            .unwrap_or_default()
+            .into_iter()
+            .map(|topic| (topic.name, topic.error_code))
+            .collect::<Vec<_>>(),
+    );
+
+    Ok(())
+}
+
+/// The same leak, for groups: a group's name is a workload's name.
+#[tokio::test]
+async fn list_groups_omits_the_groups_a_principal_may_not_describe() -> Result<(), Error> {
+    let storage = storage().await?;
+
+    // Two groups, made to exist by committing an offset under each.
+    for group in ["tenant-a.workers", "tenant-b.workers"] {
+        _ = storage
+            .update_group_generation(group, Default::default(), None)
+            .await
+            .map_err(|error| Error::Message(format!("{error:?}")))?;
+    }
+
+    _ = storage
+        .create_acls(&[AclBinding {
+            resource_type: Resource::Group,
+            resource_name: "tenant-a.".into(),
+            pattern: Pattern::Prefixed,
+            principal: ALICE.into(),
+            host: WILDCARD_HOST.into(),
+            operation: Operation::Read,
+            permission: Permission::Allow,
+        }])
+        .await?;
+
+    let listed = ListGroupsService
+        .serve(
+            asking(&storage, ALICE),
+            ListGroupsRequest::default().states_filter(None),
+        )
+        .await?;
+
+    assert_eq!(
+        vec!["tenant-a.workers".to_owned()],
+        listed
+            .groups
+            .unwrap_or_default()
+            .into_iter()
+            .map(|group| group.group_id)
+            .collect::<Vec<_>>(),
+        "a group a principal may not describe must not be named to it",
     );
 
     Ok(())
