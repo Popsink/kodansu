@@ -46,10 +46,11 @@ use tansu_sans_io::{
 };
 use tansu_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
 use tansu_storage::{
-    AssignmentDoc, AssignmentOutcome, BrokerRegistrationRequest, GenerationDoc, ListOffsetResponse,
-    MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
-    ProducerIdResponse, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
+    AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, BrokerRegistrationRequest,
+    GenerationDoc, ListOffsetResponse, MemberDoc, MetadataResponse, NamedGroupDetail,
+    OffsetCommitRequest, OffsetStage, ProducerIdResponse, ScramCredential, Storage, TopicId,
+    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    UpdateError, Version,
 };
 use tracing::{debug, instrument};
 use url::Url;
@@ -973,6 +974,24 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
+    #[instrument(skip_all)]
+    async fn create_acls(&self, _bindings: &[AclBinding]) -> tansu_storage::Result<Vec<ErrorCode>> {
+        unimplemented!()
+    }
+
+    #[instrument(skip_all)]
+    async fn describe_acls(&self, _filter: &AclFilter) -> tansu_storage::Result<Vec<AclBinding>> {
+        unimplemented!()
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_acls(
+        &self,
+        _filters: &[AclFilter],
+    ) -> tansu_storage::Result<Vec<Vec<AclBinding>>> {
+        unimplemented!()
+    }
+
     #[instrument(skip_all)]
     async fn assert_group_schema(&self) -> tansu_storage::Result<()> {
         unimplemented!()

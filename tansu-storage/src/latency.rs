@@ -42,11 +42,11 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    AssignmentDoc, AssignmentOutcome, AutoTopicCreate, BrokerRegistrationRequest, GenerationDoc,
-    ListOffsetResponse, MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-    Version,
+    AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
+    BrokerRegistrationRequest, GenerationDoc, ListOffsetResponse, MemberDoc, MetadataResponse,
+    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
+    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, UpdateError, Version,
 };
 
 #[derive(Clone, Debug)]
@@ -275,6 +275,24 @@ where
         _ = self.member_lists.fetch_add(1, Ordering::Relaxed);
 
         self.storage.list_group_members(group_id).await
+    }
+
+    async fn create_acls(&self, bindings: &[AclBinding]) -> Result<Vec<ErrorCode>> {
+        self.introduce_latency().await?;
+
+        self.storage.create_acls(bindings).await
+    }
+
+    async fn describe_acls(&self, filter: &AclFilter) -> Result<Vec<AclBinding>> {
+        self.introduce_latency().await?;
+
+        self.storage.describe_acls(filter).await
+    }
+
+    async fn delete_acls(&self, filters: &[AclFilter]) -> Result<Vec<Vec<AclBinding>>> {
+        self.introduce_latency().await?;
+
+        self.storage.delete_acls(filters).await
     }
 
     async fn assert_group_schema(&self) -> Result<()> {

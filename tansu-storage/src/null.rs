@@ -43,11 +43,11 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    AssignmentDoc, AssignmentOutcome, BrokerRegistrationRequest, Error, GenerationDoc,
-    GroupDetailResponse, ListOffsetResponse, MemberDoc, MetadataResponse, NamedGroupDetail,
-    OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result, ScramCredential, Storage,
-    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    UpdateError, Version,
+    AclBinding, AclFilter, Acls, AssignmentDoc, AssignmentOutcome, BrokerRegistrationRequest,
+    Error, GenerationDoc, GroupDetailResponse, ListOffsetResponse, MemberDoc, MetadataResponse,
+    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
+    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, UpdateError, Version,
 };
 
 /// A stored document with the version identifying it, as the object store
@@ -74,6 +74,7 @@ pub(crate) struct Engine {
 
     /// The decomposed group layout (#359), keyed as the object store keys it:
     /// `(group, member)`, `group`, `(group, generation)`.
+    acls: Arc<Mutex<Acls>>,
     members: Arc<Mutex<MemberDocs>>,
     generations: Arc<Mutex<GenerationDocs>>,
     assignments: Arc<Mutex<AssignmentDocs>>,
@@ -86,6 +87,7 @@ impl Engine {
             node,
             advertised_listener,
             topics: Arc::new(Mutex::new(Vec::new())),
+            acls: Arc::new(Mutex::new(Acls::default())),
             members: Arc::new(Mutex::new(BTreeMap::new())),
             generations: Arc::new(Mutex::new(BTreeMap::new())),
             assignments: Arc::new(Mutex::new(BTreeMap::new())),
@@ -470,6 +472,45 @@ impl Storage for Engine {
                 .iter()
                 .filter(|((group, _), _)| group == group_id)
                 .map(|((_, member_id), held)| (member_id.clone(), held.clone()))
+                .collect()
+        })
+    }
+
+    /// In memory for the life of the process, like everything else this engine
+    /// keeps.
+    #[instrument(skip_all)]
+    async fn create_acls(&self, bindings: &[AclBinding]) -> Result<Vec<ErrorCode>> {
+        self.acls.lock().map_err(Into::into).map(|mut acls| {
+            for binding in bindings {
+                _ = acls.bindings.insert(binding.clone());
+            }
+
+            vec![ErrorCode::None; bindings.len()]
+        })
+    }
+
+    #[instrument(skip_all)]
+    async fn describe_acls(&self, filter: &AclFilter) -> Result<Vec<AclBinding>> {
+        self.acls
+            .lock()
+            .map_err(Into::into)
+            .map(|acls| acls.matching(filter).cloned().collect())
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_acls(&self, filters: &[AclFilter]) -> Result<Vec<Vec<AclBinding>>> {
+        self.acls.lock().map_err(Into::into).map(|mut acls| {
+            filters
+                .iter()
+                .map(|filter| {
+                    let selected = acls.matching(filter).cloned().collect::<Vec<_>>();
+
+                    for binding in &selected {
+                        _ = acls.bindings.remove(binding);
+                    }
+
+                    selected
+                })
                 .collect()
         })
     }

@@ -12,8 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use serde::{Deserialize, Serialize};
+
 /// Resource pattern
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
 #[repr(i8)]
 pub enum Pattern {
     #[default]
@@ -47,5 +52,11 @@ impl From<i8> for Pattern {
 
             _ => Pattern::Unknown,
         }
+    }
+}
+
+impl From<Pattern> for i8 {
+    fn from(value: Pattern) -> Self {
+        value as i8
     }
 }

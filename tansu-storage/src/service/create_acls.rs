@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,10 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rama::{Context, Service};
-use tansu_sans_io::{ApiKey, CreateAclsRequest, CreateAclsResponse};
+//! `CreateAcls`, which used to answer success without doing anything (#363).
 
-use crate::{Error, Storage};
+use rama::{Context, Service};
+use tansu_sans_io::{
+    ApiKey, CreateAclsRequest, CreateAclsResponse, ErrorCode,
+    create_acls_response::AclCreationResult,
+};
+
+use crate::{AclBinding, Error, Storage};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CreateAclsService;
@@ -33,9 +38,62 @@ where
 
     async fn serve(
         &self,
-        _ctx: Context<G>,
-        _req: CreateAclsRequest,
+        ctx: Context<G>,
+        req: CreateAclsRequest,
     ) -> Result<Self::Response, Self::Error> {
-        Ok(CreateAclsResponse::default())
+        let creations = req.creations.unwrap_or_default();
+
+        let bindings = creations
+            .iter()
+            .map(|creation| AclBinding {
+                resource_type: creation.resource_type.into(),
+                resource_name: creation.resource_name.clone(),
+                // Absent below v1, where the pattern type did not exist and
+                // every rule was literal. Defaulting to anything else would
+                // silently change what an old client's rule selects.
+                pattern: creation.resource_pattern_type.unwrap_or(3).into(),
+                principal: creation.principal.clone(),
+                host: creation.host.clone(),
+                operation: creation.operation.into(),
+                permission: creation.permission_type.into(),
+            })
+            .collect::<Vec<_>>();
+
+        ctx.state()
+            .create_acls(&bindings[..])
+            .await
+            .map(|outcomes| {
+                CreateAclsResponse::default()
+                    .throttle_time_ms(0)
+                    .results(Some(
+                        outcomes
+                            .into_iter()
+                            .map(|error_code| {
+                                AclCreationResult::default()
+                                    .error_code(error_code.into())
+                                    .error_message(None)
+                            })
+                            .collect(),
+                    ))
+            })
+            .or_else(|error| {
+                // One error code per creation, in request order: a client
+                // matches results to creations positionally, so a short list
+                // is a client attributing the failure to the wrong rule.
+                tracing::error!(?error, "could not create acls");
+
+                Ok(CreateAclsResponse::default()
+                    .throttle_time_ms(0)
+                    .results(Some(
+                        creations
+                            .iter()
+                            .map(|_| {
+                                AclCreationResult::default()
+                                    .error_code(ErrorCode::UnknownServerError.into())
+                                    .error_message(Some("could not create acls".into()))
+                            })
+                            .collect(),
+                    )))
+            })
     }
 }

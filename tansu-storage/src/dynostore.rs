@@ -70,7 +70,7 @@ use tansu_sans_io::{
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
 };
 use tokio::sync::oneshot;
-use tokio::time::Duration;
+use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, instrument, warn};
 use url::Url;
 use uuid::Uuid;
@@ -82,11 +82,11 @@ mod opticon;
 mod tests;
 
 use crate::{
-    AssignmentDoc, AssignmentOutcome, AutoTopicCreate, BrokerRegistrationRequest,
-    ConsumerGroupState, Error, GROUP_SCHEMA_VERSION, GenerationDoc, GroupDetail, GroupMember,
-    GroupSchema, GroupState, ListOffsetResponse, METER, MemberDoc, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
-    ScramCredential, Storage, TopicDefaults, TopicId, Topition, TxnAddPartitionsRequest,
+    AclBinding, AclFilter, Acls, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
+    BrokerRegistrationRequest, ConsumerGroupState, Error, GROUP_SCHEMA_VERSION, GenerationDoc,
+    GroupDetail, GroupMember, GroupSchema, GroupState, ListOffsetResponse, METER, MemberDoc,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
+    Result, ScramCredential, Storage, TopicDefaults, TopicId, Topition, TxnAddPartitionsRequest,
     TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
     storage_error_code,
 };
@@ -4002,7 +4002,7 @@ impl DynoStore {
 
                     debug!(candidate, attempt, prefix, "segment seq taken, resyncing");
 
-                    tokio::time::sleep(cas_conflict_backoff(attempt)).await;
+                    sleep(cas_conflict_backoff(attempt)).await;
 
                     // Fold-before-claim off the index the forced refresh just
                     // listed, rather than a second full LIST (#91).
@@ -5538,7 +5538,7 @@ impl DynoStore {
                 let linger = self.jittered_linger();
 
                 _ = tokio::spawn(async move {
-                    tokio::time::sleep(linger).await;
+                    sleep(linger).await;
 
                     let buffer = store
                         .prefix_coalesce_buffers
@@ -5865,7 +5865,7 @@ impl DynoStore {
                     // writer lose every attempt of its budget to the same peers.
                     let backoff = cas_conflict_backoff(attempt);
                     backoff_elapsed += backoff;
-                    tokio::time::sleep(backoff).await;
+                    sleep(backoff).await;
                     continue;
                 }
 
@@ -6233,6 +6233,84 @@ impl DynoStore {
             inception: to_system_time(generation.inception_ms).unwrap_or(SystemTime::UNIX_EPOCH),
             state,
         }))
+    }
+
+    /// Every ACL in the cluster, as one object (#363).
+    ///
+    /// One object rather than one per rule because of how it is read: the
+    /// request path needs all of them to answer any question, so a per-rule
+    /// keyspace would put a LIST on the authorization path — the one place
+    /// that can least afford one.
+    fn acls_location(&self) -> Path {
+        Path::from(format!("clusters/{}/acls.json", self.cluster))
+    }
+
+    /// The cluster's ACLs and the version to CAS the next write against.
+    ///
+    /// A cluster that has never had an ACL applied has no object, which reads
+    /// as an empty set rather than as an error: "no rules" is a state, and on a
+    /// fail-closed broker it is the *most* consequential one, so it must not
+    /// depend on somebody having written the object first.
+    async fn read_acls(&self) -> Result<(Acls, Option<Version>)> {
+        Ok(
+            match Self::absent_is_none(self.get::<Acls>(&self.acls_location()).await)? {
+                Some((acls, version)) => (acls, Some(version)),
+                None => (Acls::default(), None),
+            },
+        )
+    }
+
+    /// Read-modify-CAS the ACL object.
+    ///
+    /// `apply` is re-run from scratch on every lost race, against the document
+    /// that won — never replayed onto the one that lost. Two operators
+    /// applying different rules at the same moment both land; the alternative,
+    /// last-writer-wins, silently drops one of them.
+    async fn update_acls<F>(&self, mut apply: F) -> Result<()>
+    where
+        F: FnMut(&mut Acls),
+    {
+        /// Generous: ACL writes are administrative and rare, so a conflict
+        /// means two operators at once rather than sustained contention, and
+        /// giving up on one is worse than trying again.
+        const ATTEMPTS: u32 = 16;
+
+        for attempt in 0..ATTEMPTS {
+            let (mut acls, version) = self.read_acls().await?;
+
+            apply(&mut acls);
+
+            match self
+                .put(
+                    &self.acls_location(),
+                    acls,
+                    json_content_type(),
+                    version.map(Into::into),
+                )
+                .await
+            {
+                Ok(_) => return Ok(()),
+
+                Err(UpdateError::Outdated { .. }) => {
+                    debug!(attempt, cluster = self.cluster, "acl update lost the CAS");
+                    sleep(Duration::from_millis(5 * u64::from(1 + attempt))).await;
+                }
+
+                Err(UpdateError::Error(error)) => return Err(error),
+                Err(UpdateError::SerdeJson(error)) => return Err(Error::SerdeJson(error)),
+                Err(UpdateError::Uuid(error)) => return Err(Error::Uuid(error)),
+                Err(UpdateError::MissingEtag) => {
+                    return Err(Error::Message(String::from(
+                        "acl update reported a missing etag",
+                    )));
+                }
+            }
+        }
+
+        Err(Error::Message(format!(
+            "could not write the acls of cluster {} in {ATTEMPTS} attempts",
+            self.cluster,
+        )))
     }
 
     /// Read `Option`, not `Result`: an object that is not there is an answer —
@@ -7862,7 +7940,7 @@ impl DynoStore {
 
                     let backoff = throttle_backoff(attempt);
                     warn!(%err, attempt, ?backoff, "S3 throttled DeleteObjects; backing off then retrying");
-                    tokio::time::sleep(backoff).await;
+                    sleep(backoff).await;
                     attempt += 1;
                 }
 
@@ -10368,6 +10446,60 @@ impl Storage for DynoStore {
         debug!(group_id, generation_id, ?deleted);
 
         Ok(deleted.len() as u64)
+    }
+
+    async fn create_acls(&self, bindings: &[AclBinding]) -> Result<Vec<ErrorCode>> {
+        // Every creation reports `None`: a rule that is already there is not a
+        // failure. `kafka-acls.sh` is run from configuration management, so
+        // re-applying the same file must not start reporting errors on the
+        // second run.
+        let outcome = vec![ErrorCode::None; bindings.len()];
+
+        if bindings.is_empty() {
+            return Ok(outcome);
+        }
+
+        self.update_acls(|acls| {
+            for binding in bindings {
+                _ = acls.bindings.insert(binding.clone());
+            }
+        })
+        .await
+        .map(|()| outcome)
+    }
+
+    async fn describe_acls(&self, filter: &AclFilter) -> Result<Vec<AclBinding>> {
+        self.read_acls()
+            .await
+            .map(|(acls, _)| acls.matching(filter).cloned().collect())
+    }
+
+    async fn delete_acls(&self, filters: &[AclFilter]) -> Result<Vec<Vec<AclBinding>>> {
+        if filters.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Decided inside the CAS, not before it: a filter evaluated against a
+        // snapshot that then lost the race would report deleting rules another
+        // writer had already removed, or miss ones it had just added.
+        let mut deleted = vec![];
+
+        self.update_acls(|acls| {
+            deleted = filters
+                .iter()
+                .map(|filter| {
+                    let selected = acls.matching(filter).cloned().collect::<Vec<_>>();
+
+                    for binding in &selected {
+                        _ = acls.bindings.remove(binding);
+                    }
+
+                    selected
+                })
+                .collect();
+        })
+        .await
+        .map(|()| deleted)
     }
 
     async fn assert_group_schema(&self) -> Result<()> {
