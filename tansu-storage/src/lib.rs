@@ -900,28 +900,6 @@ impl From<&GroupDetail> for ConsumerGroupState {
     }
 }
 
-impl From<&GroupDetail> for consumer_group_describe_response::DescribedGroup {
-    fn from(value: &GroupDetail) -> Self {
-        let assignor_name = match value.state {
-            GroupState::Forming { ref leader, .. } => leader.clone().unwrap_or_default(),
-            GroupState::Formed { ref leader, .. } => leader.clone(),
-        };
-
-        let group_state = ConsumerGroupState::from(value).to_string();
-
-        Self::default()
-            .error_code(ErrorCode::None.into())
-            .error_message(Some(ErrorCode::None.to_string()))
-            .group_id(Default::default())
-            .group_state(group_state)
-            .group_epoch(-1)
-            .assignment_epoch(-1)
-            .assignor_name(assignor_name)
-            .members(Some([].into()))
-            .authorized_operations(-1)
-    }
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum GroupDetailResponse {
     ErrorCode(ErrorCode),
@@ -956,55 +934,41 @@ impl NamedGroupDetail {
 
 impl From<&NamedGroupDetail> for consumer_group_describe_response::DescribedGroup {
     fn from(value: &NamedGroupDetail) -> Self {
-        match value {
-            NamedGroupDetail {
-                name,
-                response: GroupDetailResponse::Found(group_detail),
-            } => {
-                let assignor_name = match group_detail.state {
-                    GroupState::Forming { ref leader, .. } => leader.clone().unwrap_or_default(),
-                    GroupState::Formed { ref leader, .. } => leader.clone(),
-                };
+        let NamedGroupDetail { name, response } = value;
 
-                let group_state = ConsumerGroupState::from(group_detail).to_string();
+        // Every group this engine holds is a *classic* group, and
+        // `ConsumerGroupDescribe` describes KIP-848 groups only. Kafka answers
+        // `GROUP_ID_NOT_FOUND` for a classic group here, and that code is not a
+        // failure to the caller — it is the signal the AdminClient waits for
+        // before retrying on `DescribeGroups` ("failed because the group is not
+        // a new consumer group"). So a found group is reported not-found on
+        // this API, and there is nothing left to describe on it.
+        //
+        // Answering `NONE` with an empty member list instead — which is what
+        // this did until the pre-cut rehearsal caught it — is taken at face
+        // value: the client never falls back, so a healthy group reports zero
+        // members, zero assigned partitions and therefore zero lag. That is the
+        // whole of #215's symptom, still live for every 4.x client, on the one
+        // API a modern AdminClient tries first.
+        //
+        // Reporting a group here for real means decoding the classic protocol's
+        // opaque assignment blob into KIP-848's structured form. Until this
+        // engine speaks that protocol there is no honest `NONE` to give.
+        let error_code = match response {
+            GroupDetailResponse::Found(_) => ErrorCode::GroupIdNotFound,
+            GroupDetailResponse::ErrorCode(error_code) => *error_code,
+        };
 
-                Self::default()
-                    .error_code(ErrorCode::None.into())
-                    .error_message(Some(ErrorCode::None.to_string()))
-                    .group_id(name.into())
-                    .group_state(group_state)
-                    // The generation is the epoch this engine actually has
-                    // (#215). `-1` read as "no information" to every tool.
-                    .group_epoch(group_detail.generation_id)
-                    .assignment_epoch(group_detail.generation_id)
-                    .assignor_name(assignor_name)
-                    // Still empty: a KIP-848 member carries a *structured*
-                    // topic-partition assignment, while what this engine
-                    // persists is the classic protocol's opaque blob. Filling
-                    // this means decoding that blob, which is real work and not
-                    // a field copy — deferred, with the reasoning on #215. The
-                    // tools in that issue's report (`rpk`,
-                    // `kafka-consumer-groups.sh`, the AdminClient) all read the
-                    // classic `DescribeGroups` path below, which is now
-                    // populated.
-                    .members(Some([].into()))
-                    .authorized_operations(-1)
-            }
-
-            NamedGroupDetail {
-                name,
-                response: GroupDetailResponse::ErrorCode(error_code),
-            } => Self::default()
-                .error_code((*error_code).into())
-                .error_message(Some(error_code.to_string()))
-                .group_id(name.into())
-                .group_state("Unknown".into())
-                .group_epoch(-1)
-                .assignment_epoch(-1)
-                .assignor_name("".into())
-                .members(Some([].into()))
-                .authorized_operations(-1),
-        }
+        Self::default()
+            .error_code(error_code.into())
+            .error_message(Some(error_code.to_string()))
+            .group_id(name.into())
+            .group_state("Unknown".into())
+            .group_epoch(-1)
+            .assignment_epoch(-1)
+            .assignor_name("".into())
+            .members(Some([].into()))
+            .authorized_operations(-1)
     }
 }
 
@@ -2950,19 +2914,37 @@ mod tests {
         );
     }
 
-    /// The KIP-848 response reports the generation as its epoch rather than `-1`
-    /// (#215). Its member list stays empty for now — see the note at the call
-    /// site.
+    /// A classic group is reported `GROUP_ID_NOT_FOUND` on the KIP-848 API, so
+    /// that an AdminClient falls back to `DescribeGroups` — which is the path
+    /// that carries the members and their assignments. Answering `NONE` with an
+    /// empty member list is believed, and reports a healthy group as empty.
     #[test]
-    fn consumer_group_describe_reports_the_generation_as_its_epoch() {
+    fn consumer_group_describe_sends_a_classic_group_to_the_classic_api() {
         let described =
             consumer_group_describe_response::DescribedGroup::from(&NamedGroupDetail::found(
                 "g1".into(),
                 formed_group_with_assignment("m-1", b"sub", b"assign"),
             ));
 
-        assert_eq!(7, described.group_epoch);
-        assert_eq!(7, described.assignment_epoch);
+        assert_eq!(i16::from(ErrorCode::GroupIdNotFound), described.error_code);
+        assert_eq!("g1", described.group_id);
+    }
+
+    /// The classic path is the one that must carry the membership, precisely
+    /// because the KIP-848 path above sends every client to it.
+    #[test]
+    fn describe_groups_carries_the_members_and_their_assignments() {
+        let described = describe_groups_response::DescribedGroup::from(&NamedGroupDetail::found(
+            "g1".into(),
+            formed_group_with_assignment("m-1", b"sub", b"assign"),
+        ));
+
+        assert_eq!(i16::from(ErrorCode::None), described.error_code);
+
+        let members = described.members.unwrap_or_default();
+        assert_eq!(1, members.len());
+        assert_eq!("m-1", members[0].member_id);
+        assert_eq!(b"assign".to_vec(), members[0].member_assignment);
     }
 
     #[test]
