@@ -31,6 +31,15 @@ use tansu_auth::Authentication;
 use tansu_service::Peer;
 use tansu_storage::{Authorizer, Requester};
 
+/// The principal type a SASL-authenticated client is given.
+///
+/// Kafka's principals are `Type:name`, and SASL only ever produces `User`. The
+/// other types in Kafka's model come from an authorizer plugin, which this
+/// broker does not have — so this is a constant rather than a configuration,
+/// and naming it is what keeps `User:alice` from being spelled by hand in two
+/// places that could drift.
+const PRINCIPAL_TYPE: &str = "User";
+
 /// Puts the [`Requester`] — and the [`Authorizer`], when there is one — into
 /// every request's context.
 #[derive(Clone, Debug, Default)]
@@ -85,9 +94,19 @@ where
         // `Authentication` is a handle onto the session and is re-read per
         // request, which is also what makes re-authentication (KIP-368) visible
         // without anything else being told.
+        //
+        // Qualified with its type on the way through, because an authentication
+        // identity and an authorization principal are not the same string. SASL
+        // yields a bare `alice`; every rule ever written says `User:alice` —
+        // that is what the wire carries, what `kafka-acls.sh` prints, what
+        // `--super-users` is documented to take, and what `User:*` has to match.
+        // Comparing the bare name against any of them matches nothing, so a
+        // cluster with authentication on denies everything to everyone,
+        // including the super user who is the only way to write the first rule.
         let principal = ctx
             .get::<Authentication>()
-            .and_then(Authentication::principal);
+            .and_then(Authentication::principal)
+            .map(|auth_id| principal_of(&auth_id));
 
         let host = ctx
             .get::<Peer>()
@@ -104,6 +123,16 @@ where
     }
 }
 
+/// The principal an ACL is written against, from the id SASL authenticated.
+///
+/// The translation between two namespaces that look alike and are not: SASL's
+/// `alice` and authorization's `User:alice`. Nothing downstream can bridge them
+/// — a rule carries the qualified form because that is what the wire carries,
+/// and `--super-users` takes it for the same reason.
+fn principal_of(auth_id: &str) -> String {
+    format!("{PRINCIPAL_TYPE}:{auth_id}")
+}
+
 /// The address an ACL's `host` is written against.
 ///
 /// The address alone, without the ephemeral port: an operator writes
@@ -116,6 +145,12 @@ fn host_of(addr: SocketAddr) -> String {
 #[cfg(test)]
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    use tansu_sans_io::{
+        acl::{Operation, Permission, Resource},
+        resource::Pattern,
+    };
+    use tansu_storage::{AclBinding, WILDCARD_HOST, WILDCARD_PRINCIPAL};
 
     use super::*;
 
@@ -136,5 +171,51 @@ mod tests {
             "::1",
             host_of(SocketAddr::from((IpAddr::V6(Ipv6Addr::LOCALHOST), 54321))),
         );
+    }
+
+    fn rule_for(principal: &str) -> AclBinding {
+        AclBinding {
+            resource_type: Resource::Topic,
+            resource_name: "orders".into(),
+            pattern: Pattern::Literal,
+            principal: principal.into(),
+            host: WILDCARD_HOST.into(),
+            operation: Operation::Read,
+            permission: Permission::Allow,
+        }
+    }
+
+    /// The invariant the whole of #363 rests on: what SASL authenticates and
+    /// what a rule is written against must be the *same string*.
+    ///
+    /// They are two namespaces that look alike. SASL yields `alice`; every rule
+    /// on the wire, every `kafka-acls.sh` line and every `--super-users` entry
+    /// says `User:alice`. Handing the bare id to the decision matches no rule
+    /// naming anybody, and no super user — so a broker with authentication on
+    /// denies everything to everyone, permanently, including the super user who
+    /// is the only way to write the first rule.
+    ///
+    /// Every unit test of the rules themselves passed throughout, because they
+    /// all fed the qualified form that production never produced.
+    #[test]
+    fn an_authenticated_id_becomes_the_principal_a_rule_is_written_against() {
+        let principal = principal_of("alice");
+
+        assert_eq!("User:alice", principal);
+        assert!(rule_for("User:alice").applies_to(&principal));
+        assert!(rule_for(WILDCARD_PRINCIPAL).applies_to(&principal));
+
+        // What the bare id did, and what this exists to keep it from doing
+        // again. Only a rule that names somebody: `User:*` matches whatever it
+        // is handed, which is why a cluster whose only rule was a wildcard
+        // looked like it worked.
+        assert!(!rule_for("User:alice").applies_to("alice"));
+    }
+
+    /// `--super-users` is documented as `User:admin`, and is compared against
+    /// this same string. A bare id makes the escape hatch unreachable.
+    #[test]
+    fn a_super_user_is_named_the_way_the_option_documents_it() {
+        assert_eq!("User:admin", principal_of("admin"));
     }
 }

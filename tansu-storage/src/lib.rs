@@ -2834,7 +2834,19 @@ impl Drop for Parked {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+/// What a SCRAM handshake is checked against.
+///
+/// Never the password, and never anything a password can be recovered from:
+/// PBKDF2 over the salt gives a salted password, `stored_key` is a further hash
+/// of the client key derived from it, and `server_key` is what lets the client
+/// verify the broker in turn. The client proves it knows the password without
+/// sending it, and this document is what the broker needs to check that proof.
+///
+/// It is still the whole of a principal's authentication: anyone who can read
+/// it can impersonate the user to a broker. It is written under the cluster
+/// prefix in the object store, so **the bucket's own access control is what
+/// keeps it**, exactly as it is for the committed offsets beside it.
+#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ScramCredential {
     pub salt: Bytes,
     pub iterations: i32,
