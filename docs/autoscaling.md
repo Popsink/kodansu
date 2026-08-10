@@ -105,15 +105,28 @@ spec:
           stabilizationWindowSeconds: 300
   triggers:
     - type: prometheus
+      # Set explicitly, and read the note below before changing the query.
+      metricType: AverageValue
       metadata:
         serverAddress: http://prometheus.monitoring.svc:9090
-        # Busy requests per replica: in flight, minus the ones only waiting.
+        # Busy requests across the whole fleet: in flight, minus the ones only
+        # waiting. A *total*, deliberately not divided by replica count.
         query: |
-          (
-            sum(tansu_requests_in_flight) - sum(tansu_requests_parked or vector(0))
-          ) / count(tansu_requests_in_flight)
+          sum(tansu_requests_in_flight) - sum(tansu_requests_parked or vector(0))
         threshold: "8"
 ```
+
+> **The query is a fleet total and `threshold` is the per-replica target.** With
+> `metricType: AverageValue` — KEDA's default for this scaler — the HPA computes
+> `ceil(query / threshold)`, so the division by replica count happens *there*.
+> Dividing in the query as well divides twice: a fleet of ten replicas at 7.9
+> busy each asks for `ceil(7.9 / 8)` and is scaled to **one**. The failure is
+> silent, immediate and total, which is why `metricType` is written out here
+> rather than left to the default.
+>
+> The other consistent pairing is `metricType: Value` with a query that *does*
+> divide by `count(tansu_requests_in_flight)`. Either works; mixing them does
+> not.
 
 **`minReplicaCount: 2`, not 0.** On a mutualised multi-tenant fleet scale-to-zero
 only fires when *every* tenant is idle, so in production it effectively never
@@ -125,6 +138,13 @@ property and a correctness consequence of statelessness — set
 **The threshold is a starting point, not a recommendation.** Eight busy requests
 per replica is a plausible first target for the object-store-bound workload this
 was written against; measure yours against `tansu_request_duration` and move it.
+
+For one data point from a real fleet: a ten-replica production broker measured
+**121 requests in flight, 42 of them parked** — so 79 busy, 7.9 per replica
+(p50 7.8, p90 9.2). A third of what requests-in-flight reported was waiting on
+nothing, which is the whole argument for subtracting. Eight lands that fleet at
+about the size it was already running at by hand, which is what makes it a
+usable starting value rather than a confirmation of anything.
 
 **Scale-down is deliberately slow.** A five-minute stabilisation window and a
 two-minute cooldown, because removing a replica costs its clients a reconnect
