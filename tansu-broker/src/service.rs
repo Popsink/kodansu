@@ -20,9 +20,10 @@ use tansu_service::{
     BytesFrameLayer, BytesFrameService, FrameRouteService, TcpBytesLayer, TcpBytesService,
     TcpContext, TcpContextLayer, TcpContextService,
 };
-use tansu_storage::{Authorizer, Storage};
+use tansu_storage::{Authorizer, QuotaEnforcer, Storage};
 
 use crate::service::principal::{RequesterLayer, RequesterService};
+use crate::service::quota::{QuotaLayer, QuotaService};
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
@@ -31,10 +32,14 @@ use crate::{Error, Result, coordinator::group::Coordinator};
 pub mod auth;
 pub mod coordinator;
 pub mod principal;
+pub mod quota;
 pub mod storage;
 
 type TcpRouteFrame = TcpContextService<
-    TcpBytesService<BytesFrameService<RequesterService<FrameRouteService<(), Error>>>, ()>,
+    TcpBytesService<
+        BytesFrameService<RequesterService<QuotaService<FrameRouteService<(), Error>>>>,
+        (),
+    >,
 >;
 
 /// The per-connection service stack.
@@ -46,7 +51,8 @@ type TcpRouteFrame = TcpContextService<
 ///
 /// `authorizer` is `None` on a broker without `--authentication`, and its
 /// absence is what disables authorization: no principals, nothing to evaluate
-/// (#363).
+/// (#363). `enforcer` is `None` for the same reason and on the same switch:
+/// with no principal there is nothing to write a quota against (#384).
 pub fn services<C, S>(
     cluster_id: &str,
     coordinator: C,
@@ -54,6 +60,7 @@ pub fn services<C, S>(
     sasl_config: Option<Arc<SASLConfig>>,
     drain: CancellationToken,
     authorizer: Option<Authorizer>,
+    enforcer: Option<QuotaEnforcer>,
 ) -> Result<TcpRouteFrame, Error>
 where
     S: Storage + Clone,
@@ -76,6 +83,10 @@ where
                 TcpBytesLayer::default(),
                 BytesFrameLayer::default().with_sasl_config(sasl_config),
                 RequesterLayer::new(authorizer),
+                // Immediately inside the layer that says who is asking, and
+                // outside every API's own service: a quota is a property of the
+                // principal, not of the produce path (#384).
+                QuotaLayer::new(enforcer),
             )
                 .into_layer(route)
         })

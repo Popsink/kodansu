@@ -225,6 +225,7 @@ async fn serve_broker_stack() -> Result<u16> {
                 None,
                 CancellationToken::new(),
                 None,
+                None,
             ) else {
                 return;
             };
@@ -483,6 +484,7 @@ async fn a_non_api_error_still_ends_the_connection() -> Result<()> {
                 storage.clone(),
                 None,
                 CancellationToken::new(),
+                None,
                 None,
             ) else {
                 return;

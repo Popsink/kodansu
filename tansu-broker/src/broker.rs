@@ -41,7 +41,8 @@ use std::{
 use tansu_sans_io::{ErrorCode, RootMessageMeta};
 use tansu_service::{Classify as _, Peer, Severity};
 use tansu_storage::{
-    ArcDynStorage, Authorizer, BrokerRegistrationRequest, Storage, StorageContainer, TopicDefaults,
+    ArcDynStorage, Authorizer, BrokerRegistrationRequest, QuotaEnforcer, QuotaLimits, Storage,
+    StorageContainer, TopicDefaults,
 };
 use tokio::{
     net::{TcpListener, TcpStream},
@@ -235,6 +236,13 @@ pub struct Broker<G, S> {
     /// nothing to evaluate, and enforcing would refuse every request on every
     /// deployment that has never turned authentication on.
     authorizer: Option<Authorizer>,
+
+    /// The quota decision, when this broker enforces one (#384).
+    ///
+    /// `None` on the same switch as `authorizer`, and for the same reason:
+    /// without a principal there is nothing to write a limit against.
+    enforcer: Option<QuotaEnforcer>,
+
     tls_server_config: Option<Arc<ServerConfig>>,
     silent: bool,
     maintenance: Maintenance,
@@ -268,6 +276,7 @@ where
 
             sasl_config: None,
             authorizer: None,
+            enforcer: None,
             tls_server_config: None,
 
             silent: false,
@@ -702,6 +711,7 @@ where
             // the drain runs out of patience (#361).
             self.cancellation.clone(),
             self.authorizer.clone(),
+            self.enforcer.clone(),
         )?;
 
         let handle = set.spawn(async move {
@@ -828,6 +838,23 @@ pub struct Builder<N, C, I, A, S, L> {
     /// a fail-closed broker denies `CreateAcls` like everything else.
     super_users: Vec<String>,
 
+    /// The limits a principal gets when the cluster's quotas name neither it
+    /// nor a default (#384), so that a broker with no control plane in front of
+    /// it is still protected by something.
+    quota_defaults: QuotaLimits,
+
+    /// How many replicas a configured quota is shared between (#384).
+    ///
+    /// `1` enforces every configured limit on every replica, which is what
+    /// Apache Kafka does. Higher reads a configured limit as a fleet-wide one
+    /// and divides it — approximate, and wrong while the fleet is mid-scale;
+    /// see `docs/quotas.md`.
+    ///
+    /// A count, deliberately not a peer set: it does not name a replica, ask
+    /// for a hostname, or need any replica to be reachable from any other,
+    /// which is what #360 removed and what must not come back.
+    quota_fleet_size: u32,
+
     cancellation: CancellationToken,
 }
 
@@ -859,6 +886,8 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             topic_defaults: self.topic_defaults,
 
             super_users: self.super_users,
+            quota_defaults: self.quota_defaults,
+            quota_fleet_size: self.quota_fleet_size,
             cancellation: self.cancellation,
         }
     }
@@ -879,6 +908,8 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             topic_defaults: self.topic_defaults,
 
             super_users: self.super_users,
+            quota_defaults: self.quota_defaults,
+            quota_fleet_size: self.quota_fleet_size,
             cancellation: self.cancellation,
         }
     }
@@ -899,6 +930,8 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             topic_defaults: self.topic_defaults,
 
             super_users: self.super_users,
+            quota_defaults: self.quota_defaults,
+            quota_fleet_size: self.quota_fleet_size,
             cancellation: self.cancellation,
         }
     }
@@ -922,6 +955,8 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             topic_defaults: self.topic_defaults,
 
             super_users: self.super_users,
+            quota_defaults: self.quota_defaults,
+            quota_fleet_size: self.quota_fleet_size,
             cancellation: self.cancellation,
         }
     }
@@ -981,6 +1016,8 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             topic_defaults: self.topic_defaults,
 
             super_users: self.super_users,
+            quota_defaults: self.quota_defaults,
+            quota_fleet_size: self.quota_fleet_size,
             cancellation: self.cancellation,
         }
     }
@@ -1003,6 +1040,8 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             topic_defaults: self.topic_defaults,
 
             super_users: self.super_users,
+            quota_defaults: self.quota_defaults,
+            quota_fleet_size: self.quota_fleet_size,
             cancellation: self.cancellation,
         }
     }
@@ -1036,6 +1075,24 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
     pub fn super_users(self, super_users: Vec<String>) -> Self {
         Self {
             super_users,
+            ..self
+        }
+    }
+
+    /// The quota a principal gets when the cluster's own quotas name neither it
+    /// nor a default (#384).
+    pub fn quota_defaults(self, quota_defaults: QuotaLimits) -> Self {
+        Self {
+            quota_defaults,
+            ..self
+        }
+    }
+
+    /// How many replicas a configured quota is shared between (#384). `1`
+    /// enforces each configured limit on every replica, as Apache Kafka does.
+    pub fn quota_fleet_size(self, quota_fleet_size: u32) -> Self {
+        Self {
+            quota_fleet_size,
             ..self
         }
     }
@@ -1104,6 +1161,15 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             .authentication
             .then(|| Authorizer::new(storage.clone(), self.super_users.clone()));
 
+        // The same switch, for the same reason: a quota is written against a
+        // principal, and without authentication there are none (#384). A broker
+        // that has never turned authentication on behaves exactly as it did.
+        let enforcer = self.authentication.then(|| {
+            QuotaEnforcer::new(storage.clone())
+                .with_defaults(self.quota_defaults)
+                .with_replicas(self.quota_fleet_size.max(1))
+        });
+
         Ok(Broker {
             node_id: self.node_id,
             cluster_id: self.cluster_id.clone(),
@@ -1114,6 +1180,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             groups,
             sasl_config,
             authorizer,
+            enforcer,
             tls_server_config: self.tls_server_config.map(Arc::new),
 
             silent: self.silent,

@@ -50,8 +50,9 @@ use crate::{
     AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
     BrokerRegistrationRequest, Error, GenerationDoc, ListOffsetResponse, METER, MemberDoc,
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
+    QuotaAlteration, QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas, Result,
+    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, UpdateError, Version,
 };
 
 static BATCH_REQUESTS_LENGTH: LazyLock<Gauge<u64>> =
@@ -747,6 +748,30 @@ where
         self.storage.advertised_listener().await
     }
 
+    async fn alter_client_quotas(
+        &self,
+        alterations: &[QuotaAlteration],
+        validate_only: bool,
+    ) -> Result<Vec<ErrorCode>> {
+        self.storage
+            .alter_client_quotas(alterations, validate_only)
+            .await
+    }
+
+    async fn describe_client_quotas(
+        &self,
+        components: &[QuotaFilterComponent],
+        strict: bool,
+    ) -> Result<Vec<(QuotaEntity, QuotaLimits)>> {
+        self.storage
+            .describe_client_quotas(components, strict)
+            .await
+    }
+
+    async fn client_quotas(&self) -> Result<Quotas> {
+        self.storage.client_quotas().await
+    }
+
     async fn ping(&self) -> Result<()> {
         self.storage.ping().await
     }
@@ -1164,6 +1189,26 @@ mod tests {
             _user: &str,
             _mechanism: ScramMechanism,
         ) -> Result<Option<ScramCredential>> {
+            unimplemented!()
+        }
+
+        async fn alter_client_quotas(
+            &self,
+            _alterations: &[QuotaAlteration],
+            _validate_only: bool,
+        ) -> Result<Vec<ErrorCode>> {
+            unimplemented!()
+        }
+
+        async fn describe_client_quotas(
+            &self,
+            _components: &[QuotaFilterComponent],
+            _strict: bool,
+        ) -> Result<Vec<(QuotaEntity, QuotaLimits)>> {
+            unimplemented!()
+        }
+
+        async fn client_quotas(&self) -> Result<Quotas> {
             unimplemented!()
         }
     }

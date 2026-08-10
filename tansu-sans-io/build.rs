@@ -239,6 +239,8 @@ fn body_enum(messages: &[Message], include_tag: bool) -> TokenStream {
             }
         };
 
+        let throttle = throttle_time_ms(messages);
+
         quote! {
             #[non_exhaustive]
             #[derive(Clone, Debug, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize)]
@@ -248,6 +250,8 @@ fn body_enum(messages: &[Message], include_tag: bool) -> TokenStream {
             pub enum Body {
                 #(#variants),*
             }
+
+            #throttle
 
             #from_mezzanine
         }
@@ -285,6 +289,65 @@ fn body_enum(messages: &[Message], include_tag: bool) -> TokenStream {
             }
 
             #from_tagged
+        }
+    }
+}
+
+/// `Body::with_throttle_time_ms`: answer a throttle without knowing which
+/// response is being answered (#384).
+///
+/// `throttle_time_ms` is on nearly every response and was a hardcoded zero at
+/// forty-eight call sites. A quota is decided in one layer, above the service
+/// that builds the body and below the codec, and that layer holds a [`Body`]
+/// rather than a `ProduceResponse` — so without this it would need a
+/// hand-written match over ninety variants, which is exactly the kind of list
+/// that is complete on the day it is written and silently short afterwards.
+/// The generator already knows which messages carry the field.
+///
+/// A body without the field is returned unchanged rather than refused: the
+/// throttle is advisory on the wire, and a client that cannot be told still has
+/// its connection muted, which is what actually enforces the limit.
+fn throttle_time_ms(messages: &[Message]) -> TokenStream {
+    let arms = messages
+        .iter()
+        .filter(|message| message.kind() == MessageKind::Response)
+        .filter_map(|message| {
+            let field = message
+                .fields()
+                .iter()
+                .find(|field| field.name() == "ThrottleTimeMs")?;
+
+            let name = message.type_name();
+            let ident = field.ident();
+
+            // The same test `kind` applies to decide the generated type: a
+            // field absent from the earliest versions of a response is
+            // `Option<i32>`, one present in all of them is a bare `i32`.
+            let assign = if field.nullable().is_none() && field.versions().is_mandatory(None) {
+                quote! { inner.#ident = throttle_time_ms; }
+            } else {
+                quote! { inner.#ident = Some(throttle_time_ms); }
+            };
+
+            Some(quote! {
+                Body::#name(mut inner) => {
+                    #assign
+                    Body::#name(inner)
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    quote! {
+        impl Body {
+            #[doc = "Answer this response with a throttle, when it is a response that can carry one."]
+            #[must_use]
+            pub fn with_throttle_time_ms(self, throttle_time_ms: i32) -> Self {
+                match self {
+                    #(#arms)*
+                    otherwise => otherwise,
+                }
+            }
         }
     }
 }

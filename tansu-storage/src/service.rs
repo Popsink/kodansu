@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod alter_client_quotas;
 mod alter_user_scram_credentials;
 mod consumer_group_describe;
 mod create_acls;
@@ -21,6 +22,7 @@ mod delete_groups;
 mod delete_records;
 mod delete_topics;
 mod describe_acls;
+mod describe_client_quotas;
 mod describe_cluster;
 mod describe_configs;
 mod describe_groups;
@@ -38,6 +40,7 @@ mod metadata;
 mod produce;
 mod txn;
 
+pub use alter_client_quotas::AlterClientQuotasService;
 pub use alter_user_scram_credentials::AlterUserScramCredentialsService;
 pub use consumer_group_describe::ConsumerGroupDescribeService;
 pub use create_acls::CreateAclsService;
@@ -47,6 +50,7 @@ pub use delete_groups::DeleteGroupsService;
 pub use delete_records::DeleteRecordsService;
 pub use delete_topics::DeleteTopicsService;
 pub use describe_acls::DescribeAclsService;
+pub use describe_client_quotas::DescribeClientQuotasService;
 pub use describe_cluster::DescribeClusterService;
 pub use describe_configs::DescribeConfigsService;
 pub use describe_groups::DescribeGroupsService;

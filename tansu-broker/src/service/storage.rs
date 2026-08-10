@@ -17,23 +17,25 @@ use rama::{
     layer::{MapErrLayer, MapStateLayer},
 };
 use tansu_sans_io::{
-    AddOffsetsToTxnRequest, AddPartitionsToTxnRequest, AlterUserScramCredentialsRequest,
-    ApiKey as _, ConsumerGroupDescribeRequest, CreateAclsRequest, CreateTopicsRequest,
-    DeleteAclsRequest, DeleteGroupsRequest, DeleteRecordsRequest, DeleteTopicsRequest,
-    DescribeAclsRequest, DescribeClusterRequest, DescribeConfigsRequest, DescribeGroupsRequest,
-    DescribeTopicPartitionsRequest, DescribeUserScramCredentialsRequest, FetchRequest,
-    FindCoordinatorRequest, GetTelemetrySubscriptionsRequest, IncrementalAlterConfigsRequest,
-    InitProducerIdRequest, ListGroupsRequest, ListOffsetsRequest,
-    ListPartitionReassignmentsRequest, MetadataRequest, ProduceRequest, TxnOffsetCommitRequest,
+    AddOffsetsToTxnRequest, AddPartitionsToTxnRequest, AlterClientQuotasRequest,
+    AlterUserScramCredentialsRequest, ApiKey as _, ConsumerGroupDescribeRequest, CreateAclsRequest,
+    CreateTopicsRequest, DeleteAclsRequest, DeleteGroupsRequest, DeleteRecordsRequest,
+    DeleteTopicsRequest, DescribeAclsRequest, DescribeClientQuotasRequest, DescribeClusterRequest,
+    DescribeConfigsRequest, DescribeGroupsRequest, DescribeTopicPartitionsRequest,
+    DescribeUserScramCredentialsRequest, FetchRequest, FindCoordinatorRequest,
+    GetTelemetrySubscriptionsRequest, IncrementalAlterConfigsRequest, InitProducerIdRequest,
+    ListGroupsRequest, ListOffsetsRequest, ListPartitionReassignmentsRequest, MetadataRequest,
+    ProduceRequest, TxnOffsetCommitRequest,
 };
 use tansu_service::{FrameRequestLayer, FrameRouteBuilder};
 use tansu_storage::{
-    AlterUserScramCredentialsService, ConsumerGroupDescribeService, CreateAclsService,
-    CreateTopicsService, DeleteAclsService, DeleteGroupsService, DeleteRecordsService,
-    DeleteTopicsService, DescribeAclsService, DescribeClusterService, DescribeConfigsService,
-    DescribeGroupsService, DescribeTopicPartitionsService, DescribeUserScramCredentialsService,
-    FetchService, FindCoordinatorService, GetTelemetrySubscriptionsService,
-    IncrementalAlterConfigsService, InitProducerIdService, ListGroupsService, ListOffsetsService,
+    AlterClientQuotasService, AlterUserScramCredentialsService, ConsumerGroupDescribeService,
+    CreateAclsService, CreateTopicsService, DeleteAclsService, DeleteGroupsService,
+    DeleteRecordsService, DeleteTopicsService, DescribeAclsService, DescribeClientQuotasService,
+    DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
+    DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
+    FindCoordinatorService, GetTelemetrySubscriptionsService, IncrementalAlterConfigsService,
+    InitProducerIdService, ListGroupsService, ListOffsetsService,
     ListPartitionReassignmentsService, MetadataService, ProduceService, Storage,
     TxnAddOffsetsService, TxnAddPartitionService, TxnOffsetCommitService,
 };
@@ -50,6 +52,7 @@ where
     [
         add_offsets_to_txn,
         add_partitions_to_txn,
+        alter_client_quotas,
         alter_user_scram_credentials,
         consumer_group_describe,
         create_acls,
@@ -59,6 +62,7 @@ where
         delete_records,
         delete_topics,
         describe_acls,
+        describe_client_quotas,
         describe_cluster,
         describe_configs,
         describe_groups,
@@ -80,6 +84,48 @@ where
     .try_fold(builder, |builder, service| {
         service(builder, storage.clone())
     })
+}
+
+pub fn alter_client_quotas<S>(
+    builder: FrameRouteBuilder<(), Error>,
+    storage: S,
+) -> Result<FrameRouteBuilder<(), Error>, Error>
+where
+    S: Storage + Clone,
+{
+    builder
+        .with_route(
+            AlterClientQuotasRequest::KEY,
+            (
+                MapErrLayer::new(Error::from),
+                MapStateLayer::new(|_| storage),
+                FrameRequestLayer::<AlterClientQuotasRequest>::new(),
+            )
+                .into_layer(AlterClientQuotasService)
+                .boxed(),
+        )
+        .map_err(Into::into)
+}
+
+pub fn describe_client_quotas<S>(
+    builder: FrameRouteBuilder<(), Error>,
+    storage: S,
+) -> Result<FrameRouteBuilder<(), Error>, Error>
+where
+    S: Storage + Clone,
+{
+    builder
+        .with_route(
+            DescribeClientQuotasRequest::KEY,
+            (
+                MapErrLayer::new(Error::from),
+                MapStateLayer::new(|_| storage),
+                FrameRequestLayer::<DescribeClientQuotasRequest>::new(),
+            )
+                .into_layer(DescribeClientQuotasService)
+                .boxed(),
+        )
+        .map_err(Into::into)
 }
 
 pub fn alter_user_scram_credentials<S>(

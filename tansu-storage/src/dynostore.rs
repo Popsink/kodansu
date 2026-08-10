@@ -86,7 +86,8 @@ use crate::{
     BrokerRegistrationRequest, ConsumerGroupState, Error, GROUP_SCHEMA_VERSION, GenerationDoc,
     GroupDetail, GroupMember, GroupSchema, GroupState, ListOffsetResponse, METER, MemberDoc,
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    Result, ScramCredential, Storage, TopicDefaults, TopicId, Topition, TxnAddPartitionsRequest,
+    QuotaAlteration, QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas, Result,
+    ScramCredential, Storage, TopicDefaults, TopicId, Topition, TxnAddPartitionsRequest,
     TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
     storage_error_code,
 };
@@ -6245,6 +6246,16 @@ impl DynoStore {
         Path::from(format!("clusters/{}/acls.json", self.cluster))
     }
 
+    /// Every client quota in the cluster, as one object (#384).
+    ///
+    /// The same choice as `acls.json` above and for the same reason: the
+    /// request path holds a snapshot of all of them to answer any question, so
+    /// a key per entity would put a LIST behind the refresh of the one cache
+    /// that has to be cheap.
+    fn quotas_location(&self) -> Path {
+        Path::from(format!("clusters/{}/quotas.json", self.cluster))
+    }
+
     /// One object per principal per mechanism.
     ///
     /// The opposite choice to `acls.json` above, and for the opposite reason:
@@ -6333,6 +6344,71 @@ impl DynoStore {
 
         Err(Error::Message(format!(
             "could not write the acls of cluster {} in {ATTEMPTS} attempts",
+            self.cluster,
+        )))
+    }
+
+    /// The cluster's quotas and the version to CAS the next write against.
+    ///
+    /// A cluster that has never had a quota applied has no object, which reads
+    /// as no quotas rather than as an error — and on a broker that fails open,
+    /// "no quotas" has to be a state a fresh cluster can be in without anybody
+    /// having written the object first.
+    async fn read_quotas(&self) -> Result<(Quotas, Option<Version>)> {
+        Ok(
+            match Self::absent_is_none(self.get::<Quotas>(&self.quotas_location()).await)? {
+                Some((quotas, version)) => (quotas, Some(version)),
+                None => (Quotas::default(), None),
+            },
+        )
+    }
+
+    /// Read-modify-CAS the quota object.
+    ///
+    /// `apply` is re-run from scratch against the document that won every lost
+    /// race, never replayed onto the one that lost — the reasoning is
+    /// [`Self::update_acls`]'s, and so is the attempt count: quota writes are
+    /// administrative and rare, so a conflict means two operators at once.
+    async fn update_quotas<F>(&self, mut apply: F) -> Result<()>
+    where
+        F: FnMut(&mut Quotas),
+    {
+        const ATTEMPTS: u32 = 16;
+
+        for attempt in 0..ATTEMPTS {
+            let (mut quotas, version) = self.read_quotas().await?;
+
+            apply(&mut quotas);
+
+            match self
+                .put(
+                    &self.quotas_location(),
+                    quotas,
+                    json_content_type(),
+                    version.map(Into::into),
+                )
+                .await
+            {
+                Ok(_) => return Ok(()),
+
+                Err(UpdateError::Outdated { .. }) => {
+                    debug!(attempt, cluster = self.cluster, "quota update lost the CAS");
+                    sleep(Duration::from_millis(5 * u64::from(1 + attempt))).await;
+                }
+
+                Err(UpdateError::Error(error)) => return Err(error),
+                Err(UpdateError::SerdeJson(error)) => return Err(Error::SerdeJson(error)),
+                Err(UpdateError::Uuid(error)) => return Err(Error::Uuid(error)),
+                Err(UpdateError::MissingEtag) => {
+                    return Err(Error::Message(String::from(
+                        "quota update reported a missing etag",
+                    )));
+                }
+            }
+        }
+
+        Err(Error::Message(format!(
+            "could not write the client quotas of cluster {} in {ATTEMPTS} attempts",
             self.cluster,
         )))
     }
@@ -10524,6 +10600,60 @@ impl Storage for DynoStore {
         })
         .await
         .map(|()| deleted)
+    }
+
+    async fn alter_client_quotas(
+        &self,
+        alterations: &[QuotaAlteration],
+        validate_only: bool,
+    ) -> Result<Vec<ErrorCode>> {
+        // Validated against the current document before anything is written,
+        // so that a request naming a key this broker does not enforce is
+        // refused whole rather than half-applied — and so `validate_only` is
+        // the same check without the write, rather than a second
+        // implementation of it that can drift from the first.
+        let mut proposed = self.read_quotas().await.map(|(quotas, _)| quotas)?;
+
+        let outcomes = alterations
+            .iter()
+            .map(|alteration| match proposed.alter(alteration) {
+                Ok(()) => ErrorCode::None,
+
+                Err(error) => {
+                    warn!(?alteration, %error, "refusing a quota alteration");
+                    ErrorCode::InvalidConfig
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if !validate_only && outcomes.iter().any(|code| *code == ErrorCode::None) {
+            self.update_quotas(|quotas| {
+                for alteration in alterations {
+                    // Re-applied against whatever document won the CAS, and the
+                    // refusals above stay refused: a key this broker cannot
+                    // enforce does not become enforceable by another writer
+                    // having landed first.
+                    _ = quotas.alter(alteration);
+                }
+            })
+            .await?;
+        }
+
+        Ok(outcomes)
+    }
+
+    async fn describe_client_quotas(
+        &self,
+        components: &[QuotaFilterComponent],
+        strict: bool,
+    ) -> Result<Vec<(QuotaEntity, QuotaLimits)>> {
+        self.read_quotas()
+            .await
+            .map(|(quotas, _)| quotas.matching(components, strict))
+    }
+
+    async fn client_quotas(&self) -> Result<Quotas> {
+        self.read_quotas().await.map(|(quotas, _)| quotas)
     }
 
     async fn assert_group_schema(&self) -> Result<()> {

@@ -45,9 +45,10 @@ use uuid::Uuid;
 use crate::{
     AclBinding, AclFilter, Acls, AssignmentDoc, AssignmentOutcome, BrokerRegistrationRequest,
     Error, GenerationDoc, GroupDetailResponse, ListOffsetResponse, MemberDoc, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
-    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, UpdateError, Version,
+    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, QuotaAlteration,
+    QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas, Result, ScramCredential, Storage,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    UpdateError, Version,
 };
 
 /// A stored document with the version identifying it, as the object store
@@ -75,6 +76,7 @@ pub(crate) struct Engine {
     /// The decomposed group layout (#359), keyed as the object store keys it:
     /// `(group, member)`, `group`, `(group, generation)`.
     acls: Arc<Mutex<Acls>>,
+    quotas: Arc<Mutex<Quotas>>,
     members: Arc<Mutex<MemberDocs>>,
     generations: Arc<Mutex<GenerationDocs>>,
     assignments: Arc<Mutex<AssignmentDocs>>,
@@ -88,6 +90,7 @@ impl Engine {
             advertised_listener,
             topics: Arc::new(Mutex::new(Vec::new())),
             acls: Arc::new(Mutex::new(Acls::default())),
+            quotas: Arc::new(Mutex::new(Quotas::default())),
             members: Arc::new(Mutex::new(BTreeMap::new())),
             generations: Arc::new(Mutex::new(BTreeMap::new())),
             assignments: Arc::new(Mutex::new(BTreeMap::new())),
@@ -512,6 +515,53 @@ impl Storage for Engine {
                     selected
                 })
                 .collect()
+        })
+    }
+
+    #[instrument(skip_all)]
+    async fn alter_client_quotas(
+        &self,
+        alterations: &[QuotaAlteration],
+        validate_only: bool,
+    ) -> Result<Vec<ErrorCode>> {
+        self.quotas.lock().map_err(Into::into).map(|mut quotas| {
+            // Validated against a copy, so that `validate_only` and a refused
+            // key both leave the document as they found it.
+            let mut proposed = quotas.clone();
+
+            let outcomes = alterations
+                .iter()
+                .map(|alteration| match proposed.alter(alteration) {
+                    Ok(()) => ErrorCode::None,
+                    Err(_) => ErrorCode::InvalidConfig,
+                })
+                .collect::<Vec<_>>();
+
+            if !validate_only {
+                *quotas = proposed;
+            }
+
+            outcomes
+        })
+    }
+
+    #[instrument(skip_all)]
+    async fn describe_client_quotas(
+        &self,
+        components: &[QuotaFilterComponent],
+        strict: bool,
+    ) -> Result<Vec<(QuotaEntity, QuotaLimits)>> {
+        self.quotas
+            .lock()
+            .map_err(Into::into)
+            .map(|quotas| quotas.matching(components, strict))
+    }
+
+    #[instrument(skip_all)]
+    async fn client_quotas(&self) -> Result<Quotas> {
+        self.quotas.lock().map_err(Into::into).map(|quotas| {
+            let quotas: &Quotas = &quotas;
+            quotas.clone()
         })
     }
 

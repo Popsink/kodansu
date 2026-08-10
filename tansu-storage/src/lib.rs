@@ -145,9 +145,11 @@ mod dynostore;
 mod acl;
 mod authorizer;
 mod batch;
+mod enforcer;
 mod group;
 mod latency;
 mod null;
+mod quota;
 mod service;
 
 pub use acl::{
@@ -159,6 +161,14 @@ pub use authorizer::{
     ACL_SNAPSHOT_TTL, Authorizer, Requester, authorized, authorized_cluster, enforcing,
 };
 
+pub use enforcer::{Charge, MAX_THROTTLE, QUOTA_SNAPSHOT_TTL, QuotaEnforcer};
+
+pub use quota::{
+    CONSUMER_BYTE_RATE, PRODUCER_BYTE_RATE, QUOTA_KEYS, QuotaAlteration, QuotaEntity,
+    QuotaFilterComponent, QuotaKeyError, QuotaLimits, QuotaMatch, QuotaOp, Quotas, REQUEST_RATE,
+    USER_ENTITY, user_of,
+};
+
 pub use group::{
     AssignmentDoc, AssignmentOutcome, GROUP_SCHEMA_VERSION, GenerationDoc, GroupSchema, MemberDoc,
     MemberRef,
@@ -167,12 +177,13 @@ pub use group::{
 pub use latency::LatencyIntroducingStorage;
 
 pub use service::{
-    AlterUserScramCredentialsService, ConsumerGroupDescribeService, CreateAclsService,
-    CreateTopicsService, DeleteAclsService, DeleteGroupsService, DeleteRecordsService,
-    DeleteTopicsService, DescribeAclsService, DescribeClusterService, DescribeConfigsService,
-    DescribeGroupsService, DescribeTopicPartitionsService, DescribeUserScramCredentialsService,
-    FetchService, FindCoordinatorService, GetTelemetrySubscriptionsService,
-    IncrementalAlterConfigsService, InitProducerIdService, ListGroupsService, ListOffsetsService,
+    AlterClientQuotasService, AlterUserScramCredentialsService, ConsumerGroupDescribeService,
+    CreateAclsService, CreateTopicsService, DeleteAclsService, DeleteGroupsService,
+    DeleteRecordsService, DeleteTopicsService, DescribeAclsService, DescribeClientQuotasService,
+    DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
+    DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
+    FindCoordinatorService, GetTelemetrySubscriptionsService, IncrementalAlterConfigsService,
+    InitProducerIdService, ListGroupsService, ListOffsetsService,
     ListPartitionReassignmentsService, MetadataService, ProduceService, TxnAddOffsetsService,
     TxnAddPartitionService, TxnOffsetCommitService,
 };
@@ -1488,6 +1499,38 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// deleted what they meant to.
     async fn delete_acls(&self, filters: &[AclFilter]) -> Result<Vec<Vec<AclBinding>>>;
 
+    /// Apply each quota alteration, answering one error code per alteration
+    /// **in request order** (#384).
+    ///
+    /// An entry is applied whole or not at all, as KIP-546 requires, and a key
+    /// this broker does not enforce fails its entry rather than being stored
+    /// and ignored — a stub that reports success is what #363 found for ACLs
+    /// and #381 found again for credentials.
+    ///
+    /// `validate_only` checks every entry against the current document and
+    /// writes nothing.
+    async fn alter_client_quotas(
+        &self,
+        alterations: &[QuotaAlteration],
+        validate_only: bool,
+    ) -> Result<Vec<ErrorCode>>;
+
+    /// Every quota entity `components` selects, with the limits stored against
+    /// it.
+    async fn describe_client_quotas(
+        &self,
+        components: &[QuotaFilterComponent],
+        strict: bool,
+    ) -> Result<Vec<(QuotaEntity, QuotaLimits)>>;
+
+    /// The cluster's quotas, whole.
+    ///
+    /// What [`QuotaEnforcer`] snapshots. A filter would do, but the enforcer
+    /// wants all of them to answer any question, and saying so here is what
+    /// keeps the hot path from being expressed as a describe that matches
+    /// everything.
+    async fn client_quotas(&self) -> Result<Quotas>;
+
     /// Assert that the group layout this binary writes is the one the cluster
     /// already holds, claiming it when the cluster holds none (#359).
     ///
@@ -1828,6 +1871,30 @@ where
 
     async fn delete_acls(&self, filters: &[AclFilter]) -> Result<Vec<Vec<AclBinding>>> {
         self.as_ref().delete_acls(filters).await
+    }
+
+    async fn alter_client_quotas(
+        &self,
+        alterations: &[QuotaAlteration],
+        validate_only: bool,
+    ) -> Result<Vec<ErrorCode>> {
+        self.as_ref()
+            .alter_client_quotas(alterations, validate_only)
+            .await
+    }
+
+    async fn describe_client_quotas(
+        &self,
+        components: &[QuotaFilterComponent],
+        strict: bool,
+    ) -> Result<Vec<(QuotaEntity, QuotaLimits)>> {
+        self.as_ref()
+            .describe_client_quotas(components, strict)
+            .await
+    }
+
+    async fn client_quotas(&self) -> Result<Quotas> {
+        self.as_ref().client_quotas().await
     }
 
     async fn assert_group_schema(&self) -> Result<()> {
@@ -2182,6 +2249,30 @@ where
 
     async fn delete_acls(&self, filters: &[AclFilter]) -> Result<Vec<Vec<AclBinding>>> {
         self.as_ref().delete_acls(filters).await
+    }
+
+    async fn alter_client_quotas(
+        &self,
+        alterations: &[QuotaAlteration],
+        validate_only: bool,
+    ) -> Result<Vec<ErrorCode>> {
+        self.as_ref()
+            .alter_client_quotas(alterations, validate_only)
+            .await
+    }
+
+    async fn describe_client_quotas(
+        &self,
+        components: &[QuotaFilterComponent],
+        strict: bool,
+    ) -> Result<Vec<(QuotaEntity, QuotaLimits)>> {
+        self.as_ref()
+            .describe_client_quotas(components, strict)
+            .await
+    }
+
+    async fn client_quotas(&self) -> Result<Quotas> {
+        self.as_ref().client_quotas().await
     }
 
     async fn assert_group_schema(&self) -> Result<()> {
