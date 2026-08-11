@@ -63,6 +63,30 @@ Throughput cross-checks already exist and are worth graphing next to it:
 > empty fetch records 5 000 ms and did no work; reading that histogram as
 > saturation is the same mistake as reading requests-in-flight.
 
+### A throttling fleet is not a busy fleet
+
+Client quotas (#384) would corrupt this signal if a throttle were a sleep in the
+request path: the wait would be counted in flight, not parked, so a fleet
+deliberately refusing traffic would read as saturated and the scaler would add
+replicas to serve load the broker has just decided not to serve. It would also
+land in `tansu_request_duration`, which the note above says is not a load signal.
+
+It is not. A throttle is answered immediately in `throttle_time_ms` and the
+connection is muted *between* requests, outside both (KIP-219), and the wait is
+not counted as parked either — parked is subtracted from in flight, so counting
+a wait that was never in flight would push `busy` negative.
+
+The consequence for this page: **`busy` is at or near zero on a fleet that is
+throttling hard**, which on the busy signal alone is indistinguishable from a
+fleet with nothing to do. Graph these two next to it to tell them apart:
+
+| metric | meaning |
+|---|---|
+| `tansu_throttled_requests` | requests answered with a non-zero `throttle_time_ms` |
+| `tansu_throttled_time` | milliseconds connections have spent muted by a quota |
+
+See `docs/quotas.md`.
+
 ## Getting it to Prometheus
 
 Metrics are **pushed over OTLP** — there is no scrape endpoint (see

@@ -44,9 +44,10 @@ use uuid::Uuid;
 use crate::{
     AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
     BrokerRegistrationRequest, GenerationDoc, ListOffsetResponse, MemberDoc, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, Result,
-    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, UpdateError, Version,
+    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, QuotaAlteration,
+    QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas, Result, ScramCredential, Storage,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    UpdateError, Version,
 };
 
 #[derive(Clone, Debug)]
@@ -293,6 +294,36 @@ where
         self.introduce_latency().await?;
 
         self.storage.delete_acls(filters).await
+    }
+
+    async fn alter_client_quotas(
+        &self,
+        alterations: &[QuotaAlteration],
+        validate_only: bool,
+    ) -> Result<Vec<ErrorCode>> {
+        self.introduce_latency().await?;
+
+        self.storage
+            .alter_client_quotas(alterations, validate_only)
+            .await
+    }
+
+    async fn describe_client_quotas(
+        &self,
+        components: &[QuotaFilterComponent],
+        strict: bool,
+    ) -> Result<Vec<(QuotaEntity, QuotaLimits)>> {
+        self.introduce_latency().await?;
+
+        self.storage
+            .describe_client_quotas(components, strict)
+            .await
+    }
+
+    async fn client_quotas(&self) -> Result<Quotas> {
+        self.introduce_latency().await?;
+
+        self.storage.client_quotas().await
     }
 
     async fn assert_group_schema(&self) -> Result<()> {

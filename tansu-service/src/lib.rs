@@ -299,8 +299,33 @@ impl Drop for Parked {
 
 pub use stream::{
     BytesLayer, BytesService, BytesTcpService, Peer, TcpBytesLayer, TcpBytesService, TcpContext,
-    TcpContextLayer, TcpContextService, TcpListenerLayer,
+    TcpContextLayer, TcpContextService, TcpListenerLayer, Throttle,
 };
+
+/// Requests answered with a non-zero `throttle_time_ms` (#384).
+pub(crate) static THROTTLED_REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_throttled_requests")
+        .with_description("The number of API requests answered with a quota throttle")
+        .build()
+});
+
+/// How long connections have spent muted between requests (#384).
+///
+/// Deliberately not a share of [`REQUEST_DURATION`], and deliberately not
+/// counted in [`REQUESTS_IN_FLIGHT`]: the wait happens after a response is
+/// written and before the next request is read, so a fleet throttling hard
+/// reports `busy` at or near zero rather than looking saturated to the scaler
+/// that reads it (#362). This counter is the only place the time shows up,
+/// which is what makes "the fleet is deliberately refusing traffic" a thing an
+/// operator can see rather than infer.
+pub(crate) static THROTTLED_TIME: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_throttled_time")
+        .with_unit("ms")
+        .with_description("Time connections have spent muted by a quota, between requests")
+        .build()
+});
 
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {

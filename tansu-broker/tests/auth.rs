@@ -48,9 +48,10 @@ use tansu_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
 use tansu_storage::{
     AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, BrokerRegistrationRequest,
     GenerationDoc, ListOffsetResponse, MemberDoc, MetadataResponse, NamedGroupDetail,
-    OffsetCommitRequest, OffsetStage, ProducerIdResponse, ScramCredential, Storage, TopicId,
-    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    UpdateError, Version,
+    OffsetCommitRequest, OffsetStage, ProducerIdResponse, QuotaAlteration, QuotaEntity,
+    QuotaFilterComponent, QuotaLimits, Quotas, ScramCredential, Storage, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
+    Version,
 };
 use tracing::{debug, instrument};
 use url::Url;
@@ -1144,5 +1145,25 @@ impl Storage for Engine {
     ) -> tansu_storage::Result<Option<ScramCredential>> {
         debug!(user, ?mechanism);
         Ok(self.credentials.get(&(user.into(), mechanism)).cloned())
+    }
+
+    async fn alter_client_quotas(
+        &self,
+        _alterations: &[QuotaAlteration],
+        _validate_only: bool,
+    ) -> tansu_storage::Result<Vec<ErrorCode>> {
+        unimplemented!()
+    }
+
+    async fn describe_client_quotas(
+        &self,
+        _components: &[QuotaFilterComponent],
+        _strict: bool,
+    ) -> tansu_storage::Result<Vec<(QuotaEntity, QuotaLimits)>> {
+        unimplemented!()
+    }
+
+    async fn client_quotas(&self) -> tansu_storage::Result<Quotas> {
+        Ok(Quotas::default())
     }
 }

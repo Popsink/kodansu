@@ -28,7 +28,7 @@ use rustls::{
 };
 use tansu_broker::{NODE_ID, broker::Broker, coordinator::group::administrator::Controller};
 use tansu_sans_io::ErrorCode;
-use tansu_storage::{ArcDynStorage, DEFAULT_CLEANUP_POLICY, TopicDefaults};
+use tansu_storage::{ArcDynStorage, DEFAULT_CLEANUP_POLICY, QuotaLimits, TopicDefaults};
 use tokio::time::Instant;
 use tracing::debug;
 use url::Url;
@@ -100,9 +100,48 @@ pub(super) struct Arg {
     #[arg(long, env = "SUPER_USERS", value_delimiter = ',')]
     super_users: Vec<String>,
 
+    /// Default produce bytes/second for a principal the cluster's quotas do not name. Only meaningful with --authentication; AlterClientQuotas overrides it.
+    #[arg(long, env = "QUOTA_PRODUCER_BYTE_RATE", value_parser = parse_rate)]
+    quota_producer_byte_rate: Option<f64>,
+
+    /// Default fetch bytes/second for a principal the cluster's quotas do not name. Only meaningful with --authentication; AlterClientQuotas overrides it.
+    #[arg(long, env = "QUOTA_CONSUMER_BYTE_RATE", value_parser = parse_rate)]
+    quota_consumer_byte_rate: Option<f64>,
+
+    /// Default requests/second for a principal the cluster's quotas do not name. Only meaningful with --authentication; AlterClientQuotas overrides it.
+    #[arg(long, env = "QUOTA_REQUEST_RATE", value_parser = parse_rate)]
+    quota_request_rate: Option<f64>,
+
+    /// How many replicas a configured quota is shared between. 1 (the default) enforces each limit on every replica, as Apache Kafka does; higher reads a limit as fleet-wide and divides it, which is approximate while the fleet is scaling.
+    #[arg(long, env = "QUOTA_FLEET_SIZE", default_value_t = 1)]
+    quota_fleet_size: u32,
+
     /// Silent
     #[arg(long)]
     silent: bool,
+}
+
+/// Parse a quota rate: a non-negative, finite number.
+///
+/// Rejected at parse time rather than clamped later, because a broker started
+/// with `--quota-producer-byte-rate=-1` meaning "unlimited" and getting
+/// "nothing at all" is a fleet that refuses every produce, and finding that out
+/// from a throttle is much later than finding it out from `--help`. Leave the
+/// option off for unlimited.
+fn parse_rate(value: &str) -> Result<f64, String> {
+    value
+        .trim()
+        .parse::<f64>()
+        .map_err(|err| err.to_string())
+        .and_then(|rate| {
+            if rate.is_finite() && rate >= 0.0 {
+                Ok(rate)
+            } else {
+                Err(format!(
+                    "{rate} is not a rate; omit the option for no limit"
+                ))
+            }
+        })
 }
 
 /// Parse `DEFAULT_RETENTION` into a `retention.ms` value.
@@ -212,6 +251,12 @@ impl Arg {
             .tls_server_config(tls_server_config)
             .topic_defaults(topic_defaults)
             .super_users(self.super_users)
+            .quota_defaults(QuotaLimits {
+                producer_byte_rate: self.quota_producer_byte_rate,
+                consumer_byte_rate: self.quota_consumer_byte_rate,
+                request_rate: self.quota_request_rate,
+            })
+            .quota_fleet_size(self.quota_fleet_size)
             .silent(self.silent);
 
         if !self.silent {
@@ -307,6 +352,59 @@ mod tests {
             Vec::<String>::new(),
             command.collect::<Vec<_>>(),
             "a replica must not have to be told about its peers",
+        );
+    }
+
+    /// A quota rate is a rate. `-1` is a spelling of "unlimited" an operator
+    /// will reach for from `retention.ms` next door, and it must not be taken
+    /// as a limit of nothing — which would refuse every produce on the fleet.
+    #[test]
+    fn a_quota_rate_is_non_negative_and_finite() {
+        assert_eq!(Ok(1024.0), parse_rate("1024"));
+        assert_eq!(Ok(0.5), parse_rate("0.5"));
+        assert_eq!(Ok(0.0), parse_rate("0"));
+        assert_eq!(Ok(1024.0), parse_rate("  1024 "));
+
+        assert!(parse_rate("-1").is_err());
+        assert!(parse_rate("inf").is_err());
+        assert!(parse_rate("NaN").is_err());
+        assert!(parse_rate("lots").is_err());
+    }
+
+    /// `--quota-fleet-size` declares how *many* replicas there are, never where
+    /// any of them is (#384 against #360).
+    ///
+    /// The forbidden-option test above covers the naming; this covers the
+    /// shape. A count takes one number and cannot become a list, which is the
+    /// difference between "the fleet is this big" and a peer set arriving by
+    /// the back door.
+    #[test]
+    fn the_fleet_size_is_a_count_and_not_a_peer_set() {
+        let command = Arg::command();
+
+        let fleet_size = command
+            .get_arguments()
+            .find(|argument| argument.get_long() == Some("quota-fleet-size"))
+            .expect("--quota-fleet-size");
+
+        assert_eq!(
+            None,
+            fleet_size.get_value_delimiter(),
+            "a fleet size is one number, not a comma-separated list of replicas",
+        );
+
+        // And it parses as one — `--super-users` next door is the delimited
+        // option this must not become.
+        assert_eq!(
+            4,
+            Arg::try_parse_from(["tansu", "--quota-fleet-size", "4"])
+                .expect("--quota-fleet-size 4")
+                .quota_fleet_size,
+        );
+
+        assert!(
+            Arg::try_parse_from(["tansu", "--quota-fleet-size", "4,5"]).is_err(),
+            "a list of replicas must not parse",
         );
     }
 

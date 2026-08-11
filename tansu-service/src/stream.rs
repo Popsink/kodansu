@@ -18,7 +18,11 @@ use std::{
     io,
     marker::PhantomData,
     net::SocketAddr,
-    time::SystemTime,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, SystemTime},
 };
 
 use bytes::Bytes;
@@ -29,13 +33,14 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufWriter},
     net::{TcpListener, TcpStream},
     task::JoinSet,
+    time::sleep,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument, warn};
 
 use crate::{
     BYTES_RECEIVED, BYTES_SENT, Classify, Error, REQUEST_DURATION, REQUEST_SIZE,
-    REQUESTS_IN_FLIGHT, RESPONSE_SIZE, Severity, frame_length,
+    REQUESTS_IN_FLIGHT, RESPONSE_SIZE, Severity, THROTTLED_REQUESTS, THROTTLED_TIME, frame_length,
 };
 
 /// A request being served, counted for as long as this value lives (#362).
@@ -55,6 +60,54 @@ impl InFlight {
 impl Drop for InFlight {
     fn drop(&mut self) {
         REQUESTS_IN_FLIGHT.add(-1, &[]);
+    }
+}
+
+/// What this connection owes before its next request is read (#384).
+///
+/// KIP-219 semantics, and the reason a quota is not simply a sleep in the
+/// request path. A throttled request is *waiting*, not working: delaying it
+/// before it is served would count it in [`REQUESTS_IN_FLIGHT`] and fold the
+/// delay into [`REQUEST_DURATION`], which would report a fleet deliberately
+/// refusing traffic as a fleet saturated by it — and #362's scaler would add
+/// replicas to serve load this broker has just decided not to serve. So the
+/// response is written immediately, carrying the delay in `throttle_time_ms`,
+/// and the wait happens here: between requests, where nothing counts it.
+///
+/// A shared cell rather than a return value because the two ends are far apart.
+/// The delay is decided by a layer that knows who is asking — deep inside the
+/// stack, above the codec — and applied by the loop that reads frames, at the
+/// very bottom of it. Nothing in between has any business carrying it.
+///
+/// A connection with no quota layer above it has no [`Throttle`] in its
+/// context, and nothing writes one: the wait is unreachable rather than zero.
+#[derive(Clone, Debug, Default)]
+pub struct Throttle(Arc<AtomicU64>);
+
+impl Throttle {
+    /// Owe `delay` before the next request on this connection is read.
+    ///
+    /// The longest wins rather than accumulating: two dimensions of one request
+    /// each asking for a wait are asking for the *same* wait, and one request
+    /// must never be able to mute a connection for the sum of every limit it
+    /// touched.
+    pub fn owe(&self, delay: Duration) {
+        _ = self.0.fetch_max(delay.as_millis() as u64, Ordering::AcqRel);
+    }
+
+    /// What is owed right now, without taking it.
+    ///
+    /// The layer that decides a throttle is not the code that applies it, so
+    /// asserting that the two agree needs a way to look without draining —
+    /// draining is what the connection loop does, exactly once.
+    #[must_use]
+    pub fn owed(&self) -> Duration {
+        Duration::from_millis(self.0.load(Ordering::Acquire))
+    }
+
+    /// Take what is owed, leaving nothing.
+    fn take(&self) -> Duration {
+        Duration::from_millis(self.0.swap(0, Ordering::AcqRel))
     }
 }
 
@@ -527,6 +580,17 @@ where
         let maximum_frame_size = ctx.state().maximum_frame_size;
         let drain = ctx.state().drain.clone();
 
+        // One cell for the life of the connection, and the same one every
+        // request writes into: the quota layer above finds it in the context,
+        // and this loop drains it below (#384).
+        let throttle = Throttle::default();
+
+        let ctx = {
+            let mut ctx = ctx;
+            _ = ctx.insert(throttle.clone());
+            ctx
+        };
+
         loop {
             // The only place a connection may be ended by the drain: between
             // requests, with nothing owed to the client. `biased` so the drain
@@ -545,7 +609,40 @@ where
             };
 
             self.answer(&mut req, size, &attributes[..], ctx.clone())
-                .await?
+                .await?;
+
+            // The response is already written, and this request is no longer in
+            // flight — `answer` dropped its guard on the way out. What is left
+            // is the mute, and it happens here, where no counter and no
+            // histogram is watching (#384).
+            //
+            // Deliberately *not* wrapped in `Parked` either: parked is
+            // subtracted from in flight to get the fleet's `busy`, and counting
+            // a wait that was never counted as in flight would push that
+            // expression negative. The wait shows up in `tansu_throttled_time`
+            // and nowhere else.
+            let delay = throttle.take();
+
+            if !delay.is_zero() {
+                debug!(?delay, "muting a connection over its quota");
+
+                THROTTLED_REQUESTS.add(1, &attributes[..]);
+                THROTTLED_TIME.add(delay.as_millis() as u64, &attributes[..]);
+
+                // The drain still wins: a replica that has been asked to stop
+                // must not hold a muted connection open for the throttle before
+                // noticing (#361).
+                tokio::select! {
+                    biased;
+
+                    () = drain.cancelled() => {
+                        debug!("closing a throttled connection: this replica is stopping");
+                        return Ok(());
+                    }
+
+                    () = sleep(delay) => {}
+                }
+            }
         }
     }
 }
@@ -647,5 +744,153 @@ mod tests {
         async fn serve(&self, _ctx: Context<()>, req: Bytes) -> Result<Bytes, Error> {
             Ok(req)
         }
+    }
+
+    /// Echoes, and owes a throttle on the first request only — a client over
+    /// its quota once.
+    #[derive(Clone, Debug)]
+    struct ThrottleOnce {
+        delay: Duration,
+        served: Arc<AtomicU64>,
+    }
+
+    impl Service<(), Bytes> for ThrottleOnce {
+        type Response = Bytes;
+        type Error = Error;
+
+        async fn serve(&self, ctx: Context<()>, req: Bytes) -> Result<Bytes, Error> {
+            if self.served.fetch_add(1, Ordering::AcqRel) == 0
+                && let Some(throttle) = ctx.get::<Throttle>()
+            {
+                throttle.owe(self.delay);
+            }
+
+            Ok(req)
+        }
+    }
+
+    /// A length-delimited frame of `payload`, as this loop reads them.
+    fn frame(payload: &[u8]) -> Vec<u8> {
+        let mut framed = (payload.len() as i32).to_be_bytes().to_vec();
+        framed.extend_from_slice(payload);
+        framed
+    }
+
+    /// **KIP-219, and the whole reason a quota is not a sleep in the request
+    /// path (#384).**
+    ///
+    /// A throttled request is answered *immediately* — the client gets its
+    /// response with `throttle_time_ms` in it — and the connection is muted
+    /// afterwards, so it is the *next* request that waits. Delaying before the
+    /// response instead would put the wait inside `tansu_requests_in_flight`
+    /// and inside `tansu_request_duration`, and #362's scaler would read a
+    /// fleet deliberately refusing traffic as one saturated by it.
+    ///
+    /// Both halves are asserted, because either alone passes with the wait in
+    /// the wrong place: an implementation that slept before serving would also
+    /// deliver two responses five seconds apart.
+    #[tokio::test(start_paused = true)]
+    async fn a_throttle_is_answered_at_once_and_waited_for_between_requests() {
+        const DELAY: Duration = Duration::from_secs(5);
+
+        let service: TcpBytesService<ThrottleOnce, ()> = TcpBytesService {
+            inner: ThrottleOnce {
+                delay: DELAY,
+                served: Arc::new(AtomicU64::new(0)),
+            },
+            _state: PhantomData,
+        };
+
+        let (mut client, server) = tokio::io::duplex(4096);
+
+        let connection = tokio::spawn(async move {
+            service
+                .serve(Context::with_state(TcpContext::default()), server)
+                .await
+        });
+
+        // Two requests, both in flight before either is answered — a pipelining
+        // client, which is what makes "muted between requests" observable.
+        client
+            .write_all(&frame(b"first"))
+            .await
+            .expect("first request");
+        client
+            .write_all(&frame(b"second"))
+            .await
+            .expect("second request");
+
+        let started = tokio::time::Instant::now();
+
+        let mut first = [0u8; 9];
+        _ = client
+            .read_exact(&mut first)
+            .await
+            .expect("the first response");
+
+        assert_eq!(
+            Duration::ZERO,
+            started.elapsed(),
+            "a throttled request must be answered at once, not slept on",
+        );
+        assert_eq!(&frame(b"first")[..], &first[..]);
+
+        let mut second = [0u8; 10];
+
+        // Still muted: the second request has been sent and is sitting unread.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), client.read_exact(&mut second))
+                .await
+                .is_err(),
+            "the connection must stay muted for the throttle it answered",
+        );
+
+        _ = client
+            .read_exact(&mut second)
+            .await
+            .expect("the second response");
+
+        assert_eq!(&frame(b"second")[..], &second[..]);
+        assert!(
+            started.elapsed() >= DELAY,
+            "the second request must wait out the throttle, not the first",
+        );
+
+        drop(client);
+        _ = connection.await;
+    }
+
+    /// A connection nothing throttles is not delayed at all, which is every
+    /// connection on a broker without `--authentication`.
+    #[tokio::test(start_paused = true)]
+    async fn an_unthrottled_connection_is_never_delayed() {
+        let service: TcpBytesService<EchoBytes, ()> = TcpBytesService {
+            inner: EchoBytes,
+            _state: PhantomData,
+        };
+
+        let (mut client, server) = tokio::io::duplex(4096);
+
+        let connection = tokio::spawn(async move {
+            service
+                .serve(Context::with_state(TcpContext::default()), server)
+                .await
+        });
+
+        let started = tokio::time::Instant::now();
+
+        for payload in [&b"first"[..], &b"second"[..]] {
+            client.write_all(&frame(payload)).await.expect("request");
+
+            let mut response = vec![0u8; payload.len() + 4];
+            _ = client.read_exact(&mut response).await.expect("response");
+
+            assert_eq!(frame(payload), response);
+        }
+
+        assert_eq!(Duration::ZERO, started.elapsed());
+
+        drop(client);
+        _ = connection.await;
     }
 }

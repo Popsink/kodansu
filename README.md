@@ -188,6 +188,10 @@ The options that matter in a deployment, each with its environment variable:
 | `--default-cleanup-policy` | `DEFAULT_CLEANUP_POLICY` | `delete` | Applied to topics created without one. |
 | `--default-retention-ms` | `DEFAULT_RETENTION` | `7days` | Applied to `delete`-policy topics created without a `retention.ms`. Accepts a duration, or `-1`/`infinite`/`forever`. |
 | `--super-users` | `SUPER_USERS` | — | Principals allowed everything without consulting an ACL, comma separated (`User:admin,User:ops`). Only meaningful with `--authentication`. |
+| `--quota-producer-byte-rate` | `QUOTA_PRODUCER_BYTE_RATE` | — | Default produce bytes/second for a principal the cluster's quotas do not name. Only meaningful with `--authentication`. |
+| `--quota-consumer-byte-rate` | `QUOTA_CONSUMER_BYTE_RATE` | — | Default fetch bytes/second, likewise. |
+| `--quota-request-rate` | `QUOTA_REQUEST_RATE` | — | Default requests/second, likewise. |
+| `--quota-fleet-size` | `QUOTA_FLEET_SIZE` | `1` | How many replicas a configured quota is shared between. `1` enforces each limit on every replica, as Apache Kafka does. |
 
 The URL and address options accept `${VAR}` references, expanded when the argument is
 parsed.
@@ -300,6 +304,39 @@ is nothing left for concurrent replicas to contend on, so there is nothing to ro
 The practical consequence: **replicas are interchangeable.** One can be added or
 removed under consumer load and the groups it was serving do not notice — no cold
 owner, no DNS convergence window, no configuration to keep in step.
+
+### Quotas
+
+Authorization says *whether* a principal may write; nothing said *how much*, and
+`throttle_time_ms` was a hardcoded zero on every response. On a broker whose
+cost is object-store requests, the request rate against the object store was a
+property of who happened to be connected rather than of anything configured
+(#384).
+
+Three dimensions — `producer_byte_rate`, `consumer_byte_rate` and a
+`request_rate` — written against the `user` entity over the standard admin APIs,
+so `kafka-configs.sh` and `rpk` configure them unchanged:
+
+```shell
+kafka-configs.sh --bootstrap-server localhost:9092 \
+  --alter --entity-type users --entity-default \
+  --add-config 'producer_byte_rate=1048576,request_rate=500'
+```
+
+Like authorization, it is armed by `--authentication` and off without it: no
+principal, nothing to write a limit against.
+
+The throttle is **answered, then waited for** (KIP-219). The response goes out
+immediately carrying `throttle_time_ms`, and the connection is muted for that
+long *between* requests — never inside one, because a request delayed in flight
+would tell the autoscaler above that a fleet refusing traffic is a fleet
+saturated by it. `tansu_throttled_requests` and `tansu_throttled_time` are where
+the wait shows up instead.
+
+**[docs/quotas.md](docs/quotas.md)** has the keys, the `kafka-configs.sh`
+invocations, the convergence behaviour, and the honest caveat: the accounting is
+per replica, so a fleet's effective limit is the configured one times the
+replica count unless `--quota-fleet-size` is set.
 
 ### Autoscaling
 
@@ -422,6 +459,7 @@ just grafana-ui   # opens http://localhost:3000
 
 | Document | What it covers |
 |---|---|
+| [docs/quotas.md](docs/quotas.md) | Client quotas: the three dimensions, configuring them with `kafka-configs.sh`, and why the accounting is per replica |
 | [docs/storage-tuning.md](docs/storage-tuning.md) | Every storage-URL tuning key: coalescing, compaction, maintenance coordination |
 | [docs/virtual-topics-format.md](docs/virtual-topics-format.md) | The segment frame and footer — the contract for external S3-direct readers |
 | [docs/design-multiwriter-segments.md](docs/design-multiwriter-segments.md) | Why the create-only segment sequence is the offset arbiter |
