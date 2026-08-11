@@ -29,7 +29,7 @@
 use bytes::Bytes;
 use object_store::memory::InMemory;
 use tansu_sans_io::{
-    ListOffset,
+    ConfigResource, ListOffset,
     create_topics_request::CreatableTopic,
     delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic},
     record::Record,
@@ -85,9 +85,17 @@ async fn create(storage: &DynoStore, name: &str, compacted: bool) -> Result<()> 
 }
 
 /// Drive a topic through the paths that populate the per-topic maps, as a client
-/// would: a by-name Metadata lookup (`topic_metas`), a produce (`next_offsets`,
-/// `watermarks`) and a LATEST/EARLIEST offset read
+/// would: a by-name Metadata lookup, a `DescribeConfigs` (`topic_metas`), a
+/// produce (`next_offsets`, `watermarks`) and a LATEST/EARLIEST offset read
 /// (`coalesced_watermark_floors`, `truncate_floors`).
+///
+/// `DescribeConfigs` is what reaches `topic_metas` on a replica that never created
+/// the topic. The by-name Metadata lookup used to, and since #387 does not: it is
+/// answered from the topic index, so it allocates no per-topic `OptiCon` handle at
+/// all. That is a reduction in exactly the growth this module guards, but it would
+/// make the assertions below pass vacuously — hence a path that still reads the
+/// topic's own object, which `describe_config` deliberately remains (a stale
+/// `cleanup.policy` there is a permanently mis-pinned routing prefix).
 ///
 /// `compacted_topics` is not reachable from here and is asserted empty by the
 /// callers. Since the routing pin (#236) it is only consulted for a topic created
@@ -96,6 +104,10 @@ async fn create(storage: &DynoStore, name: &str, compacted: bool) -> Result<()> 
 /// pre-pin topics.
 async fn exercise(storage: &DynoStore, name: &str) -> Result<()> {
     _ = storage.metadata(Some(&[TopicId::from(name)])).await?;
+
+    _ = storage
+        .describe_config(name, ConfigResource::Topic, None)
+        .await?;
 
     for partition in 0..PARTITIONS {
         let topition = Topition::new(name, partition);

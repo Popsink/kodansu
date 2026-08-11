@@ -33,13 +33,13 @@ use object_store::{
 };
 use std::time::{Duration, SystemTime};
 use tansu_sans_io::{
-    IsolationLevel, ListOffset,
+    ErrorCode, IsolationLevel, ListOffset,
     create_topics_request::CreatableTopic,
     record::{Record, deflated, inflated},
 };
 
 use crate::{
-    Error, Result, Storage, Topition,
+    Error, OffsetCommitRequest, Result, Storage, TopicId, Topition,
     dynostore::{CoalesceTuning, DynoStore, tests::init_tracing},
 };
 
@@ -350,6 +350,164 @@ async fn list_all_metadata_is_cached() -> Result<(), Error> {
         cached,
         "cached list-all must not hit the object store"
     );
+    Ok(())
+}
+
+/// #387: a warm `Metadata` naming N topics costs **zero** object-store requests,
+/// and one that crosses the index window costs **one LIST** — never a conditional
+/// GET per topic.
+///
+/// This is #167's acceptance criterion applied to the half of it that did not
+/// land. `Metadata` mapped every requested topic to a read of its own object, 32
+/// at a time, and the consumers here subscribe to hundreds of topics each: on the
+/// production fleet that was 2,081 lookups/s against 21.5 `Metadata` requests/s,
+/// ~97 per request, of which ~1,040/s reached S3 as a conditional GET answered
+/// `304` — ~$38/day and 63% of the entire remaining request bill.
+///
+/// Counted across windows as well as within one, because within a window the etag
+/// memo already answered locally and only wall-clock hours separated the two
+/// versions — so the within-window count below is `0` on both sides of this fix
+/// and proves nothing on its own. `invalidate_topic_index` plus
+/// `expire_metadata_etags` opens a fresh window on both caches without putting 30s
+/// of sleep in the suite per count, the same trick the hint tests use on
+/// `listed_at`. Eight windows: 1,600 conditional GETs before, eight LISTs now.
+///
+/// The `0` is the load-bearing number, not the `8`. A shorter `TOPIC_INDEX_TTL`
+/// costs more LISTs and stays correct; a per-topic read on this path is the bill
+/// coming back.
+#[tokio::test]
+async fn warm_metadata_by_name_costs_no_per_topic_get() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+    let (storage, counters) = store();
+
+    const TOPICS: usize = 200;
+
+    let names = (0..TOPICS)
+        .map(|n| format!("topic-{n:05}"))
+        .collect::<Vec<_>>();
+
+    for name in &names {
+        create(&storage, name, 1).await?;
+    }
+
+    let requested = names
+        .iter()
+        .map(|name| TopicId::Name(name.clone()))
+        .collect::<Vec<_>>();
+
+    // Warm the index (one LIST, plus the cold GET per topic that builds it).
+    _ = storage.metadata(Some(&requested)).await?;
+
+    // Repeated within the window: nothing at all.
+    counters.reset();
+    for _ in 0..50 {
+        let response = storage.metadata(Some(&requested)).await?;
+        assert_eq!(TOPICS, response.topics.len());
+    }
+    assert_eq!(
+        (0, 0, 0, 0, 0),
+        counters.report("metadata by name x50, one window"),
+        "a warm Metadata must not touch the object store"
+    );
+
+    // Across windows: one LIST each, and no GET — every topic object is unchanged,
+    // so the etag comparison reuses all 200 decoded entries.
+    counters.reset();
+    const WINDOWS: u64 = 8;
+    for _ in 0..WINDOWS {
+        storage.invalidate_topic_index();
+        storage.expire_metadata_etags();
+
+        let response = storage.metadata(Some(&requested)).await?;
+        assert_eq!(TOPICS, response.topics.len());
+
+        // Every topic resolved — a fallback to per-topic reads would also answer
+        // correctly, so the assertion below is what distinguishes them.
+        for topic in &response.topics {
+            assert_eq!(
+                i16::from(ErrorCode::None),
+                topic.error_code,
+                "{:?}",
+                topic.name
+            );
+        }
+    }
+
+    let across = counters.report("metadata by name across 8 windows");
+    assert_eq!(
+        0, across.1,
+        "a Metadata refresh must not read one object per topic (#387)"
+    );
+    assert_eq!(
+        WINDOWS, across.2,
+        "one LIST per window, whatever the topic count"
+    );
+    assert_eq!(0, across.0, "and it must not write");
+
+    Ok(())
+}
+
+/// #387: `OffsetCommit`'s per-partition existence test costs no object-store
+/// request beyond the offset write itself.
+///
+/// It reads topic metadata **per partition committed**, purely to decide whether
+/// to write — so a group committing hundreds of partitions across dozens of topics
+/// asked the store once per partition for answers about a handful of topics.
+/// Bounded at tens/s on the production fleet (the fleet-wide PUT rate bounds it),
+/// which is why it is not where the money was, but it is the same read on the same
+/// plane and it scales with the group's assignment.
+///
+/// Spread over 16 topics rather than one so the count discriminates: the etag memo
+/// collapses repeats of a single key, so one topic's 64 partitions cost one request
+/// either way and only a multi-topic commit shows the difference.
+#[tokio::test]
+async fn a_warm_offset_commit_costs_one_put_per_partition_and_nothing_else() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+    let (storage, counters) = store();
+
+    const TOPICS: i32 = 16;
+    const PARTITIONS: i32 = 4;
+
+    for topic in 0..TOPICS {
+        create(&storage, &format!("committed-{topic:05}"), PARTITIONS).await?;
+    }
+
+    let offsets = (0..TOPICS)
+        .flat_map(|topic| {
+            (0..PARTITIONS).map(move |partition| {
+                (
+                    Topition::new(format!("committed-{topic:05}"), partition),
+                    OffsetCommitRequest::default().offset(i64::from(partition)),
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+
+    // Warm the index, then open a fresh etag-memo window so a per-topic read would
+    // actually reach the store.
+    _ = storage.metadata(None).await?;
+    storage.expire_metadata_etags();
+
+    counters.reset();
+    let committed = storage.offset_commit("group-a", None, &offsets).await?;
+
+    assert_eq!((TOPICS * PARTITIONS) as usize, committed.len());
+    for (topition, error_code) in &committed {
+        assert_eq!(ErrorCode::None, *error_code, "{topition:?}");
+    }
+
+    let profile = counters.report("offset commit, 16 topics x 4 partitions, warm index");
+    assert_eq!(
+        (TOPICS * PARTITIONS) as u64,
+        profile.0,
+        "one PUT per partition, and no more"
+    );
+    assert_eq!(
+        0, profile.1,
+        "the existence test must not read an object per partition (#387)"
+    );
+    assert_eq!(0, profile.2, "and it must not LIST");
+
     Ok(())
 }
 

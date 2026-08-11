@@ -749,6 +749,41 @@ static METADATA_UNRESOLVED_EXISTING: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Per-topic metadata resolutions, labelled by the API path that asked
+/// (`caller`) and where the answer came from (`source`: `index` or `object`)
+/// (#387).
+///
+/// The object-store counters carry a `class="topic_metadata"` label but no
+/// caller, so a 1,040/s revalidation plane could be attributed to a call site
+/// only by arithmetic against the API mix. This says it directly, and it is also
+/// how the fix is checked: `source="object"` is the population that still costs a
+/// conditional GET, and after #387 it should be admin-rate — a `Metadata` or
+/// `OffsetCommit` steady state that keeps showing `object` means the index is
+/// being missed (aged out, or a topic it does not hold).
+static TOPIC_METADATA_READS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_topic_metadata_reads")
+        .with_description("per-topic metadata resolutions by caller and source")
+        .build()
+});
+
+/// Objects a [`TopicIndex`] refresh had to GET (`outcome="fetched"`) against
+/// those it reused from the previous snapshot on an unchanged etag
+/// (`outcome="reused"`) (#387).
+///
+/// The reuse is what makes the index cheap enough to serve every `Metadata`
+/// answer from: one LIST per window, and a body read only for a topic whose
+/// object actually changed. That rests entirely on the listing carrying an etag
+/// per object — a store that omits it degrades the refresh to a GET per topic
+/// per window, which at 15k topics is far worse than the per-topic reads this
+/// replaces. Silent in every other signal, so it is counted here.
+static TOPIC_INDEX_REFRESH_OBJECTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_topic_index_refresh_objects")
+        .with_description("objects a topic index refresh fetched against those it reused")
+        .build()
+});
+
 /// Segments cached in this process's prefix index, across every prefix (#196).
 static PREFIX_INDEX_SEGMENTS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
@@ -2182,16 +2217,33 @@ impl DynoStore {
         }
     }
 
-    /// Every topic's metadata, by listing the `topic-metadata/` prefix and
-    /// reading each object. Used by the list-all Metadata path and the cleanup
-    /// policies; not on the produce/fetch hot path. The prefix holds only the
-    /// per-topic metadata objects (topic *data* lives under `topics/`), so the
-    /// listing does not scan record objects.
-    /// How long a [`TopicIndex`] snapshot is served before a refresh. Bounds the
-    /// cross-replica staleness of the list-all metadata view (a topic created on
-    /// another replica appears within this window); the by-name path is always
-    /// fresh via the per-topic object.
-    const TOPIC_INDEX_TTL: Duration = Duration::from_secs(5);
+    /// How long a [`TopicIndex`] snapshot is served before a refresh.
+    ///
+    /// Since #387 this bounds the staleness of **every** `Metadata` answer, not
+    /// just the list-all view: the by-name path is served from this index too, so
+    /// a change made on another replica — a create, a delete, an `AlterConfigs`
+    /// or a `CreatePartitions` — becomes visible here within one window. (A
+    /// create is the exception that stays immediate: a name the index does not
+    /// hold falls back to the topic's own object, which resolves it at once. The
+    /// window is a delay on *changes to* and *removals of* topics the index
+    /// already lists.)
+    ///
+    /// 30s rather than the 5s it was while the by-name path read one object per
+    /// topic. That 5s was not a freshness requirement — it was #167's blocker,
+    /// where a stale `cleanup.policy` verdict meant two pods routing one
+    /// partition to different prefixes. #236/#242 pinned the routing prefix in an
+    /// immutable object, so what is left here is ordinary bounded staleness, and
+    /// every Kafka client already caches metadata for `metadata.max.age.ms`
+    /// (default 5 minutes) — an order of magnitude looser than this.
+    ///
+    /// What the window costs is the LIST that refreshes it, once per window per
+    /// replica, against a plane that used to cost one conditional GET per topic
+    /// per window per replica: ~1,040 revalidations/s and 63% of the remaining S3
+    /// request bill on the production fleet (#387). Shortening it back does not
+    /// re-break correctness, it re-buys that bill — which is why
+    /// `warm_metadata_by_name_costs_no_per_topic_get` pins the request count
+    /// rather than the number.
+    const TOPIC_INDEX_TTL: Duration = Duration::from_secs(30);
 
     /// How long a per-partition high-watermark hint is served from memory before
     /// the read path re-lists the tail (see [`OffsetHint`] / [`Self::cached_high_fresh`]).
@@ -2311,8 +2363,8 @@ impl DynoStore {
     /// All topics, served from the in-memory [`TopicIndex`]. Returns the shared
     /// snapshot if fresh; otherwise refreshes it (single-flight) by LISTing the
     /// `topic-metadata/` prefix and GETting only the objects whose etag changed.
-    /// Used by the list-all metadata path and the cleanup policies — never on
-    /// the produce/fetch hot path.
+    /// Used by the list-all metadata path, the by-name metadata path (#387) and
+    /// the cleanup policies — never on the produce/fetch hot path.
     async fn topics_index(&self) -> Result<Arc<Vec<TopicMetadata>>> {
         if let Some(snapshot) = self.fresh_topic_index()? {
             return Ok(snapshot);
@@ -2390,6 +2442,11 @@ impl DynoStore {
             .buffer_unordered(FETCH_EACH_CONCURRENCY)
             .try_collect::<Vec<_>>()
             .await?;
+
+        TOPIC_INDEX_REFRESH_OBJECTS
+            .add(fetched.len() as u64, &[KeyValue::new("outcome", "fetched")]);
+        TOPIC_INDEX_REFRESH_OBJECTS
+            .add(entries.len() as u64, &[KeyValue::new("outcome", "reused")]);
 
         for (name, value) in fetched {
             _ = entries.insert(name, value);
@@ -2529,6 +2586,13 @@ impl DynoStore {
         Ok(())
     }
 
+    /// A topic's metadata read from its own `topic-metadata/{name}.json`: one
+    /// conditional GET, always fresh.
+    ///
+    /// The authority, and the only thing that may decide a routing derivation or
+    /// a lifecycle operation. Read paths that only *describe* a topic should go
+    /// through [`Self::described_topic_metadata`] instead — this costs a request
+    /// per topic per etag-memo window, which is the ~1,040/s plane #387 removed.
     async fn topic_metadata(&self, topic: &TopicId) -> Result<Option<TopicMetadata>> {
         debug!(?topic);
 
@@ -2538,6 +2602,114 @@ impl DynoStore {
                 Some(name) => self.topic_meta(&name)?.get_opt(&self.object_store).await,
                 None => Ok(None),
             },
+        }
+    }
+
+    /// A topic's metadata from the in-memory [`TopicIndex`], at **zero**
+    /// object-store requests, or `None` when the index cannot answer.
+    ///
+    /// `None` is not a claim of absence. It means the index does not hold the name
+    /// — because the topic does not exist, or because it was created after the
+    /// snapshot was taken — or that the snapshot has aged past
+    /// [`Self::TOPIC_INDEX_TTL`]. Every caller therefore falls back to the topic's
+    /// own object, which is what keeps a freshly created topic immediately
+    /// resolvable (#28).
+    ///
+    /// Deliberately does **not** refresh: the caller refreshes once for a whole
+    /// request (see [`Self::refresh_index_for_described_reads`]). A per-topic
+    /// refresh here would serialise behind the index's single-flight lock — so a
+    /// `Metadata` naming 1,500 topics against a failing object store would attempt
+    /// 1,500 sequential LISTs rather than one.
+    ///
+    /// A topic-id is resolved to a name through the permanently-cached
+    /// `topic-ids/{uuid}.json` pointer rather than by scanning the snapshot: the
+    /// mapping is immutable for a topic's lifetime, so it costs one GET per id per
+    /// process, where a scan would be O(topics) per lookup — 15k comparisons per
+    /// topic on a by-id `Metadata`.
+    async fn indexed_topic_metadata(&self, topic: &TopicId) -> Result<Option<TopicMetadata>> {
+        if self.fresh_topic_index()?.is_none() {
+            return Ok(None);
+        }
+
+        let name = match topic {
+            TopicId::Name(name) => name.clone(),
+            TopicId::Id(id) => match self.topic_name_by_id(id).await? {
+                Some(name) => name,
+                None => return Ok(None),
+            },
+        };
+
+        Ok(self
+            .topic_index
+            .lock()?
+            .entries
+            .get(name.as_str())
+            .map(|(_, metadata)| metadata.clone()))
+    }
+
+    /// A topic's metadata for a path that only *describes* it: served from the
+    /// [`TopicIndex`] when the index holds it, falling back to the topic's own
+    /// object otherwise (#387).
+    ///
+    /// This is the whole of #387. `Metadata` maps every requested topic to a
+    /// per-topic read 32-way concurrently, and consumers here subscribe to
+    /// hundreds of topics each, so one client refreshing metadata was ~100
+    /// conditional GETs — 2,081 lookups/s against 21.5 `Metadata` requests/s on
+    /// the production fleet, of which ~1,040/s reached S3 as a `304`, ~$38/day and
+    /// 63% of the remaining request bill. The index answers all of them from one
+    /// LIST per window per replica: a cost that does not scale with the topic
+    /// count, the same reasoning as #112's per-prefix manifest.
+    ///
+    /// Not for anything that must be fresh. In particular `describe_config` stays
+    /// on [`Self::topic_metadata`], because [`Self::topic_is_compacted`] reads
+    /// through it to derive a routing prefix for a pre-#236 topic, and that
+    /// derivation is pinned permanently — a stale verdict there is unreachable
+    /// data, not a stale answer. Lifecycle operations (`create_topic`,
+    /// `delete_topic`, `AlterConfigs`) likewise read the object.
+    ///
+    /// `caller` labels [`TOPIC_METADATA_READS`], so the residual `source="object"`
+    /// population is attributable per call site rather than inferred from the API
+    /// mix.
+    async fn described_topic_metadata(
+        &self,
+        topic: &TopicId,
+        caller: &'static str,
+    ) -> Result<Option<TopicMetadata>> {
+        let indexed = self
+            .indexed_topic_metadata(topic)
+            .await
+            .inspect_err(|error| warn!(?error, caller, ?topic, "indexed topic metadata"))
+            .unwrap_or_default();
+
+        let source = if indexed.is_some() { "index" } else { "object" };
+
+        TOPIC_METADATA_READS.add(
+            1,
+            &[
+                KeyValue::new("caller", caller),
+                KeyValue::new("source", source),
+            ],
+        );
+
+        match indexed {
+            Some(metadata) => Ok(Some(metadata)),
+            None => self.topic_metadata(topic).await,
+        }
+    }
+
+    /// Refresh the [`TopicIndex`] once for a request that is about to resolve
+    /// topics through [`Self::described_topic_metadata`].
+    ///
+    /// Best-effort: a failed refresh is not a failed request. Every topic then
+    /// misses the index and falls back to its own object, which is exactly the
+    /// pre-#387 behaviour — so a LIST that cannot be served degrades the cost, not
+    /// the answers.
+    async fn refresh_index_for_described_reads(&self, caller: &'static str) {
+        if let Err(error) = self.topics_index().await {
+            warn!(
+                ?error,
+                caller, "topics index unavailable; falling back to per-topic reads"
+            );
         }
     }
 
@@ -9709,6 +9881,15 @@ impl Storage for DynoStore {
         _retention_time_ms: Option<Duration>,
         offsets: &[(Topition, OffsetCommitRequest)],
     ) -> Result<Vec<(Topition, ErrorCode)>> {
+        // One index refresh for the whole commit (#387). The existence test below
+        // is per *partition*, purely to decide whether to write the offset, so a
+        // group committing 1,500 topics × 16 partitions asked the object store
+        // 24,000 times for answers the index already holds — the same topic over
+        // and over. Served from the index it costs nothing, and only a topic the
+        // index does not hold reads its own object.
+        self.refresh_index_for_described_reads("offset_commit")
+            .await;
+
         // Commit each partition's offset concurrently (bounded): the same
         // O(N) -> O(N / concurrency) scaling fix as ListOffsets (#147) and
         // Metadata (#154). A large formed group commits offsets for
@@ -9726,7 +9907,7 @@ impl Storage for DynoStore {
             .iter()
             .map(|(topition, offset_commit)| async move {
                 let error_code = if self
-                    .topic_metadata(&TopicId::from(topition))
+                    .described_topic_metadata(&TopicId::from(topition), "offset_commit")
                     .await?
                     .is_some()
                 {
@@ -9923,19 +10104,32 @@ impl Storage for DynoStore {
 
         let responses = match topics {
             Some(topics) if !topics.is_empty() => {
-                // Fetch each topic's metadata concurrently. `topic_metadata`'s
-                // object-store GET is the only await here; a serial loop is
-                // O(topics × RTT) and, on a high-latency store, blew past the
-                // client's metadata/request timeout at scale — so a consumer
-                // group leader resolving the union of its members' subscriptions
-                // (hundreds–thousands of topics) never completed the fetch,
-                // never sent SyncGroup, and the group stayed `Forming` with zero
-                // partitions assigned. Bounded concurrency issues exactly the
-                // same per-topic reads and returns the same answers, in
-                // O(topics / concurrency) wall time. `buffered` preserves
-                // response order; collecting `Result`s (not `try_collect`) keeps
-                // the per-topic error handling below intact. Same scaling fix as
-                // ListOffsets (#147), same concurrency bound.
+                // One refresh for the whole request (#387). Every topic below is
+                // then answered from the in-memory index at zero requests, and
+                // only a name the index does not hold — a topic that does not
+                // exist, or one created since the snapshot — costs a read of its
+                // own object.
+                //
+                // This is the fan-out that made `topic_metadata` the fleet's
+                // largest remaining S3 cost: 2,081 lookups/s against 21.5
+                // `Metadata` requests/s, ~97 per request, because consumers here
+                // subscribe to hundreds of topics each. Per-topic reads spread
+                // thin across ~15k topics missed their window about half the time,
+                // so ~1,040/s reached S3 as a conditional GET answered `304`.
+                self.refresh_index_for_described_reads("metadata").await;
+
+                // Resolve each topic concurrently. The index lookup does not
+                // await, but the fallback read does, and a serial loop over it is
+                // O(topics × RTT) — on a high-latency store that blew past the
+                // client's metadata/request timeout at scale, so a consumer group
+                // leader resolving the union of its members' subscriptions
+                // (hundreds–thousands of topics) never completed the fetch, never
+                // sent SyncGroup, and the group stayed `Forming` with zero
+                // partitions assigned. Bounded concurrency returns the same
+                // answers in O(topics / concurrency) wall time. `buffered`
+                // preserves response order; collecting `Result`s (not
+                // `try_collect`) keeps the per-topic error handling below intact.
+                // Same scaling fix as ListOffsets (#147), same concurrency bound.
                 const METADATA_FETCH_CONCURRENCY: usize = 32;
 
                 // Eagerly collected to pin every future to this call's lifetime
@@ -9944,7 +10138,7 @@ impl Storage for DynoStore {
                 // allocates, it does not serialize.
                 let fetches = topics
                     .iter()
-                    .map(|topic| async move { self.topic_metadata(topic).await })
+                    .map(|topic| self.described_topic_metadata(topic, "metadata"))
                     .collect::<Vec<_>>();
 
                 let fetched = futures::stream::iter(fetches)
@@ -9965,6 +10159,15 @@ impl Storage for DynoStore {
                 // and fails the batch. Production saw eight topics answered
                 // absent minutes after being written, taking six of twenty-four
                 // source connectors into restart loops.
+                //
+                // #387 moved most of that population out of reach: a topic the
+                // index holds is answered from the index, so no object read
+                // happens and no spurious 404 can be mistaken for absence. What
+                // remains is the fallback — a name the index did not hold — and
+                // there this witness still decides, because the index can be
+                // refreshed between the lookup that missed and the read that came
+                // back empty (a peer's create, a maintenance sweep, another
+                // request's refresh after an invalidation).
                 //
                 // The topics index is an independent witness: it is built from a
                 // LIST of the `topic-metadata/` prefix, not from the per-object
@@ -10198,6 +10401,14 @@ impl Storage for DynoStore {
         _keys: Option<&[String]>,
     ) -> Result<DescribeConfigsResult> {
         match resource {
+            // Deliberately the authoritative per-topic read, not the
+            // index-served `described_topic_metadata` (#387): `topic_is_compacted`
+            // reads through here to derive a routing prefix for a pre-#236 topic,
+            // and that derivation is pinned create-only and permanently. A stale
+            // `cleanup.policy` would route a topic's new records to a prefix its
+            // existing segments are not under — unreachable data, not a stale
+            // answer. Admin-rate plus a memoized derivation, so the request it
+            // costs is not part of the plane #387 removed.
             ConfigResource::Topic => match self.topic_metadata(&TopicId::Name(name.into())).await {
                 Ok(Some(topic_metadata)) => {
                     let error_code = ErrorCode::None;
@@ -10270,9 +10481,13 @@ impl Storage for DynoStore {
         let mut responses =
             Vec::with_capacity(topics.map(|topics| topics.len()).unwrap_or_default());
 
+        // One refresh, then every topic below is described from the index (#387).
+        self.refresh_index_for_described_reads("describe_topic_partitions")
+            .await;
+
         for topic in topics.unwrap_or_default() {
             match self
-                .topic_metadata(topic)
+                .described_topic_metadata(topic, "describe_topic_partitions")
                 .await
                 .inspect_err(|error| error!(?error))
             {
