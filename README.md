@@ -41,6 +41,22 @@ each per poll. At that shape the bill is S3 *requests*, not bandwidth or storage
 an object-per-produced-batch layout is what makes it expensive. Most of what follows
 is a consequence of that.
 
+## Hosted
+
+There is also a managed Kodansu at **[kodansu.com][kodansu-com]** — a cluster on
+infrastructure that is not yours to operate, reachable at a bootstrap URL with
+SASL/SCRAM credentials.
+
+It is **concierge** right now, which is a deliberate stage rather than a missing
+feature: a person reads each request and provisions the cluster by hand. So there is
+no signup, no console and no price yet, and no SLA is offered because none would be
+honest while that is true. It is free while it lasts, and the point of it is to find
+out what breaks against workloads that are not ours.
+
+Running it yourself is what this repository is for, and nothing here is held back to
+make the hosted one worth paying for: the broker enforces limits, the control plane
+that decides them and bills for them is what is not in this tree.
+
 ## How Kodansu diverged
 
 Relative to the tree it forked from:
@@ -499,5 +515,6 @@ separate, breaking change; this documentation runs ahead of it deliberately.
 [aws-s3]: https://en.wikipedia.org/wiki/Amazon_S3
 [aws-s3-storage-classes]: https://aws.amazon.com/s3/storage-classes/
 [github-com-tansu-io]: https://github.com/tansu-io/tansu
+[kodansu-com]: https://kodansu.com
 [kodansu-issues]: https://github.com/Popsink/tansu/issues
 [min-io]: https://min.io
