@@ -51,6 +51,15 @@ bytes, in order — byte-for-byte what a legacy single-topic coalesced object
 batch_length (i32) + batch_length bytes` repeatedly (the standard batch prefix).
 Absolute offsets come from the footer, **not** from the batch headers.
 
+A region's extent holds whole batches: `byte_start` points at a batch prefix and
+`byte_len` ends on a batch boundary. So a walk that reads a `batch_length` which
+is negative, or which runs past the extent, has not found a short frame — it has
+found that the footer entry and the bytes disagree, and the reader should treat
+the region as damaged rather than as a region that happens to be empty. The one
+exception is a *short read*: a ranged GET that returns fewer bytes than
+`byte_len` is a truncated read of a whole region, and the partial tail is
+ignored (#386).
+
 ### Footer
 
 Three versions exist. **v3 is what production writes** — since

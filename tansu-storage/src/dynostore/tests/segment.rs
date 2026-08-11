@@ -29,7 +29,7 @@ use tansu_sans_io::record::{Record, deflated, inflated};
 use crate::{
     Error, Result, Topition,
     dynostore::{
-        CoalesceTuning, DynoStore, IdempotentClass, ProducerCoord, ProducerTail,
+        CoalesceTuning, DynoStore, FrameTail, IdempotentClass, ProducerCoord, ProducerTail,
         SEGMENT_FORMAT_VERSION_V2, SEGMENT_FORMAT_VERSION_V3, SEGMENT_MAGIC, SEGMENT_TRAILER_LEN,
         SegmentFooter, SubstreamEntry,
     },
@@ -113,7 +113,9 @@ async fn round_trips_multiple_substreams() -> Result<(), Error> {
     for entry in &decoded.entries {
         let start = entry.byte_start as usize;
         let end = start + entry.byte_len as usize;
-        let batches = store.decode_frame(segment.slice(start..end))?;
+        let (batches, tail) = store.decode_frame(segment.slice(start..end))?;
+        // Every byte of the range is a whole batch: no ignorable tail (#386).
+        assert_eq!(FrameTail::Exhausted, tail);
         let records: i64 = batches.iter().map(|b| b.last_offset_delta as i64 + 1).sum();
         assert_eq!(entry.record_count, records);
     }
@@ -163,7 +165,7 @@ async fn legacy_object_has_no_footer() -> Result<(), Error> {
 
     assert!(store.decode_segment_footer(&object)?.is_none());
 
-    let decoded = store.decode_frame(object)?;
+    let (decoded, _) = store.decode_frame(object)?;
     assert_eq!(2, decoded.len());
     assert_eq!(1, decoded[0].last_offset_delta); // 2 records
     assert_eq!(2, decoded[1].last_offset_delta); // 3 records
