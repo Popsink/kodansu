@@ -66,11 +66,58 @@ async fn create_topic(storage: &DynoStore, name: &str, partitions: i32) -> Resul
 /// metadata object. `OptiCon::refresh` clears its cached value on any
 /// `NotFound`, so one such answer is enough to make `topic_metadata` return
 /// `Ok(None)` for a topic that exists.
+///
+/// `armed` gates the injection so a test can warm the topic index *through* this
+/// store before the fault is live (#387): the point of that fix is that a topic
+/// the index holds is never read from its own object, and proving it means
+/// asserting the fault is never reached.
+///
+/// `list_fails` injects one failing `list_with_delimiter` on top, which is what
+/// makes the #214 witness reachable deterministically: the index refresh fails,
+/// the topic falls back to its own (404-ing) object, and the witness — a second
+/// refresh, which succeeds — is what recognises the topic as live.
 #[derive(Clone)]
 struct NotFoundOnce<O> {
     inner: O,
     key: Path,
+    armed: Arc<AtomicBool>,
     fired: Arc<AtomicBool>,
+    list_fails: Arc<AtomicBool>,
+}
+
+impl<O> NotFoundOnce<O> {
+    /// Injecting nothing yet: reads go straight through.
+    fn disarmed(inner: O, key: Path) -> Self {
+        Self {
+            inner,
+            key,
+            armed: Arc::new(AtomicBool::new(false)),
+            fired: Arc::new(AtomicBool::new(false)),
+            list_fails: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Injecting from now on: the next read of `key` answers `NotFound`.
+    fn armed(inner: O, key: Path) -> Self {
+        let injecting = Self::disarmed(inner, key);
+        injecting.arm();
+        injecting
+    }
+
+    fn arm(&self) {
+        self.armed.store(true, Relaxed);
+    }
+
+    /// Also fail the next `list_with_delimiter`, so the index cannot answer.
+    fn failing_one_listing(self) -> Self {
+        self.list_fails.store(true, Relaxed);
+        self
+    }
+
+    /// Whether the injected 404 was ever reached.
+    fn fired(&self) -> bool {
+        self.fired.load(Relaxed)
+    }
 }
 
 impl<O> Debug for NotFoundOnce<O> {
@@ -112,7 +159,7 @@ where
         location: &Path,
         options: GetOptions,
     ) -> Result<GetResult, object_store::Error> {
-        if *location == self.key && !self.fired.swap(true, Relaxed) {
+        if *location == self.key && self.armed.load(Relaxed) && !self.fired.swap(true, Relaxed) {
             return Err(object_store::Error::NotFound {
                 path: location.to_string(),
                 source: "injected spurious 404".into(),
@@ -147,6 +194,12 @@ where
         &self,
         prefix: Option<&Path>,
     ) -> Result<ListResult, object_store::Error> {
+        if self.list_fails.swap(false, Relaxed) {
+            return Err(object_store::Error::Generic {
+                store: "NotFoundOnce",
+                source: "injected listing failure".into(),
+            });
+        }
         self.inner.list_with_delimiter(prefix).await
     }
 
@@ -160,8 +213,8 @@ where
     }
 }
 
-/// #214: a topic whose metadata object cannot be resolved is answered
-/// **retriably**, not reported absent.
+/// #214, as #387 leaves it: a live topic is answered **from the topic index**, so
+/// the per-object read that used to report it absent is never made.
 ///
 /// One spurious 404 is enough to empty `OptiCon`'s cached value, so
 /// `topic_metadata` returns `Ok(None)` for a topic that plainly exists. Reporting
@@ -170,9 +223,73 @@ where
 /// `max.block.ms` expires and then fails the batch. Production saw eight such
 /// topics and six of twenty-four source connectors in restart loops.
 ///
-/// The topics index is the witness — it comes from a LIST of `topic-metadata/`,
-/// not from the per-object read that just came back empty — so `LeaderNotAvailable`
-/// is both true and retriable.
+/// #214 answered that with a retriable error code; #387 removes the read that
+/// produces it. The index is built from a LIST of `topic-metadata/`, and once it
+/// holds a topic, `Metadata` answers from it — so the fault below is not survived,
+/// it is not reached, which is what `fired()` asserts. The retriable answer is
+/// still there for the fallback population, pinned by
+/// `an_unresolvable_existing_topic_is_retriable_not_absent`.
+#[tokio::test]
+async fn a_topic_the_index_holds_is_never_read_from_its_own_object() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let topic = "actively-produced";
+
+    let seeder = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    _ = create_topic(&seeder, topic, 1).await?;
+
+    // A replica reading through an injectable fault, not yet armed: warming its
+    // index has to be allowed to read the object once.
+    let faulty = NotFoundOnce::disarmed(
+        bucket.clone(),
+        Path::from(format!("clusters/{CLUSTER}/topic-metadata/{topic}.json")),
+    );
+    let store = DynoStore::new(CLUSTER, NODE, faulty.clone());
+
+    _ = store.metadata(None).await?;
+
+    // From here, any read of that object answers 404 — as production's did.
+    faulty.arm();
+
+    let response = store.metadata(Some(&[TopicId::Name(topic.into())])).await?;
+
+    assert_eq!(1, response.topics.len());
+    assert_eq!(
+        ErrorCode::None,
+        ErrorCode::try_from(response.topics[0].error_code)?,
+        "a topic the index holds must resolve",
+    );
+    assert_eq!(
+        Some(1),
+        response.topics[0]
+            .partitions
+            .as_ref()
+            .map(|partitions| partitions.len()),
+        "and it must be described, not answered empty",
+    );
+    assert!(
+        !faulty.fired(),
+        "the topic's own object must not be read at all (#387)",
+    );
+
+    Ok(())
+}
+
+/// #214: a topic the index could not answer for, whose own object then cannot be
+/// resolved either, is answered **retriably** rather than reported absent.
+///
+/// This is the fallback population #387 leaves behind — a name the index does not
+/// hold, here because its refresh failed. The read of the topic's own object then
+/// takes the spurious 404, and the witness is a *second* index refresh, which
+/// succeeds: it comes from a LIST of `topic-metadata/`, not from the per-object
+/// read that just came back empty, so `LeaderNotAvailable` is both true and
+/// retriable.
+///
+/// The interleaving is injected here and racy in production — a peer's create, a
+/// maintenance sweep, or another request refreshing after an invalidation between
+/// the lookup that missed and the read that came back empty — which is why the
+/// witness stays.
 #[tokio::test]
 async fn an_unresolvable_existing_topic_is_retriable_not_absent() -> Result<(), Error> {
     let _guard = init_tracing()?;
@@ -180,19 +297,19 @@ async fn an_unresolvable_existing_topic_is_retriable_not_absent() -> Result<(), 
     let bucket = InMemory::new();
     let topic = "actively-produced";
 
-    // Create it, and warm the topics index so the witness knows it.
     let seeder = DynoStore::new(CLUSTER, NODE, bucket.clone());
     _ = create_topic(&seeder, topic, 1).await?;
 
-    // A replica whose very first read of that object gets a spurious 404.
+    // A replica whose index refresh fails once, and whose very first read of that
+    // object then gets a spurious 404.
     let store = DynoStore::new(
         CLUSTER,
         NODE,
-        NotFoundOnce {
-            inner: bucket.clone(),
-            key: Path::from(format!("clusters/{CLUSTER}/topic-metadata/{topic}.json")),
-            fired: Arc::new(AtomicBool::new(false)),
-        },
+        NotFoundOnce::armed(
+            bucket.clone(),
+            Path::from(format!("clusters/{CLUSTER}/topic-metadata/{topic}.json")),
+        )
+        .failing_one_listing(),
     );
 
     let response = store.metadata(Some(&[TopicId::Name(topic.into())])).await?;
@@ -253,6 +370,66 @@ async fn topic_created_on_one_replica_is_visible_on_another() -> Result<(), Erro
     // replicas.
     let by_id = replica_b.topic_metadata(&TopicId::Id(id)).await?;
     assert_eq!(Some(id), by_id.map(|metadata| metadata.id));
+
+    Ok(())
+}
+
+/// #28 survives #387: a topic created on another replica is visible **through
+/// `Metadata`** at once, not after a topic-index window.
+///
+/// `Metadata` is now answered from the index (#387), whose snapshot may be up to
+/// `TOPIC_INDEX_TTL` old — so on its own that would put a 30s hole exactly where
+/// #28 needs none, and `create-then-produce` against a fresh topic would fail
+/// with `UNKNOWN_TOPIC_OR_PARTITION` again. It does not, because a name the index
+/// does not hold falls back to the topic's own object. That asymmetry is the whole
+/// contract of the window: it delays *changes to* and *removals of* topics the
+/// index already lists, never the appearance of a new one.
+///
+/// Warming B's index first is load-bearing: an empty index would miss the topic
+/// for the trivial reason that it holds nothing, and prove nothing.
+#[tokio::test]
+async fn a_topic_created_on_a_peer_resolves_through_metadata_before_the_index_refreshes()
+-> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let replica_a = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    let replica_b = DynoStore::new(CLUSTER, NODE, bucket.clone());
+
+    _ = create_topic(&replica_a, "already-there", 1).await?;
+
+    // B's index is now fresh, and holds one topic.
+    _ = replica_b.metadata(None).await?;
+
+    let topic = "created-on-a-peer";
+    let id = create_topic(&replica_a, topic, 3).await?;
+
+    // B's snapshot cannot know it, and B must answer anyway.
+    let response = replica_b
+        .metadata(Some(&[TopicId::Name(topic.into())]))
+        .await?;
+
+    assert_eq!(1, response.topics.len());
+    assert_eq!(
+        ErrorCode::None,
+        ErrorCode::try_from(response.topics[0].error_code)?,
+    );
+    assert_eq!(Some(id.into_bytes()), response.topics[0].topic_id);
+    assert_eq!(
+        Some(3),
+        response.topics[0]
+            .partitions
+            .as_ref()
+            .map(|partitions| partitions.len()),
+    );
+
+    // And by id, which resolves through the `topic-ids/{uuid}.json` pointer before
+    // reaching the index.
+    let by_id = replica_b.metadata(Some(&[TopicId::Id(id)])).await?;
+    assert_eq!(
+        ErrorCode::None,
+        ErrorCode::try_from(by_id.topics[0].error_code)?,
+    );
 
     Ok(())
 }
