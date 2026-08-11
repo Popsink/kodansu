@@ -10626,7 +10626,7 @@ impl Storage for DynoStore {
             })
             .collect::<Vec<_>>();
 
-        if !validate_only && outcomes.iter().any(|code| *code == ErrorCode::None) {
+        if !validate_only && outcomes.contains(&ErrorCode::None) {
             self.update_quotas(|quotas| {
                 for alteration in alterations {
                     // Re-applied against whatever document won the CAS, and the
