@@ -30,7 +30,7 @@ use tracing::{debug, error, instrument};
 
 use tansu_sans_io::acl::{Operation, Resource};
 
-use crate::{Error, Parked, Result, Storage, Topition, authorized};
+use crate::{Error, Parked, Result, Storage, Topition, authorized, storage_error_code};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`FetchRequest`] returning [`FetchResponse`].
 /// ```
@@ -184,6 +184,19 @@ impl FetchService {
             // healthy ones sharing the same `poll()`. Answering per partition lets
             // the client see the error, apply its own policy, and keep consuming
             // everything else.
+            //
+            // That holds for EVERY error, not only `Error::Api` (#386). The
+            // exception was doing the exact damage the rule exists to prevent: a
+            // corrupt segment region raised a bare `TryFromIntError`, which is not
+            // an `Api` code, so the whole request failed and the broker dropped the
+            // connection with no response written. A client cannot act on a closed
+            // socket — no code, no partition named, nothing to retry selectively —
+            // so it reconnected and replayed the same fetch, which is how one
+            // damaged region wedged a Connect worker reading its compacted offsets
+            // topic from 0 (#219). No storage-layer error class gets to decide
+            // whether a connection stays open; `storage_error_code` decides what
+            // the client is told (`CORRUPT_MESSAGE` for damage,
+            // `KAFKA_STORAGE_ERROR` for a transient store failure, #6/#275).
             let mut fetched = match fetched {
                 Ok(fetched) => fetched,
 
@@ -194,7 +207,8 @@ impl FetchService {
 
                 Err(error) => {
                     error!(?tp, ?error);
-                    return Err(error);
+                    error_code = storage_error_code(&error);
+                    break;
                 }
             };
 
@@ -249,11 +263,24 @@ impl FetchService {
         // the cluster-wide `meta.json` object — keeping this hot path off the
         // single meta key's request ceiling (#109). Read-committed still reads
         // meta for the last-stable offset and aborted-transaction list.
-        let offset_stage = ctx
-            .state()
-            .offset_stage_at(&tp, isolation)
-            .await
-            .inspect_err(|error| error!(?error, ?tp))?;
+        // Per partition for the same reason the read above is (#386): a partition
+        // whose offsets cannot be resolved is one partition's answer, and this is
+        // the other place in this function where a storage error used to cost the
+        // whole request its connection.
+        let offset_stage = match ctx.state().offset_stage_at(&tp, isolation).await {
+            Ok(offset_stage) => offset_stage,
+
+            Err(error) => {
+                error!(?error, ?tp);
+
+                let error_code = match error {
+                    Error::Api(code) => code,
+                    ref error => storage_error_code(error),
+                };
+
+                return Ok(self.unservable_partition(partition_index, error_code));
+            }
+        };
 
         Ok(PartitionData::default()
             .partition_index(partition_index)
@@ -288,6 +315,28 @@ impl FetchService {
                 Some(Frame { batches })
             }))
         .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed()))
+    }
+
+    /// One partition answered with an error code and nothing else — the shape a
+    /// client can act on when the broker cannot say what its offsets are (#386).
+    ///
+    /// The offsets are the ones `refused_topic_response` sends for a partition
+    /// that has no readable state: a `high_watermark` of 0 with a
+    /// `log_start_offset` of -1 claims nothing, so a client that looks past the
+    /// error code cannot mistake it for an empty-but-healthy partition.
+    fn unservable_partition(&self, partition_index: i32, error_code: ErrorCode) -> PartitionData {
+        PartitionData::default()
+            .partition_index(partition_index)
+            .error_code(error_code.into())
+            .high_watermark(0)
+            .last_stable_offset(Some(0))
+            .log_start_offset(Some(-1))
+            .diverging_epoch(None)
+            .current_leader(None)
+            .snapshot_id(None)
+            .aborted_transactions(Some([].into()))
+            .preferred_read_replica(Some(-1))
+            .records(None)
     }
 
     /// A topic this principal may not read, refused the way an unknown one is

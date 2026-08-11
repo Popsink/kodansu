@@ -17,7 +17,7 @@
 use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
-    fmt::{Debug, Display},
+    fmt::{Debug, Display, Write as _},
     str::FromStr,
     sync::{
         Arc, LazyLock, Mutex,
@@ -83,11 +83,11 @@ mod tests;
 
 use crate::{
     AclBinding, AclFilter, Acls, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
-    BrokerRegistrationRequest, ConsumerGroupState, Error, GROUP_SCHEMA_VERSION, GenerationDoc,
-    GroupDetail, GroupMember, GroupSchema, GroupState, ListOffsetResponse, METER, MemberDoc,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    QuotaAlteration, QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas, Result,
-    ScramCredential, Storage, TopicDefaults, TopicId, Topition, TxnAddPartitionsRequest,
+    BrokerRegistrationRequest, ConsumerGroupState, CorruptRegion, Error, GROUP_SCHEMA_VERSION,
+    GenerationDoc, GroupDetail, GroupMember, GroupSchema, GroupState, ListOffsetResponse, METER,
+    MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
+    ProducerIdResponse, QuotaAlteration, QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas,
+    Result, ScramCredential, Storage, TopicDefaults, TopicId, Topition, TxnAddPartitionsRequest,
     TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
     storage_error_code,
 };
@@ -934,6 +934,37 @@ static SEGMENT_FOOTER_UNDECODABLE: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Sub-stream regions whose bytes are not the batch frames their footer entry
+/// claims (#386) — a `byte_start` that does not point at a frame header.
+///
+/// Expected to be zero. Nonzero is a data-integrity failure on the write side (a
+/// segment rewrite whose footer and payload disagree), not something a read can
+/// repair, and each occurrence costs a partition a `CORRUPT_MESSAGE` answer. Paired
+/// with [`SEGMENT_REGION_TRUNCATED`], which is the *other* cause of the same
+/// symptom: this counter moving means the object was whole and the index was wrong.
+static SEGMENT_REGION_CORRUPT: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_segment_regions_corrupt")
+        .with_description("sub-stream regions that do not begin at a batch frame")
+        .build()
+});
+
+/// Ranged region reads that came back short of the byte extent the footer claims
+/// (#386): a damaged, truncated or partially-visible segment object.
+///
+/// Distinct from [`SEGMENT_REGION_CORRUPT`] on purpose — a short read is not
+/// answered as corruption. Whole batches decode, the partial tail is ignored
+/// exactly as the frame contract says, and a region yielding nothing that way
+/// stays the bounded empty read of #290 rather than becoming an error. Which
+/// makes it invisible without this counter, and it is one of the two candidate
+/// causes #386 could not separate.
+static SEGMENT_REGION_TRUNCATED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_segment_regions_truncated")
+        .with_description("region reads returning fewer bytes than the footer extent")
+        .build()
+});
+
 /// Segments discovered by a listing that were gone by the time their footer was
 /// read (#191): concurrent compaction (#66) merged them away, or retention (#61)
 /// reclaimed them. A normal consequence of maintenance running against live
@@ -1183,6 +1214,100 @@ struct SubstreamEntry {
     /// dedup (#88) so duplicate detection derives from the durable log rather than
     /// a lazily-checkpointed `producers/{id}.json`.
     producers: Vec<ProducerCoord>,
+}
+
+/// Why a [`DynoStore::decode_frame`] scan stopped (#386).
+///
+/// The bytes cannot say whether stopping early is benign, so the scan reports
+/// where and why and leaves the verdict to [`DynoStore::decode_region`], which
+/// holds the footer entry the bytes were read for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrameTail {
+    /// Every byte was consumed by whole batches.
+    Exhausted,
+
+    /// Fewer bytes remain than a frame header needs, so no length was read.
+    Short { at: usize, remaining: usize },
+
+    /// A `batch_length` that no frame can carry: negative, or running past the
+    /// bytes that remain.
+    Malformed { at: usize, declared: i32 },
+}
+
+impl FrameTail {
+    /// Byte offset within the region where the scan stopped.
+    fn at(&self) -> usize {
+        match self {
+            Self::Exhausted => 0,
+            Self::Short { at, .. } | Self::Malformed { at, .. } => *at,
+        }
+    }
+
+    /// The `batch_length` read where the scan stopped, if one was read.
+    fn declared(&self) -> Option<i32> {
+        match self {
+            Self::Malformed { declared, .. } => Some(*declared),
+            _ => None,
+        }
+    }
+}
+
+/// A footer entry paired with the bytes read for it (#386): what
+/// [`DynoStore::decode_region`] needs to classify a frame scan that stopped
+/// early, and to name the segment in the error if it was damage.
+struct RegionRead<'a> {
+    prefix: &'a str,
+    seq: u64,
+    entry: &'a SubstreamEntry,
+    encoded: &'a Bytes,
+}
+
+impl RegionRead<'_> {
+    /// Frame header bytes reported in a diagnostic.
+    const HEAD: usize = size_of::<i64>() + size_of::<i32>();
+
+    /// Whether the read came back short of the extent the footer claims — a torn
+    /// or partially-visible object rather than a footer that disagrees with its
+    /// payload. The whole discrimination #386 asked for rests on this, so it is
+    /// one named predicate and not an inline comparison.
+    fn truncated(&self) -> bool {
+        (self.encoded.len() as u64) < self.entry.byte_len
+    }
+
+    /// Report the region as damaged, counted and logged with everything needed to
+    /// tell the two causes apart on the next occurrence.
+    fn corrupt(&self, at: usize, declared: Option<i32>, detail: String) -> Error {
+        let head = self
+            .encoded
+            .get(at..)
+            .unwrap_or_default()
+            .iter()
+            .take(Self::HEAD)
+            .fold(String::new(), |mut head, byte| {
+                let _ = write!(head, "{byte:02x}");
+                head
+            });
+
+        let region = CorruptRegion {
+            prefix: self.prefix.to_owned(),
+            seq: self.seq,
+            topic: self.entry.topic.clone(),
+            partition: self.entry.partition,
+            base_offset: self.entry.base_offset,
+            byte_start: self.entry.byte_start,
+            byte_len: self.entry.byte_len,
+            read_len: self.encoded.len(),
+            at,
+            declared,
+            head,
+            detail,
+        };
+
+        SEGMENT_REGION_CORRUPT.add(1, &[]);
+        error!(?region, "segment region does not begin at a batch frame");
+
+        Error::CorruptSegment(Box::new(region))
+    }
 }
 
 /// [`ProducerCoord::flags`] bit 0 (#174): the batch is transactional
@@ -4714,7 +4839,7 @@ impl DynoStore {
             regions.push((
                 seq,
                 entry.base_offset,
-                self.decode_frame(object.slice(start..end))?,
+                self.decode_region(prefix, seq, &entry, object.slice(start..end))?,
             ));
         }
 
@@ -5002,7 +5127,10 @@ impl DynoStore {
                         .bytes()
                         .await
                         .map_err(Error::from)
-                        .and_then(|encoded| self.decode_frame(encoded))?,
+                        // Damage here answers this partition `CORRUPT_MESSAGE`
+                        // (#386) instead of propagating a bare integer-conversion
+                        // failure that took the request and the connection with it.
+                        .and_then(|encoded| self.decode_region(&prefix, seq, &entry, encoded))?,
 
                     // Deleted between locate and read (compaction #66 / retention
                     // #61): drop anything gathered so far, evict the stale seq
@@ -8163,29 +8291,145 @@ impl DynoStore {
     /// `base_offset (i64) + batch_length (i32) + batch_length bytes` — so this
     /// handles both, and a single-batch object decodes to a one-element vec that
     /// is byte-for-byte what [`Self::decode`] would return. Trailing bytes that
-    /// do not form a whole batch are ignored (mirroring `Batch::try_from`).
-    fn decode_frame(&self, encoded: Bytes) -> Result<Vec<deflated::Batch>> {
+    /// do not form a whole batch are ignored (mirroring `Batch::try_from`) — the
+    /// returned [`FrameTail`] says why the scan stopped, which is what lets a
+    /// caller holding the footer entry tell an ignorable tail from a region that
+    /// never began at a frame (#386).
+    ///
+    /// Both malformed-length cases now stop the scan and report, where a negative
+    /// length used to `?` out as a bare `TryFromIntError`: the guard was
+    /// asymmetric, and the arm that raised was the one carrying no diagnostic.
+    /// Reading a length is not the place to decide severity — a length can be
+    /// unusable because the region is a truncated read (benign) or because it
+    /// starts in the wrong place (damage), and only [`Self::decode_region`] can
+    /// see which.
+    fn decode_frame(&self, encoded: Bytes) -> Result<(Vec<deflated::Batch>, FrameTail)> {
         // base_offset (i64) + batch_length (i32) precede the `batch_length` body.
         const PREFIX: usize = size_of::<i64>() + size_of::<i32>();
 
         let mut batches = Vec::new();
         let mut remaining = encoded;
+        let mut at = 0usize;
 
-        while remaining.len() >= PREFIX {
+        let tail = loop {
+            if remaining.len() < PREFIX {
+                break if remaining.is_empty() {
+                    FrameTail::Exhausted
+                } else {
+                    FrameTail::Short {
+                        at,
+                        remaining: remaining.len(),
+                    }
+                };
+            }
+
             let mut length = [0u8; size_of::<i32>()];
             length.copy_from_slice(&remaining[size_of::<i64>()..PREFIX]);
-            let batch_length = usize::try_from(i32::from_be_bytes(length))?;
+            let declared = i32::from_be_bytes(length);
+
+            // A `batch_length` is a byte count: negative is not a short frame, it
+            // is not a frame. Same outcome as one that overruns what is left.
+            let Ok(batch_length) = usize::try_from(declared) else {
+                break FrameTail::Malformed { at, declared };
+            };
 
             let total = PREFIX + batch_length;
             if total > remaining.len() {
-                break;
+                break FrameTail::Malformed { at, declared };
             }
 
             batches.push(self.decode(remaining.slice(0..total))?);
             remaining = remaining.slice(total..);
+            at += total;
+        };
+
+        Ok((batches, tail))
+    }
+
+    /// Decode the bytes read for footer `entry` into that sub-stream's batches,
+    /// attributing damage to the segment it came from (#386).
+    ///
+    /// [`Self::decode_frame`] knows only bytes, so on its own it cannot tell the
+    /// documented ignorable tail from a region that is not where the footer says
+    /// it is. Here the entry is in hand, and the discriminator is whether the read
+    /// returned the whole extent the footer claims:
+    ///
+    /// - **short read** — a torn, truncated or partially-visible object. Whole
+    ///   batches are returned and the remainder ignored, so a region that yields
+    ///   nothing stays the bounded empty read #290 settled on rather than becoming
+    ///   an error. Counted ([`SEGMENT_REGION_TRUNCATED`]), because it is otherwise
+    ///   invisible.
+    /// - **full-length read that yields no batch** — the region arrived whole and
+    ///   still holds no frame, so `byte_start` does not point at one: the footer
+    ///   and the payload disagree. That is damage, and it is answered as such.
+    ///
+    /// Only a region that decodes to *nothing* is treated as corrupt. A malformed
+    /// tail after whole batches keeps the frame contract's behaviour — it cannot
+    /// be a divergent start, and erroring there would fail reads that serve data
+    /// today.
+    fn decode_region(
+        &self,
+        prefix: &str,
+        seq: u64,
+        entry: &SubstreamEntry,
+        encoded: Bytes,
+    ) -> Result<Vec<deflated::Batch>> {
+        let read = RegionRead {
+            prefix,
+            seq,
+            entry,
+            encoded: &encoded,
+        };
+
+        // A frame header that parsed over a body that will not decode is the same
+        // damage seen one layer down, and it reached the client as a bare protocol
+        // error naming no segment. Attribute it here too.
+        let (batches, tail) = self
+            .decode_frame(encoded.clone())
+            .map_err(|error| read.corrupt(0, None, format!("undecodable batch: {error:?}")))?;
+
+        if read.truncated() {
+            SEGMENT_REGION_TRUNCATED.add(1, &[]);
+            warn!(
+                prefix,
+                seq,
+                topic = entry.topic,
+                partition = entry.partition,
+                byte_start = entry.byte_start,
+                byte_len = entry.byte_len,
+                read_len = encoded.len(),
+                batches = batches.len(),
+                ?tail,
+                "segment region read short of its footer extent"
+            );
+
+            return Ok(batches);
         }
 
-        Ok(batches)
+        match tail {
+            FrameTail::Exhausted => Ok(batches),
+
+            _ if batches.is_empty() => Err(read.corrupt(
+                tail.at(),
+                tail.declared(),
+                format!("region holds no whole batch: {tail:?}"),
+            )),
+
+            // The documented ignore: bytes past the last whole batch.
+            _ => {
+                debug!(
+                    prefix,
+                    seq,
+                    topic = entry.topic,
+                    partition = entry.partition,
+                    batches = batches.len(),
+                    ?tail,
+                    "ignoring trailing bytes of a segment region"
+                );
+
+                Ok(batches)
+            }
+        }
     }
 
     /// Serialize a run of contiguous batches into one `records/` object payload

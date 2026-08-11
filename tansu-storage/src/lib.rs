@@ -194,10 +194,56 @@ mod gcs;
 #[cfg(feature = "dynostore")]
 mod os;
 
+/// Everything a read knew about a segment region that would not decode as batch
+/// frames (#386), so the *next* occurrence says which cause it is instead of
+/// only that it happened.
+///
+/// The failure used to reach the log as a bare `TryFromIntError` — no prefix, no
+/// sequence, no byte range, not even which of the two candidate causes it was:
+/// a footer entry that disagrees with its payload (a `byte_start` that does not
+/// point at a frame, so `read_len == byte_len` and the head is garbage), or a
+/// damaged/partially-visible object (a ranged GET that came back short, so
+/// `read_len < byte_len`). Those want opposite fixes — the first is a write-side
+/// integrity bug in the segment rewrite, the second is read-side repair — and
+/// nothing in the error told them apart.
+///
+/// `head` is the hex of the bytes at `at`, where a `base_offset (i64) +
+/// batch_length (i32)` frame header was expected; `declared` is the length those
+/// bytes decoded to, when a length was read at all.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CorruptRegion {
+    /// Coalesced prefix the segment belongs to.
+    pub prefix: String,
+    /// Segment sequence within the prefix.
+    pub seq: u64,
+    pub topic: String,
+    pub partition: i32,
+    /// The footer entry's claims about the region.
+    pub base_offset: i64,
+    pub byte_start: u64,
+    pub byte_len: u64,
+    /// Bytes the read actually returned; short of `byte_len` means a torn or
+    /// partially-visible object rather than a divergent footer.
+    pub read_len: usize,
+    /// Byte offset *within the region* where the frame scan stopped.
+    pub at: usize,
+    /// The `batch_length` read at `at`, when one was read.
+    pub declared: Option<i32>,
+    /// Hex of the frame header bytes at `at`.
+    pub head: String,
+    /// Why the scan stopped there.
+    pub detail: String,
+}
+
 /// Storage Errors
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
     Api(ErrorCode),
+
+    /// A segment region whose bytes are not the batch frames its footer entry
+    /// claims (#386). Answered to the client as `CORRUPT_MESSAGE` for that
+    /// partition — see [`storage_error_code`].
+    CorruptSegment(Box<CorruptRegion>),
 
     FeatureNotEnabled {
         feature: String,
@@ -302,6 +348,12 @@ pub(crate) fn storage_error_code(error: &Error) -> ErrorCode {
     match error {
         #[cfg(feature = "dynostore")]
         Error::ObjectStore(_) => ErrorCode::KafkaStorageError,
+
+        // Damage in a stored segment region (#386), which is exactly what
+        // `CORRUPT_MESSAGE` means: the bytes for these offsets are unreadable, so
+        // no retry against this broker will change the answer and the client is
+        // told so rather than being handed a dropped socket to guess from.
+        Error::CorruptSegment(_) => ErrorCode::CorruptMessage,
 
         _ => ErrorCode::UnknownServerError,
     }
