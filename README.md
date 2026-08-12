@@ -507,14 +507,17 @@ Kodansu is a fork of [tansu][github-com-tansu-io] by Peter Morgan, and is licens
 like tansu, under [Apache 2.0][apache-license]. Upstream copyright headers are
 preserved throughout.
 
-**On the name:** the project is Kodansu, but the binary, the crates and the container
-image are all still called `tansu` (`ghcr.io/popsink/tansu`). Renaming those is a
-separate, breaking change; this documentation runs ahead of it deliberately.
+**On the name:** the repository is now `Popsink/kodansu`, and GitHub redirects the
+old path indefinitely. The binary, the crates and the container image are all still
+called `tansu` (`ghcr.io/popsink/tansu`) — a container image's name does not follow
+the repository it was built from, and renaming those is a separate change that
+breaks every manifest referring to them. [docs/rename-kodansu.md](docs/rename-kodansu.md)
+is the checklist for closing the rest of the gap.
 
 [apache-license]: https://www.apache.org/licenses/LICENSE-2.0
 [aws-s3]: https://en.wikipedia.org/wiki/Amazon_S3
 [aws-s3-storage-classes]: https://aws.amazon.com/s3/storage-classes/
 [github-com-tansu-io]: https://github.com/tansu-io/tansu
 [kodansu-com]: https://kodansu.com
-[kodansu-issues]: https://github.com/Popsink/tansu/issues
+[kodansu-issues]: https://github.com/Popsink/kodansu/issues
 [min-io]: https://min.io
