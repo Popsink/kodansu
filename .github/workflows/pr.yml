@@ -223,7 +223,7 @@ jobs:
   # once and lets `test` start at T+0:
   #
   #   gh api -X PATCH \
-  #     repos/Popsink/tansu/branches/main/protection/required_status_checks \
+  #     repos/Popsink/kodansu/branches/main/protection/required_status_checks \
   #     -f 'checks[][context]=all-green'
   all-green:
     if: always()

@@ -23,6 +23,7 @@ probably should not ship at all.
 | Metric names | `tansu_*` | Prometheus, Grafana, any alert rule | Dashboards and alerts break silently — the query returns no data, not an error. |
 | OTLP `service.name` | `tansu-broker` (from `CARGO_PKG_NAME`) | Jaeger, the otel-collector sidecar config | Trace and metric filters stop matching. |
 | Container image | `ghcr.io/popsink/tansu` | every k8s manifest, the `TANSU_IMAGE` env | Cheap if the old tag keeps being pushed for a release or two. |
+| Helm values key | `tansu:` in `Popsink/data-plane` | **every self-hosted customer's `values.yaml`** | Helm ignores unknown keys, so a customer's `tansu.enabled: true` becomes a no-op and their broker disappears with no error. Needs a release that reads both keys. |
 
 Recommendation: rename the crates, the binary and the image; **keep the metric
 prefix and the cluster-id default alone** for now, and rename them later as two
@@ -43,8 +44,21 @@ production without producing a compile error, a failing test or a red CI job.
       that) or set it to Popsink. Not a link, but it is published crate metadata.
 - [ ] `.github/workflows/release.yml` runs `cargo publish --workspace` on `v*` tags.
       The `tansu-*` names on crates.io belong to upstream, so this job cannot
-      currently succeed. Either delete the workflow, or — if `kodansu-*` is to be
-      published — reserve the 10 names on crates.io **before** the first tag.
+      currently succeed. It is `disabled_manually` today. **Decide: delete it, or
+      keep it as the vehicle for `kodansu-*`** — and if the latter, all ten names
+      have to be taken before the first tag, because `kodansu` cannot publish
+      without `kodansu-broker` already on the registry.
+
+      `kodansu` itself is taken (0.0.0, a documented placeholder pointing at this
+      repository and at the container image). The other nine were **deliberately
+      left free**: crates.io discourages holding names one does not intend to use,
+      and a server distributed as an image has no reason to publish nine library
+      crates nobody will depend on. Taking them is a decision that follows from
+      keeping `release.yml`, not a precaution to take in advance.
+
+      Ownership of `kodansu` is currently one personal account. Add a second owner
+      (`cargo owner --add <login>`, or a GitHub team once one exists) — the product
+      name should not have a bus factor of one.
 
 The mechanical part is one `fd`/`sd` pass plus `cargo fmt`; `cargo check --workspace
 --exclude fuzz --all-targets` catches everything it missed.
@@ -117,18 +131,37 @@ lockstep and need to be in the same rollout:
 - [ ] namespaces `tansu-external`, `tansu-maintain`
 - [ ] container name `tansu` (`kubectl logs -c tansu` and anything scripted on it)
 - [ ] image tag, the otel-collector sidecar's `service.name` relabelling
-- [ ] `GROUP_FORWARD_PEER_DNS` — the headless Service name; **renaming this during a
-      rolling restart is a partitioned peer set**, so old and new pods must resolve
-      the same DNS name through the cutover. Rename it in a *separate* release from
-      the image rename, never both at once.
+- [ ] ~~`GROUP_FORWARD_PEER_DNS` — the headless Service name~~ — **no longer applies
+      to a 1.0 fleet.** Forward-to-owner coordination was deleted in #360, and the
+      only tag containing that removal is `v1.0.0-alpha.1`. The deployment repo is
+      already clean of it; what is *not* clean is `Popsink/data-plane`, whose chart
+      still pins `0.7.0-beta.39` and therefore still ships `GROUP_FORWARDING`,
+      `GROUP_FORWARD_PEER_DNS`, `INTERNAL_LISTENER_URL`, `POD_IP`, a headless
+      Service and a public `tansu.groupForwarding` values key — as a **live**
+      feature, not dead weight. Removing any of it is gated on that chart moving to
+      ≥ `1.0.0-alpha.1`.
+
+      More generally: production runs three broker generations at once
+      (`eks-mb-production` on `1.0.0-alpha.1`, both GCP fleets on `0.7.0-beta.16`,
+      the self-hosted chart on `0.7.0-beta.39`). Any cleanup of the form "the broker
+      no longer does X, so its config can go" has to be answered per fleet.
 - [ ] Prometheus alert rules and any saved Grafana dashboard, per §3.
 
 ## 6. Repository and docs
 
-- [ ] Renaming `Popsink/tansu` → `Popsink/kodansu` on GitHub: GitHub redirects the
-      web and git URLs indefinitely, so clones keep working, but update `origin`
-      anyway, and check anything that pins `Popsink/tansu` by string — `gh` scripts,
-      the `IMAGE` env in `publish.yml`, external CI.
+- [x] **Done.** `Popsink/tansu` → `Popsink/kodansu`; the old path answers `301` and
+      GitHub redirects web and git URLs indefinitely, so clones and open pull
+      requests keep working. Update `origin` on local checkouts anyway, and never
+      create a new repository named `tansu` in the organisation — that is the one
+      thing that breaks the redirect.
+
+      It turned out to be nearly free, for a reason worth writing down: searching
+      the organisation for `Popsink/tansu` returns ~20 files, and almost all of them
+      are `ghcr.io/popsink/tansu` — **image paths, not repository URLs.** A GHCR
+      package name does not follow the repository it was built from, so the rename
+      touched none of them. The two registry paths (`ghcr.io/popsink/tansu` and the
+      `onprem/tansu` the data-plane chart pulls) plus
+      `infra-terraform/.github/scripts/test_sync_images.py` belong to §7 step 3.
 - [ ] `README.md` — nine of the ten crate READMEs are **symlinks to it**
       (`tansu-auth` has none), so there is one file to edit, not ten — and the
       symlinks are relative, so renaming the crate directories keeps them valid.
@@ -145,13 +178,22 @@ lockstep and need to be in the same rollout:
 
 ## 7. Suggested sequencing
 
-1. **Now, no rename required** — delete what will otherwise have to be renamed
-   twice. See [§8](#8-what-not-to-rename-because-it-should-not-exist).
-2. **PR 1 — crates, binary, modules, logs dirs, justfile, Dockerfile.** Pure
+1. **Done — delete what would otherwise be renamed twice.** [§8](#8-dead-weight--already-removed),
+   plus upstream's `ci.yml`: `disabled_manually`, gated on `github.actor ==
+   'shortishly'`, and carrying `ghcr.io/tansu-io/tansu`. The merge gate comes from
+   `pr.yml`, which owns the `test` context branch protection requires, so deleting
+   it changed no required check. `kodansu` was reserved on crates.io in the same
+   pass — see §1 on why the other nine names were deliberately *not* taken.
+2. **Done — GitHub repo rename** and the README/CLAUDE.md prose. Moved ahead of the
+   code because it is independent of all of it: no image path, no manifest and no
+   crate name refers to the repository. See [§6](#6-repository-and-docs).
+3. **PR — crates, binary, modules, logs dirs, justfile, Dockerfile.** Pure
    compile-time; CI proves it. The image keeps its old name.
-3. **PR 2 — image and manifests.** Push both tags for one release, then drop the old.
-4. **PR 3 — GitHub repo rename** and the README/CLAUDE.md prose.
-5. **Later, separately, each with its own announcement** — metric prefix (dual-emit
+4. **PR — image and manifests.** Push both tags for one release, then drop the old.
+5. **PR — the `tansu:` Helm values key in `Popsink/data-plane`,** read both for one
+   release before dropping the old one. This is the only step with a failure mode
+   that reaches customers who did not ask for any of this.
+6. **Later, separately, each with its own announcement** — metric prefix (dual-emit
    for one release), `service.name`, and `CLUSTER_ID`. Or never; there is no cost to
    a broker named kodansu that emits `tansu_*` metrics beyond the mild confusion of
    reading it.

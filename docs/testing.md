@@ -291,7 +291,7 @@ the tests start at T+0 instead of ~1m35s in:
 
 ```shell
 gh api -X PATCH \
-  repos/Popsink/tansu/branches/main/protection/required_status_checks \
+  repos/Popsink/kodansu/branches/main/protection/required_status_checks \
   -f 'checks[][context]=all-green'
 ```
 
