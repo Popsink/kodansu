@@ -10,8 +10,12 @@ on:
   workflow_dispatch:
 
 env:
-  # `github.repository` is `Popsink/tansu`, but OCI/Docker refs must be
-  # lowercase, so the org casing is hardcoded here.
+  # Hardcoded, and deliberately NOT derived from `github.repository`: that is
+  # now `Popsink/kodansu`, while the published image is still `tansu`. A GHCR
+  # package name does not follow the repository it was built from, and every
+  # manifest in the deployment repos pulls this path. Renaming it is step 4 of
+  # the sequencing in docs/rename-kodansu.md, not a side effect of renaming
+  # the repository. (OCI refs must also be lowercase, which the org casing is not.)
   IMAGE: ghcr.io/popsink/tansu
 
 permissions:
