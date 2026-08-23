@@ -235,6 +235,33 @@ pub struct CorruptRegion {
     pub detail: String,
 }
 
+/// A batch refused at the segment encoder because its `batch_length` field does
+/// not describe the bytes it serialises to (#393).
+///
+/// Writing it would produce exactly the region [`CorruptRegion`] reports: a
+/// footer entry covering the bytes actually written, and a frame at
+/// `byte_start` declaring more of them than exist. Refusing it here is the
+/// write-side half of that issue — the footer cannot claim what the encoder
+/// never accepted.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DivergentBatch {
+    pub topic: String,
+    pub partition: i32,
+    /// Offset the sub-stream assigns this batch's region.
+    pub base_offset: i64,
+    /// Index of the batch within the sub-stream, so a run of batches can be
+    /// told apart.
+    pub index: usize,
+    /// The `batch_length` the batch carries.
+    pub declared: i32,
+    /// The `batch_length` its own bytes imply.
+    pub encoded: i32,
+    /// `magic`, because the one shape known to reach here is the pre-v2 husk
+    /// (`magic != 2`) the decoder returns for a MessageSet it cannot represent.
+    pub magic: i8,
+    pub record_data_len: usize,
+}
+
 /// Storage Errors
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
@@ -244,6 +271,11 @@ pub enum Error {
     /// claims (#386). Answered to the client as `CORRUPT_MESSAGE` for that
     /// partition — see [`storage_error_code`].
     CorruptSegment(Box<CorruptRegion>),
+
+    /// A batch whose declared length diverges from its bytes, refused before it
+    /// could be written (#393). Answered as `CORRUPT_MESSAGE`: the batch is
+    /// unusable and no retry of the same bytes changes that.
+    DivergentBatch(Box<DivergentBatch>),
 
     FeatureNotEnabled {
         feature: String,
@@ -354,6 +386,11 @@ pub(crate) fn storage_error_code(error: &Error) -> ErrorCode {
         // no retry against this broker will change the answer and the client is
         // told so rather than being handed a dropped socket to guess from.
         Error::CorruptSegment(_) => ErrorCode::CorruptMessage,
+
+        // Refused before the write (#393). Same answer as reading the damage
+        // would give, for the same reason: these bytes cannot be stored or
+        // served, and re-sending them will not help.
+        Error::DivergentBatch(_) => ErrorCode::CorruptMessage,
 
         _ => ErrorCode::UnknownServerError,
     }

@@ -322,6 +322,37 @@ impl Batch {
     pub fn crc_matches(&self) -> Result<bool> {
         self.computed_crc().map(|computed| computed == self.crc)
     }
+
+    /// The `batch_length` this batch's own bytes imply: the fixed header from
+    /// `partition_leader_epoch` onwards, plus `record_data`.
+    ///
+    /// This is what `From<Batch> for Bytes` *writes after* the length field, and
+    /// it is computed the same way `CrcData::into_batch` computes the field when
+    /// it builds a batch from records.
+    pub fn encoded_batch_length(&self) -> Result<i32> {
+        i32::try_from(FIXED_BATCH_LENGTH + self.record_data.len()).map_err(Into::into)
+    }
+
+    /// Whether the `batch_length` field describes the bytes this batch would
+    /// serialize to.
+    ///
+    /// It normally does, because every batch built from records takes the field
+    /// from the payload (`CrcData::into_batch`) and every batch decoded from a
+    /// v2 RecordBatch was framed by that same length. One shape breaks it: the
+    /// pre-v2 husk `TryFrom<Bytes>` returns for `magic != 2` keeps the wire's
+    /// `batch_length` — the length of a MessageSet this struct cannot represent
+    /// — over an empty `record_data`, so `From<Batch> for Bytes` re-emits a
+    /// header claiming bytes that are not there.
+    ///
+    /// A husk is meant to be refused before it can matter, with
+    /// `UNSUPPORTED_FOR_MESSAGE_FORMAT` on the produce path (#320). This is the
+    /// question a *writer* asks before committing bytes to storage, where the
+    /// consequence of a mismatch is not a rejected request but a region no
+    /// reader can ever decode (#393).
+    pub fn declares_its_own_length(&self) -> bool {
+        self.encoded_batch_length()
+            .is_ok_and(|encoded| encoded == self.batch_length)
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]

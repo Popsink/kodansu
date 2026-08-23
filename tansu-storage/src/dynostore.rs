@@ -83,13 +83,13 @@ mod tests;
 
 use crate::{
     AclBinding, AclFilter, Acls, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
-    BrokerRegistrationRequest, ConsumerGroupState, CorruptRegion, Error, GROUP_SCHEMA_VERSION,
-    GenerationDoc, GroupDetail, GroupMember, GroupSchema, GroupState, ListOffsetResponse, METER,
-    MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
-    ProducerIdResponse, QuotaAlteration, QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas,
-    Result, ScramCredential, Storage, TopicDefaults, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
-    storage_error_code,
+    BrokerRegistrationRequest, ConsumerGroupState, CorruptRegion, DivergentBatch, Error,
+    GROUP_SCHEMA_VERSION, GenerationDoc, GroupDetail, GroupMember, GroupSchema, GroupState,
+    ListOffsetResponse, METER, MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
+    OffsetStage, ProducerIdResponse, QuotaAlteration, QuotaEntity, QuotaFilterComponent,
+    QuotaLimits, Quotas, Result, ScramCredential, Storage, TopicDefaults, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
+    UpdateError, Version, storage_error_code,
 };
 
 const APPLICATION_JSON: &str = "application/json";
@@ -8718,7 +8718,50 @@ impl DynoStore {
             let mut max_timestamp = i64::MIN;
             let mut producers = Vec::new();
 
-            for batch in batches {
+            for (index, batch) in batches.iter().enumerate() {
+                // A footer entry must not be able to claim bytes the payload does
+                // not hold (#393).
+                //
+                // `byte_len` below is measured from `body`, so it always covers
+                // exactly what was written — which means the only way the two can
+                // disagree is a batch whose own `batch_length` header lies about
+                // its bytes. `From<Batch> for Bytes` writes that field verbatim,
+                // so such a batch serialises a frame declaring a length no
+                // reader will find, and the region becomes permanently
+                // undecodable: the exact damage #386 had to answer for on the
+                // read side.
+                //
+                // The one shape known to produce it is the pre-v2 husk the
+                // decoder returns for `magic != 2` — the wire's `batch_length`
+                // over an empty `record_data` (see `declares_its_own_length`).
+                // The produce path already refuses that with
+                // `UNSUPPORTED_FOR_MESSAGE_FORMAT` (#320), so reaching here is a
+                // defect rather than a client error, and this is the invariant
+                // asserted where the footer is built rather than where it is
+                // read.
+                //
+                // Refusing costs the caller its tick or its flush, having
+                // written nothing — the same trade #388 made for compaction.
+                if !batch.declares_its_own_length() {
+                    let divergent = DivergentBatch {
+                        topic: topition.topic().to_owned(),
+                        partition: topition.partition(),
+                        base_offset: *base_offset,
+                        index,
+                        declared: batch.batch_length,
+                        encoded: batch.encoded_batch_length().unwrap_or(-1),
+                        magic: batch.magic,
+                        record_data_len: batch.record_data.len(),
+                    };
+
+                    error!(
+                        ?divergent,
+                        "refusing to encode a batch that misdeclares its length"
+                    );
+
+                    return Err(Error::DivergentBatch(Box::new(divergent)));
+                }
+
                 // Offset of this batch within the sub-stream, before it is added.
                 let offset_delta = record_count as u32;
                 body.extend_from_slice(&Bytes::from(batch.clone()));
