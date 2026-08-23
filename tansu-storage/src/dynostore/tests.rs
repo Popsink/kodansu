@@ -26,6 +26,7 @@ use super::{DynoStore, ServedEnd, Watermark};
 mod compact_segments;
 mod corrupt_region;
 mod delete_groups;
+mod divergent_batch;
 mod group_describe;
 mod group_documents;
 mod group_expiry;
