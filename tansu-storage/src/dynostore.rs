@@ -997,6 +997,22 @@ static SEGMENTS_LIVE: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Footer-index entries replaced by the object's own trailer after a short read
+/// (#397) — the read path catching the in-memory index serving an entry that
+/// does not belong to the object it was used against.
+///
+/// The trailer is self-describing precisely so a reader never has to derive a
+/// region from anything else (#64/#60), and this counts the times that mattered.
+/// Nonzero means the index is a cache that can be wrong, which is a different
+/// fault from the object being wrong — the discriminator #397 asked for, answered
+/// per occurrence rather than once by hand.
+static SEGMENT_INDEX_ENTRIES_CORRECTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_segment_index_entries_corrected")
+        .with_description("footer-index entries replaced by the object's own trailer")
+        .build()
+});
+
 /// Segments quarantined by compaction because they hold a region no reader can
 /// decode (#398) — first sight only, so this counts *distinct* bad objects
 /// discovered, not re-reads of them.
@@ -1445,9 +1461,8 @@ impl RegionRead<'_> {
         (self.encoded.len() as u64) < self.entry.byte_len
     }
 
-    /// Report the region as damaged, counted and logged with everything needed to
-    /// tell the two causes apart on the next occurrence.
-    fn corrupt(&self, at: usize, declared: Option<i32>, detail: String) -> Error {
+    /// The diagnostic for this read, with the scan's stopping point folded in.
+    fn region(&self, at: usize, declared: Option<i32>, detail: String) -> CorruptRegion {
         let head = self
             .encoded
             .get(at..)
@@ -1459,7 +1474,7 @@ impl RegionRead<'_> {
                 head
             });
 
-        let region = CorruptRegion {
+        CorruptRegion {
             prefix: self.prefix.to_owned(),
             seq: self.seq,
             topic: self.entry.topic.clone(),
@@ -1472,10 +1487,32 @@ impl RegionRead<'_> {
             declared,
             head,
             detail,
-        };
+        }
+    }
+
+    /// Report the region as damaged, counted and logged with everything needed to
+    /// tell the two causes apart on the next occurrence.
+    fn corrupt(&self, at: usize, declared: Option<i32>, detail: String) -> Error {
+        let region = self.region(at, declared, detail);
 
         SEGMENT_REGION_CORRUPT.add(1, &[]);
         error!(?region, "segment region does not begin at a batch frame");
+
+        Error::CorruptSegment(Box::new(region))
+    }
+
+    /// Report the read as short of the extent its footer entry claims (#397).
+    ///
+    /// The same `CorruptRegion` payload as [`Self::corrupt`], under its own
+    /// counter, because the two say different things about *what* is wrong: a
+    /// full-length read that holds no frame means the entry does not describe
+    /// the region, while a short read means the entry claims bytes the object
+    /// does not have at all.
+    fn short_of_extent(&self, detail: String) -> Error {
+        let region = self.region(self.encoded.len(), None, detail);
+
+        SEGMENT_REGION_TRUNCATED.add(1, &[]);
+        error!(?region, "segment region read short of its footer extent");
 
         Error::CorruptSegment(Box::new(region))
     }
@@ -5129,10 +5166,18 @@ impl DynoStore {
     /// narrowed to the segments the caller actually fetched — the size merge
     /// fetches its run, per-key rewrite fetches everything.
     ///
-    /// A region whose recorded extent runs past its object is skipped rather
-    /// than decoded: a footer that disagrees with its object is damage, and
-    /// carrying its *base* forward without its records would mislabel the
-    /// batches that follow it.
+    /// A region whose recorded extent runs past its object **fails the run**
+    /// (#397). It used to be skipped, on the reasoning that carrying its base
+    /// forward without its records would mislabel the batches that follow it —
+    /// but skipping mislabels them just as badly, and durably. The merged region
+    /// is written with the base offset of its first region and read back by
+    /// running offsets from there, so a dropped region in the middle of a run
+    /// slides everything above it down into the gap, and `retire_segments` then
+    /// deletes the original the records could still have been read from.
+    ///
+    /// Failing the run costs a merge; #398's quarantine then excludes the object
+    /// and the drain proceeds over what is readable. Silently rewriting the
+    /// prefix with shifted offsets costs the data.
     fn decode_fenced_regions(
         &self,
         prefix: &str,
@@ -5151,7 +5196,19 @@ impl DynoStore {
             let start = entry.byte_start as usize;
             let end = start + entry.byte_len as usize;
             if end > object.len() {
-                continue;
+                let available = object.slice(start.min(object.len())..);
+
+                return Err(RegionRead {
+                    prefix,
+                    seq,
+                    entry: &entry,
+                    encoded: &available,
+                }
+                .short_of_extent(format!(
+                    "region extent runs {} bytes past a {}-byte object",
+                    end - object.len(),
+                    object.len(),
+                )));
             }
 
             regions.push((
@@ -5441,14 +5498,28 @@ impl DynoStore {
                     )
                     .await
                 {
-                    Ok(result) => result
-                        .bytes()
-                        .await
-                        .map_err(Error::from)
+                    Ok(result) => {
+                        let encoded = result.bytes().await.map_err(Error::from)?;
+
+                        // Short of the extent the index claims (#397): the index
+                        // entry and the object disagree, and only the object's own
+                        // trailer says which is wrong. A correctable index is
+                        // repaired and the fetch restarts off it — the whole
+                        // entry, `base_offset` and `record_count` included, feeds
+                        // the offset arithmetic below, so re-reading one region
+                        // inline would mix a corrected extent with a stale span.
+                        if (encoded.len() as u64) < entry.byte_len {
+                            self.resolve_short_region(&prefix, seq, &entry, &location, &encoded)
+                                .await?;
+                            restart = true;
+                            break;
+                        }
+
                         // Damage here answers this partition `CORRUPT_MESSAGE`
                         // (#386) instead of propagating a bare integer-conversion
                         // failure that took the request and the connection with it.
-                        .and_then(|encoded| self.decode_region(&prefix, seq, &entry, encoded))?,
+                        self.decode_region(&prefix, seq, &entry, encoded)?
+                    }
 
                     // Deleted between locate and read (compaction #66 / retention
                     // #61): drop anything gathered so far, evict the stale seq
@@ -8831,6 +8902,103 @@ impl DynoStore {
         Ok(floor)
     }
 
+    /// Decide which of the footer index and the object is wrong when a region
+    /// read comes back short of the extent the index claims (#397), and repair
+    /// the index if it is the one at fault.
+    ///
+    /// Segments are immutable and created atomically, so a ranged GET cannot
+    /// return fewer bytes than the object holds over that range. A short read
+    /// therefore says the entry the read was issued from claims bytes past the
+    /// end of the object — and `encode_segment_v3` measures `byte_len` from the
+    /// bytes it just appended, so it cannot over-claim for the payload it built.
+    /// Two things can produce the pairing, and they are distinguishable by one
+    /// suffix GET:
+    ///
+    /// - **the index is wrong.** The reader locates a region from the in-memory
+    ///   prefix index, not from the object's trailer. An entry that describes a
+    ///   different payload — a rewrite's, an adopted create's — is a *cache*
+    ///   fault, and the trailer is the authority. Re-index the segment from the
+    ///   trailer and let the caller retry: `Ok(())`.
+    /// - **the object is wrong.** The trailer says exactly what the index said,
+    ///   and the object is still short of it. Nothing in the bucket can serve
+    ///   these offsets, so the read is answered `CORRUPT_MESSAGE` rather than
+    ///   returning part of a region and calling it the whole thing.
+    ///
+    /// This is why the short read is no longer served as a silently truncated
+    /// region. #395 said it did not repair the regions already on the fleet; this
+    /// makes the ones caused by a stale entry read whole, and makes the rest say
+    /// so.
+    async fn resolve_short_region(
+        &self,
+        prefix: &str,
+        seq: u64,
+        entry: &SubstreamEntry,
+        location: &Path,
+        encoded: &Bytes,
+    ) -> Result<()> {
+        let read = RegionRead {
+            prefix,
+            seq,
+            entry,
+            encoded,
+        };
+
+        let Some(footer) = self.read_segment_footer(location).await? else {
+            return Err(read.short_of_extent(
+                "object carries no segment trailer to resolve the region against".to_owned(),
+            ));
+        };
+
+        let Some(own) = footer.get(&entry.topic, entry.partition) else {
+            return Err(read.short_of_extent(format!(
+                "object's own footer holds no {}-{} region",
+                entry.topic, entry.partition
+            )));
+        };
+
+        if own.byte_start == entry.byte_start && own.byte_len == entry.byte_len {
+            return Err(read.short_of_extent(format!(
+                "object's own footer claims the same {} bytes at {} and the object is short of it",
+                entry.byte_len, entry.byte_start
+            )));
+        }
+
+        // The index served an entry that does not belong to this object. Replace
+        // the whole cached footer, not just this sub-stream's entry: if one entry
+        // came from another payload they all did, and a footer half from each
+        // would be a third thing that describes nothing.
+        //
+        // The append time is preserved from the cached segment where there is one,
+        // because whole-segment retention (#61) decides expiry on it and a `0`
+        // here would read as "ancient" and delete a live segment.
+        let last_modified_ms = self
+            .prefix_index
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .get(prefix)
+            .and_then(|index| index.segments.get(&seq))
+            .map(|cached| cached.last_modified_ms)
+            .unwrap_or_else(|| {
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|since| since.as_millis() as i64)
+                    .unwrap_or_default()
+            });
+
+        SEGMENT_INDEX_ENTRIES_CORRECTED.add(1, &[]);
+        warn!(
+            prefix,
+            seq,
+            topic = entry.topic,
+            partition = entry.partition,
+            indexed = ?(entry.byte_start, entry.byte_len, entry.base_offset, entry.record_count),
+            trailer = ?(own.byte_start, own.byte_len, own.base_offset, own.record_count),
+            "footer index entry did not belong to this object; taking the object's own trailer"
+        );
+
+        self.index_insert(prefix, seq, footer, last_modified_ms)
+    }
+
     fn decode(&self, encoded: Bytes) -> Result<deflated::Batch> {
         debug!(encoded = ?&encoded[..]);
         deflated::Batch::try_from(encoded)
@@ -8909,19 +9077,30 @@ impl DynoStore {
     /// it is. Here the entry is in hand, and the discriminator is whether the read
     /// returned the whole extent the footer claims:
     ///
-    /// - **short read** — a torn, truncated or partially-visible object. Whole
-    ///   batches are returned and the remainder ignored, so a region that yields
-    ///   nothing stays the bounded empty read #290 settled on rather than becoming
-    ///   an error. Counted ([`SEGMENT_REGION_TRUNCATED`]), because it is otherwise
-    ///   invisible.
+    /// - **short read** — the entry claims bytes the object does not hold.
+    ///   Answered as damage, counted ([`SEGMENT_REGION_TRUNCATED`]).
     /// - **full-length read that yields no batch** — the region arrived whole and
     ///   still holds no frame, so `byte_start` does not point at one: the footer
     ///   and the payload disagree. That is damage, and it is answered as such.
     ///
-    /// Only a region that decodes to *nothing* is treated as corrupt. A malformed
-    /// tail after whole batches keeps the frame contract's behaviour — it cannot
-    /// be a divergent start, and erroring there would fail reads that serve data
-    /// today.
+    /// The short read used to return the batches it managed to decode and drop the
+    /// rest of the region, on the reasoning that it was a torn or partially
+    /// visible object and should stay the bounded empty read #290 settled on. The
+    /// fleet then produced 313 of them in 29 minutes on
+    /// `*.connect.ibmi-offsets` — `KafkaOffsetBackingStore`'s durable state —
+    /// with `read_len` pinned at exactly 199 across 216 distinct sequences (#397).
+    /// A constant over-claim across hundreds of objects is not tearing, and the
+    /// consumer of a partial offsets region is a connector resuming from an offset
+    /// map with holes in it, with nothing in its own logs to say so. Nor is
+    /// tearing something an immutable, atomically created object can do: a short
+    /// read means the entry and the object disagree, full stop. The reader
+    /// resolves *which* of them is wrong against the object's own trailer before
+    /// this is reached — see [`Self::resolve_short_region`].
+    ///
+    /// Beyond that, only a region that decodes to *nothing* is treated as corrupt.
+    /// A malformed tail after whole batches keeps the frame contract's behaviour —
+    /// it cannot be a divergent start, and erroring there would fail reads that
+    /// serve data today.
     fn decode_region(
         &self,
         prefix: &str,
@@ -8944,21 +9123,11 @@ impl DynoStore {
             .map_err(|error| read.corrupt(0, None, format!("undecodable batch: {error:?}")))?;
 
         if read.truncated() {
-            SEGMENT_REGION_TRUNCATED.add(1, &[]);
-            warn!(
-                prefix,
-                seq,
-                topic = entry.topic,
-                partition = entry.partition,
-                byte_start = entry.byte_start,
-                byte_len = entry.byte_len,
-                read_len = encoded.len(),
-                batches = batches.len(),
-                ?tail,
-                "segment region read short of its footer extent"
-            );
-
-            return Ok(batches);
+            return Err(read.short_of_extent(format!(
+                "region short of its footer extent by {} bytes, {} whole batches: {tail:?}",
+                entry.byte_len - encoded.len() as u64,
+                batches.len(),
+            )));
         }
 
         match tail {

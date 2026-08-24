@@ -252,13 +252,22 @@ async fn a_whole_region_holding_no_frame_is_reported_with_its_segment() -> Resul
     Ok(())
 }
 
-/// A read that came back short of the footer's extent is NOT answered as
-/// damage — it is the other candidate cause, and a torn or partially-visible
-/// object stays the bounded, error-free empty read of #290 rather than becoming a
-/// `CORRUPT_MESSAGE` a client cannot act on. Counted instead, so it stops being
-/// invisible.
+/// A read that came back short of the footer's extent is the other candidate
+/// cause — and it is damage too (#397).
+///
+/// It used to return the batches it managed to decode and drop the rest of the
+/// region, on the reasoning that a torn or partially-visible object should stay
+/// the bounded, error-free empty read of #290. The fleet then produced 313 of
+/// them in 29 minutes on `*.connect.ibmi-offsets`, with `read_len` pinned at
+/// exactly 199 across 216 distinct sequences: a constant over-claim, not tearing.
+/// A consumer served part of an offsets region and told nothing is a connector
+/// resuming from an offset map with holes in it.
+///
+/// Which side is wrong is resolved against the object's own trailer *before*
+/// this — see `short_region.rs`. By the time a short read reaches here it has
+/// nowhere left to go.
 #[tokio::test]
-async fn a_short_read_is_not_read_as_damage() -> Result<(), Error> {
+async fn a_short_read_is_damage_too() -> Result<(), Error> {
     let _guard = super::init_tracing()?;
 
     let store = store(&InMemory::new());
@@ -266,15 +275,32 @@ async fn a_short_read_is_not_read_as_damage() -> Result<(), Error> {
 
     let start = entry.byte_start as usize;
 
-    // Short of a frame header, as a truncated ranged GET returns it.
-    let batches = store.decode_region(OFFSETS, 7, &entry, segment.slice(start..start + 4))?;
-    assert!(batches.is_empty());
+    // Short of a frame header, as a ranged GET past the end of an object returns
+    // it.
+    let error = store
+        .decode_region(OFFSETS, 7, &entry, segment.slice(start..start + 4))
+        .expect_err("a region short of its extent");
 
-    // And short mid-frame, where a length *is* read but its body is not there.
+    let Error::CorruptSegment(region) = error else {
+        panic!("{error:?}");
+    };
+
+    // `read_len < byte_len` is the discriminator, and it is what the diagnostic
+    // leads with.
+    assert_eq!(entry.byte_len, region.byte_len);
+    assert_eq!(4, region.read_len);
+    assert_eq!(
+        ErrorCode::CorruptMessage,
+        storage_error_code(&Error::CorruptSegment(region))
+    );
+
+    // And short mid-frame, where a length *is* read but its body is not there:
+    // the same finding, not a partial region.
     let truncated = entry.byte_len as usize / 2;
-    let batches =
-        store.decode_region(OFFSETS, 7, &entry, segment.slice(start..start + truncated))?;
-    assert!(batches.is_empty());
+    assert!(matches!(
+        store.decode_region(OFFSETS, 7, &entry, segment.slice(start..start + truncated)),
+        Err(Error::CorruptSegment(_))
+    ));
 
     Ok(())
 }
