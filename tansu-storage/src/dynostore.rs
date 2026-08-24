@@ -586,6 +586,42 @@ static PREFIX_TAIL_PROBES: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// Contiguity is checked with running totals rather than by sorting: a set
 /// of non-overlapping spans is one interval exactly when the records it
 /// holds equal the offsets it spans.
+/// The outcome of one compaction run over a prefix (#399).
+///
+/// [`DynoStore::compact_prefix_segments`] used to answer `u64`, and the drain
+/// read `Ok(0)` as "this prefix has nothing left to merge". It is also what a run
+/// that could not proceed *at all* answered — the index named segments a peer had
+/// already retired — so the drain stopped there having merged nothing, and run
+/// selection picks the oldest segments, which are exactly the ones a peer's
+/// compaction retires first. `tansu_prefix_segment_vanished_before_read` runs at
+/// 11/s on the fleet, against busiest prefixes sitting at 30–68× their trigger.
+///
+/// Naming the three cases is what lets the drain continue over a run it could
+/// not use, and stop on the one case that means it is finished.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum CompactRun {
+    /// Segments merged away by this run.
+    Merged(u64),
+
+    /// Nothing left to merge under the current thresholds — or another compactor
+    /// holds the prefix, which is the same thing for this replica this tick.
+    Drained,
+
+    /// This run could not proceed, and the next selection will differ: the index
+    /// named segments that are gone, and they have been pruned from it.
+    Retry,
+}
+
+impl CompactRun {
+    fn outcome(&self) -> &'static str {
+        match self {
+            Self::Merged(_) => "merged",
+            Self::Drained => "drained",
+            Self::Retry => "retry",
+        }
+    }
+}
+
 /// A sub-stream inside a merge run.
 type SubstreamKey = (String, i32);
 
@@ -985,15 +1021,96 @@ static SERVED_END_CERTIFIED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
-/// Live segment count per prefix after a maintenance tick (#66) — the signal
-/// that tells whether compaction is keeping `S` bounded (a counter can't).
+/// Segments **this replica has indexed** for a prefix after a maintenance tick
+/// (#66) — the signal that tells whether compaction is keeping `S` bounded (a
+/// counter can't).
 ///
 /// Carries a `prefix` attribute: without one the last write of a pass won and the
 /// gauge reported an arbitrary prefix rather than the growing one (#284).
+///
+/// Read it per replica, not aggregated (#399). It is `PrefixIndex::segments.len()`
+/// — the size of this process's cached footer index — and the incremental refresh
+/// is add-only below the tail, so an entry for a segment a *peer* retired stays
+/// until this replica reads a 404 for it. Four maintainers reported 17 517,
+/// 14 374, 13 932 and 67 for the same prefix at the same instant, and none of
+/// those is the number of objects in the bucket. `max()` over the fleet is the
+/// staleness of the worst index, not a backlog. What makes the gauge converge on
+/// the truth is the drain pruning what it finds gone
+/// ([`CompactRun::Retry`]) rather than stopping on the first of it.
 static SEGMENTS_LIVE: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("tansu_prefix_segments_live")
-        .with_description("live segments for a prefix after maintenance, by prefix")
+        .with_description("segments this replica has indexed for a prefix, by prefix")
+        .build()
+});
+
+/// Prefixes a maintenance tick met, by `outcome` (#399): `claimed` when this
+/// replica took the work, `recent` when a peer's stamp was inside
+/// `maintenance_recency`, `lost` when the lease acquire was fenced.
+///
+/// #140's remedies all shipped and the busiest prefixes still net-grew — 17 500
+/// live segments against a 256 trigger — while the four maintainers ran at 12
+/// millicores between them. Nothing said how many prefixes a tick actually
+/// claimed, or whether the top-`S` ones were the ones being claimed. This is that
+/// measurement, and the pairing that makes it readable: `claimed` against
+/// `recent` says whether the recency window is throttling the fleet or doing
+/// nothing.
+static MAINTENANCE_PREFIXES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_maintenance_prefixes")
+        .with_description("prefixes a maintenance tick met, by outcome")
+        .build()
+});
+
+/// Extra backlog sweeps a maintenance tick ran past its first pass (#399) — the
+/// scheduling deficit made visible.
+///
+/// A tick used to be one pass over its claim, then idle until the next interval.
+/// Measured in production at `maintenance_interval=10m`: compaction ran in a
+/// burst of 1–2 minutes and then nothing for 8–9, a 10–20 % duty cycle, while
+/// producers refilled the prefixes for the whole window. Zero here means the
+/// first pass drained everything it claimed; a steady non-zero means the interval
+/// was never the right place to decide how much work to do.
+static MAINTENANCE_SWEEPS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_maintenance_sweeps")
+        .with_description("extra backlog sweeps past a maintenance tick's first pass")
+        .build()
+});
+
+/// Compaction runs attempted, by `outcome` (#399): `merged`, `drained`,
+/// `retry`, `error`.
+///
+/// The denominator `tansu_prefix_segment_compactions` never had: with it,
+/// segments-merged-per-run is a division rather than a guess, which is what says
+/// whether `prefix_compact_target_bytes` is the binding constraint on a run or
+/// whether something else ends it first.
+///
+/// `retry` is the one to watch. A run that could not proceed — a peer deleted the
+/// segments it selected — used to return `Ok(0)`, which the drain read as "this
+/// prefix is drained" and stopped on, having merged nothing. Run selection picks
+/// the *oldest* segments, which are exactly the ones a peer's compaction retires
+/// first, and `tansu_prefix_segment_vanished_before_read` runs at 11/s on the
+/// fleet.
+static SEGMENT_COMPACT_RUNS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_segment_compact_runs")
+        .with_description("compaction runs attempted, by outcome")
+        .build()
+});
+
+/// Why a prefix's drain stopped, by `reason` (#399): `drained`, `runs`,
+/// `retries`, `error`.
+///
+/// "Does a drain that starts on a 15 000-segment prefix finish it?" was
+/// unanswerable: the drain logged nothing on the way out, so a prefix that
+/// converged and a prefix that hit `MAX_RUNS_PER_PREFIX` looked identical from
+/// outside. Anything other than `drained` means the backlog outlived the tick for
+/// a reason worth naming.
+static PREFIX_DRAIN_STOPS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_drain_stops")
+        .with_description("why a prefix's compaction drain stopped, by reason")
         .build()
 });
 
@@ -1152,11 +1269,18 @@ static SEGMENT_REGION_TRUNCATED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
-/// Segments discovered by a listing that were gone by the time their footer was
-/// read (#191): concurrent compaction (#66) merged them away, or retention (#61)
-/// reclaimed them. A normal consequence of maintenance running against live
-/// readers, so nonzero is expected — but it is worth a series, because it used to
-/// abort the whole index refresh and surface as a raw `NotFound` on `ListOffsets`.
+/// Segments this replica's index named that were gone by the time it read them
+/// (#191): concurrent compaction (#66) merged them away, or retention (#61)
+/// reclaimed them. Counted on the index refresh, the compaction fetch and — since
+/// #399 — the read-path region GET, which is where most of it is.
+///
+/// A normal consequence of maintenance running against live readers, so nonzero is
+/// expected. What is *not* normal is the rate the fleet runs at: ~11/s, against
+/// 0.55 compaction runs/s that merge anything, because the incremental index
+/// refresh is add-only below the tail so a stale entry is never reconciled away —
+/// it is only ever discovered here. Read against `tansu_prefix_segment_compact_runs`
+/// by outcome: the `retry` share is how much of the drain is spent walking an
+/// index through the objects it names that no longer exist.
 static SEGMENT_VANISHED_BEFORE_READ: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_prefix_segment_vanished_before_read")
@@ -5528,6 +5652,13 @@ impl DynoStore {
                     // restart clean. The merged segment covers the same offsets
                     // and wins the overlap (higher seq), so no gap/duplicate.
                     Err(object_store::Error::NotFound { .. }) => {
+                        // Counted (#399): the same event the compaction path has
+                        // always counted, and on the fleet the *bigger* half —
+                        // 39 `segment` 404s/s on the brokers against 7 on the
+                        // maintainers — while this side reported none of it,
+                        // because the incremental index refresh is add-only and
+                        // nothing here ever said how much of it was stale.
+                        SEGMENT_VANISHED_BEFORE_READ.add(1, &[]);
                         self.index_prune(&prefix, &[seq])?;
                         self.index_invalidate(&prefix)?;
                         restart = true;
@@ -7467,9 +7598,9 @@ impl DynoStore {
     /// path's overlap resolver returns exactly one copy, so a concurrent fetch is
     /// correct; a fetch that GETs an original just as it is deleted retries off a
     /// refreshed index (see `fetch_prefix_coalesced`).
-    async fn compact_prefix_segments(&self, prefix: &str) -> Result<u64> {
+    async fn compact_prefix_segments(&self, prefix: &str) -> Result<CompactRun> {
         if self.prefix_compact_min_segments == 0 {
-            return Ok(0);
+            return Ok(CompactRun::Drained);
         }
 
         self.refresh_prefix_index(prefix).await?;
@@ -7531,11 +7662,11 @@ impl DynoStore {
 
         // Only above the trigger, and never touch the hot (newest) tail.
         if segs.len() <= self.prefix_compact_min_segments {
-            return Ok(0);
+            return Ok(CompactRun::Drained);
         }
         let eligible_end = segs.len().saturating_sub(self.prefix_compact_keep_hot);
         if eligible_end < 2 {
-            return Ok(0);
+            return Ok(CompactRun::Drained);
         }
 
         // Pick the OLDEST contiguous run of at least two segments to merge, up to
@@ -7607,7 +7738,7 @@ impl DynoStore {
             (chosen, chosen_last_modified)
         };
         if run.len() < 2 {
-            return Ok(0);
+            return Ok(CompactRun::Drained);
         }
 
         // Coordinate compactors with a *separate* compaction lease (#66 review):
@@ -7615,7 +7746,7 @@ impl DynoStore {
         // produce lease, so it must not require — or fence — the produce writer.
         // If another compactor holds this prefix, yield.
         if self.acquire_compaction_lease(prefix).await.is_err() {
-            return Ok(0);
+            return Ok(CompactRun::Drained);
         }
 
         // Snapshot the run's footers; GET each run segment once.
@@ -7639,7 +7770,11 @@ impl DynoStore {
             .fetch_segment_objects(prefix, run.iter().copied())
             .await?
         else {
-            return Ok(0);
+            // Not "drained" (#399): the run selected segments a peer had already
+            // retired, and `fetch_segment_objects` has pruned them from the
+            // index — so the *next* selection is over a different segment set and
+            // the drain must take it rather than stopping here.
+            return Ok(CompactRun::Retry);
         };
 
         // Merge the EPOCH-FENCED view (#66 review fix, critical): rebuild each
@@ -7721,7 +7856,7 @@ impl DynoStore {
             "compacted prefix segments"
         );
 
-        Ok(run.len() as u64)
+        Ok(CompactRun::Merged(run.len() as u64))
     }
 
     /// Enforce `cleanup.policy=compact` over a compacted topic's dedicated
@@ -8078,13 +8213,17 @@ impl DynoStore {
                 && let Some(lease) = self.read_compaction_lease(&prefix).await?
                 && now_ms.saturating_sub(lease.maintained_at_ms) < recency_ms
             {
+                MAINTENANCE_PREFIXES.add(1, &[KeyValue::new("outcome", "recent")]);
                 continue;
             }
             match self.acquire_compaction_lease(&prefix).await {
                 Ok(_) => {
+                    MAINTENANCE_PREFIXES.add(1, &[KeyValue::new("outcome", "claimed")]);
                     _ = owned.insert(prefix);
                 }
-                Err(Error::Api(ErrorCode::NotLeaderOrFollower)) => {}
+                Err(Error::Api(ErrorCode::NotLeaderOrFollower)) => {
+                    MAINTENANCE_PREFIXES.add(1, &[KeyValue::new("outcome", "lost")]);
+                }
                 Err(err) => error!(?err, prefix, "maintenance claim"),
             }
         }
@@ -8199,17 +8338,71 @@ impl DynoStore {
     /// Every other error still ends the drain. They are not attributable to one
     /// object, so there is nothing to exclude and nothing to make the next run
     /// different — retrying would be a hot loop against the object store.
+    ///
+    /// A run that could not *proceed* is the third case (#399), and it used to be
+    /// the same `break` as well: `fetch_segment_objects` answering `None` — the
+    /// index named segments a peer had already retired — came back as `Ok(0)`,
+    /// which reads as "drained". Selection picks the oldest segments, which are
+    /// exactly the ones a peer's compaction retires first, and
+    /// `tansu_prefix_segment_vanished_before_read` runs at 11/s on the fleet
+    /// while the busiest prefixes sit at 30–68× their trigger. The pruned index
+    /// makes the next selection different, so the drain takes it.
+    ///
+    /// Why the drain stopped is reported (`tansu_prefix_drain_stops`), because
+    /// "does a drain that starts on a 15 000-segment prefix finish it?" was
+    /// otherwise unanswerable from outside.
     async fn drain_compact_prefix(&self, prefix: &str) -> u64 {
         /// Bounds the drain loop so a pathological prefix can't monopolize a
         /// maintenance tick; far above the runs a real backlog needs.
         const MAX_RUNS_PER_PREFIX: usize = 4_096;
 
+        /// Bounds the runs that could not proceed, so a listing that keeps
+        /// naming segments that are gone cannot spin.
+        ///
+        /// High on purpose. Each such run prunes *every* gone segment its run
+        /// named, so the ghosts are consumed monotonically and the ceiling is
+        /// (ghost entries / segments per run) — on the fleet, an index carrying
+        /// tens of thousands of stale entries against runs of ~22 segments. A
+        /// low cap would leave the drain stopping short of the live segments for
+        /// exactly the prefixes furthest over the trigger, which is the
+        /// behaviour being fixed. The real bounds are `MAX_RUNS_PER_PREFIX`
+        /// above and the broker's maintenance run timeout (#131).
+        const MAX_RETRIES_PER_PREFIX: usize = 1_024;
+
         let mut compacted = 0;
+        let mut retries = 0usize;
+        let mut reason = "runs";
 
         for _ in 0..MAX_RUNS_PER_PREFIX {
-            match self.compact_prefix_segments(prefix).await {
-                Ok(0) => break,
-                Ok(n) => compacted += n,
+            let outcome = self.compact_prefix_segments(prefix).await;
+
+            SEGMENT_COMPACT_RUNS.add(
+                1,
+                &[KeyValue::new(
+                    "outcome",
+                    outcome.as_ref().map_or("error", CompactRun::outcome),
+                )],
+            );
+
+            match outcome {
+                Ok(CompactRun::Merged(n)) => compacted += n,
+
+                Ok(CompactRun::Drained) => {
+                    reason = "drained";
+                    break;
+                }
+
+                Ok(CompactRun::Retry) => {
+                    retries += 1;
+                    if retries >= MAX_RETRIES_PER_PREFIX {
+                        warn!(
+                            prefix,
+                            retries, "drain kept selecting segments that are gone"
+                        );
+                        reason = "retries";
+                        break;
+                    }
+                }
 
                 // Damage attributable to one object: exclude it and keep
                 // draining. `quarantine_segment` returning `false` means the run
@@ -8223,16 +8416,20 @@ impl DynoStore {
                         .unwrap_or_default()
                     {
                         error!(?region, prefix, "compaction damage the quarantine misses");
+                        reason = "error";
                         break;
                     }
                 }
 
                 Err(err) => {
                     error!(?err, prefix);
+                    reason = "error";
                     break;
                 }
             }
         }
+
+        PREFIX_DRAIN_STOPS.add(1, &[KeyValue::new("reason", reason)]);
 
         // Report the live segment count so runaway `S` is observable even if the
         // drain can't keep up.
@@ -8432,7 +8629,119 @@ impl DynoStore {
         })
         .await;
 
-        Ok(outcomes)
+        // Then keep going while a claimed prefix is still over the trigger
+        // (#399), instead of returning and idling out the rest of the interval.
+        let (deleted, compacted) = outcomes;
+        let swept = self
+            .sweep_backlogged_prefixes(&compactable, PREFIX_MAINTENANCE_CONCURRENCY)
+            .await;
+
+        Ok((deleted, compacted + swept))
+    }
+
+    /// Drain the claimed prefixes that are *still* over the compaction trigger,
+    /// repeatedly, until the backlog stops shrinking (#399).
+    ///
+    /// #140's acceptance was that the busiest prefixes converge toward
+    /// `prefix_compact_min_segments` under sustained produce. Its four remedies
+    /// shipped and they did not: production sits at 17 500 live segments against
+    /// a 256 trigger, 30–68× over, having grown ~700 segments/hour through the
+    /// remedies. #140 concluded the limit was one maintainer's merge throughput
+    /// and added concurrency *within* a maintainer. But the four maintainers run
+    /// at **12 millicores between them** with S3 GETs at 24 ms, and compaction
+    /// fires in a burst of 1–2 minutes per 10-minute window and then nothing:
+    /// a 10–20 % duty cycle. They are not throughput-bound, they are unscheduled.
+    ///
+    /// So the interval stops deciding how much work a tick does. The tick keeps
+    /// sweeping while there is a backlog it owns, and stops when a sweep merges
+    /// nothing — which means the prefix is waiting on produce, not on scheduling.
+    /// The outer bound stays where it was: the broker's bounded maintenance run
+    /// (#131) cancels a tick that overruns, and its in-flight guard stops a slow
+    /// tick from being joined by the next one.
+    ///
+    /// The claim is deliberately **not** re-taken between sweeps. It is already
+    /// held for these prefixes, re-reading every lease per sweep would be
+    /// O(prefixes) requests for nothing, and `maintenance_recency` (110 s in
+    /// production, against a 600 s interval) would skip this replica's own claim
+    /// back at it.
+    ///
+    /// Retention and the per-key pass are deliberately not repeated either. Both
+    /// are once-per-tick work — retention is age-gated and the per-key pass GETs
+    /// every segment of its prefix, so sweeping them would multiply the read cost
+    /// of a clean prefix by the sweep count for no removal at all.
+    async fn sweep_backlogged_prefixes(
+        &self,
+        compactable: &BTreeSet<String>,
+        concurrency: usize,
+    ) -> u64 {
+        /// Bounds the sweeps so one tick cannot become unbounded even if the
+        /// broker's run timeout were disabled. Each sweep that does nothing ends
+        /// the loop anyway, so this is a backstop, not a budget.
+        const MAX_SWEEPS: usize = 64;
+
+        let mut compacted = 0;
+
+        for _ in 0..MAX_SWEEPS {
+            let backlogged = self.backlogged_prefixes(compactable);
+            if backlogged.is_empty() {
+                break;
+            }
+
+            let merged = futures::stream::iter(
+                backlogged
+                    .into_iter()
+                    .map(|prefix| async move { self.drain_compact_prefix(&prefix).await }),
+            )
+            .buffer_unordered(concurrency)
+            .fold(0u64, |merged, n| async move { merged + n })
+            .await;
+
+            MAINTENANCE_SWEEPS.add(1, &[]);
+            compacted += merged;
+
+            // A sweep that merged nothing is a prefix waiting for produce, not
+            // for a tick. Sweeping again would re-list every backlogged prefix
+            // for the same answer.
+            if merged == 0 {
+                break;
+            }
+        }
+
+        compacted
+    }
+
+    /// The claimed prefixes whose cached live-segment count is still over the
+    /// compaction trigger, largest first (#399).
+    ///
+    /// Read from the in-memory index this process already holds — no request —
+    /// and gated on the same `min_segments` + `keep_hot` arithmetic
+    /// `compact_prefix_segments` selects a run under, so a prefix that cannot
+    /// yield a run is never swept for one.
+    fn backlogged_prefixes(&self, compactable: &BTreeSet<String>) -> Vec<String> {
+        let Ok(index) = self.prefix_index.lock() else {
+            return Vec::new();
+        };
+
+        let mut backlogged: Vec<(usize, String)> = compactable
+            .iter()
+            .filter_map(|prefix| {
+                index
+                    .get(prefix)
+                    .map(|entry| entry.segments.len())
+                    .filter(|live| {
+                        *live > self.prefix_compact_min_segments
+                            && live.saturating_sub(self.prefix_compact_keep_hot) >= 2
+                    })
+                    .map(|live| (live, prefix.clone()))
+            })
+            .collect();
+
+        // Largest known backlog first, as the tick's first pass orders itself
+        // (#140): a timeout that cuts a sweep should cut the prefixes that needed
+        // it least.
+        backlogged.sort_by_key(|(live, _)| Reverse(*live));
+
+        backlogged.into_iter().map(|(_, prefix)| prefix).collect()
     }
 
     /// Whole-segment retention across all coalesced prefixes (#61). Groups the

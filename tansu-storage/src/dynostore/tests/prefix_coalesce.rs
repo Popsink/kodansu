@@ -48,8 +48,8 @@ use tansu_sans_io::{
 use crate::{
     Error, Result, Storage, TopicId, Topition, TxnAddPartitionsRequest,
     dynostore::{
-        CoalesceTuning, DynoStore, Era, PrefixLease, SegmentFooter, ServedEnd, SubstreamEntry,
-        TxnProduceOffset,
+        CoalesceTuning, CompactRun, DynoStore, Era, PrefixLease, SegmentFooter, ServedEnd,
+        SubstreamEntry, TxnProduceOffset,
     },
     storage_error_code,
 };
@@ -1539,7 +1539,10 @@ async fn compaction_drops_zombie_overlap_input() -> Result<(), Error> {
     assert_eq!(3, before);
 
     // Compaction removes both run segments and merges only the fenced view.
-    assert_eq!(2, store.compact_prefix_segments(PREFIX).await?);
+    assert_eq!(
+        CompactRun::Merged(2),
+        store.compact_prefix_segments(PREFIX).await?
+    );
 
     // Still 3 records — the zombie was not fused into the merged segment.
     let after: i64 = fetch_from(&store, &a, 0)
@@ -1571,7 +1574,10 @@ async fn stale_index_entry_reads_via_merged() -> Result<(), Error> {
     // Two segments [0,2) then [2,4); compact into one merged, originals deleted.
     _ = store.produce(None, &a, batch(2)?).await?;
     _ = store.produce(None, &a, batch(2)?).await?;
-    assert_eq!(2, store.compact_prefix_segments(PREFIX).await?);
+    assert_eq!(
+        CompactRun::Merged(2),
+        store.compact_prefix_segments(PREFIX).await?
+    );
 
     // Re-inject a now-deleted original (seq 0) as a stale index entry.
     store.index_insert(
@@ -1664,7 +1670,7 @@ async fn compaction_merges_segments_and_reads_are_unchanged() -> Result<(), Erro
 
     // Compact: the four merge into one.
     let merged = store.compact_prefix_segments(PREFIX).await?;
-    assert_eq!(4, merged);
+    assert_eq!(CompactRun::Merged(4), merged);
     assert_eq!(1, segments(&bucket).await.len());
 
     // Reads are identical after the merge.
@@ -1698,7 +1704,10 @@ async fn compaction_below_threshold_is_a_noop() -> Result<(), Error> {
     }
     assert_eq!(3, segments(&bucket).await.len());
 
-    assert_eq!(0, store.compact_prefix_segments(PREFIX).await?);
+    assert_eq!(
+        CompactRun::Drained,
+        store.compact_prefix_segments(PREFIX).await?
+    );
     assert_eq!(
         3,
         segments(&bucket).await.len(),
