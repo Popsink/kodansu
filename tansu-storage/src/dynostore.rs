@@ -271,6 +271,29 @@ pub struct DynoStore {
     /// would serve)? See [`SegmentReadTrace`].
     segment_reads: Arc<Mutex<BTreeMap<(String, u64), SegmentReadTrace>>>,
 
+    /// Segments a compaction pass has proved undecodable, per prefix (#398).
+    ///
+    /// A region that arrives whole and holds no frame is damage no code path in
+    /// this process can undo: `CorruptSegment` is deliberately fatal to the
+    /// compaction run (#388), so without this the run selection picks the same
+    /// object every tick — it selects the *oldest* mergeable segments, and a
+    /// damaged one is old — and the prefix's drain dies on byte 0 of it forever.
+    /// Observed in production for 17 hours at ~2 errors/hour, which is #274's
+    /// "one error aborts the prefix's pass" one error variant later.
+    ///
+    /// In memory and per process on purpose: it is a *skip list*, not a verdict
+    /// about the object. A restart re-reads the segment once and re-quarantines
+    /// it if it is still bad, which is exactly the behaviour wanted the day a
+    /// repair path lands — nothing durable has to be un-said.
+    ///
+    /// A quarantined sequence bounds a merge run rather than being filtered out
+    /// of it: the merged segment carries the base offset of its first region and
+    /// concatenates the rest, so merging *across* a hole would shift every
+    /// following record's offset down into it. Bounded by
+    /// [`Self::PREFIX_QUARANTINE_CAP`] per prefix, and pruned against the index
+    /// as segments retire.
+    quarantined_segments: Arc<Mutex<BTreeMap<String, BTreeSet<u64>>>>,
+
     /// Per-prefix compaction leases this process holds (#66) — the maintenance
     /// side of the single-writer fence. The produce lease is gone with #177;
     /// this is the only remaining lease.
@@ -545,6 +568,94 @@ static PREFIX_TAIL_PROBES: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .with_description("prefix-index refreshes served by a tail probe, not a listing")
         .build()
 });
+
+/// Per-sub-stream offset coverage of a candidate merge run (#398) — the
+/// guard that stops a merge from closing a hole.
+///
+/// The read path re-derives every record's offset by running from the
+/// merged footer entry's `base_offset`
+/// ([`DynoStore::fetch_prefix_coalesced`]), so a merged region must cover one
+/// unbroken offset interval per sub-stream. Normally it does: the segments
+/// of a prefix tile the offset axis with no gaps, so any run of them is
+/// contiguous whatever order it was selected in. Quarantining a segment
+/// (see [`DynoStore::quarantined_segments`]) punches a hole in that tiling, and
+/// merging *across* the hole would slide every record above it down into
+/// the gap — silent offset corruption, which is far worse than the stalled
+/// drain being fixed.
+///
+/// Contiguity is checked with running totals rather than by sorting: a set
+/// of non-overlapping spans is one interval exactly when the records it
+/// holds equal the offsets it spans.
+/// A sub-stream inside a merge run.
+type SubstreamKey = (String, i32);
+
+/// One sub-stream's offset coverage within a candidate run: the lowest base
+/// offset seen, the highest end, and the records held between them. The spans
+/// are one unbroken interval exactly when the records equal the offsets spanned.
+#[derive(Copy, Clone, Debug)]
+struct OffsetSpan {
+    base: i64,
+    end: i64,
+    records: i64,
+}
+
+impl OffsetSpan {
+    fn is_contiguous(&self) -> bool {
+        self.records == self.end - self.base
+    }
+}
+
+#[derive(Debug, Default)]
+struct RunCoverage {
+    spans: BTreeMap<SubstreamKey, OffsetSpan>,
+}
+
+impl RunCoverage {
+    /// Fold `entries` in, or leave the coverage untouched and answer `false` if
+    /// any sub-stream would stop being one unbroken interval.
+    ///
+    /// Overlapping spans are refused by the same arithmetic (records exceed the
+    /// offsets spanned). Inside a run that cannot normally happen — the merge
+    /// reads the epoch-fenced view, which resolves overlaps — but these entries
+    /// come from the raw footers, so on a prefix holding a zombie region this
+    /// ends the run early rather than merging it. Refusing is the safe
+    /// direction, and it only applies to a prefix that already has a quarantined
+    /// segment.
+    fn extend(&mut self, entries: &[SubstreamEntry]) -> bool {
+        let mut folded: Vec<(SubstreamKey, OffsetSpan)> = Vec::with_capacity(entries.len());
+
+        for entry in entries {
+            let key = (entry.topic.clone(), entry.partition);
+            let end = entry.base_offset + entry.record_count;
+
+            let span = match self.spans.get(&key) {
+                Some(held) => OffsetSpan {
+                    base: held.base.min(entry.base_offset),
+                    end: held.end.max(end),
+                    records: held.records + entry.record_count,
+                },
+
+                None => OffsetSpan {
+                    base: entry.base_offset,
+                    end,
+                    records: entry.record_count,
+                },
+            };
+
+            if !span.is_contiguous() {
+                return false;
+            }
+
+            folded.push((key, span));
+        }
+
+        for (key, span) in folded {
+            _ = self.spans.insert(key, span);
+        }
+
+        true
+    }
+}
 
 /// What one pod has recently read out of a single segment object (#117):
 /// the distinct `(byte_start, byte_len)` ranges it fetched record bytes over, and
@@ -883,6 +994,31 @@ static SEGMENTS_LIVE: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("tansu_prefix_segments_live")
         .with_description("live segments for a prefix after maintenance, by prefix")
+        .build()
+});
+
+/// Segments quarantined by compaction because they hold a region no reader can
+/// decode (#398) — first sight only, so this counts *distinct* bad objects
+/// discovered, not re-reads of them.
+///
+/// The pairing with [`SEGMENTS_QUARANTINED`] is the point: a counter that moves
+/// once and then stops, against a gauge that stays non-zero, is the steady state
+/// this replaces — a permanent `ERROR` stream on a condition nothing in the
+/// process will ever change. A counter that keeps moving means damage is still
+/// being *created*, which is a different (and much worse) fact.
+static SEGMENT_QUARANTINES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_segment_quarantines")
+        .with_description("segments excluded from compaction as undecodable")
+        .build()
+});
+
+/// Segments currently quarantined for a prefix (#398), by `prefix` — as
+/// [`SEGMENTS_LIVE`] is labelled, and for the same reason.
+static SEGMENTS_QUARANTINED: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("tansu_prefix_segments_quarantined")
+        .with_description("segments excluded from compaction as undecodable, by prefix")
         .build()
 });
 
@@ -2008,6 +2144,7 @@ impl DynoStore {
             prefix_flush_locks: Arc::new(Mutex::new(BTreeMap::new())),
             prefix_index: Arc::new(Mutex::new(BTreeMap::new())),
             segment_reads: Arc::new(Mutex::new(BTreeMap::new())),
+            quarantined_segments: Arc::new(Mutex::new(BTreeMap::new())),
             compaction_leases: Arc::new(Mutex::new(BTreeMap::new())),
             era_epochs: Arc::new(Mutex::new(BTreeMap::new())),
             compacted_topics: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2359,6 +2496,15 @@ impl DynoStore {
     /// topics hold hundreds of keys); a partition exceeding it skips removal
     /// for the tick instead of ballooning maintainer memory.
     const PREFIX_COMPACT_SEEN_KEYS: usize = 1_000_000;
+
+    /// Cap on [`Self::quarantined_segments`] per prefix (#398).
+    ///
+    /// The set is one `u64` per known-bad object and production holds ~900 of
+    /// them across the fleet, so this is far above the incidence it exists for.
+    /// Past the cap a further bad segment is logged and *not* recorded, which
+    /// restores the pre-#398 behaviour for it — the drain ends on that run — in
+    /// preference to letting a pathological prefix grow the set without bound.
+    const PREFIX_QUARANTINE_CAP: usize = 4_096;
 
     /// All topics, served from the in-memory [`TopicIndex`]. Returns the shared
     /// snapshot if fresh; otherwise refreshes it (single-flight) by LISTing the
@@ -7136,6 +7282,106 @@ impl DynoStore {
         Ok(deleted)
     }
 
+    /// The segments of `prefix` this process has proved undecodable (#398).
+    ///
+    /// Snapshotted rather than read under the lock by the caller: run selection
+    /// walks the prefix's whole segment list, and holding a process-wide lock
+    /// across that walk would serialise every prefix being maintained
+    /// concurrently. The set is small by construction
+    /// ([`Self::PREFIX_QUARANTINE_CAP`]).
+    fn quarantined_segments_of(&self, prefix: &str) -> Result<BTreeSet<u64>> {
+        Ok(self
+            .quarantined_segments
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .get(prefix)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Exclude `region`'s segment from this prefix's future compaction runs
+    /// (#398). `true` when it was not already excluded — the first sight, and
+    /// the only one that logs.
+    ///
+    /// `false` therefore means "quarantining this changes nothing", which is the
+    /// signal the caller needs: the run that just failed was already selected
+    /// with this segment excluded, so the failure is somewhere the skip list
+    /// cannot reach and retrying the drain would spin.
+    fn quarantine_segment(&self, region: &CorruptRegion) -> Result<bool> {
+        let held = {
+            let mut quarantined = self
+                .quarantined_segments
+                .lock()
+                .map_err(Into::<Error>::into)?;
+            let seqs = quarantined.entry(region.prefix.clone()).or_default();
+
+            if !seqs.contains(&region.seq) && seqs.len() >= Self::PREFIX_QUARANTINE_CAP {
+                warn!(
+                    prefix = region.prefix,
+                    seq = region.seq,
+                    cap = Self::PREFIX_QUARANTINE_CAP,
+                    "quarantine cap reached; this prefix's drain still ends on this segment"
+                );
+
+                return Ok(false);
+            }
+
+            if !seqs.insert(region.seq) {
+                return Ok(false);
+            }
+
+            seqs.len() as u64
+        };
+
+        SEGMENT_QUARANTINES.add(1, &[]);
+        SEGMENTS_QUARANTINED.record(held, &[KeyValue::new("prefix", region.prefix.clone())]);
+
+        // Once, at `warn` — the whole region detail, so the object is
+        // identifiable — where this used to be an `ERROR` on every maintenance
+        // tick for as long as the object existed (#398). The steady state is
+        // `SEGMENTS_QUARANTINED`, not a log stream.
+        warn!(
+            ?region,
+            "excluding an undecodable segment from this prefix's compaction"
+        );
+
+        Ok(true)
+    }
+
+    /// Drop quarantine entries naming segments `prefix` no longer holds (#398)
+    /// and report what survives.
+    ///
+    /// The skip list must not outlive the objects in it: retention and the
+    /// per-key rewrite retire segments the size merge never selects, and a
+    /// sequence is never reused (#77), so an entry whose object is gone is dead
+    /// weight — and a gauge that never falls would read as damage that was never
+    /// cleared.
+    fn prune_quarantine(&self, prefix: &str, live: &BTreeSet<u64>) -> Result<()> {
+        let held = {
+            let mut quarantined = self
+                .quarantined_segments
+                .lock()
+                .map_err(Into::<Error>::into)?;
+
+            let Some(seqs) = quarantined.get_mut(prefix) else {
+                return Ok(());
+            };
+
+            seqs.retain(|seq| live.contains(seq));
+            let held = seqs.len() as u64;
+
+            if held == 0 {
+                _ = quarantined.remove(prefix);
+            }
+
+            held
+        };
+
+        SEGMENTS_QUARANTINED.record(held, &[KeyValue::new("prefix", prefix.to_string())]);
+
+        Ok(())
+    }
+
     /// Compact a prefix's oldest segments into fewer, larger ones (#66) to bound
     /// the live segment count `S` (otherwise ≈ flush_rate × retention, unbounded)
     /// — keeping the footer index footprint and the per-fetch scan bounded.
@@ -7187,6 +7433,31 @@ impl DynoStore {
         };
         segs.sort_by_key(|(seq, ..)| *seq);
 
+        // Segments a previous run proved undecodable (#398). Read before the
+        // walk below so the lock is not held across it.
+        let quarantined = self.quarantined_segments_of(prefix)?;
+
+        // The offset spans a run would cover, needed only once this prefix has a
+        // hole in its tiling — see [`RunCoverage`]. Skipped entirely otherwise:
+        // a prefix with no quarantined segment is contiguous by construction, and
+        // this clones a `Vec<SubstreamEntry>` per segment on a path that walks
+        // tens of thousands of them per drain.
+        let spans: BTreeMap<u64, Vec<SubstreamEntry>> = if quarantined.is_empty() {
+            BTreeMap::new()
+        } else {
+            let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            index
+                .get(prefix)
+                .map(|entry| {
+                    entry
+                        .segments
+                        .iter()
+                        .map(|(seq, cached)| (*seq, cached.footer.entries.clone()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
         // Only above the trigger, and never touch the hot (newest) tail.
         if segs.len() <= self.prefix_compact_min_segments {
             return Ok(0);
@@ -7216,17 +7487,33 @@ impl DynoStore {
 
             while start < eligible_end {
                 // A leading (or intervening) already-target-sized segment is a
-                // boundary: leave it alone and seed the run after it.
-                if segs[start].3 >= self.prefix_compact_target_bytes {
+                // boundary: leave it alone and seed the run after it. So is a
+                // quarantined one (#398) — and it has to be a *boundary* rather
+                // than a filtered-out element, because the merged segment carries
+                // the base offset of its first region and concatenates the rest:
+                // merging across the hole would shift every following record's
+                // offset down into it, which is corruption where today there is
+                // only a stalled drain.
+                if segs[start].3 >= self.prefix_compact_target_bytes
+                    || quarantined.contains(&segs[start].0)
+                {
                     start += 1;
                     continue;
                 }
 
                 let mut bytes = 0usize;
                 let mut end = start;
+                let mut coverage = RunCoverage::default();
                 while end < eligible_end
                     && segs[end].3 < self.prefix_compact_target_bytes
+                    && !quarantined.contains(&segs[end].0)
                     && (end == start || bytes + segs[end].3 <= self.prefix_compact_target_bytes)
+                    // A hole in the prefix's offset tiling ends the run here
+                    // (#398). Only ever consulted when something is quarantined,
+                    // where `spans` is populated; empty means "no hole to cross".
+                    && spans
+                        .get(&segs[end].0)
+                        .is_none_or(|entries| coverage.extend(entries))
                 {
                     bytes += segs[end].3;
                     end += 1;
@@ -7406,6 +7693,14 @@ impl DynoStore {
     async fn compact_prefix_per_key(&self, prefix: &str) -> Result<u64> {
         self.refresh_prefix_index(prefix).await?;
 
+        // Segments a compaction pass has proved undecodable (#398). Excluded
+        // outright here rather than treated as a run boundary: this pass rewrites
+        // each segment in place under its own `base_offset`, so dropping one from
+        // the walk shifts nothing — where the size merge would fuse across the
+        // hole. Without the exclusion one bad object costs the prefix its per-key
+        // pass on every tick, the same permanent stall the size merge had.
+        let quarantined = self.quarantined_segments_of(prefix)?;
+
         // Snapshot `(writer_epoch, last_modified_ms)` per segment and the
         // sub-stream key set from the cached footers — no object requests.
         let mut segments_meta: BTreeMap<u64, (i64, i64)> = BTreeMap::new();
@@ -7414,6 +7709,10 @@ impl DynoStore {
             let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
             if let Some(entry) = index.get(prefix) {
                 for (seq, cached) in &entry.segments {
+                    if quarantined.contains(seq) {
+                        continue;
+                    }
+
                     _ = segments_meta
                         .insert(*seq, (cached.footer.writer_epoch, cached.last_modified_ms));
                     for e in &cached.footer.entries {
@@ -7816,6 +8115,19 @@ impl DynoStore {
     /// converges to the trigger threshold within the tick. Errors are logged and
     /// end this prefix's drain only — one bad prefix must never abort the others'
     /// maintenance (#140).
+    ///
+    /// An **undecodable segment is the exception** (#398). `Ok(0)` and `Err(_)`
+    /// used to share one `break`, which conflated "there is nothing left to
+    /// merge" with "this run died", and run selection picks the *oldest*
+    /// mergeable segments — so a damaged old object was re-read and re-failed on
+    /// every tick that reached it, for as long as it existed, having merged
+    /// nothing for the prefix. `CorruptSegment` names the segment, so the run can
+    /// skip it and the drain can carry on over what is readable: #274's fix for
+    /// `NotFound`, one error variant later.
+    ///
+    /// Every other error still ends the drain. They are not attributable to one
+    /// object, so there is nothing to exclude and nothing to make the next run
+    /// different — retrying would be a hot loop against the object store.
     async fn drain_compact_prefix(&self, prefix: &str) -> u64 {
         /// Bounds the drain loop so a pathological prefix can't monopolize a
         /// maintenance tick; far above the runs a real backlog needs.
@@ -7824,13 +8136,30 @@ impl DynoStore {
         let mut compacted = 0;
 
         for _ in 0..MAX_RUNS_PER_PREFIX {
-            match self
-                .compact_prefix_segments(prefix)
-                .await
-                .inspect_err(|err| error!(?err, prefix))
-            {
-                Ok(0) | Err(_) => break,
+            match self.compact_prefix_segments(prefix).await {
+                Ok(0) => break,
                 Ok(n) => compacted += n,
+
+                // Damage attributable to one object: exclude it and keep
+                // draining. `quarantine_segment` returning `false` means the run
+                // was *already* selected without it, so the failure is not the
+                // one this skip list can route around — end the drain as any
+                // other error would.
+                Err(Error::CorruptSegment(region)) => {
+                    if !self
+                        .quarantine_segment(&region)
+                        .inspect_err(|err| error!(?err, prefix))
+                        .unwrap_or_default()
+                    {
+                        error!(?region, prefix, "compaction damage the quarantine misses");
+                        break;
+                    }
+                }
+
+                Err(err) => {
+                    error!(?err, prefix);
+                    break;
+                }
             }
         }
 
@@ -7841,16 +8170,73 @@ impl DynoStore {
         // attributes, last write won, so the gauge showed whichever prefix
         // happened to be drained last — never the one running away, which is the
         // only reason to look at it. Cardinality is tens of prefixes.
-        if let Ok(index) = self.prefix_index.lock()
-            && let Some(entry) = index.get(prefix)
-        {
-            SEGMENTS_LIVE.record(
-                entry.segments.len() as u64,
-                &[KeyValue::new("prefix", prefix.to_string())],
-            );
+        let live: Option<BTreeSet<u64>> = self.prefix_index.lock().ok().and_then(|index| {
+            index.get(prefix).map(|entry| {
+                SEGMENTS_LIVE.record(
+                    entry.segments.len() as u64,
+                    &[KeyValue::new("prefix", prefix.to_string())],
+                );
+
+                entry.segments.keys().copied().collect()
+            })
+        });
+
+        // Retire quarantine entries whose objects are gone (#398), under no other
+        // lock — the index one above is released by here. Only against an index
+        // this process actually holds for the prefix: an absent entry is "not
+        // known", not "no segments", and pruning against it would silently empty
+        // the skip list on a store with compaction disabled.
+        if let Some(live) = live {
+            _ = self
+                .prune_quarantine(prefix, &live)
+                .inspect_err(|err| error!(?err, prefix));
         }
 
         compacted
+    }
+
+    /// Run the per-key pass over `prefix`, excluding any segment it proves
+    /// undecodable and retrying over the rest (#398).
+    ///
+    /// The pass reads *every* segment of the prefix, so one damaged object cost
+    /// the whole prefix its key cleanup on every tick — the same permanent stall
+    /// the size merge had, on the pass that matters more: a compacted topic with
+    /// no per-key cleanup grows stale versions forever.
+    ///
+    /// Attempts are tightly bounded because each one re-GETs the prefix: a tick
+    /// quarantines at most `MAX_ATTEMPTS - 1` new bad segments and defers the
+    /// rest, which converges over ticks without turning one tick into a scan of
+    /// the same prefix a hundred times over.
+    async fn drain_compact_prefix_per_key(&self, prefix: &str) {
+        const MAX_ATTEMPTS: usize = 8;
+
+        for _ in 0..MAX_ATTEMPTS {
+            match self.compact_prefix_per_key(prefix).await {
+                Ok(_) => return,
+
+                Err(Error::CorruptSegment(region)) => {
+                    if !self
+                        .quarantine_segment(&region)
+                        .inspect_err(|err| error!(?err, prefix))
+                        .unwrap_or_default()
+                    {
+                        error!(?region, prefix, "per-key damage the quarantine misses");
+                        return;
+                    }
+                }
+
+                Err(err) => {
+                    error!(?err, prefix);
+                    return;
+                }
+            }
+        }
+
+        warn!(
+            prefix,
+            attempts = MAX_ATTEMPTS,
+            "per-key compaction still finding undecodable segments; the rest wait for the next tick"
+        );
     }
 
     /// Per-prefix segment maintenance — retention **then** compaction for each
@@ -7948,10 +8334,7 @@ impl DynoStore {
                 // per-prefix error is logged and skips this prefix only, as
                 // for the drain (#140).
                 if per_key.contains(&prefix) {
-                    _ = self
-                        .compact_prefix_per_key(&prefix)
-                        .await
-                        .inspect_err(|err| error!(?err, prefix));
+                    self.drain_compact_prefix_per_key(&prefix).await;
                 }
 
                 let compacted = if compactable.contains(&prefix) {

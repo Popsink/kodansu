@@ -37,6 +37,7 @@ mod metadata_visibility;
 mod offset_assignment;
 mod offset_commit;
 mod prefix_coalesce;
+mod quarantine_segment;
 mod reachable_panics;
 mod scaling;
 mod scram_credentials;
