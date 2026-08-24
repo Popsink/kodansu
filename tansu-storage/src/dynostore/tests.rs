@@ -31,6 +31,7 @@ mod group_describe;
 mod group_documents;
 mod group_expiry;
 mod idempotent;
+mod index_reconcile;
 mod latency;
 mod maintenance_scheduling;
 mod meta_growth;

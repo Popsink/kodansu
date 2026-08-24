@@ -485,6 +485,16 @@ struct PrefixIndex {
     /// When the live segment set was last reconciled by a listing; gates the
     /// TTL so a hot prefix lists at most once per [`DynoStore::HIGH_WATERMARK_HINT_TTL`].
     refreshed_at: Option<SystemTime>,
+
+    /// When a listing last reconciled this index *downwards* — dropped entries
+    /// whose objects are gone (#408).
+    ///
+    /// Distinct from `refreshed_at`, which the add-only refresh and the tail
+    /// probe both stamp: neither of those can remove an entry, so a replica's
+    /// index grows monotonically with every segment a *peer* retires and only
+    /// ever shrinks when this replica reads a 404 for one, an entry at a time.
+    /// This is the clock that bounds how often the downward pass is paid for.
+    reconciled_at: Option<SystemTime>,
     /// Monotonic token bumped whenever this process's view of the segment set
     /// may have *lost* a segment's tail knowledge: a committed real listing
     /// (which can reflect another replica's deletions) or a prune. The
@@ -1225,6 +1235,25 @@ static FLUSH_CAS_EXHAUSTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_prefix_flush_cas_exhausted")
         .with_description("leaseless flushes that exhausted their segment create-CAS budget")
+        .build()
+});
+
+/// Index entries dropped by a reconciling listing because their objects are gone
+/// (#408), by `prefix`.
+///
+/// The incremental refresh is add-only below the tail, so a replica's index
+/// accrues an entry for every segment a *peer* retires and sheds them one 404 at
+/// a time: 39 `segment` 404s/s on the brokers, each one a billed GET and a
+/// restarted fetch, against 4.94 M indexed segments across ten of them. This
+/// counts what a listing removes that no 404 had reached yet.
+///
+/// Expected to move in bursts on the busiest prefixes and to fall as compaction
+/// converges (#399). A prefix whose count keeps climbing is one whose segments
+/// are being retired faster than this replica reads them.
+static PREFIX_INDEX_RECONCILED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_index_reconciled")
+        .with_description("index entries dropped by a reconciling listing, by prefix")
         .build()
 });
 
@@ -2667,6 +2696,20 @@ impl DynoStore {
     /// preference to letting a pathological prefix grow the set without bound.
     const PREFIX_QUARANTINE_CAP: usize = 4_096;
 
+    /// How often one prefix's index may be reconciled downwards by a listing
+    /// (#408).
+    ///
+    /// The pass is triggered by a 404 — proof that this replica's index names an
+    /// object that is gone — so the rate is bounded by how many *distinct*
+    /// prefixes are proved stale, not by the 404 rate. Without a gate a fetch
+    /// storm against one stale prefix would buy a tier-1 listing per fetch.
+    ///
+    /// Five minutes is chosen against the maintenance interval rather than the
+    /// index TTL (5s, far too short to amortise a listing): compaction retires
+    /// segments in bursts one tick apart, so re-listing much faster than that
+    /// pays for a staleness that has not accrued yet.
+    const PREFIX_INDEX_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
+
     /// All topics, served from the in-memory [`TopicIndex`]. Returns the shared
     /// snapshot if fresh; otherwise refreshes it (single-flight) by LISTing the
     /// `topic-metadata/` prefix and GETting only the objects whose etag changed.
@@ -3949,6 +3992,24 @@ impl DynoStore {
         self.object_store.list_with_delimiter(Some(prefix)).await
     }
 
+    /// The segment sequence a listed object's name encodes, or `None` for a name
+    /// that is not one.
+    ///
+    /// Shared by the incremental refresh and the reconciling pass (#408) so the
+    /// two cannot disagree about which listed objects are segments — a
+    /// reconciler that parsed one name differently from the refresher would drop
+    /// live entries.
+    fn segment_seq_of(location: &Path) -> Option<u64> {
+        let name = location.parts().next_back()?;
+        let name = name.as_ref();
+
+        if name.len() < 20 {
+            return None;
+        }
+
+        u64::from_str(&name[0..20]).ok()
+    }
+
     /// The `segments/` listing prefix for a connector prefix (#57).
     fn segment_prefix(&self, prefix: &str) -> Path {
         Path::from(format!(
@@ -4703,6 +4764,111 @@ impl DynoStore {
         self.refresh_prefix_index_inner(prefix, false).await
     }
 
+    /// Reconcile `prefix`'s cached index *downwards* against a listing, dropping
+    /// entries whose objects are gone (#408). Answers how many it dropped.
+    ///
+    /// Nothing else can do this. `refresh_prefix_index_inner` lists
+    /// `start_after` the highest known sequence and the tail probe only ever
+    /// folds forward, so an entry for a segment a *peer* retired survives until
+    /// this replica happens to read a 404 for it — and the read path prunes one
+    /// per fetch, then restarts, bounded by `MAX_ATTEMPTS`. On the fleet that is
+    /// 39 `segment` 404s/s on the brokers, each a billed GET and a restarted
+    /// fetch, against 4.94 M indexed segments across ten of them.
+    ///
+    /// **Called from evidence, not from a timer.** A 404 is proof this prefix's
+    /// index is stale, and only then is a listing worth its tier-1 price; a
+    /// timer would pay it for every prefix whether or not anything had been
+    /// retired. Then rate-limited per prefix
+    /// ([`Self::PREFIX_INDEX_RECONCILE_INTERVAL`]), because one fetch storm
+    /// against a stale prefix would otherwise buy one listing per fetch.
+    ///
+    /// **Only entries below the listing's own maximum are dropped.** A segment
+    /// created while the listing was being walked may not appear in it, and
+    /// pruning that would take records out of this replica's view of the tail —
+    /// where the add-only refresh would never put them back. Below the maximum
+    /// the listing is authoritative: sequences are never reused (#77), so an
+    /// absent name is a retired one.
+    ///
+    /// The generation is bumped exactly as [`Self::index_prune`] does: dropping
+    /// entries removes tail knowledge, so the certified seq floor must be
+    /// re-read before the LATEST fast path may trust the index again.
+    async fn reconcile_prefix_index(&self, prefix: &str) -> Result<u64> {
+        // Due, and worth listing at all: an index this process holds nothing for
+        // has nothing to drop.
+        {
+            let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            let Some(entry) = index.get(prefix) else {
+                return Ok(0);
+            };
+
+            if entry.segments.is_empty() {
+                return Ok(0);
+            }
+
+            if entry.reconciled_at.is_some_and(|at| {
+                SystemTime::now()
+                    .duration_since(at)
+                    .is_ok_and(|elapsed| elapsed < Self::PREFIX_INDEX_RECONCILE_INTERVAL)
+            }) {
+                return Ok(0);
+            }
+        }
+
+        let listing = self.segment_prefix(prefix);
+        let mut stream = self.scan(Scan::SegmentIndex, &listing);
+        let mut live: BTreeSet<u64> = BTreeSet::new();
+
+        while let Some(meta) = stream
+            .next()
+            .await
+            .transpose()
+            .inspect_err(|err| debug!(?err, prefix, "reconciling the prefix index"))?
+        {
+            if let Some(seq) = Self::segment_seq_of(&meta.location) {
+                _ = live.insert(seq);
+            }
+        }
+
+        let Some(listed_max) = live.iter().next_back().copied() else {
+            // An empty listing is not evidence: it is also what a prefix whose
+            // objects are all above a raced page boundary looks like. Stamp the
+            // clock so a fetch storm does not re-list, and drop nothing.
+            let mut index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            if let Some(entry) = index.get_mut(prefix) {
+                entry.reconciled_at = Some(SystemTime::now());
+            }
+
+            return Ok(0);
+        };
+
+        let dropped = {
+            let mut index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            let Some(entry) = index.get_mut(prefix) else {
+                return Ok(0);
+            };
+
+            let before = entry.segments.len();
+            entry
+                .segments
+                .retain(|seq, _| *seq >= listed_max || live.contains(seq));
+            let dropped = before.saturating_sub(entry.segments.len()) as u64;
+
+            if dropped > 0 {
+                entry.generation += 1;
+            }
+            entry.reconciled_at = Some(SystemTime::now());
+
+            dropped
+        };
+
+        if dropped > 0 {
+            PREFIX_INDEX_RECONCILED.add(dropped, &[KeyValue::new("prefix", prefix.to_string())]);
+            debug!(prefix, dropped, listed_max, "reconciled the prefix index");
+        }
+
+        Ok(dropped)
+    }
+
     /// Refresh the prefix index unconditionally, bypassing the TTL freshness
     /// gate (#86). The leaseless write path (`fold-before-claim`) must observe
     /// every live segment — including a peer replica's seconds-old write — before
@@ -4980,14 +5146,7 @@ impl DynoStore {
             .transpose()
             .inspect_err(|err| error!(?err, prefix))?
         {
-            let Some(name) = meta.location.parts().next_back() else {
-                continue;
-            };
-            let name = name.as_ref();
-            if name.len() < 20 {
-                continue;
-            }
-            let Ok(seq) = u64::from_str(&name[0..20]) else {
+            let Some(seq) = Self::segment_seq_of(&meta.location) else {
                 continue;
             };
             discovered.push((seq, meta.location, meta.last_modified.timestamp_millis()));
@@ -5660,6 +5819,22 @@ impl DynoStore {
                         // nothing here ever said how much of it was stale.
                         SEGMENT_VANISHED_BEFORE_READ.add(1, &[]);
                         self.index_prune(&prefix, &[seq])?;
+
+                        // This 404 is proof the index is stale, and pruning the
+                        // one sequence it named leaves every other stale entry in
+                        // place — to be found by another 404, another billed GET
+                        // and another restarted fetch (#408). A listing settles
+                        // the whole prefix at once, so take it here where there is
+                        // evidence for it, rate-limited per prefix.
+                        //
+                        // Not `?`: a listing that fails must not cost the fetch
+                        // the restart it was already going to make. The next 404
+                        // tries again.
+                        _ = self
+                            .reconcile_prefix_index(&prefix)
+                            .await
+                            .inspect_err(|err| debug!(?err, prefix, seq));
+
                         self.index_invalidate(&prefix)?;
                         restart = true;
                         break;
