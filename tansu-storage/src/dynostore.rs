@@ -13102,6 +13102,13 @@ where
     fn new(object_store: O, cluster: &str) -> Self {
         Self {
             cluster: cluster.into(),
+            // Labelled by `class` as well as `method` (#409). The error counter
+            // below has carried the key class since #203 and this had not, so
+            // "the brokers are slow" — a 350 ms `get_opts` mean against the
+            // maintainers' 24 ms on the same bucket — could not be narrowed to
+            // "slow reading *what*". One label, and it separates a request
+            // waiting on the wire from a plane with a pathological caller:
+            // `list_with_delimiter` averages 4.5 s at 0.3 req/s on that fleet.
             request_duration: METER
                 .u64_histogram("tansu_object_store_request_duration")
                 .with_unit("ms")
@@ -13138,6 +13145,7 @@ where
     fn instrument_listing(
         &self,
         method: &'static str,
+        class: &'static str,
         inner: BoxStream<'static, Result<ObjectMeta, object_store::Error>>,
     ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
         /// Keys per `ListObjectsV2` response, i.e. per metered LIST request.
@@ -13146,6 +13154,7 @@ where
         let attributes = vec![
             KeyValue::new("method", method),
             KeyValue::new("cluster", self.cluster.clone()),
+            KeyValue::new("class", class),
         ];
         let request_duration = self.request_duration.clone();
         let request_error = self.request_error.clone();
@@ -13201,6 +13210,7 @@ where
         let mut attributes = vec![
             KeyValue::new("method", "put_opts"),
             KeyValue::new("cluster", self.cluster.clone()),
+            KeyValue::new("class", key_class(location)),
         ];
 
         self.object_store
@@ -13239,6 +13249,7 @@ where
         let mut attributes = vec![
             KeyValue::new("method", "put_multipart_opts"),
             KeyValue::new("cluster", self.cluster.clone()),
+            KeyValue::new("class", key_class(location)),
         ];
 
         self.object_store
@@ -13274,6 +13285,7 @@ where
         let mut attributes = vec![
             KeyValue::new("method", "get_opts"),
             KeyValue::new("cluster", self.cluster.clone()),
+            KeyValue::new("class", key_class(location)),
         ];
 
         self.object_store
@@ -13346,7 +13358,11 @@ where
     ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
         debug!(?prefix);
 
-        self.instrument_listing("list", self.object_store.list(prefix))
+        self.instrument_listing(
+            "list",
+            prefix.map_or("other", key_class),
+            self.object_store.list(prefix),
+        )
     }
 
     // Forward `list_with_offset` (S3 `start-after`) so a tail-offset scan reads
@@ -13360,6 +13376,7 @@ where
 
         self.instrument_listing(
             "list_with_offset",
+            prefix.map_or("other", key_class),
             self.object_store.list_with_offset(prefix, offset),
         )
     }
@@ -13374,6 +13391,7 @@ where
         let mut attributes = vec![
             KeyValue::new("method", "list_with_delimiter"),
             KeyValue::new("cluster", self.cluster.clone()),
+            KeyValue::new("class", prefix.map_or("other", key_class)),
         ];
 
         if let Some(prefix) = prefix {
@@ -13420,6 +13438,7 @@ where
         let mut attributes = vec![
             KeyValue::new("method", "copy_opts"),
             KeyValue::new("cluster", self.cluster.clone()),
+            KeyValue::new("class", key_class(to)),
         ];
 
         self.object_store
