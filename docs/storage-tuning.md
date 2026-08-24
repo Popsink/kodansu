@@ -152,6 +152,13 @@ your `maintenance_interval` (a maintained prefix must stay skipped for just unde
 one interval, so it is re-maintained exactly once per interval); `0` reverts to
 every-maintainer-works-every-prefix.
 
+Setting it *below* the interval quietly disables the skip: the window lapses
+before the next tick, so no prefix is ever skipped for recency and the claim is
+decided entirely by the lease race. That is not incorrect — the lease is the
+correctness guard — but it costs a lease GET per prefix per maintainer per tick
+for nothing. `tansu_maintenance_prefixes{outcome="recent"}` at zero against a
+non-zero `claimed` is what that looks like.
+
 ### Bounding the segment count (linger vs. compaction)
 
 Segments are written one object per flush window per prefix and are never
@@ -173,10 +180,18 @@ bounded:
   (many topics share one segment), so a wide linger is appropriate here.
 - **Compaction** (`prefix_compact_*`, on by default) — merges old segments into
   fewer, larger ones. It runs on the maintenance loop and each tick **drains a
-  prefix down to `prefix_compact_min_segments`**, so `S` is bounded to roughly
+  prefix toward `prefix_compact_min_segments`**, so `S` is bounded to roughly
   that threshold plus one maintenance interval's worth of new segments — keeping
   the footer-index footprint and per-fetch scan flat. Widen the linger too if
-  the between-tick growth is large. Compaction merges the epoch-fenced view
+  the between-tick growth is large.
+
+  A tick keeps sweeping the prefixes it claimed that are still over the trigger
+  until a sweep merges nothing, rather than stopping after one pass and idling
+  out the interval, so the interval bounds how often work *starts* and not how
+  much a tick does. Watch `tansu_prefix_drain_stops` by `reason`: anything other
+  than `drained` means a prefix's backlog outlived the tick, and
+  `tansu_maintenance_duration` against your interval says whether that is the
+  interval's fault. Compaction merges the epoch-fenced view
   (never fuses a stale/overlapping segment), writes the merged segment
   create-only before deleting the originals (no object mutation — GCS-safe), and
   is coordinated by a **separate compaction lease** (`compaction-lease.json`) so
@@ -203,6 +218,93 @@ retries at the next sequence.
 a coalesced prefix; the format is the published contract (see
 `docs/virtual-topics-format.md`), tracked for the reference reader in
 kotatsu#82.
+
+## The S3 request bill
+
+Everything above is a latency/memory trade with a price attached, and the price
+is worth writing down because the intuition is wrong. **This backend's cost is
+requests, not bytes.** Measured on a production fleet (10 brokers, 4 maintainers,
+eu-west-3) absorbing **0.23 MiB/s** of produce: 441 S3 requests/s, ~$37/day of
+requests, against a storage and transfer bill that rounds to nothing at that
+volume.
+
+eu-west-3 S3 Standard prices `PUT/COPY/POST/LIST` at $0.0054/1 000 and `GET` at
+$0.00043/1 000 — a PUT is **12.6× a GET**. Error responses are billed, so a 404
+probe and a 304 revalidation each cost a request. Deletes are free.
+
+| class | rate | $/day | share |
+|---|---|---|---|
+| `put_opts` (+ errors) | 34 /s | $15.90 | 43 % |
+| `get_opts` (+ 404/304) | 388 /s | $14.42 | 39 % |
+| `list*` | 15 /s | $6.86 | 18 % |
+| `delete_stream` | 4 /s | — | free |
+
+### Where the PUTs actually go
+
+The tempting conclusion from a 43 % PUT share is to reach for `coalesce_linger`.
+On that fleet it would have addressed under a third of it. Split by key class:
+
+| PUT class | rate | share of PUTs | $/day |
+|---|---|---|---|
+| `group` | 22.7 /s | **67 %** | $10.59 |
+| `segment` | 10.5 /s | 31 % | $4.90 |
+| everything else | 1.4 /s | 4 % | $0.65 |
+
+Consumer-group state is the largest single line item on the whole bill — larger
+than segment writes, larger than any read plane — on a fleet serving 32
+`Heartbeat`/s and 2.7 `OffsetCommit`/s. That is ~0.7 group PUTs and ~5.3 group
+GETs *per heartbeat*, and it scales with group and member count rather than with
+data. Check `tansu_objectstore_cache_requests{class="group"}` before tuning the
+write path.
+
+### What `coalesce_linger` is worth
+
+Segments are one PUT per flush window **per prefix**, so the segment PUT rate is
+`active prefixes / linger` and is independent of how little data arrived. At
+`coalesce_linger=1s` that fleet wrote 10.5 segments/s — ~11 continuously-active
+prefixes — for 0.23 MiB/s, an average of 7.4 KiB per object.
+
+The linger divides three things at once, and the indirect savings are the larger
+ones:
+
+| linger | segment PUT/s | segments/day | direct $/day saved | produce latency added |
+|---|---|---|---|---|
+| `1s` (fleet today) | 10.5 | 907 k | — | ≤ 1 s |
+| `2s` | 5.3 | 454 k | $2.45 | ≤ 2 s |
+| `5s` | 2.1 | 181 k | $3.92 | ≤ 5 s |
+
+Halving the segment creation rate also halves what compaction has to merge, the
+live segment count `S`, the footer-index memory that scales with it, and the
+`segment` GET and 404 planes that scale with it — on that fleet, 179 segment
+GETs/s and 47 segment 404s/s. `5s` is the recommendation for a CDC-shaped
+workload whose consumers long-poll: the produce latency is bounded by the linger
+and paid once per flush, while everything downstream of `S` improves by 5×.
+
+Do not adopt a figure blind. Sweep it in one deployment and watch
+`tansu_objectstore_cache_requests{method="put_opts",class="segment"}`,
+`tansu_prefix_segment_flushes` and produce p99 together.
+
+### Reading the request metrics without being misled
+
+Three of these series have been misread in cost analyses, so:
+
+- **`tansu_prefix_segments_live` is per replica.** It is the size of *that
+  process's* cached footer index, and the incremental refresh is add-only below
+  the tail, so an entry for a segment a peer retired survives until this replica
+  reads a 404 for it. Four maintainers once reported 17 517, 14 374, 13 932 and
+  67 for the same prefix at the same instant. `max()` across the fleet is the
+  staleness of the worst index, not a backlog.
+- **`tansu_objectstore_cache_entries` is a counter, not a size.** It counts etag
+  memo *insertions*. `tansu_objectstore_cache_size` is the size.
+- **A cache "miss" is not a lost request.** The etag memo answers a
+  revalidation locally when the caller presents a matching `If-None-Match`; a
+  miss just means the GET goes to the store, which most classes' reads do
+  unconditionally anyway. The aggregate hit rate is therefore meaningless —
+  read it per class. `meta` runs at ~98 %, which is the plane the memo exists
+  for; classes nothing revalidates sit at zero and always will.
+- **`get_opts` latency differs by deployment.** On that fleet the maintainers saw
+  a 24 ms mean and the brokers 350 ms against the same bucket. Same region, same
+  objects; the difference is on the client side.
 
 ## Coalescing vs the `batch_*` request batcher
 

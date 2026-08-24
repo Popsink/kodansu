@@ -26,7 +26,10 @@ use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult, UpdateVersion, path::Path,
 };
-use opentelemetry::{KeyValue, metrics::Counter};
+use opentelemetry::{
+    KeyValue,
+    metrics::{Counter, Gauge},
+};
 use tracing::{debug, instrument};
 
 use crate::{Error, dynostore::object_store_error_name};
@@ -110,6 +113,23 @@ pub(super) fn key_class(path: &Path) -> &'static str {
     } else {
         "other"
     }
+}
+
+/// Whether `path` names an immutable data object — a segment (#64) or a legacy
+/// `records/` batch (#50) — for which memoizing an etag can never pay (#400).
+///
+/// These are create-only and read by **ranged** GET for their bytes, so no
+/// caller presents `If-None-Match` for one, and answering a body read
+/// `NotModified` would be wrong if one did. Measured over an hour on the
+/// production fleet: `class="segment"` took 179 memo insertions/s and scored
+/// **zero** hits, against `class="meta"` at 385 hits/s — the one key the memo
+/// exists for. Every segment path is distinct, so those insertions are also the
+/// churn: an evicting insert into the shared, locked map on the read hot path,
+/// serialised against the `meta` revalidations that do work.
+fn is_immutable(path: &Path) -> bool {
+    let path = path.as_ref();
+
+    path.ends_with(".seg") || path.ends_with(".batch")
 }
 
 /// Single-flight stripes for revalidation (#167). Striped rather than per-key so
@@ -285,10 +305,27 @@ static OUTCOMES: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Etag memo **insertions**, by `outcome` (`add` / `existing` / `replace` /
+/// `delete`) — a counter, not a live size.
+///
+/// Its description used to read "object_store cache entries", and #400 read the
+/// cumulative total (23.3 M across 14 pods) as the number of entries held, and
+/// from there as the memory the brokers were sitting on. It is neither: it is
+/// ~415 insertions/s over the pods' uptime, and the live size is bounded by the
+/// retention window. [`CACHE_SIZE`] is the size.
 static ENTRIES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_objectstore_cache_entries")
-        .with_description("object_store cache entries")
+        .with_description("etag memo insertions, by outcome")
+        .build()
+});
+
+/// Etags currently memoized in this process (#400) — the gauge
+/// [`ENTRIES`] was being read as.
+static CACHE_SIZE: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("tansu_objectstore_cache_size")
+        .with_description("etags currently memoized")
         .build()
 });
 
@@ -320,10 +357,19 @@ where
             .await
             .inspect(|put_result| {
                 debug!(?put_result);
+
+                // An immutable data object's etag is never revalidated (#400):
+                // memoizing it is churn on a lock the metadata revalidations
+                // share, for a hit that cannot happen.
+                if is_immutable(location) {
+                    return;
+                }
+
                 if let Ok(mut guard) = self.entries.lock() {
                     debug!(cached = guard.len());
 
                     _ = guard.insert_evict(location.to_owned(), CacheEntry::from(put_result), true);
+                    CACHE_SIZE.record(guard.len() as u64, &[]);
                 }
             })
             .inspect_err(|error| record_outcome(&method, class, error))
@@ -364,6 +410,26 @@ where
         let class = KeyValue::new("class", key_class(location));
 
         REQUESTS.add(1, &[method.clone(), class.clone()]);
+
+        // An immutable data object is read for its bytes, never revalidated
+        // (#400): neither the lookup nor the memo below can pay, so it goes
+        // straight through rather than touching the lock on the read hot path.
+        if is_immutable(location) {
+            OUTCOMES.add(
+                1,
+                &[
+                    method.clone(),
+                    class.clone(),
+                    KeyValue::new("outcome", "uncached"),
+                ],
+            );
+
+            return self
+                .object_store
+                .get_opts(location, options)
+                .await
+                .inspect_err(|error| record_outcome(&method, class, error));
+        }
 
         if let Ok(mut guard) = self.entries.lock() {
             if let Some(entry) = guard.deref_mut().get(location) {
@@ -508,6 +574,7 @@ where
                     debug!(outcome);
 
                     ENTRIES.add(1, &[method.clone(), KeyValue::new("outcome", outcome)]);
+                    CACHE_SIZE.record(guard.len() as u64, &[]);
                 }
             })
             .inspect_err(|error| {
@@ -730,6 +797,36 @@ mod tests {
             ("clusters/c/prefixes/p/era.json", "era"),
         ] {
             assert_eq!(expected, key_class(&Path::from(path)), "for {path}");
+        }
+    }
+
+    /// The etag memo holds only keys something revalidates (#400).
+    ///
+    /// A segment and a legacy `records/` batch are create-only and read by
+    /// ranged GET for their bytes, so no caller presents `If-None-Match` for
+    /// one — measured over an hour on the fleet, `class="segment"` took 179 memo
+    /// insertions/s and scored zero hits. Every path is distinct, so those
+    /// insertions were also churn on the lock the metadata revalidations share.
+    #[test]
+    fn only_revalidated_keys_are_memoized() {
+        for immutable in [
+            "clusters/c/prefixes/p/segments/00000000000000000001.seg",
+            "clusters/c/topics/t/partitions/0000000000/records/0.batch",
+        ] {
+            assert!(is_immutable(&Path::from(immutable)), "for {immutable}");
+        }
+
+        // Everything the memo does pay for is a mutable JSON object read
+        // conditionally — `meta.json` above all, which is 385 hits/s of the
+        // fleet's revalidations.
+        for revalidated in [
+            "clusters/c/meta.json",
+            "clusters/c/topics/t/partitions/0000000000/watermark.json",
+            "clusters/c/prefixes/p/seq-floor.json",
+            "clusters/c/topic-metadata/t.json",
+            "clusters/c/groups/consumers/g/generation.json",
+        ] {
+            assert!(!is_immutable(&Path::from(revalidated)), "for {revalidated}");
         }
     }
 
