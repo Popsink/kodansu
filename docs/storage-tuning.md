@@ -257,28 +257,37 @@ GETs *per heartbeat*, and it scales with group and member count rather than with
 data. Check `tansu_objectstore_cache_requests{class="group"}` before tuning the
 write path.
 
-### What `coalesce_linger` is worth
+### What `coalesce_linger` is worth, and where it stops
 
 Segments are one PUT per flush window **per prefix**, so the segment PUT rate is
 `active prefixes / linger` and is independent of how little data arrived. At
 `coalesce_linger=1s` that fleet wrote 10.5 segments/s — ~11 continuously-active
 prefixes — for 0.23 MiB/s, an average of 7.4 KiB per object.
 
-The linger divides three things at once, and the indirect savings are the larger
-ones:
+The linger divides several things at once, and the indirect savings are the
+larger ones:
 
 | linger | segment PUT/s | segments/day | direct $/day saved | produce latency added |
 |---|---|---|---|---|
-| `1s` (fleet today) | 10.5 | 907 k | — | ≤ 1 s |
+| `1s` (that fleet) | 10.5 | 907 k | — | ≤ 1 s |
 | `2s` | 5.3 | 454 k | $2.45 | ≤ 2 s |
 | `5s` | 2.1 | 181 k | $3.92 | ≤ 5 s |
 
 Halving the segment creation rate also halves what compaction has to merge, the
 live segment count `S`, the footer-index memory that scales with it, and the
 `segment` GET and 404 planes that scale with it — on that fleet, 179 segment
-GETs/s and 47 segment 404s/s. `5s` is the recommendation for a CDC-shaped
-workload whose consumers long-poll: the produce latency is bounded by the linger
-and paid once per flush, while everything downstream of `S` improves by 5×.
+GETs/s and 47 segment 404s/s.
+
+**The latency budget is the ceiling, and it binds before the cost curve does.**
+On that fleet 1 s is the limit of what the workload will accept, so the table
+above stops being a choice at its first row: the linger is not a lever there, and
+`S` has to be bounded by compaction converging (`prefix_compact_*`, and see the
+drain notes above) rather than by writing fewer segments. Read the two together —
+a linger you cannot raise means the compaction side is the only side left.
+
+The complementary lever that costs no broker-side latency is **fewer, larger
+batches at the source**: the Kafka *producer*'s `linger.ms` / `batch.size`
+connector-side, which changes what arrives rather than how long it waits here.
 
 Do not adopt a figure blind. Sweep it in one deployment and watch
 `tansu_objectstore_cache_requests{method="put_opts",class="segment"}`,
