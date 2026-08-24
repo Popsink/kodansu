@@ -36,7 +36,7 @@ use tansu_sans_io::{
 
 use crate::{
     Error, Result, Storage, Topition, TxnAddPartitionsRequest,
-    dynostore::{CoalesceTuning, DynoStore, tests::init_tracing},
+    dynostore::{CoalesceTuning, CompactRun, DynoStore, tests::init_tracing},
 };
 
 const CLUSTER: &str = "tansu";
@@ -384,8 +384,8 @@ async fn compaction_carries_producer_coordinates_forward() -> Result<(), Error> 
     // Compact the whole run into one segment.
     let merged = store.compact_prefix_segments(PREFIX).await?;
     assert!(
-        merged >= 2,
-        "the run should have been compacted (got {merged})"
+        matches!(merged, CompactRun::Merged(n) if n >= 2),
+        "the run should have been compacted (got {merged:?})"
     );
 
     // The merged segment's footer still carries every batch's producer

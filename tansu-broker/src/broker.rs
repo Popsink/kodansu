@@ -22,7 +22,7 @@ use crate::{
 };
 use console::Term;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use opentelemetry::metrics::Counter;
+use opentelemetry::metrics::{Counter, Histogram};
 use rama::{Context, Service};
 use rsasl::config::SASLConfig;
 use rustls::ServerConfig;
@@ -68,6 +68,26 @@ static MAINTENANCE_FAILURES: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_maintenance_failures")
         .with_description("maintenance passes that failed at the top")
+        .build()
+});
+
+/// Wall clock of one maintenance pass (#399), against which
+/// `maintenance_interval` is the thing to compare it to.
+///
+/// #140's remedies shipped and the busiest prefixes still net-grew, and the first
+/// question — is a tick finishing early? — could only be answered indirectly, by
+/// watching `tansu_prefix_segment_compactions` go quiet between bursts. It did:
+/// 1–2 minutes of merging per 10-minute window at
+/// `maintenance_interval=10m`, a 10–20 % duty cycle, with the maintainers at 12
+/// millicores between them. This makes the answer a measurement rather than an
+/// inference, and it is the number to read the sweep counter against: a pass that
+/// now fills its interval is one whose backlog the interval was never going to
+/// clear.
+static MAINTENANCE_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    METER
+        .u64_histogram("tansu_maintenance_duration")
+        .with_unit("ms")
+        .with_description("wall clock of one maintenance pass in milliseconds")
         .build()
 });
 
@@ -578,6 +598,8 @@ where
                             // tick can retry, rather than wedging maintenance
                             // pod-wide until restart (#131).
                             run_bounded_maintenance(in_flight, maintenance_run_timeout, async move {
+                                let started = Instant::now();
+
                                 // A failure here is not cosmetic: it means this
                                 // replica did no retention and no compaction this
                                 // tick. `warn!` rather than `debug!` so it is
@@ -603,6 +625,13 @@ where
                                         )
                                     })
                                     .ok();
+
+                                // Recorded for a failed pass too: a pass that
+                                // died at the top is a pass that did nothing for
+                                // the rest of the interval, and the duration is
+                                // how that reads next to the sweep counter (#399).
+                                MAINTENANCE_DURATION
+                                    .record(started.elapsed().as_millis() as u64, &[]);
                             }).instrument(span).await
                         });
 

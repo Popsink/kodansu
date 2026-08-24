@@ -32,6 +32,7 @@ mod group_documents;
 mod group_expiry;
 mod idempotent;
 mod latency;
+mod maintenance_scheduling;
 mod meta_growth;
 mod metadata_visibility;
 mod offset_assignment;
