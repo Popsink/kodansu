@@ -51,6 +51,7 @@ use crate::{
         CoalesceTuning, DynoStore, Era, PrefixLease, SegmentFooter, ServedEnd, SubstreamEntry,
         TxnProduceOffset,
     },
+    storage_error_code,
 };
 
 const CLUSTER: &str = "tansu";
@@ -453,32 +454,45 @@ async fn a_recreated_topic_inherits_nothing_from_a_shared_segment() -> Result<()
     Ok(())
 }
 
-/// A fetch whose region yields no batches returns, bounded, and returns **no
-/// error** (#302).
+/// A fetch whose region comes back short of its extent returns, bounded, and
+/// answers `CORRUPT_MESSAGE` — never `OffsetOutOfRange` (#302, #397).
 ///
-/// This test used to assert `OffsetOutOfRange` here. That answer shipped and
-/// fired on 61 healthy topics in 3 minutes, resetting live consumers through
-/// `auto.offset.reset`, so it is gone and the client is told nothing.
+/// This test has been through both wrong answers. It first asserted
+/// `OffsetOutOfRange`; that shipped, fired on 61 healthy topics in 3 minutes and
+/// reset live consumers through `auto.offset.reset`. It then asserted empty and
+/// error-free, which is what #397 came back on: the truncated arm returned the
+/// batches it could decode and dropped the rest of the region, and a consumer of
+/// `*.connect.ibmi-offsets` served part of an offset map with nothing in its own
+/// logs to say so is a connector resuming from holes.
 ///
-/// It was then counted by `tansu_fetch_unservable` and logged at debug for one
-/// release. #314 removed both once the condition measured ~10/min on a healthy
-/// fleet, so today this condition is neither counted nor logged.
+/// The evidence that settles which is right is that
+/// `tansu_prefix_segment_regions_truncated` was flat zero across a whole
+/// pre-`alpha.2` week and only moved when known-damaged objects were re-read.
+/// This is not a condition a healthy fleet produces, so it is not one to absorb
+/// silently. And segments are immutable and created atomically, so a ranged GET
+/// returning fewer bytes than the extent means the entry and the object
+/// disagree — which the reader now resolves against the object's own trailer
+/// before answering (`resolve_short_region`). Here the trailer agrees with the
+/// index, so the object really is short and there is nowhere else to look.
+///
+/// `CORRUPT_MESSAGE` is what keeps #302 fixed: it is per-partition damage
+/// (#388), and it is not the error code `auto.offset.reset` acts on. What it is
+/// not is silence.
 ///
 /// The *neighbouring* state — a floor above the surviving segment tail — is
 /// counted (`tansu_watermark_above_segment_tail`, #338) and, once certified
 /// (`Watermark::served`) either by the expiry that created it or by
 /// `certify_prefix_served_ends` reconciling one it never saw, its fetches
-/// answer `OffsetOutOfRange` (#290). Neither reaches this test's state: here
-/// the index *covers* the offset, so there is no gap to certify and empty —
-/// bounded, error-free — remains the answer.
+/// answer `OffsetOutOfRange` (#290). That is a different state from this one:
+/// there the index does not cover the offset, here it claims to and cannot
+/// deliver.
 ///
-/// What remains worth pinning is the property that survives the removal — the
-/// fetch **returns** rather than hanging. #290's complaint was a fetch that never
-/// completed at all, which is what let 25.6M records of advertised backlog sit
-/// unreadable with no signal anywhere while `poll()` starved 250 healthy
-/// partitions on the same consumer.
+/// The property from #290 still holds and is still pinned: the fetch
+/// **returns**. Its complaint was a fetch that never completed at all, which let
+/// 25.6M records of advertised backlog sit unreadable with no signal anywhere
+/// while `poll()` starved 250 healthy partitions on the same consumer.
 #[tokio::test]
-async fn a_fetch_whose_region_yields_nothing_returns_without_erroring() -> Result<(), Error> {
+async fn a_fetch_whose_region_is_short_of_its_extent_answers_corrupt() -> Result<(), Error> {
     /// Once armed, truncates every segment record read to fewer bytes than a
     /// batch header needs.
     ///
@@ -632,11 +646,13 @@ async fn a_fetch_whose_region_yields_nothing_returns_without_erroring() -> Resul
                     ))
                 })?;
 
-        assert!(
-            matches!(outcome, Ok(ref batches) if batches.is_empty()),
-            "offset {offset} must answer empty and without an error — an error here \
-             resets a consumer through auto.offset.reset, and this condition is not \
-             known to mean the log is damaged (#302); got {outcome:?}",
+        let error = outcome.expect_err("a region short of its extent is damage");
+
+        assert_eq!(
+            ErrorCode::CorruptMessage,
+            storage_error_code(&error),
+            "offset {offset} must answer CORRUPT_MESSAGE — damage on this partition \
+             alone, and not the code auto.offset.reset acts on (#302); got {error:?}",
         );
     }
 
