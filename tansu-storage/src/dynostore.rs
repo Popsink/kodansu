@@ -622,6 +622,46 @@ impl CompactRun {
     }
 }
 
+/// Why a describe-path metadata lookup did or did not come from the topics index
+/// (#407).
+///
+/// [`DynoStore::indexed_topic_metadata`] answered `Option`, which collapsed two
+/// facts that want different things. The fleet falls through to the object 18.5
+/// times a second and **every one of those 404s** —
+/// `tansu_topic_metadata_reads{source="object"}` and
+/// `class="topic_metadata",reason="not_found"` are equal to three decimals — so
+/// the question is whether the fallback is ever the thing that finds a topic, or
+/// whether it is 1.6 M/day of confirming absence.
+///
+/// It cannot be answered from the request counters, because a miss on a *fresh*
+/// index and a miss because there was no usable index at all are the same
+/// `source="object"`. Only the first is provably pointless.
+enum IndexedTopic {
+    /// The index holds it, and this is the whole of #387 working.
+    Hit(TopicMetadata),
+
+    /// The index is inside its TTL and does not hold this topic — so as of the
+    /// last listing the topic did not exist, and the object read that follows can
+    /// only confirm it. A by-id lookup whose id pointer does not resolve is the
+    /// same answer for the same reason.
+    FreshMiss,
+
+    /// No usable index: outside its TTL, or never built. This is the case the
+    /// fallback exists for (#28/#29 — a topic created since the last refresh must
+    /// be visible immediately), and the one that must keep reading the object.
+    Stale,
+}
+
+impl IndexedTopic {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Hit(_) => "hit",
+            Self::FreshMiss => "fresh_miss",
+            Self::Stale => "stale",
+        }
+    }
+}
+
 /// A sub-stream inside a merge run.
 type SubstreamKey = (String, i32);
 
@@ -907,10 +947,25 @@ static METADATA_UNRESOLVED_EXISTING: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// conditional GET, and after #387 it should be admin-rate — a `Metadata` or
 /// `OffsetCommit` steady state that keeps showing `object` means the index is
 /// being missed (aged out, or a topic it does not hold).
+/// Per-topic metadata resolutions by `caller`, `source` and `index` (#387, #407).
+///
+/// `source` says whether the topics index answered or the topic's own object had
+/// to be read. `index` says *why* — see [`IndexedTopic`] — and that is the pair
+/// that matters, because the fleet falls through to the object 18.5 times a
+/// second and **every one of those 404s**:
+/// `tansu_topic_metadata_reads{source="object"}` and
+/// `tansu_object_store_request_error{class="topic_metadata",reason="not_found"}`
+/// are equal to three decimals, 1.6 M billed requests/day confirming that a
+/// topic a client keeps asking for does not exist.
+///
+/// `index="fresh_miss"` is the share that could be answered negatively from the
+/// index with no new staleness at all. `index="stale"` is the share the fallback
+/// exists for (#28/#29). Skipping the fallback is only safe to the extent the
+/// first dominates, and until this label there was no way to know.
 static TOPIC_METADATA_READS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_topic_metadata_reads")
-        .with_description("per-topic metadata resolutions by caller and source")
+        .with_description("per-topic metadata resolutions by caller, source and index outcome")
         .build()
 });
 
@@ -2933,16 +2988,16 @@ impl DynoStore {
     /// mapping is immutable for a topic's lifetime, so it costs one GET per id per
     /// process, where a scan would be O(topics) per lookup — 15k comparisons per
     /// topic on a by-id `Metadata`.
-    async fn indexed_topic_metadata(&self, topic: &TopicId) -> Result<Option<TopicMetadata>> {
+    async fn indexed_topic_metadata(&self, topic: &TopicId) -> Result<IndexedTopic> {
         if self.fresh_topic_index()?.is_none() {
-            return Ok(None);
+            return Ok(IndexedTopic::Stale);
         }
 
         let name = match topic {
             TopicId::Name(name) => name.clone(),
             TopicId::Id(id) => match self.topic_name_by_id(id).await? {
                 Some(name) => name,
-                None => return Ok(None),
+                None => return Ok(IndexedTopic::FreshMiss),
             },
         };
 
@@ -2951,7 +3006,8 @@ impl DynoStore {
             .lock()?
             .entries
             .get(name.as_str())
-            .map(|(_, metadata)| metadata.clone()))
+            .map(|(_, metadata)| IndexedTopic::Hit(metadata.clone()))
+            .unwrap_or(IndexedTopic::FreshMiss))
     }
 
     /// A topic's metadata for a path that only *describes* it: served from the
@@ -2986,21 +3042,33 @@ impl DynoStore {
             .indexed_topic_metadata(topic)
             .await
             .inspect_err(|error| warn!(?error, caller, ?topic, "indexed topic metadata"))
-            .unwrap_or_default();
+            // A failed index read is not a usable index, which is exactly the
+            // case the object fallback exists for.
+            .unwrap_or(IndexedTopic::Stale);
 
-        let source = if indexed.is_some() { "index" } else { "object" };
+        let source = if matches!(indexed, IndexedTopic::Hit(_)) {
+            "index"
+        } else {
+            "object"
+        };
 
+        // `index` alongside `source` (#407): a `fresh_miss` is a fallback that can
+        // only confirm the topic does not exist, and a `stale` is the fallback
+        // doing the job it was added for. `source="object"` alone cannot tell
+        // them apart, so it could not say whether skipping the fallback on a
+        // fresh index would cost any visibility at all.
         TOPIC_METADATA_READS.add(
             1,
             &[
                 KeyValue::new("caller", caller),
                 KeyValue::new("source", source),
+                KeyValue::new("index", indexed.as_str()),
             ],
         );
 
         match indexed {
-            Some(metadata) => Ok(Some(metadata)),
-            None => self.topic_metadata(topic).await,
+            IndexedTopic::Hit(metadata) => Ok(Some(metadata)),
+            IndexedTopic::FreshMiss | IndexedTopic::Stale => self.topic_metadata(topic).await,
         }
     }
 

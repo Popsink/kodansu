@@ -51,6 +51,70 @@ async fn create_topic(storage: &DynoStore, name: &str, partitions: i32) -> Resul
         .await
 }
 
+/// The three answers a describe-path lookup can get from the topics index
+/// (#407), which used to be two.
+///
+/// `indexed_topic_metadata` answered `Option`, so a miss on a *fresh* index and a
+/// miss because there was no usable index were the same `source="object"`. The
+/// fleet falls through to the object 18.5 times a second and every one of those
+/// 404s — so the whole question is which of the two it is, and it could not be
+/// asked.
+#[tokio::test]
+async fn the_index_says_why_a_lookup_fell_through() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let store = DynoStore::new(CLUSTER, NODE, InMemory::new());
+    let topic = "org.env.conn.table";
+
+    _ = create_topic(&store, topic, 1).await?;
+    _ = store.topics_index().await?;
+
+    // Held: #387 working, and no object read at all.
+    assert_eq!(
+        "hit",
+        store
+            .indexed_topic_metadata(&TopicId::Name(topic.into()))
+            .await?
+            .as_str()
+    );
+
+    // A fresh index that does not hold the topic. As of the last listing the
+    // topic does not exist, so the object read that follows can only confirm it —
+    // this is the population that is 1.6 M/day of confirming absence.
+    assert_eq!(
+        "fresh_miss",
+        store
+            .indexed_topic_metadata(&TopicId::Name("org.env.conn.absent".into()))
+            .await?
+            .as_str()
+    );
+
+    // A by-id lookup whose pointer does not resolve is the same answer for the
+    // same reason.
+    assert_eq!(
+        "fresh_miss",
+        store
+            .indexed_topic_metadata(&TopicId::Id(Uuid::new_v4()))
+            .await?
+            .as_str()
+    );
+
+    // No usable index: the case the fallback exists for (#28/#29), and the one
+    // that must keep reading the object. Aged rather than waited out, so the test
+    // does not sleep through the TTL.
+    store.topic_index.lock()?.refreshed_at = None;
+
+    assert_eq!(
+        "stale",
+        store
+            .indexed_topic_metadata(&TopicId::Name(topic.into()))
+            .await?
+            .as_str()
+    );
+
+    Ok(())
+}
+
 /// Regression for #28: a topic created on one replica must be visible on
 /// another sharing the same bucket, with no stale-read window.
 ///
