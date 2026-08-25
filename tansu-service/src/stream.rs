@@ -29,6 +29,7 @@ use bytes::Bytes;
 use nanoid::nanoid;
 use opentelemetry::KeyValue;
 use rama::{Context, Layer, Service};
+use tansu_sans_io::RootMessageMeta;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufWriter},
     net::{TcpListener, TcpStream},
@@ -122,6 +123,25 @@ impl Throttle {
 /// it.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Peer(pub SocketAddr);
+
+/// The API key at the head of a request frame, or `-1` (#410).
+///
+/// The frame carries its own four-byte size prefix, so the request header — and
+/// the `api_key (i16)` that starts it — begins at byte 4.
+///
+/// Validated against the protocol's own request table before it becomes a label.
+/// A SASL v0 handshake continues as opaque packets that are not Kafka frames at
+/// all, so their first two bytes are not an API key; labelling three histograms
+/// with whatever they happen to say would put unbounded cardinality on them.
+/// `-1` is the same "not a known API" value the wire uses for an absent id.
+fn frame_api_key(request: &Bytes) -> i64 {
+    request
+        .get(4..6)
+        .and_then(|head| <[u8; 2]>::try_from(head).ok())
+        .map(i16::from_be_bytes)
+        .filter(|api_key| RootMessageMeta::messages().requests().contains_key(api_key))
+        .map_or(-1, i64::from)
+}
 
 /// A [`Layer`] that listens for TCP connections
 #[derive(Clone, Debug, Default)]
@@ -475,6 +495,14 @@ where
         ctx: Context<TcpContext>,
         request: Bytes,
     ) -> Result<Bytes, S::Error> {
+        // Per-API, not just per-connection (#410). `tansu_api_requests` has
+        // carried `api_key` all along and these three have not, so there was no
+        // per-API latency or size series at all — and a fleet where one API is
+        // 20% of its traffic could not say what answering it costs.
+        let mut attributes = attributes.to_vec();
+        attributes.push(KeyValue::new("api_key", frame_api_key(&request)));
+        let attributes = attributes.as_slice();
+
         REQUEST_SIZE.record(request.len() as u64, attributes);
 
         let (ctx, _) = ctx.swap_state(State::default());
@@ -692,6 +720,36 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tansu_sans_io::{ApiKey, ApiVersionsRequest, FetchRequest, ProduceRequest};
+
+    /// A frame is labelled by the API it actually is, and anything that is not a
+    /// known request is not labelled with its first two bytes (#410).
+    #[test]
+    fn a_frame_is_labelled_by_its_api_key() {
+        let framed = |api_key: i16| {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&0i32.to_be_bytes());
+            bytes.extend_from_slice(&api_key.to_be_bytes());
+            bytes.extend_from_slice(&0i16.to_be_bytes());
+            Bytes::from(bytes)
+        };
+
+        for api_key in [
+            ProduceRequest::KEY,
+            FetchRequest::KEY,
+            ApiVersionsRequest::KEY,
+        ] {
+            assert_eq!(i64::from(api_key), frame_api_key(&framed(api_key)));
+        }
+
+        // An opaque SASL v0 packet is not a Kafka frame, so its leading bytes
+        // are not an API key. Labelling three histograms with whatever they say
+        // would put unbounded cardinality on them.
+        assert_eq!(-1, frame_api_key(&framed(31_337)));
+
+        // And a frame too short to hold a header carries no key either.
+        assert_eq!(-1, frame_api_key(&Bytes::from_static(&[0, 0, 0, 0, 1])));
+    }
 
     /// #244: the cap rejects a frame larger than the limit and accepts one at it.
     ///

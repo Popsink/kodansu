@@ -90,9 +90,13 @@ impl From<&GetResult> for CacheEntry {
 pub(super) fn key_class(path: &Path) -> &'static str {
     let path = path.as_ref();
 
-    if path.ends_with(".seg") {
+    // The `/segments/` and `/records/` directory forms are matched as well as the
+    // object suffixes so a *listing* of either classes as what it is listing
+    // rather than falling through to `other` (#409). Both forms, because `Path`
+    // normalises the trailing slash off a listing prefix.
+    if path.ends_with(".seg") || path.contains("/segments/") || path.ends_with("/segments") {
         "segment"
-    } else if path.ends_with(".batch") {
+    } else if path.ends_with(".batch") || path.contains("/records/") || path.ends_with("/records") {
         "records"
     } else if path.ends_with("/meta.json") {
         "meta"
@@ -107,7 +111,32 @@ pub(super) fn key_class(path: &Path) -> &'static str {
     } else if path.contains("/producers/") {
         "producer"
     } else if path.contains("/groups/") {
-        "group"
+        // Decomposed, because the aggregate is the largest single line item on
+        // the request bill and could not be attributed (#406): consumer-group
+        // PUTs are 67% of the fleet's PUT plane, and one label folded a
+        // per-partition offset write, a per-member liveness renewal, a
+        // generation CAS and a per-generation assignment into one series.
+        //
+        // #359 is what makes the split necessary: it traded one object per group
+        // for several per member per generation, deliberately and correctly (the
+        // CAS contention of #43/#44/#190/#240), and nothing since has said what
+        // that costs at steady state.
+        //
+        // A deliberate label change: `class=~"group.*"` reproduces the old
+        // series. Ordered most-specific first, and the bare group state object
+        // (the pre-#359 `{group}.json`, and the prefix a widening listing walks)
+        // keeps `group`.
+        if path.contains("/offsets/") {
+            "group_offsets"
+        } else if path.contains("/members/") {
+            "group_member"
+        } else if path.contains("/assignment/") {
+            "group_assignment"
+        } else if path.ends_with("/generation.json") {
+            "group_generation"
+        } else {
+            "group"
+        }
     } else if path.contains("/topic-metadata/") || path.contains("/topic-ids/") {
         "topic_metadata"
     } else {
@@ -795,6 +824,41 @@ mod tests {
             ),
             ("clusters/c/prefixes/p/seq-floor.json", "seq_floor"),
             ("clusters/c/prefixes/p/era.json", "era"),
+            // The directory forms, so a listing is attributable too (#409).
+            ("clusters/c/prefixes/p/segments/", "segment"),
+            (
+                "clusters/c/topics/t/partitions/0000000000/records/",
+                "records",
+            ),
+        ] {
+            assert_eq!(expected, key_class(&Path::from(path)), "for {path}");
+        }
+    }
+
+    /// The group plane is decomposed (#406): 67% of the fleet's PUTs were one
+    /// label, and the four objects behind it want different fixes.
+    #[test]
+    fn key_class_decomposes_the_group_plane() {
+        for (path, expected) in [
+            (
+                "clusters/c/groups/consumers/g/offsets/t/partitions/0000000000.json",
+                "group_offsets",
+            ),
+            (
+                "clusters/c/groups/consumers/g/members/m.json",
+                "group_member",
+            ),
+            (
+                "clusters/c/groups/consumers/g/assignment/0000000007.json",
+                "group_assignment",
+            ),
+            (
+                "clusters/c/groups/consumers/g/generation.json",
+                "group_generation",
+            ),
+            // The pre-#359 group state object keeps the bare class, so
+            // `class=~"group.*"` is the old series.
+            ("clusters/c/groups/consumers/g.json", "group"),
         ] {
             assert_eq!(expected, key_class(&Path::from(path)), "for {path}");
         }
