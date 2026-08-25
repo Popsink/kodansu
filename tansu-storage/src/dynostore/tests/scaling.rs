@@ -447,21 +447,26 @@ async fn warm_metadata_by_name_costs_no_per_topic_get() -> Result<(), Error> {
     Ok(())
 }
 
-/// #387: `OffsetCommit`'s per-partition existence test costs no object-store
-/// request beyond the offset write itself.
+/// #406/#111: a commit over `t` partitions costs **one** PUT, and #387: its
+/// existence test costs no object-store read at all.
 ///
-/// It reads topic metadata **per partition committed**, purely to decide whether
-/// to write — so a group committing hundreds of partitions across dozens of topics
-/// asked the store once per partition for answers about a handful of topics.
-/// Bounded at tens/s on the production fleet (the fleet-wide PUT rate bounds it),
-/// which is why it is not where the money was, but it is the same read on the same
-/// plane and it scales with the group's assignment.
+/// Two fixes, one profile. The existence test reads topic metadata *per partition
+/// committed*, purely to decide whether to write, so a group committing hundreds
+/// of partitions across dozens of topics asked the store once per partition for
+/// answers about a handful of topics (#387 — served from the index, free).
 ///
-/// Spread over 16 topics rather than one so the count discriminates: the etag memo
-/// collapses repeats of a single key, so one topic's 64 partitions cost one request
-/// either way and only a multi-topic commit shows the difference.
+/// And the write was one unconditional overwrite **per partition**. On the
+/// production fleet consumer-group writes are 67 % of the whole PUT plane —
+/// $10.59/day, the largest single line item on the request bill — and #111 asked
+/// for exactly this in 2024: "a commit over `t` topitions issues O(1) PUTs, not
+/// `1 + t`". Its acceptance was never met; the issue was closed on its other
+/// half. 64 partitions, one PUT.
+///
+/// Spread over 16 topics rather than one so the read count discriminates: the etag
+/// memo collapses repeats of a single key, so one topic's 64 partitions cost one
+/// request either way and only a multi-topic commit shows the difference.
 #[tokio::test]
-async fn a_warm_offset_commit_costs_one_put_per_partition_and_nothing_else() -> Result<(), Error> {
+async fn a_warm_offset_commit_costs_one_put_for_the_whole_request() -> Result<(), Error> {
     let _guard = init_tracing()?;
     let (storage, counters) = store();
 
@@ -496,17 +501,32 @@ async fn a_warm_offset_commit_costs_one_put_per_partition_and_nothing_else() -> 
         assert_eq!(ErrorCode::None, *error_code, "{topition:?}");
     }
 
-    let profile = counters.report("offset commit, 16 topics x 4 partitions, warm index");
+    let profile = counters.report("first offset commit, 16 topics x 4 partitions, warm index");
     assert_eq!(
-        (TOPICS * PARTITIONS) as u64,
-        profile.0,
-        "one PUT per partition, and no more"
+        1, profile.0,
+        "one PUT for the whole commit, whatever the partition count (#406/#111)"
     );
     assert_eq!(
         0, profile.1,
-        "the existence test must not read an object per partition (#387)"
+        "the existence test must not read an object per partition (#387), and the \
+         first commit creates rather than reads"
     );
     assert_eq!(0, profile.2, "and it must not LIST");
+
+    // Steady state, which is what the fleet pays 22.7 PUT/s for: the object now
+    // exists, so the write CASes against the etag this process already holds.
+    // Still one request for the whole commit.
+    counters.reset();
+    let committed = storage.offset_commit("group-a", None, &offsets).await?;
+    assert_eq!((TOPICS * PARTITIONS) as usize, committed.len());
+
+    let steady = counters.report("second offset commit, same group");
+    assert_eq!(1, steady.0, "one PUT, again");
+    assert_eq!(
+        0, steady.1,
+        "and no read: the CAS is against the memoized etag"
+    );
+    assert_eq!(0, steady.2, "and no LIST");
 
     Ok(())
 }

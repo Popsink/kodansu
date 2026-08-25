@@ -31,6 +31,7 @@ mod flush_conflict;
 mod group_describe;
 mod group_documents;
 mod group_expiry;
+mod group_offsets;
 mod idempotent;
 mod index_reconcile;
 mod latency;
