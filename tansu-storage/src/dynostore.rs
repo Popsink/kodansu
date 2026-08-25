@@ -271,6 +271,11 @@ pub struct DynoStore {
     /// would serve)? See [`SegmentReadTrace`].
     segment_reads: Arc<Mutex<BTreeMap<(String, u64), SegmentReadTrace>>>,
 
+    /// Per-group optimistic-concurrency handle on `offsets.json` (#406), so the
+    /// conditional GET a commit pays is served from a memoized etag rather than a
+    /// body read on every commit.
+    group_offsets: Arc<Mutex<BTreeMap<String, OptiCon<GroupOffsets>>>>,
+
     /// Segments a compaction pass has proved undecodable, per prefix (#398).
     ///
     /// A region that arrives whole and holds no frame is damage no code path in
@@ -629,6 +634,72 @@ impl CompactRun {
             Self::Drained => "drained",
             Self::Retry => "retry",
         }
+    }
+}
+
+/// Every committed offset of one consumer group, in one object (#406, #111).
+///
+/// The layout this replaces is one object per `(group, topic, partition)`,
+/// written with an unconditional overwrite. So a commit over `t` partitions cost
+/// `t` billed PUTs and an `OffsetFetch(all)` cost a LIST plus a GET each — and on
+/// the production fleet consumer-group writes are **67 % of the whole PUT
+/// plane**, $10.59/day, the largest single line item on the request bill.
+///
+/// #111 asked for exactly this and its acceptance — "a commit over `t` topitions
+/// issues O(1) PUTs, not `1 + t`" — was never met; the issue was closed on its
+/// other half.
+///
+/// The per-partition objects are **not** migrated in bulk and **not** deleted.
+/// Reads fall back to them per key ([`DynoStore::offset_fetch`]) and the
+/// topition-set discovery unions them in
+/// ([`DynoStore::committed_offset_topitions`]), so this object accumulates as
+/// commits happen with no fold-everything pass on a path whose whole purpose is
+/// to stop reading O(partitions) objects. Leaving them also bounds what a
+/// rollback costs: an older binary reads only the per-partition objects, so it
+/// resumes from the last offset committed before the upgrade rather than from
+/// nothing.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+struct GroupOffsets {
+    /// `topic -> partition -> commit`.
+    #[serde(default)]
+    committed: BTreeMap<String, BTreeMap<i32, OffsetCommitRequest>>,
+
+    /// Fields a future version adds, preserved through this version's rewrites —
+    /// the same catch-all the watermark document carries (#182), for the same
+    /// reason: a reader that drops what it does not understand turns every
+    /// round-trip through an older binary into silent field erasure.
+    #[serde(flatten)]
+    rest: BTreeMap<String, serde_json::Value>,
+}
+
+impl GroupOffsets {
+    fn get(&self, topition: &Topition) -> Option<&OffsetCommitRequest> {
+        self.committed
+            .get(topition.topic())
+            .and_then(|partitions| partitions.get(&topition.partition()))
+    }
+
+    fn insert(&mut self, topition: &Topition, commit: OffsetCommitRequest) {
+        _ = self
+            .committed
+            .entry(topition.topic().to_owned())
+            .or_default()
+            .insert(topition.partition(), commit);
+    }
+
+    /// Drop every partition of `topic`, answering whether anything went. Called
+    /// when a topic is deleted: a committed offset that outlives its topic is
+    /// served against the recreated one, which is #241's shape.
+    fn remove_topic(&mut self, topic: &str) -> bool {
+        self.committed.remove(topic).is_some()
+    }
+
+    fn topitions(&self) -> impl Iterator<Item = Topition> + '_ {
+        self.committed.iter().flat_map(|(topic, partitions)| {
+            partitions
+                .keys()
+                .map(move |partition| Topition::new(topic.clone(), *partition))
+        })
     }
 }
 
@@ -2397,6 +2468,7 @@ impl DynoStore {
             prefix_flush_locks: Arc::new(Mutex::new(BTreeMap::new())),
             prefix_index: Arc::new(Mutex::new(BTreeMap::new())),
             segment_reads: Arc::new(Mutex::new(BTreeMap::new())),
+            group_offsets: Arc::new(Mutex::new(BTreeMap::new())),
             quarantined_segments: Arc::new(Mutex::new(BTreeMap::new())),
             compaction_leases: Arc::new(Mutex::new(BTreeMap::new())),
             era_epochs: Arc::new(Mutex::new(BTreeMap::new())),
@@ -7111,6 +7183,28 @@ impl DynoStore {
         (prefix != self.groups_root()).then_some(prefix)
     }
 
+    /// The optimistic-concurrency handle on a group's `offsets.json` (#406), or
+    /// `None` for the widening group id [`Self::group_prefix`] refuses (#277).
+    ///
+    /// Memoized per group so the conditional GET a commit pays is answered from
+    /// the etag memo. It sits *beside* the `offsets/` prefix rather than under it,
+    /// so every listing that walks that prefix — the topition-set discovery, and
+    /// `delete_topic`'s per-topic sweep — is unchanged by its existence.
+    fn group_offsets(&self, group_id: &str) -> Result<Option<OptiCon<GroupOffsets>>> {
+        let Some(prefix) = self.group_prefix(group_id) else {
+            return Ok(None);
+        };
+
+        Ok(Some(
+            self.group_offsets
+                .lock()
+                .map_err(Into::<Error>::into)?
+                .entry(group_id.to_owned())
+                .or_insert_with(|| OptiCon::path(Path::from(format!("{prefix}/offsets.json"))))
+                .clone(),
+        ))
+    }
+
     /// `members/` under a group's prefix, or `None` for the widening group id
     /// [`Self::group_prefix`] refuses (#277).
     fn group_members_prefix(&self, group_id: &str) -> Option<Path> {
@@ -10708,6 +10802,57 @@ impl Storage for DynoStore {
                 .try_collect::<Vec<Path>>()
                 .await?;
 
+            // And the same topic out of every group's one offsets object (#406).
+            // A committed offset that outlives its topic is served against the
+            // recreated one, which is #241's shape — 70 topics reporting a
+            // committed offset above a high watermark of 0 — so the two layouts
+            // have to be swept together or deleting a topic only half works.
+            //
+            // One delimited listing for the group ids, then a conditional GET
+            // each and a write only where the topic was actually held. On an
+            // admin path, against a group count, not a partition count.
+            let groups = self
+                .scan_delimited(
+                    Scan::AdminDelete,
+                    &Path::from(format!("clusters/{}/groups/consumers/", self.cluster)),
+                )
+                .await?;
+
+            for group in groups.common_prefixes {
+                // A common prefix has no filename, so the group id is its last
+                // path component.
+                let Some(group_id) = group
+                    .parts()
+                    .next_back()
+                    .map(|part| part.as_ref().to_owned())
+                else {
+                    continue;
+                };
+
+                let Some(offsets) = self.group_offsets(&group_id)? else {
+                    continue;
+                };
+
+                let held = offsets
+                    .get_opt(&self.object_store)
+                    .await
+                    .inspect_err(|error| warn!(?error, %group_id, "group offsets"))
+                    .unwrap_or_default();
+
+                if !held.is_some_and(|group| group.committed.contains_key(&metadata.topic.name)) {
+                    continue;
+                }
+
+                _ = offsets
+                    .with_mut(&self.object_store, |group| {
+                        Ok(group.remove_topic(&metadata.topic.name))
+                    })
+                    .await
+                    .inspect_err(|error| {
+                        warn!(?error, %group_id, topic = %metadata.topic.name, "dropping a deleted topic's committed offsets")
+                    });
+            }
+
             // Only now that the data is gone: the metadata object, its id ->
             // name pointer, and the routing pin. Past this point the topic no
             // longer exists for the API or for maintenance, so nothing above may
@@ -11173,76 +11318,124 @@ impl Storage for DynoStore {
         self.refresh_index_for_described_reads("offset_commit")
             .await;
 
-        // Commit each partition's offset concurrently (bounded): the same
-        // O(N) -> O(N / concurrency) scaling fix as ListOffsets (#147) and
-        // Metadata (#154). A large formed group commits offsets for
-        // hundreds-to-thousands of partitions at once, and two serial
-        // object-store round trips per partition (a metadata GET plus the
-        // offset PUT) blew past the client's commit/rebalance timeout at scale,
-        // stalling every rebalance. `try_collect` keeps the fail-fast semantics
-        // of the `?` below (a metadata read error aborts the commit); the
-        // per-partition PUT error is still reported as `UnknownServerError` in
-        // the response, and `buffered` preserves response order.
+        // Resolve which topitions exist, concurrently and off the topics index
+        // (#387/#154): a group committing 1,500 topics × 16 partitions asks about
+        // the same topic 16 times, and the index answers all of it for free.
+        //
+        // `try_collect` keeps the fail-fast semantics of the `?` (a metadata read
+        // error aborts the commit) and `buffered` preserves response order, which
+        // the response the client gets is keyed on.
         const OFFSET_COMMIT_CONCURRENCY: usize = 32;
 
         // Eagerly collected to pin lifetimes under `async_trait` (see #147).
-        let commits = offsets
+        let resolutions = offsets
             .iter()
             .map(|(topition, offset_commit)| async move {
-                let error_code = if self
+                let known = self
                     .described_topic_metadata(&TopicId::from(topition), "offset_commit")
                     .await?
-                    .is_some()
-                {
-                    let location = Path::from(format!(
-                        "clusters/{}/groups/consumers/{}/offsets/{}/partitions/{:0>10}.json",
-                        self.cluster, group_id, topition.topic, topition.partition,
-                    ));
+                    .is_some();
 
-                    let payload = serde_json::to_vec(&offset_commit)
-                        .map(Bytes::from)
-                        .map(PutPayload::from)?;
-
-                    let options = PutOptions {
-                        mode: PutMode::Overwrite,
-                        attributes: json_content_type(),
-                        ..Default::default()
-                    };
-
-                    // #275: every failure here is an object-store failure, and
-                    // they are overwhelmingly transient — a 503 SlowDown, a
-                    // timeout, a 5xx. `UnknownServerError` is non-retriable in
-                    // Kafka clients, so `commitSync` threw rather than retrying
-                    // and a connector treating that as engine death restarted:
-                    // a throttle burst turned into connector restarts. Answer
-                    // the way produce already does.
-                    self.object_store
-                        .put_opts(&location, payload, options)
-                        .await
-                        .inspect_err(|err| error!(?err))
-                        .inspect(|outcome| debug!(?outcome))
-                        .map_or_else(
-                            |err| storage_error_code(&Error::from(err)),
-                            |_| ErrorCode::None,
-                        )
-                } else {
-                    ErrorCode::UnknownTopicOrPartition
-                };
-
-                Ok::<_, Error>((topition.to_owned(), error_code))
+                Ok::<_, Error>((topition.to_owned(), offset_commit.clone(), known))
             })
             .collect::<Vec<_>>();
 
-        let responses = futures::stream::iter(commits)
+        let resolved = futures::stream::iter(resolutions)
             .buffered(OFFSET_COMMIT_CONCURRENCY)
             .try_collect::<Vec<_>>()
             .await?;
 
-        Ok(responses)
+        // One conditional write for the whole request (#406, #111): the layout
+        // was one unconditional overwrite per partition, so a commit over `t`
+        // partitions cost `t` billed PUTs. Consumer-group writes are 67% of the
+        // fleet's PUT plane, and #111's acceptance — "a commit over `t` topitions
+        // issues O(1) PUTs, not `1 + t`" — was never met.
+        //
+        // The CAS matters beyond the count: two replicas committing for the same
+        // group used to race per object with last-write-wins per partition, so a
+        // commit could interleave with another and leave a group's offsets from
+        // two different requests. `with_mut` re-applies the fold on conflict, so
+        // the losing writer folds onto the winner's value instead of over it.
+        let committable: Vec<(Topition, OffsetCommitRequest)> = resolved
+            .iter()
+            .filter(|(_, _, known)| *known)
+            .map(|(topition, commit, _)| (topition.clone(), commit.clone()))
+            .collect();
+
+        let stored = if committable.is_empty() {
+            Ok(())
+        } else {
+            match self.group_offsets(group_id)? {
+                Some(offsets) => {
+                    offsets
+                        .with_mut(&self.object_store, |group| {
+                            for (topition, commit) in &committable {
+                                group.insert(topition, commit.clone());
+                            }
+
+                            Ok(())
+                        })
+                        .await
+                }
+
+                // The widening group id `group_prefix` refuses (#277): there is no
+                // object to write, and writing the root would be the bug that
+                // issue exists for.
+                None => Err(Error::Api(ErrorCode::GroupIdNotFound)),
+            }
+        };
+
+        // #275: a failure here is an object-store failure, and they are
+        // overwhelmingly transient — a 503 SlowDown, a timeout, a 5xx.
+        // `UnknownServerError` is non-retriable in Kafka clients, so `commitSync`
+        // threw rather than retrying and a connector treating that as engine death
+        // restarted: a throttle burst turned into connector restarts. Answer the
+        // way produce already does.
+        //
+        // One write now covers every partition in the request, so the code it
+        // fails with covers them all too — which is what a client committing a
+        // batch already assumes when it retries the batch.
+        let commit_code = match stored {
+            Ok(()) => ErrorCode::None,
+            Err(error) => {
+                error!(?error, group_id, partitions = committable.len());
+                storage_error_code(&error)
+            }
+        };
+
+        Ok(resolved
+            .into_iter()
+            .map(|(topition, _, known)| {
+                let error_code = if known {
+                    commit_code
+                } else {
+                    ErrorCode::UnknownTopicOrPartition
+                };
+
+                (topition, error_code)
+            })
+            .collect())
     }
 
     async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
-        let mut topitions = vec![];
+        // The union of what the group's one offsets object holds and what the
+        // per-partition layout left behind (#406). The set has to be a union, not
+        // a preference: a group whose commits only ever landed in the new object
+        // has nothing under the `offsets/` prefix to list, and a group that has
+        // not committed since the upgrade has nothing in the new object — an
+        // `OffsetFetch(all)` that took either alone would answer empty for one of
+        // them, which is a consumer resuming from nothing.
+        let mut topitions: Vec<Topition> = match self.group_offsets(group_id)? {
+            Some(offsets) => offsets
+                .get_opt(&self.object_store)
+                .await
+                .inspect_err(|error| warn!(?error, group_id, "group offsets"))
+                .unwrap_or_default()
+                .map(|group| group.topitions().collect())
+                .unwrap_or_default(),
+
+            None => Vec::new(),
+        };
 
         {
             let location = Path::from(format!(
@@ -11304,6 +11497,9 @@ impl Storage for DynoStore {
             }
         }
 
+        topitions.sort();
+        topitions.dedup();
+
         self.offset_fetch(Some(group_id), topitions.as_ref(), Some(false))
             .await
     }
@@ -11327,38 +11523,63 @@ impl Storage for DynoStore {
             // store error stays retriable, not a fatal `-1`, #6/#129).
             const OFFSET_FETCH_CONCURRENCY: usize = 32;
 
+            // The group's one offsets object first (#406): one conditional GET,
+            // served from the etag memo, answers every partition it holds. What it
+            // does not hold falls through to that partition's own object below —
+            // which is how the layout migrates without a fold-everything pass,
+            // and why a rollback still finds the pre-upgrade offsets where it
+            // expects them.
+            let group = match self.group_offsets(group_id)? {
+                Some(offsets) => offsets
+                    .get_opt(&self.object_store)
+                    .await
+                    .inspect_err(|error| warn!(?error, group_id, "group offsets"))
+                    .unwrap_or_default()
+                    .unwrap_or_default(),
+
+                None => GroupOffsets::default(),
+            };
+
             // Eagerly collected to pin lifetimes under `async_trait` (see #147).
             let fetches = topics
                 .iter()
-                .map(|topition| async move {
-                    let location = Path::from(format!(
-                        "clusters/{}/groups/consumers/{}/offsets/{}/partitions/{:0>10}.json",
-                        self.cluster, group_id, topition.topic, topition.partition,
-                    ));
+                .map(|topition| {
+                    let held = group.get(topition).map(|commit| commit.offset);
 
-                    let offset = match self.object_store.get(&location).await {
-                        Ok(get_result) => get_result
-                            .bytes()
-                            .await
-                            .map_err(Error::from)
-                            .and_then(|encoded| {
-                                serde_json::from_slice::<OffsetCommitRequest>(&encoded[..])
-                                    .map_err(Error::from)
-                            })
-                            .map(|commit| commit.offset)
-                            .inspect_err(|error| error!(?error, ?group_id, ?topition)),
-
-                        Err(object_store::Error::NotFound { .. }) => Ok(-1),
-
-                        Err(error) => {
-                            error!(?error, ?group_id, ?topition);
-                            // Preserve the storage error so a transient S3
-                            // failure is retriable, not fatal `-1` (#6/#129).
-                            Err(Error::from(error))
+                    async move {
+                        if let Some(offset) = held {
+                            return Ok::<_, Error>((topition.to_owned(), offset));
                         }
-                    }?;
 
-                    Ok::<_, Error>((topition.to_owned(), offset))
+                        let location = Path::from(format!(
+                            "clusters/{}/groups/consumers/{}/offsets/{}/partitions/{:0>10}.json",
+                            self.cluster, group_id, topition.topic, topition.partition,
+                        ));
+
+                        let offset = match self.object_store.get(&location).await {
+                            Ok(get_result) => get_result
+                                .bytes()
+                                .await
+                                .map_err(Error::from)
+                                .and_then(|encoded| {
+                                    serde_json::from_slice::<OffsetCommitRequest>(&encoded[..])
+                                        .map_err(Error::from)
+                                })
+                                .map(|commit| commit.offset)
+                                .inspect_err(|error| error!(?error, ?group_id, ?topition)),
+
+                            Err(object_store::Error::NotFound { .. }) => Ok(-1),
+
+                            Err(error) => {
+                                error!(?error, ?group_id, ?topition);
+                                // Preserve the storage error so a transient S3
+                                // failure is retriable, not fatal `-1` (#6/#129).
+                                Err(Error::from(error))
+                            }
+                        }?;
+
+                        Ok::<_, Error>((topition.to_owned(), offset))
+                    }
                 })
                 .collect::<Vec<_>>();
 
@@ -11995,6 +12216,17 @@ impl Storage for DynoStore {
                 // and every generation's assignment. One sweep covers all of
                 // them because they share the prefix — which is also what makes
                 // `expire_groups` layout-agnostic.
+                // Drop the memoized handle with the group (#406). `with_mut`
+                // would self-heal a stale etag against a recreated group — the
+                // conditional PUT fails its precondition and re-reads — but the
+                // map would otherwise grow with group churn, and #45 measured
+                // ~15k orphaned groups accumulating.
+                _ = self
+                    .group_offsets
+                    .lock()
+                    .map(|mut handles| handles.remove(group_id))
+                    .inspect_err(|error| debug!(?error, group_id));
+
                 let deleted = self
                     .object_store
                     .delete_stream(locations)

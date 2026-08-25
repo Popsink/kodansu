@@ -32,10 +32,14 @@ const CLUSTER: &str = "tansu";
 const NODE: i32 = 111;
 const TOPIC: &str = "committed";
 
-/// Serves everything normally except a write under `.../offsets/`, which fails
-/// the way S3 answers a throttle burst. Only the offset PUT fails, so the topic
-/// metadata read ahead of it still succeeds and the commit reaches the write —
-/// which is the path under test.
+/// Serves everything normally except a write of a group's committed offsets,
+/// which fails the way S3 answers a throttle burst. Only that PUT fails, so the
+/// topic metadata read ahead of it still succeeds and the commit reaches the
+/// write — which is the path under test.
+///
+/// Both layouts are matched: `offsets.json` is the one object per group (#406)
+/// and `offsets/` the per-partition objects it replaced, which the read path
+/// still falls back to.
 struct ThrottledOffsetWrites {
     inner: InMemory,
 }
@@ -75,7 +79,7 @@ impl ObjectStore for ThrottledOffsetWrites {
         payload: PutPayload,
         options: PutOptions,
     ) -> Result<PutResult, object_store::Error> {
-        if location.as_ref().contains("/offsets/") {
+        if location.as_ref().contains("/offsets/") || location.as_ref().ends_with("/offsets.json") {
             return Err(Self::throttled());
         }
 
