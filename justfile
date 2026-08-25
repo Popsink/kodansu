@@ -60,6 +60,19 @@ test-group-scale *args:
     cargo nextest run --package tansu-broker --all-features \
       -E 'binary(group_scale)' --run-ignored all {{ args }}
 
+# What GCS costs that S3 does not, on a laptop, with no bucket.
+#
+# Two things: the fetch path is one serial ranged GET per segment, so its wall
+# clock is N x per-GET latency and GCS is where that first crosses a client
+# timeout; and the `gs` arm wraps the store in a 1-put/s/object rate limiter
+# whose cost is a *local* delay, so it is observable with no bucket either.
+#
+# `#[ignore]`d because it is wall clock rather than a regression gate: ~95s,
+# most of it the group-formation case.
+test-gcs *args:
+    cargo nextest run --package tansu-storage --all-features \
+      -E 'test(dynostore::tests::gcs::)' --run-ignored all --no-capture {{ args }}
+
 # The storage suite against minio, the closest thing to S3 that runs on a laptop.
 #
 # Deliberately NOT on the PR path: it needs Docker, and `pr.yml`'s `test` job is
