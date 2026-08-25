@@ -126,7 +126,13 @@ pub(super) fn key_class(path: &Path) -> &'static str {
         // series. Ordered most-specific first, and the bare group state object
         // (the pre-#359 `{group}.json`, and the prefix a widening listing walks)
         // keeps `group`.
-        if path.contains("/offsets/") {
+        // Both offset layouts, because #415 landed the one-object form *after*
+        // this sub-class was written for the per-partition tree, and
+        // `offsets.json` contains no `/offsets/` — so every write of the layout
+        // #406 exists to measure was being labelled bare `group`, and
+        // `group_offsets` at zero read as "the new layout is not being written"
+        // when it meant the opposite.
+        if path.contains("/offsets/") || path.ends_with("/offsets.json") {
             "group_offsets"
         } else if path.contains("/members/") {
             "group_member"
@@ -840,6 +846,13 @@ mod tests {
     #[test]
     fn key_class_decomposes_the_group_plane() {
         for (path, expected) in [
+            // Both layouts (#415 and the per-partition tree it replaces): the
+            // plane has to be one series across the migration, or the release
+            // that shrinks it cannot be read.
+            (
+                "clusters/c/groups/consumers/g/offsets.json",
+                "group_offsets",
+            ),
             (
                 "clusters/c/groups/consumers/g/offsets/t/partitions/0000000000.json",
                 "group_offsets",
