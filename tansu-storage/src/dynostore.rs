@@ -1221,6 +1221,14 @@ static FLUSH_CAS_CONFLICTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// and returned a retriable error to the producer (#157). Every increment is a
 /// failed produce round-trip, so this is the alerting signal for the
 /// contention/wedge class.
+///
+/// Labelled by `prefix` and by `spent` (#401): the log line already said which
+/// prefix and where the budget went, but the counter said neither, so a fleet
+/// running 9 of these an hour could not attribute one without grepping ten
+/// replicas' logs. `spent` is `elapsed` when the wall clock was actually spent
+/// and `projected` when the loop declined to *start* an attempt the slowest
+/// observed one said could not finish — on the fleet that projection ends about
+/// a third of them, and the two want different fixes.
 static FLUSH_CAS_EXHAUSTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_prefix_flush_cas_exhausted")
@@ -4713,6 +4721,79 @@ impl DynoStore {
         self.refresh_prefix_index_inner(prefix, true).await
     }
 
+    /// Fold exactly one segment's footer into the prefix index, answering
+    /// whether it landed (#401).
+    ///
+    /// This is the fold for a writer that already has *proof* the segment
+    /// exists — a create that came back `AlreadyExists` — and so needs neither
+    /// the tail probe's absence chain nor the always-fresh seq-floor read that
+    /// makes the absence a proof ([`Self::probe_prefix_tail`]). One ranged
+    /// footer GET, and `folded_max` advances by one.
+    ///
+    /// `false` means the caller should fall back to the full refresh: an
+    /// unreadable or undecodable footer at a sequence a create says is occupied
+    /// is exactly the `stalled` case the loop's own diagnostics exist for, and
+    /// the LIST path is where that is resolved. So this can only be faster than
+    /// a refresh, never a substitute for one that answers differently.
+    ///
+    /// Only `refreshed_at` is stamped, as the probe does: folding can add a
+    /// segment but never reflect a peer's deletion, so the index generation —
+    /// and with it the certified seq floor keeping the LATEST path off
+    /// `watermark.json` — stays valid.
+    async fn fold_segment_footer(&self, prefix: &str, seq: u64) -> bool {
+        let location = self.segment_location(prefix, seq);
+
+        let result = match self
+            .object_store
+            .get_opts(
+                &location,
+                GetOptions {
+                    range: Some(GetRange::Suffix(
+                        SEGMENT_FOOTER_OVER_READ.max(SEGMENT_TRAILER_LEN) as u64,
+                    )),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                debug!(?error, prefix, seq, "folding the winner's footer");
+                return false;
+            }
+        };
+
+        let last_modified_ms = result.meta.last_modified.timestamp_millis();
+
+        let Ok(bytes) = result.bytes().await.inspect_err(|error| {
+            debug!(?error, prefix, seq, "folding the winner's footer body");
+        }) else {
+            return false;
+        };
+
+        let Ok(Some(footer)) = self.decode_segment_footer(&bytes).inspect_err(|error| {
+            debug!(?error, prefix, seq, "decoding the winner's footer");
+        }) else {
+            return false;
+        };
+
+        let Ok(mut index) = self.prefix_index.lock() else {
+            return false;
+        };
+
+        let entry = index.entry(prefix.to_owned()).or_default();
+        _ = entry.segments.insert(
+            seq,
+            CachedSegment {
+                footer,
+                last_modified_ms,
+            },
+        );
+        entry.refreshed_at = Some(SystemTime::now());
+
+        true
+    }
+
     /// Whether the cached prefix index is within its freshness TTL, plus the
     /// incremental-listing watermark (highest known sequence).
     fn prefix_index_freshness(&self, prefix: &str) -> Result<(bool, Option<u64>)> {
@@ -6297,12 +6378,22 @@ impl DynoStore {
         let mut stalled = 0usize;
         let mut last_candidate: Option<u64> = None;
 
+        // Which of the two budget guards ended the loop, for the counter (#401).
+        // `attempts` is the third: `MAX_ATTEMPTS` reached without either clock
+        // guard firing, which no production sample has ever shown.
+        let mut spent = "attempts";
+
         // Where the budget actually went (#192). `conflicts`/`ambiguous_lost`/
         // `stalled` say why the loop *retried*; without these, a flush starved by
         // one slow PUT and a flush losing races look identical in the log, which
         // is what made #192 read as contention when contention was near zero.
         let mut attempts_made = 0usize;
         let mut slowest_attempt = Duration::ZERO;
+
+        // The sequence a peer's create was proved to hold, carried into the next
+        // attempt so it can fold that footer instead of re-proving the tail
+        // (#401). See the fold below.
+        let mut won_by_peer: Option<u64> = None;
         let mut put_elapsed = Duration::ZERO;
         let mut put_bytes = 0u64;
         let mut backoff_elapsed = Duration::ZERO;
@@ -6323,7 +6414,12 @@ impl DynoStore {
             //   case the arms below exist to resolve.
             if attempts_made >= Self::MIN_FLUSH_ATTEMPTS {
                 let elapsed = started.elapsed();
-                if elapsed >= max_elapsed || elapsed + slowest_attempt > max_elapsed {
+                if elapsed >= max_elapsed {
+                    spent = "elapsed";
+                    break;
+                }
+                if elapsed + slowest_attempt > max_elapsed {
+                    spent = "projected";
                     break;
                 }
             }
@@ -6332,8 +6428,28 @@ impl DynoStore {
             attempts_made += 1;
 
             // Fold-before-claim: observe every live segment so the candidate
-            // sequence and the derived bases reflect all writers, not a stale view.
-            if let Err(error) = self.refresh_prefix_index_forced(prefix).await {
+            // sequence and the derived bases reflect all writers, not a stale
+            // view.
+            //
+            // On a retry after a lost create the full refresh is more than the
+            // situation needs (#401). The PUT already *proved* which sequence a
+            // peer holds, so the only new information is that segment's footer:
+            // folding it advances `folded_max` by one and the next candidate
+            // follows, without the tail probe's absence chain or the
+            // always-fresh seq-floor read that makes an absence a proof. One
+            // ranged GET where the refresh costs three or four round trips —
+            // and the fleet's exhaustion samples spend 88 % of a flush neither
+            // in the PUT nor in the backoff, so the round trips are the budget.
+            //
+            // A fold that does not land falls through to the refresh, so the
+            // worst case is today's cost, and the `stalled` diagnostics still
+            // see a sequence this writer cannot resolve.
+            let folded = match won_by_peer.take() {
+                Some(seq) => self.fold_segment_footer(prefix, seq).await,
+                None => false,
+            };
+
+            if !folded && let Err(error) = self.refresh_prefix_index_forced(prefix).await {
                 return Self::fail_prefix_flush(buffer, error, prefix);
             }
             // Derive the candidate from the index the forced refresh just folded
@@ -6506,6 +6622,13 @@ impl DynoStore {
                     } else {
                         conflicts += 1;
                     }
+
+                    // A peer holds `candidate` — `resolve_segment_create` has
+                    // established that for both arms, the ambiguous one by
+                    // reading a footer that was not ours. So the next attempt
+                    // folds that one segment rather than re-proving the tail
+                    // (#401).
+                    won_by_peer = Some(candidate);
                     slowest_attempt = slowest_attempt.max(attempt_started.elapsed());
                     FLUSH_CAS_CONFLICTS.add(1, &[]);
                     // Yield briefly, jittered (#157): N replicas flushing this
@@ -6527,7 +6650,13 @@ impl DynoStore {
             }
         }
 
-        FLUSH_CAS_EXHAUSTED.add(1, &[]);
+        FLUSH_CAS_EXHAUSTED.add(
+            1,
+            &[
+                KeyValue::new("prefix", prefix.to_string()),
+                KeyValue::new("spent", spent),
+            ],
+        );
         // Arm-attributed at error level so production (warn) can tell the modes
         // apart without a debug bump (#157): `conflicts` = peers won the create,
         // `ambiguous_lost` = the PUT was ambiguous and a peer's footer was there,
@@ -6554,11 +6683,18 @@ impl DynoStore {
             backoff_ms = backoff_elapsed.as_millis(),
             slowest_attempt_ms = slowest_attempt.as_millis(),
             budget_ms = max_elapsed.as_millis(),
+            spent,
             "leaseless flush exhausted retries"
         );
         // Retriable: exhaustion here is pure create-CAS contention (a transport
         // error fails fast retriably above), so tell the client to back off and
         // retry rather than dropping the batch on a fatal code (#6/#129).
+        //
+        // There is deliberately no fallback to a leased write here (#401's
+        // direction 2): the produce lease was removed in #177 and the create-CAS
+        // *is* the offset arbiter, so there is no other path to take. What makes
+        // this terminal rarer is fitting more attempts inside the same budget,
+        // which is what the winner-fold above does.
         Self::fail_prefix_flush(buffer, Error::Api(ErrorCode::KafkaStorageError), prefix)
     }
 

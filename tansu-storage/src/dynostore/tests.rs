@@ -27,6 +27,7 @@ mod compact_segments;
 mod corrupt_region;
 mod delete_groups;
 mod divergent_batch;
+mod flush_conflict;
 mod group_describe;
 mod group_documents;
 mod group_expiry;
