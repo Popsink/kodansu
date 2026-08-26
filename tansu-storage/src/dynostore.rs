@@ -1404,11 +1404,20 @@ static SEGMENT_FOOTER_UNDECODABLE: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// Sub-stream regions whose bytes are not the batch frames their footer entry
 /// claims (#386) — a `byte_start` that does not point at a frame header.
 ///
-/// Expected to be zero. Nonzero is a data-integrity failure on the write side (a
-/// segment rewrite whose footer and payload disagree), not something a read can
-/// repair, and each occurrence costs a partition a `CORRUPT_MESSAGE` answer. Paired
-/// with [`SEGMENT_REGION_TRUNCATED`], which is the *other* cause of the same
-/// symptom: this counter moving means the object was whole and the index was wrong.
+/// Counts the **attempt**, before the cause is known. It used to be documented as
+/// "expected to be zero; nonzero is a data-integrity failure on the write side",
+/// and that reading is what sent #395 and #397 after a write-side bug twice: the
+/// fleet's population turned out to be intact objects read through an index entry
+/// that belonged to a different segment (#432). Either cause produces this
+/// counter, and each occurrence costs a partition a `CORRUPT_MESSAGE` answer that
+/// a Kafka client retries at the same offset.
+///
+/// Read it against [`SEGMENT_INDEX_ENTRIES_CORRECTED`], which is the subset the
+/// object's own trailer proved was an index fault
+/// ([`DynoStore::resolve_corrupt_region`]). The difference between the two is the
+/// write-side population — #395's husks — and only that difference is
+/// unrecoverable. Paired with [`SEGMENT_REGION_TRUNCATED`], which is the same
+/// symptom reached by an entry that over-states rather than under-states.
 static SEGMENT_REGION_CORRUPT: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_prefix_segment_regions_corrupt")
@@ -6019,10 +6028,33 @@ impl DynoStore {
                             break;
                         }
 
-                        // Damage here answers this partition `CORRUPT_MESSAGE`
-                        // (#386) instead of propagating a bare integer-conversion
-                        // failure that took the request and the connection with it.
-                        self.decode_region(&prefix, seq, &entry, encoded)?
+                        // A full-length region that holds no frame is the *same*
+                        // index/object disagreement as the short read above, and
+                        // the branch above cannot see it: an entry that
+                        // under-states a healthy frame is served in full, so
+                        // `read_len == byte_len` (#432). Ask the object's own
+                        // trailer here too, and restart off a corrected entry —
+                        // otherwise a wrong entry is a `CORRUPT_MESSAGE` that the
+                        // client retries at the same offset, forever.
+                        //
+                        // Damage that survives the trailer still answers this
+                        // partition `CORRUPT_MESSAGE` (#386) rather than
+                        // propagating a bare integer-conversion failure that took
+                        // the request, and the connection, with it.
+                        match self.decode_region(&prefix, seq, &entry, encoded) {
+                            Ok(decoded) => decoded,
+
+                            Err(Error::CorruptSegment(corrupt)) => {
+                                self.resolve_corrupt_region(
+                                    &prefix, seq, &entry, &location, corrupt,
+                                )
+                                .await?;
+                                restart = true;
+                                break;
+                            }
+
+                            Err(otherwise) => return Err(otherwise),
+                        }
                     }
 
                     // Deleted between locate and read (compaction #66 / retention
@@ -9745,11 +9777,95 @@ impl DynoStore {
             )));
         }
 
-        // The index served an entry that does not belong to this object. Replace
-        // the whole cached footer, not just this sub-stream's entry: if one entry
-        // came from another payload they all did, and a footer half from each
-        // would be a third thing that describes nothing.
-        //
+        // The index served an entry that does not belong to this object.
+        self.adopt_segment_trailer(prefix, seq, entry, footer)
+    }
+
+    /// Resolve a **full-length** region that holds no whole batch against the
+    /// object's own trailer (#432), the way [`Self::resolve_short_region`]
+    /// already resolves a short one.
+    ///
+    /// #403 built that mechanism on the short-read arm alone, because the
+    /// population it was aimed at *over*-stated the region: the ranged GET came
+    /// back short, and `read_len < byte_len` was the tell. The discriminator run
+    /// on #397 then found the other half of the same fault — an entry that
+    /// **under**-states a healthy frame. The GET returns those bytes in full, so
+    /// `read_len == byte_len`, the short arm never fires, and the frame decoder
+    /// correctly reports that the truncated span holds no whole batch. Same
+    /// index/object disagreement, opposite sign, and the arm that could ask the
+    /// authority was the one that never saw it.
+    ///
+    /// The verdict is the same discrimination against the same authority:
+    ///
+    /// - **the index is wrong.** The trailer describes this object differently —
+    ///   a different extent for this sub-stream, or no region for it at all.
+    ///   Re-index the segment from the trailer and let the caller retry:
+    ///   `Ok(())`.
+    /// - **the object is wrong.** The trailer claims exactly what the index
+    ///   claimed and the bytes still hold no frame — #395's husk population. The
+    ///   original verdict stands and the read is answered `CORRUPT_MESSAGE`.
+    ///
+    /// Why this arm matters more than the short one: a `CORRUPT_MESSAGE` is
+    /// retried by a Kafka client **at the same offset**, so a partition served
+    /// through a wrong entry never advances. Its only exits were compaction
+    /// merging the object away or retention expiring it, and the second skips
+    /// every record in between. Measured on `1.0.0-alpha.4`: five partitions
+    /// across four replicas re-reading one segment each at ~100/minute, against
+    /// 41 285 corrupt reads on the brokers in 25.5 h.
+    async fn resolve_corrupt_region(
+        &self,
+        prefix: &str,
+        seq: u64,
+        entry: &SubstreamEntry,
+        location: &Path,
+        corrupt: Box<CorruptRegion>,
+    ) -> Result<()> {
+        // No trailer is no authority: the original verdict is the only one
+        // available, and it is the honest one.
+        let Some(footer) = self.read_segment_footer(location).await? else {
+            return Err(Error::CorruptSegment(corrupt));
+        };
+
+        // A trailer holding no region for this sub-stream at all is the loudest
+        // form of the fault — the entry belongs to another object outright, which
+        // is what the #397 discriminator found (40 sub-streams in the object, and
+        // the index named a 41st). An entry present but at a different extent is
+        // the same fault seen through a partial overlap.
+        let disagrees = footer
+            .get(&entry.topic, entry.partition)
+            .is_none_or(|own| own.byte_start != entry.byte_start || own.byte_len != entry.byte_len);
+
+        if !disagrees {
+            return Err(Error::CorruptSegment(corrupt));
+        }
+
+        self.adopt_segment_trailer(prefix, seq, entry, footer)
+    }
+
+    /// Replace this segment's cached footer with the object's own trailer, after
+    /// one of the resolvers above has established that the index entry the read
+    /// was issued from does not belong to this object (#397, #432).
+    ///
+    /// Replaces the **whole** cached footer, not just this sub-stream's entry: if
+    /// one entry came from another payload they all did, and a footer half from
+    /// each would be a third thing that describes nothing.
+    fn adopt_segment_trailer(
+        &self,
+        prefix: &str,
+        seq: u64,
+        entry: &SubstreamEntry,
+        footer: SegmentFooter,
+    ) -> Result<()> {
+        // Read out before the footer is moved into the index.
+        let trailer = footer.get(&entry.topic, entry.partition).map(|own| {
+            (
+                own.byte_start,
+                own.byte_len,
+                own.base_offset,
+                own.record_count,
+            )
+        });
+
         // The append time is preserved from the cached segment where there is one,
         // because whole-segment retention (#61) decides expiry on it and a `0`
         // here would read as "ancient" and delete a live segment.
@@ -9774,7 +9890,7 @@ impl DynoStore {
             topic = entry.topic,
             partition = entry.partition,
             indexed = ?(entry.byte_start, entry.byte_len, entry.base_offset, entry.record_count),
-            trailer = ?(own.byte_start, own.byte_len, own.base_offset, own.record_count),
+            ?trailer,
             "footer index entry did not belong to this object; taking the object's own trailer"
         );
 
