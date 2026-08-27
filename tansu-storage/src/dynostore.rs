@@ -4778,8 +4778,34 @@ impl DynoStore {
         // bytes that costs in re-uploads.
         let mut conflicts = 0u64;
 
+        // #77's invariant is that a sequence name freed by retention or
+        // compaction is never reused, and it needs a floor observed *after* the
+        // tail. The hint cannot supply one. `set_seq` only ever rises within
+        // *this* process, and nothing else touches `segment_seqs` — so a peer's
+        // `retire_segments`, which raises the durable floor write-ahead of the
+        // delete and frees every name below it, is invisible here. A create at
+        // such a name then **succeeds**: the create-only CAS proves the name is
+        // unoccupied, which is not the same as fresh. Every replica still
+        // caching the retired segment's footer under that name then serves it
+        // against the reborn object — which is #432, and #77's own comment
+        // predicted it verbatim.
+        //
+        // Read the floor live rather than through `certified_seq_floor`. That
+        // cache is keyed on the index generation, and `index_insert` — the
+        // writer fast path every create takes — does not bump it, so a peer's
+        // raise can stay uncertified for as long as this process neither lists
+        // nor prunes. A floor that is merely *usually* fresh does not establish
+        // an invariant whose failure is a wrong offset.
+        //
+        // One GET per compaction create is what that costs, and this is not the
+        // produce path: the leaseless flush derives every candidate from
+        // `tail_next_seq_folded`, which has folded the floor all along. #116's
+        // saving lives there and is untouched.
         let mut candidate = match self.cached_seq(prefix)? {
-            Some(seq) => seq,
+            Some(seq) => seq.max(self.read_seq_floor(prefix).await?),
+
+            // Already folded: `tail_next_seq` reads the floor live, after its
+            // listing.
             None => self.tail_next_seq(prefix).await?,
         };
 
