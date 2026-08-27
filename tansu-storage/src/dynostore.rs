@@ -1372,6 +1372,26 @@ static FLUSH_CAS_EXHAUSTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Conditional writes that lost the CAS to an object which was then deleted
+/// before the winner's value could be read back (#431), by key `class`.
+///
+/// The condition was logged and not counted, so a fleet running ~17/h of them
+/// across five of ten replicas was invisible on every dashboard and could only
+/// be found by grepping. Each one used to end a connection with no response
+/// written — see [`DynoStore::put`].
+///
+/// Expected to be small and non-zero: it is a genuine race between a CAS and a
+/// delete, and both are things the group plane does continuously. A rate that
+/// tracks `class="group_member"` is the session sweep meeting a rejoin; one on
+/// `class="group_assignment"` is `delete_group_assignments_before` meeting a
+/// `SyncGroup` for the generation it is sweeping.
+static CONDITIONAL_PUT_VANISHED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_conditional_put_vanished")
+        .with_description("conditional writes whose lost-CAS re-read found the object deleted")
+        .build()
+});
+
 /// Index entries dropped by a reconciling listing because their objects are gone
 /// (#408), by `prefix`.
 ///
@@ -7505,7 +7525,12 @@ impl DynoStore {
             {
                 Ok(_) => return Ok(()),
 
-                Err(UpdateError::Outdated { .. }) => {
+                // `Vanished` is the same instruction as `Outdated` here and for
+                // the same reason: this is a read-modify-write loop, so the next
+                // attempt re-reads. It finds the object absent, `version` is
+                // `None`, and the put becomes a `PutMode::Create` — which is
+                // exactly what re-applying onto "there is no value" means (#431).
+                Err(UpdateError::Outdated { .. } | UpdateError::Vanished) => {
                     debug!(attempt, cluster = self.cluster, "acl update lost the CAS");
                     sleep(Duration::from_millis(5 * u64::from(1 + attempt))).await;
                 }
@@ -7570,7 +7595,12 @@ impl DynoStore {
             {
                 Ok(_) => return Ok(()),
 
-                Err(UpdateError::Outdated { .. }) => {
+                // `Vanished` is the same instruction as `Outdated` here and for
+                // the same reason: this is a read-modify-write loop, so the next
+                // attempt re-reads. It finds the object absent, `version` is
+                // `None`, and the put becomes a `PutMode::Create` — which is
+                // exactly what re-applying onto "there is no value" means (#431).
+                Err(UpdateError::Outdated { .. } | UpdateError::Vanished) => {
                     debug!(attempt, cluster = self.cluster, "quota update lost the CAS");
                     sleep(Duration::from_millis(5 * u64::from(1 + attempt))).await;
                 }
@@ -10515,10 +10545,29 @@ impl DynoStore {
 
             Err(object_store::Error::Precondition { .. })
             | Err(object_store::Error::AlreadyExists { .. }) => {
-                let (current, version) = self
-                    .get(location)
-                    .await
-                    .inspect_err(|error| error!(%location, ?error))?;
+                // The re-read hands the caller the winner's value so the retry
+                // can re-apply onto it. It can also find nothing: the object was
+                // deleted between the failed CAS and this read — a member the
+                // session sweep reaped, an assignment
+                // `delete_group_assignments_before` swept — and *that is an
+                // answer*, not a fault (#431).
+                //
+                // It used to be `?`, so the 404 propagated as a raw
+                // `ObjectStore` error: not `Outdated`, so no retry loop absorbed
+                // it, and `Severity::Failure` at the boundary, so the connection
+                // ended with **no response written**. A Kafka client cannot
+                // retry an error code it never received; it reconnects and
+                // replays, which is the #219 wedge shape. Measured at ~17/h
+                // across five of ten replicas on `1.0.0-alpha.4`, every one of
+                // them a `JoinGroup`/`Heartbeat`-class call.
+                let Some((current, version)) = Self::absent_is_none(self.get(location).await)
+                    .inspect_err(|error| error!(%location, ?error))?
+                else {
+                    CONDITIONAL_PUT_VANISHED.add(1, &[KeyValue::new("class", key_class(location))]);
+                    debug!(%location, ?value, "lost the CAS to an object that was then deleted");
+
+                    return Err(UpdateError::Vanished);
+                };
 
                 debug!(%location, ?value, ?current);
 
@@ -12595,6 +12644,27 @@ impl Storage for DynoStore {
                 Ok(AssignmentOutcome::AlreadyExists(current))
             }
 
+            // The winner's assignment was deleted before it could be read back,
+            // and the only thing that deletes one is
+            // `delete_group_assignments_before` — so the group has already moved
+            // past this generation and there is nothing here to adopt (#431).
+            //
+            // That is the same situation the caller's own post-create fence
+            // answers, so give it the same retriable code rather than a value it
+            // would have to invent: `RebalanceInProgress` is `Severity::Expected`
+            // at the boundary, so the client is *told* to re-join instead of
+            // having its connection dropped.
+            Err(UpdateError::Vanished) => {
+                debug!(
+                    group_id,
+                    generation_id,
+                    sync_outcome = ?ErrorCode::RebalanceInProgress,
+                    "the assignment this create lost to was swept",
+                );
+
+                Err(Error::Api(ErrorCode::RebalanceInProgress))
+            }
+
             Err(UpdateError::Error(error)) => Err(error),
             Err(UpdateError::SerdeJson(error)) => Err(Error::SerdeJson(error)),
             Err(UpdateError::Uuid(error)) => Err(Error::Uuid(error)),
@@ -12830,6 +12900,17 @@ impl Storage for DynoStore {
                     }
 
                     Err(UpdateError::Outdated { current, .. }) => refuse(current.version),
+
+                    // Nothing in this codebase deletes the layout claim, so this
+                    // is the arm that should never run — but it is the arm where
+                    // folding `Vanished` into `Outdated` with a defaulted
+                    // document would be actively harmful: `GroupSchema::default()`
+                    // is version 0, `refuse` would fire, and the broker would
+                    // reject the cluster's group layout over a document nobody
+                    // wrote (#431). Named, not defaulted, and not `unreachable!()`.
+                    Err(UpdateError::Vanished) => Err(Error::Message(String::from(
+                        "the consumer group layout claim was deleted while being claimed",
+                    ))),
 
                     Err(UpdateError::Error(error)) => Err(error),
                     Err(UpdateError::SerdeJson(error)) => Err(Error::SerdeJson(error)),

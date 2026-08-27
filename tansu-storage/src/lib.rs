@@ -2454,7 +2454,27 @@ pub enum UpdateError<T> {
 
     MissingEtag,
 
-    Outdated { current: Box<T>, version: Version },
+    Outdated {
+        current: Box<T>,
+        version: Version,
+    },
+
+    /// The conditional write lost, and the object it lost to was **gone** by the
+    /// time the winner's value was read back (#431).
+    ///
+    /// Distinct from [`Self::Outdated`] on purpose, and the distinction is not
+    /// cosmetic. `Outdated` says *"a peer holds a different value, here it is"*;
+    /// this says *"there is no value"*, and a caller that acts on the two the
+    /// same way is wrong in at least one place. `assert_group_schema` is the
+    /// proof: folding this into `Outdated` with a defaulted document would hand
+    /// it `GroupSchema { version: 0 }` and it would **refuse the cluster's group
+    /// layout** over a document nobody wrote.
+    ///
+    /// For a CAS retry loop the answer is almost always the same as `Outdated` —
+    /// re-read and re-apply, which now takes `PutMode::Create` — but it has to
+    /// be said at each call site rather than assumed, which is why this is a
+    /// variant and not a defaulted value.
+    Vanished,
 
     SerdeJson(Arc<serde_json::Error>),
 

@@ -893,6 +893,13 @@ where
             // fresh as this one, so there is nothing to redo.
             Err(UpdateError::Outdated { .. }) => Ok(()),
 
+            // The document was reaped between this read and this write — the
+            // sweep found the session lapsed. That is the same answer the
+            // `read_group_member` guard above gives when the document is already
+            // gone: there is nothing to renew, and the membership is the sweep's
+            // to reclaim (#431).
+            Err(UpdateError::Vanished) => Ok(()),
+
             Err(error) => Err(update_error(error)),
         }
     }
@@ -992,8 +999,10 @@ where
             }
 
             // Another replica swept first, or the group moved. Either way its
-            // verdict was computed from the same documents as ours.
-            Err(UpdateError::Outdated { .. }) => (),
+            // verdict was computed from the same documents as ours — and a
+            // generation document that has gone entirely says the same thing
+            // more loudly (#431).
+            Err(UpdateError::Outdated { .. } | UpdateError::Vanished) => (),
 
             Err(error) => return Err(update_error(error)),
         }
@@ -1307,6 +1316,11 @@ fn update_error<T>(error: UpdateError<T>) -> Error {
         UpdateError::Uuid(uuid) => Error::Message(format!("uuid: {uuid}")),
         UpdateError::MissingEtag => Error::Message(String::from("missing e-tag")),
         UpdateError::Outdated { .. } => Error::Message(String::from("outdated")),
+        // Every caller that can meet one handles it before reaching here (#431).
+        // Reaching this is a call site that forgot, so it is named rather than
+        // folded into "outdated" — the two mean different things and the whole
+        // point of the variant is that a caller must say which it is acting on.
+        UpdateError::Vanished => Error::Message(String::from("vanished")),
     }
 }
 
@@ -1673,7 +1687,11 @@ where
                     // through the same backoff as a generation conflict, so a
                     // member whose two requests are chasing each other does not
                     // spin against the store.
-                    Err(UpdateError::Outdated { .. }) => {
+                    // `Vanished` takes the same path: the loop re-reads, finds
+                    // no held document, and writes with `None` — a create, which
+                    // is what re-registering a member whose document was reaped
+                    // mid-join means (#431).
+                    Err(UpdateError::Outdated { .. } | UpdateError::Vanished) => {
                         self.generation_conflict(group_id, "join_member_outdated", &mut conflicts)
                             .await;
                         continue;
@@ -1703,7 +1721,7 @@ where
                         };
                     }
 
-                    Err(UpdateError::Outdated { .. }) => {
+                    Err(UpdateError::Outdated { .. } | UpdateError::Vanished) => {
                         self.generation_conflict(group_id, "join_outdated", &mut conflicts)
                             .await;
                         continue;
@@ -1996,7 +2014,7 @@ where
                     return Ok(body);
                 }
 
-                Err(UpdateError::Outdated { .. }) => {
+                Err(UpdateError::Outdated { .. } | UpdateError::Vanished) => {
                     if conflicts >= MAX_GENERATION_CAS_ATTEMPTS {
                         return Err(Error::Api(ErrorCode::RebalanceInProgress));
                     }
