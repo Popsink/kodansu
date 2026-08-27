@@ -39,9 +39,21 @@
 //!    offsets, so say so instead of serving part of the region as the whole
 //!    thing.
 //!
-//! The discriminator has not been run against a production object, so which case
-//! the fleet's ~900 damaged segments are in is still unrecorded. These tests pin
-//! both answers, which is what makes shipping the read path correct without it.
+//! The discriminator has since been run against a live affected object and the
+//! verdict is **case 1**: the object was perfectly well formed — 40 sub-streams,
+//! regions plus footer plus trailer summing to exactly its length — and the index
+//! named a 41st that was not in it. So there is nothing in the bucket to repair;
+//! what there is, is an index entry that can name another segment's footer, which
+//! #432 traces to a freed sequence being re-created.
+//!
+//! That verdict also found the half this arm could not reach. An over-claiming
+//! entry makes the ranged GET come back **short**, and `read_len < byte_len` is
+//! what sends it to the trailer. An entry that **under**-states a healthy frame is
+//! served in full, so `read_len == byte_len`, the discriminator above never fires,
+//! and the read answered `CORRUPT_MESSAGE` for an intact object — which a Kafka
+//! client retries at the same offset, so that partition never advanced again. The
+//! fleet ran five of those at once. Both arms now resolve against the trailer, and
+//! these tests pin all four answers.
 
 use std::time::Duration;
 
@@ -329,6 +341,230 @@ async fn a_region_running_past_its_object_never_shifts_the_offsets_above_it() ->
             .iter()
             .map(|batch| batch.base_offset)
             .collect::<Vec<_>>()
+    );
+
+    Ok(())
+}
+
+/// Rewrite segment `seq` so its **own** trailer claims only `byte_len` bytes for
+/// each sub-stream, leaving the record body untouched.
+///
+/// The mirror of [`make_over_claiming`], and case 2 of the *full-length* arm: the
+/// object is the liar in the other direction, so index and trailer agree on a
+/// span that holds no whole frame and the read has nowhere else to look.
+async fn make_under_claiming(bucket: &InMemory, seq: u64, byte_len: u64) -> Result<()> {
+    let location = segment_path(seq);
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
+
+    let mut footer = store
+        .read_segment_footer(&location)
+        .await?
+        .expect("a segment trailer");
+
+    // Summed before the claims are shrunk: the record bytes stay exactly as they
+    // were written, which is what makes this an entry fault and not a short
+    // object.
+    let body: u64 = footer.entries.iter().map(|entry| entry.byte_len).sum();
+    for entry in &mut footer.entries {
+        entry.byte_len = byte_len;
+    }
+
+    let object = bucket.get(&location).await?.bytes().await?;
+    let mut rewritten = object.slice(..body as usize).to_vec();
+    rewritten.extend_from_slice(&trailered(&footer));
+
+    _ = bucket
+        .put(&location, PutPayload::from(Bytes::from(rewritten)))
+        .await?;
+
+    Ok(())
+}
+
+/// Case 1 through the **full-length** arm (#432): an entry that under-states a
+/// healthy frame.
+///
+/// This is the half #403 could not reach. An over-claiming entry makes the ranged
+/// GET come back short, and `read_len < byte_len` is what sends it to the
+/// trailer. An *under*-claiming entry is served in full — `read_len == byte_len`
+/// — so the short arm never fires, the frame decoder correctly reports that the
+/// truncated span holds no whole batch, and the read used to answer
+/// `CORRUPT_MESSAGE` for an object that is perfectly intact.
+///
+/// The fleet's own numbers: `byte_len: 477, read_len: 477, at: 0, declared:
+/// Some(2170)` — a healthy 2 170-byte frame read through an entry claiming 477.
+/// A Kafka client retries a corrupt-record error at the same offset, so that
+/// partition never advanced again.
+#[tokio::test]
+async fn an_under_claiming_index_entry_loses_to_the_objects_own_trailer() -> Result<(), Error> {
+    let _guard = super::init_tracing()?;
+
+    let bucket = InMemory::new();
+    let store = new_store(&bucket);
+    create_topic(&store, TOPIC).await?;
+    let tp = Topition::new(TOPIC, 0);
+
+    _ = store.produce(None, &tp, batch("v0")?).await?;
+    assert_eq!(1, segments(&bucket).await.len());
+
+    // Poison this process's cached footer: the same region, claiming 20 of the
+    // bytes it has. Wide enough that a `batch_length` is still read, so the
+    // decoder reports `Malformed { at: 0, declared }` exactly as the fleet does.
+    let mut footer = store
+        .read_segment_footer(&segment_path(0))
+        .await?
+        .expect("a segment trailer");
+    let honest = footer.entries[0].byte_len;
+    assert!(honest > 20, "the frame must out-run the claim: {honest}");
+    footer.entries[0].byte_len = 20;
+    store.index_insert(PREFIX, 0, footer, 0)?;
+
+    // Without the trailer lookup this is `CORRUPT_MESSAGE`, forever.
+    let fetched = fetch_from(&store, &tp, 0).await?;
+    assert_eq!(1, fetched.len());
+    assert_eq!(0, fetched[0].base_offset);
+
+    // The entry left behind is the object's own, so the wedge does not re-form on
+    // the next read.
+    assert_eq!(
+        honest,
+        store
+            .read_segment_footer(&segment_path(0))
+            .await?
+            .expect("a segment trailer")
+            .entries[0]
+            .byte_len
+    );
+    assert_eq!(1, fetch_from(&store, &tp, 0).await?.len());
+
+    Ok(())
+}
+
+/// The shape the #397 discriminator actually found: the object holds no region
+/// for the sub-stream at all.
+///
+/// One segment, read whole from the bucket, held 40 sub-streams — and the index
+/// named a 41st that was not among them, pointed at `byte_start: 0`, and decoded
+/// the *first* sub-stream's frame through it. Nothing repairs that by reading
+/// harder; the trailer has to be asked whether the sub-stream is there.
+///
+/// What the fix has to buy is the partition **advancing**. The records that
+/// object never held are not recoverable from it — but everything above the bad
+/// entry is, and before this the consumer never reached them: it retried
+/// `CORRUPT_MESSAGE` at the same offset until compaction merged the object away
+/// or retention expired it seven days later.
+#[tokio::test]
+async fn an_entry_for_a_substream_the_object_does_not_hold_is_read_past() -> Result<(), Error> {
+    let _guard = super::init_tracing()?;
+
+    let bucket = InMemory::new();
+    let store = new_store(&bucket);
+    create_topic(&store, TOPIC).await?;
+    let tp = Topition::new(TOPIC, 0);
+
+    for i in 0..3 {
+        _ = store.produce(None, &tp, batch(&format!("v{i}"))?).await?;
+    }
+    assert_eq!(3, segments(&bucket).await.len());
+
+    // Segment 1's object names a different sub-stream of the same prefix: the
+    // name was freed and re-created under another occupant (#432), and this
+    // replica's index still describes the one before it.
+    let mut trailer = store
+        .read_segment_footer(&segment_path(1))
+        .await?
+        .expect("a segment trailer");
+    let honest = trailer.entries[0].byte_len;
+    trailer.entries[0].topic = format!("{PREFIX}.other");
+
+    let object = bucket.get(&segment_path(1)).await?.bytes().await?;
+    let mut rewritten = object.slice(..honest as usize).to_vec();
+    rewritten.extend_from_slice(&trailered(&trailer));
+    _ = bucket
+        .put(&segment_path(1), PutPayload::from(Bytes::from(rewritten)))
+        .await?;
+
+    // The retired entry this replica still holds: this topic, at a span that
+    // holds no whole frame, so the read reaches the corrupt arm rather than
+    // silently serving another sub-stream's bytes as this one's.
+    let mut stale = store
+        .read_segment_footer(&segment_path(1))
+        .await?
+        .expect("a segment trailer");
+    stale.entries[0].topic = TOPIC.to_owned();
+    stale.entries[0].base_offset = 1;
+    stale.entries[0].record_count = 1;
+    stale.entries[0].byte_len = 20;
+    store.index_insert(PREFIX, 1, stale, 0)?;
+
+    // Reverting the trailer lookup on this arm takes the fetch to
+    // `CORRUPT_MESSAGE`, and it stays there: a Kafka client retries a
+    // corrupt-record error at the same offset.
+    assert_eq!(
+        vec![0, 2],
+        fetch_from(&store, &tp, 0)
+            .await?
+            .iter()
+            .map(|batch| batch.base_offset)
+            .collect::<Vec<_>>()
+    );
+
+    // The entry is gone rather than re-found, so the next read does not pay for
+    // it again.
+    assert_eq!(
+        vec![0, 2],
+        store
+            .valid_substream_segments(PREFIX, TOPIC, 0)?
+            .iter()
+            .map(|(seq, _)| *seq)
+            .collect::<Vec<_>>()
+    );
+
+    Ok(())
+}
+
+/// Case 2 through the full-length arm: the object's own trailer claims a span
+/// that holds no whole frame.
+///
+/// Index and trailer agree, so there is no other authority and the bytes under
+/// that claim are not a batch. This is #395's husk population as the corrupt arm
+/// sees it, and it stays `CORRUPT_MESSAGE` — the trailer lookup must not turn a
+/// genuine write-side fault into a silent empty read.
+#[tokio::test]
+async fn an_object_whose_trailer_claims_a_frameless_region_is_answered_corrupt() -> Result<(), Error>
+{
+    let _guard = super::init_tracing()?;
+
+    let bucket = InMemory::new();
+    let store = new_store(&bucket);
+    create_topic(&store, TOPIC).await?;
+    let tp = Topition::new(TOPIC, 0);
+
+    _ = store.produce(None, &tp, batch("v0")?).await?;
+    make_under_claiming(&bucket, 0, 20).await?;
+
+    // A fresh store, so the index is built from the object's own trailer and the
+    // two genuinely agree.
+    let reader = new_store(&bucket);
+    let error = fetch_from(&reader, &tp, 0)
+        .await
+        .expect_err("a region holding no whole batch");
+
+    let Error::CorruptSegment(region) = error else {
+        panic!("{error:?}");
+    };
+
+    assert_eq!(PREFIX, region.prefix);
+    assert_eq!(0, region.seq);
+    assert_eq!(TOPIC, region.topic);
+
+    // The discriminator for this arm, and the reason #403 never reached it: the
+    // read got every byte it asked for.
+    assert_eq!(region.byte_len, region.read_len as u64);
+    assert!(region.declared.is_some(), "{region:?}");
+
+    assert_eq!(
+        ErrorCode::CorruptMessage,
+        storage_error_code(&Error::CorruptSegment(region))
     );
 
     Ok(())
