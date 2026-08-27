@@ -403,3 +403,168 @@ async fn an_ambiguous_create_that_did_not_land_is_an_error() -> Result<()> {
 
     Ok(())
 }
+
+/// A sequence freed by a peer's retire is never re-created, even when this
+/// process's hint still points into the range (#432).
+///
+/// The hint is a plain `BTreeMap` that `set_seq` only ever raises, and nothing
+/// else in the file touches `segment_seqs` — so it is monotonic *within a
+/// process* and blind to every other one. A peer's `retire_segments` raises the
+/// durable floor write-ahead of the delete (#77) and frees every name below it;
+/// this process's hint still names one of them, and `PutMode::Create` there
+/// **succeeds**, because the CAS proves the name is unoccupied and not that it
+/// is fresh.
+///
+/// What that costs is not a lost write but a wrong read: every replica still
+/// caching the retired segment's footer under that name serves it against the
+/// reborn object. #77's own comment predicted the symptom verbatim, and #397's
+/// discriminator found it in the bucket — an index entry claiming a 793-byte
+/// region of a topic the object does not hold, over a healthy 10 220-byte frame
+/// belonging to another.
+#[tokio::test]
+async fn a_create_never_targets_a_sequence_at_or_below_the_persisted_floor() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let storage = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    let peer = DynoStore::new(CLUSTER, NODE, bucket.clone());
+
+    // This replica wins 0, 1, 2, so its hint sits at 3.
+    for nonce in 0..3u64 {
+        assert_eq!(
+            nonce,
+            storage
+                .assign_and_create_segment(
+                    PREFIX,
+                    merged(&storage, nonce)?,
+                    nonce,
+                    SegmentCreateRole::Compaction,
+                )
+                .await?
+        );
+    }
+    assert_eq!(Some(3), storage.cached_seq(PREFIX)?);
+
+    // A peer carries the prefix on to 5, which this replica never observes.
+    for nonce in 3..6u64 {
+        assert_eq!(
+            nonce,
+            peer.assign_and_create_segment(
+                PREFIX,
+                merged(&peer, nonce)?,
+                nonce,
+                SegmentCreateRole::Compaction,
+            )
+            .await?
+        );
+    }
+
+    // The peer then merges the whole run away: floor write-ahead of the delete,
+    // so 0..=5 are unoccupied names above which nothing may be created.
+    assert_eq!(6, peer.retire_segments(PREFIX, &[0, 1, 2, 3, 4, 5]).await?);
+    assert_eq!(6, storage.read_seq_floor(PREFIX).await?);
+
+    // The hint is unmoved and now points *into* the freed range — the state the
+    // fleet was in.
+    assert_eq!(Some(3), storage.cached_seq(PREFIX)?);
+
+    let seq = storage
+        .assign_and_create_segment(
+            PREFIX,
+            merged(&storage, 6)?,
+            6,
+            SegmentCreateRole::Compaction,
+        )
+        .await?;
+
+    assert_eq!(
+        6, seq,
+        "a create must land above the floor, not reuse the freed name its hint names"
+    );
+
+    // And nothing was written at the freed name, so no replica's cached footer
+    // for it can alias onto a new object.
+    assert!(
+        bucket
+            .head(&storage.segment_location(PREFIX, 3))
+            .await
+            .is_err(),
+        "sequence 3 was freed and must stay free"
+    );
+
+    Ok(())
+}
+
+/// The floor is read live, because the certified one can be arbitrarily stale
+/// against a peer (#432).
+///
+/// This is the test that justifies not taking `certified_seq_floor` here, which
+/// is what the issue proposed. That cache is keyed on the prefix index's
+/// generation, and `index_insert` — the writer fast path every create takes —
+/// does not bump it. So a replica that creates and neither lists nor prunes
+/// keeps whatever floor it last certified, however long ago, and a peer's raise
+/// stays invisible to it for that whole time.
+///
+/// Certify a floor, let a peer raise it well past this process's hint, and the
+/// next create must respect the raise rather than the certification.
+#[tokio::test]
+async fn a_peers_raise_is_respected_even_when_this_process_certified_an_older_floor() -> Result<()>
+{
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let storage = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    let peer = DynoStore::new(CLUSTER, NODE, bucket.clone());
+
+    for nonce in 0..3u64 {
+        _ = storage
+            .assign_and_create_segment(
+                PREFIX,
+                merged(&storage, nonce)?,
+                nonce,
+                SegmentCreateRole::Compaction,
+            )
+            .await?;
+    }
+    assert_eq!(Some(3), storage.cached_seq(PREFIX)?);
+
+    // Certify this process's view of the floor at its current value. Nothing
+    // after this lists or prunes on this replica, so nothing invalidates it.
+    assert_eq!(0, storage.certified_seq_floor(PREFIX).await?);
+    assert_eq!(Some(0), storage.cached_certified_seq_floor(PREFIX)?);
+
+    // The peer carries the prefix past this replica's hint and then retires the
+    // whole run, raising the floor to 5.
+    for nonce in 3..5u64 {
+        _ = peer
+            .assign_and_create_segment(
+                PREFIX,
+                merged(&peer, nonce)?,
+                nonce,
+                SegmentCreateRole::Compaction,
+            )
+            .await?;
+    }
+    assert_eq!(5, peer.retire_segments(PREFIX, &[0, 1, 2, 3, 4]).await?);
+
+    // The stale certification survives the peer's raise — which is exactly why
+    // the create cannot be built on it.
+    assert_eq!(Some(0), storage.cached_certified_seq_floor(PREFIX)?);
+    assert_eq!(5, storage.read_seq_floor(PREFIX).await?);
+
+    let seq = storage
+        .assign_and_create_segment(
+            PREFIX,
+            merged(&storage, 9)?,
+            9,
+            SegmentCreateRole::Compaction,
+        )
+        .await?;
+
+    assert_eq!(
+        5, seq,
+        "a create must respect a peer's raise, not this process's certification"
+    );
+
+    Ok(())
+}
