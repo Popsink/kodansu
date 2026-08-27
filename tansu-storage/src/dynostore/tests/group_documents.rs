@@ -14,10 +14,22 @@
 
 //! The decomposed group objects through the storage trait (#359).
 
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    fmt::{self, Debug, Display},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
+use async_trait::async_trait;
 use bytes::Bytes;
-use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory,
+    path::Path,
+};
 
 use tansu_sans_io::{ErrorCode, join_group_response::JoinGroupResponseMember};
 
@@ -861,4 +873,229 @@ async fn acls_are_readable_by_a_replica_that_did_not_apply_them() -> Result<()> 
     assert!(applied.describe_acls(&everything).await?.is_empty());
 
     Ok(())
+}
+
+/// An [`ObjectStore`] that reaps a document the instant a conditional write
+/// loses the CAS for it — the interleaving of #431, made deterministic.
+///
+/// On the fleet the two halves come from different callers: a `JoinGroup` loses
+/// the CAS on a member document while the session sweep deletes that member for
+/// a lapsed session, or a `SyncGroup`'s assignment create loses while
+/// `delete_group_assignments_before` sweeps the generation it was for. Here one
+/// store does both, so the window is not a matter of timing.
+struct ReapsWhatTheCasLosesTo {
+    inner: InMemory,
+    reaped: Arc<AtomicUsize>,
+}
+
+impl ReapsWhatTheCasLosesTo {
+    fn new(reaped: Arc<AtomicUsize>) -> Self {
+        Self {
+            inner: InMemory::new(),
+            reaped,
+        }
+    }
+}
+
+impl Debug for ReapsWhatTheCasLosesTo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReapsWhatTheCasLosesTo").finish()
+    }
+}
+
+impl Display for ReapsWhatTheCasLosesTo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReapsWhatTheCasLosesTo").finish()
+    }
+}
+
+#[async_trait]
+impl ObjectStore for ReapsWhatTheCasLosesTo {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> Result<PutResult, object_store::Error> {
+        let outcome = self.inner.put_opts(location, payload, options).await;
+
+        // The loser is about to re-read the winner's value. Delete it first —
+        // which is what the sweep running concurrently amounts to.
+        if matches!(
+            outcome,
+            Err(object_store::Error::Precondition { .. }
+                | object_store::Error::AlreadyExists { .. })
+        ) {
+            _ = self.reaped.fetch_add(1, Ordering::SeqCst);
+            self.inner.delete(location).await?;
+        }
+
+        outcome
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        options: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> Result<GetResult, object_store::Error> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, Result<Path, object_store::Error>>,
+    ) -> futures::stream::BoxStream<'static, Result<Path, object_store::Error>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> Result<ListResult, object_store::Error> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> Result<(), object_store::Error> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// The `Precondition` arm: a member write loses on a spent version, and the
+/// document is gone by the time the winner's value is read back (#431).
+///
+/// The re-read used to be a bare `?`, so a 404 there propagated as
+/// `Error::ObjectStore(NotFound)`. That is not `Outdated`, so no retry loop
+/// absorbed it, and not `Severity::Expected`, so the boundary classified it
+/// `Failure` and the connection ended with **no response written** — a Kafka
+/// client cannot retry an error code it never received. ~17/h on five of ten
+/// replicas.
+#[tokio::test]
+async fn a_member_write_that_loses_to_a_document_then_reaped_answers_vanished() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let storage = DynoStore::new(CLUSTER, NODE, InMemory::new());
+
+    let first = storage
+        .write_group_member("g-1", "m-1", member(1_000), None)
+        .await
+        .expect("create");
+
+    // Spend `first`, so the next write with it must lose.
+    _ = storage
+        .write_group_member("g-1", "m-1", member(2_000).bumped(), Some(first.clone()))
+        .await
+        .expect("cas");
+
+    // The sweep reclaims the member for a lapsed session.
+    storage.delete_group_member("g-1", "m-1").await?;
+
+    match storage
+        .write_group_member("g-1", "m-1", member(3_000), Some(first))
+        .await
+    {
+        Err(UpdateError::Vanished) => (),
+        otherwise => panic!("a CAS lost to a reaped document must answer Vanished: {otherwise:?}"),
+    }
+
+    // And the caller's next attempt succeeds as a create, which is what
+    // re-applying onto "there is no value" means.
+    _ = storage
+        .write_group_member("g-1", "m-1", member(4_000), None)
+        .await
+        .expect("re-create");
+
+    Ok(())
+}
+
+/// The `AlreadyExists` arm, and the interleaving driven directly: a create loses
+/// the key race, and the winner's document is deleted before the loser can read
+/// it back.
+///
+/// This is the half that cannot be built by deleting first — a `PutMode::Create`
+/// against a missing object *succeeds*. The object has to be there when the PUT
+/// runs and gone when the GET does, which is what `ReapsWhatTheCasLosesTo` makes
+/// deterministic.
+#[tokio::test]
+async fn a_create_that_loses_to_a_document_then_reaped_answers_the_caller() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let reaped = Arc::new(AtomicUsize::new(0));
+    let storage = DynoStore::new(CLUSTER, NODE, ReapsWhatTheCasLosesTo::new(reaped.clone()));
+
+    // The winner writes the generation's assignment.
+    assert!(matches!(
+        storage
+            .create_group_assignment("g-1", 7, assignment(7))
+            .await?,
+        AssignmentOutcome::Created(_)
+    ));
+
+    // The loser's create races the sweep. It must be *answered* — with a
+    // retriable code the client can act on — rather than propagating a 404 that
+    // costs the connection.
+    match storage
+        .create_group_assignment("g-1", 7, assignment(7))
+        .await
+    {
+        Err(Error::Api(ErrorCode::RebalanceInProgress)) => (),
+        otherwise => panic!("a swept assignment must answer retriably: {otherwise:?}"),
+    }
+
+    assert_eq!(1, reaped.load(Ordering::SeqCst), "the interleaving ran");
+
+    Ok(())
+}
+
+/// A generation update that loses to a document then reaped is answered too, and
+/// with the variant rather than a raw `NotFound`.
+///
+/// The generation is the document a `JoinGroup` and the session sweep contend
+/// on most, and it is the one whose 404 was seen in production.
+#[tokio::test]
+async fn a_generation_update_that_loses_to_a_reaped_document_answers_vanished() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let storage = DynoStore::new(CLUSTER, NODE, InMemory::new());
+
+    let first = storage
+        .update_group_generation("g-1", generation(0), None)
+        .await
+        .expect("create");
+
+    _ = storage
+        .update_group_generation("g-1", generation(1).bumped(), Some(first.clone()))
+        .await
+        .expect("cas");
+
+    _ = storage.delete_groups(Some(&[String::from("g-1")])).await?;
+
+    match storage
+        .update_group_generation("g-1", generation(2), Some(first))
+        .await
+    {
+        Err(UpdateError::Vanished) => Ok(()),
+        otherwise => {
+            panic!("a CAS lost to a deleted generation must answer Vanished: {otherwise:?}")
+        }
+    }
 }

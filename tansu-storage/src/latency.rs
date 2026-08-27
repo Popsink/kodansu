@@ -356,7 +356,13 @@ where
             .update_group_generation(group_id, generation, version)
             .await;
 
-        if matches!(result, Err(UpdateError::Outdated { .. })) {
+        // `Vanished` is a lost CAS too — the winner's document was deleted
+        // before it could be read back (#431) — so it belongs in the conflict
+        // count rather than being invisible to it.
+        if matches!(
+            result,
+            Err(UpdateError::Outdated { .. } | UpdateError::Vanished)
+        ) {
             _ = self
                 .generation_cas_conflicts
                 .fetch_add(1, Ordering::Relaxed);
