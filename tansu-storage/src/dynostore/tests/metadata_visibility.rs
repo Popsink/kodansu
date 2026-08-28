@@ -22,7 +22,7 @@ use std::{
     collections::BTreeMap,
     fmt::{self, Debug, Display},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering::Relaxed},
     },
 };
@@ -89,10 +89,15 @@ async fn the_index_says_why_a_lookup_fell_through() -> Result<(), Error> {
             .as_str()
     );
 
-    // A by-id lookup whose pointer does not resolve is the same answer for the
-    // same reason.
+    // A by-id lookup whose pointer does not resolve was folded into
+    // `fresh_miss` on the reasoning that it is "the same answer for the same
+    // reason". Same answer, different reason — and the reason is what decides
+    // the cost (#407). A name miss keeps its object read because #28 needs a
+    // peer's create visible at once; an id miss has already read the only key
+    // that could resolve it, so the fallback would read that key a second time
+    // and answer identically.
     assert_eq!(
-        "fresh_miss",
+        "unknown_id",
         store
             .indexed_topic_metadata(&TopicId::Id(Uuid::new_v4()))
             .await?
@@ -901,6 +906,177 @@ async fn migration_is_one_shot() -> Result<(), Error> {
             .await?
             .is_none(),
         "marker should make migration one-shot; b must not be backfilled"
+    );
+
+    Ok(())
+}
+
+/// Counts `get_opts` per key, so a test can say what a lookup *costs* rather
+/// than only what it answers.
+struct CountsGets<O> {
+    inner: O,
+    gets: Arc<Mutex<BTreeMap<String, usize>>>,
+}
+
+impl<O> CountsGets<O> {
+    fn new(inner: O) -> Self {
+        Self {
+            inner,
+            gets: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    fn handle(&self) -> Arc<Mutex<BTreeMap<String, usize>>> {
+        self.gets.clone()
+    }
+}
+
+impl<O> Debug for CountsGets<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CountsGets").finish()
+    }
+}
+
+impl<O> Display for CountsGets<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CountsGets").finish()
+    }
+}
+
+#[async_trait]
+impl<O> ObjectStore for CountsGets<O>
+where
+    O: ObjectStore,
+{
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> Result<PutResult, object_store::Error> {
+        self.inner.put_opts(location, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        options: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> Result<GetResult, object_store::Error> {
+        if let Ok(mut gets) = self.gets.lock() {
+            *gets.entry(location.as_ref().to_owned()).or_default() += 1;
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path, object_store::Error>>,
+    ) -> BoxStream<'static, Result<Path, object_store::Error>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> Result<ListResult, object_store::Error> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> Result<(), object_store::Error> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// What a metadata miss *costs*, for both kinds of miss — and why only one of
+/// them could be made cheaper (#407).
+///
+/// #407 measured the fallback at a 100% miss rate and proposed skipping it
+/// whenever the index is fresh, on the reasoning that a fresh index is
+/// authoritative for absence and the skip adds "no new staleness". It is not,
+/// and it does: `a_topic_created_on_a_peer_resolves_through_metadata_before_the_index_refreshes`
+/// pins the opposite as #28's contract, and it is precisely this fallback that
+/// keeps it. So the by-**name** miss keeps its one GET, and that GET is the
+/// price of a topic being visible the instant a peer creates it.
+///
+/// The by-**id** miss was different and nobody had looked. `indexed_topic_metadata`
+/// resolves the id through `topic-ids/{uuid}.json`, `topic_metadata` resolves it
+/// through the same key, and `topic_name_by_id` caches only positives — so a
+/// miss read the same object twice in one request and could not answer
+/// differently. That half is now one lookup, with no contract traded: it is not
+/// the index's window, it is the same uncached function called twice.
+#[tokio::test]
+async fn a_by_id_miss_reads_its_pointer_once_and_a_by_name_miss_still_reads_its_object()
+-> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let seeder = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    _ = create_topic(&seeder, "already-there", 1).await?;
+
+    let counting = CountsGets::new(bucket.clone());
+    let gets = counting.handle();
+    let store = DynoStore::new(CLUSTER, NODE, counting);
+
+    // Warm the index, so both misses below are `fresh_miss`/`unknown_id` rather
+    // than `stale` — the arm that keeps the fallback for a different reason.
+    _ = store.metadata(None).await?;
+    gets.lock()?.clear();
+
+    // By name: one GET of the topic's own object, and it stays. Skipping it is
+    // what #407 asked for and what #28 forbids.
+    let absent = store
+        .metadata(Some(&[TopicId::Name("nope".into())]))
+        .await?;
+    assert_eq!(
+        ErrorCode::UnknownTopicOrPartition,
+        ErrorCode::try_from(absent.topics[0].error_code)?,
+    );
+    assert_eq!(
+        vec![(
+            format!("clusters/{CLUSTER}/topic-metadata/nope.json"),
+            1_usize
+        )],
+        gets.lock()?.clone().into_iter().collect::<Vec<_>>(),
+        "a by-name miss costs exactly the one object read #28 needs",
+    );
+
+    // By id: one GET of the pointer. It was two of the same key before — the
+    // lookup that decided the miss, and the fallback repeating it.
+    gets.lock()?.clear();
+    let unknown = Uuid::new_v4();
+    let by_id = store.metadata(Some(&[TopicId::Id(unknown)])).await?;
+    assert_eq!(
+        ErrorCode::UnknownTopicOrPartition,
+        ErrorCode::try_from(by_id.topics[0].error_code)?,
+        "and the answer is unchanged",
+    );
+    assert_eq!(
+        vec![(
+            format!("clusters/{CLUSTER}/topic-ids/{unknown}.json"),
+            1_usize
+        )],
+        gets.lock()?.clone().into_iter().collect::<Vec<_>>(),
+        "a by-id miss reads its pointer once, not twice",
     );
 
     Ok(())
