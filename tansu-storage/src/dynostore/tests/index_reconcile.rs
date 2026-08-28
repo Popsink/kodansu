@@ -34,11 +34,23 @@
 //!
 //! What is safe is a listing, which is authoritative for the range it covered.
 
-use std::time::Duration;
+use std::{
+    fmt::{self, Debug, Display},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
+use async_trait::async_trait;
 use bytes::Bytes;
-use futures::TryStreamExt as _;
-use object_store::{ObjectStore as _, ObjectStoreExt as _, memory::InMemory, path::Path};
+use futures::{TryStreamExt as _, stream::BoxStream};
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore as _,
+    ObjectStoreExt as _, PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory,
+    path::Path,
+};
 use tansu_sans_io::{
     IsolationLevel,
     create_topics_request::CreatableTopic,
@@ -271,6 +283,155 @@ async fn a_fetch_reads_past_more_stale_entries_than_it_has_attempts() -> Result<
         "the fetch answered empty: it spent its attempts one stale entry at a time"
     );
     assert_eq!(vec![6, 7], indexed(&store));
+
+    Ok(())
+}
+
+/// Counts `get_opts` that answered `NotFound` on a `.seg` object.
+struct TalliesSegment404s<O> {
+    inner: O,
+    absent: Arc<AtomicUsize>,
+}
+
+impl<O> Debug for TalliesSegment404s<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TalliesSegment404s").finish()
+    }
+}
+
+impl<O> Display for TalliesSegment404s<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TalliesSegment404s").finish()
+    }
+}
+
+#[async_trait]
+impl<O> object_store::ObjectStore for TalliesSegment404s<O>
+where
+    O: object_store::ObjectStore,
+{
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> Result<PutResult, object_store::Error> {
+        self.inner.put_opts(location, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        options: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> Result<GetResult, object_store::Error> {
+        let outcome = self.inner.get_opts(location, options).await;
+
+        if location.as_ref().ends_with(".seg")
+            && matches!(outcome, Err(object_store::Error::NotFound { .. }))
+        {
+            _ = self.absent.fetch_add(1, Ordering::SeqCst);
+        }
+
+        outcome
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path, object_store::Error>>,
+    ) -> BoxStream<'static, Result<Path, object_store::Error>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> Result<ListResult, object_store::Error> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> Result<(), object_store::Error> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// A `segment` 404 is not evidence of a stale index, which is what #408's
+/// acceptance assumed.
+///
+/// The issue's first criterion is *"`segment` `not_found` on the brokers drops by
+/// at least an order of magnitude"*, on the reading that the plane is stale
+/// entries being discovered one 404 at a time. Part of it is, and #413 removed
+/// that part. The rest is `probe_prefix_tail` asking whether `cursor + 1` exists
+/// — where **a 404 is the affirmative answer**, the cheap proof that the tail has
+/// not moved, and the whole reason the read path does not LIST per fetch.
+///
+/// This pins it: a replica whose index is exactly right, reading a partition
+/// nothing has retired, still takes segment 404s. No reconciliation reduces them,
+/// because reducing them would mean not asking. Hence `caller` on
+/// `tansu_prefix_segment_absent` — without it the acceptance is measured against
+/// a floor it cannot reach.
+#[tokio::test]
+async fn a_segment_404_is_not_always_a_stale_index_entry() -> Result<(), Error> {
+    let _guard = super::init_tracing()?;
+
+    let absent = Arc::new(AtomicUsize::new(0));
+    let bucket = TalliesSegment404s {
+        inner: InMemory::new(),
+        absent: absent.clone(),
+    };
+
+    let storage = DynoStore::new(CLUSTER, NODE, bucket).coalesce_tuning(CoalesceTuning {
+        coalesce_batches: Some(1),
+        ..Default::default()
+    });
+    create_topic(&storage, TOPIC).await?;
+    let tp = Topition::new(TOPIC, 0);
+
+    for i in 0..4 {
+        _ = storage.produce(None, &tp, batch(&format!("v{i}"))?).await?;
+    }
+
+    // One replica, one bucket, nothing retired: every entry this index holds
+    // names an object that is there. Read it back so the index is warm and
+    // provably accurate.
+    let fetched = fetch_from(&storage, &tp, 0).await?;
+    assert_eq!(4, fetched.len(), "the index is right and the read is whole");
+
+    absent.store(0, Ordering::SeqCst);
+
+    // Steady state: one more produce and the read that follows it. The flush's
+    // fold-before-claim probes the tail before claiming a sequence, and the probe
+    // proves it by reading `cursor + 1` and taking a 404. Nothing here is stale —
+    // one replica, one bucket, nothing retired — so every one of these is the
+    // `path="forced"` population the fleet runs at 10.6/s.
+    _ = storage.produce(None, &tp, batch("v4")?).await?;
+    assert_eq!(5, fetch_from(&storage, &tp, 0).await?.len());
+
+    assert!(
+        absent.load(Ordering::SeqCst) > 0,
+        "a correct index still takes segment 404s — the tail probe's proof of \
+         absence — so the `segment` 404 plane has a floor that reconciliation \
+         cannot reach",
+    );
 
     Ok(())
 }

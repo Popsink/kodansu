@@ -1487,6 +1487,34 @@ static SEGMENT_REGION_TRUNCATED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Every `segment` 404 this process takes, by the `caller` that took it (#408).
+///
+/// `class="segment",reason="not_found"` was the number #408 was filed on — 39.2/s
+/// on the brokers — and its acceptance asked for an order of magnitude off it.
+/// The plane could not be attributed, so that target folded together two
+/// populations with opposite meanings:
+///
+/// - **stale-index 404s.** A segment a *peer* retired that this replica's
+///   add-only index still names. The bug, and what #413's reconciling listing
+///   removes: `caller="fetch"` / `"refresh"` / `"compaction"`.
+/// - **404s that are the answer.** `probe_prefix_tail` proves the tail by reading
+///   `cursor + 1` and *expecting* absence; `resolve_segment_create` probes a
+///   sequence its own PUT may not have landed at. These are deliberate, they
+///   scale with produce and reads rather than with staleness, and no fix reduces
+///   them because reducing them would mean not asking.
+///
+/// So `sum by (caller)` is what says whether the acceptance is met, and
+/// `sum(...)` over all callers is what the class counter was measuring. Kept
+/// alongside [`SEGMENT_VANISHED_BEFORE_READ`] rather than replacing it: that one
+/// means "the index named an object that is gone", which is a narrower claim than
+/// this and the one #191/#274 reason about.
+static SEGMENT_ABSENT: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_segment_absent")
+        .with_description("segment objects read and found absent, by caller")
+        .build()
+});
+
 /// Segments this replica's index named that were gone by the time it read them
 /// (#191): concurrent compaction (#66) merged them away, or retention (#61)
 /// reclaimed them. Counted on the index refresh, the compaction fetch and — since
@@ -4824,6 +4852,17 @@ impl DynoStore {
             }
 
             Err(probe_error) => {
+                // A 404 here is the probe's answer, not a fault: the create did
+                // not land, which is exactly what this read asks (#408). Counted
+                // as its own caller so it is not mistaken for a stale index
+                // entry — it scales with ambiguous PUTs, and no reconciliation
+                // reduces it.
+                if let Error::ObjectStore(ref inner) = probe_error
+                    && matches!(**inner, object_store::Error::NotFound { .. })
+                {
+                    SEGMENT_ABSENT.add(1, &[KeyValue::new("caller", "create_probe")]);
+                }
+
                 debug!(
                     prefix,
                     candidate,
@@ -5178,6 +5217,10 @@ impl DynoStore {
         {
             Ok(result) => result,
             Err(error) => {
+                if matches!(error, object_store::Error::NotFound { .. }) {
+                    SEGMENT_ABSENT.add(1, &[KeyValue::new("caller", "fold")]);
+                }
+
                 debug!(?error, prefix, seq, "folding the winner's footer");
                 return false;
             }
@@ -5311,6 +5354,12 @@ impl DynoStore {
                 // read *after* the absence, and fresh — see the proof above and
                 // [`Self::probe_seq_floor`].
                 Err(object_store::Error::NotFound { .. }) => {
+                    // Absence is what this read is *for* (#408): the probe asks
+                    // whether `cursor + 1` exists and a 404 is the affirmative
+                    // answer. Counted so the `segment` 404 plane can be split
+                    // from the stale-index population it was conflated with.
+                    SEGMENT_ABSENT.add(1, &[KeyValue::new("caller", "tail_probe")]);
+
                     let floor = match self.probe_seq_floor(prefix).await {
                         Ok(floor) => floor,
                         Err(error) => {
@@ -5590,6 +5639,7 @@ impl DynoStore {
                 FooterOutcome::Vanished => {
                     if entry.opaque.insert(seq) {
                         SEGMENT_VANISHED_BEFORE_READ.add(1, &[]);
+                        SEGMENT_ABSENT.add(1, &[KeyValue::new("caller", "refresh")]);
                         debug!(
                             prefix,
                             seq, "segment deleted before its footer could be read; stepping over"
@@ -5751,6 +5801,7 @@ impl DynoStore {
 
                 Err(object_store::Error::NotFound { .. }) => {
                     SEGMENT_VANISHED_BEFORE_READ.add(1, &[]);
+                    SEGMENT_ABSENT.add(1, &[KeyValue::new("caller", "compaction")]);
                     debug!(
                         prefix,
                         seq, "segment deleted before compaction could read it; pruning"
@@ -6276,6 +6327,7 @@ impl DynoStore {
                         // because the incremental index refresh is add-only and
                         // nothing here ever said how much of it was stale.
                         SEGMENT_VANISHED_BEFORE_READ.add(1, &[]);
+                        SEGMENT_ABSENT.add(1, &[KeyValue::new("caller", "fetch")]);
                         self.index_prune(prefix, &[*seq])?;
 
                         // This 404 is proof the index is stale, and pruning the
