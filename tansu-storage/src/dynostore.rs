@@ -1781,6 +1781,28 @@ impl FrameTail {
     }
 }
 
+/// What one buffered region read produced (#426).
+///
+/// The serial loop could `break` out of the middle of an iteration; a buffered
+/// stage cannot, so each read reports its outcome and the caller interprets them
+/// in input order. `buffered` preserves that order, and the offset arithmetic is
+/// per-segment (`running = entry.base_offset`), so the regions are independent
+/// and the assembled result is byte-identical to the serial shape.
+enum RegionOutcome {
+    /// The region decoded. Its batches still carry the encoded base offsets; the
+    /// caller re-bases them from the entry, as it always did.
+    Decoded(Vec<deflated::Batch>),
+
+    /// The object was gone by the time it was read (compaction #66 / retention
+    /// #61). The caller prunes, reconciles and restarts.
+    Vanished,
+
+    /// The index entry and the object disagreed, and the object's own trailer
+    /// has replaced the cached footer (#397, #432). The caller restarts off the
+    /// corrected entry rather than mixing a corrected extent with a stale span.
+    Corrected,
+}
+
 /// A footer entry paired with the bytes read for it (#386): what
 /// [`DynoStore::decode_region`] needs to classify a frame scan that stopped
 /// early, and to name the segment in the error if it was damage.
@@ -6053,6 +6075,12 @@ impl DynoStore {
         /// restart cleanly. Bounded so a genuinely missing object can't loop.
         const MAX_ATTEMPTS: usize = 3;
 
+        /// Ranged region GETs in flight for one sub-stream (#426), matching the
+        /// footer warm's `FOOTER_FETCH_CONCURRENCY` immediately above it and every
+        /// other fan-out in the engine (`list_offsets`, `offset_commit`,
+        /// `offset_fetch`, `metadata_fetch`, `list_state`, `describe`).
+        const SEGMENT_READ_CONCURRENCY: usize = 32;
+
         let prefix = self.routed_prefix_of(topition).await?;
 
         for _ in 0..MAX_ATTEMPTS {
@@ -6060,15 +6088,27 @@ impl DynoStore {
             let segments =
                 self.valid_substream_segments(&prefix, topition.topic(), topition.partition())?;
 
-            let mut batches = vec![];
+            // Plan the reads from the index before issuing any (#426).
+            //
+            // Every input to the decision is an index field: the offset skip and
+            // the high-watermark stop come from `base_offset`/`record_count`, and
+            // the byte budget consumes `entry.byte_len`, which is the cached
+            // footer's claim and not the response's length. So the set of
+            // segments this fetch will read is known before the first GET — which
+            // is the whole reason the reads can be concurrent instead of a chain.
+            //
+            // This was the only fan-out in the engine that was not buffered. The
+            // footer warm immediately above it is `buffered(32)` with a comment
+            // explaining that a sequential footer-per-segment loop stalled
+            // `list_offsets` past the client timeout; the data read below it had
+            // the same shape and no buffering. Measured with injected per-GET
+            // latency over 64 segments in one partition: 2 ms at 0 ms, 431 ms at
+            // 5 ms, 1 417 ms at 20 ms — exactly linear, and that is the innermost
+            // loop alone.
             let mut bytes = max_bytes as u64;
-            let mut restart = false;
+            let mut plan: Vec<(u64, SubstreamEntry)> = Vec::new();
 
             for (seq, entry) in segments {
-                if has_deadline_expired() {
-                    break;
-                }
-
                 // Segments are sorted by base offset; skip those ending at/before
                 // the requested offset, stop once one starts at/past the HWM.
                 if entry.base_offset + entry.record_count <= offset {
@@ -6078,75 +6118,157 @@ impl DynoStore {
                     break;
                 }
 
-                // One ranged GET of exactly this sub-stream's byte span.
-                let location = self.segment_location(&prefix, seq);
-                self.note_segment_data_read(&prefix, seq, entry.byte_start, entry.byte_len);
-                let region = match self
-                    .object_store
-                    .get_opts(
-                        &location,
-                        GetOptions {
-                            range: Some(GetRange::Bounded(
-                                entry.byte_start..entry.byte_start + entry.byte_len,
-                            )),
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                {
-                    Ok(result) => {
-                        let encoded = result.bytes().await.map_err(Error::from)?;
+                // The budget admits the entry that crosses it and stops *after*,
+                // which is what the serial loop did: it read the region, pushed
+                // its batches, and only then compared. Preserved exactly —
+                // returning one region fewer per round trip is a behaviour change
+                // a client would see.
+                let byte_len = entry.byte_len;
+                plan.push((seq, entry));
 
-                        // Short of the extent the index claims (#397): the index
-                        // entry and the object disagree, and only the object's own
-                        // trailer says which is wrong. A correctable index is
-                        // repaired and the fetch restarts off it — the whole
-                        // entry, `base_offset` and `record_count` included, feeds
-                        // the offset arithmetic below, so re-reading one region
-                        // inline would mix a corrected extent with a stale span.
-                        if (encoded.len() as u64) < entry.byte_len {
-                            self.resolve_short_region(&prefix, seq, &entry, &location, &encoded)
-                                .await?;
-                            restart = true;
-                            break;
-                        }
+                if byte_len > bytes {
+                    break;
+                }
+                bytes = bytes.saturating_sub(byte_len);
+            }
 
-                        // A full-length region that holds no frame is the *same*
-                        // index/object disagreement as the short read above, and
-                        // the branch above cannot see it: an entry that
-                        // under-states a healthy frame is served in full, so
-                        // `read_len == byte_len` (#432). Ask the object's own
-                        // trailer here too, and restart off a corrected entry —
-                        // otherwise a wrong entry is a `CORRUPT_MESSAGE` that the
-                        // client retries at the same offset, forever.
-                        //
-                        // Damage that survives the trailer still answers this
-                        // partition `CORRUPT_MESSAGE` (#386) rather than
-                        // propagating a bare integer-conversion failure that took
-                        // the request, and the connection, with it.
-                        match self.decode_region(&prefix, seq, &entry, encoded) {
-                            Ok(decoded) => decoded,
+            // `&str` rather than the `String`, so each read's future captures a
+            // `Copy` borrow instead of moving the prefix the attempt loop reuses.
+            let prefix = prefix.as_str();
 
-                            Err(Error::CorruptSegment(corrupt)) => {
-                                self.resolve_corrupt_region(
-                                    &prefix, seq, &entry, &location, corrupt,
-                                )
-                                .await?;
-                                restart = true;
-                                break;
+            // Eagerly collected to pin lifetimes, the same idiom `Metadata` and
+            // `ListOffsets` use in this file (#147): the futures are inert until
+            // `buffered` polls them, so this allocates, it does not serialise.
+            let reads = plan
+                .iter()
+                .map(|(seq, entry)| {
+                    let location = self.segment_location(prefix, *seq);
+
+                    async move {
+                        self.note_segment_data_read(prefix, *seq, entry.byte_start, entry.byte_len);
+
+                        // One ranged GET of exactly this sub-stream's byte span.
+                        match self
+                            .object_store
+                            .get_opts(
+                                &location,
+                                GetOptions {
+                                    range: Some(GetRange::Bounded(
+                                        entry.byte_start..entry.byte_start + entry.byte_len,
+                                    )),
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                        {
+                            Ok(result) => {
+                                let encoded = result.bytes().await.map_err(Error::from)?;
+
+                                // Short of the extent the index claims (#397): the
+                                // index entry and the object disagree, and only the
+                                // object's own trailer says which is wrong. A
+                                // correctable index is repaired and the fetch restarts
+                                // off it — the whole entry, `base_offset` and
+                                // `record_count` included, feeds the offset arithmetic
+                                // below, so re-reading one region inline would mix a
+                                // corrected extent with a stale span.
+                                if (encoded.len() as u64) < entry.byte_len {
+                                    self.resolve_short_region(
+                                        prefix, *seq, entry, &location, &encoded,
+                                    )
+                                    .await?;
+
+                                    return Ok(RegionOutcome::Corrected);
+                                }
+
+                                // A full-length region that holds no frame is the
+                                // *same* index/object disagreement, and the branch
+                                // above cannot see it: an entry that under-states a
+                                // healthy frame is served in full, so
+                                // `read_len == byte_len` (#432). Ask the object's own
+                                // trailer here too, and restart off a corrected entry
+                                // — otherwise a wrong entry is a `CORRUPT_MESSAGE`
+                                // that the client retries at the same offset, forever.
+                                //
+                                // Damage that survives the trailer still answers this
+                                // partition `CORRUPT_MESSAGE` (#386) rather than
+                                // propagating a bare integer-conversion failure that
+                                // took the request, and the connection, with it.
+                                match self.decode_region(prefix, *seq, entry, encoded) {
+                                    Ok(decoded) => Ok(RegionOutcome::Decoded(decoded)),
+
+                                    Err(Error::CorruptSegment(corrupt)) => {
+                                        self.resolve_corrupt_region(
+                                            prefix, *seq, entry, &location, corrupt,
+                                        )
+                                        .await?;
+
+                                        Ok(RegionOutcome::Corrected)
+                                    }
+
+                                    Err(otherwise) => Err(otherwise),
+                                }
                             }
 
-                            Err(otherwise) => return Err(otherwise),
+                            // Deleted between locate and read (compaction #66 /
+                            // retention #61). Reported rather than handled here: the
+                            // prune, the reconciling listing and the restart are the
+                            // caller's, so they happen once for the attempt instead of
+                            // once per concurrent read that met the same stale prefix.
+                            Err(object_store::Error::NotFound { .. }) => {
+                                Ok(RegionOutcome::Vanished)
+                            }
+
+                            Err(error) => {
+                                error!(?error, location = %location);
+                                // Preserve the storage error so it is classified
+                                // retriable rather than fatal `-1` (#6/#129).
+                                Err(Error::from(error))
+                            }
+                        }
+                    }
+                })
+                .collect::<Vec<_>>();
+
+            let mut reads = futures::stream::iter(reads).buffered(SEGMENT_READ_CONCURRENCY);
+
+            let mut batches = vec![];
+            let mut restart = false;
+
+            // Consumed in input order, so the assembled batches are the serial
+            // loop's. Stopping early drops the futures still in flight, which
+            // cancels their reads — the same thing the serial `break` did, one
+            // round trip earlier.
+            for (seq, entry) in plan.iter() {
+                // Checked before consuming, which is where the serial loop
+                // checked it: before the work for this segment, not after. Tested
+                // after the await instead, a single GET that spends the budget
+                // would discard its own result and the fetch would answer empty.
+                if has_deadline_expired() {
+                    break;
+                }
+
+                let Some(outcome) = reads.next().await else {
+                    break;
+                };
+
+                match outcome? {
+                    RegionOutcome::Decoded(region) => {
+                        let mut running = entry.base_offset;
+                        for mut batch in region {
+                            let span = batch.last_offset_delta as i64 + 1;
+                            batch.base_offset = running;
+                            running += span;
+                            batches.push(batch);
                         }
                     }
 
-                    // Deleted between locate and read (compaction #66 / retention
-                    // #61): drop anything gathered so far, evict the stale seq
+                    // Drop anything gathered so far, evict the stale seq
                     // (prune-on-404 — the add-only refresh never would), force a
                     // re-list to pick up the merged/surviving segments, and
                     // restart clean. The merged segment covers the same offsets
                     // and wins the overlap (higher seq), so no gap/duplicate.
-                    Err(object_store::Error::NotFound { .. }) => {
+                    RegionOutcome::Vanished => {
                         // Counted (#399): the same event the compaction path has
                         // always counted, and on the fleet the *bigger* half —
                         // 39 `segment` 404s/s on the brokers against 7 on the
@@ -6154,7 +6276,7 @@ impl DynoStore {
                         // because the incremental index refresh is add-only and
                         // nothing here ever said how much of it was stale.
                         SEGMENT_VANISHED_BEFORE_READ.add(1, &[]);
-                        self.index_prune(&prefix, &[seq])?;
+                        self.index_prune(prefix, &[*seq])?;
 
                         // This 404 is proof the index is stale, and pruning the
                         // one sequence it named leaves every other stale entry in
@@ -6167,35 +6289,19 @@ impl DynoStore {
                         // the restart it was already going to make. The next 404
                         // tries again.
                         _ = self
-                            .reconcile_prefix_index(&prefix)
+                            .reconcile_prefix_index(prefix)
                             .await
                             .inspect_err(|err| debug!(?err, prefix, seq));
 
-                        self.index_invalidate(&prefix)?;
+                        self.index_invalidate(prefix)?;
                         restart = true;
                         break;
                     }
 
-                    Err(error) => {
-                        error!(?error, location = %location);
-                        // Preserve the storage error so it is classified
-                        // retriable rather than fatal `-1` (#6/#129).
-                        return Err(Error::from(error));
+                    RegionOutcome::Corrected => {
+                        restart = true;
+                        break;
                     }
-                };
-
-                let mut running = entry.base_offset;
-                for mut batch in region {
-                    let span = batch.last_offset_delta as i64 + 1;
-                    batch.base_offset = running;
-                    running += span;
-                    batches.push(batch);
-                }
-
-                if entry.byte_len > bytes {
-                    break;
-                } else {
-                    bytes = bytes.saturating_sub(entry.byte_len);
                 }
             }
 

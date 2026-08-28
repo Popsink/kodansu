@@ -17,14 +17,20 @@
 //! Two unrelated things live here because one URL scheme is what they have in
 //! common, and neither had a test.
 //!
-//! **The read path is latency-multiplied, and that is not GCS-specific.**
-//! `fetch_is_one_serial_round_trip_per_segment` measures the shape: a fetch is
-//! one ranged GET per segment, awaited in sequence, and the two loops above it
-//! in `service::fetch` walk partitions and topics in sequence too. Wall clock
-//! is therefore `segments x partitions x topics x per-GET latency`, and GCS is
-//! where that first crosses a client timeout because its per-GET latency is
-//! higher. Latency is injected rather than real, so the linearity is observable
+//! **The read path was latency-multiplied, and that was not GCS-specific.**
+//! `a_fetch_over_many_segments_is_not_one_round_trip_per_segment` measured the
+//! shape and now bounds it. A fetch was one ranged GET per segment *awaited in
+//! sequence*, so wall clock was `segments x per-GET latency`; #426 buffered that
+//! loop and the same 64 GETs now cost two waves instead of sixty-four round
+//! trips. Latency is injected rather than real, so the shape is observable
 //! without a store.
+//!
+//! The two loops above it in `service::fetch` still walk partitions and topics
+//! in sequence, so the remaining multiplier is `partitions x topics`. That is
+//! not an oversight: both thread the request-level `max_bytes` budget through as
+//! `&mut u32`, consumed in order, and overlapping them means deciding what a
+//! per-request byte cap should mean when several partitions spend it at once —
+//! a client-visible question, not a mechanical change. See #426.
 //!
 //! **The write cap is GCS-specific and only reaches one object.** `memory://`
 //! is `InMemory` with nothing in front of it, so every other test in this crate
@@ -391,21 +397,39 @@ async fn produce_fan_out_under_the_per_object_cap() -> Result<()> {
     Ok(())
 }
 
-/// What a consumer pays to read a prefix that holds many segments.
+/// What a consumer pays to read a prefix that holds many segments — now a
+/// **bound**, where it was a description (#426).
 ///
-/// `fetch_prefix_coalesced` walks the fenced sub-stream view with **one ranged
-/// GET per segment, awaited in sequence** — the loop at `dynostore.rs:5595`.
-/// The footer warm above it is `buffered(FOOTER_FETCH_CONCURRENCY)`; the data
-/// read below it is not buffered at all, so a fetch spanning N segments is N
-/// serial round trips and its wall clock is N x store latency.
+/// `fetch_prefix_coalesced` used to walk the fenced sub-stream view with one
+/// ranged GET per segment *awaited in sequence*, so a fetch spanning N segments
+/// was N serial round trips and its wall clock was N x store latency. That was
+/// the only fan-out in the engine that was not buffered: the footer warm
+/// immediately above it has been `buffered(FOOTER_FETCH_CONCURRENCY)` all along,
+/// with a comment explaining that a sequential footer-per-segment loop stalled
+/// `list_offsets` past the client timeout, and the data read below it had the
+/// same shape and no buffering.
 ///
-/// Latency is the parameter because that is the whole point: the same N costs
+/// What this printed before the fix, and what it asserts now:
+///
+/// | per-GET latency | GETs issued | wall clock (serial) |
+/// |---|---|---|
+/// | 0 ms | 64 ranged | 2 ms |
+/// | 5 ms | 64 ranged | 431 ms |
+/// | 20 ms | 64 ranged | 1 417 ms |
+///
+/// Exactly linear, and that is the innermost loop alone — the two outer loops
+/// (partitions, then topics) multiply on top. The GET *count* is unchanged by
+/// the fix; what changes is that they overlap, so the wall clock is
+/// `O(N / SEGMENT_READ_CONCURRENCY)` round trips. Asserted loosely enough to
+/// survive a loaded runner and tightly enough that a return to the serial shape
+/// cannot pass.
+///
+/// Latency is the parameter because that is the whole point: the same N cost
 /// 24ms x N against the maintainers' measured `get_opts` and 350ms x N against
 /// the brokers' (#409). Injected rather than real so the shape is observable
 /// without a bucket.
-#[ignore]
 #[tokio::test(flavor = "multi_thread")]
-async fn fetch_is_one_serial_round_trip_per_segment() -> Result<()> {
+async fn a_fetch_over_many_segments_is_not_one_round_trip_per_segment() -> Result<()> {
     use std::{fmt, sync::atomic::AtomicUsize, time::Duration as StdDuration};
 
     use async_trait::async_trait;
@@ -539,7 +563,7 @@ async fn fetch_is_one_serial_round_trip_per_segment() -> Result<()> {
             .map_err(Into::into)
     }
 
-    async fn run(latency_ms: u64) -> Result<()> {
+    async fn run(latency_ms: u64) -> Result<(usize, usize, u64)> {
         let tally = Tally::default();
         let storage = DynoStore::new(
             CLUSTER,
@@ -589,20 +613,45 @@ async fn fetch_is_one_serial_round_trip_per_segment() -> Result<()> {
             .await?;
         let elapsed = started.elapsed().map_or(0, |d| d.as_millis() as u64);
 
+        let gets = tally.gets.load(Ordering::Relaxed);
+        let ranged = tally.ranged_gets.load(Ordering::Relaxed);
+
         println!(
             "latency={latency_ms:>3}ms: {SEGMENTS} segments -> {} batches, \
-             {} GETs ({} ranged), {elapsed}ms",
+             {gets} GETs ({ranged} ranged), {elapsed}ms",
             fetched.len(),
-            tally.gets.load(Ordering::Relaxed),
-            tally.ranged_gets.load(Ordering::Relaxed),
         );
 
-        Ok(())
+        assert_eq!(
+            SEGMENTS,
+            fetched.len(),
+            "every segment's batch is still returned",
+        );
+
+        Ok((gets, ranged, elapsed))
     }
 
-    run(0).await?;
-    run(5).await?;
-    run(20).await?;
+    // The GET count is what the fix does *not* change: the same regions are read,
+    // one ranged GET each. Overlapping them cannot save a request, only wall
+    // clock, and a fix that read fewer would be reading less data.
+    let (_, ranged, _) = run(0).await?;
+    assert_eq!(SEGMENTS, ranged, "one ranged GET per segment, as before");
+
+    // And the wall clock is no longer linear in N. Serial would be
+    // `SEGMENTS x latency`; buffered at 32 it is two waves. Asserted at a quarter
+    // of the serial cost, which is ~8x looser than the shape predicts and still
+    // an order of magnitude below what the serial loop measured.
+    for latency_ms in [5, 20] {
+        let (_, ranged, elapsed) = run(latency_ms).await?;
+
+        assert_eq!(SEGMENTS, ranged);
+        assert!(
+            elapsed * 4 < SEGMENTS as u64 * latency_ms,
+            "{SEGMENTS} segments at {latency_ms}ms took {elapsed}ms — \
+             serial would be {}ms, so this is the O(N) shape again",
+            SEGMENTS as u64 * latency_ms,
+        );
+    }
 
     Ok(())
 }

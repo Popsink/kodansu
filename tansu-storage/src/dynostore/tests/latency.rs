@@ -926,7 +926,23 @@ async fn fetch_1_min_bytes_max_wait_of_2x_latency() -> Result<(), Error> {
         .map(|frame| &frame.batches[..])
         .unwrap_or_default();
 
-    assert_eq!(2, batches.len());
+    // Seven segments, one per produce, and a `max_bytes` far above their total —
+    // so what a fetch returns here is decided by `max_wait` against the per-GET
+    // latency, and nothing else.
+    //
+    // This asserted **2** when the region reads were serial: one round trip each,
+    // so two fitted in `2 x LATENCY_INTRODUCED` and the other five were left for
+    // the client to come back for. They are now issued concurrently (#426), so
+    // one round trip covers all seven and the same `max_wait` returns the whole
+    // sub-stream. The deadline still bounds the wall clock — the assertions above
+    // are unchanged and still hold — it no longer bounds how much of the
+    // partition one round trip can carry.
+    //
+    // `fetch_1_min_bytes_max_wait_of_1x_latency` is the other half and is
+    // unchanged at 1: a `max_wait` of exactly one round trip expires as the first
+    // result lands, so the deadline check ends the loop after it. What moved is
+    // the yield per round trip, not the meaning of `max_wait`.
+    assert_eq!(7, batches.len());
 
     let inflated = batches
         .first()
