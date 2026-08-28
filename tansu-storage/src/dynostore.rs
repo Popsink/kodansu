@@ -721,11 +721,36 @@ enum IndexedTopic {
     /// The index holds it, and this is the whole of #387 working.
     Hit(TopicMetadata),
 
-    /// The index is inside its TTL and does not hold this topic — so as of the
-    /// last listing the topic did not exist, and the object read that follows can
-    /// only confirm it. A by-id lookup whose id pointer does not resolve is the
-    /// same answer for the same reason.
+    /// The index is inside its TTL and does not hold this topic.
+    ///
+    /// The object read still follows, and #407 proposed skipping it here on the
+    /// grounds that a fresh index is authoritative for absence. **It is not, and
+    /// the codebase already says so**:
+    /// `a_topic_created_on_a_peer_resolves_through_metadata_before_the_index_refreshes`
+    /// pins #28's contract — a topic created on another replica is visible
+    /// through `Metadata` *at once*, and it is this fallback that makes it so.
+    /// The index window delays changes to and removals of topics it already
+    /// lists; it must never delay the appearance of a new one. Skipping here
+    /// would put a `TOPIC_INDEX_TTL` hole exactly where #28 needs none.
+    ///
+    /// So this arm costs one GET and keeps it.
     FreshMiss,
+
+    /// A by-id lookup whose `topic-ids/{uuid}.json` pointer does not resolve.
+    ///
+    /// Split out of `FreshMiss` (#407), which folded the two on the reasoning
+    /// that they were "the same answer for the same reason". They are not the
+    /// same *cost*. The pointer lookup is the only way to turn an id into a
+    /// name, [`DynoStore::topic_metadata`] does exactly the same lookup, and
+    /// `topic_name_by_id` caches only positives — so falling through spent a
+    /// second GET on the same key, in the same request, microseconds later, and
+    /// could not answer differently for any reason a caller could observe.
+    ///
+    /// Measured: a by-id miss cost **2** GETs of one `topic-ids/{uuid}.json`
+    /// against a by-name miss's 1. Unlike `FreshMiss` there is no contract here
+    /// to trade — this is not the index's window, it is the same uncached
+    /// function called twice.
+    UnknownId,
 
     /// No usable index: outside its TTL, or never built. This is the case the
     /// fallback exists for (#28/#29 — a topic created since the last refresh must
@@ -738,6 +763,7 @@ impl IndexedTopic {
         match self {
             Self::Hit(_) => "hit",
             Self::FreshMiss => "fresh_miss",
+            Self::UnknownId => "unknown_id",
             Self::Stale => "stale",
         }
     }
@@ -3149,7 +3175,7 @@ impl DynoStore {
             TopicId::Name(name) => name.clone(),
             TopicId::Id(id) => match self.topic_name_by_id(id).await? {
                 Some(name) => name,
-                None => return Ok(IndexedTopic::FreshMiss),
+                None => return Ok(IndexedTopic::UnknownId),
             },
         };
 
@@ -3220,6 +3246,17 @@ impl DynoStore {
 
         match indexed {
             IndexedTopic::Hit(metadata) => Ok(Some(metadata)),
+
+            // The pointer has already been read and did not resolve.
+            // `topic_metadata` would read the same key again, through the same
+            // positives-only cache, and return `Ok(None)` — so this is the one
+            // arm where the fallback is provably a no-op rather than a
+            // visibility guarantee (#407).
+            IndexedTopic::UnknownId => Ok(None),
+
+            // Both keep the fallback, and for different reasons: `Stale` because
+            // there is no usable index at all, `FreshMiss` because a fresh index
+            // is *not* authoritative for absence — see [`IndexedTopic`].
             IndexedTopic::FreshMiss | IndexedTopic::Stale => self.topic_metadata(topic).await,
         }
     }
