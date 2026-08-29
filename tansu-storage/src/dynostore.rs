@@ -1676,7 +1676,7 @@ static LIST_SCANS: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// Magic trailer word marking a prefix-coalesced multi-topic segment object
 /// (#64), distinguishing a `.seg` from a foreign or truncated object
 /// (#50), which carries no trailer. ASCII `TSEG`.
-const SEGMENT_MAGIC: u32 = 0x5453_4547;
+pub(crate) const SEGMENT_MAGIC: u32 = 0x5453_4547;
 
 /// On-disk version of the segment frame + footer format (#64). Version `0` is
 /// the implicit legacy single-topic layout (a bare batch concatenation with no
@@ -1731,7 +1731,7 @@ const SEGMENT_FORMAT_VERSION_V3: u16 = 3;
 /// every segment, already covers the whole footer (see
 /// [`SEGMENT_FOOTER_OVER_READ`]); only a footer larger than the over-read needs
 /// a second exact GET — never downloading the record body.
-const SEGMENT_TRAILER_LEN: usize =
+pub(crate) const SEGMENT_TRAILER_LEN: usize =
     size_of::<u64>() + size_of::<u32>() + size_of::<u16>() + size_of::<u32>();
 
 /// Speculative suffix size for reading a segment footer in a single ranged GET
@@ -1742,7 +1742,7 @@ const SEGMENT_TRAILER_LEN: usize =
 /// this (a prefix with very many sub-streams) falls back to a second exact GET.
 /// Footers are immutable, so the over-read is always self-consistent; the extra
 /// bytes are in-region and cost nothing per request.
-const SEGMENT_FOOTER_OVER_READ: usize = 64 * 1024;
+pub(crate) const SEGMENT_FOOTER_OVER_READ: usize = 64 * 1024;
 
 /// One `(topic, partition)` sub-stream's self-describing entry in a segment
 /// footer (#64): where its batches live in the shared object and what offset
@@ -1750,21 +1750,21 @@ const SEGMENT_FOOTER_OVER_READ: usize = 64 * 1024;
 /// recovery (#58) read, instead of deriving offsets from the object filename
 /// (the legacy `{offset}.batch` authority).
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct SubstreamEntry {
-    topic: String,
-    partition: i32,
+pub(crate) struct SubstreamEntry {
+    pub(crate) topic: String,
+    pub(crate) partition: i32,
     /// Absolute base offset of this sub-stream's first record in the segment.
-    base_offset: i64,
+    pub(crate) base_offset: i64,
     /// Offsets this sub-stream occupies
     /// (`last_offset == base_offset + record_count - 1`).
-    record_count: i64,
+    pub(crate) record_count: i64,
     /// Byte offset of this sub-stream's contiguous region within the segment.
-    byte_start: u64,
+    pub(crate) byte_start: u64,
     /// Byte length of that region (its batches, wire-encoded and concatenated).
-    byte_len: u64,
+    pub(crate) byte_len: u64,
     /// Greatest record timestamp in the sub-stream, read by per-prefix
     /// whole-segment retention (#61) to decide expiry without a body read.
-    max_timestamp: i64,
+    pub(crate) max_timestamp: i64,
     /// Producer coordinates of the idempotent/transactional batches in this
     /// sub-stream's region, in region (offset) order (#87, footer v2). Empty in a
     /// v1 footer and for non-idempotent batches. Consumed by log-based idempotent
@@ -1930,7 +1930,7 @@ const FLAG_CONTROL: u8 = 0b10;
 /// it survives the offset re-derivation on a conflict-correction re-encode);
 /// `last_sequence` is `base_sequence + (record_count - 1)`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ProducerCoord {
+pub(crate) struct ProducerCoord {
     producer_id: i64,
     producer_epoch: i16,
     base_sequence: i32,
@@ -2071,17 +2071,17 @@ enum FooterOutcome {
 /// the segment tail ahead of the [`SEGMENT_TRAILER_LEN`] trailer and treated as
 /// the published external-reader contract (kotatsu#82).
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-struct SegmentFooter {
+pub(crate) struct SegmentFooter {
     /// The lease epoch of the writer that produced this segment (#59). `0` when
     /// prefix leasing is not in effect. Stamped so a stale-epoch segment (from a
     /// fenced writer) is identifiable on read/recovery.
-    writer_epoch: i64,
+    pub(crate) writer_epoch: i64,
     /// Per-flush nonce (#87, footer v2): lets a writer recognise its own segment
     /// after an ambiguous PUT (create succeeded but the response was lost) and
     /// adopt it instead of re-writing the batch at the next sequence (#89). `0` in
     /// a v1 footer.
     nonce: u64,
-    entries: Vec<SubstreamEntry>,
+    pub(crate) entries: Vec<SubstreamEntry>,
 }
 
 impl SegmentFooter {
@@ -5034,7 +5034,7 @@ impl DynoStore {
 
         // Fast path: the over-read already holds the whole `[footer || trailer]`.
         if SEGMENT_TRAILER_LEN + footer_len <= buffer.len() {
-            return self.decode_segment_footer(&buffer);
+            return Self::decode_segment_footer(&buffer);
         }
 
         // Rare: a footer larger than the over-read (a prefix with very many
@@ -5052,7 +5052,7 @@ impl DynoStore {
             .bytes()
             .await?;
 
-        self.decode_segment_footer(&tail)
+        Self::decode_segment_footer(&tail)
     }
 
     /// Refresh the in-memory [`PrefixIndex`] for `prefix` (read-path #60 review
@@ -5234,7 +5234,7 @@ impl DynoStore {
             return false;
         };
 
-        let Ok(Some(footer)) = self.decode_segment_footer(&bytes).inspect_err(|error| {
+        let Ok(Some(footer)) = Self::decode_segment_footer(&bytes).inspect_err(|error| {
             debug!(?error, prefix, seq, "decoding the winner's footer");
         }) else {
             return false;
@@ -5407,7 +5407,7 @@ impl DynoStore {
 
             // The over-read carries the footer for all but a pathologically wide
             // prefix; anything else is the LIST path's business.
-            match self.decode_segment_footer(&bytes) {
+            match Self::decode_segment_footer(&bytes) {
                 Ok(Some(footer)) => {
                     if let Ok(mut index) = self.prefix_index.lock() {
                         _ = index.entry(prefix.to_owned()).or_default().segments.insert(
@@ -10654,7 +10654,7 @@ impl DynoStore {
     /// whole object). Returns `Ok(None)` when the trailer magic is absent — the
     /// object is a legacy single-topic coalesced object (#50, the v0 case) and
     /// must be read as a bare batch concatenation via [`Self::decode_frame`].
-    fn decode_segment_footer(&self, tail: &[u8]) -> Result<Option<SegmentFooter>> {
+    pub(crate) fn decode_segment_footer(tail: &[u8]) -> Result<Option<SegmentFooter>> {
         if tail.len() < SEGMENT_TRAILER_LEN {
             return Ok(None);
         }

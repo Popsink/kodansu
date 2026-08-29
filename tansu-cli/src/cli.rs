@@ -26,6 +26,9 @@ use clap::{Parser, Subcommand};
 use tansu_sans_io::ErrorCode;
 use tracing::debug;
 
+#[cfg(feature = "dynostore")]
+mod audit;
+
 mod broker;
 mod topic;
 mod user;
@@ -65,6 +68,10 @@ enum Command {
     /// Apache Kafka compatible broker backed by an object store (S3, GCS or memory) [default if no command supplied]
     Broker(Box<broker::Arg>),
 
+    /// Report the offsets a bucket's segments cannot serve, offline (#447)
+    #[cfg(feature = "dynostore")]
+    Audit(Box<audit::Arg>),
+
     /// Create, list or delete topics managed by the broker
     Topic {
         #[command(subcommand)]
@@ -88,6 +95,8 @@ impl Cli {
         let cli = Cli::parse();
 
         match cli.command.unwrap_or(Command::Broker(Box::new(cli.broker))) {
+            #[cfg(feature = "dynostore")]
+            Command::Audit(arg) => arg.main().await,
             Command::Broker(arg) => arg.main().await,
             Command::Topic { command } => command.main().await,
             Command::User { command } => command.main().await,

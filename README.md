@@ -182,6 +182,12 @@ specified in [docs/virtual-topics-format.md](docs/virtual-topics-format.md); the
 design rationale and the leaseless arbiter are in
 [docs/design-multiwriter-segments.md](docs/design-multiwriter-segments.md).
 
+`tansu audit` reads a bucket — or an offline copy of one — through that same contract
+and reports the offsets its segments **cannot** serve. Corruption counters measure
+reads that met damage; they cannot measure records that are no longer there to be
+read, and the surviving objects stay byte-perfect either way. See
+[docs/segment-audit.md](docs/segment-audit.md).
+
 ## Running the broker
 
 The broker subcommand is the default, and every option has a default:
@@ -478,6 +484,7 @@ just grafana-ui   # opens http://localhost:3000
 | [docs/quotas.md](docs/quotas.md) | Client quotas: the three dimensions, configuring them with `kafka-configs.sh`, and why the accounting is per replica |
 | [docs/storage-tuning.md](docs/storage-tuning.md) | Every storage-URL tuning key: coalescing, compaction, maintenance coordination |
 | [docs/virtual-topics-format.md](docs/virtual-topics-format.md) | The segment frame and footer — the contract for external S3-direct readers |
+| [docs/segment-audit.md](docs/segment-audit.md) | `tansu audit`: measuring, offline, the offsets a bucket's segments cannot serve |
 | [docs/design-multiwriter-segments.md](docs/design-multiwriter-segments.md) | Why the create-only segment sequence is the offset arbiter |
 | [docs/migration-scos.md](docs/migration-scos.md) | Operator runbook for the lease → leaseless cutover (historical) |
 | [docs/sarama.md](docs/sarama.md) | Driving the broker with the Go Sarama client |

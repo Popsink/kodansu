@@ -15,7 +15,10 @@ workspace = true
 
 [features]
 default = []
-dynostore = []
+# Forwards, rather than being a bare marker: the `audit` subcommand is
+# `tansu-storage`'s object-store audit, so enabling this feature here without
+# enabling it there leaves the subcommand referring to types that are not built.
+dynostore = ["tansu-broker/dynostore", "tansu-storage/dynostore"]
 
 [dependencies]
 bytes.workspace = true
@@ -27,6 +30,7 @@ pbkdf2.workspace = true
 rand.workspace = true
 regex.workspace = true
 rustls.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 tansu-broker.workspace = true
 tansu-client.workspace = true
