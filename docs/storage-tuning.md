@@ -62,6 +62,55 @@ Validate any change by sweeping the param in one deployment and watching S3
 `PutRequests` (CloudWatch) against produce p99 latency, rather than adopting a
 figure blind.
 
+### The linger is also a per-connection request-rate ceiling
+
+A broker connection is served **one request at a time**: the loop reads a frame,
+answers it, and only then reads the next. (Apache Kafka does the same — it mutes
+the channel while a request is in flight.) So a connection's request rate is
+exactly `1 / per-request latency`, and for produce that latency is
+`linger + PUT`.
+
+At the default `50ms` linger that is **~19 produce requests per second, per
+connection** — measured over `memory://`, where the PUT costs microseconds, so
+the figure is the linger and nothing else:
+
+| | requests/s | per request |
+|---|---|---|
+| one connection | 19.1 | 52.3 ms |
+| eight connections | 148.9 | — |
+
+The second row is the important one: throughput scales with connections, so this
+is **not** a broker-wide limit and **not** the object store. It is per
+connection, and the cost is the linger.
+
+The trap is that a single client cannot fill its own linger window. Nothing more
+is read from that connection until the request in flight is answered, so the
+buffer holds exactly one of its batches and waits out the full window for
+batches that cannot arrive. The linger coalesces across *connections*, never
+within one.
+
+What this means in practice:
+
+- **A fleet of low-rate, small-batch producers** — CDC, event-at-a-time, low
+  `linger.ms` client-side — is bounded at ~`1/linger` requests per second per
+  connection whatever the broker is doing. Message throughput comes from
+  client-side batching: raise the *producer*'s `linger.ms` / `batch.size` so each
+  request carries more.
+- **Latency accumulates rather than erroring.** A client pacing faster than
+  `1/linger` builds a queue in its own send buffer; delivery latency grows
+  without bound and no error is surfaced.
+- **`acks=0` makes that queue invisible.** The delivery report fires when the
+  request is written to the socket, so a client is told "sent" for records the
+  broker has not read yet, and process exit discards them. The broker no longer
+  compounds this by answering an `acks=0` produce (#440) — that response
+  desynchronised the correlation-id stream and made clients drop the connection
+  outright — but the queue itself is the linger's doing.
+
+Lowering `coalesce_linger` raises the per-connection ceiling proportionally and
+raises the segment PUT rate by the same factor. That is the whole trade, and the
+cost side is quantified under
+[What `coalesce_linger` is worth](#what-coalesce_linger-is-worth-and-where-it-stops).
+
 ## Producer idempotency checkpoint — removed
 
 There is nothing to tune here any more. The lazily-checkpointed per-producer

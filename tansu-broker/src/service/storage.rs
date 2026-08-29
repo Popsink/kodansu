@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use rama::{
-    Layer as _, Service as _,
+    Context, Layer as _, Service,
     layer::{MapErrLayer, MapStateLayer},
 };
 use tansu_sans_io::{
@@ -27,7 +27,7 @@ use tansu_sans_io::{
     ListGroupsRequest, ListOffsetsRequest, ListPartitionReassignmentsRequest, MetadataRequest,
     ProduceRequest, TxnOffsetCommitRequest,
 };
-use tansu_service::{FrameRequestLayer, FrameRouteBuilder};
+use tansu_service::{FrameRequestLayer, FrameRouteBuilder, NoResponse};
 use tansu_storage::{
     AlterClientQuotasService, AlterUserScramCredentialsService, ConsumerGroupDescribeService,
     CreateAclsService, CreateTopicsService, DeleteAclsService, DeleteGroupsService,
@@ -39,6 +39,7 @@ use tansu_storage::{
     ListPartitionReassignmentsService, MetadataService, ProduceService, Storage,
     TxnAddOffsetsService, TxnAddPartitionService, TxnEndService, TxnOffsetCommitService,
 };
+use tracing::warn;
 
 use crate::Error;
 
@@ -591,6 +592,54 @@ where
         .map_err(Into::into)
 }
 
+/// Kafka's `acks=0`: the request is served and **not answered** (#440).
+///
+/// The client registers no handler for it, does not wait for it, and considers
+/// the record delivered the moment the request is written to the socket. A
+/// response it never asked for arrives carrying a correlation id it has no
+/// in-flight request for, and a client that meets one drops the connection —
+/// taking everything still queued on it with it, while the delivery reports it
+/// already fired say the records were sent. Nothing reports a loss.
+///
+/// A layer here rather than inside `ProduceService` because the decision
+/// belongs to the *protocol*, not to storage: `tansu-storage` cannot see
+/// [`NoResponse`], which lives with the connection loop that acts on it. The
+/// records are still written and still awaited — `acks=0` withholds the answer,
+/// it does not withhold the durability.
+#[derive(Clone, Debug)]
+struct Acks<S>(S);
+
+impl<State, S> Service<State, ProduceRequest> for Acks<S>
+where
+    S: Service<State, ProduceRequest>,
+    State: Clone + Send + Sync + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+
+    async fn serve(
+        &self,
+        ctx: Context<State>,
+        req: ProduceRequest,
+    ) -> Result<Self::Response, Self::Error> {
+        if req.acks == 0 {
+            if let Some(no_response) = ctx.get::<NoResponse>() {
+                no_response.set();
+            } else {
+                // Unreachable through the broker's own stack — the connection
+                // loop inserts one — but worth a line rather than a shrug: the
+                // symptom is a client that keeps dropping its connection for no
+                // reason a broker log would explain.
+                warn!(
+                    "no acks=0 signal on this connection: answering a request that gets no answer"
+                );
+            }
+        }
+
+        self.0.serve(ctx, req).await
+    }
+}
+
 pub fn produce<S>(
     builder: FrameRouteBuilder<(), Error>,
     storage: S,
@@ -606,7 +655,7 @@ where
                 MapStateLayer::new(|_| storage),
                 FrameRequestLayer::<ProduceRequest>::new(),
             )
-                .into_layer(ProduceService)
+                .into_layer(Acks(ProduceService))
                 .boxed(),
         )
         .map_err(Into::into)

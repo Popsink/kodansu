@@ -20,7 +20,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
 };
@@ -109,6 +109,40 @@ impl Throttle {
     /// Take what is owed, leaving nothing.
     fn take(&self) -> Duration {
         Duration::from_millis(self.0.swap(0, Ordering::AcqRel))
+    }
+}
+
+/// A request the Kafka protocol says gets **no response at all** (#440).
+///
+/// `Produce` with `acks=0` is the only one: the client does not register a
+/// handler for it, does not wait for it, and considers the record delivered the
+/// moment the request is written to the socket. A broker that answers it anyway
+/// puts a frame on the wire that the client has no in-flight request for — the
+/// correlation-id stream desynchronises, and a client meeting a correlation id
+/// it never sent **drops the connection**. Everything still queued on it dies,
+/// and because the delivery reports already fired as success, nothing anywhere
+/// reports a loss. That is the shape of "345 of 2 000 persisted, no error".
+///
+/// A shared cell for the same reason [`Throttle`] is one: the fact is known
+/// deep in the stack, by the layer that has decoded the request, and it is acted
+/// on at the bottom, by the loop that writes frames. Nothing in between has any
+/// business carrying it.
+///
+/// Set per request and taken exactly once, by the same sequential loop, so
+/// there is no window in which it could leak into the next request.
+#[derive(Clone, Debug, Default)]
+pub struct NoResponse(Arc<AtomicBool>);
+
+impl NoResponse {
+    /// This request gets no response.
+    pub fn set(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Whether the request just served asked for silence, clearing it for the
+    /// next one.
+    fn take(&self) -> bool {
+        self.0.swap(false, Ordering::AcqRel)
     }
 }
 
@@ -513,9 +547,7 @@ where
         // connection because of it — and that boundary logs it there. Logging
         // here as well put every error into the error plane twice, which is how
         // one `NOT_COORDINATOR` became two `ERROR` lines (#289).
-        self.inner.serve(ctx, request).await.inspect(|response| {
-            RESPONSE_SIZE.record(response.len() as u64, attributes);
-
+        self.inner.serve(ctx, request).await.inspect(|_| {
             let elapsed_millis = self.elapsed_millis(request_start);
 
             REQUEST_DURATION.record(elapsed_millis, attributes);
@@ -523,10 +555,21 @@ where
     }
 
     #[instrument(skip_all)]
-    async fn write<W>(&self, req: &mut W, frame: Bytes) -> Result<(), S::Error>
+    async fn write<W>(
+        &self,
+        req: &mut W,
+        frame: Bytes,
+        attributes: &[KeyValue],
+    ) -> Result<(), S::Error>
     where
         W: AsyncWriteExt + Unpin,
     {
+        // Recorded here rather than where the response was built, so a response
+        // that is never written is never counted as one (#440): `acks=0` is
+        // answered with silence, and a `RESPONSE_SIZE` that included those
+        // would report bytes this broker did not send.
+        RESPONSE_SIZE.record(frame.len() as u64, attributes);
+
         // Deliberately does not log. A write that fails here is almost always the
         // client having gone away mid-response — `BrokenPipe`, `ConnectionReset` —
         // which is routine for a broker clients connect to and drop continuously,
@@ -570,9 +613,21 @@ where
         // the difference against `tansu_requests_parked` to be work (#362).
         let _in_flight = InFlight::enter();
 
+        let no_response = ctx.get::<NoResponse>().cloned();
+
         let request = self.read(req, size).await?;
         let response = self.process(attributes, ctx, request).await?;
-        self.write(req, response).await
+
+        // `Produce` with `acks=0` is answered with silence, because that is what
+        // the protocol says and what the client is built for — see
+        // [`NoResponse`]. The work still happened and is still counted; only the
+        // frame is withheld.
+        if no_response.is_some_and(|no_response| no_response.take()) {
+            debug!("acks=0: the request is served and gets no response");
+            return Ok(());
+        }
+
+        self.write(req, response, attributes).await
     }
 }
 
@@ -613,9 +668,15 @@ where
         // and this loop drains it below (#384).
         let throttle = Throttle::default();
 
+        // Likewise one cell for the life of the connection, taken by `answer`
+        // after each request: the loop is sequential, so a value set while
+        // serving request N is always consumed by request N (#440).
+        let no_response = NoResponse::default();
+
         let ctx = {
             let mut ctx = ctx;
             _ = ctx.insert(throttle.clone());
+            _ = ctx.insert(no_response);
             ctx
         };
 
@@ -912,6 +973,87 @@ mod tests {
         assert!(
             started.elapsed() >= DELAY,
             "the second request must wait out the throttle, not the first",
+        );
+
+        drop(client);
+        _ = connection.await;
+    }
+
+    /// Echoes, and asks for silence on the first request only — an `acks=0`
+    /// produce followed by anything else.
+    #[derive(Clone, Debug)]
+    struct SilentOnce {
+        served: Arc<AtomicU64>,
+    }
+
+    impl Service<(), Bytes> for SilentOnce {
+        type Response = Bytes;
+        type Error = Error;
+
+        async fn serve(&self, ctx: Context<()>, req: Bytes) -> Result<Bytes, Error> {
+            if self.served.fetch_add(1, Ordering::AcqRel) == 0
+                && let Some(no_response) = ctx.get::<NoResponse>()
+            {
+                no_response.set();
+            }
+
+            Ok(req)
+        }
+    }
+
+    /// A request that asks for silence gets none of its bytes on the wire — and
+    /// the *next* request is answered normally, in its own right (#440).
+    ///
+    /// The second half is what makes this a test rather than a tautology. A
+    /// signal that leaked into the following request would mute a connection
+    /// permanently after one `acks=0` produce, and a client would see its
+    /// `Metadata` call hang rather than a correlation-id mismatch — a different
+    /// bug, equally invisible from the broker's side.
+    #[tokio::test]
+    async fn a_request_that_asks_for_silence_is_not_answered() {
+        let service: TcpBytesService<SilentOnce, ()> = TcpBytesService {
+            inner: SilentOnce {
+                served: Arc::new(AtomicU64::new(0)),
+            },
+            _state: PhantomData,
+        };
+
+        let (mut client, server) = tokio::io::duplex(4096);
+
+        let connection = tokio::spawn(async move {
+            service
+                .serve(Context::with_state(TcpContext::default()), server)
+                .await
+        });
+
+        client
+            .write_all(&frame(b"silent"))
+            .await
+            .expect("first request");
+        client
+            .write_all(&frame(b"answered"))
+            .await
+            .expect("second request");
+
+        // The only bytes on the wire are the second request's. Reading the
+        // second response's length first is the assertion: if the first had been
+        // answered, these four bytes would be *its* length.
+        let mut answered = [0u8; 12];
+        _ = client
+            .read_exact(&mut answered)
+            .await
+            .expect("the second response");
+
+        assert_eq!(&frame(b"answered")[..], &answered[..]);
+
+        // And nothing else follows, so the first was withheld rather than
+        // reordered behind the second.
+        let mut trailing = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), client.read_exact(&mut trailing))
+                .await
+                .is_err(),
+            "a withheld response must not arrive later",
         );
 
         drop(client);
