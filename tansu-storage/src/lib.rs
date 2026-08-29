@@ -157,6 +157,7 @@ mod latency;
 mod null;
 mod quota;
 mod service;
+mod validation;
 
 pub use acl::{
     AclBinding, AclFilter, Acls, CLUSTER_RESOURCE, WILDCARD_HOST, WILDCARD_PRINCIPAL,

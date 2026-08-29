@@ -89,7 +89,7 @@ use crate::{
     OffsetStage, ProducerIdResponse, QuotaAlteration, QuotaEntity, QuotaFilterComponent,
     QuotaLimits, Quotas, Result, ScramCredential, Storage, TopicDefaults, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
-    UpdateError, Version, storage_error_code,
+    UpdateError, Version, storage_error_code, validation,
 };
 
 const APPLICATION_JSON: &str = "application/json";
@@ -10882,7 +10882,33 @@ impl Storage for DynoStore {
     }
 
     #[instrument(skip_all, fields(topic = %topic.name))]
-    async fn create_topic(&self, mut topic: CreatableTopic, _validate_only: bool) -> Result<Uuid> {
+    async fn create_topic(&self, mut topic: CreatableTopic, validate_only: bool) -> Result<Uuid> {
+        // Before anything is written, and here rather than in the
+        // `CreateTopics` service, for the same reason the config defaults are
+        // (#225): this is the single creation choke point, and metadata
+        // auto-create takes its topic name straight off the wire (#443).
+        validation::creatable_topic(&topic)?;
+
+        // `validate_only` is a dry run, and it used to create the topic — which
+        // makes a plan/apply provider or a CI validation job provision for real
+        // while reporting that it would have. Existence is still checked,
+        // because Kafka's dry run reports `TOPIC_ALREADY_EXISTS` and that is the
+        // answer a plan is asking for; nothing else is touched.
+        //
+        // The nil uuid, not a fresh one: no topic was created, so there is no id
+        // to name — and `NULL_TOPIC_ID` is what a client reads it back as.
+        if validate_only {
+            return if self
+                .topic_metadata(&TopicId::Name(topic.name.clone()))
+                .await?
+                .is_some()
+            {
+                Err(Error::Api(ErrorCode::TopicAlreadyExists))
+            } else {
+                Ok(Uuid::nil())
+            };
+        }
+
         let id = Uuid::now_v7();
         debug!(%id);
 
