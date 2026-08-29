@@ -235,6 +235,12 @@ pub struct DynoStore {
     /// Keyed by prefix, so one buffer accumulates `PrefixPending` batches across
     /// many topitions; drained (never held across an await) on a threshold or
     /// linger flush into one create-only segment object.
+    /// Kafka's `message.max.bytes`: the largest record batch this broker
+    /// accepts, in wire bytes including the length prefix (#443). Defaults to
+    /// [`DynoStore::MESSAGE_MAX_BYTES`], Kafka's own default, and is overridable
+    /// per deployment from the storage URL.
+    message_max_bytes: usize,
+
     prefix_coalesce_buffers: Arc<Mutex<BTreeMap<String, PrefixCoalesceBuffer>>>,
 
     /// Per-prefix next segment sequence hint (#57). The segment object name
@@ -2568,6 +2574,7 @@ impl DynoStore {
             prefix_read_sync_locks: Arc::new(Mutex::new(BTreeMap::new())),
             producers: Arc::new(Mutex::new(BTreeMap::new())),
             oldest_retained_prefix: Arc::new(Mutex::new(BTreeMap::new())),
+            message_max_bytes: Self::MESSAGE_MAX_BYTES,
             prefix_coalesce_buffers: Arc::new(Mutex::new(BTreeMap::new())),
             segment_seqs: Arc::new(Mutex::new(BTreeMap::new())),
             prefix_flush_locks: Arc::new(Mutex::new(BTreeMap::new())),
@@ -2659,6 +2666,21 @@ impl DynoStore {
     /// thresholds (#54). Each `None` in `tuning` leaves that trigger at its
     /// current value (the compile-time default), so an all-default `tuning` is a
     /// no-op and reproduces the shipped behaviour.
+    /// Override the largest record batch this broker accepts (#443), Kafka's
+    /// `message.max.bytes`. Populated from the storage URL; `0` is read as "no
+    /// override" rather than "accept nothing", since a cap of zero would refuse
+    /// every produce and is never what an operator meant.
+    pub fn message_max_bytes(self, message_max_bytes: usize) -> Self {
+        Self {
+            message_max_bytes: if message_max_bytes == 0 {
+                Self::MESSAGE_MAX_BYTES
+            } else {
+                message_max_bytes
+            },
+            ..self
+        }
+    }
+
     pub fn coalesce_tuning(self, tuning: CoalesceTuning) -> Self {
         Self {
             coalesce_linger: tuning.coalesce_linger.unwrap_or(self.coalesce_linger),
@@ -2829,6 +2851,12 @@ impl DynoStore {
     /// cap ([`Self::COALESCE_MAX_RECORDS`]) stays a fixed safety bound: it also
     /// bounds how far back [`Self::fetch`] must probe to find the object
     /// containing a mid-frame offset.
+    /// Kafka's own `message.max.bytes` default: 1 MiB plus the record-batch
+    /// overhead it allows on top (`1048576 + 12`). Matching it exactly is the
+    /// point — an application that fits here fits on a stock Kafka, which is
+    /// what a drop-in replacement owes its users (#443).
+    pub const MESSAGE_MAX_BYTES: usize = 1_048_588;
+
     const COALESCE_LINGER: Duration = Duration::from_millis(50);
     const COALESCE_BATCHES: usize = 64;
     const COALESCE_BYTES: usize = 1 << 20;
@@ -11301,6 +11329,30 @@ impl Storage for DynoStore {
         deflated: deflated::Batch,
     ) -> Result<i64> {
         {
+            // Kafka's `message.max.bytes`, refused before anything is buffered
+            // (#443). Without a cap an unbounded payload reaches the write path,
+            // and an application built against a broker with no limit breaks the
+            // day it is pointed at a stock Kafka that has one — which is the
+            // failure this exists to bring forward.
+            //
+            // Measured on the wire batch, which is what Kafka measures: the
+            // batch length plus the `base_offset (i64) + batch_length (i32)`
+            // prefix that precedes it in the log, so the number an operator sets
+            // is the number of bytes a record set costs.
+            let batch_bytes =
+                size_of::<i64>() + size_of::<i32>() + deflated.batch_length.max(0) as usize;
+
+            if batch_bytes > self.message_max_bytes {
+                warn!(
+                    ?topition,
+                    batch_bytes,
+                    message_max_bytes = self.message_max_bytes,
+                    "refusing a batch larger than message_max_bytes"
+                );
+
+                return Err(Error::Api(ErrorCode::MessageTooLarge));
+            }
+
             let attributes =
                 BatchAttribute::try_from(deflated.attributes).inspect_err(|err| debug!(?err))?;
 

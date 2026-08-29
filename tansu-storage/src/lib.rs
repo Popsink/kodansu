@@ -2602,6 +2602,32 @@ impl<N, C, A, S> Builder<N, C, A, S> {
     }
 }
 
+/// The largest record batch this broker accepts, from the storage URL query
+/// string (`?message_max_bytes=1MiB`), falling back to Kafka's own default
+/// (#443).
+///
+/// A key here rather than a broker CLI flag, alongside `auto_create_topics` and
+/// the `coalesce_*` keys, because that is where this deployment's engine
+/// behaviour is already configured — and because the limit is enforced by the
+/// engine, at the single write choke point, rather than by the protocol layer.
+///
+/// An unparseable value keeps the default and says so: a size limit that
+/// silently became something else is worse than one that was ignored.
+#[cfg(feature = "dynostore")]
+fn message_max_bytes(storage: &Url) -> usize {
+    storage
+        .query_pairs()
+        .find(|(k, _)| k == "message_max_bytes")
+        .and_then(|(_, v)| {
+            human_units::Size::from_str(v.as_ref())
+                .map(|size| size.0)
+                .inspect_err(|err| warn!(%storage, value = v.as_ref(), ?err))
+                .ok()
+                .and_then(|size| usize::try_from(size).ok())
+        })
+        .unwrap_or(DynoStore::MESSAGE_MAX_BYTES)
+}
+
 /// Parse the auto-topic-creation policy from the storage URL query string
 /// (`?auto_create_topics=false&num_partitions=3&default_replication_factor=2`),
 /// falling back to [`AutoTopicCreate::default`] for any absent or unparseable key.
@@ -2817,6 +2843,7 @@ impl Builder<i32, String, Url, Url> {
                             .auto_create(auto_topic_create(&self.storage))
                             .topic_defaults(self.topic_defaults.clone())
                             .coalesce_tuning(coalesce_tuning(&self.storage))
+                            .message_max_bytes(message_max_bytes(&self.storage))
                     })
                     .map(|storage| {
                         ProduceRequestBatcher::new(storage)
@@ -2894,6 +2921,7 @@ impl Builder<i32, String, Url, Url> {
                             .auto_create(auto_topic_create(&self.storage))
                             .topic_defaults(self.topic_defaults.clone())
                             .coalesce_tuning(coalesce_tuning(&self.storage))
+                            .message_max_bytes(message_max_bytes(&self.storage))
                     })
                     .map(|storage| {
                         ProduceRequestBatcher::new(storage)
@@ -2911,7 +2939,8 @@ impl Builder<i32, String, Url, Url> {
                     .advertised_listener(self.advertised_listener.clone())
                     .auto_create(auto_topic_create(&self.storage))
                     .topic_defaults(self.topic_defaults.clone())
-                    .coalesce_tuning(coalesce_tuning(&self.storage)),
+                    .coalesce_tuning(coalesce_tuning(&self.storage))
+                    .message_max_bytes(message_max_bytes(&self.storage)),
             )
             .map(|storage| Box::new(storage) as Box<dyn Storage>)
             .map(Arc::new),

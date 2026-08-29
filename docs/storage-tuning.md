@@ -111,6 +111,32 @@ raises the segment PUT rate by the same factor. That is the whole trade, and the
 cost side is quantified under
 [What `coalesce_linger` is worth](#what-coalesce_linger-is-worth-and-where-it-stops).
 
+## `message_max_bytes` — the largest batch this broker accepts
+
+Kafka's `message.max.bytes`, defaulting to Kafka's own value (`1048588` — 1 MiB
+plus the record-batch overhead it allows on top). A batch above it is refused
+with `MESSAGE_TOO_LARGE` before anything is buffered.
+
+```
+s3://my-bucket/?message_max_bytes=8m
+```
+
+Matching Kafka's default exactly is the point: an application that fits here
+fits on a stock Kafka, and one that does not finds out now rather than on the
+day it is migrated or replicated onto one. Client-side `max.request.size` is
+also 1 MiB by default, so nothing reaches this limit without having been
+configured past it on purpose.
+
+**If your producers were configured past it, raise this before upgrading.** A
+deployment that has been sending batches larger than 1 MiB has been relying on
+the absence of the cap; it will start seeing `MESSAGE_TOO_LARGE` otherwise.
+`tansu_api_requests` by `api_key=0` against your producers' error rate is the
+signal, and the fix is one query-string key.
+
+An unparseable value keeps the default and logs a warning: a size limit that
+silently became something else is worse than one that was ignored, because the
+operator believes a number that is not in force.
+
 ## Producer idempotency checkpoint — removed
 
 There is nothing to tune here any more. The lazily-checkpointed per-producer
