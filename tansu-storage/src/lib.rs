@@ -191,7 +191,7 @@ pub use service::{
     FindCoordinatorService, GetTelemetrySubscriptionsService, IncrementalAlterConfigsService,
     InitProducerIdService, ListGroupsService, ListOffsetsService,
     ListPartitionReassignmentsService, MetadataService, ProduceService, TxnAddOffsetsService,
-    TxnAddPartitionService, TxnOffsetCommitService,
+    TxnAddPartitionService, TxnEndService, TxnOffsetCommitService,
 };
 
 #[cfg(feature = "dynostore")]
