@@ -22,7 +22,7 @@ use tansu_sans_io::{
     CreateTopicsRequest, DeleteAclsRequest, DeleteGroupsRequest, DeleteRecordsRequest,
     DeleteTopicsRequest, DescribeAclsRequest, DescribeClientQuotasRequest, DescribeClusterRequest,
     DescribeConfigsRequest, DescribeGroupsRequest, DescribeTopicPartitionsRequest,
-    DescribeUserScramCredentialsRequest, FetchRequest, FindCoordinatorRequest,
+    DescribeUserScramCredentialsRequest, EndTxnRequest, FetchRequest, FindCoordinatorRequest,
     GetTelemetrySubscriptionsRequest, IncrementalAlterConfigsRequest, InitProducerIdRequest,
     ListGroupsRequest, ListOffsetsRequest, ListPartitionReassignmentsRequest, MetadataRequest,
     ProduceRequest, TxnOffsetCommitRequest,
@@ -37,7 +37,7 @@ use tansu_storage::{
     FindCoordinatorService, GetTelemetrySubscriptionsService, IncrementalAlterConfigsService,
     InitProducerIdService, ListGroupsService, ListOffsetsService,
     ListPartitionReassignmentsService, MetadataService, ProduceService, Storage,
-    TxnAddOffsetsService, TxnAddPartitionService, TxnOffsetCommitService,
+    TxnAddOffsetsService, TxnAddPartitionService, TxnEndService, TxnOffsetCommitService,
 };
 
 use crate::Error;
@@ -68,6 +68,7 @@ where
         describe_groups,
         describe_topic_partitions,
         describe_user_scram_credentials,
+        end_txn,
         fetch,
         find_coordinator,
         get_telemetry_subscriptions,
@@ -669,6 +670,34 @@ where
                 FrameRequestLayer::<AddPartitionsToTxnRequest>::new(),
             )
                 .into_layer(TxnAddPartitionService)
+                .boxed(),
+        )
+        .map_err(Into::into)
+}
+
+/// `EndTxn` (api key 26): commit or abort a transaction.
+///
+/// Absent until #441. [`Storage::txn_end`] was implemented and tested, but with
+/// no route the API was not advertised — so `commit_transaction` and
+/// `abort_transaction` both failed `_UNSUPPORTED_FEATURE` on a client that the
+/// *other* four transaction APIs had already let write records. The route is
+/// what makes the transaction machinery reachable over the wire.
+pub fn end_txn<S>(
+    builder: FrameRouteBuilder<(), Error>,
+    storage: S,
+) -> Result<FrameRouteBuilder<(), Error>, Error>
+where
+    S: Storage + Clone,
+{
+    builder
+        .with_route(
+            EndTxnRequest::KEY,
+            (
+                MapErrLayer::new(Error::from),
+                MapStateLayer::new(|_| storage),
+                FrameRequestLayer::<EndTxnRequest>::new(),
+            )
+                .into_layer(TxnEndService)
                 .boxed(),
         )
         .map_err(Into::into)

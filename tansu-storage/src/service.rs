@@ -68,4 +68,5 @@ pub use metadata::MetadataService;
 pub use produce::ProduceService;
 pub use txn::add_offsets::AddOffsetsService as TxnAddOffsetsService;
 pub use txn::add_partitions::AddPartitionService as TxnAddPartitionService;
+pub use txn::end::EndService as TxnEndService;
 pub use txn::offset_commit::OffsetCommitService as TxnOffsetCommitService;
