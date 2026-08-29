@@ -328,7 +328,7 @@ async fn an_intact_region_decodes_to_its_batches() -> Result<(), Error> {
 /// Damage the head of the only region under `topic`'s prefix, in the object
 /// store, behind the broker's back — leaving the footer index the broker already
 /// holds pointing where it always did.
-async fn corrupt_stored_region(bucket: &InMemory, store: &DynoStore, topic: &str) -> Result<()> {
+async fn corrupt_stored_region(bucket: &InMemory, topic: &str) -> Result<()> {
     let listing = Path::from(format!("clusters/{CLUSTER}/prefixes/{topic}/segments/"));
 
     let locations: Vec<Path> = bucket
@@ -339,9 +339,7 @@ async fn corrupt_stored_region(bucket: &InMemory, store: &DynoStore, topic: &str
     assert_eq!(1, locations.len());
 
     let segment = bucket.get(&locations[0]).await?.bytes().await?;
-    let footer = store
-        .decode_segment_footer(&segment)?
-        .expect("segment must carry a footer");
+    let footer = DynoStore::decode_segment_footer(&segment)?.expect("segment must carry a footer");
     let entry = footer.get(topic, 0).expect("sub-stream entry");
 
     _ = bucket
@@ -390,7 +388,7 @@ async fn a_corrupt_region_fails_its_partition_and_the_request_is_still_answered(
             .await?
     );
 
-    corrupt_stored_region(&bucket, &store, OFFSETS).await?;
+    corrupt_stored_region(&bucket, OFFSETS).await?;
 
     const MAX_BYTES: i32 = 64 * 1024;
 

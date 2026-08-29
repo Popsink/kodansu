@@ -204,7 +204,7 @@ async fn legacy_records(bucket: &InMemory, topic: &str) -> Vec<Path> {
         .expect("list records")
 }
 
-async fn footer_of(bucket: &InMemory, store: &DynoStore, location: &Path) -> SegmentFooter {
+async fn footer_of(bucket: &InMemory, location: &Path) -> SegmentFooter {
     let bytes = bucket
         .get(location)
         .await
@@ -213,8 +213,7 @@ async fn footer_of(bucket: &InMemory, store: &DynoStore, location: &Path) -> Seg
         .await
         .expect("segment bytes");
 
-    store
-        .decode_segment_footer(&bytes)
+    DynoStore::decode_segment_footer(&bytes)
         .expect("decode footer")
         .expect("segment carries a footer")
 }
@@ -288,7 +287,7 @@ async fn one_window_across_topics_is_one_segment() -> Result<(), Error> {
     let segments = segments(&bucket).await;
     assert_eq!(1, segments.len(), "expected exactly one segment PUT");
 
-    let footer = footer_of(&bucket, &store, &segments[0]).await;
+    let footer = footer_of(&bucket, &segments[0]).await;
     assert_eq!(2, footer.entries.len());
 
     let ea = footer.get(topic_a, 0).expect("tab_a entry");
@@ -2510,7 +2509,7 @@ async fn leaseless_segment_stamps_seeded_era_above_lease() -> Result<(), Error> 
 
     assert_eq!(0, store.produce(None, &tp, batch(3)?).await?);
 
-    let footer = footer_of(&bucket, &store, &segment_path(0)).await;
+    let footer = footer_of(&bucket, &segment_path(0)).await;
     assert_eq!(
         6, footer.writer_epoch,
         "era = max(lease 5, footer 0) + 1, stamped into the segment"
@@ -4736,7 +4735,7 @@ async fn txn_commit_marker_lands_in_segment() -> Result<(), Error> {
         assert_eq!(3, version, "the leaseless writer stamps v3 unconditionally");
         assert_eq!(0, trailing, "documented v3 stride must consume the footer");
 
-        let footer = footer_of(&bucket, &store, location).await;
+        let footer = footer_of(&bucket, location).await;
         for coord in footer.entries.iter().flat_map(|entry| &entry.producers) {
             assert_eq!(pid, coord.producer_id);
             match coord.flags {

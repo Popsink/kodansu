@@ -3779,6 +3779,7 @@ dependencies = [
  "rand 0.10.1",
  "regex",
  "rustls",
+ "serde_json",
  "sha2",
  "tansu-broker",
  "tansu-client",

@@ -142,6 +142,12 @@ use tracing::warn;
 #[cfg(feature = "dynostore")]
 mod dynostore;
 
+#[cfg(feature = "dynostore")]
+mod audit;
+
+#[cfg(feature = "dynostore")]
+pub use audit::{Audit, AuditReport, Bracket, Gap, PartitionAudit, SegmentFault, TopicAudit};
+
 mod acl;
 mod authorizer;
 mod batch;

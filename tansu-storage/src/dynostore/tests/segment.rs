@@ -103,9 +103,7 @@ async fn round_trips_multiple_substreams() -> Result<(), Error> {
     assert_eq!(a1.byte_start + a1.byte_len, b0.byte_start);
 
     // The footer recovered from the object equals the one returned by encode.
-    let decoded = store
-        .decode_segment_footer(&segment)?
-        .expect("segment must carry a footer");
+    let decoded = DynoStore::decode_segment_footer(&segment)?.expect("segment must carry a footer");
     assert_eq!(footer, decoded);
 
     // Each sub-stream's byte range decodes to exactly its batches — no
@@ -144,9 +142,7 @@ async fn footer_recovered_from_tail_only() -> Result<(), Error> {
     let body_len = footer.entries.iter().map(|e| e.byte_len).sum::<u64>() as usize;
     let tail = segment.slice(body_len..);
 
-    let decoded = store
-        .decode_segment_footer(&tail)?
-        .expect("footer from tail");
+    let decoded = DynoStore::decode_segment_footer(&tail)?.expect("footer from tail");
     assert_eq!(footer, decoded);
 
     Ok(())
@@ -163,7 +159,7 @@ async fn legacy_object_has_no_footer() -> Result<(), Error> {
     let payload: PutPayload = store.encode_frame(&batches)?;
     let object = Bytes::from(payload);
 
-    assert!(store.decode_segment_footer(&object)?.is_none());
+    assert!(DynoStore::decode_segment_footer(&object)?.is_none());
 
     let (decoded, _) = store.decode_frame(object)?;
     assert_eq!(2, decoded.len());
@@ -177,9 +173,8 @@ async fn legacy_object_has_no_footer() -> Result<(), Error> {
 /// not panic or misread, it returns `None`.
 #[tokio::test]
 async fn tail_shorter_than_trailer_is_not_a_segment() -> Result<(), Error> {
-    let store = store();
     let tiny = Bytes::from(vec![0u8; SEGMENT_TRAILER_LEN - 1]);
-    assert!(store.decode_segment_footer(&tiny)?.is_none());
+    assert!(DynoStore::decode_segment_footer(&tiny)?.is_none());
     Ok(())
 }
 
@@ -189,8 +184,6 @@ async fn tail_shorter_than_trailer_is_not_a_segment() -> Result<(), Error> {
 /// cutover; this pins the format so v2 segments are readable once it flips.)
 #[test]
 fn footer_v2_round_trips_producer_coords_and_nonce() -> Result<(), Error> {
-    let store = store();
-
     let footer = SegmentFooter {
         writer_epoch: 9,
         nonce: 0x0123_4567_89ab_cdef,
@@ -247,9 +240,7 @@ fn footer_v2_round_trips_producer_coords_and_nonce() -> Result<(), Error> {
     tail.extend_from_slice(&SEGMENT_FORMAT_VERSION_V2.to_be_bytes());
     tail.extend_from_slice(&SEGMENT_MAGIC.to_be_bytes());
 
-    let decoded = store
-        .decode_segment_footer(&tail)?
-        .expect("v2 footer must decode");
+    let decoded = DynoStore::decode_segment_footer(&tail)?.expect("v2 footer must decode");
     assert_eq!(footer, decoded);
 
     Ok(())
@@ -267,8 +258,6 @@ fn footer_v2_round_trips_producer_coords_and_nonce() -> Result<(), Error> {
 /// the encoder currently does.
 #[test]
 fn footer_v2_encoding_is_byte_identical_to_golden() -> Result<(), Error> {
-    let store = store();
-
     let footer = SegmentFooter {
         writer_epoch: 1,
         nonce: 2,
@@ -324,9 +313,7 @@ fn footer_v2_encoding_is_byte_identical_to_golden() -> Result<(), Error> {
     tail.extend_from_slice(&SEGMENT_FORMAT_VERSION_V2.to_be_bytes());
     tail.extend_from_slice(&SEGMENT_MAGIC.to_be_bytes());
 
-    let decoded = store
-        .decode_segment_footer(&tail)?
-        .expect("v2 footer must decode");
+    let decoded = DynoStore::decode_segment_footer(&tail)?.expect("v2 footer must decode");
     assert_eq!(0, decoded.entries[0].producers[0].flags);
 
     Ok(())
@@ -342,8 +329,6 @@ fn footer_v2_encoding_is_byte_identical_to_golden() -> Result<(), Error> {
 /// this pins the v3 layout so those segments are readable once it flips.)
 #[test]
 fn footer_v3_round_trips_producer_coords_with_flags() -> Result<(), Error> {
-    let store = store();
-
     let footer = SegmentFooter {
         writer_epoch: 9,
         nonce: 0x0123_4567_89ab_cdef,
@@ -395,9 +380,7 @@ fn footer_v3_round_trips_producer_coords_with_flags() -> Result<(), Error> {
     tail.extend_from_slice(&SEGMENT_FORMAT_VERSION_V3.to_be_bytes());
     tail.extend_from_slice(&SEGMENT_MAGIC.to_be_bytes());
 
-    let decoded = store
-        .decode_segment_footer(&tail)?
-        .expect("v3 footer must decode");
+    let decoded = DynoStore::decode_segment_footer(&tail)?.expect("v3 footer must decode");
     assert_eq!(footer, decoded);
 
     Ok(())
@@ -411,8 +394,6 @@ fn footer_v3_round_trips_producer_coords_with_flags() -> Result<(), Error> {
 /// anything", silently discarding the contract's rejection MUST.
 #[test]
 fn footer_rejects_unknown_version() -> Result<(), Error> {
-    let store = store();
-
     let footer = SegmentFooter {
         writer_epoch: 1,
         nonce: 2,
@@ -426,9 +407,7 @@ fn footer_rejects_unknown_version() -> Result<(), Error> {
     tail.extend_from_slice(&4u16.to_be_bytes());
     tail.extend_from_slice(&SEGMENT_MAGIC.to_be_bytes());
 
-    let error = store
-        .decode_segment_footer(&tail)
-        .expect_err("version 4 must be rejected");
+    let error = DynoStore::decode_segment_footer(&tail).expect_err("version 4 must be rejected");
     assert!(
         error
             .to_string()
