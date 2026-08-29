@@ -444,7 +444,12 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
-        assert_eq!(Some(0), partition.offset);
+        // No record at or after the target, because this partition has
+        // none at all: `-1`, the "no such offset" sentinel, beside the
+        // `-1` timestamp below (#444). It used to answer `0` here — a real
+        // position meaning the very beginning — so a client seeking to it
+        // replayed the whole partition.
+        assert_eq!(Some(-1), partition.offset);
         assert_eq!(Some(-1), partition.timestamp);
     }
 
@@ -494,7 +499,12 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
-        assert_eq!(Some(0), partition.offset);
+        // No record at or after the target, because this partition has
+        // none at all: `-1`, the "no such offset" sentinel, beside the
+        // `-1` timestamp below (#444). It used to answer `0` here — a real
+        // position meaning the very beginning — so a client seeking to it
+        // replayed the whole partition.
+        assert_eq!(Some(-1), partition.offset);
         assert_eq!(Some(-1), partition.timestamp);
     }
 
@@ -544,7 +554,12 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
 
     for partition in partitions[1..].iter() {
         assert_eq!(i16::from(ErrorCode::None), partition.error_code);
-        assert_eq!(Some(0), partition.offset);
+        // No record at or after the target, because this partition has
+        // none at all: `-1`, the "no such offset" sentinel, beside the
+        // `-1` timestamp below (#444). It used to answer `0` here — a real
+        // position meaning the very beginning — so a client seeking to it
+        // replayed the whole partition.
+        assert_eq!(Some(-1), partition.offset);
         assert_eq!(Some(-1), partition.timestamp);
     }
 

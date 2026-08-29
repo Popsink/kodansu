@@ -30,7 +30,9 @@ use tracing::{debug, error, instrument};
 
 use tansu_sans_io::acl::{Operation, Resource};
 
-use crate::{Error, Parked, Result, Storage, Topition, authorized, storage_error_code};
+use crate::{
+    Error, OffsetStage, Parked, Result, Storage, Topition, authorized, storage_error_code,
+};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`FetchRequest`] returning [`FetchResponse`].
 /// ```
@@ -155,6 +157,62 @@ impl FetchService {
         let mut error_code = ErrorCode::None;
 
         let mut offset = fetch_partition.fetch_offset;
+
+        // A fetch position outside the log is answered `OFFSET_OUT_OF_RANGE`
+        // (#444), and that error is every consumer's self-healing mechanism: it
+        // is how a client detects a stale position — retention expiry, a
+        // `DeleteRecords` truncation, a topic deleted and recreated (#442) — and
+        // applies its `auto.offset.reset`. Without it the two ends fail
+        // differently and both fail silently. A position *above* the log end
+        // yields nothing and parks on the long poll, so the consumer polls
+        // forever: connected, zero throughput, lag growing, nothing to alarm on.
+        // A position *below* the log start is worse — the read resolves to the
+        // oldest surviving records and serves them as though they were the ones
+        // asked for, so a consumer resuming on a recreated topic silently reads
+        // a different topic's successor from a position that no longer means
+        // what it meant.
+        //
+        // Checked against the LOG, not the stable region, and so always at
+        // read-uncommitted regardless of what this fetch asked for: an offset
+        // above the last stable offset but below the log end is not out of
+        // range, it is merely not yet visible to a read-committed consumer, and
+        // refusing it would break every consumer of an open transaction. That
+        // choice is also what makes the check free — the read-uncommitted stage
+        // resolves from the in-memory hint and never reads `meta.json` (#109),
+        // so no fetch pays a request for it.
+        //
+        // `fetch_offset == high_watermark` is IN range: it is what a caught-up
+        // consumer sends on every poll.
+        let log = match ctx
+            .state()
+            .offset_stage_at(&tp, IsolationLevel::ReadUncommitted)
+            .await
+        {
+            Ok(log) => log,
+
+            Err(error) => {
+                error!(?error, ?tp);
+
+                let error_code = match error {
+                    Error::Api(code) => code,
+                    ref error => storage_error_code(error),
+                };
+
+                return Ok(self.unservable_partition(partition_index, error_code));
+            }
+        };
+
+        if offset < log.log_start() || offset > log.high_watermark() {
+            debug!(
+                ?tp,
+                offset,
+                log_start = log.log_start(),
+                high_watermark = log.high_watermark(),
+                "fetch offset is outside the log"
+            );
+
+            return Ok(self.out_of_range_partition(partition_index, &log));
+        }
 
         loop {
             if *max_bytes == 0 {
@@ -324,6 +382,29 @@ impl FetchService {
     /// that has no readable state: a `high_watermark` of 0 with a
     /// `log_start_offset` of -1 claims nothing, so a client that looks past the
     /// error code cannot mistake it for an empty-but-healthy partition.
+    /// A fetch position outside the log (#444).
+    ///
+    /// Distinct from [`Self::unservable_partition`], which reports zeroed
+    /// bounds because it does not have any: this one carries the **real**
+    /// `log_start_offset` and `high_watermark`, which is what a client resetting
+    /// itself is looking at. Answering `OFFSET_OUT_OF_RANGE` with a log start of
+    /// `-1` would tell a consumer its position is invalid and give it nothing to
+    /// move to.
+    fn out_of_range_partition(&self, partition_index: i32, log: &OffsetStage) -> PartitionData {
+        PartitionData::default()
+            .partition_index(partition_index)
+            .error_code(ErrorCode::OffsetOutOfRange.into())
+            .high_watermark(log.high_watermark())
+            .last_stable_offset(Some(log.last_stable()))
+            .log_start_offset(Some(log.log_start()))
+            .diverging_epoch(None)
+            .current_leader(None)
+            .snapshot_id(None)
+            .aborted_transactions(Some([].into()))
+            .preferred_read_replica(Some(-1))
+            .records(None)
+    }
+
     fn unservable_partition(&self, partition_index: i32, error_code: ErrorCode) -> PartitionData {
         PartitionData::default()
             .partition_index(partition_index)
