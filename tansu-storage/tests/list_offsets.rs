@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use crate::common::{Error, cluster_id, init_tracing, storage_url, storage_url_with_query};
 use bytes::Bytes;
 use rama::{Context, Layer as _, Service, layer::MapStateLayer};
@@ -19,6 +21,7 @@ use tansu_sans_io::{
     CreateTopicsRequest, ErrorCode, IsolationLevel, ListOffset, ListOffsetsRequest, ProduceRequest,
     create_topics_request::CreatableTopic,
     list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
+    list_offsets_response::ListOffsetsPartitionResponse,
     produce_request::{PartitionProduceData, TopicProduceData},
     record::{Record, deflated, inflated::Batch},
 };
@@ -422,6 +425,158 @@ async fn wide_assignment_earliest_and_latest_prefix_coalesced() -> Result<(), Er
             }
         }
     }
+
+    Ok(())
+}
+
+/// `offsetsForTimes` with a timestamp no record reaches answers `-1`, not `0`
+/// (#444).
+///
+/// The storage layer already says `None` for "no record at or after this time"
+/// — the sentinel is what the wire mapping made of it. `0` is not a sentinel:
+/// it is a valid position meaning the very beginning of the log, so
+/// `offsets_for_times(now + 60s)` turned "resume from later" into "replay the
+/// entire topic". A client that seeks to the returned offset re-reads
+/// everything, at full-history scale, from a seek that looked innocent.
+///
+/// The `timestamp` field beside it already answered `-1`, which is what makes
+/// this a mapping slip rather than a missing feature — and what made it
+/// survive: a response carrying `timestamp: -1, offset: 0` looks half right.
+#[tokio::test]
+async fn a_timestamp_no_record_reaches_has_no_offset() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    const NODE_ID: i32 = 111;
+    const TOPIC: &str = "offsets-for-times";
+    const RECORDS: i32 = 5;
+
+    let storage = StorageContainer::builder()
+        .cluster_id(cluster_id())
+        .node_id(NODE_ID)
+        .advertised_listener(Url::parse("tcp://localhost:9092")?)
+        .storage(storage_url()?)
+        .build()
+        .await?;
+
+    _ = {
+        let storage = storage.clone();
+        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    }
+    .serve(
+        Context::default(),
+        CreateTopicsRequest::default()
+            .topics(Some(
+                [CreatableTopic::default()
+                    .name(TOPIC.into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into()))]
+                .into(),
+            ))
+            .validate_only(Some(false)),
+    )
+    .await?;
+
+    let produce = {
+        let storage = storage.clone();
+        MapStateLayer::new(|_| storage).into_layer(ProduceService)
+    };
+
+    for i in 0..RECORDS {
+        let batch = Batch::builder()
+            .record(Record::builder().value(Some(Bytes::copy_from_slice(
+                format!("record-{i}").as_bytes(),
+            ))))
+            .build()
+            .and_then(deflated::Batch::try_from)?;
+
+        _ = produce
+            .serve(
+                Context::default(),
+                ProduceRequest::default()
+                    .acks(-1)
+                    .timeout_ms(30_000)
+                    .topic_data(Some(
+                        [TopicProduceData::default()
+                            .name(TOPIC.into())
+                            .partition_data(Some(
+                                [PartitionProduceData::default().index(0).records(Some(
+                                    deflated::Frame {
+                                        batches: [batch].into(),
+                                    },
+                                ))]
+                                .into(),
+                            ))]
+                        .into(),
+                    )),
+            )
+            .await?;
+    }
+
+    let list_offsets = MapStateLayer::new(|_| storage).into_layer(ListOffsetsService);
+
+    let ask = async |timestamp: i64| -> Result<ListOffsetsPartitionResponse, Error> {
+        let response = list_offsets
+            .serve(
+                Context::default(),
+                ListOffsetsRequest::default()
+                    .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
+                    .replica_id(NODE_ID)
+                    .topics(Some(
+                        [ListOffsetsTopic::default()
+                            .name(TOPIC.into())
+                            .partitions(Some(
+                                [ListOffsetsPartition::default()
+                                    .current_leader_epoch(Some(-1))
+                                    .partition_index(0)
+                                    .timestamp(timestamp)]
+                                .into(),
+                            ))]
+                        .into(),
+                    )),
+            )
+            .await?;
+
+        let topics = response.topics.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+
+        let partitions = topics[0].partitions.as_deref().unwrap_or_default();
+        assert_eq!(1, partitions.len());
+
+        Ok(partitions[0].clone())
+    };
+
+    // An hour from now: no record is at or after it, and none ever will be in
+    // this test.
+    let future = (SystemTime::now() + Duration::from_secs(3_600))
+        .duration_since(UNIX_EPOCH)
+        .expect("an hour from now is after the epoch")
+        .as_millis() as i64;
+
+    let answered = ask(future).await?;
+
+    assert_eq!(
+        ErrorCode::None,
+        ErrorCode::try_from(answered.error_code)?,
+        "no matching record is an answer, not an error",
+    );
+    assert_eq!(Some(-1), answered.offset);
+    assert_eq!(Some(-1), answered.timestamp);
+
+    // A timestamp every record is at or after still resolves to a real offset,
+    // so the sentinel has not swallowed the working case.
+    let matched = ask(0).await?;
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(matched.error_code)?);
+    assert_eq!(Some(0), matched.offset);
+
+    // And the two named positions are unaffected: they never answer `None`, so
+    // nothing about them goes through the sentinel.
+    let earliest = ask(ListOffset::Earliest.try_into()?).await?;
+    assert_eq!(Some(0), earliest.offset);
+
+    let latest = ask(ListOffset::Latest.try_into()?).await?;
+    assert_eq!(Some(i64::from(RECORDS)), latest.offset);
 
     Ok(())
 }

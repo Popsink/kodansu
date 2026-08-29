@@ -165,7 +165,31 @@ where
                                                                 .unwrap_or(Some(-1))
                                                                 .or(Some(-1)),
                                                         )
-                                                        .offset(offset.offset().or(Some(0)))
+                                                        // `-1`, not `0`, when
+                                                        // the storage layer has
+                                                        // no offset to give
+                                                        // (#444). It only says
+                                                        // `None` for a
+                                                        // timestamp query with
+                                                        // no record at or after
+                                                        // the target — EARLIEST
+                                                        // and LATEST always
+                                                        // answer — and Kafka's
+                                                        // sentinel for that is
+                                                        // `-1`, "no such
+                                                        // offset". `0` is a
+                                                        // valid position
+                                                        // meaning the very
+                                                        // beginning, so
+                                                        // `offsetsForTimes(now +
+                                                        // 60s)` turned "resume
+                                                        // from later" into
+                                                        // "replay the entire
+                                                        // topic". The
+                                                        // `timestamp` field
+                                                        // beside it already
+                                                        // answered `-1`.
+                                                        .offset(offset.offset().or(Some(-1)))
                                                         .leader_epoch(Some(0)),
                                                 )
                                             } else {
