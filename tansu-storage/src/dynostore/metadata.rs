@@ -433,7 +433,19 @@ where
             })
     }
 
-    #[instrument(skip_all, fields(%location, if_none_match = options.if_none_match), ret)]
+    /// `debug`, and without `ret` (#428).
+    ///
+    /// `#[instrument]` with no level is `INFO`, and `ret` records the return
+    /// value as an event at the span's level — so every GET through this cache
+    /// emitted an `INFO` carrying the `Debug` of the whole `Result<GetResult,
+    /// _>`. This decorator is installed on **every** backend, not only GCS, and
+    /// it sits above `Metron`, which carried the same annotation: one read cost
+    /// two formatted `INFO` events, on a read path that issues one GET per
+    /// segment per partition per topic, on a fleet that runs at
+    /// `RUST_LOG=info`.
+    ///
+    /// The `debug!` inside says what is worth saying, at a level that is off.
+    #[instrument(level = "debug", skip_all, fields(%location, if_none_match = options.if_none_match))]
     async fn get_opts(
         &self,
         location: &Path,
