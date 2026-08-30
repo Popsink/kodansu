@@ -63,7 +63,7 @@ use bytes::Bytes;
 
 use console::Emoji;
 #[cfg(feature = "dynostore")]
-use dynostore::CoalesceTuning;
+use dynostore::{CoalesceTuning, SEGMENT_FORMAT_WRITABLE};
 // Gated like the `mod dynostore` it names, and like the `CoalesceTuning` import
 // directly above. Without this the crate does not build without its own optional
 // feature: `cargo check -p tansu-storage --no-default-features` fails on an
@@ -2858,6 +2858,31 @@ fn coalesce_tuning(storage: &Url) -> CoalesceTuning {
                     )
                     .ok();
             }
+            // The one key here that changes what is *written* rather than how
+            // often (#442), and the only one whose effect does not reverse when
+            // it is unset again — see `DynoStore::segment_format_version`. An
+            // unparseable or unknown version is ignored with a warning like
+            // every other key, which leaves the writer at its default: a typo
+            // must not be able to stamp segments with a version no reader knows.
+            "segment_format" => {
+                tuning.segment_format_version = value
+                    .parse::<u16>()
+                    .inspect_err(
+                        |err| warn!(storage = %storage, key = "segment_format", value, ?err),
+                    )
+                    .ok()
+                    .filter(|version| SEGMENT_FORMAT_WRITABLE.contains(version))
+                    .or_else(|| {
+                        warn!(
+                            storage = %storage,
+                            key = "segment_format",
+                            value,
+                            writable = ?SEGMENT_FORMAT_WRITABLE,
+                            "ignoring an unwritable segment format version"
+                        );
+                        None
+                    });
+            }
             _ => {}
         }
     }
@@ -3409,6 +3434,40 @@ mod tests {
         )?);
         assert_eq!(None, tuning.coalesce_linger);
         assert_eq!(None, tuning.coalesce_batches);
+        Ok(())
+    }
+
+    /// `segment_format` accepts only a version this build can *write* (#442).
+    ///
+    /// Every other tuning key trades cost against latency and a typo costs a
+    /// default. This one decides the bytes that go into immutable objects, and a
+    /// version no reader knows is a hard `decode_segment_footer` error — a
+    /// partition-wide read outage, on a shared segment, for every topic in the
+    /// prefix. So an unrecognised value leaves the writer where it was rather
+    /// than being passed through.
+    #[cfg(feature = "dynostore")]
+    #[test]
+    fn segment_format_accepts_only_a_writable_version() -> Result<()> {
+        let parse = |query: &str| -> Result<Option<u16>> {
+            Ok(
+                coalesce_tuning(&Url::parse(&format!("s3://tansu/?{query}"))?)
+                    .segment_format_version,
+            )
+        };
+
+        assert_eq!(None, parse("")?, "absent leaves the writer at its default");
+        assert_eq!(Some(3), parse("segment_format=3")?);
+        assert_eq!(Some(4), parse("segment_format=4")?);
+
+        // Readable, but nothing may be asked to emit them again.
+        assert_eq!(None, parse("segment_format=1")?);
+        assert_eq!(None, parse("segment_format=2")?);
+
+        // Ahead of this build, and not a number at all.
+        assert_eq!(None, parse("segment_format=5")?);
+        assert_eq!(None, parse("segment_format=v4")?);
+        assert_eq!(None, parse("segment_format=")?);
+
         Ok(())
     }
 }

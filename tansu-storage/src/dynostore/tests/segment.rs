@@ -24,14 +24,19 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use object_store::{PutPayload, memory::InMemory};
-use tansu_sans_io::record::{Record, deflated, inflated};
+use tansu_sans_io::{
+    ErrorCode,
+    record::{Record, deflated, inflated},
+};
+use uuid::Uuid;
 
 use crate::{
     Error, Result, Topition,
     dynostore::{
         CoalesceTuning, DynoStore, FrameTail, IdempotentClass, ProducerCoord, ProducerTail,
-        SEGMENT_FORMAT_VERSION_V2, SEGMENT_FORMAT_VERSION_V3, SEGMENT_MAGIC, SEGMENT_TRAILER_LEN,
-        SegmentFooter, SubstreamEntry,
+        SEGMENT_FORMAT_VERSION_V2, SEGMENT_FORMAT_VERSION_V3, SEGMENT_FORMAT_VERSION_V4,
+        SEGMENT_MAGIC, SEGMENT_TRAILER_LEN, SegmentFooter, Substream, SubstreamEntry,
+        SubstreamWrite,
     },
 };
 
@@ -85,15 +90,21 @@ async fn round_trips_multiple_substreams() -> Result<(), Error> {
     assert_eq!(7, footer.writer_epoch);
     assert_eq!(3, footer.entries.len());
 
-    let a0 = footer.get("alpha", 0).expect("alpha-0 entry");
+    let a0 = footer
+        .get(&Substream::Name("alpha".into()), 0)
+        .expect("alpha-0 entry");
     assert_eq!(40, a0.base_offset);
     assert_eq!(5, a0.record_count);
 
-    let a1 = footer.get("alpha", 1).expect("alpha-1 entry");
+    let a1 = footer
+        .get(&Substream::Name("alpha".into()), 1)
+        .expect("alpha-1 entry");
     assert_eq!(7, a1.base_offset);
     assert_eq!(1, a1.record_count);
 
-    let b0 = footer.get("beta", 0).expect("beta-0 entry");
+    let b0 = footer
+        .get(&Substream::Name("beta".into()), 0)
+        .expect("beta-0 entry");
     assert_eq!(900, b0.base_offset);
     assert_eq!(4, b0.record_count);
 
@@ -192,6 +203,7 @@ fn footer_v2_round_trips_producer_coords_and_nonce() -> Result<(), Error> {
             // in region (offset) order.
             SubstreamEntry {
                 topic: "org.env.conn.tab_a".into(),
+                topic_id: None,
                 partition: 0,
                 base_offset: 100,
                 record_count: 5,
@@ -220,6 +232,7 @@ fn footer_v2_round_trips_producer_coords_and_nonce() -> Result<(), Error> {
             // A non-idempotent sub-stream carries no producer coordinates.
             SubstreamEntry {
                 topic: "org.env.conn.tab_b".into(),
+                topic_id: None,
                 partition: 1,
                 base_offset: 0,
                 record_count: 2,
@@ -263,6 +276,7 @@ fn footer_v2_encoding_is_byte_identical_to_golden() -> Result<(), Error> {
         nonce: 2,
         entries: vec![SubstreamEntry {
             topic: "t".into(),
+            topic_id: None,
             partition: 3,
             base_offset: 4,
             record_count: 5,
@@ -334,6 +348,7 @@ fn footer_v3_round_trips_producer_coords_with_flags() -> Result<(), Error> {
         nonce: 0x0123_4567_89ab_cdef,
         entries: vec![SubstreamEntry {
             topic: "org.env.conn.tab_a".into(),
+            topic_id: None,
             partition: 0,
             base_offset: 100,
             record_count: 6,
@@ -386,12 +401,215 @@ fn footer_v3_round_trips_producer_coords_with_flags() -> Result<(), Error> {
     Ok(())
 }
 
-/// A trailer carrying an unknown version (4) is still rejected, loudly. The
+/// A v4 footer (per-entry `topic_id`, #442) round-trips both identities, and the
+/// reader accepts version 4 alongside 1, 2 and 3.
+///
+/// The nil uuid is the wire's "no id", and it decodes back to `None` rather than
+/// to a `Some(nil)` nobody can match: "the segment is v4" and "this sub-stream is
+/// keyed by id" are independent, because both kinds of topic coexist in one
+/// prefix for as long as any pre-flip topic lives.
+///
+/// This is the reader half of the same two-step #174 took: every broker accepts
+/// v4 *before* any writer emits it, because an unaccepted version is a hard
+/// `decode_segment_footer` error — and since a segment is shared, one writer
+/// emitting v4 into a prefix would take out an older reader's reads of that whole
+/// prefix, not just of the topic that caused it.
+#[test]
+fn footer_v4_round_trips_the_substream_identity() -> Result<(), Error> {
+    let id = Uuid::from_u128(0x0192_3f5a_7c11_4d2e_9b83_0f6a_1c4d_5e70);
+
+    let footer = SegmentFooter {
+        writer_epoch: 9,
+        nonce: 0x0123_4567_89ab_cdef,
+        entries: vec![
+            // Keyed by id: a topic created under the v4 writer regime.
+            SubstreamEntry {
+                topic: "org.env.conn.tab_a".into(),
+                topic_id: Some(id),
+                partition: 0,
+                base_offset: 0,
+                record_count: 6,
+                byte_start: 0,
+                byte_len: 42,
+                max_timestamp: 1_700_000_000_000,
+                producers: vec![ProducerCoord {
+                    producer_id: 7,
+                    producer_epoch: 3,
+                    base_sequence: 0,
+                    last_sequence: 5,
+                    offset_delta: 0,
+                    flags: 0,
+                }],
+            },
+            // Keyed by name, in the same v4 segment: a topic that predates the
+            // flip, whose records are still found by the name they were written
+            // under.
+            SubstreamEntry {
+                topic: "org.env.conn.tab_b".into(),
+                topic_id: None,
+                partition: 3,
+                base_offset: 100,
+                record_count: 2,
+                byte_start: 42,
+                byte_len: 18,
+                max_timestamp: 1_700_000_000_001,
+                producers: vec![],
+            },
+        ],
+    };
+
+    let footer_bytes = DynoStore::encode_footer(&footer, SEGMENT_FORMAT_VERSION_V4);
+    let mut tail = footer_bytes.clone();
+    tail.extend_from_slice(&(footer_bytes.len() as u64).to_be_bytes());
+    tail.extend_from_slice(&(footer.entries.len() as u32).to_be_bytes());
+    tail.extend_from_slice(&SEGMENT_FORMAT_VERSION_V4.to_be_bytes());
+    tail.extend_from_slice(&SEGMENT_MAGIC.to_be_bytes());
+
+    let decoded = DynoStore::decode_segment_footer(&tail)?.expect("v4 footer must decode");
+    assert_eq!(footer, decoded);
+
+    // The identities are what a reader resolves by, and they do not collide.
+    assert_eq!(
+        Some(&decoded.entries[0]),
+        decoded.get(&Substream::Id(id), 0)
+    );
+    assert_eq!(
+        None,
+        decoded.get(&Substream::Name("org.env.conn.tab_a".into()), 0),
+        "an id-keyed entry must not answer to its own name, or a recreated \
+         topic's records would be served as its predecessor's"
+    );
+    assert_eq!(
+        Some(&decoded.entries[1]),
+        decoded.get(&Substream::Name("org.env.conn.tab_b".into()), 3)
+    );
+
+    Ok(())
+}
+
+/// Asked for v3, `encode_footer` emits the **exact** pre-v4 bytes: the 16-byte
+/// `topic_id` is dropped, not zero-filled.
+///
+/// Deployed readers — internal and S3-direct external — decode v3 by that byte
+/// layout, and a v3 segment that carried an extra 16 bytes per entry would
+/// mis-decode every following field of every following entry. The same MUST that
+/// kept `flags` out of a v2 footer (#174).
+#[test]
+fn a_v3_footer_carries_no_topic_id() -> Result<(), Error> {
+    let entry = |topic_id| SubstreamEntry {
+        topic: "ab".into(),
+        topic_id,
+        partition: 1,
+        base_offset: 2,
+        record_count: 3,
+        byte_start: 4,
+        byte_len: 5,
+        max_timestamp: 6,
+        producers: vec![],
+    };
+
+    let footer = |topic_id| SegmentFooter {
+        writer_epoch: 1,
+        nonce: 2,
+        entries: vec![entry(topic_id)],
+    };
+
+    #[rustfmt::skip]
+    const GOLDEN_V3: [u8; 48] = [
+        0, 0, 0, 0, 0, 0, 0, 1,     // writer_epoch i64
+        0, 0, 0, 0, 0, 0, 0, 2,     // nonce u64 (v2+)
+        0, 2,                       // topic_len u16
+        b'a', b'b',                 // topic
+        0, 0, 0, 1,                 // partition i32
+        0, 0, 0, 0, 0, 0, 0, 2,     // base_offset i64
+        0, 0, 0, 0, 0, 0, 0, 3,     // record_count i64
+        0, 0, 0, 0, 0, 0, 0, 4,     // byte_start u64
+    ];
+
+    // The identity makes no difference to a v3 encoding: it has nowhere to put
+    // one, so both must produce the same prefix.
+    let with_id =
+        DynoStore::encode_footer(&footer(Some(Uuid::now_v7())), SEGMENT_FORMAT_VERSION_V3);
+    let without = DynoStore::encode_footer(&footer(None), SEGMENT_FORMAT_VERSION_V3);
+
+    assert_eq!(without, with_id);
+    assert_eq!(GOLDEN_V3.as_slice(), &without[..GOLDEN_V3.len()]);
+
+    // v4 is the same bytes with 16 more, immediately after the topic name.
+    let v4 = DynoStore::encode_footer(&footer(None), SEGMENT_FORMAT_VERSION_V4);
+    assert_eq!(without.len() + 16, v4.len());
+
+    Ok(())
+}
+
+/// A v3 writer refuses an id-keyed sub-stream rather than writing it name-keyed
+/// (#442).
+///
+/// Writing it name-keyed would put acked, durable records where no reader of that
+/// topic looks — the failure mode this whole keying exists to prevent, arriving
+/// through the writer instead of the reader. The only way to reach it is a
+/// deployment that pinned `substream_id` on a topic and then went back to a v3
+/// writer regime, which is why raising `segment_format` is documented as one-way.
+#[test]
+fn a_pre_v4_writer_refuses_an_id_keyed_substream() -> Result<(), Error> {
+    let store = store();
+    let tp = Topition::new("org.env.conn.tab", 0);
+
+    // A real batch: an empty sub-stream contributes no footer entry at all, so
+    // it has no identity to refuse.
+    let write = |substream| -> Result<Vec<SubstreamWrite>> {
+        Ok(vec![SubstreamWrite {
+            topition: tp.clone(),
+            substream,
+            base_offset: 0,
+            batches: vec![batch(1)?],
+        }])
+    };
+
+    // A name-keyed sub-stream encodes at v3 exactly as it always did.
+    assert!(
+        store
+            .encode_segment_indexed(
+                &write(Substream::Name(tp.topic().into()))?,
+                0,
+                0,
+                SEGMENT_FORMAT_VERSION_V3,
+            )
+            .is_ok()
+    );
+
+    // The same sub-stream keyed by id does not.
+    assert!(matches!(
+        store.encode_segment_indexed(
+            &write(Substream::Id(Uuid::now_v7()))?,
+            0,
+            0,
+            SEGMENT_FORMAT_VERSION_V3,
+        ),
+        Err(Error::Api(ErrorCode::KafkaStorageError))
+    ));
+
+    // And does at v4.
+    assert!(
+        store
+            .encode_segment_indexed(
+                &write(Substream::Id(Uuid::now_v7()))?,
+                0,
+                0,
+                SEGMENT_FORMAT_VERSION_V4,
+            )
+            .is_ok()
+    );
+
+    Ok(())
+}
+
+/// A trailer carrying an unknown version (5) is still rejected, loudly. The
 /// external contract (`docs/virtual-topics-format.md`) says a reader MUST
-/// accept {1, 2, 3} and MUST reject anything else rather than guessing — an
+/// accept {1, 2, 3, 4} and MUST reject anything else rather than guessing — an
 /// unknown layout would mis-decode, not degrade. Without this, widening the
-/// accepted set for v3 (#174) could accidentally have become "accept
-/// anything", silently discarding the contract's rejection MUST.
+/// accepted set for v3 (#174) and then v4 (#442) could accidentally have become
+/// "accept anything", silently discarding the contract's rejection MUST.
 #[test]
 fn footer_rejects_unknown_version() -> Result<(), Error> {
     let footer = SegmentFooter {
@@ -404,14 +622,14 @@ fn footer_rejects_unknown_version() -> Result<(), Error> {
     let mut tail = footer_bytes.clone();
     tail.extend_from_slice(&(footer_bytes.len() as u64).to_be_bytes());
     tail.extend_from_slice(&0u32.to_be_bytes());
-    tail.extend_from_slice(&4u16.to_be_bytes());
+    tail.extend_from_slice(&5u16.to_be_bytes());
     tail.extend_from_slice(&SEGMENT_MAGIC.to_be_bytes());
 
-    let error = DynoStore::decode_segment_footer(&tail).expect_err("version 4 must be rejected");
+    let error = DynoStore::decode_segment_footer(&tail).expect_err("version 5 must be rejected");
     assert!(
         error
             .to_string()
-            .contains("unsupported segment format version 4"),
+            .contains("unsupported segment format version 5"),
         "unexpected error: {error}"
     );
 
@@ -527,6 +745,7 @@ async fn control_coordinate_does_not_fold_into_producer_tail() -> Result<(), Err
             nonce: 42,
             entries: vec![SubstreamEntry {
                 topic: topic.into(),
+                topic_id: None,
                 partition: 0,
                 base_offset: 0,
                 record_count: 4,
@@ -565,7 +784,7 @@ async fn control_coordinate_does_not_fold_into_producer_tail() -> Result<(), Err
         0,
     )?;
 
-    let tail = store.producer_tail_folded(prefix, &tp, 7)?;
+    let tail = store.producer_tail_folded(prefix, &Substream::Name(tp.topic().into()), &tp, 7)?;
 
     // The tail reflects the data batches only: next in order is sequence 3.
     // Had the marker folded, expected() would be seq_increment(-1) = 0 and

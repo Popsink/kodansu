@@ -97,7 +97,11 @@ const APPLICATION_JSON: &str = "application/json";
 /// One cached segment's expiry-decision inputs (#61/#176): `(seq, age_ms,
 /// [(topic, partition, end_offset)])`, snapshotted under the `prefix_index`
 /// lock so the truncation floors can be evaluated outside it.
-type SegmentExpirySnapshot = (u64, i64, Vec<(String, i32, i64)>);
+/// One segment's inputs to the retention decision: its sequence, its age, and
+/// where each of its sub-streams ends — identified (#442) as well as named,
+/// because two incarnations of one topic can hold slices in the same segment and
+/// only one of them is the topic that name resolves to today.
+type SegmentExpirySnapshot = (u64, i64, Vec<(Substream, String, i32, i64)>);
 
 #[derive(Clone, Debug)]
 pub struct DynoStore {
@@ -144,7 +148,7 @@ pub struct DynoStore {
     /// only be memoized for seconds, and the per-topic conditional GET that
     /// refreshed it was 57% of the fleet's 304 plane (~$38/day). Invalidated on
     /// delete, exactly like the id pointer.
-    routing_prefixes: Arc<Mutex<BTreeMap<Topic, String>>>,
+    routing_prefixes: Arc<Mutex<BTreeMap<Topic, TopicRouting>>>,
 
     /// Broker auto-topic-creation policy (Kafka `auto.create.topics.enable` /
     /// `num.partitions` / `default.replication.factor`), consulted by the
@@ -350,6 +354,27 @@ pub struct DynoStore {
     coalesce_batches: usize,
     coalesce_bytes: usize,
 
+    /// The segment footer version this deployment **writes** (#442).
+    /// [`SEGMENT_FORMAT_VERSION_V3`] by default; `segment_format=4` in the
+    /// storage URL raises it to [`SEGMENT_FORMAT_VERSION_V4`], which is what
+    /// turns on id-keyed sub-streams — and so what makes a topic deleted and
+    /// recreated under the same name start at offset 0 rather than continue its
+    /// predecessor's offsets.
+    ///
+    /// Readers accept both regardless. Only the writer is gated, and the gate is
+    /// a flag rather than a release so the ordering is one deploy instead of
+    /// two: roll the binary everywhere, then flip.
+    ///
+    /// **Flipping it is one-way.** A topic created under the v4 regime has an
+    /// `substream_id` pinned for its lifetime; a writer put back to v3 cannot
+    /// express that identity and refuses the write
+    /// ([`Self::encode_segment_indexed`]) rather than writing records under a
+    /// key nothing reads. Going back therefore means those topics stop being
+    /// writable, not that they quietly degrade — and older binaries, which do
+    /// not model `substream_id` at all, would do the quiet thing. Do not flip
+    /// this before every replica is on a build that has this field.
+    segment_format_version: u16,
+
     /// Segment-compaction thresholds (#66), each seeded from its compile-time
     /// default and overridable per deployment via [`Self::coalesce_tuning`].
     /// `prefix_compact_min_segments == 0` disables compaction.
@@ -400,6 +425,12 @@ pub struct DynoStore {
 #[derive(Debug)]
 struct PrefixPending {
     topition: Topition,
+    /// What this batch's sub-stream is identified by in the segment footer
+    /// (#442). Resolved where the batch is buffered — the same pinned lookup
+    /// that decided which prefix it is buffered under — rather than re-derived
+    /// at flush time, so a batch cannot be written under a different identity
+    /// from the one its offsets were assigned against.
+    substream: Substream,
     batch: deflated::Batch,
     ack: oneshot::Sender<Result<i64>>,
 }
@@ -775,8 +806,51 @@ impl IndexedTopic {
     }
 }
 
+/// What identifies a sub-stream inside a shared segment object (#442).
+///
+/// By **name** for every topic created before footer v4, and that is exactly why
+/// a topic deleted and recreated under the same name continued its
+/// predecessor's offsets instead of starting at 0. The predecessor's records
+/// live in shared, immutable segments — a segment multiplexes many topics and
+/// is reclaimed whole only once every sub-stream in it is past retention — so
+/// they cannot be removed, and a successor's log starting at 0 would be laid
+/// directly on top of records that are still there and still found by name.
+/// What keeps them apart today is the truncation floor `DeleteTopics` leaves
+/// behind (#246): the successor's log starts at the predecessor's end.
+///
+/// By **topic id** for a topic created under the v4 writer regime
+/// ([`DynoStore::segment_format_version`]). A recreation is a different uuid, so
+/// it is a different sub-stream, its predecessor's slices are unreachable by
+/// construction rather than hidden by a floor, and its log starts where an empty
+/// log starts. The pinned identity is `topic-routing/{name}.json`'s
+/// `substream_id` (see [`TopicRouting`]) — immutable for the topic's lifetime,
+/// which is what lets every reader cache it permanently.
+///
+/// This is the published external-reader contract; see
+/// `docs/virtual-topics-format.md`.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) enum Substream {
+    Name(String),
+    Id(Uuid),
+}
+
+impl Substream {
+    /// The name a sub-stream's records were produced under.
+    ///
+    /// An id-keyed sub-stream still carries its topic name in the footer, so
+    /// this is only ever `None` for a caller holding an identity with no entry
+    /// beside it — which is why every caller that needs the name takes it from
+    /// the entry, not from here.
+    fn id(&self) -> Option<Uuid> {
+        match self {
+            Self::Id(id) => Some(*id),
+            Self::Name(_) => None,
+        }
+    }
+}
+
 /// A sub-stream inside a merge run.
-type SubstreamKey = (String, i32);
+type SubstreamKey = (Substream, i32);
 
 /// One sub-stream's offset coverage within a candidate run: the lowest base
 /// offset seen, the highest end, and the records held between them. The spans
@@ -814,7 +888,7 @@ impl RunCoverage {
         let mut folded: Vec<(SubstreamKey, OffsetSpan)> = Vec::with_capacity(entries.len());
 
         for entry in entries {
-            let key = (entry.topic.clone(), entry.partition);
+            let key = (entry.substream(), entry.partition);
             let end = entry.base_offset + entry.record_count;
 
             let span = match self.spans.get(&key) {
@@ -985,6 +1059,10 @@ pub struct CoalesceTuning {
     /// (#192). Hard-coded at 10s before that issue, which is too small to admit
     /// a useful number of attempts once one attempt costs seconds.
     pub flush_max_elapsed: Option<Duration>,
+    /// The segment footer version this deployment writes (#442). See
+    /// [`DynoStore::segment_format_version`] — including why raising it is a
+    /// one-way move.
+    pub segment_format_version: Option<u16>,
 }
 
 /// Process-wide counter making each [`DynoStore`]'s `writer_id` unique (#59), so
@@ -1746,7 +1824,7 @@ const SEGMENT_FORMAT_VERSION_V2: u16 = 2;
 /// flags let the footer index transactional data batches and transaction
 /// markers (control batches), which release B of #174 routes into segments.
 ///
-/// **What every leaseless write emits** ([`Self::encode_segment_v3`]: the
+/// **What every leaseless write emits by default** ([`Self::encode_segment_indexed`]: the
 /// leaseless flush, merge compaction, and the per-key compaction rewrite) —
 /// unconditionally: the version follows the writer regime, never the
 /// segment's content. Shipped reader-first, in two releases, like the
@@ -1761,6 +1839,35 @@ const SEGMENT_FORMAT_VERSION_V2: u16 = 2;
 /// had to accept v3 (release A, beta.23; kotatsu#87, chart 0.9.0) before this
 /// writer flip could land.
 const SEGMENT_FORMAT_VERSION_V3: u16 = 3;
+
+/// Segment format version adding a per-entry `topic_id` (#442), so a sub-stream
+/// can be identified by the topic's **id** rather than by its name — see
+/// [`Substream`] for why that is what makes a recreated topic a new log instead
+/// of a continuation of the one it replaced.
+///
+/// Shipped the same way v3 was, and for the same reason: a reader meeting a
+/// version it does not know hard-errors, and that error propagates through the
+/// index refresh into fetch, so one writer emitting v4 into a shared prefix
+/// would take out every older reader's reads of that **whole prefix** — not
+/// just of the topic that caused it. External S3-direct readers (kotatsu#82)
+/// reject unknown versions by the same contract.
+///
+/// What is different is that the gate is a flag rather than a release. Nothing
+/// emits v4 until a deployment sets `segment_format=4`
+/// ([`DynoStore::segment_format_version`]), so the ordering is: roll the binary
+/// everywhere (every reader now accepts v4, nothing writes it), *then* flip.
+/// The flip is one-way in practice — see the warning on
+/// [`DynoStore::segment_format_version`].
+pub(crate) const SEGMENT_FORMAT_VERSION_V4: u16 = 4;
+
+/// The footer versions a deployment may be configured to **write** (#442).
+///
+/// Not "everything the reader accepts": v1 and v2 stay readable so segments
+/// written before they were superseded stay readable in place, but nothing may
+/// be asked to emit them again — the version follows the writer regime, and the
+/// regime only moves forward.
+pub(crate) const SEGMENT_FORMAT_WRITABLE: [u16; 2] =
+    [SEGMENT_FORMAT_VERSION_V3, SEGMENT_FORMAT_VERSION_V4];
 
 /// Fixed-size trailer at the very end of every multi-topic segment (#64):
 /// `footer_len (u64) + entry_count (u32) + version (u16) + magic (u32)`. A
@@ -1789,6 +1896,15 @@ pub(crate) const SEGMENT_FOOTER_OVER_READ: usize = 64 * 1024;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SubstreamEntry {
     pub(crate) topic: String,
+    /// The id of the topic incarnation these records belong to (#442, footer
+    /// v4), or `None` in a v1/v2/v3 entry and for a name-keyed topic.
+    ///
+    /// Present is what makes this sub-stream's identity the **id** rather than
+    /// the name, which is the whole of [`Substream`]. The name is kept beside it
+    /// — an external reader, an audit and a log line all want to say which topic
+    /// a region belongs to, and resolving an id back to a name costs an object
+    /// read they should not have to make.
+    pub(crate) topic_id: Option<Uuid>,
     pub(crate) partition: i32,
     /// Absolute base offset of this sub-stream's first record in the segment.
     pub(crate) base_offset: i64,
@@ -1808,6 +1924,44 @@ pub(crate) struct SubstreamEntry {
     /// dedup (#88) so duplicate detection derives from the durable log rather than
     /// a lazily-checkpointed `producers/{id}.json`.
     producers: Vec<ProducerCoord>,
+}
+
+impl SubstreamEntry {
+    /// What this entry's records are identified by (#442): the topic id when the
+    /// footer carries one, else the topic name.
+    pub(crate) fn substream(&self) -> Substream {
+        self.topic_id
+            .map_or_else(|| Substream::Name(self.topic.clone()), Substream::Id)
+    }
+
+    /// Whether this entry holds `substream`'s records.
+    ///
+    /// Deliberately **not** "the ids match, or else the names match": a
+    /// name-keyed read must not pick up an id-keyed entry that happens to carry
+    /// the same name, or a recreated topic's records would be served as its
+    /// predecessor's — which is the mixing the id keying exists to make
+    /// impossible.
+    fn is(&self, substream: &Substream) -> bool {
+        match substream {
+            Substream::Id(id) => self.topic_id == Some(*id),
+            Substream::Name(name) => self.topic_id.is_none() && self.topic == *name,
+        }
+    }
+}
+
+/// One sub-stream on its way into a segment object (#57): which log it is,
+/// where its first record lands, and the batches themselves.
+///
+/// The identity travels beside the topition rather than being derived from it
+/// (#442). A topition is a *name*, and a name is exactly what a sub-stream stops
+/// being keyed by once its topic is id-keyed — deriving it here would silently
+/// write an id-keyed topic's records under a key nothing reads.
+#[derive(Clone, Debug)]
+pub(crate) struct SubstreamWrite {
+    pub(crate) topition: Topition,
+    pub(crate) substream: Substream,
+    pub(crate) base_offset: i64,
+    pub(crate) batches: Vec<deflated::Batch>,
 }
 
 /// One segment of a sub-stream's epoch-fenced view
@@ -1979,7 +2133,7 @@ impl RegionRead<'_> {
 
 /// [`ProducerCoord::flags`] bit 0 (#174): the batch is transactional
 /// (wire-batch attribute bit 4). Derived from the batch attributes by the v3
-/// writer ([`DynoStore::encode_segment_v3`]); transactional *data*
+/// writer ([`DynoStore::encode_segment_indexed`]); transactional *data*
 /// coordinates carry real sequences and fold into the [`ProducerTail`] like
 /// any idempotent batch.
 const FLAG_TRANSACTIONAL: u8 = 0b01;
@@ -2009,7 +2163,7 @@ pub(crate) struct ProducerCoord {
     /// transaction marker); bits 2-7 are written 0 and ignored on read.
     /// Always `0` when decoded from a v1/v2 footer — those layouts carry no
     /// flags byte. Derived from the batch attribute bits by the v3 writer
-    /// ([`DynoStore::encode_segment_v3`]), so every re-encode — conflict
+    /// ([`DynoStore::encode_segment_indexed`]), so every re-encode — conflict
     /// correction, merge compaction, the per-key rewrite — carries flags
     /// forward for free.
     flags: u8,
@@ -2154,10 +2308,10 @@ pub(crate) struct SegmentFooter {
 impl SegmentFooter {
     /// The entry for a `(topic, partition)` sub-stream, if it is present in this
     /// segment. `None` means the segment holds no records for that topition.
-    fn get(&self, topic: &str, partition: i32) -> Option<&SubstreamEntry> {
+    fn get(&self, substream: &Substream, partition: i32) -> Option<&SubstreamEntry> {
         self.entries
             .iter()
-            .find(|entry| entry.topic == topic && entry.partition == partition)
+            .find(|entry| entry.partition == partition && entry.is(substream))
     }
 }
 
@@ -2478,6 +2632,30 @@ impl OptiCon<TopicMetadata> {
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 struct TopicRouting {
     prefix: String,
+    /// The id this topic's sub-streams are keyed by inside a shared segment
+    /// (#442), or absent for a topic keyed by name — see [`Substream`].
+    ///
+    /// Pinned here rather than derived from `topic-metadata/{name}.json`'s `id`
+    /// for the reason the prefix is: the identity has to be immutable and
+    /// permanently cacheable, and it has to be able to say **name** for a topic
+    /// that predates the v4 writer regime. A topic has an id either way; what is
+    /// recorded here is whether its records were written under it.
+    ///
+    /// The `skip_serializing_if` is load-bearing, not stylistic, for the same
+    /// reason `Watermark::truncate`'s is: a routing pin written before #442 must
+    /// keep its exact byte layout (`{"prefix":…}`), or every topic's pin is
+    /// rewritten — and etag-churned — on first touch across a fleet where none
+    /// of them are id-keyed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    substream_id: Option<Uuid>,
+}
+
+impl TopicRouting {
+    /// How this topic's sub-streams are identified in a segment footer.
+    fn substream(&self, topic: &str) -> Substream {
+        self.substream_id
+            .map_or_else(|| Substream::Name(topic.to_owned()), Substream::Id)
+    }
 }
 
 /// Pointer object at `topic-ids/{uuid}.json` mapping a topic's id back to its
@@ -2661,6 +2839,7 @@ impl DynoStore {
             coalesce_linger: Self::COALESCE_LINGER,
             coalesce_batches: Self::COALESCE_BATCHES,
             coalesce_bytes: Self::COALESCE_BYTES,
+            segment_format_version: SEGMENT_FORMAT_VERSION_V3,
             prefix_compact_min_segments: Self::PREFIX_COMPACT_MIN_SEGMENTS,
             prefix_compact_target_bytes: Self::PREFIX_COMPACT_TARGET_BYTES,
             prefix_compact_keep_hot: Self::PREFIX_COMPACT_KEEP_HOT,
@@ -2763,6 +2942,9 @@ impl DynoStore {
                 .maintenance_recency
                 .unwrap_or(self.maintenance_recency),
             flush_max_elapsed: tuning.flush_max_elapsed.unwrap_or(self.flush_max_elapsed),
+            segment_format_version: tuning
+                .segment_format_version
+                .unwrap_or(self.segment_format_version),
             ..self
         }
     }
@@ -3808,7 +3990,7 @@ impl DynoStore {
     ///   partition (~660/s, a third of the fleet's 304 plane) to protect an
     ///   authority that cannot move behind the floor.
     async fn coalesced_high_from_index(&self, topition: &Topition) -> Result<Option<i64>> {
-        let prefix = self.routed_prefix_of(topition).await?;
+        let (prefix, substream) = self.routed_substream_of(topition).await?;
         self.refresh_prefix_index(&prefix).await?;
 
         // `None` for a sub-stream holding no segment: the persisted floor below is
@@ -3817,7 +3999,7 @@ impl DynoStore {
         // state #290 is about from a drained partition (#299) — see
         // [`Self::note_floor_above_tail`].
         let tail = self
-            .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
+            .valid_substream_segments(&prefix, &substream, topition.partition())?
             .last()
             .map(FencedSegment::end);
 
@@ -3950,7 +4132,7 @@ impl DynoStore {
         // and recover footer-only (#58), caching the watermark under the
         // certified floor read *before* it so the fast path serves the
         // next stale-hint resolution.
-        let prefix = self.routed_prefix_of(topition).await?;
+        let (prefix, substream) = self.routed_substream_of(topition).await?;
         let floor = self.certified_seq_floor(&prefix).await?;
         let (from_watermark, served) = self.persisted_watermark_bounds(topition).await?;
 
@@ -3968,7 +4150,7 @@ impl DynoStore {
         self.note_floor_above_tail(
             &prefix,
             topition,
-            self.valid_substream_segments(&prefix, topition.topic(), topition.partition())?
+            self.valid_substream_segments(&prefix, &substream, topition.partition())?
                 .last()
                 .map(FencedSegment::end),
             from_watermark,
@@ -4052,21 +4234,39 @@ impl DynoStore {
 
     /// The prefix `topition`'s records are segment-routed under: the **pinned**
     /// value (#236), read once per process and then served from memory forever.
+    async fn routed_prefix_of(&self, topition: &Topition) -> Result<String> {
+        self.routing_of(topition)
+            .await
+            .map(|routing| routing.prefix)
+    }
+
+    /// Where `topition`'s records live and what identifies them there: the
+    /// pinned prefix (#236) and the pinned sub-stream identity (#442), read once
+    /// per process and then served from memory forever.
     ///
     /// Three steps, in cost order:
     ///
-    /// 1. Topics whose connector prefix already equals their own name (fewer than
-    ///    three dotted components) need nothing at all — both routings agree, so
-    ///    there is no decision to pin and no request to make.
-    /// 2. The permanent memo. Sound because the pin is immutable, which is the
+    /// 1. The permanent memo. Sound because the pin is immutable, which is the
     ///    property that makes this whole path free; see [`TopicRouting`].
-    /// 3. Otherwise read the pin. A topic created before pinning existed has none,
-    ///    so the fallback **reproduces exactly today's derivation** —
+    /// 2. Read the pin. A topic created before pinning existed has none, so the
+    ///    fallback **reproduces exactly today's derivation** —
     ///    [`Self::prefix_of`] plus the [`Self::topic_is_compacted`] verdict — and
     ///    pins that answer, create-only. Reproducing it is not a nicety: a
     ///    different answer would route the topic's new records to a prefix its
     ///    existing segments are not under, which is not a cost regression but data
     ///    becoming unreachable.
+    /// 3. A topic whose connector prefix already equals its own name (fewer than
+    ///    three dotted components) and which has no pin needs no *write*: both
+    ///    routings agree, so there is nothing to pin down and a create would be
+    ///    an object per topic bought for nothing.
+    ///
+    /// Step 3 used to short-circuit the whole function — no memo, no read, no
+    /// request at all. It cannot any more: whether a topic is id-keyed is not
+    /// derivable from its name, and answering `Name` without looking would serve
+    /// an id-keyed topic's reads against a key its records were never written
+    /// under, which reads as an empty topic. So the read happens for every
+    /// topic — once, and then never again, on the same permanent memo the prefix
+    /// has always used.
     ///
     /// The lazy pin is create-only so peers converge: whoever writes first wins,
     /// and a loser adopts the winner's value rather than keeping its own. Without
@@ -4074,13 +4274,8 @@ impl DynoStore {
     /// as the old 5s window was open, if an `AlterConfigs` lands between their
     /// reads — would each cache their own permanently, turning a bounded window
     /// into a permanent split. The pin is the tie-breaker.
-    async fn routed_prefix_of(&self, topition: &Topition) -> Result<String> {
+    async fn routing_of(&self, topition: &Topition) -> Result<TopicRouting> {
         let topic = topition.topic();
-
-        let prefix = self.prefix_of(topition);
-        if prefix == topic {
-            return Ok(prefix);
-        }
 
         if let Some(pinned) = self
             .routing_prefixes
@@ -4096,25 +4291,36 @@ impl DynoStore {
             Some(pinned) => pinned,
 
             // Pre-#236 topic: derive as before, then pin it so this is the last
-            // time anyone derives it.
+            // time anyone derives it. Name-keyed by construction — its records
+            // are already in segments under its name.
             None => {
-                let derived = self.routed_prefix(topition, self.topic_is_compacted(topic).await?);
+                let derived = TopicRouting {
+                    prefix: self.routed_prefix(topition, self.topic_is_compacted(topic).await?),
+                    substream_id: None,
+                };
 
-                if self
-                    .put_create(
-                        &self.topic_routing_path(topic),
-                        serde_json::to_vec(&TopicRouting {
-                            prefix: derived.clone(),
-                        })
-                        .map(Bytes::from)
-                        .map(PutPayload::from)?,
-                    )
-                    .await?
-                {
+                // A topic whose connector prefix already equals its own name has
+                // nothing to pin down — both routings agree and it is name-keyed
+                // — so it is memoized without buying an object for it.
+                if self.prefix_of(topition) == topic {
                     derived
                 } else {
-                    // A peer pinned it first: adopt its value, whatever we derived.
-                    self.read_routing_pin(topic).await?.unwrap_or(derived)
+                    let won = self
+                        .put_create(
+                            &self.topic_routing_path(topic),
+                            serde_json::to_vec(&derived)
+                                .map(Bytes::from)
+                                .map(PutPayload::from)?,
+                        )
+                        .await?;
+
+                    if won {
+                        derived
+                    } else {
+                        // A peer pinned it first: adopt its value, whatever we
+                        // derived.
+                        self.read_routing_pin(topic).await?.unwrap_or(derived)
+                    }
                 }
             }
         };
@@ -4127,9 +4333,45 @@ impl DynoStore {
         Ok(pinned)
     }
 
-    /// The pinned prefix for `topic`, or `None` when the object does not exist (a
+    /// What identifies `topition`'s sub-stream in a segment footer (#442), and
+    /// the prefix its segments are under — the pair every read path needs, since
+    /// neither answers on its own.
+    async fn routed_substream_of(&self, topition: &Topition) -> Result<(String, Substream)> {
+        self.routing_of(topition)
+            .await
+            .map(|routing| (routing.prefix.clone(), routing.substream(topition.topic())))
+    }
+
+    /// The identity a topic of this name is written under **right now** (#442),
+    /// read without pinning anything.
+    ///
+    /// The maintenance paths reach sub-streams by walking footers, and a footer
+    /// can name an incarnation that no longer exists: a deleted topic's slices
+    /// survive in shared segments until every co-tenant in them is past
+    /// retention. Resolving those through [`Self::routing_of`] would create a
+    /// routing pin for a topic that is gone, so this reads and never writes —
+    /// and answers `Name` for a name that has no pin at all, which is what a
+    /// deleted topic's name looks like.
+    async fn current_substream_of(&self, topic: &str) -> Result<Substream> {
+        if let Some(pinned) = self
+            .routing_prefixes
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .get(topic)
+            .cloned()
+        {
+            return Ok(pinned.substream(topic));
+        }
+
+        Ok(self.read_routing_pin(topic).await?.map_or_else(
+            || Substream::Name(topic.to_owned()),
+            |routing| routing.substream(topic),
+        ))
+    }
+
+    /// The pinned routing for `topic`, or `None` when the object does not exist (a
     /// topic created before #236). One GET, uncached — the caller memoizes.
-    async fn read_routing_pin(&self, topic: &str) -> Result<Option<String>> {
+    async fn read_routing_pin(&self, topic: &str) -> Result<Option<TopicRouting>> {
         match self.object_store.get(&self.topic_routing_path(topic)).await {
             Ok(get_result) => get_result
                 .bytes()
@@ -4138,7 +4380,7 @@ impl DynoStore {
                 .and_then(|encoded| {
                     serde_json::from_slice::<TopicRouting>(&encoded).map_err(Into::into)
                 })
-                .map(|routing| Some(routing.prefix)),
+                .map(Some),
 
             Err(object_store::Error::NotFound { .. }) => Ok(None),
 
@@ -5948,11 +6190,11 @@ impl DynoStore {
     fn decode_fenced_regions(
         &self,
         prefix: &str,
-        topic: &str,
+        substream: &Substream,
         partition: i32,
         objects: &BTreeMap<u64, Bytes>,
     ) -> Result<Vec<(u64, i64, Vec<deflated::Batch>)>> {
-        let fenced = self.valid_substream_segments(prefix, topic, partition)?;
+        let fenced = self.valid_substream_segments(prefix, substream, partition)?;
         let mut regions = Vec::with_capacity(fenced.len());
 
         for fenced in fenced {
@@ -6065,7 +6307,7 @@ impl DynoStore {
     fn valid_substream_segments(
         &self,
         prefix: &str,
-        topic: &str,
+        substream: &Substream,
         partition: i32,
     ) -> Result<Vec<FencedSegment>> {
         let mut segs: Vec<(i64, u64, SubstreamEntry)> = self
@@ -6080,7 +6322,7 @@ impl DynoStore {
                     .filter_map(|(seq, cached)| {
                         cached
                             .footer
-                            .get(topic, partition)
+                            .get(substream, partition)
                             .map(|entry| (cached.footer.writer_epoch, *seq, entry.clone()))
                     })
                     .collect()
@@ -6155,11 +6397,11 @@ impl DynoStore {
         topition: &Topition,
         persisted_floor: i64,
     ) -> Result<i64> {
-        let prefix = self.routed_prefix_of(topition).await?;
+        let (prefix, substream) = self.routed_substream_of(topition).await?;
         self.refresh_prefix_index(&prefix).await?;
 
         let segment_tail = self
-            .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
+            .valid_substream_segments(&prefix, &substream, topition.partition())?
             .last()
             .map(FencedSegment::end)
             .unwrap_or(0);
@@ -6276,12 +6518,12 @@ impl DynoStore {
         /// `offset_fetch`, `metadata_fetch`, `list_state`, `describe`).
         const SEGMENT_READ_CONCURRENCY: usize = 32;
 
-        let prefix = self.routed_prefix_of(topition).await?;
+        let (prefix, substream) = self.routed_substream_of(topition).await?;
 
         for _ in 0..MAX_ATTEMPTS {
             self.refresh_prefix_index(&prefix).await?;
             let segments =
-                self.valid_substream_segments(&prefix, topition.topic(), topition.partition())?;
+                self.valid_substream_segments(&prefix, &substream, topition.partition())?;
 
             // Plan the reads from the index before issuing any (#426).
             //
@@ -6531,10 +6773,10 @@ impl DynoStore {
     /// start of the segment region. `None` when the
     /// sub-stream has no segment yet.
     async fn segment_region_start(&self, topition: &Topition) -> Result<Option<i64>> {
-        let prefix = self.routed_prefix_of(topition).await?;
+        let (prefix, substream) = self.routed_substream_of(topition).await?;
         self.refresh_prefix_index(&prefix).await?;
         Ok(self
-            .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
+            .valid_substream_segments(&prefix, &substream, topition.partition())?
             .first()
             .map(|fenced| fenced.entry.base_offset))
     }
@@ -6625,10 +6867,10 @@ impl DynoStore {
     /// `max_timestamp` not the log's latest timestamp — no writer can create one,
     /// and no read path can serve one.
     async fn coalesced_latest_timestamp(&self, topition: &Topition) -> Result<Option<SystemTime>> {
-        let prefix = self.routed_prefix_of(topition).await?;
+        let (prefix, substream) = self.routed_substream_of(topition).await?;
         self.refresh_prefix_index(&prefix).await?;
         Ok(self
-            .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
+            .valid_substream_segments(&prefix, &substream, topition.partition())?
             .last()
             .map(|fenced| fenced.entry.max_timestamp)
             .filter(|&ms| ms >= 0)
@@ -6707,7 +6949,7 @@ impl DynoStore {
         // index (no per-segment I/O); `None` (→ -1 on the wire) when no record is
         // at or after the target, matching Kafka's "no offset" semantics.
         if let ListOffset::Timestamp(target) = offset_request {
-            let prefix = self.routed_prefix_of(topition).await?;
+            let (prefix, substream) = self.routed_substream_of(topition).await?;
             self.refresh_prefix_index(&prefix).await?;
             let target_ms = target
                 .duration_since(SystemTime::UNIX_EPOCH)
@@ -6715,7 +6957,7 @@ impl DynoStore {
                 .unwrap_or(0);
 
             let found = self
-                .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
+                .valid_substream_segments(&prefix, &substream, topition.partition())?
                 .into_iter()
                 .find(|fenced| {
                     fenced.entry.max_timestamp >= 0 && fenced.entry.max_timestamp >= target_ms
@@ -6959,7 +7201,7 @@ impl DynoStore {
         // is first consulted when the flag is on (`produce`'s eligibility gate
         // short-circuits past `topic_is_compacted` in that case), so the cost is
         // the same one conditional metadata GET per TTL — just paid here.
-        let prefix = self.routed_prefix_of(topition).await?;
+        let (prefix, substream) = self.routed_substream_of(topition).await?;
         let (ack, offset) = oneshot::channel();
         let span = deflated.last_offset_delta as i64 + 1;
         let size = size_of::<i64>() + size_of::<i32>() + deflated.batch_length.max(0) as usize;
@@ -6988,6 +7230,7 @@ impl DynoStore {
             let first = buffer.pending.is_empty();
             buffer.pending.push(PrefixPending {
                 topition: topition.to_owned(),
+                substream,
                 batch: deflated,
                 ack,
             });
@@ -7233,13 +7476,23 @@ impl DynoStore {
             // batch that raced in through a peer (folded on the conflict retry)
             // flips to a duplicate acked with the winner's offset, closing the
             // cross-pod dedup window.
-            let mut substreams: Vec<(Topition, i64, Vec<deflated::Batch>)> =
-                Vec::with_capacity(grouped.len());
+            let mut substreams: Vec<SubstreamWrite> = Vec::with_capacity(grouped.len());
             let mut outcomes: Vec<Result<i64>> = vec![Ok(0); buffer.pending.len()];
             let mut advances: Vec<(Topition, i64)> = Vec::with_capacity(grouped.len());
 
             for (topition, indices) in &grouped {
-                let base = match self.leaseless_base(prefix, topition).await {
+                // Every batch grouped under one topition carries the same
+                // identity — it comes from the topic's immutable pin (#442), not
+                // from anything per-batch — so the group's is the first one's. A
+                // group is never empty: `grouped` is built by pushing indices.
+                let Some(substream) = indices
+                    .first()
+                    .map(|&index| buffer.pending[index].substream.clone())
+                else {
+                    continue;
+                };
+
+                let base = match self.leaseless_base(prefix, &substream, topition).await {
                     Ok(base) => base,
                     Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
                 };
@@ -7272,6 +7525,7 @@ impl DynoStore {
                             Entry::Vacant(vacant) => {
                                 let folded = match self.producer_tail_folded(
                                     prefix,
+                                    &substream,
                                     topition,
                                     producer_id,
                                 ) {
@@ -7312,7 +7566,12 @@ impl DynoStore {
 
                 if !batches.is_empty() {
                     advances.push((topition.clone(), running));
-                    substreams.push((topition.clone(), base, batches));
+                    substreams.push(SubstreamWrite {
+                        topition: topition.clone(),
+                        substream,
+                        base_offset: base,
+                        batches,
+                    });
                 }
             }
 
@@ -7324,7 +7583,12 @@ impl DynoStore {
 
             // Encode a v3 segment stamped with the leaseless era epoch (#92) and
             // try to create it at `candidate`.
-            let (payload, footer) = match self.encode_segment_v3(&substreams, era, nonce) {
+            let (payload, footer) = match self.encode_segment_indexed(
+                &substreams,
+                era,
+                nonce,
+                self.segment_format_version,
+            ) {
                 Ok(encoded) => encoded,
                 Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
             };
@@ -7455,9 +7719,14 @@ impl DynoStore {
     /// `prefix` is the flush's (routed, #175) buffer key, threaded through
     /// rather than re-derived so the base is read from exactly the segment set
     /// the flush is about to append to.
-    async fn leaseless_base(&self, prefix: &str, topition: &Topition) -> Result<i64> {
+    async fn leaseless_base(
+        &self,
+        prefix: &str,
+        substream: &Substream,
+        topition: &Topition,
+    ) -> Result<i64> {
         let segment_tail = self
-            .valid_substream_segments(prefix, topition.topic(), topition.partition())?
+            .valid_substream_segments(prefix, substream, topition.partition())?
             .last()
             .map(FencedSegment::end)
             .unwrap_or(0);
@@ -7520,13 +7789,12 @@ impl DynoStore {
     fn producer_tail_folded(
         &self,
         prefix: &str,
+        substream: &Substream,
         topition: &Topition,
         producer_id: i64,
     ) -> Result<ProducerTail> {
         let mut tail = ProducerTail::default();
-        for fenced in
-            self.valid_substream_segments(prefix, topition.topic(), topition.partition())?
-        {
+        for fenced in self.valid_substream_segments(prefix, substream, topition.partition())? {
             for pc in &fenced.entry.producers {
                 // Belt and braces: `base_sequence == -1` also catches any
                 // future non-sequenced coordinate that lacks the flag (a v2
@@ -8304,7 +8572,12 @@ impl DynoStore {
                                 .entries
                                 .iter()
                                 .map(|e| {
-                                    (e.topic.clone(), e.partition, e.base_offset + e.record_count)
+                                    (
+                                        e.substream(),
+                                        e.topic.clone(),
+                                        e.partition,
+                                        e.base_offset + e.record_count,
+                                    )
                                 })
                                 .collect();
 
@@ -8316,7 +8589,7 @@ impl DynoStore {
         };
 
         let mut expirable: Vec<u64> = Vec::new();
-        let mut affected: BTreeSet<(String, i32)> = BTreeSet::new();
+        let mut affected: BTreeSet<(Substream, String, i32)> = BTreeSet::new();
         let mut surviving_oldest_ms: Option<i64> = None;
 
         for (seq, age_ms, ends) in &segments_snapshot {
@@ -8332,7 +8605,7 @@ impl DynoStore {
             // it served the DeleteRecords itself); age-based retention still
             // bounds the physical debt.
             let mut fully_truncated = !ends.is_empty();
-            for (topic, partition, end) in ends {
+            for (_, topic, partition, end) in ends {
                 let tp = Topition::new(topic.as_str(), *partition);
                 if self.cached_truncate(&tp)?.is_none_or(|floor| floor < *end) {
                     fully_truncated = false;
@@ -8342,8 +8615,8 @@ impl DynoStore {
 
             if *age_ms < threshold_ms || fully_truncated {
                 expirable.push(*seq);
-                for (topic, partition, _) in ends {
-                    _ = affected.insert((topic.clone(), *partition));
+                for (substream, topic, partition, _) in ends {
+                    _ = affected.insert((substream.clone(), topic.clone(), *partition));
                 }
             } else {
                 surviving_oldest_ms =
@@ -8395,9 +8668,35 @@ impl DynoStore {
         // `OffsetOutOfRange` instead of empty-forever. `None` survivors certify
         // at the floor itself: an empty log whose end is the floor, which #299
         // already reports as starting where it ends.
+        // A slice of an incarnation that is no longer the topic of this name
+        // (#442) still has to lose its segments to retention — that is the
+        // physical debt this pass exists to reclaim — but it must not write a
+        // watermark, because the watermark object is keyed by name and the topic
+        // that name resolves to now is a *different* log. Advancing its `high` to
+        // a dead incarnation's tail is the "recreated topic does not start at 0"
+        // defect arriving by another route.
+        //
+        // Resolved once per distinct topic rather than once per sub-stream: a
+        // deleted topic has no routing pin left, so its lookup is a 404 that
+        // nothing memoizes, and `affected` is per *partition*.
+        let mut current: BTreeMap<&String, Substream> = BTreeMap::new();
+        for (_, topic, _) in &affected {
+            if !current.contains_key(topic) {
+                _ = current.insert(topic, self.current_substream_of(topic).await?);
+            }
+        }
+
         let expirable_seqs: BTreeSet<u64> = expirable.iter().copied().collect();
-        for (topic, partition) in &affected {
-            let segments = self.valid_substream_segments(prefix, topic, *partition)?;
+        for (substream, topic, partition) in &affected {
+            if current.get(topic) != Some(substream) {
+                debug!(
+                    ?substream,
+                    topic, partition, "skipping the watermark of a retired incarnation"
+                );
+                continue;
+            }
+
+            let segments = self.valid_substream_segments(prefix, substream, *partition)?;
             let tail = segments.last().map(FencedSegment::end);
             let surviving = segments
                 .iter()
@@ -8433,12 +8732,12 @@ impl DynoStore {
         // their own: the seq-floor raise invalidates their cached watermark
         // floors, so their next read pays the one GET and sees the pair.
         self.next_offsets.lock().map(|mut locked| {
-            for (topic, partition) in &affected {
+            for (_, topic, partition) in &affected {
                 _ = locked.remove(&Topition::new(topic.clone(), *partition));
             }
         })?;
         self.coalesced_watermark_floors.lock().map(|mut locked| {
-            for (topic, partition) in &affected {
+            for (_, topic, partition) in &affected {
                 _ = locked.remove(&Topition::new(topic.clone(), *partition));
             }
         })?;
@@ -8745,21 +9044,24 @@ impl DynoStore {
         // entries. A zombie/dominated input is dropped there and an overlap's
         // duplicated head is clipped off (#461), never fused into the merged
         // segment, so compaction can't bake in duplicate/shifted offsets.
-        let substream_keys: BTreeSet<(String, i32)> = footers
+        // Identified as well as named (#442): two incarnations of one topic can
+        // hold slices in the same run, and merging them as one sub-stream would
+        // concatenate two logs' offsets into one region.
+        let substream_keys: BTreeSet<(Substream, String, i32)> = footers
             .values()
             .flat_map(|footer| {
                 footer
                     .entries
                     .iter()
-                    .map(|e| (e.topic.clone(), e.partition))
+                    .map(|e| (e.substream(), e.topic.clone(), e.partition))
             })
             .collect();
 
-        let mut substreams: Vec<(Topition, i64, Vec<deflated::Batch>)> = Vec::new();
+        let mut substreams: Vec<SubstreamWrite> = Vec::new();
         let mut merged_epoch = i64::MIN;
 
-        for (topic, partition) in substream_keys {
-            let in_run = self.decode_fenced_regions(prefix, &topic, partition, &objects)?;
+        for (substream, topic, partition) in substream_keys {
+            let in_run = self.decode_fenced_regions(prefix, &substream, partition, &objects)?;
 
             // Every run segment holding this sub-stream is superseded by a
             // segment outside the run — nothing to carry forward.
@@ -8815,7 +9117,12 @@ impl DynoStore {
                     merged_epoch = merged_epoch.max(footer.writer_epoch);
                 }
             }
-            substreams.push((Topition::new(topic, partition), base, batches));
+            substreams.push(SubstreamWrite {
+                topition: Topition::new(topic, partition),
+                substream,
+                base_offset: base,
+                batches,
+            });
         }
 
         // Write the merged segment (create-only, no produce-lease fencing), index
@@ -8834,8 +9141,12 @@ impl DynoStore {
             // instead of being re-appended. A fresh per-segment nonce (#89) is
             // stamped as on any create.
             let nonce = rng().random::<u64>();
-            let (payload, footer) =
-                self.encode_segment_v3(&substreams, merged_epoch.max(0), nonce)?;
+            let (payload, footer) = self.encode_segment_indexed(
+                &substreams,
+                merged_epoch.max(0),
+                nonce,
+                self.segment_format_version,
+            )?;
             let seq = self
                 .assign_and_create_segment(prefix, payload, nonce, SegmentCreateRole::Compaction)
                 .await?;
@@ -8922,7 +9233,7 @@ impl DynoStore {
         // Snapshot `(writer_epoch, last_modified_ms)` per segment and the
         // sub-stream key set from the cached footers — no object requests.
         let mut segments_meta: BTreeMap<u64, (i64, i64)> = BTreeMap::new();
-        let mut substream_keys: BTreeSet<(String, i32)> = BTreeSet::new();
+        let mut substream_keys: BTreeSet<(Substream, String, i32)> = BTreeSet::new();
         {
             let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
             if let Some(entry) = index.get(prefix) {
@@ -8934,7 +9245,7 @@ impl DynoStore {
                     _ = segments_meta
                         .insert(*seq, (cached.footer.writer_epoch, cached.last_modified_ms));
                     for e in &cached.footer.entries {
-                        _ = substream_keys.insert((e.topic.clone(), e.partition));
+                        _ = substream_keys.insert((e.substream(), e.topic.clone(), e.partition));
                     }
                 }
             }
@@ -8967,16 +9278,16 @@ impl DynoStore {
         // duplicated head batches are clipped off (#461), never fused in.
         // `outputs[seq]` accumulates every fenced sub-stream's (possibly
         // compacted) region so a dirty segment can be rebuilt whole.
-        let mut outputs: BTreeMap<u64, Vec<(Topition, i64, Vec<deflated::Batch>)>> =
-            BTreeMap::new();
+        let mut outputs: BTreeMap<u64, Vec<SubstreamWrite>> = BTreeMap::new();
         let mut dirty: BTreeSet<u64> = BTreeSet::new();
         let mut removed_total: u64 = 0;
         let mut repaired_total: u64 = 0;
 
-        for (topic, partition) in substream_keys {
+        for (substream, topic, partition) in substream_keys {
             // Decode every fenced region once, then walk them newest first — a
             // key kept in a newer region supersedes older copies.
-            let mut regions = self.decode_fenced_regions(prefix, &topic, partition, &objects)?;
+            let mut regions =
+                self.decode_fenced_regions(prefix, &substream, partition, &objects)?;
             regions.reverse();
 
             let mut seen: BTreeSet<Bytes> = BTreeSet::new();
@@ -9055,11 +9366,12 @@ impl DynoStore {
                 // by a SIBLING partition still needs this sub-stream's content:
                 // contribute the originals, untouched.
                 for (seq, base, region) in regions {
-                    outputs.entry(seq).or_default().push((
-                        Topition::new(topic.clone(), partition),
-                        base,
-                        region,
-                    ));
+                    outputs.entry(seq).or_default().push(SubstreamWrite {
+                        topition: Topition::new(topic.clone(), partition),
+                        substream: substream.clone(),
+                        base_offset: base,
+                        batches: region,
+                    });
                 }
                 continue;
             }
@@ -9091,11 +9403,12 @@ impl DynoStore {
                         );
                     }
                 }
-                outputs.entry(seq).or_default().push((
-                    Topition::new(topic.clone(), partition),
-                    base,
-                    out,
-                ));
+                outputs.entry(seq).or_default().push(SubstreamWrite {
+                    topition: Topition::new(topic.clone(), partition),
+                    substream: substream.clone(),
+                    base_offset: base,
+                    batches: out,
+                });
             }
         }
 
@@ -9118,7 +9431,12 @@ impl DynoStore {
             let (epoch, last_modified) = segments_meta.get(seq).copied().unwrap_or((0, i64::MIN));
 
             let nonce = rng().random::<u64>();
-            let (payload, footer) = self.encode_segment_v3(substreams, epoch.max(0), nonce)?;
+            let (payload, footer) = self.encode_segment_indexed(
+                substreams,
+                epoch.max(0),
+                nonce,
+                self.segment_format_version,
+            )?;
             let new_seq = self
                 .assign_and_create_segment(prefix, payload, nonce, SegmentCreateRole::Compaction)
                 .await?;
@@ -9951,31 +10269,44 @@ impl DynoStore {
 
         self.refresh_prefix_index_forced(prefix).await?;
 
-        let substreams: BTreeSet<(String, i32)> = self
-            .prefix_index
-            .lock()
-            .map_err(Into::<Error>::into)?
-            .get(prefix)
-            .map(|index| {
-                index
-                    .segments
-                    .values()
-                    .flat_map(|cached| {
-                        cached
-                            .footer
-                            .entries
-                            .iter()
-                            .map(|entry| (entry.topic.clone(), entry.partition))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let substreams: BTreeSet<(Substream, String, i32)> =
+            self.prefix_index
+                .lock()
+                .map_err(Into::<Error>::into)?
+                .get(prefix)
+                .map(|index| {
+                    index
+                        .segments
+                        .values()
+                        .flat_map(|cached| {
+                            cached.footer.entries.iter().map(|entry| {
+                                (entry.substream(), entry.topic.clone(), entry.partition)
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
 
         let mut certified: Vec<Topition> = Vec::new();
 
-        for (topic, partition) in &substreams {
+        // The watermark object is keyed by name, so a slice left behind by an
+        // incarnation this name no longer resolves to must not certify against it
+        // (#442) — that would advertise a dead log's end as the live one's.
+        // Resolved once per distinct topic; see `expire_prefix_segments`.
+        let mut current: BTreeMap<&String, Substream> = BTreeMap::new();
+        for (_, topic, _) in &substreams {
+            if !current.contains_key(topic) {
+                _ = current.insert(topic, self.current_substream_of(topic).await?);
+            }
+        }
+
+        for (substream, topic, partition) in &substreams {
+            if current.get(topic) != Some(substream) {
+                continue;
+            }
+
             let Some(tail) = self
-                .valid_substream_segments(prefix, topic, *partition)?
+                .valid_substream_segments(prefix, substream, *partition)?
                 .last()
                 .map(FencedSegment::end)
             else {
@@ -10231,7 +10562,7 @@ impl DynoStore {
     /// Segments are immutable and created atomically, so a ranged GET cannot
     /// return fewer bytes than the object holds over that range. A short read
     /// therefore says the entry the read was issued from claims bytes past the
-    /// end of the object — and `encode_segment_v3` measures `byte_len` from the
+    /// end of the object — and `encode_segment_indexed` measures `byte_len` from the
     /// bytes it just appended, so it cannot over-claim for the payload it built.
     /// Two things can produce the pairing, and they are distinguishable by one
     /// suffix GET:
@@ -10271,7 +10602,7 @@ impl DynoStore {
             ));
         };
 
-        let Some(own) = footer.get(&entry.topic, entry.partition) else {
+        let Some(own) = footer.get(&entry.substream(), entry.partition) else {
             return Err(read.short_of_extent(format!(
                 "object's own footer holds no {}-{} region",
                 entry.topic, entry.partition
@@ -10340,7 +10671,7 @@ impl DynoStore {
         // the index named a 41st). An entry present but at a different extent is
         // the same fault seen through a partial overlap.
         let disagrees = footer
-            .get(&entry.topic, entry.partition)
+            .get(&entry.substream(), entry.partition)
             .is_none_or(|own| own.byte_start != entry.byte_start || own.byte_len != entry.byte_len);
 
         if !disagrees {
@@ -10365,7 +10696,7 @@ impl DynoStore {
         footer: SegmentFooter,
     ) -> Result<()> {
         // Read out before the footer is moved into the index.
-        let trailer = footer.get(&entry.topic, entry.partition).map(|own| {
+        let trailer = footer.get(&entry.substream(), entry.partition).map(|own| {
             (
                 own.byte_start,
                 own.byte_len,
@@ -10616,6 +10947,10 @@ impl DynoStore {
 
             entries.push(SubstreamEntry {
                 topic: topition.topic().to_owned(),
+                // v1 has no place to put one, so a v1 sub-stream is keyed by
+                // name — which is what every topic written by that path was
+                // (#442).
+                topic_id: None,
                 partition: topition.partition(),
                 base_offset: *base_offset,
                 record_count,
@@ -10655,20 +10990,54 @@ impl DynoStore {
     /// the footer alone (#174) — placement metadata, not commit authority:
     /// LSO/aborted derivation stays a pure `meta.json` function. `offset_delta`
     /// is the batch's offset within its sub-stream so it survives the
-    /// conflict-correction re-encode. v3 is stamped unconditionally — the
-    /// version follows the writer regime, never the segment's content.
-    fn encode_segment_v3(
+    /// conflict-correction re-encode.
+    ///
+    /// `version` is stamped unconditionally and comes from the writer regime
+    /// ([`DynoStore::segment_format_version`]), never from the segment's
+    /// content — a v4 segment whose sub-streams are all name-keyed is still v4,
+    /// and its entries carry the nil uuid. What *is* content is the identity of
+    /// each sub-stream (#442), which the caller decides and passes in: a v3
+    /// writer handed an id-keyed sub-stream would drop the id on the floor and
+    /// write records under a key nothing reads, so that combination is refused
+    /// rather than silently downgraded.
+    fn encode_segment_indexed(
         &self,
-        substreams: &[(Topition, i64, Vec<deflated::Batch>)],
+        substreams: &[SubstreamWrite],
         writer_epoch: i64,
         nonce: u64,
+        version: u16,
     ) -> Result<(PutPayload, SegmentFooter)> {
         let mut body = Vec::new();
         let mut entries = Vec::with_capacity(substreams.len());
 
-        for (topition, base_offset, batches) in substreams {
+        for SubstreamWrite {
+            topition,
+            substream,
+            base_offset,
+            batches,
+        } in substreams
+        {
             if batches.is_empty() {
                 continue;
+            }
+
+            // An id-keyed sub-stream cannot be expressed below v4, and writing
+            // it name-keyed would put its records where no reader of that topic
+            // looks — durable, acked, and invisible. The only way to reach here
+            // is a deployment that stamped `substream_id` on a topic and then
+            // went back to a v3 writer regime, which the flag's one-way
+            // discipline exists to prevent.
+            if version < SEGMENT_FORMAT_VERSION_V4
+                && let Some(id) = substream.id()
+            {
+                error!(
+                    ?topition,
+                    %id,
+                    version,
+                    "refusing to write an id-keyed sub-stream into a pre-v4 segment"
+                );
+
+                return Err(Error::Api(ErrorCode::KafkaStorageError));
             }
 
             let byte_start = body.len() as u64;
@@ -10752,6 +11121,7 @@ impl DynoStore {
 
             entries.push(SubstreamEntry {
                 topic: topition.topic().to_owned(),
+                topic_id: substream.id(),
                 partition: topition.partition(),
                 base_offset: *base_offset,
                 record_count,
@@ -10767,32 +11137,62 @@ impl DynoStore {
             nonce,
             entries,
         };
-        let footer_bytes = Self::encode_footer(&footer, SEGMENT_FORMAT_VERSION_V3);
+        let footer_bytes = Self::encode_footer(&footer, version);
 
         body.extend_from_slice(&footer_bytes);
         body.extend_from_slice(&(footer_bytes.len() as u64).to_be_bytes());
         body.extend_from_slice(&(footer.entries.len() as u32).to_be_bytes());
-        body.extend_from_slice(&SEGMENT_FORMAT_VERSION_V3.to_be_bytes());
+        body.extend_from_slice(&version.to_be_bytes());
         body.extend_from_slice(&SEGMENT_MAGIC.to_be_bytes());
 
         Ok((PutPayload::from(Bytes::from(body)), footer))
     }
 
+    /// [`Self::encode_segment_indexed`] at v3 over name-keyed sub-streams: the
+    /// shape every write had before #442, kept for the tests that pin the v3
+    /// byte layout and the read paths built on it.
+    #[cfg(test)]
+    fn encode_segment_v3(
+        &self,
+        substreams: &[(Topition, i64, Vec<deflated::Batch>)],
+        writer_epoch: i64,
+        nonce: u64,
+    ) -> Result<(PutPayload, SegmentFooter)> {
+        let substreams = substreams
+            .iter()
+            .map(|(topition, base_offset, batches)| SubstreamWrite {
+                substream: Substream::Name(topition.topic().to_owned()),
+                topition: topition.clone(),
+                base_offset: *base_offset,
+                batches: batches.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        self.encode_segment_indexed(&substreams, writer_epoch, nonce, SEGMENT_FORMAT_VERSION_V3)
+    }
+
     /// Serialize a [`SegmentFooter`] index (#64/#59). Header: `writer_epoch
     /// (i64)`, plus `nonce (u64)` at v2. Then each entry: `topic_len (u16) +
-    /// topic (utf8) + partition (i32) + base_offset (i64) + record_count (i64) +
-    /// byte_start (u64) + byte_len (u64) + max_timestamp (i64)`, plus at v2
-    /// `pcoord_count (u16)` and that many `producer_id (i64) + producer_epoch
-    /// (i16) + base_sequence (i32) + last_sequence (i32) + offset_delta (u32)`,
-    /// plus at v3 a per-coordinate `flags (u8)` (#174) — all big-endian. Asked
-    /// for v2, this MUST keep emitting the exact pre-v3 bytes (`flags` is
-    /// dropped, not zero-filled): deployed readers, internal and S3-direct
-    /// external, decode v2 by that byte layout. Paired with
-    /// [`Self::decode_footer`]; the external contract is
-    /// `docs/virtual-topics-format.md`.
+    /// topic (utf8)`, plus at v4 `topic_id ([16], #442)`, then `partition
+    /// (i32) + base_offset (i64) + record_count (i64) + byte_start (u64) +
+    /// byte_len (u64) + max_timestamp (i64)`, plus at v2 `pcoord_count (u16)`
+    /// and that many `producer_id (i64) + producer_epoch (i16) + base_sequence
+    /// (i32) + last_sequence (i32) + offset_delta (u32)`, plus at v3 a per-coordinate
+    /// `flags (u8)` (#174) — all big-endian. Asked for v2, this MUST keep
+    /// emitting the exact pre-v3 bytes (`flags` is dropped, not zero-filled),
+    /// and asked for v3 the exact pre-v4 bytes (`topic_id` likewise): deployed
+    /// readers, internal and S3-direct external, decode those versions by those
+    /// byte layouts. Paired with [`Self::decode_footer`]; the external contract
+    /// is `docs/virtual-topics-format.md`.
+    ///
+    /// A v4 entry for a name-keyed topic writes the **nil** uuid, which decodes
+    /// back to `None` — so "the segment is v4" and "this sub-stream is keyed by
+    /// id" are independent, exactly as they have to be while both kinds of topic
+    /// coexist in one prefix.
     fn encode_footer(footer: &SegmentFooter, version: u16) -> Vec<u8> {
         let v2 = version >= SEGMENT_FORMAT_VERSION_V2;
         let v3 = version >= SEGMENT_FORMAT_VERSION_V3;
+        let v4 = version >= SEGMENT_FORMAT_VERSION_V4;
         let mut buf = Vec::new();
         buf.extend_from_slice(&footer.writer_epoch.to_be_bytes());
         if v2 {
@@ -10802,6 +11202,9 @@ impl DynoStore {
             let topic = entry.topic.as_bytes();
             buf.extend_from_slice(&(topic.len() as u16).to_be_bytes());
             buf.extend_from_slice(topic);
+            if v4 {
+                buf.extend_from_slice(entry.topic_id.unwrap_or(Uuid::nil()).as_bytes());
+            }
             buf.extend_from_slice(&entry.partition.to_be_bytes());
             buf.extend_from_slice(&entry.base_offset.to_be_bytes());
             buf.extend_from_slice(&entry.record_count.to_be_bytes());
@@ -10835,6 +11238,7 @@ impl DynoStore {
     ) -> Result<SegmentFooter> {
         let v2 = version >= SEGMENT_FORMAT_VERSION_V2;
         let v3 = version >= SEGMENT_FORMAT_VERSION_V3;
+        let v4 = version >= SEGMENT_FORMAT_VERSION_V4;
         let mut entries = Vec::with_capacity(entry_count);
         let mut cursor = footer_bytes;
 
@@ -10858,6 +11262,15 @@ impl DynoStore {
             let topic_len = u16::from_be_bytes(take(&mut cursor, 2)?.try_into()?) as usize;
             let topic = String::from_utf8(take(&mut cursor, topic_len)?.to_vec())
                 .map_err(|e| Error::Message(e.to_string()))?;
+            // v4 carries the topic id the records were produced under (#442). A
+            // nil uuid means this sub-stream is keyed by name — the same state a
+            // v1/v2/v3 entry is in, and the state every topic created before the
+            // v4 writer regime stays in for its whole life.
+            let topic_id = if v4 {
+                Some(Uuid::from_bytes(take(&mut cursor, 16)?.try_into()?)).filter(|id| !id.is_nil())
+            } else {
+                None
+            };
             let partition = i32::from_be_bytes(take(&mut cursor, 4)?.try_into()?);
             let base_offset = i64::from_be_bytes(take(&mut cursor, 8)?.try_into()?);
             let record_count = i64::from_be_bytes(take(&mut cursor, 8)?.try_into()?);
@@ -10888,6 +11301,7 @@ impl DynoStore {
 
             entries.push(SubstreamEntry {
                 topic,
+                topic_id,
                 partition,
                 base_offset,
                 record_count,
@@ -10925,16 +11339,18 @@ impl DynoStore {
         let footer_len = u64::from_be_bytes(trailer[0..8].try_into()?) as usize;
         let entry_count = u32::from_be_bytes(trailer[8..12].try_into()?) as usize;
         let version = u16::from_be_bytes(trailer[12..14].try_into()?);
-        // v3 is accepted one release before anything writes it (#174): this
-        // rejection is a hard error that propagates through the index refresh
-        // into fetch, so a reader that lacks a version suffers a partition-wide
-        // read outage the moment a writer emits it — see
-        // [`SEGMENT_FORMAT_VERSION_V3`]. Rejecting every *other* version stays:
+        // v3 is accepted one release before anything writes it (#174), and v4
+        // one *flag* before anything writes it (#442): this rejection is a hard
+        // error that propagates through the index refresh into fetch, so a
+        // reader that lacks a version suffers a partition-wide read outage the
+        // moment a writer emits it — see [`SEGMENT_FORMAT_VERSION_V3`] and
+        // [`SEGMENT_FORMAT_VERSION_V4`]. Rejecting every *other* version stays:
         // it is the external contract's MUST (`docs/virtual-topics-format.md`),
         // and guessing at an unknown layout would mis-decode, not degrade.
         if version != SEGMENT_FORMAT_VERSION
             && version != SEGMENT_FORMAT_VERSION_V2
             && version != SEGMENT_FORMAT_VERSION_V3
+            && version != SEGMENT_FORMAT_VERSION_V4
         {
             return Err(Error::Message(format!(
                 "unsupported segment format version {version}"
@@ -11223,19 +11639,27 @@ impl Storage for DynoStore {
         // uncontended here — and it is deliberately an overwrite rather than a
         // create: it clears any pin left behind by a torn delete of a same-named
         // predecessor, which a create-only write would silently adopt.
-        let pinned = self.routed_prefix(
-            &Topition::new(topic.name.as_str(), 0),
-            Self::topic_configs_are_compacted(&topic),
-        );
+        //
+        // The sub-stream identity is pinned by the same write (#442). Under the
+        // v4 writer regime a topic is keyed by its own id, which is what makes
+        // this creation a **new log** rather than a continuation of whatever a
+        // same-named predecessor left in the shared segments — see
+        // [`Substream`]. Under v3 it is `None`, byte-identical to every pin
+        // written before this existed.
+        let pinned = TopicRouting {
+            prefix: self.routed_prefix(
+                &Topition::new(topic.name.as_str(), 0),
+                Self::topic_configs_are_compacted(&topic),
+            ),
+            substream_id: (self.segment_format_version >= SEGMENT_FORMAT_VERSION_V4).then_some(id),
+        };
         _ = self
             .object_store
             .put_opts(
                 &self.topic_routing_path(topic.name.as_str()),
-                serde_json::to_vec(&TopicRouting {
-                    prefix: pinned.clone(),
-                })
-                .map(Bytes::from)
-                .map(PutPayload::from)?,
+                serde_json::to_vec(&pinned)
+                    .map(Bytes::from)
+                    .map(PutPayload::from)?,
                 PutOptions::default(),
             )
             .await?;
@@ -11243,7 +11667,7 @@ impl Storage for DynoStore {
         _ = self
             .routing_prefixes
             .lock()
-            .map(|mut locked| locked.insert(topic.name.clone(), pinned));
+            .map(|mut locked| locked.insert(topic.name.clone(), pinned.clone()));
 
         for partition in 0..topic.num_partitions {
             let topition = Topition::new(topic.name.as_str(), partition);
@@ -11310,9 +11734,28 @@ impl Storage for DynoStore {
             //
             // `high` is still cleared: it re-derives from the segment fold, and
             // `expire_prefix_segments` stays its single writer (#179, #237).
+            //
+            // An **id-keyed** topic clears the floor instead of preserving it
+            // (#442). The floor's whole job was to hide a predecessor's slices
+            // from a successor that would otherwise find them by name; keyed by
+            // id there is nothing to hide, because there is nothing this
+            // incarnation can reach. Keeping it would be worse than pointless —
+            // it would clamp a genuinely empty log to a dead incarnation's end,
+            // which is the very "does not restart at 0" this exists to fix.
+            //
+            // The `served` certification goes with it for the same reason: it
+            // certifies what a *previous* incarnation's expiry left servable, and
+            // read paths honour it against the floor.
+            let id_keyed = pinned.substream_id.is_some();
+
             watermark
                 .with_mut(&self.object_store, |watermark| {
                     _ = watermark.high.take();
+
+                    if id_keyed {
+                        _ = watermark.truncate.take();
+                        _ = watermark.served.take();
+                    }
 
                     Ok(())
                 })

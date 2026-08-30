@@ -39,7 +39,11 @@ use tansu_sans_io::{
     record::{Record, deflated, inflated},
 };
 
-use crate::{Error, Result, Topition, dynostore::DynoStore, storage_error_code};
+use crate::{
+    Error, Result, Topition,
+    dynostore::{DynoStore, Substream},
+    storage_error_code,
+};
 
 const CLUSTER: &str = "tansu";
 const NODE: i32 = 111;
@@ -193,7 +197,7 @@ fn a_well_formed_segment_still_encodes_and_its_entry_covers_its_frame() -> Resul
     let (payload, footer) = store.encode_segment_v3(&[(tp.clone(), 0, batches)], 0, 0)?;
 
     let entry = footer
-        .get(tp.topic(), tp.partition())
+        .get(&Substream::Name(tp.topic().into()), tp.partition())
         .expect("sub-stream entry");
 
     // What the frames claim, plus their headers, is exactly what the entry

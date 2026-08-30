@@ -46,7 +46,8 @@ use tansu_sans_io::{
 use crate::{
     Result, Storage as _, Topition,
     dynostore::{
-        CoalesceTuning, CompactRun, DynoStore, SegmentFooter, SubstreamEntry, tests::init_tracing,
+        CoalesceTuning, CompactRun, DynoStore, SegmentFooter, Substream, SubstreamEntry,
+        tests::init_tracing,
     },
 };
 
@@ -64,6 +65,7 @@ fn footer(base: i64, count: i64) -> SegmentFooter {
         nonce: 0,
         entries: vec![SubstreamEntry {
             topic: TOPIC.into(),
+            topic_id: None,
             partition: 0,
             base_offset: base,
             record_count: count,
@@ -196,7 +198,7 @@ async fn a_segment_reaching_past_the_frontier_is_clipped_not_dropped() -> Result
     store.index_insert(PREFIX, 1, footer(0, 100), 0)?;
     store.index_insert(PREFIX, 2, footer(50, 9_950), 0)?;
 
-    let fenced = store.valid_substream_segments(PREFIX, TOPIC, 0)?;
+    let fenced = store.valid_substream_segments(PREFIX, &Substream::Name(TOPIC.into()), 0)?;
 
     assert_eq!(
         2,
@@ -240,7 +242,7 @@ async fn a_segment_wholly_inside_the_frontier_is_still_dropped() -> Result<()> {
     store.index_insert(PREFIX, 1, footer(0, 100), 0)?;
     store.index_insert(PREFIX, 2, footer(100, 100), 0)?;
 
-    let fenced = store.valid_substream_segments(PREFIX, TOPIC, 0)?;
+    let fenced = store.valid_substream_segments(PREFIX, &Substream::Name(TOPIC.into()), 0)?;
 
     assert_eq!(
         1,
@@ -318,7 +320,7 @@ async fn compaction_heals_a_batch_aligned_overlap() -> Result<()> {
     // One surviving object, whose single entry tiles the sub-stream exactly.
     assert_eq!(1, segments(&bucket).await.len());
 
-    let fenced = store.valid_substream_segments(PREFIX, TOPIC, 0)?;
+    let fenced = store.valid_substream_segments(PREFIX, &Substream::Name(TOPIC.into()), 0)?;
     assert_eq!(1, fenced.len(), "{fenced:?}");
     assert_eq!(0, fenced[0].entry.base_offset);
     assert_eq!(200, fenced[0].entry.record_count);

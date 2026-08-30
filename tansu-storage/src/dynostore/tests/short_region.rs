@@ -72,6 +72,7 @@ use crate::{
     Error, Result, Storage as _, Topition,
     dynostore::{
         CoalesceTuning, DynoStore, SEGMENT_FORMAT_VERSION_V3, SEGMENT_MAGIC, SegmentFooter,
+        Substream,
     },
     storage_error_code,
 };
@@ -513,7 +514,7 @@ async fn an_entry_for_a_substream_the_object_does_not_hold_is_read_past() -> Res
     assert_eq!(
         vec![0, 2],
         store
-            .valid_substream_segments(PREFIX, TOPIC, 0)?
+            .valid_substream_segments(PREFIX, &Substream::Name(TOPIC.into()), 0)?
             .iter()
             .map(|fenced| fenced.seq)
             .collect::<Vec<_>>()

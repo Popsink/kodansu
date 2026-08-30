@@ -40,7 +40,7 @@ use tansu_sans_io::{
 
 use crate::{
     Error, OffsetCommitRequest, Result, Storage, TopicId, Topition,
-    dynostore::{CoalesceTuning, DynoStore, tests::init_tracing},
+    dynostore::{CoalesceTuning, DynoStore, Substream, tests::init_tracing},
 };
 
 const CLUSTER: &str = "tansu";
@@ -1330,7 +1330,7 @@ async fn segmentless_substream_stale_hint_latest_costs_no_per_partition_get() ->
     for tp in [&a, &b] {
         assert!(
             storage
-                .valid_substream_segments(&prefix, topic, tp.partition())?
+                .valid_substream_segments(&prefix, &Substream::Name(topic.into()), tp.partition())?
                 .is_empty(),
             "{tp:?} must hold no segment for this to be the drained case"
         );

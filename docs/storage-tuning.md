@@ -136,6 +136,61 @@ This does not move the per-connection ceiling — that is still one request at a
 time per connection, and still `1 / (linger + PUT)`. It removes the penalty for
 *width*, which is the dimension a CDC workload grows in.
 
+## `segment_format` — the footer version this deployment writes
+
+```
+s3://my-bucket/?segment_format=4
+```
+
+| Value | |
+|---|---|
+| `3` (default) | Sub-streams are keyed by `(topic, partition)` **name**. |
+| `4` | Sub-streams of topics created from now on are keyed by `(topic_id, partition)`. |
+
+Raising it is what makes **a topic deleted and recreated under the same name
+start at offset 0** instead of continuing its predecessor's offsets (#442).
+Everything else about the segment is unchanged.
+
+The mechanism is why it is a flag rather than a default. A segment is immutable
+and shared, and is reclaimed whole only once every sub-stream in it is past
+retention — so a deleted topic's slices cannot be removed. Keyed by name, a
+same-named successor found them; what kept it from *serving* them was the
+truncation floor `DeleteTopics` leaves behind, which is also why its watermarks
+read `(10, 13)` where Apache Kafka answers `(0, 3)`. Keyed by id, a recreation is
+a different uuid, so it is a different sub-stream: the old slices are unreachable
+by construction and the new log starts where an empty log starts.
+
+**The identity is pinned per topic at creation and never changes.** A topic that
+existed before the flip stays name-keyed for its whole life, records and all —
+its segments have no id to match, so nothing about it moves. Only topics created
+after the flip are id-keyed. That is what makes the flip safe to do on a live
+bucket, and it means the fix applies to a topic from its *next* recreation
+onwards, not retroactively.
+
+### Rolling it out
+
+1. Deploy the binary everywhere. Every reader in this release accepts v4
+   segments; nothing writes one.
+2. Confirm every **external** S3-direct reader (kotatsu and anything else built
+   on `docs/virtual-topics-format.md`) is on a build that accepts v4 *and*
+   resolves a sub-stream by `substream_id`. A reader that keys by name against an
+   id-keyed bucket does not fail — it silently answers with a *predecessor's*
+   records for any recreated name.
+3. Set `segment_format=4`.
+
+Step 2 is the one that cannot be skipped. A reader that rejects v4 fails cleanly,
+but it fails on the **whole prefix**, not on the topic that caused it — the
+version follows the writer, so the first flush after the flip makes every new
+segment v4 everywhere.
+
+**Flipping back is not a rollback.** A topic created under v4 has its
+`substream_id` pinned for its lifetime, and a v3 writer cannot express that
+identity — it refuses the produce (`KAFKA_STORAGE_ERROR`, retriable) rather than
+writing records under a key nothing reads. Those topics stop being writable until
+the flag goes back on. A binary from *before* this release does not model
+`substream_id` at all and would take the quiet path instead, which is why step 1
+precedes step 3.
+
 ## `message_max_bytes` — the largest batch this broker accepts
 
 Kafka's `message.max.bytes`, defaulting to Kafka's own value (`1048588` — 1 MiB

@@ -177,6 +177,14 @@ fn text(report: &AuditReport, storage_engine: &Url, topics: &[String], ranges: b
         );
     }
 
+    if report.retired_substreams > 0 {
+        println!(
+            "retired       {} sub-streams of deleted topic incarnations — unreachable, \
+             held until every co-tenant of their segments is past retention",
+            thousands(report.retired_substreams as i64)
+        );
+    }
+
     println!();
 
     let lost = report.lost_records();

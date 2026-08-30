@@ -36,7 +36,7 @@ use tansu_sans_io::{
 
 use crate::{
     Error, Result, Storage, Topition,
-    dynostore::{CoalesceTuning, DynoStore, tests::init_tracing},
+    dynostore::{CoalesceTuning, DynoStore, Substream, tests::init_tracing},
 };
 
 const CLUSTER: &str = "tansu";
@@ -511,7 +511,7 @@ async fn a_cold_replica_must_not_reuse_offsets_below_the_persisted_floor() -> Re
     // Precondition 4: the cold tail really is below the floor. This is the whole
     // hypothesis — a non-zero tail that under-reports the log end.
     let cold_tail = cold
-        .valid_substream_segments(&prefix, tp.topic(), tp.partition())?
+        .valid_substream_segments(&prefix, &Substream::Name(tp.topic().into()), tp.partition())?
         .last()
         .map(|fenced| fenced.entry.base_offset + fenced.entry.record_count)
         .unwrap_or(0);
@@ -521,7 +521,9 @@ async fn a_cold_replica_must_not_reuse_offsets_below_the_persisted_floor() -> Re
     );
 
     // The question: does the flush path answer the stale tail, or the floor?
-    let base = cold.leaseless_base(&prefix, &tp).await?;
+    let base = cold
+        .leaseless_base(&prefix, &Substream::Name(tp.topic().into()), &tp)
+        .await?;
 
     assert!(
         base >= floor,
@@ -563,14 +565,20 @@ async fn folding_the_floor_does_not_move_a_healthy_base() -> Result<(), Error> {
     );
 
     // Warm store: the base is exactly the tail, not one above it.
-    assert_eq!(8, store.leaseless_base(&prefix, &tp).await?);
+    assert_eq!(
+        8,
+        store
+            .leaseless_base(&prefix, &Substream::Name(tp.topic().into()), &tp)
+            .await?
+    );
 
     // Cold store: same answer, derived from the segments alone.
     let cold = DynoStore::new(CLUSTER, NODE, bucket.clone());
     cold.refresh_prefix_index_forced(&prefix).await?;
     assert_eq!(
         8,
-        cold.leaseless_base(&prefix, &tp).await?,
+        cold.leaseless_base(&prefix, &Substream::Name(tp.topic().into()), &tp)
+            .await?,
         "a cold replica must derive the same base, with no gap",
     );
 

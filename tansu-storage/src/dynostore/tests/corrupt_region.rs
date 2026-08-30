@@ -46,7 +46,7 @@ use tansu_sans_io::{
 
 use crate::{
     Error, FetchService, Result, Storage as _, Topition,
-    dynostore::{DynoStore, FrameTail, SubstreamEntry},
+    dynostore::{DynoStore, FrameTail, Substream, SubstreamEntry},
     storage_error_code,
 };
 
@@ -118,7 +118,7 @@ fn segment_with_one_region(store: &DynoStore) -> Result<(Bytes, SubstreamEntry)>
         store.encode_segment_v3(&[(tp.clone(), 0, vec![keyed_batch(b"k", b"v")?])], 0, 0)?;
 
     let entry = footer
-        .get(tp.topic(), tp.partition())
+        .get(&Substream::Name(tp.topic().into()), tp.partition())
         .expect("sub-stream entry")
         .clone();
 
@@ -340,7 +340,9 @@ async fn corrupt_stored_region(bucket: &InMemory, topic: &str) -> Result<()> {
 
     let segment = bucket.get(&locations[0]).await?.bytes().await?;
     let footer = DynoStore::decode_segment_footer(&segment)?.expect("segment must carry a footer");
-    let entry = footer.get(topic, 0).expect("sub-stream entry");
+    let entry = footer
+        .get(&Substream::Name(topic.into()), 0)
+        .expect("sub-stream entry");
 
     _ = bucket
         .put(

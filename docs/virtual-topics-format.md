@@ -12,12 +12,19 @@ clusters/{cluster}/prefixes/{prefix}/segments/{seq:020}.seg
 A reader must **not** assume sequence order equals offset order — **segment
 compaction (#66) writes a merged segment covering old offsets under a fresh
 (higher) sequence**, so a high sequence can hold low offsets. Offset order comes
-from the footer, never from the name. A segment multiplexes the batches of every
-`(topic, partition)` sub-stream, and is self-describing: an external S3-direct
-reader (e.g. kotatsu, kotatsu#82) locates and decodes any sub-stream from the
-object alone, with no external index — resolving `(topic, partition, offset)`
-through the footer's offset ranges (on the rare overlap left by a
-compaction/failover, see [Resolving overlaps](#resolving-overlaps)).
+from the footer, never from the name. A segment multiplexes the batches of many
+sub-streams, and is self-describing: an external S3-direct reader (e.g. kotatsu,
+kotatsu#82) locates and decodes any sub-stream from the object alone, with no
+external index — resolving `(sub-stream, offset)` through the footer's offset
+ranges (on the rare overlap left by a compaction/failover, see
+[Resolving overlaps](#resolving-overlaps)).
+
+**What identifies a sub-stream changed at v4 (#442).** It used to be
+`(topic, partition)` by **name**, and at v4 it is `(topic_id, partition)` for
+any entry carrying a topic id. See
+[Sub-stream identity](#sub-stream-identity-v4) — this is the one part of the
+contract that is not additive, and a reader that ignores it serves a deleted
+topic's records as its successor's.
 
 This document is the **wire contract**. All integers are **big-endian**.
 
@@ -62,16 +69,20 @@ ignored (#386).
 
 ### Footer
 
-Three versions exist. **v3 is what production writes** — since
+Four versions exist. **v3 is what production writes by default** — since
 `0.7.0-beta.25` (#188), every write emits it: the leaseless flush (#86), merge
 compaction, and the per-key compaction rewrite alike. **Nothing emits v2 or v1
 any more**; both remain readable so segments written before that release stay
-readable in place. A reader MUST accept all three, and MUST reject any other
+readable in place. **v4 (#442) is emitted only by a deployment configured with
+`segment_format=4`.** A reader MUST accept all four, and MUST reject any other
 version.
 
-The practical consequence for an external reader: **v3 support is not optional.**
-Every segment written by a current broker is v3, so a reader that implements only
-v1 and v2 fails on the whole bucket, not on a subset.
+The practical consequence for an external reader: **v3 support is not optional,
+and v4 support is not optional either.** Every segment written by a current
+broker is v3, so a reader that implements only v1 and v2 fails on the whole
+bucket, not on a subset — and the moment a deployment raises `segment_format`,
+the same is true of v4. Because the version follows the *writer*, not the
+content, that flip makes every new segment in every prefix v4 at once.
 
 ```
 writer_epoch      i64          # see "writer_epoch" below
@@ -79,6 +90,7 @@ nonce             u64          # v2+ ONLY — per-flush write identity (#89)
 entries[entry_count]:
     topic_len     u16
     topic         [topic_len]  # UTF-8
+    topic_id      [16]         # v4+ ONLY — nil uuid = "no id" (#442)
     partition     i32
     base_offset   i64          # absolute offset of the region's first record
     record_count  i64          # last_offset = base_offset + record_count - 1
@@ -121,9 +133,47 @@ range landed at which offset. An external reader that only serves records can
 skip it; one that wants to recognise duplicates does not have to keep separate
 state.
 
-To read `(topic, partition)` from `offset`: find its entry, ranged-GET
+To read a sub-stream from `offset`: find its entry, ranged-GET
 `[byte_start, byte_start + byte_len)`, decode the region, and assign offsets
 running from `base_offset`.
+
+#### Sub-stream identity (v4)
+
+**A sub-stream is identified by `(topic_id, partition)` when its entry carries a
+non-nil `topic_id`, and by `(topic, partition)` otherwise.** The two are
+disjoint: an id-keyed entry does **not** answer to its own name, and a name-keyed
+entry does not answer to an id.
+
+`topic_id` is absent from the layout below v4, and a v4 entry writes the **nil**
+uuid for a name-keyed sub-stream — so "the segment is v4" and "this sub-stream is
+keyed by id" are independent facts. They have to be: both kinds of topic live in
+one prefix, and share one segment, for as long as any topic created before the
+flip is alive.
+
+**Why it exists.** A segment is immutable and shared, and is reclaimed whole only
+once every sub-stream in it is past retention, so a deleted topic's slices cannot
+be removed. Keyed by name, a topic recreated under that name found its
+predecessor's slices and folded its offsets from them: watermarks `(10, 13)`
+where Apache Kafka answers `(0, 3)` (#442). Keyed by id, a recreation is a
+different uuid, so it is a different sub-stream — its predecessor's records are
+unreachable rather than hidden, and its log starts at 0.
+
+**How a reader resolves a topic name to an id.** From the topic's own metadata,
+`clusters/{cluster}/topic-routing/{name}.json`:
+
+```json
+{"prefix": "org.env.conn", "substream_id": "0192…"}
+```
+
+`substream_id` is **absent** for a name-keyed topic, which is every topic created
+before the flip. The object is immutable for the topic's lifetime, so a reader
+may cache it permanently — and MUST re-read it (or drop it) when the topic is
+deleted, because the name may be reused by a topic with a different id.
+
+**A reader that ignores `topic_id` is not merely missing a feature.** Resolving
+by name against a bucket that has id-keyed topics finds the *predecessor's*
+slices for any recreated name, at offsets the live topic also uses. That is
+exactly the old/new data mixing this keying exists to make impossible.
 
 #### `writer_epoch`
 
@@ -137,8 +187,10 @@ them, but the writer regimes stamp it differently:
   leaseless segment out-epochs every pre-cutover lease-era segment on the same
   prefix (#92).
 - **compaction:** the merged segment carries the maximum `writer_epoch` of the
-  segments it merged (floored at 0). It is written v3 regardless of the prefix —
-  the encoder takes no version parameter.
+  segments it merged (floored at 0). It is written at the deployment's configured
+  version regardless of the versions of the segments it merged — so a v4 writer
+  compacting v3 inputs emits v4, with the nil uuid on every name-keyed entry it
+  carried forward.
 - **lease mode (#59) — historical, v1 segments only:** the epoch of the lease the
   writer held, `0` if none. No current writer emits v1; this is here to read
   segments written before `0.7.0-beta.25`.
@@ -148,7 +200,7 @@ them, but the writer regimes stamp it differently:
 ```
 footer_len    u64
 entry_count   u32
-version       u16              # 1, 2 or 3 (3 is what production writes)
+version       u16              # 1, 2, 3 or 4 (3 by default; 4 with segment_format=4)
 magic         u32              # 0x5453_4547  ("TSEG")
 ```
 
@@ -157,9 +209,16 @@ magic         u32              # 0x5453_4547  ("TSEG")
 - `version = 1` is the first self-describing multi-topic segment; `version = 2`
   adds the footer `nonce` and the per-entry `producers` block described above;
   `version = 3` (#174) appends one `flags` byte per producer coordinate and
-  widens coordinate emission to transactional and control batches. A reader
-  MUST accept `{1, 2, 3}` and MUST reject any other version rather than
-  guessing.
+  widens coordinate emission to transactional and control batches; `version = 4`
+  (#442) inserts a 16-byte `topic_id` after each entry's `topic` and changes what
+  identifies a sub-stream (see
+  [Sub-stream identity](#sub-stream-identity-v4)). A reader MUST accept
+  `{1, 2, 3, 4}` and MUST reject any other version rather than guessing.
+
+  **v4 is the only version bump so far that is not purely additive.** v2 and v3
+  added fields a reader could skip and still answer the same questions the same
+  way. v4 adds a field that decides *which records belong to the topic you asked
+  for*, so skipping it is not degradation — it is a wrong answer.
 - **v3 is what is written, since `0.7.0-beta.25` (#188).** The writer stamps it
   unconditionally — the version follows the writer, never the segment's content —
   so from that release on, *every* new segment is v3, including compaction
@@ -167,11 +226,25 @@ magic         u32              # 0x5453_4547  ("TSEG")
 
   This document previously said v3 was accepted on read but not yet emitted,
   which was the plan: publish the layout one release ahead so every reader could
-  accept `{1, 2, 3}` before any writer flipped. The flip has happened. The
-  ordering advice still holds for the next version — readers before writers,
-  because the version-rejection MUST above means an old reader fails **cleanly**
-  on a newer segment, but it fails on *every* segment the moment a writer flips,
-  not on a subset.
+  accept `{1, 2, 3}` before any writer flipped. The flip has happened.
+- **v4 is at that same stage, with the gate moved from a release to a flag
+  (#442).** Every reader in this repository accepts v4; nothing emits it until a
+  deployment sets `segment_format=4`. So the ordering is one deploy rather than
+  two: roll the binary everywhere, confirm every reader — internal *and*
+  S3-direct external — is on a build that accepts v4 and resolves by
+  `substream_id`, then flip.
+
+  Readers before writers, because the version-rejection MUST above means an old
+  reader fails **cleanly** on a newer segment, but it fails on *every* segment
+  the moment a writer flips, not on a subset — and because a segment is shared,
+  one topic's writer flipping takes out reads of the entire prefix.
+
+  **The flip is one-way in practice.** A topic created under the v4 regime has a
+  `substream_id` pinned for its lifetime, and a writer put back to v3 cannot
+  express that identity: it refuses the write rather than storing records under a
+  key nothing reads. Those topics stop being writable; they do not quietly
+  degrade. A binary that predates #442 does not model `substream_id` at all and
+  *would* do the quiet thing, which is why the roll must precede the flip.
 - A **legacy** single-topic coalesced object (#50) has **no trailer**: its last
   bytes are record data, so the trailing `magic` will not equal `TSEG`. A reader
   MUST treat "magic absent" as the v0 case and decode the whole object as a bare
@@ -232,12 +305,14 @@ data the two rules agree.
 
 ## Notes for readers
 
-- **A topic's prefix is pinned at creation, not derivable from its config (#236).**
-  The mapping lives in
-  `clusters/{cluster}/topic-routing/{topic}.json` — `{"prefix": "..."}` — written
-  create-only with the topic, immutable for its lifetime, and deleted with it. A
-  reader that needs the prefix for a topic name must read that object (it can be
-  cached indefinitely).
+- **A topic's prefix — and, since #442, its sub-stream identity — is pinned at
+  creation, not derivable from its config (#236).** The mapping lives in
+  `clusters/{cluster}/topic-routing/{topic}.json` —
+  `{"prefix": "...", "substream_id": "0192…"}`, with `substream_id` **absent**
+  for a name-keyed topic — written create-only with the topic, immutable for its
+  lifetime, and deleted with it. A reader that needs either fact for a topic name
+  must read that object (it can be cached indefinitely, but must be dropped when
+  the topic is deleted: the name can come back with a different id).
 
   Do **not** recompute the prefix from `cleanup.policy`: a compacted topic is
   routed under its own name and everything else under its connector prefix (the
@@ -257,6 +332,14 @@ data the two rules agree.
   broker's log start. A segment every one of whose sub-stream slices ends
   at/below its floor becomes reclaimable ahead of age-based retention — the
   deletion/`404` contract below applies unchanged.
+- **A deleted topic's slices survive, and for a name-keyed topic the floor is
+  what hides them (#246).** `DeleteTopics` rewrites each partition's
+  `watermark.json` as a tombstone at the deleted log end rather than removing it,
+  so a same-named successor starts past whatever it would otherwise inherit. An
+  **id-keyed** topic needs none of that — its successor has a different id, so it
+  cannot reach the slices at all — and its creation therefore *clears* the floor
+  rather than preserving it. A reader that honours `truncate` sees the right
+  thing either way; one that keys by name against an id-keyed bucket sees neither.
 - **Segments are immutable but not permanent.** Compaction deletes the originals
   once the merged segment exists, and retention deletes whole segments (by age,
   or fully-truncated per the previous note), so a GET of a segment a reader

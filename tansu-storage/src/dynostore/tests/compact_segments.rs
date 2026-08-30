@@ -646,7 +646,9 @@ async fn an_unpinned_topic_keeps_the_routing_it_already_has() -> Result<(), Erro
         // … and it pins that answer, so this is the last derivation anyone pays for.
         assert_eq!(
             Some(expected.to_owned()),
-            cold.read_routing_pin(topic).await?,
+            cold.read_routing_pin(topic)
+                .await?
+                .map(|routing| routing.prefix),
             "the derived answer must be pinned for {topic}"
         );
     }
@@ -681,7 +683,13 @@ async fn a_lazily_pinned_prefix_converges_across_pods() -> Result<(), Error> {
     let second = loser.routed_prefix_of(&tp).await?;
 
     assert_eq!(first, second, "pods must agree on a lazily pinned prefix");
-    assert_eq!(Some(first), loser.read_routing_pin(topic).await?);
+    assert_eq!(
+        Some(first),
+        loser
+            .read_routing_pin(topic)
+            .await?
+            .map(|routing| routing.prefix)
+    );
 
     Ok(())
 }
@@ -698,18 +706,33 @@ async fn a_recreated_topic_is_pinned_afresh() -> Result<(), Error> {
 
     let topic = "org.env.conn.reborn";
     create_topic_with_configs(&store, topic, &[("cleanup.policy", "compact")]).await?;
-    assert_eq!(Some(topic.to_owned()), store.read_routing_pin(topic).await?);
+    assert_eq!(
+        Some(topic.to_owned()),
+        store
+            .read_routing_pin(topic)
+            .await?
+            .map(|routing| routing.prefix)
+    );
 
     assert_eq!(
         ErrorCode::None,
         store.delete_topic(&TopicId::Name(topic.into())).await?
     );
-    assert_eq!(None, store.read_routing_pin(topic).await?);
+    assert_eq!(
+        None,
+        store
+            .read_routing_pin(topic)
+            .await?
+            .map(|routing| routing.prefix)
+    );
 
     create_topic_with_configs(&store, topic, &[("cleanup.policy", "delete")]).await?;
     assert_eq!(
         Some("org.env.conn".to_owned()),
-        store.read_routing_pin(topic).await?,
+        store
+            .read_routing_pin(topic)
+            .await?
+            .map(|routing| routing.prefix),
         "a re-created topic is pinned from its own config"
     );
     assert_eq!(
