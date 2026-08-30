@@ -1808,7 +1808,7 @@ async fn epoch_fencing_drops_stale_overlapping_segment() -> Result<(), Error> {
     store.index_insert(PREFIX, 2, footer(1, 10, 10), 0)?;
 
     let valid = store.valid_substream_segments(PREFIX, topic, 0)?;
-    let seqs: Vec<u64> = valid.iter().map(|(seq, _)| *seq).collect();
+    let seqs: Vec<u64> = valid.iter().map(|fenced| fenced.seq).collect();
     assert_eq!(vec![0, 1], seqs, "zombie seq2 dropped, higher epoch wins");
 
     Ok(())

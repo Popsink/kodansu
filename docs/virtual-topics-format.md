@@ -206,10 +206,29 @@ per coordinate.
 Compaction and writer failover can leave two segments claiming the same offset
 range for one sub-stream. Sort the candidate entries by ascending `base_offset`,
 breaking ties by **higher `writer_epoch` first, then higher `seq` first**, then
-sweep in that order and drop any entry whose `base_offset` falls below the range
-already covered. The higher-sequence tie-break is what makes a merged segment win
-over the originals it merged: they carry the same epoch, and the merged segment's
-sequence is always higher.
+sweep in that order. The higher-sequence tie-break is what makes a merged
+segment win over the originals it merged: they carry the same epoch, and the
+merged segment's sequence is always higher.
+
+What the sweep does with a losing entry depends on what is being computed:
+
+- **Resolving one offset**: drop any entry whose `base_offset` falls below the
+  range already covered — the higher-priority entry already answers it.
+- **Computing coverage** (what the sub-stream contains — the read path, the
+  log-end offset, anything that decides what exists before acting on it): drop
+  an entry only when it is **wholly** inside the range already covered. An
+  entry that starts inside it but reaches **past** it holds a tail nothing
+  else holds; serve that tail, `[covered, entry end)`, and treat only the head
+  as superseded.
+
+The distinction is load-bearing. Applying the one-offset drop to coverage
+discards the reaching entry's tail — the exact records nothing else holds —
+which inflated the audit's loss figure until #460 and, applied by the broker's
+own overlap resolver, silently hid and (via compaction, which deletes the run
+it merged) destroyed record tails until #461. The only overlap a healthy
+history produces — a merged segment's originals, or a rewrite's original
+during the write→delete window — is wholly inside its winner, so on healthy
+data the two rules agree.
 
 ## Notes for readers
 

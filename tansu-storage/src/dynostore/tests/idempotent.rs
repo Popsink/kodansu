@@ -394,7 +394,7 @@ async fn compaction_carries_producer_coordinates_forward() -> Result<(), Error> 
     let carried: Vec<i32> = store
         .valid_substream_segments(PREFIX, topic, 0)?
         .into_iter()
-        .flat_map(|(_, entry)| entry.producers)
+        .flat_map(|fenced| fenced.entry.producers)
         .filter(|coord| coord.producer_id == pid)
         .map(|coord| coord.base_sequence)
         .collect();

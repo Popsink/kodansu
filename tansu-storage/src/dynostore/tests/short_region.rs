@@ -515,7 +515,7 @@ async fn an_entry_for_a_substream_the_object_does_not_hold_is_read_past() -> Res
         store
             .valid_substream_segments(PREFIX, TOPIC, 0)?
             .iter()
-            .map(|(seq, _)| *seq)
+            .map(|fenced| fenced.seq)
             .collect::<Vec<_>>()
     );
 
