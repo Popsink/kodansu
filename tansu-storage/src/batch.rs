@@ -48,11 +48,11 @@ use uuid::Uuid;
 
 use crate::{
     AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
-    BrokerRegistrationRequest, Error, GenerationDoc, ListOffsetResponse, METER, MemberDoc,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    QuotaAlteration, QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas, Result,
-    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, UpdateError, Version,
+    BrokerRegistrationRequest, CommittedOffset, Error, GenerationDoc, ListOffsetResponse, METER,
+    MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
+    ProducerIdResponse, QuotaAlteration, QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas,
+    Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
 };
 
 static BATCH_REQUESTS_LENGTH: LazyLock<Gauge<u64>> =
@@ -589,13 +589,16 @@ where
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.storage
             .offset_fetch(group_id, topics, require_stable)
             .await
     }
 
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.storage.committed_offset_topitions(group_id).await
     }
 
@@ -955,7 +958,7 @@ mod tests {
         async fn committed_offset_topitions(
             &self,
             _group_id: &str,
-        ) -> Result<BTreeMap<Topition, i64>> {
+        ) -> Result<BTreeMap<Topition, CommittedOffset>> {
             unimplemented!()
         }
 
@@ -964,7 +967,7 @@ mod tests {
             _group_id: Option<&str>,
             _topics: &[Topition],
             _require_stable: Option<bool>,
-        ) -> Result<BTreeMap<Topition, i64>> {
+        ) -> Result<BTreeMap<Topition, CommittedOffset>> {
             unimplemented!()
         }
 

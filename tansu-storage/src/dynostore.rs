@@ -83,8 +83,8 @@ mod tests;
 
 use crate::{
     AclBinding, AclFilter, Acls, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
-    BrokerRegistrationRequest, ConsumerGroupState, CorruptRegion, DivergentBatch, Error,
-    GROUP_SCHEMA_VERSION, GenerationDoc, GroupDetail, GroupMember, GroupSchema, GroupState,
+    BrokerRegistrationRequest, CommittedOffset, ConsumerGroupState, CorruptRegion, DivergentBatch,
+    Error, GROUP_SCHEMA_VERSION, GenerationDoc, GroupDetail, GroupMember, GroupSchema, GroupState,
     ListOffsetResponse, METER, MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
     OffsetStage, ProducerIdResponse, QuotaAlteration, QuotaEntity, QuotaFilterComponent,
     QuotaLimits, Quotas, Result, ScramCredential, Storage, TopicDefaults, TopicId, Topition,
@@ -11938,7 +11938,10 @@ impl Storage for DynoStore {
             .collect())
     }
 
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         // The union of what the group's one offsets object holds and what the
         // per-partition layout left behind (#406). The set has to be a union, not
         // a preference: a group whose commits only ever landed in the new object
@@ -12030,7 +12033,7 @@ impl Storage for DynoStore {
         group_id: Option<&str>,
         topics: &[Topition],
         _require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         let mut responses = BTreeMap::new();
 
         if let Some(group_id) = group_id {
@@ -12065,11 +12068,15 @@ impl Storage for DynoStore {
             let fetches = topics
                 .iter()
                 .map(|topition| {
-                    let held = group.get(topition).map(|commit| commit.offset);
+                    // The whole commit, not just its offset: the metadata a
+                    // client stored beside the offset used to be projected away
+                    // right here, so it was accepted, written, and never read
+                    // back (#445).
+                    let held = group.get(topition).map(CommittedOffset::from);
 
                     async move {
-                        if let Some(offset) = held {
-                            return Ok::<_, Error>((topition.to_owned(), offset));
+                        if let Some(committed) = held {
+                            return Ok::<_, Error>((topition.to_owned(), committed));
                         }
 
                         let location = Path::from(format!(
@@ -12077,7 +12084,7 @@ impl Storage for DynoStore {
                             self.cluster, group_id, topition.topic, topition.partition,
                         ));
 
-                        let offset = match self.object_store.get(&location).await {
+                        let committed = match self.object_store.get(&location).await {
                             Ok(get_result) => get_result
                                 .bytes()
                                 .await
@@ -12086,10 +12093,10 @@ impl Storage for DynoStore {
                                     serde_json::from_slice::<OffsetCommitRequest>(&encoded[..])
                                         .map_err(Error::from)
                                 })
-                                .map(|commit| commit.offset)
+                                .map(|commit| CommittedOffset::from(&commit))
                                 .inspect_err(|error| error!(?error, ?group_id, ?topition)),
 
-                            Err(object_store::Error::NotFound { .. }) => Ok(-1),
+                            Err(object_store::Error::NotFound { .. }) => Ok(CommittedOffset::NONE),
 
                             Err(error) => {
                                 error!(?error, ?group_id, ?topition);
@@ -12099,7 +12106,7 @@ impl Storage for DynoStore {
                             }
                         }?;
 
-                        Ok::<_, Error>((topition.to_owned(), offset))
+                        Ok::<_, Error>((topition.to_owned(), committed))
                     }
                 })
                 .collect::<Vec<_>>();

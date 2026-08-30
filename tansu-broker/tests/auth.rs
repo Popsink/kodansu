@@ -47,11 +47,11 @@ use tansu_sans_io::{
 use tansu_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
 use tansu_storage::{
     AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, BrokerRegistrationRequest,
-    GenerationDoc, ListOffsetResponse, MemberDoc, MetadataResponse, NamedGroupDetail,
-    OffsetCommitRequest, OffsetStage, ProducerIdResponse, QuotaAlteration, QuotaEntity,
-    QuotaFilterComponent, QuotaLimits, Quotas, ScramCredential, Storage, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-    Version,
+    CommittedOffset, GenerationDoc, ListOffsetResponse, MemberDoc, MetadataResponse,
+    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, QuotaAlteration,
+    QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas, ScramCredential, Storage, TopicId,
+    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    UpdateError, Version,
 };
 use tracing::{debug, instrument};
 use url::Url;
@@ -861,7 +861,7 @@ impl Storage for Engine {
     async fn committed_offset_topitions(
         &self,
         _group_id: &str,
-    ) -> tansu_storage::Result<BTreeMap<Topition, i64>> {
+    ) -> tansu_storage::Result<BTreeMap<Topition, CommittedOffset>> {
         unimplemented!()
     }
 
@@ -871,7 +871,7 @@ impl Storage for Engine {
         _group_id: Option<&str>,
         _topics: &[Topition],
         _require_stable: Option<bool>,
-    ) -> tansu_storage::Result<BTreeMap<Topition, i64>> {
+    ) -> tansu_storage::Result<BTreeMap<Topition, CommittedOffset>> {
         unimplemented!()
     }
 

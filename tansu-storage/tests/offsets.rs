@@ -120,16 +120,176 @@ async fn concurrent_offset_commit_fetch_round_trip() -> Result<(), Error> {
 
     for p in 0..PARTITIONS {
         assert_eq!(
-            Some(&(i64::from(p) * 10)),
-            fetched.get(&Topition::new(known, p)),
+            Some(i64::from(p) * 10),
+            fetched
+                .get(&Topition::new(known, p))
+                .map(|committed| committed.offset),
             "wrong committed offset for partition {p}"
         );
     }
     assert_eq!(
-        Some(&-1),
-        fetched.get(&Topition::new(known, PARTITIONS + 1)),
+        Some(-1),
+        fetched
+            .get(&Topition::new(known, PARTITIONS + 1))
+            .map(|committed| committed.offset),
         "never-committed partition must fetch -1"
     );
 
     Ok(())
+}
+
+/// Commit metadata survives the round trip (#445).
+///
+/// It was accepted and stored all along, and dropped by the **return type** of
+/// the read: `offset_fetch` answered `BTreeMap<Topition, i64>`, so no response
+/// builder could have carried it however it was written. Nothing reported the
+/// loss at write time — the commit succeeded — and frameworks that keep their
+/// restore point in commit metadata (Streams-style checkpointing, recovery
+/// tools) found out during a recovery, which is the worst moment there is.
+mod metadata {
+    use std::sync::Arc;
+
+    use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
+    use tansu_sans_io::{
+        CreateTopicsRequest, ErrorCode, create_topics_request::CreatableTopic,
+        offset_commit_request::OffsetCommitRequestPartition,
+    };
+    use tansu_storage::{
+        CreateTopicsService, OffsetCommitRequest, Storage, StorageContainer, Topition,
+    };
+    use url::Url;
+
+    use crate::common::{Error, cluster_id, init_tracing, storage_url};
+
+    const TOPIC: &str = "commit-metadata";
+    const GROUP: &str = "checkpointing";
+    const CHECKPOINT: &str = "checkpoint-abc";
+
+    async fn storage() -> Result<Arc<Box<dyn Storage>>, Error> {
+        let storage = StorageContainer::builder()
+            .cluster_id(cluster_id())
+            .node_id(111)
+            .advertised_listener(Url::parse("tcp://localhost:9092")?)
+            .storage(storage_url()?)
+            .build()
+            .await?;
+
+        let create = {
+            let storage = storage.clone();
+            MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+        };
+
+        let created = create
+            .serve(
+                Context::default(),
+                CreateTopicsRequest::default()
+                    .topics(Some(
+                        [CreatableTopic::default()
+                            .name(TOPIC.into())
+                            .num_partitions(1)
+                            .replication_factor(1)
+                            .assignments(Some([].into()))
+                            .configs(Some([].into()))]
+                        .into(),
+                    ))
+                    .validate_only(Some(false)),
+            )
+            .await?;
+
+        let topics = created.topics.unwrap_or_default();
+        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+
+        Ok(storage)
+    }
+
+    async fn commit(storage: &Arc<Box<dyn Storage>>, metadata: Option<&str>) -> Result<(), Error> {
+        let committed = storage
+            .offset_commit(
+                GROUP,
+                None,
+                &[(
+                    Topition::new(TOPIC, 0),
+                    OffsetCommitRequest::try_from(
+                        &OffsetCommitRequestPartition::default()
+                            .partition_index(0)
+                            .committed_offset(7)
+                            .committed_leader_epoch(Some(-1))
+                            .commit_timestamp(None)
+                            .committed_metadata(metadata.map(ToOwned::to_owned)),
+                    )?,
+                )],
+            )
+            .await?;
+
+        assert_eq!(ErrorCode::None, committed[0].1);
+
+        Ok(())
+    }
+
+    /// Through `Storage`, where the value now survives at all.
+    #[tokio::test]
+    async fn metadata_committed_is_metadata_fetched() -> Result<(), Error> {
+        let _guard = init_tracing()?;
+
+        let storage = storage().await?;
+        commit(&storage, Some(CHECKPOINT)).await?;
+
+        let fetched = storage
+            .offset_fetch(Some(GROUP), &[Topition::new(TOPIC, 0)], None)
+            .await?;
+
+        let committed = fetched
+            .get(&Topition::new(TOPIC, 0))
+            .expect("the partition was committed");
+
+        assert_eq!(7, committed.offset);
+        assert_eq!(Some(CHECKPOINT.to_owned()), committed.metadata);
+
+        Ok(())
+    }
+
+    /// A commit that carried no metadata still reads back as none, rather than
+    /// as an empty string: a framework that stores `""` deliberately and one
+    /// that stores nothing are different, and the round trip has to keep them
+    /// apart at the storage layer.
+    #[tokio::test]
+    async fn no_metadata_committed_is_no_metadata_fetched() -> Result<(), Error> {
+        let _guard = init_tracing()?;
+
+        let storage = storage().await?;
+        commit(&storage, None).await?;
+
+        let fetched = storage
+            .offset_fetch(Some(GROUP), &[Topition::new(TOPIC, 0)], None)
+            .await?;
+
+        assert_eq!(
+            None,
+            fetched
+                .get(&Topition::new(TOPIC, 0))
+                .and_then(|committed| committed.metadata.clone())
+        );
+
+        Ok(())
+    }
+
+    /// A partition nothing has committed still answers `-1` with no metadata —
+    /// the sentinel is unchanged by carrying a second field beside it.
+    #[tokio::test]
+    async fn an_uncommitted_partition_is_still_minus_one() -> Result<(), Error> {
+        let _guard = init_tracing()?;
+
+        let storage = storage().await?;
+
+        let fetched = storage
+            .offset_fetch(Some(GROUP), &[Topition::new(TOPIC, 0)], None)
+            .await?;
+
+        let committed = fetched.get(&Topition::new(TOPIC, 0)).expect("an answer");
+
+        assert_eq!(-1, committed.offset);
+        assert_eq!(None, committed.metadata);
+
+        Ok(())
+    }
 }

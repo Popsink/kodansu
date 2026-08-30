@@ -77,11 +77,19 @@ where
         .offset_fetch(Some(&group_id), slice::from_ref(&topition), None)
         .await?;
     assert!(offset_fetch.contains_key(&topition));
-    assert_eq!(Some(&offset), offset_fetch.get(&topition));
+    assert_eq!(
+        Some(offset),
+        offset_fetch
+            .get(&topition)
+            .map(|committed| committed.offset)
+    );
 
     let co_tps = sc.committed_offset_topitions(&group_id).await?;
     assert!(co_tps.contains_key(&topition));
-    assert_eq!(Some(&offset), co_tps.get(&topition));
+    assert_eq!(
+        Some(offset),
+        co_tps.get(&topition).map(|committed| committed.offset)
+    );
 
     let groups = sc.list_groups(None).await?;
     assert_eq!(1, groups.len());
@@ -146,7 +154,12 @@ where
         .offset_fetch(Some(&group_id), slice::from_ref(&topition), None)
         .await?;
     assert!(offset_fetch.contains_key(&topition));
-    assert_eq!(Some(&offset), offset_fetch.get(&topition));
+    assert_eq!(
+        Some(offset),
+        offset_fetch
+            .get(&topition)
+            .map(|committed| committed.offset)
+    );
 
     assert_eq!(ErrorCode::None, sc.delete_topic(&topic_name.into()).await?);
 
@@ -154,7 +167,12 @@ where
         .offset_fetch(Some(&group_id), slice::from_ref(&topition), None)
         .await?;
     assert!(offset_fetch.contains_key(&topition));
-    assert_eq!(Some(&-1), offset_fetch.get(&topition));
+    assert_eq!(
+        Some(-1),
+        offset_fetch
+            .get(&topition)
+            .map(|committed| committed.offset)
+    );
 
     Ok(())
 }
@@ -215,7 +233,12 @@ where
         .offset_fetch(Some(&group_id), slice::from_ref(&topition), None)
         .await?;
     assert!(offset_fetch.contains_key(&topition));
-    assert_eq!(Some(&offset), offset_fetch.get(&topition));
+    assert_eq!(
+        Some(offset),
+        offset_fetch
+            .get(&topition)
+            .map(|committed| committed.offset)
+    );
 
     let deleted = sc.delete_groups(Some(slice::from_ref(&group_id))).await?;
     assert_eq!(1, deleted.len());
@@ -226,7 +249,12 @@ where
         .offset_fetch(Some(&group_id), slice::from_ref(&topition), None)
         .await?;
     assert!(offset_fetch.contains_key(&topition));
-    assert_eq!(Some(&-1), offset_fetch.get(&topition));
+    assert_eq!(
+        Some(-1),
+        offset_fetch
+            .get(&topition)
+            .map(|committed| committed.offset)
+    );
 
     Ok(())
 }
@@ -294,7 +322,12 @@ where
         .offset_fetch(Some(&group_id), slice::from_ref(&topition), None)
         .await?;
     assert!(offset_fetch.contains_key(&topition));
-    assert_eq!(Some(&-1), offset_fetch.get(&topition));
+    assert_eq!(
+        Some(-1),
+        offset_fetch
+            .get(&topition)
+            .map(|committed| committed.offset)
+    );
 
     let groups = sc.list_groups(None).await?;
     assert_eq!(0, groups.len());
@@ -326,7 +359,12 @@ where
         .offset_fetch(Some(&group_id), slice::from_ref(&topition), None)
         .await?;
     assert!(offset_fetch.contains_key(&topition));
-    assert_eq!(Some(&-1), offset_fetch.get(&topition));
+    assert_eq!(
+        Some(-1),
+        offset_fetch
+            .get(&topition)
+            .map(|committed| committed.offset)
+    );
 
     let groups = sc.list_groups(None).await?;
     assert_eq!(0, groups.len());

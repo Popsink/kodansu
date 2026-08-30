@@ -97,7 +97,10 @@ where
         .inspect(|offsets| debug!(?offsets, ?topition))?;
 
     assert!(offsets.contains_key(&topition));
-    assert_eq!(Some(&-1), offsets.get(&topition));
+    assert_eq!(
+        Some(-1),
+        offsets.get(&topition).map(|committed| committed.offset)
+    );
 
     let committed_offset = 32123;
 
@@ -142,7 +145,10 @@ where
         .inspect(|offsets| debug!(?offsets, ?topition))?;
 
     assert!(offsets.contains_key(&topition));
-    assert_eq!(Some(&-1), offsets.get(&topition));
+    assert_eq!(
+        Some(-1),
+        offsets.get(&topition).map(|committed| committed.offset)
+    );
 
     let commit = true;
     assert_eq!(
@@ -163,7 +169,10 @@ where
         .inspect(|offsets| debug!(?offsets, ?topition))?;
 
     assert!(offsets.contains_key(&topition));
-    assert_eq!(Some(&committed_offset), offsets.get(&topition));
+    assert_eq!(
+        Some(committed_offset),
+        offsets.get(&topition).map(|committed| committed.offset)
+    );
 
     assert_eq!(
         ErrorCode::None,
@@ -235,7 +244,10 @@ where
         .inspect(|offsets| debug!(?offsets, ?topition))?;
 
     assert!(offsets.contains_key(&topition));
-    assert_eq!(Some(&-1), offsets.get(&topition));
+    assert_eq!(
+        Some(-1),
+        offsets.get(&topition).map(|committed| committed.offset)
+    );
 
     let committed_offset = 32123;
 
@@ -280,7 +292,10 @@ where
         .inspect(|offsets| debug!(?offsets, ?topition))?;
 
     assert!(offsets.contains_key(&topition));
-    assert_eq!(Some(&-1), offsets.get(&topition));
+    assert_eq!(
+        Some(-1),
+        offsets.get(&topition).map(|committed| committed.offset)
+    );
 
     let commit = false;
     assert_eq!(
@@ -301,7 +316,10 @@ where
         .inspect(|offsets| debug!(?offsets, ?topition))?;
 
     assert!(offsets.contains_key(&topition));
-    assert_eq!(Some(&-1), offsets.get(&topition));
+    assert_eq!(
+        Some(-1),
+        offsets.get(&topition).map(|committed| committed.offset)
+    );
 
     assert_eq!(
         ErrorCode::None,
