@@ -25,12 +25,12 @@
 //! trips. Latency is injected rather than real, so the shape is observable
 //! without a store.
 //!
-//! The two loops above it in `service::fetch` still walk partitions and topics
-//! in sequence, so the remaining multiplier is `partitions x topics`. That is
-//! not an oversight: both thread the request-level `max_bytes` budget through as
-//! `&mut u32`, consumed in order, and overlapping them means deciding what a
-//! per-request byte cap should mean when several partitions spend it at once —
-//! a client-visible question, not a mechanical change. See #426.
+//! The two loops above it in `service::fetch` walked partitions and topics in
+//! sequence too, and #426 closed that: they are now one flat fan-out, and the
+//! client-visible question — what a per-request byte cap means when several
+//! partitions spend it at once — is answered by `Budget`, which claims a share
+//! before reading and settles it after. `tests/fetch_fan_out.rs` measures that
+//! half; this one still measures the segments of a single sub-stream.
 //!
 //! **The write cap is GCS-specific and only reaches one object.** `memory://`
 //! is `InMemory` with nothing in front of it, so every other test in this crate

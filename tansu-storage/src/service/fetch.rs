@@ -12,8 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::SystemTime;
+use std::{
+    cmp::Ordering as Ordering2,
+    sync::atomic::{AtomicU32, Ordering},
+    time::SystemTime,
+};
 
+use futures::{StreamExt as _, TryStreamExt as _};
 use rama::{Context, Service};
 use tansu_sans_io::{
     ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel, NULL_TOPIC_ID,
@@ -122,6 +127,122 @@ use crate::{
 /// # Ok(())
 /// # }
 /// ```
+/// Partitions read at once across the whole request (#426).
+///
+/// The same bound as every other fan-out in the engine — `FOOTER_FETCH_CONCURRENCY`,
+/// `LIST_OFFSETS_CONCURRENCY`, `OFFSET_COMMIT_CONCURRENCY`, `DESCRIBE_CONCURRENCY` —
+/// and for the same reason: it keeps one wide request inside the object store's
+/// throttling envelope.
+const FETCH_CONCURRENCY: usize = 32;
+
+/// A `Fetch`'s request-level `max_bytes`, shared by every partition reading at
+/// once (#426).
+///
+/// The partitions of a request used to be read one after another, threading the
+/// remaining budget through as `&mut u32`. That is what Kafka does too — and
+/// Kafka can afford it, because a local log read is sub-millisecond. Here every
+/// partition read is a round trip to an object store, so a request's wall clock
+/// was `partitions × topics × latency` and a consumer holding ~94 partitions
+/// paid all of it in series.
+///
+/// Overlapping them is only safe if the cap still means something, which is the
+/// question #437 left open. It is answered by **claiming rather than checking**:
+/// a partition takes its allowance out of the budget *before* it reads and
+/// hands back what it did not spend. A budget merely checked before the read
+/// would be overshot by every partition already in flight; claimed, the total
+/// delivered is bounded by `max_bytes` exactly, as it was in series.
+///
+/// # A claim is a share, not a reservation
+///
+/// The obvious claim — `min(partition_max_bytes, remaining)` — starves. The
+/// request budget is clamped to 5 MiB and a client's `max.partition.fetch.bytes`
+/// is 1 MiB by default, so the first five partitions would reserve the lot and
+/// the remaining twenty-seven would be answered empty, having read nothing.
+/// Measured exactly that way while writing this: 5 of 32 partitions returned
+/// records.
+///
+/// So a claim is bounded by the budget's **share per concurrent reader** as well
+/// as by the partition's own cap. The share is recomputed on every claim, so a
+/// partition that finishes hands its slice back and the ones still reading grow
+/// into it — and a partition needing more than one slice simply claims again on
+/// the next turn of its loop, which is the loop it already had.
+///
+/// The floor of one byte is Kafka's `minOneMessage` in miniature: a budget that
+/// is not yet exhausted must admit *somebody*, or a request whose remainder is
+/// smaller than the number of readers would deliver nothing at all.
+#[derive(Debug)]
+struct Budget {
+    remaining: AtomicU32,
+
+    /// Readers that may be spending at once — `min(FETCH_CONCURRENCY, partitions
+    /// in the request)`. The divisor of the share, and never zero.
+    readers: u32,
+}
+
+impl Budget {
+    fn new(max_bytes: u32, readers: usize) -> Self {
+        Self {
+            remaining: AtomicU32::new(max_bytes),
+            readers: u32::try_from(readers).unwrap_or(u32::MAX).max(1),
+        }
+    }
+
+    /// Take this reader's share, up to `want` bytes, or `None` when the budget
+    /// is spent.
+    ///
+    /// `None` is the signal to stop reading, and it is *not* an error: the
+    /// partition answers with whatever it already has, exactly as the
+    /// `max_bytes == 0` break did in series.
+    fn claim(&self, want: u32) -> Option<u32> {
+        let mut claimed = 0;
+
+        self.remaining
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                let share = (remaining / self.readers).max(1);
+                claimed = want.min(share).min(remaining);
+                (claimed > 0).then_some(remaining - claimed)
+            })
+            .ok()
+            .map(|_| claimed)
+    }
+
+    /// Reconcile a claim against what the read actually cost.
+    ///
+    /// Usually it returns the unspent part. It can also *charge* an overspend:
+    /// a partition asked for `claim` bytes and the log answers with at least one
+    /// whole batch whatever the cap, so a small claim can come back with a
+    /// larger batch. That is Kafka's rule too — `max_bytes` is explicitly not an
+    /// absolute maximum, because a request that could never return the first
+    /// batch would never make progress — and the excess has to come off the
+    /// budget or the next reader spends it twice.
+    fn settle(&self, claimed: u32, spent: u32) {
+        match spent.cmp(&claimed) {
+            Ordering2::Less => {
+                _ = self.remaining.fetch_add(claimed - spent, Ordering::AcqRel);
+            }
+
+            Ordering2::Greater => {
+                // Saturating: an overspend larger than what is left takes the
+                // budget to zero and stops the readers behind it, which is the
+                // answer — not a wrap to `u32::MAX`, which would uncap the
+                // request entirely.
+                _ = self
+                    .remaining
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                        Some(remaining.saturating_sub(spent - claimed))
+                    });
+            }
+
+            Ordering2::Equal => {}
+        }
+    }
+
+    #[cfg(test)]
+    fn remaining(&self) -> u32 {
+        self.remaining.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FetchService;
 
@@ -137,7 +258,7 @@ impl FetchService {
         ctx: &Context<G>,
         max_wait: Duration,
         min_bytes: u32,
-        max_bytes: &mut u32,
+        budget: &Budget,
         isolation: IsolationLevel,
         topic: &str,
         fetch_partition: &FetchPartition,
@@ -214,12 +335,26 @@ impl FetchService {
             return Ok(self.out_of_range_partition(partition_index, &log));
         }
 
-        loop {
-            if *max_bytes == 0 {
-                break;
-            }
+        // Kafka's own per-partition cap, which this path ignored: it passed the
+        // whole remaining request budget to every partition. Honouring it is
+        // what makes the partitions safe to overlap — each one can spend at most
+        // what the client allotted it, so the claim below is bounded (#426).
+        // Absent or nonsensical means *no* per-partition cap, which is what this
+        // path did before it honoured one at all — not the tightest possible
+        // cap. Clamping a missing value up to 1 would make a client that leaves
+        // the field unset read one byte at a time.
+        let partition_max_bytes = u32::try_from(fetch_partition.partition_max_bytes)
+            .ok()
+            .filter(|cap| *cap > 0)
+            .unwrap_or(u32::MAX);
 
-            debug!(offset);
+        // Claimed before each read and settled after, so the request-level cap
+        // holds even though several partitions are spending it at once. A budget
+        // merely *checked* before the read would be overshot by every partition
+        // already in flight, and `None` — the budget is spent — is the signal to
+        // stop, exactly as the `max_bytes == 0` break was in series.
+        while let Some(claim) = budget.claim(partition_max_bytes) {
+            debug!(offset, claim);
 
             let fetched = ctx
                 .state()
@@ -227,7 +362,7 @@ impl FetchService {
                     &tp,
                     offset,
                     min_bytes,
-                    *max_bytes,
+                    claim,
                     isolation,
                     max_wait.saturating_sub(started_at.elapsed()),
                 )
@@ -258,22 +393,28 @@ impl FetchService {
             let mut fetched = match fetched {
                 Ok(fetched) => fetched,
 
+                // Nothing was read, so nothing was spent: hand the whole claim
+                // back before leaving, or a failing partition would take the
+                // request's budget with it and starve the healthy ones sharing
+                // the fan-out.
                 Err(Error::Api(code)) => {
+                    budget.settle(claim, 0);
                     error_code = code;
                     break;
                 }
 
                 Err(error) => {
+                    budget.settle(claim, 0);
                     error!(?tp, ?error);
                     error_code = storage_error_code(&error);
                     break;
                 }
             };
 
-            *max_bytes =
-                u32::try_from(fetched.byte_size()).map(|bytes| max_bytes.saturating_sub(bytes))?;
+            let spent = u32::try_from(fetched.byte_size())?;
+            budget.settle(claim, spent);
 
-            debug!(?offset, ?fetched, max_bytes);
+            debug!(?offset, ?fetched, claim, spent);
 
             if fetched.is_empty() {
                 break;
@@ -477,7 +618,7 @@ impl FetchService {
         ctx: &Context<G>,
         max_wait: Duration,
         min_bytes: u32,
-        max_bytes: &mut u32,
+        max_bytes: u32,
         isolation: IsolationLevel,
         topics: &[FetchTopic],
     ) -> Result<Vec<FetchableTopicResponse>>
@@ -548,30 +689,82 @@ impl FetchService {
             responses.clear();
 
             let fetch_started_at = SystemTime::now();
-            for topic in resolved.iter() {
-                let fetch_response = if !topic.allowed {
-                    self.unauthorized_topic_response(topic.fetch)?
-                } else if let Some((name, topic_id)) = topic.known.as_ref() {
-                    let mut partitions = Vec::new();
 
-                    for fetch_partition in topic.fetch.partitions.as_ref().unwrap_or(&Vec::new()) {
+            // Every partition of every topic in one flat fan-out, bounded once
+            // (#426). Nested `buffered` calls would bound `topics × partitions`
+            // rather than the request, and it is the request that meets the
+            // object store's throttling envelope.
+            //
+            // `buffered`, not `buffer_unordered`: a client matches partitions to
+            // its request positionally, so the order the answers come back in is
+            // part of the response.
+            // A fresh budget for a fresh response set, sized by how many
+            // partitions will share it. The previous iteration's responses were
+            // just cleared, so spending its budget on them and carrying the
+            // remainder forward would make each long-poll pass read less than
+            // the last and eventually nothing — it was threaded through as
+            // `&mut` across iterations and never reset.
+            let readers = resolved
+                .iter()
+                .filter(|topic| topic.allowed && topic.known.is_some())
+                .map(|topic| topic.fetch.partitions.as_deref().unwrap_or_default().len())
+                .sum::<usize>()
+                .min(FETCH_CONCURRENCY);
+
+            let budget = &Budget::new(max_bytes, readers);
+
+            let reads = resolved
+                .iter()
+                .enumerate()
+                .filter(|(_, topic)| topic.allowed && topic.known.is_some())
+                .flat_map(|(index, topic)| {
+                    topic
+                        .fetch
+                        .partitions
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(move |fetch_partition| (index, topic, fetch_partition))
+                })
+                .map(|(index, topic, fetch_partition)| {
+                    let name = topic
+                        .known
+                        .as_ref()
+                        .map(|(name, _)| name.as_str())
+                        .unwrap_or_default();
+
+                    async move {
                         let remaining = max_wait.saturating_sub(started_at.elapsed()?);
 
-                        let partition = self
-                            .fetch_partition(
-                                ctx,
-                                remaining,
-                                min_bytes,
-                                max_bytes,
-                                isolation,
-                                name,
-                                fetch_partition,
-                            )
-                            .await?;
-
-                        partitions.push(partition);
+                        self.fetch_partition(
+                            ctx,
+                            remaining,
+                            min_bytes,
+                            budget,
+                            isolation,
+                            name,
+                            fetch_partition,
+                        )
+                        .await
+                        .map(|partition| (index, partition))
                     }
+                })
+                .collect::<Vec<_>>();
 
+            let mut fetched: Vec<Vec<PartitionData>> = vec![Vec::new(); resolved.len()];
+
+            {
+                let mut reads = futures::stream::iter(reads).buffered(FETCH_CONCURRENCY);
+
+                while let Some((index, partition)) = reads.try_next().await? {
+                    fetched[index].push(partition);
+                }
+            }
+
+            for (topic, partitions) in resolved.iter().zip(fetched) {
+                let fetch_response = if !topic.allowed {
+                    self.unauthorized_topic_response(topic.fetch)?
+                } else if let Some((_, topic_id)) = topic.known.as_ref() {
                     FetchableTopicResponse::default()
                         .topic(topic.fetch.topic.to_owned())
                         // `topic_id` is not nullable from Fetch v13, where it
@@ -667,7 +860,7 @@ where
 
             const DEFAULT_MAX_BYTES: u32 = 5 * 1024 * 1024;
 
-            let mut max_bytes = req.max_bytes.map_or(Ok(DEFAULT_MAX_BYTES), |max_bytes| {
+            let max_bytes = req.max_bytes.map_or(Ok(DEFAULT_MAX_BYTES), |max_bytes| {
                 u32::try_from(max_bytes).map(|max_bytes| max_bytes.min(DEFAULT_MAX_BYTES))
             })?;
 
@@ -675,7 +868,7 @@ where
                 &ctx,
                 max_wait_ms,
                 min_bytes,
-                &mut max_bytes,
+                max_bytes,
                 isolation_level,
                 topics.as_ref(),
             )
@@ -764,5 +957,114 @@ impl ByteSize for PartitionData {
 impl ByteSize for FetchableTopicResponse {
     fn byte_size(&self) -> u64 {
         self.partitions.byte_size()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The whole point of claiming rather than checking (#426): a budget that
+    /// several partitions spend at once still bounds the response exactly.
+    ///
+    /// Checked-then-spent, every partition already in flight would see the full
+    /// remaining budget and read against it, so `N` concurrent partitions could
+    /// deliver `N ×` the cap. Claimed, the arithmetic is the same as it was in
+    /// series.
+    #[test]
+    fn concurrent_claims_cannot_exceed_the_budget() {
+        const BUDGET: u32 = 1_000;
+        const PARTITION: u32 = 400;
+
+        let budget = Budget::new(BUDGET, 1);
+
+        // Three partitions want 400 each against a budget of 1 000. Two get
+        // what they asked for; the third gets the remainder, not a refusal.
+        assert_eq!(Some(PARTITION), budget.claim(PARTITION));
+        assert_eq!(Some(PARTITION), budget.claim(PARTITION));
+        assert_eq!(Some(BUDGET - 2 * PARTITION), budget.claim(PARTITION));
+
+        // And a fourth gets nothing, which is the signal to stop reading.
+        assert_eq!(None, budget.claim(PARTITION));
+        assert_eq!(0, budget.remaining());
+    }
+
+    /// A partition that claimed more than it used hands the rest back, so a
+    /// mostly-empty assignment does not starve the partitions that have data.
+    #[test]
+    fn an_unspent_claim_returns_to_the_budget() {
+        let budget = Budget::new(1_000, 1);
+
+        let claim = budget.claim(1_000).expect("the whole budget");
+        assert_eq!(0, budget.remaining());
+
+        budget.settle(claim, 10);
+
+        assert_eq!(990, budget.remaining());
+        assert_eq!(Some(990), budget.claim(u32::MAX));
+    }
+
+    /// A claim spent in full returns nothing, and a read that somehow reported
+    /// more than it claimed does not credit the budget by underflowing.
+    #[test]
+    fn a_spent_claim_returns_nothing() {
+        let budget = Budget::new(100, 1);
+
+        let claim = budget.claim(100).expect("the whole budget");
+        budget.settle(claim, 100);
+        assert_eq!(0, budget.remaining());
+    }
+
+    /// A read that came back with more than it claimed charges the difference.
+    ///
+    /// The log answers with at least one whole batch whatever the cap — Kafka's
+    /// rule, and the reason `max_bytes` is documented as not an absolute
+    /// maximum — so a small claim can return a larger batch. Crediting only the
+    /// unspent side would let the next reader spend the excess a second time.
+    #[test]
+    fn an_overspent_claim_is_charged_to_the_budget() {
+        let budget = Budget::new(1_000, 1);
+
+        let claim = budget.claim(10).expect("a small claim");
+        assert_eq!(10, claim);
+
+        // The batch was 110 bytes: 100 more than the claim.
+        budget.settle(claim, 110);
+
+        assert_eq!(890, budget.remaining());
+    }
+
+    /// And an overspend larger than the budget takes it to zero, stopping the
+    /// readers behind it — never wrapping, which would uncap the request.
+    #[test]
+    fn an_overspend_cannot_wrap_the_budget() {
+        let budget = Budget::new(100, 1);
+
+        let claim = budget.claim(100).expect("the whole budget");
+        budget.settle(claim, u32::MAX);
+
+        assert_eq!(0, budget.remaining());
+        assert_eq!(None, budget.claim(1));
+    }
+
+    /// A partition can never take the whole request's budget, which is Kafka's
+    /// rule and was not honoured here at all: every partition used to be handed
+    /// the entire remaining `max_bytes`.
+    #[test]
+    fn a_claim_is_bounded_by_what_the_partition_asked_for() {
+        let budget = Budget::new(1_000, 1);
+
+        assert_eq!(Some(10), budget.claim(10));
+        assert_eq!(990, budget.remaining());
+    }
+
+    /// An exhausted budget refuses rather than returning zero: zero is a claim
+    /// that would read nothing forever, and the caller reads `None` as "stop".
+    #[test]
+    fn an_exhausted_budget_refuses() {
+        let budget = Budget::new(0, 1);
+
+        assert_eq!(None, budget.claim(1));
+        assert_eq!(None, budget.claim(u32::MAX));
     }
 }
