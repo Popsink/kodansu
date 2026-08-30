@@ -12,8 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::BTreeMap,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
+use futures::StreamExt as _;
 use rama::{Context, Service};
 use tansu_sans_io::{
     ApiKey, BatchAttribute, ErrorCode, ProduceRequest, ProduceResponse, TimestampType,
@@ -133,6 +137,14 @@ use crate::{Error, Result, Storage, Topition, authorized, storage_error_code};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProduceService;
+
+/// Partitions written at once across the whole request (#439).
+///
+/// The same bound as every other fan-out in the engine — `FETCH_CONCURRENCY`,
+/// `FOOTER_FETCH_CONCURRENCY`, `LIST_OFFSETS_CONCURRENCY`,
+/// `OFFSET_COMMIT_CONCURRENCY` — and for the same reason: it keeps one wide
+/// request inside the object store's throttling envelope.
+const PRODUCE_CONCURRENCY: usize = 32;
 
 impl ApiKey for ProduceService {
     const KEY: i16 = ProduceRequest::KEY;
@@ -292,46 +304,16 @@ impl ProduceService {
         }
     }
 
-    #[instrument(skip_all)]
-    async fn topic<G>(
-        &self,
-        ctx: &Context<G>,
-        transaction_id: Option<&str>,
-        topic: TopicProduceData,
-    ) -> TopicProduceResponse
-    where
-        G: Storage,
-    {
-        // Per topic, and refused per partition, because that is the shape the
-        // response has: a client reads a partition's error code, and a blanket
-        // failure at the top would tell it every partition of every topic in
-        // the request had failed (#363).
-        let allowed = authorized(ctx, Resource::Topic, &topic.name, Operation::Write).await;
-
-        let mut partitions = vec![];
-
-        if let Some(partition_data) = topic.partition_data {
-            for partition in partition_data {
-                partitions.push(if allowed {
-                    self.partition(ctx, transaction_id, &topic.name, partition)
-                        .await
-                } else {
-                    PartitionProduceResponse::default()
-                        .index(partition.index)
-                        .error_code(ErrorCode::TopicAuthorizationFailed.into())
-                        .base_offset(-1)
-                        .log_append_time_ms(Some(-1))
-                        .log_start_offset(Some(-1))
-                        .record_errors(Some([].into()))
-                        .error_message(None)
-                        .current_leader(None)
-                })
-            }
-        }
-
-        TopicProduceResponse::default()
-            .name(topic.name)
-            .partition_responses(Some(partitions))
+    fn unauthorized(&self, index: i32) -> PartitionProduceResponse {
+        PartitionProduceResponse::default()
+            .index(index)
+            .error_code(ErrorCode::TopicAuthorizationFailed.into())
+            .base_offset(-1)
+            .log_append_time_ms(Some(-1))
+            .log_start_offset(Some(-1))
+            .record_errors(Some([].into()))
+            .error_message(None)
+            .current_leader(None)
     }
 }
 
@@ -348,20 +330,116 @@ where
         ctx: Context<G>,
         req: ProduceRequest,
     ) -> Result<Self::Response, Self::Error> {
-        let mut responses = Vec::with_capacity(
-            req.topic_data
-                .as_ref()
-                .map_or(0, |topic_data| topic_data.len()),
-        );
+        let topics: Vec<TopicProduceData> = req.topic_data.unwrap_or_default();
+        let transactional_id = req.transactional_id;
+        let transaction_id = transactional_id.as_deref();
 
-        if let Some(topics) = req.topic_data {
-            for topic in topics {
-                responses.push(
-                    self.topic(&ctx, req.transactional_id.as_deref(), topic)
-                        .await,
-                )
+        // Per topic, and refused per partition, because that is the shape the
+        // response has: a client reads a partition's error code, and a blanket
+        // failure at the top would tell it every partition of every topic in
+        // the request had failed (#363).
+        //
+        // Resolved here, once per topic and before the fan-out below, rather
+        // than inside it: the answer is the same for every partition of a
+        // topic, and asking per partition would multiply an authorizer lookup
+        // by the width of the request.
+        let mut allowed = Vec::with_capacity(topics.len());
+        for topic in topics.iter() {
+            allowed.push(authorized(&ctx, Resource::Topic, &topic.name, Operation::Write).await);
+        }
+
+        // Every partition of every topic in one flat fan-out (#439). They were
+        // written one after the other, each `produce` awaited to completion
+        // before the next began — and because a produce completes only when its
+        // coalescing window has flushed, an N-partition request cost N × linger.
+        // That is why the conformance bench found eight partitions *slower* than
+        // one: the partitions of a request are independent logs, and nothing in
+        // the protocol orders them against each other, so waiting for one before
+        // starting the next bought nothing and cost a whole flush window.
+        //
+        // Grouped by topition rather than fanned out entry by entry: a request
+        // naming the same `(topic, partition)` twice is two appends to one log,
+        // and those must still happen in the order the client wrote them —
+        // exactly as the batches *within* one entry still do. Well-behaved
+        // clients never send that shape; a hand-rolled one that does gets the
+        // ordering it would have got before rather than a race.
+        //
+        // Bounded like every other fan-out in the engine, and for the same
+        // reason: it keeps one wide request inside the object store's
+        // throttling envelope.
+        let mut grouped: BTreeMap<Topition, Vec<(usize, usize, PartitionProduceData)>> =
+            BTreeMap::new();
+
+        // Positional: a client matches a partition response to its request by
+        // position, so each answer goes back into the slot its entry came from
+        // however the fan-out completes.
+        let mut responses: Vec<Vec<Option<PartitionProduceResponse>>> =
+            Vec::with_capacity(topics.len());
+
+        let mut names = Vec::with_capacity(topics.len());
+
+        for (index, topic) in topics.into_iter().enumerate() {
+            let partition_data = topic.partition_data.unwrap_or_default();
+
+            responses.push(vec![None; partition_data.len()]);
+
+            for (position, partition) in partition_data.into_iter().enumerate() {
+                if allowed[index] {
+                    grouped
+                        .entry(Topition::new(topic.name.as_str(), partition.index))
+                        .or_default()
+                        .push((index, position, partition));
+                } else {
+                    responses[index][position] = Some(self.unauthorized(partition.index));
+                }
+            }
+
+            names.push(topic.name);
+        }
+
+        let writes = grouped.into_iter().map(|(topition, entries)| {
+            let ctx = &ctx;
+
+            async move {
+                let mut written = Vec::with_capacity(entries.len());
+
+                for (index, position, partition) in entries {
+                    written.push((
+                        index,
+                        position,
+                        self.partition(ctx, transaction_id, topition.topic(), partition)
+                            .await,
+                    ));
+                }
+
+                written
+            }
+        });
+
+        {
+            let mut writes = futures::stream::iter(writes).buffer_unordered(PRODUCE_CONCURRENCY);
+
+            while let Some(written) = writes.next().await {
+                for (index, position, response) in written {
+                    responses[index][position] = Some(response);
+                }
             }
         }
+
+        let responses = names
+            .into_iter()
+            .zip(responses)
+            .map(|(name, partitions)| {
+                TopicProduceResponse::default()
+                    .name(name)
+                    .partition_responses(Some(
+                        // Every slot was filled: each was created from an entry,
+                        // and each entry was either answered by the fan-out or
+                        // refused above it.
+                        partitions.into_iter().flatten().collect(),
+                    ))
+            })
+            .collect::<Vec<_>>();
 
         Ok(ProduceResponse::default()
             .responses(Some(responses))
