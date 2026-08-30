@@ -27,6 +27,7 @@ mod compact_segments;
 mod corrupt_region;
 mod delete_groups;
 mod divergent_batch;
+mod fenced_overlap;
 mod flush_conflict;
 mod gcs;
 mod group_describe;
