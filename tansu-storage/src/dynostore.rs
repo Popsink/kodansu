@@ -14508,7 +14508,10 @@ where
             })
     }
 
-    #[instrument(skip_all, fields(%location), ret)]
+    // `debug`, and without `ret` (#428): see the note on `Cache::get_opts`,
+    // which sat above this one carrying the same annotation. Between them every
+    // GET on every backend emitted two formatted `INFO` events.
+    #[instrument(level = "debug", skip_all, fields(%location))]
     async fn get_opts(
         &self,
         location: &Path,

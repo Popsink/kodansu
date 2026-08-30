@@ -133,7 +133,9 @@ where
         self.object_store.put_multipart_opts(location, opts).await
     }
 
-    #[instrument(skip_all, fields(%location, if_none_match = options.if_none_match), ret)]
+    // Copied from `gcs/limit.rs`, and fixed with it (#428) so the pattern stops
+    // propagating out of a test helper.
+    #[instrument(level = "debug", skip_all, fields(%location, if_none_match = options.if_none_match))]
     async fn get_opts(
         &self,
         location: &Path,
