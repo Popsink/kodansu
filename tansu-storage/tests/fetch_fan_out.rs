@@ -27,6 +27,13 @@
 //! against the maintainers' measured `get_opts` and 350 ms × N against the
 //! brokers' (#409).
 
+// The whole file is a `DynoStore` over a custom `ObjectStore`, and
+// `object_store` is an optional dependency the `dynostore` feature pulls in —
+// so with the feature off there is nothing here to compile. The same
+// crate-level gate every other test in this directory that names the store
+// carries.
+#![cfg(feature = "dynostore")]
+
 use std::{
     fmt,
     sync::{
