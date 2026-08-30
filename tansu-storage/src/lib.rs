@@ -563,6 +563,43 @@ impl TryFrom<&OffsetCommitRequestPartition> for OffsetCommitRequest {
     }
 }
 
+/// A committed offset as a group reads it back (#445).
+///
+/// `offset` alone is what `offset_fetch` used to answer, and the metadata a
+/// client had committed beside it was dropped on the way out — accepted and
+/// stored, then projected away by the return type, so nothing could report the
+/// loss at write time. Frameworks that keep their restore point in commit
+/// metadata (Streams-style checkpointing, recovery tools) found out during a
+/// recovery, which is the worst moment there is.
+///
+/// `-1` with no metadata is the "nothing committed" answer, unchanged.
+#[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct CommittedOffset {
+    pub offset: i64,
+    pub metadata: Option<String>,
+}
+
+impl CommittedOffset {
+    /// No offset committed for this partition.
+    pub const NONE: Self = Self {
+        offset: -1,
+        metadata: None,
+    };
+
+    pub fn new(offset: i64, metadata: Option<String>) -> Self {
+        Self { offset, metadata }
+    }
+}
+
+impl From<&OffsetCommitRequest> for CommittedOffset {
+    fn from(value: &OffsetCommitRequest) -> Self {
+        Self {
+            offset: value.offset,
+            metadata: value.metadata.clone(),
+        }
+    }
+}
+
 /// Topic Id
 ///
 /// An enumeration of either the name or UUID of a topic.
@@ -1452,10 +1489,13 @@ pub trait Storage: Debug + Send + Sync + 'static {
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>>;
+    ) -> Result<BTreeMap<Topition, CommittedOffset>>;
 
     /// Fetch all committed offsets in a consumer group.
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>>;
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>>;
 
     /// Query broker and topic metadata.
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse>;
@@ -1829,13 +1869,16 @@ where
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.as_ref()
             .offset_fetch(group_id, topics, require_stable)
             .await
     }
 
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.as_ref().committed_offset_topitions(group_id).await
     }
 
@@ -2207,13 +2250,16 @@ where
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.as_ref()
             .offset_fetch(group_id, topics, require_stable)
             .await
     }
 
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.as_ref().committed_offset_topitions(group_id).await
     }
 

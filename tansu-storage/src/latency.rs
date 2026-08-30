@@ -43,11 +43,11 @@ use uuid::Uuid;
 
 use crate::{
     AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
-    BrokerRegistrationRequest, GenerationDoc, ListOffsetResponse, MemberDoc, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, QuotaAlteration,
-    QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas, Result, ScramCredential, Storage,
-    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    UpdateError, Version,
+    BrokerRegistrationRequest, CommittedOffset, GenerationDoc, ListOffsetResponse, MemberDoc,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
+    QuotaAlteration, QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas, Result,
+    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, UpdateError, Version,
 };
 
 #[derive(Clone, Debug)]
@@ -436,7 +436,7 @@ where
         group_id: Option<&str>,
         topics: &[Topition],
         require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.introduce_latency().await?;
 
         self.storage
@@ -444,7 +444,10 @@ where
             .await
     }
 
-    async fn committed_offset_topitions(&self, group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         self.introduce_latency().await?;
 
         self.storage.committed_offset_topitions(group_id).await

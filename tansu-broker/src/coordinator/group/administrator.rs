@@ -1090,14 +1090,28 @@ where
                                 .partitions(Some(
                                     offsets
                                         .iter()
-                                        .filter_map(|(topition, offset)| {
+                                        .filter_map(|(topition, committed)| {
                                             if topition.topic() == *topic_name {
                                                 Some(
                                                     OffsetFetchResponsePartition::default()
                                                         .partition_index(topition.partition())
-                                                        .committed_offset(*offset)
+                                                        .committed_offset(committed.offset)
                                                         .committed_leader_epoch(Some(-1))
-                                                        .metadata(Some("".into()))
+                                                        // What the client
+                                                        // committed, not `""`
+                                                        // (#445). It was stored
+                                                        // all along and dropped
+                                                        // on the way out, so a
+                                                        // framework keeping its
+                                                        // restore point here
+                                                        // lost it with no error
+                                                        // at write time.
+                                                        .metadata(
+                                                            committed
+                                                                .metadata
+                                                                .clone()
+                                                                .or_else(|| Some(String::new())),
+                                                        )
                                                         .error_code(ErrorCode::None.into()),
                                                 )
                                             } else {
@@ -1172,15 +1186,22 @@ where
                                         .partitions(Some(
                                             offsets
                                                 .iter()
-                                                .filter_map(|(topition, offset)| {
+                                                .filter_map(|(topition, committed)| {
                                                     if topition.topic() == *topic_name {
                                                         Some(
                                                             OffsetFetchResponsePartitions::default(
                                                             )
                                                             .partition_index(topition.partition())
-                                                            .committed_offset(*offset)
+                                                            .committed_offset(committed.offset)
                                                             .committed_leader_epoch(-1)
-                                                            .metadata(None)
+                                                            // As above (#445).
+                                                            // Nullable in this
+                                                            // shape, so an
+                                                            // absent metadata
+                                                            // stays absent
+                                                            // rather than
+                                                            // becoming `""`.
+                                                            .metadata(committed.metadata.clone())
                                                             .error_code(ErrorCode::None.into()),
                                                         )
                                                     } else {

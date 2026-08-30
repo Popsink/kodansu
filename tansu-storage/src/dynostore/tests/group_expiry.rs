@@ -290,7 +290,7 @@ async fn a_group_that_only_commits_offsets_survives() -> Result<()> {
         "the group state must survive",
     );
     assert_eq!(
-        Some(&42),
+        Some(42),
         store
             .offset_fetch(
                 Some("group-committing"),
@@ -298,7 +298,8 @@ async fn a_group_that_only_commits_offsets_survives() -> Result<()> {
                 Some(false),
             )
             .await?
-            .get(&Topition::new("committed-topic", 0)),
+            .get(&Topition::new("committed-topic", 0))
+            .map(|committed| committed.offset),
         "the committed offset must survive — losing it resets the consumer",
     );
 

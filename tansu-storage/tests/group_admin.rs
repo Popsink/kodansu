@@ -346,7 +346,12 @@ async fn a_commit_on_a_partition_that_does_not_exist_is_refused() -> Result<(), 
         .offset_fetch(Some(group_id), &[Topition::new(TOPIC, 9)], None)
         .await?;
 
-    assert_eq!(Some(&-1), fetched.get(&Topition::new(TOPIC, 9)));
+    assert_eq!(
+        Some(-1),
+        fetched
+            .get(&Topition::new(TOPIC, 9))
+            .map(|committed| committed.offset)
+    );
 
     Ok(())
 }
@@ -374,7 +379,11 @@ async fn a_commit_on_a_partition_that_exists_is_stored() -> Result<(), Error> {
         .await?;
 
     for topition in &topitions {
-        assert_eq!(Some(&7), fetched.get(topition), "{topition:?}");
+        assert_eq!(
+            Some(7),
+            fetched.get(topition).map(|committed| committed.offset),
+            "{topition:?}"
+        );
     }
 
     Ok(())
@@ -402,7 +411,12 @@ async fn a_mixed_commit_is_answered_per_partition() -> Result<(), Error> {
         .offset_fetch(Some(group_id), &[Topition::new(TOPIC, 0)], None)
         .await?;
 
-    assert_eq!(Some(&7), fetched.get(&Topition::new(TOPIC, 0)));
+    assert_eq!(
+        Some(7),
+        fetched
+            .get(&Topition::new(TOPIC, 0))
+            .map(|committed| committed.offset)
+    );
 
     Ok(())
 }

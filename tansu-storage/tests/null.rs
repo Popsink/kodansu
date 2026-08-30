@@ -38,9 +38,9 @@ use tansu_sans_io::{
     txn_offset_commit_request::TxnOffsetCommitRequestTopic,
 };
 use tansu_storage::{
-    BrokerRegistrationRequest, Error, GenerationDoc, NamedGroupDetail, OffsetCommitRequest,
-    ScramCredential, Storage, StorageContainer, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
+    BrokerRegistrationRequest, CommittedOffset, Error, GenerationDoc, NamedGroupDetail,
+    OffsetCommitRequest, ScramCredential, Storage, StorageContainer, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
 };
 use url::Url;
 use uuid::Uuid;
@@ -245,7 +245,10 @@ async fn produce_is_accepted_and_fetch_returns_nothing() -> Result {
     let fetched = storage
         .offset_fetch(Some("g1"), std::slice::from_ref(&topition), None)
         .await?;
-    assert_eq!(BTreeMap::from([(topition.clone(), 0)]), fetched);
+    assert_eq!(
+        BTreeMap::from([(topition.clone(), CommittedOffset::new(0, None))]),
+        fetched
+    );
 
     // A commit is acknowledged per partition, and nothing is retained: the
     // committed set stays empty however many commits arrive.

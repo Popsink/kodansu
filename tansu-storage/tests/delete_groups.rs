@@ -168,8 +168,10 @@ async fn empty_group_id_is_refused_and_keeps_committed_offsets() -> Result<(), E
             .await?;
 
         assert_eq!(
-            Some(&offset),
-            fetched.get(&Topition::new(topic, 0)),
+            Some(offset),
+            fetched
+                .get(&Topition::new(topic, 0))
+                .map(|committed| committed.offset),
             "{group} lost its committed offset to a refused group id"
         );
     }

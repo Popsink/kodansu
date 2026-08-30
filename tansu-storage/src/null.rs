@@ -44,11 +44,11 @@ use uuid::Uuid;
 
 use crate::{
     AclBinding, AclFilter, Acls, AssignmentDoc, AssignmentOutcome, BrokerRegistrationRequest,
-    Error, GenerationDoc, GroupDetailResponse, ListOffsetResponse, MemberDoc, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, QuotaAlteration,
-    QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas, Result, ScramCredential, Storage,
-    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    UpdateError, Version,
+    CommittedOffset, Error, GenerationDoc, GroupDetailResponse, ListOffsetResponse, MemberDoc,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
+    QuotaAlteration, QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas, Result,
+    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, UpdateError, Version,
 };
 
 /// A stored document with the version identifying it, as the object store
@@ -223,7 +223,10 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
-    async fn committed_offset_topitions(&self, _group_id: &str) -> Result<BTreeMap<Topition, i64>> {
+    async fn committed_offset_topitions(
+        &self,
+        _group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         Ok(BTreeMap::new())
     }
 
@@ -233,10 +236,10 @@ impl Storage for Engine {
         _group_id: Option<&str>,
         topics: &[Topition],
         _require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, i64>> {
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
         Ok(topics
             .iter()
-            .map(|topition| (topition.to_owned(), 0))
+            .map(|topition| (topition.to_owned(), CommittedOffset::new(0, None)))
             .collect())
     }
 

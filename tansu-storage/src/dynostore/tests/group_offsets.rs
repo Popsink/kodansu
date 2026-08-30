@@ -133,8 +133,10 @@ async fn a_commit_lands_in_one_object() -> Result<(), Error> {
 
     for partition in 0..4 {
         assert_eq!(
-            Some(&(i64::from(partition) + 10)),
-            fetched.get(&Topition::new(TOPIC, partition))
+            Some(i64::from(partition) + 10),
+            fetched
+                .get(&Topition::new(TOPIC, partition))
+                .map(|committed| committed.offset)
         );
     }
 
@@ -163,8 +165,18 @@ async fn the_old_layout_still_reads_when_the_new_object_does_not_hold_it() -> Re
         )
         .await?;
 
-    assert_eq!(Some(&41), fetched.get(&Topition::new(TOPIC, 0)));
-    assert_eq!(Some(&42), fetched.get(&Topition::new(TOPIC, 1)));
+    assert_eq!(
+        Some(41),
+        fetched
+            .get(&Topition::new(TOPIC, 0))
+            .map(|committed| committed.offset)
+    );
+    assert_eq!(
+        Some(42),
+        fetched
+            .get(&Topition::new(TOPIC, 1))
+            .map(|committed| committed.offset)
+    );
 
     // And a commit for one of them moves that key into the new object without
     // disturbing the other, which is the whole of the migration.
@@ -187,8 +199,18 @@ async fn the_old_layout_still_reads_when_the_new_object_does_not_hold_it() -> Re
         )
         .await?;
 
-    assert_eq!(Some(&99), fetched.get(&Topition::new(TOPIC, 0)));
-    assert_eq!(Some(&42), fetched.get(&Topition::new(TOPIC, 1)));
+    assert_eq!(
+        Some(99),
+        fetched
+            .get(&Topition::new(TOPIC, 0))
+            .map(|committed| committed.offset)
+    );
+    assert_eq!(
+        Some(42),
+        fetched
+            .get(&Topition::new(TOPIC, 1))
+            .map(|committed| committed.offset)
+    );
 
     Ok(())
 }
@@ -221,8 +243,18 @@ async fn the_all_topics_form_unions_both_layouts() -> Result<(), Error> {
     let committed = store.committed_offset_topitions(GROUP).await?;
 
     assert_eq!(2, committed.len(), "{committed:?}");
-    assert_eq!(Some(&7), committed.get(&Topition::new("legacy", 0)));
-    assert_eq!(Some(&11), committed.get(&Topition::new(TOPIC, 0)));
+    assert_eq!(
+        Some(7),
+        committed
+            .get(&Topition::new("legacy", 0))
+            .map(|committed| committed.offset)
+    );
+    assert_eq!(
+        Some(11),
+        committed
+            .get(&Topition::new(TOPIC, 0))
+            .map(|committed| committed.offset)
+    );
 
     Ok(())
 }
@@ -268,7 +300,12 @@ async fn deleting_a_topic_drops_its_offsets_from_the_group_object() -> Result<()
         committed.get(&Topition::new(TOPIC, 0)),
         "a deleted topic's committed offset survived: {committed:?}"
     );
-    assert_eq!(Some(&22), committed.get(&Topition::new("survivor", 0)));
+    assert_eq!(
+        Some(22),
+        committed
+            .get(&Topition::new("survivor", 0))
+            .map(|committed| committed.offset)
+    );
 
     Ok(())
 }
@@ -320,8 +357,18 @@ async fn two_replicas_committing_the_same_group_do_not_lose_each_other() -> Resu
         .committed_offset_topitions(GROUP)
         .await?;
 
-    assert_eq!(Some(&5), committed.get(&Topition::new(TOPIC, 0)));
-    assert_eq!(Some(&6), committed.get(&Topition::new(TOPIC, 1)));
+    assert_eq!(
+        Some(5),
+        committed
+            .get(&Topition::new(TOPIC, 0))
+            .map(|committed| committed.offset)
+    );
+    assert_eq!(
+        Some(6),
+        committed
+            .get(&Topition::new(TOPIC, 1))
+            .map(|committed| committed.offset)
+    );
 
     Ok(())
 }
