@@ -70,7 +70,7 @@ fn generation(generation_id: i32) -> GenerationDoc {
 fn detail_of(named: &NamedGroupDetail) -> Option<GroupDetail> {
     match &named.response {
         GroupDetailResponse::Found(detail) => Some(detail.clone()),
-        GroupDetailResponse::ErrorCode(_) => None,
+        GroupDetailResponse::ErrorCode(_) | GroupDetailResponse::Dead => None,
     }
 }
 
@@ -555,12 +555,17 @@ async fn a_member_with_no_document_is_still_a_member() -> Result<()> {
 /// A leftover `{group}.json` describes as an **empty group**, not as whatever
 /// it says.
 ///
-/// The read used to fall back to it, which cost a 404 on the describe path of
-/// every group in the cluster forever and, once the cutover had happened, paid
-/// that to answer with something *less* true: the object records a membership
-/// that the quiesce made vacuous, and nothing rewrites it again. Empty is both
-/// the honest answer and the cheap one. The object is not deleted here —
-/// `delete_groups` takes it with the group and expiry reaps it on its own.
+/// The read used to fall back to it *for its contents*, which cost a 404 on the
+/// describe path of every group in the cluster forever and, once the cutover had
+/// happened, paid that to answer with something *less* true: the object records
+/// a membership that the quiesce made vacuous, and nothing rewrites it again.
+/// Empty is both the honest answer and the cheap one. The object is not deleted
+/// here — `delete_groups` takes it with the group and expiry reaps it on its own.
+///
+/// It IS consulted for existence, and only when there is no generation (#445):
+/// that is the one case where the answer would otherwise be `Dead`, and a group
+/// that is there must not be reported as never having existed — least of all
+/// while `delete_groups` still deletes it.
 #[tokio::test]
 async fn a_legacy_leftover_describes_as_an_empty_group() -> Result<()> {
     let _guard = init_tracing()?;

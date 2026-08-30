@@ -310,6 +310,10 @@ async fn a_failed_read_is_retriable_not_an_empty_group() -> Result<(), Error> {
              on a failed read: {detail:?}",
             detail.members.len(),
         ),
+
+        GroupDetailResponse::Dead => {
+            panic!("a live group was reported as never having existed on a failed read")
+        }
     }
 
     Ok(())

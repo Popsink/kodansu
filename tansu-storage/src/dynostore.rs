@@ -7570,6 +7570,50 @@ impl DynoStore {
     /// generation is what says so — and a generation with a leader but no
     /// assignment reports `CompletingRebalance`, which is true, rather than a
     /// phantom `Stable`.
+    /// The legacy `{group}.json` a pre-#359 cutover may have left, by existence
+    /// alone (#445).
+    ///
+    /// `head`, never `delete`: a delete of an absent key **succeeds** on S3 and
+    /// on `InMemory` alike, so using a delete's outcome as an existence signal —
+    /// which `delete_groups` did — makes every group look like it existed.
+    ///
+    /// And never for its *contents*: the object records a membership that the
+    /// cutover's quiesce made vacuous, so reading it would answer with something
+    /// less true than "empty". This asks only whether the group is there at all,
+    /// which is the one thing the object can still be trusted about.
+    async fn legacy_group_exists(&self, group_id: &str) -> bool {
+        self.object_store
+            .head(&Path::from(format!(
+                "clusters/{}/groups/consumers/{}.json",
+                self.cluster, group_id,
+            )))
+            .await
+            .is_ok()
+    }
+
+    /// Whether a group with no generation nevertheless exists (#445).
+    ///
+    /// **A group exists if anything of it does.** A generation is the usual
+    /// evidence and the caller has already looked for it; this is the rest —
+    /// a legacy object, or committed offsets. That last one is not a corner
+    /// case: a client may commit for a group id without ever joining, and such
+    /// a group is one `kafka-consumer-groups --describe` lists and one
+    /// `DeleteGroups` must be able to reap. Answering "never existed" for it
+    /// would leak its offsets forever.
+    ///
+    /// Only reached when there is no generation, so a healthy group never pays
+    /// for it — which is what keeps the 404-per-describe cost this deliberately
+    /// avoids off the common path.
+    async fn group_remnants_exist(&self, group_id: &str) -> Result<bool> {
+        if self.legacy_group_exists(group_id).await {
+            return Ok(true);
+        }
+
+        self.committed_offset_topitions(group_id)
+            .await
+            .map(|topitions| !topitions.is_empty())
+    }
+
     async fn group_view(&self, group_id: &str) -> Result<Option<GroupDetail>> {
         /// As `describe_groups`' own fan-out: one round trip per member, and a
         /// group is tens of members.
@@ -11795,10 +11839,23 @@ impl Storage for DynoStore {
         let resolutions = offsets
             .iter()
             .map(|(topition, offset_commit)| async move {
+                // The topic AND the partition (#445). Committing partition 9 of
+                // a two-partition topic used to succeed, because the test was
+                // whether the *topic* existed — so a configuration typo landed
+                // as a stored offset and surfaced much later as "the consumer
+                // restarted from the wrong place", pointing at the consumer
+                // rather than at the number that was wrong.
+                //
+                // `UNKNOWN_TOPIC_OR_PARTITION` is the code the unknown-topic
+                // case already answers, and it is Kafka's answer here too: the
+                // partition does not exist, and the response path for that is
+                // already in place below.
                 let known = self
                     .described_topic_metadata(&TopicId::from(topition), "offset_commit")
                     .await?
-                    .is_some();
+                    .is_some_and(|metadata| {
+                        (0..metadata.topic.num_partitions).contains(&topition.partition())
+                    });
 
                 Ok::<_, Error>((topition.to_owned(), offset_commit.clone(), known))
             })
@@ -12657,18 +12714,48 @@ impl Storage for DynoStore {
                     self.cluster, group_id,
                 ));
 
+                // A group with live members is not deleted (#445). A cleanup
+                // script or an operator command that removes the group of a
+                // live consumer takes its coordinator out from under it
+                // mid-poll; Kafka simply refuses, and refusing is the whole
+                // safety property — an admin API that cannot be run by mistake.
+                //
+                // Membership comes from the same view `DescribeGroups` reports,
+                // so the two APIs cannot disagree about a group an operator is
+                // looking at while deciding to delete it. It is the generation's
+                // member set, which `SyncGroup` maintains and a session-timeout
+                // sweep retires, so a group whose consumers have all gone away
+                // becomes deletable on its own.
+                let view = self
+                    .group_view(group_id)
+                    .await
+                    .inspect_err(|error| error!(?error, group_id, "composing the group view"))?;
+
+                debug!(group_id, ?view);
+
+                if let Some(detail) = view.as_ref()
+                    && !detail.members.is_empty()
+                {
+                    debug!(group_id, members = detail.members.len(), "non-empty group");
+
+                    results.push(
+                        DeletableGroupResult::default()
+                            .group_id(group_id.into())
+                            .error_code(ErrorCode::NonEmptyGroup.into()),
+                    );
+
+                    continue;
+                }
+
                 // The legacy state object. Deleted for as long as one can
                 // exist; after the cutover this is a 404 per deleted group and
                 // the prefix below is what carries the group.
-                let had_legacy_state = self
+                _ = self
                     .object_store
                     .delete(&location)
                     .await
                     .inspect(|outcome| debug!(group_id, ?outcome))
-                    .inspect_err(|err| debug!(group_id, ?err))
-                    .is_ok();
-
-                debug!(group_id, had_legacy_state);
+                    .inspect_err(|err| debug!(group_id, ?err));
 
                 let locations = self
                     .scan(Scan::AdminDelete, &prefix)
@@ -12699,16 +12786,26 @@ impl Storage for DynoStore {
 
                 debug!(group_id, ?deleted);
 
+                // A group existed if ANYTHING of it did: a generation, or
+                // something the sweep above removed — its committed offsets,
+                // its member documents, its assignments. A client may commit
+                // for a group id without ever joining, so neither signal alone
+                // is sufficient.
+                //
+                // The legacy object used to be the third signal, taken from the
+                // outcome of the delete just above — and a delete of an absent
+                // key **succeeds**, on S3 and on `InMemory` alike. So that term
+                // was always true, this branch was unreachable, and deleting a
+                // group that never existed answered `NONE` (#445). Tooling that
+                // distinguishes "idle group" from "nonexistent group" had
+                // nothing to read.
+                let existed = view.is_some() || !deleted.is_empty();
+
                 results.push(
                     DeletableGroupResult::default()
                         .group_id(group_id.into())
                         .error_code(
-                            // A group existed if anything of it did. Keyed on
-                            // the legacy object alone, a group in the
-                            // decomposed layout with no committed offsets — one
-                            // that has joined but never committed — would be
-                            // reported `GroupIdNotFound` after being deleted.
-                            if had_legacy_state || !deleted.is_empty() {
+                            if existed {
                                 ErrorCode::None
                             } else {
                                 ErrorCode::GroupIdNotFound
@@ -12750,14 +12847,38 @@ impl Storage for DynoStore {
                 match self.group_view(&group_id).await {
                     Ok(Some(group_detail)) => NamedGroupDetail::found(group_id, group_detail),
 
-                    // No `generation.json` means the group does not exist,
-                    // which is a fact and is reported as an empty group. A
-                    // legacy `{group}.json` left behind by the cutover is not
-                    // consulted: it describes a membership that a quiesce made
-                    // vacuous, and reading it would put a 404 on the describe
-                    // path of every group in the cluster, forever, to answer
-                    // with something less true than "empty".
-                    Ok(None) => NamedGroupDetail::found(group_id, GroupDetail::default()),
+                    // No `generation.json` means the group does not exist, and
+                    // Kafka's word for that is `Dead` — not `Empty`, which is a
+                    // group that exists with nobody in it (#445). Reporting the
+                    // two alike left cleanup-by-inactivity tooling unable to
+                    // tell a group it should reap from one it has already
+                    // reaped.
+                    //
+                    // A legacy `{group}.json` left behind by the cutover is
+                    // still not consulted: it describes a membership that a
+                    // quiesce made vacuous, and reading it would put a 404 on
+                    // the describe path of every group in the cluster, forever.
+                    Ok(None) => match self.group_remnants_exist(&group_id).await {
+                        // It is there, with nobody in it.
+                        Ok(true) => NamedGroupDetail::found(group_id, GroupDetail::default()),
+
+                        Ok(false) => NamedGroupDetail::dead(group_id),
+
+                        // Not knowing is not the same as not existing, for the
+                        // same reason it is not the same as empty below.
+                        Err(error) => {
+                            error!(?error, group_id, "probing for group remnants");
+
+                            NamedGroupDetail::error_code(
+                                group_id,
+                                if matches!(error, Error::ObjectStore(_)) {
+                                    ErrorCode::CoordinatorLoadInProgress
+                                } else {
+                                    ErrorCode::UnknownServerError
+                                },
+                            )
+                        }
+                    },
 
                     // Not knowing is not the same as empty, and it is
                     // retriable. Answering `GroupDetail::default()` here made a

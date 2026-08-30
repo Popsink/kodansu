@@ -51,7 +51,15 @@ async fn delete_non_existent() -> Result<(), Error> {
     let results = response.results.unwrap_or_default();
     assert_eq!(1, results.len());
     assert_eq!(group_id, results[0].group_id.as_str());
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(results[0].error_code)?);
+
+    // This test's own name is the assertion: deleting a group that does not
+    // exist reports that it does not exist (#445). It answered `NONE` until
+    // then, because existence was inferred from a delete — and a delete of an
+    // absent key succeeds, on S3 and on `InMemory` alike.
+    assert_eq!(
+        ErrorCode::GroupIdNotFound,
+        ErrorCode::try_from(results[0].error_code)?
+    );
 
     Ok(())
 }

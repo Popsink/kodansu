@@ -1011,6 +1011,20 @@ impl From<&GroupDetail> for ConsumerGroupState {
 pub enum GroupDetailResponse {
     ErrorCode(ErrorCode),
     Found(GroupDetail),
+
+    /// The group does not exist (#445).
+    ///
+    /// Distinct from `Found` with no members, and the distinction is the point:
+    /// Kafka answers `Dead` for a group it has never heard of and `Empty` for
+    /// one that exists with nobody in it. Collapsing the two leaves
+    /// cleanup-by-inactivity tooling unable to tell a group it should reap from
+    /// one it has already reaped, and monitoring unable to tell a group that
+    /// went away from one that is merely idle.
+    ///
+    /// Not an `ErrorCode`: Kafka reports this with `NONE` and the state
+    /// `Dead`, because not existing is an answer about the group rather than a
+    /// failure to answer.
+    Dead,
 }
 
 /// NamedGroupDetail
@@ -1035,6 +1049,14 @@ impl NamedGroupDetail {
         Self {
             name,
             response: GroupDetailResponse::Found(found),
+        }
+    }
+
+    /// A group the broker holds no state for at all (#445).
+    pub fn dead(name: String) -> Self {
+        Self {
+            name,
+            response: GroupDetailResponse::Dead,
         }
     }
 }
@@ -1062,7 +1084,10 @@ impl From<&NamedGroupDetail> for consumer_group_describe_response::DescribedGrou
         // opaque assignment blob into KIP-848's structured form. Until this
         // engine speaks that protocol there is no honest `NONE` to give.
         let error_code = match response {
-            GroupDetailResponse::Found(_) => ErrorCode::GroupIdNotFound,
+            // A dead group is not a KIP-848 group either, and this API answers
+            // for those alone — so it is reported the same way a live classic
+            // group is, and for the same reason.
+            GroupDetailResponse::Found(_) | GroupDetailResponse::Dead => ErrorCode::GroupIdNotFound,
             GroupDetailResponse::ErrorCode(error_code) => *error_code,
         };
 
@@ -1134,6 +1159,21 @@ impl From<&NamedGroupDetail> for describe_groups_response::DescribedGroup {
                     .members(Some(members))
                     .authorized_operations(Some(-1))
             }
+
+            // `NONE` with the state `Dead`, as Kafka answers: the broker knows
+            // the group does not exist, which is an answer about the group and
+            // not a failure to give one (#445).
+            NamedGroupDetail {
+                name,
+                response: GroupDetailResponse::Dead,
+            } => Self::default()
+                .error_code(ErrorCode::None.into())
+                .group_id(name.clone())
+                .group_state(ConsumerGroupState::Dead.to_string())
+                .protocol_type("".into())
+                .protocol_data("".into())
+                .members(Some(vec![]))
+                .authorized_operations(Some(-1)),
 
             NamedGroupDetail {
                 name,
