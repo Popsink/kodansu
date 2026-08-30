@@ -488,7 +488,54 @@ fn a_merged_segment_wins_over_the_originals_it_merged() {
     assert_eq!(0, audit.records_lost);
     assert!(audit.gaps.is_empty());
     assert_eq!(2, audit.overlaps_dropped, "the two merged originals");
+    assert_eq!(0, audit.overlaps_clipped);
     assert_eq!(9, audit.records_present);
+}
+
+/// A slice that starts inside the covered range but reaches **past** it holds
+/// offsets nothing else holds, and they are counted.
+///
+/// The reader's overlap rule says to drop such an entry, and that rule is right
+/// for what it is written for — resolving *one offset*, where the
+/// higher-priority entry already answers it. Applied to *coverage* it discards
+/// the tail as well, and the sweep then reports that tail as lost.
+///
+/// This is not hypothetical: the first run of this audit against a production
+/// bucket reported **27.5 % of the offset span lost**, and 3 210 of the 3 356
+/// affected partitions also carried a dropped overlap. The holes were the
+/// discarded tails.
+#[test]
+fn a_slice_reaching_past_the_frontier_is_clipped_not_dropped() {
+    // [0, 100) then [50, 10_000): the second starts inside the first and
+    // reaches far past it.
+    let audit = audit_partition(0, vec![slice(0, 1, 0, 100), slice(1, 1, 50, 9_950)]);
+
+    assert!(
+        audit.gaps.is_empty(),
+        "the second slice holds [100, 10_000): {:?}",
+        audit.gaps,
+    );
+
+    assert_eq!(0, audit.next_offset - 10_000);
+    assert_eq!(10_000, audit.span);
+    assert_eq!(10_000, audit.records_present);
+    assert_eq!(0, audit.records_lost);
+
+    assert_eq!(1, audit.overlaps_clipped);
+    assert_eq!(0, audit.overlaps_dropped);
+}
+
+/// And one that is wholly inside contributes nothing, which is the merged
+/// segment's originals and must stay a *drop*. Counting its offsets again would
+/// make `records_present` exceed the span.
+#[test]
+fn a_slice_wholly_inside_the_frontier_is_dropped() {
+    let audit = audit_partition(0, vec![slice(7, 1, 0, 100), slice(0, 1, 10, 20)]);
+
+    assert_eq!(1, audit.overlaps_dropped);
+    assert_eq!(0, audit.overlaps_clipped);
+    assert_eq!(100, audit.records_present);
+    assert_eq!(0, audit.records_lost);
 }
 
 /// A tie on `base_offset` breaks on the higher `writer_epoch` before the

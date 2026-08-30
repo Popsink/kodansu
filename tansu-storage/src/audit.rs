@@ -174,10 +174,17 @@ pub struct PartitionAudit {
     pub records_present: i64,
     pub records_lost: i64,
     pub gaps: Vec<Gap>,
-    /// Slices dropped by the overlap rule (`docs/virtual-topics-format.md`):
-    /// a merged segment winning over the originals it merged is the normal
-    /// case, so this is informational, not a fault.
+    /// Slices wholly inside what an earlier slice already covers — a merged
+    /// segment winning over the originals it merged is the normal case, so this
+    /// is informational, not a fault.
     pub overlaps_dropped: usize,
+
+    /// Slices that overlapped the frontier and reached past it, so only their
+    /// tail was counted. Informational for the same reason, and separate
+    /// because a *dropped* slice contributes nothing while a *clipped* one is
+    /// the only holder of the offsets past the frontier — reporting them alike
+    /// is what made the sweep invent holes.
+    pub overlaps_clipped: usize,
     /// Abandoned legacy `records/{offset}.batch` objects (#50) found under this
     /// partition. Since #179 the broker neither writes nor reads them, so they
     /// are not offsets this sub-stream serves — but they say the log predates
@@ -831,6 +838,7 @@ fn audit_partition(partition: i32, mut slices: Vec<Slice>) -> PartitionAudit {
         records_lost: 0,
         gaps: Vec::new(),
         overlaps_dropped: 0,
+        overlaps_clipped: 0,
         legacy_batches: 0,
     };
 
@@ -855,16 +863,42 @@ fn audit_partition(partition: i32, mut slices: Vec<Slice>) -> PartitionAudit {
             continue;
         };
 
-        if slice.base_offset < previous.end() {
+        let frontier = previous.end();
+
+        // Wholly inside what is already covered: it adds nothing. This is the
+        // merged segment's originals, and the normal case.
+        if slice.end() <= frontier {
             audit.overlaps_dropped += 1;
             continue;
         }
 
-        if slice.base_offset > previous.end() {
+        // Overlaps the frontier and reaches past it: it contributes its TAIL,
+        // `[frontier, slice.end())`.
+        //
+        // **Clipped, not dropped.** The reader's overlap rule
+        // (`docs/virtual-topics-format.md`) says to drop an entry whose
+        // `base_offset` falls below the range already covered — and that rule is
+        // correct for what it is written for, resolving *one offset*, where the
+        // higher-priority entry already answers it. It is not a rule for
+        // computing *coverage*: applied here it discards the whole slice,
+        // including the part no other slice holds, and reports that part as
+        // lost.
+        //
+        // Measured, before this: 27.5 % of a production fleet's offset span
+        // reported as lost, 3 210 of 3 356 affected partitions also carrying a
+        // dropped overlap. The holes were the discarded tails.
+        if slice.base_offset < frontier {
+            audit.overlaps_clipped += 1;
+            audit.records_present += slice.end() - frontier;
+            covered = Some(slice);
+            continue;
+        }
+
+        if slice.base_offset > frontier {
             audit.gaps.push(Gap {
-                lost_from: previous.end(),
+                lost_from: frontier,
                 lost_to: slice.base_offset - 1,
-                records: slice.base_offset - previous.end(),
+                records: slice.base_offset - frontier,
                 before: previous.bracket(),
                 after: slice.bracket(),
             });
