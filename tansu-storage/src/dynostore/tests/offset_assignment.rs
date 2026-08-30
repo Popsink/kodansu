@@ -513,7 +513,7 @@ async fn a_cold_replica_must_not_reuse_offsets_below_the_persisted_floor() -> Re
     let cold_tail = cold
         .valid_substream_segments(&prefix, tp.topic(), tp.partition())?
         .last()
-        .map(|(_, entry)| entry.base_offset + entry.record_count)
+        .map(|fenced| fenced.entry.base_offset + fenced.entry.record_count)
         .unwrap_or(0);
     assert_eq!(
         4, cold_tail,

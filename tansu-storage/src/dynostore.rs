@@ -1014,6 +1014,23 @@ static SEGMENT_COMPACT_REFUSED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Sub-stream entries the fenced view served **clipped** (#461): an entry whose
+/// `base_offset` fell inside the range already covered but whose tail reached
+/// past it, so only the tail is served.
+///
+/// Expected to be **flat zero**: the one healthy overlap is a merged segment's
+/// originals, and those are wholly inside what the merge covers — dropped, not
+/// clipped. A non-zero value means a prefix carries the overlap shape whose
+/// *drop* used to destroy records; the clip serves them, and `tansu audit` on
+/// the bucket names the prefixes and segments so the writer that produced the
+/// overlap can be found.
+static SEGMENT_OVERLAP_CLIPPED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_substream_overlap_clipped")
+        .with_description("sub-stream entries served clipped to the fenced frontier")
+        .build()
+});
+
 /// Segments merged away by compaction (#66) — bounds live segment count.
 static SEGMENT_COMPACTIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
@@ -1791,6 +1808,36 @@ pub(crate) struct SubstreamEntry {
     /// dedup (#88) so duplicate detection derives from the durable log rather than
     /// a lazily-checkpointed `producers/{id}.json`.
     producers: Vec<ProducerCoord>,
+}
+
+/// One segment of a sub-stream's epoch-fenced view
+/// ([`DynoStore::valid_substream_segments`]), and the first offset it serves.
+///
+/// `served_from == entry.base_offset` for a disjoint entry. It is **greater**
+/// when the entry starts inside the range already covered by higher-priority
+/// segments and reaches past it (#461): the head `[entry.base_offset,
+/// served_from)` duplicates offsets an earlier segment already serves, and only
+/// the tail `[served_from, end())` belongs to this one. The byte fields are
+/// untouched — a region's offsets are positional from `entry.base_offset`, so
+/// it decodes whole and the consumer of the decode skips the batches wholly
+/// below `served_from`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct FencedSegment {
+    pub(crate) seq: u64,
+    pub(crate) served_from: i64,
+    pub(crate) entry: SubstreamEntry,
+}
+
+impl FencedSegment {
+    /// One past the last offset this segment serves.
+    fn end(&self) -> i64 {
+        self.entry.base_offset + self.entry.record_count
+    }
+
+    /// Whether this entry's head is served by an earlier segment (#461).
+    fn is_clipped(&self) -> bool {
+        self.served_from > self.entry.base_offset
+    }
 }
 
 /// Why a [`DynoStore::decode_frame`] scan stopped (#386).
@@ -3772,7 +3819,7 @@ impl DynoStore {
         let tail = self
             .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
             .last()
-            .map(|(_, entry)| entry.base_offset + entry.record_count);
+            .map(FencedSegment::end);
 
         // Certified after the refresh above, so the floor covers every
         // watermark advance whose segment deletion that listing could have
@@ -3923,7 +3970,7 @@ impl DynoStore {
             topition,
             self.valid_substream_segments(&prefix, topition.topic(), topition.partition())?
                 .last()
-                .map(|(_, entry)| entry.base_offset + entry.record_count),
+                .map(FencedSegment::end),
             from_watermark,
         );
 
@@ -5889,6 +5936,15 @@ impl DynoStore {
     /// Failing the run costs a merge; #398's quarantine then excludes the object
     /// and the drain proceeds over what is readable. Silently rewriting the
     /// prefix with shifted offsets costs the data.
+    ///
+    /// A **clipped** region ([`FencedSegment::is_clipped`], #461) contributes
+    /// from its first batch not wholly below `served_from`: the leading batches
+    /// duplicate offsets a higher-priority segment already serves, and fusing
+    /// them into a rewrite would concatenate duplicate offsets. The returned
+    /// base is that first kept batch's absolute offset — `served_from` when the
+    /// frontier lands on a batch boundary, below it when a batch straddles the
+    /// frontier (batches are opaque; the merge's contiguity check is what keeps
+    /// a straddle from being fused mid-run).
     fn decode_fenced_regions(
         &self,
         prefix: &str,
@@ -5899,20 +5955,20 @@ impl DynoStore {
         let fenced = self.valid_substream_segments(prefix, topic, partition)?;
         let mut regions = Vec::with_capacity(fenced.len());
 
-        for (seq, entry) in fenced {
-            let Some(object) = objects.get(&seq) else {
+        for fenced in fenced {
+            let Some(object) = objects.get(&fenced.seq) else {
                 continue;
             };
 
-            let start = entry.byte_start as usize;
-            let end = start + entry.byte_len as usize;
+            let start = fenced.entry.byte_start as usize;
+            let end = start + fenced.entry.byte_len as usize;
             if end > object.len() {
                 let available = object.slice(start.min(object.len())..);
 
                 return Err(RegionRead {
                     prefix,
-                    seq,
-                    entry: &entry,
+                    seq: fenced.seq,
+                    entry: &fenced.entry,
                     encoded: &available,
                 }
                 .short_of_extent(format!(
@@ -5922,11 +5978,24 @@ impl DynoStore {
                 )));
             }
 
-            regions.push((
-                seq,
-                entry.base_offset,
-                self.decode_region(prefix, seq, &entry, object.slice(start..end))?,
-            ));
+            let mut batches =
+                self.decode_region(prefix, fenced.seq, &fenced.entry, object.slice(start..end))?;
+
+            let mut base = fenced.entry.base_offset;
+            if fenced.is_clipped() {
+                let mut dropped = 0;
+                for batch in &batches {
+                    let span = batch.last_offset_delta as i64 + 1;
+                    if base + span > fenced.served_from {
+                        break;
+                    }
+                    base += span;
+                    dropped += 1;
+                }
+                drop(batches.drain(..dropped));
+            }
+
+            regions.push((fenced.seq, base, batches));
         }
 
         Ok(regions)
@@ -5980,20 +6049,25 @@ impl DynoStore {
         Ok(deleted)
     }
 
-    /// The epoch-fenced segments holding a sub-stream, as `(seq, entry)` sorted
-    /// by base offset (#59 review fix). A segment is written atomically under a
-    /// single-writer lease, so under normal operation a sub-stream's segments are
-    /// disjoint and monotonic; a fenced/zombie writer is the only way two
-    /// segments' offset ranges overlap. On overlap the higher `writer_epoch`
-    /// wins and the stale (lower-epoch) segment is dropped — so a stale-epoch
-    /// segment is ignored on read/recovery, exactly as the epic requires.
+    /// The epoch-fenced segments holding a sub-stream, sorted by base offset
+    /// (#59 review fix). A segment is written atomically under a single-writer
+    /// lease, so under normal operation a sub-stream's segments are disjoint
+    /// and monotonic; a fenced/zombie writer is the only way two segments'
+    /// offset ranges overlap. On overlap the higher `writer_epoch` wins: an
+    /// entry wholly inside the range those winners cover is dropped — so a
+    /// stale-epoch segment is ignored on read/recovery, exactly as the epic
+    /// requires — and an entry that reaches **past** that range is served
+    /// clipped to its tail ([`FencedSegment::served_from`], #461), because the
+    /// tail is held by nothing else and dropping it loses those offsets
+    /// everywhere this view is consumed: fetch, recovery, the high watermark,
+    /// retention and both compaction passes.
     /// Operates on the cached index (no object requests).
     fn valid_substream_segments(
         &self,
         prefix: &str,
         topic: &str,
         partition: i32,
-    ) -> Result<Vec<(u64, SubstreamEntry)>> {
+    ) -> Result<Vec<FencedSegment>> {
         let mut segs: Vec<(i64, u64, SubstreamEntry)> = self
             .prefix_index
             .lock()
@@ -6027,93 +6101,45 @@ impl DynoStore {
                 .then_with(|| b.1.cmp(&a.1))
         });
 
-        let mut out: Vec<(u64, SubstreamEntry)> = Vec::with_capacity(segs.len());
+        let mut out: Vec<FencedSegment> = Vec::with_capacity(segs.len());
         let mut covered_to = i64::MIN;
-        for (_epoch, seq, entry) in segs {
-            if entry.base_offset < covered_to {
-                // Overlaps an already-accepted (>= epoch) segment: stale, drop it.
-                //
-                // Sound only when the entry is *wholly* inside what is already
-                // covered — the merged segment's originals, which is what this
-                // rule is for. An entry that reaches PAST `covered_to` holds
-                // offsets nothing else holds, and dropping it loses them; see
-                // [`Self::substream_segments_reaching_past_frontier`], which is
-                // the guard compaction takes before it deletes anything (#461).
-                continue;
-            }
-            covered_to = covered_to.max(entry.base_offset + entry.record_count);
-            out.push((seq, entry));
-        }
-        Ok(out)
-    }
-
-    /// Sequences the fenced view drops **while they still hold offsets past the
-    /// frontier** (#461).
-    ///
-    /// Empty for every healthy prefix: the overlap rule exists to drop a merged
-    /// segment's originals, and those are wholly inside what the merge covers.
-    /// A non-empty answer means the sweep is about to discard a segment whose
-    /// tail nothing else holds — and on the compaction path, discarding it is
-    /// followed by `retire_segments` deleting the object, so the records are
-    /// destroyed rather than merely hidden.
-    ///
-    /// The proper fix is to *clip* rather than drop, which every one of this
-    /// function's ten callers has to be taught: a partially-overlapping region
-    /// decodes to batches the caller must skip past `covered_to`, or the read
-    /// path serves duplicate offsets and the merge concatenates them. Until
-    /// then, compaction refuses the run — the same trade #388 took for an
-    /// undecodable region, and for the same reason: a stalled drain is
-    /// recoverable and a deleted record is not.
-    fn substream_segments_reaching_past_frontier(
-        &self,
-        prefix: &str,
-        topic: &str,
-        partition: i32,
-    ) -> Result<Vec<u64>> {
-        let mut segs: Vec<(i64, u64, SubstreamEntry)> = self
-            .prefix_index
-            .lock()
-            .map_err(Into::<Error>::into)?
-            .get(prefix)
-            .map(|index| {
-                index
-                    .segments
-                    .iter()
-                    .filter_map(|(seq, cached)| {
-                        cached
-                            .footer
-                            .get(topic, partition)
-                            .map(|entry| (cached.footer.writer_epoch, *seq, entry.clone()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        segs.sort_by(|a, b| {
-            a.2.base_offset
-                .cmp(&b.2.base_offset)
-                .then_with(|| b.0.cmp(&a.0))
-                .then_with(|| b.1.cmp(&a.1))
-        });
-
-        let mut lost = Vec::new();
-        let mut covered_to = i64::MIN;
-
         for (_epoch, seq, entry) in segs {
             let end = entry.base_offset + entry.record_count;
 
-            if entry.base_offset < covered_to {
-                if end > covered_to {
-                    lost.push(seq);
-                }
-
+            // Wholly inside what an already-accepted (>= epoch) segment covers:
+            // stale, drop it. This is the merged segment's originals — the case
+            // the overlap rule exists for — and a zombie writer's duplicate of
+            // records the winning epoch also holds.
+            if end <= covered_to {
                 continue;
             }
 
-            covered_to = covered_to.max(end);
-        }
+            // Overlaps the frontier and reaches past it: serve its TAIL,
+            // `[covered_to, end)` (#461). The head duplicates offsets an
+            // earlier segment already serves, but the tail is held by nothing
+            // else — the reader's rule from `docs/virtual-topics-format.md`
+            // ("drop any entry whose `base_offset` falls below the range
+            // already covered") is written for resolving ONE offset, where the
+            // higher-priority entry already answers it, and applied to
+            // *coverage* it discards records: silently on the read path, and
+            // durably on the compaction path, where `retire_segments` deletes
+            // the run after the merge. The same error, from the same source,
+            // was in the audit until #460.
+            let served_from = if entry.base_offset < covered_to {
+                SEGMENT_OVERLAP_CLIPPED.add(1, &[]);
+                covered_to
+            } else {
+                entry.base_offset
+            };
 
-        Ok(lost)
+            covered_to = end;
+            out.push(FencedSegment {
+                seq,
+                served_from,
+                entry,
+            });
+        }
+        Ok(out)
     }
 
     /// Recover a prefix-coalesced sub-stream's next offset (#58) when the
@@ -6135,7 +6161,7 @@ impl DynoStore {
         let segment_tail = self
             .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
             .last()
-            .map(|(_, entry)| entry.base_offset + entry.record_count)
+            .map(FencedSegment::end)
             .unwrap_or(0);
 
         // `persisted_floor` is supplied by the caller (the persisted
@@ -6275,15 +6301,15 @@ impl DynoStore {
             // 5 ms, 1 417 ms at 20 ms — exactly linear, and that is the innermost
             // loop alone.
             let mut bytes = max_bytes as u64;
-            let mut plan: Vec<(u64, SubstreamEntry)> = Vec::new();
+            let mut plan: Vec<FencedSegment> = Vec::new();
 
-            for (seq, entry) in segments {
+            for fenced in segments {
                 // Segments are sorted by base offset; skip those ending at/before
                 // the requested offset, stop once one starts at/past the HWM.
-                if entry.base_offset + entry.record_count <= offset {
+                if fenced.end() <= offset {
                     continue;
                 }
-                if entry.base_offset >= high_watermark {
+                if fenced.entry.base_offset >= high_watermark {
                     break;
                 }
 
@@ -6292,8 +6318,8 @@ impl DynoStore {
                 // its batches, and only then compared. Preserved exactly —
                 // returning one region fewer per round trip is a behaviour change
                 // a client would see.
-                let byte_len = entry.byte_len;
-                plan.push((seq, entry));
+                let byte_len = fenced.entry.byte_len;
+                plan.push(fenced);
 
                 if byte_len > bytes {
                     break;
@@ -6310,11 +6336,13 @@ impl DynoStore {
             // `buffered` polls them, so this allocates, it does not serialise.
             let reads = plan
                 .iter()
-                .map(|(seq, entry)| {
-                    let location = self.segment_location(prefix, *seq);
+                .map(|fenced| {
+                    let seq = fenced.seq;
+                    let entry = &fenced.entry;
+                    let location = self.segment_location(prefix, seq);
 
                     async move {
-                        self.note_segment_data_read(prefix, *seq, entry.byte_start, entry.byte_len);
+                        self.note_segment_data_read(prefix, seq, entry.byte_start, entry.byte_len);
 
                         // One ranged GET of exactly this sub-stream's byte span.
                         match self
@@ -6343,7 +6371,7 @@ impl DynoStore {
                                 // corrected extent with a stale span.
                                 if (encoded.len() as u64) < entry.byte_len {
                                     self.resolve_short_region(
-                                        prefix, *seq, entry, &location, &encoded,
+                                        prefix, seq, entry, &location, &encoded,
                                     )
                                     .await?;
 
@@ -6363,12 +6391,12 @@ impl DynoStore {
                                 // partition `CORRUPT_MESSAGE` (#386) rather than
                                 // propagating a bare integer-conversion failure that
                                 // took the request, and the connection, with it.
-                                match self.decode_region(prefix, *seq, entry, encoded) {
+                                match self.decode_region(prefix, seq, entry, encoded) {
                                     Ok(decoded) => Ok(RegionOutcome::Decoded(decoded)),
 
                                     Err(Error::CorruptSegment(corrupt)) => {
                                         self.resolve_corrupt_region(
-                                            prefix, *seq, entry, &location, corrupt,
+                                            prefix, seq, entry, &location, corrupt,
                                         )
                                         .await?;
 
@@ -6408,7 +6436,7 @@ impl DynoStore {
             // loop's. Stopping early drops the futures still in flight, which
             // cancels their reads — the same thing the serial `break` did, one
             // round trip earlier.
-            for (seq, entry) in plan.iter() {
+            for fenced in plan.iter() {
                 // Checked before consuming, which is where the serial loop
                 // checked it: before the work for this segment, not after. Tested
                 // after the await instead, a single GET that spends the budget
@@ -6423,11 +6451,24 @@ impl DynoStore {
 
                 match outcome? {
                     RegionOutcome::Decoded(region) => {
-                        let mut running = entry.base_offset;
+                        let mut running = fenced.entry.base_offset;
                         for mut batch in region {
                             let span = batch.last_offset_delta as i64 + 1;
                             batch.base_offset = running;
                             running += span;
+
+                            // A batch wholly below `served_from` duplicates
+                            // offsets the higher-priority segment before this
+                            // one already served (#461): skip it. A batch
+                            // straddling the frontier is kept whole — its tail
+                            // is held by nothing else, and a consumer skips
+                            // records below its position, exactly as for any
+                            // compressed batch starting before the fetch
+                            // offset.
+                            if running <= fenced.served_from {
+                                continue;
+                            }
+
                             batches.push(batch);
                         }
                     }
@@ -6446,7 +6487,7 @@ impl DynoStore {
                         // nothing here ever said how much of it was stale.
                         SEGMENT_VANISHED_BEFORE_READ.add(1, &[]);
                         SEGMENT_ABSENT.add(1, &[KeyValue::new("caller", "fetch")]);
-                        self.index_prune(prefix, &[*seq])?;
+                        self.index_prune(prefix, &[fenced.seq])?;
 
                         // This 404 is proof the index is stale, and pruning the
                         // one sequence it named leaves every other stale entry in
@@ -6461,7 +6502,7 @@ impl DynoStore {
                         _ = self
                             .reconcile_prefix_index(prefix)
                             .await
-                            .inspect_err(|err| debug!(?err, prefix, seq));
+                            .inspect_err(|err| debug!(?err, prefix, seq = fenced.seq));
 
                         self.index_invalidate(prefix)?;
                         restart = true;
@@ -6495,7 +6536,7 @@ impl DynoStore {
         Ok(self
             .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
             .first()
-            .map(|(_, entry)| entry.base_offset))
+            .map(|fenced| fenced.entry.base_offset))
     }
 
     /// Whether `topic`'s `cleanup.policy` is `compact`, memoized for
@@ -6589,7 +6630,7 @@ impl DynoStore {
         Ok(self
             .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
             .last()
-            .map(|(_, entry)| entry.max_timestamp)
+            .map(|fenced| fenced.entry.max_timestamp)
             .filter(|&ms| ms >= 0)
             .map(|ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms as u64)))
     }
@@ -6676,23 +6717,26 @@ impl DynoStore {
             let found = self
                 .valid_substream_segments(&prefix, topition.topic(), topition.partition())?
                 .into_iter()
-                .find(|(_, entry)| entry.max_timestamp >= 0 && entry.max_timestamp >= target_ms);
+                .find(|fenced| {
+                    fenced.entry.max_timestamp >= 0 && fenced.entry.max_timestamp >= target_ms
+                });
 
             // A truncated segment survives physically (#176), so the located
             // base offset can sit below the truncation floor — clamp, exactly
-            // as EARLIEST does.
+            // as EARLIEST does. `served_from`, not `base_offset`: a clipped
+            // entry's head belongs to the segment before it (#461), whose
+            // records are all older than the target.
             let offset = match &found {
-                Some((_, entry)) => {
-                    Some(entry.base_offset.max(self.truncate_floor(topition).await?))
-                }
+                Some(fenced) => Some(fenced.served_from.max(self.truncate_floor(topition).await?)),
                 None => None,
             };
 
             return Ok(Some(ListOffsetResponse {
                 error_code: ErrorCode::None,
                 offset,
-                timestamp: found.as_ref().map(|(_, entry)| {
-                    SystemTime::UNIX_EPOCH + Duration::from_millis(entry.max_timestamp as u64)
+                timestamp: found.as_ref().map(|fenced| {
+                    SystemTime::UNIX_EPOCH
+                        + Duration::from_millis(fenced.entry.max_timestamp as u64)
                 }),
             }));
         }
@@ -7415,7 +7459,7 @@ impl DynoStore {
         let segment_tail = self
             .valid_substream_segments(prefix, topition.topic(), topition.partition())?
             .last()
-            .map(|(_, entry)| entry.base_offset + entry.record_count)
+            .map(FencedSegment::end)
             .unwrap_or(0);
         let cached = self.cached_high(topition)?.unwrap_or(0);
 
@@ -7480,10 +7524,10 @@ impl DynoStore {
         producer_id: i64,
     ) -> Result<ProducerTail> {
         let mut tail = ProducerTail::default();
-        for (_seq, entry) in
+        for fenced in
             self.valid_substream_segments(prefix, topition.topic(), topition.partition())?
         {
-            for pc in &entry.producers {
+            for pc in &fenced.entry.producers {
                 // Belt and braces: `base_sequence == -1` also catches any
                 // future non-sequenced coordinate that lacks the flag (a v2
                 // footer decodes with `flags == 0`).
@@ -7495,7 +7539,7 @@ impl DynoStore {
                         pc.producer_epoch,
                         pc.base_sequence,
                         pc.last_sequence,
-                        entry.base_offset + pc.offset_delta as i64,
+                        fenced.entry.base_offset + pc.offset_delta as i64,
                     );
                 }
             }
@@ -8354,11 +8398,11 @@ impl DynoStore {
         let expirable_seqs: BTreeSet<u64> = expirable.iter().copied().collect();
         for (topic, partition) in &affected {
             let segments = self.valid_substream_segments(prefix, topic, *partition)?;
-            let tail = segments.last().map(|(_, e)| e.base_offset + e.record_count);
+            let tail = segments.last().map(FencedSegment::end);
             let surviving = segments
                 .iter()
-                .filter(|(seq, _)| !expirable_seqs.contains(seq))
-                .map(|(_, e)| e.base_offset + e.record_count)
+                .filter(|fenced| !expirable_seqs.contains(&fenced.seq))
+                .map(FencedSegment::end)
                 .max();
             if let Some(tail) = tail {
                 let tp = Topition::new(topic.clone(), *partition);
@@ -8698,8 +8742,9 @@ impl DynoStore {
         // Merge the EPOCH-FENCED view (#66 review fix, critical): rebuild each
         // sub-stream from `decode_fenced_regions` (overlap-resolved, higher
         // epoch/sequence wins) restricted to the run — NOT the raw footer
-        // entries. A zombie/overlap input is dropped there, never fused into the
-        // merged segment, so compaction can't bake in duplicate/shifted offsets.
+        // entries. A zombie/dominated input is dropped there and an overlap's
+        // duplicated head is clipped off (#461), never fused into the merged
+        // segment, so compaction can't bake in duplicate/shifted offsets.
         let substream_keys: BTreeSet<(String, i32)> = footers
             .values()
             .flat_map(|footer| {
@@ -8714,36 +8759,6 @@ impl DynoStore {
         let mut merged_epoch = i64::MIN;
 
         for (topic, partition) in substream_keys {
-            // Refuse the run rather than destroy a tail (#461). The fenced view
-            // below drops an entry whose `base_offset` falls under the frontier,
-            // and `retire_segments` at the end of this function deletes every
-            // object in the run — so a dropped entry that still held offsets
-            // past the frontier has those records deleted, not merely omitted.
-            //
-            // Failing the tick is the same trade #388 took for an undecodable
-            // region: compaction stalls on this prefix, `S` grows, and an
-            // operator sees it. That is recoverable; a deleted record is not.
-            let reaching =
-                self.substream_segments_reaching_past_frontier(prefix, &topic, partition)?;
-
-            if !reaching.is_empty() {
-                SEGMENT_COMPACT_REFUSED.add(
-                    1,
-                    &[KeyValue::new("reason", "overlap_reaching_past_frontier")],
-                );
-
-                error!(
-                    prefix,
-                    topic,
-                    partition,
-                    ?reaching,
-                    "refusing to compact: the fenced view would drop a segment whose \
-                     tail nothing else holds, and the run is retired after the merge"
-                );
-
-                return Ok(CompactRun::Drained);
-            }
-
             let in_run = self.decode_fenced_regions(prefix, &topic, partition, &objects)?;
 
             // Every run segment holding this sub-stream is superseded by a
@@ -8752,6 +8767,46 @@ impl DynoStore {
                 continue;
             };
             let base = *base;
+
+            // The merged region is read back by running offsets from `base`, so
+            // the run's regions must tile `[base, ..)` exactly — one batch after
+            // another, no gap and no overlap. `decode_fenced_regions` clips a
+            // region overlapping the frontier to whole batches past it (#461),
+            // and when the clip lands on a batch boundary the tiling holds and
+            // the merge *heals* the overlap. It cannot hold when the frontier
+            // falls inside a batch (batches are opaque: splitting one is a
+            // re-encode this pass does not do) or when the segment that set the
+            // frontier sits outside the run — fusing either would shift every
+            // record above the seam onto the wrong offset, and `retire_segments`
+            // at the end of this function then deletes the originals they could
+            // still have been read from. Refuse the run instead: the same trade
+            // #388 took for an undecodable region — compaction stalls on this
+            // prefix, `S` grows, an operator sees it, and that is recoverable
+            // where a deleted or mislabeled record is not.
+            let mut expected = base;
+            for (_, region_base, region) in &in_run {
+                if *region_base != expected {
+                    SEGMENT_COMPACT_REFUSED
+                        .add(1, &[KeyValue::new("reason", "run_not_contiguous")]);
+
+                    error!(
+                        prefix,
+                        topic,
+                        partition,
+                        expected,
+                        region_base,
+                        "refusing to compact: the run's fenced regions do not tile \
+                         contiguously, and merging them would shift offsets"
+                    );
+
+                    return Ok(CompactRun::Drained);
+                }
+
+                expected += region
+                    .iter()
+                    .map(|batch| batch.last_offset_delta as i64 + 1)
+                    .sum::<i64>();
+            }
 
             let mut batches = Vec::new();
             for (seq, _, region) in in_run {
@@ -8839,6 +8894,15 @@ impl DynoStore {
     /// conservative) and their producer coordinates (#88 dedup still observes
     /// producers whose batches were fully compacted).
     ///
+    /// The one exception is a region the fenced view serves clipped (#461):
+    /// its rewrite starts at the clip — `decode_fenced_regions` sheds the head
+    /// batches a higher-priority segment already serves — so it covers the
+    /// served tail rather than the original span. That is still resolver-safe
+    /// on both sides of the write→delete window: while the original survives,
+    /// it precedes the rewrite in base order and the rewrite is wholly inside
+    /// what it and its frontier-setter cover (dropped); once the original is
+    /// retired, the rewrite serves exactly the tail the original was serving.
+    ///
     /// Memory: the prefix's segments are held decoded for the walk — bounded by
     /// the size merge's `prefix_compact_target_bytes` fold of the same prefix,
     /// and by O(distinct keys per partition) for `seen`, capped by
@@ -8899,7 +8963,8 @@ impl DynoStore {
         };
 
         // Per-key transform over the EPOCH-FENCED view (as the size merge): a
-        // zombie/overlap region is dropped from any rewrite, never fused in.
+        // zombie/dominated region is dropped from any rewrite and an overlap's
+        // duplicated head batches are clipped off (#461), never fused in.
         // `outputs[seq]` accumulates every fenced sub-stream's (possibly
         // compacted) region so a dirty segment can be rebuilt whole.
         let mut outputs: BTreeMap<u64, Vec<(Topition, i64, Vec<deflated::Batch>)>> =
@@ -9912,7 +9977,7 @@ impl DynoStore {
             let Some(tail) = self
                 .valid_substream_segments(prefix, topic, *partition)?
                 .last()
-                .map(|(_, entry)| entry.base_offset + entry.record_count)
+                .map(FencedSegment::end)
             else {
                 continue;
             };
