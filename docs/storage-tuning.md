@@ -111,6 +111,31 @@ raises the segment PUT rate by the same factor. That is the whole trade, and the
 cost side is quantified under
 [What `coalesce_linger` is worth](#what-coalesce_linger-is-worth-and-where-it-stops).
 
+#### A wide request costs one window, not one per partition
+
+`1 / (linger + PUT)` is the ceiling **per request**, whatever that request is
+worth. It used not to be: the partitions of a produce were written one after the
+other, each `produce` awaited to completion before the next began, and since a
+produce completes only when its coalescing window has flushed, an N-partition
+request cost **N × linger** end to end. That is what made the same paced
+producer measurably *slower* against eight partitions than against one (#439) —
+the reading at the time was "more batches, more requests", and the truth was one
+request paying eight flush windows.
+
+The partitions of a request are independent logs and nothing in the protocol
+orders them against each other, so they are now written at once, bounded like
+every other fan-out in the engine. A request naming 8 partitions costs one
+window; one naming 32 costs one window.
+
+Two entries naming the *same* `(topic, partition)` in one request still run in
+the order the client wrote them, as the batches within one entry always have. No
+Kafka client sends that shape and the protocol does not say what it means, but a
+hand-rolled one that does gets ordering rather than a race.
+
+This does not move the per-connection ceiling — that is still one request at a
+time per connection, and still `1 / (linger + PUT)`. It removes the penalty for
+*width*, which is the dimension a CDC workload grows in.
+
 ## `message_max_bytes` — the largest batch this broker accepts
 
 Kafka's `message.max.bytes`, defaulting to Kafka's own value (`1048588` — 1 MiB
