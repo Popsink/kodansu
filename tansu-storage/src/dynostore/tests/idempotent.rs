@@ -36,7 +36,7 @@ use tansu_sans_io::{
 
 use crate::{
     Error, Result, Storage, Topition, TxnAddPartitionsRequest,
-    dynostore::{CoalesceTuning, CompactRun, DynoStore, tests::init_tracing},
+    dynostore::{CoalesceTuning, CompactRun, DynoStore, Substream, tests::init_tracing},
 };
 
 const CLUSTER: &str = "tansu";
@@ -392,7 +392,7 @@ async fn compaction_carries_producer_coordinates_forward() -> Result<(), Error> 
     // coordinates (base sequences 0..4 for this producer) — not dropped.
     store.refresh_prefix_index(PREFIX).await?;
     let carried: Vec<i32> = store
-        .valid_substream_segments(PREFIX, topic, 0)?
+        .valid_substream_segments(PREFIX, &Substream::Name(topic.into()), 0)?
         .into_iter()
         .flat_map(|fenced| fenced.entry.producers)
         .filter(|coord| coord.producer_id == pid)

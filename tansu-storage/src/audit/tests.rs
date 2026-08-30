@@ -33,7 +33,10 @@ use tansu_sans_io::{
 
 use url::Url;
 
-use crate::{Error, Result, Storage, Topition, dynostore::DynoStore};
+use crate::{
+    Error, Result, Storage, TopicId, Topition,
+    dynostore::{CoalesceTuning, DynoStore, SEGMENT_FORMAT_VERSION_V4},
+};
 
 use super::{Audit, AuditReport, Slice, audit_partition, cleanup_policy, segment_coordinates};
 
@@ -130,6 +133,52 @@ async fn audit(bucket: &InMemory) -> Result<AuditReport> {
     Audit::new(Arc::new(bucket.clone()) as Arc<dyn ObjectStore>, CLUSTER)
         .run()
         .await
+}
+
+/// A deleted-and-recreated id-keyed topic leaves its predecessor's slices in the
+/// shared segments, and the audit counts them rather than auditing them (#442).
+///
+/// Auditing them would be a false positive with real consequences: the two
+/// incarnations' offset ranges both start at 0, so read as one log they look like
+/// a mass of overlaps and holes — on the headline number an operator uses to
+/// decide whether a cluster has lost data. No reader can reach them, so the
+/// coverage question does not apply. The count still has to be reported, because
+/// they are storage being paid for.
+#[tokio::test]
+async fn a_retired_incarnation_is_counted_not_audited() -> Result<(), Error> {
+    let bucket = InMemory::new();
+
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).coalesce_tuning(CoalesceTuning {
+        segment_format_version: Some(SEGMENT_FORMAT_VERSION_V4),
+        ..Default::default()
+    });
+
+    let tp = Topition::new(TOPIC, 0);
+
+    create_topic(&store, TOPIC, &[]).await?;
+    assert_eq!(0, store.produce(None, &tp, batch(3)?).await?);
+
+    _ = store.delete_topic(&TopicId::Name(TOPIC.into())).await?;
+
+    create_topic(&store, TOPIC, &[]).await?;
+    assert_eq!(0, store.produce(None, &tp, batch(2)?).await?);
+
+    let report = audit(&bucket).await?;
+
+    assert_eq!(
+        1, report.retired_substreams,
+        "the predecessor's sub-stream must be counted"
+    );
+
+    // One topic, one partition, and it is the successor's log: two records from
+    // offset 0, with nothing lost.
+    assert_eq!(1, report.topics.len());
+    assert_eq!(TOPIC, report.topics[0].topic);
+    assert_eq!(1, report.topics[0].partitions.len());
+    assert_eq!(2, report.topics[0].span());
+    assert_eq!(0, report.lost_records());
+
+    Ok(())
 }
 
 /// The whole point: a segment that no longer exists leaves an offset range in

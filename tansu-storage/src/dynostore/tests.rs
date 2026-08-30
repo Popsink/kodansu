@@ -50,6 +50,7 @@ mod scram_credentials;
 mod segment;
 mod segment_create;
 mod short_region;
+mod substream_identity;
 mod topic_churn;
 
 /// Write a legacy `{group}.json` — the single group object the #359 cutover

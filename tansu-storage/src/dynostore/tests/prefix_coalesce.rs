@@ -49,7 +49,7 @@ use crate::{
     Error, Result, Storage, TopicId, Topition, TxnAddPartitionsRequest,
     dynostore::{
         CoalesceTuning, CompactRun, DynoStore, Era, PrefixLease, SegmentFooter, ServedEnd,
-        SubstreamEntry, TxnProduceOffset,
+        Substream, SubstreamEntry, TxnProduceOffset,
     },
     storage_error_code,
 };
@@ -157,6 +157,7 @@ fn segment_path(seq: u64) -> Path {
 fn entry(topic: &str, base: i64, count: i64) -> SubstreamEntry {
     SubstreamEntry {
         topic: topic.to_owned(),
+        topic_id: None,
         partition: 0,
         base_offset: base,
         record_count: count,
@@ -290,11 +291,15 @@ async fn one_window_across_topics_is_one_segment() -> Result<(), Error> {
     let footer = footer_of(&bucket, &segments[0]).await;
     assert_eq!(2, footer.entries.len());
 
-    let ea = footer.get(topic_a, 0).expect("tab_a entry");
+    let ea = footer
+        .get(&Substream::Name(topic_a.into()), 0)
+        .expect("tab_a entry");
     assert_eq!(0, ea.base_offset);
     assert_eq!(4, ea.record_count);
 
-    let eb = footer.get(topic_b, 0).expect("tab_b entry");
+    let eb = footer
+        .get(&Substream::Name(topic_b.into()), 0)
+        .expect("tab_b entry");
     assert_eq!(0, eb.base_offset);
     assert_eq!(4, eb.record_count);
 
@@ -1786,6 +1791,7 @@ async fn epoch_fencing_drops_stale_overlapping_segment() -> Result<(), Error> {
 
     let entry = |base: i64, count: i64| SubstreamEntry {
         topic: topic.to_owned(),
+        topic_id: None,
         partition: 0,
         base_offset: base,
         record_count: count,
@@ -1807,7 +1813,7 @@ async fn epoch_fencing_drops_stale_overlapping_segment() -> Result<(), Error> {
     // seq2 epoch1 [10,20) — a zombie overlapping seq1 with the OLD epoch.
     store.index_insert(PREFIX, 2, footer(1, 10, 10), 0)?;
 
-    let valid = store.valid_substream_segments(PREFIX, topic, 0)?;
+    let valid = store.valid_substream_segments(PREFIX, &Substream::Name(topic.into()), 0)?;
     let seqs: Vec<u64> = valid.iter().map(|fenced| fenced.seq).collect();
     assert_eq!(vec![0, 1], seqs, "zombie seq2 dropped, higher epoch wins");
 

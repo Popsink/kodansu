@@ -73,11 +73,13 @@ use object_store::{
 use serde::Serialize;
 use tracing::debug;
 use url::Url;
+use uuid::Uuid;
 
 use crate::{
     Error, Result,
     dynostore::{
         DynoStore, SEGMENT_FOOTER_OVER_READ, SEGMENT_MAGIC, SEGMENT_TRAILER_LEN, SegmentFooter,
+        Substream,
     },
 };
 
@@ -239,6 +241,16 @@ pub struct AuditReport {
     pub faults: Vec<SegmentFault>,
     /// Every topic with at least one segment slice, sorted by name.
     pub topics: Vec<TopicAudit>,
+    /// Sub-streams belonging to a topic incarnation the bucket no longer
+    /// resolves that name to (#442) — a deleted or recreated id-keyed topic
+    /// whose slices survive in shared segments until every co-tenant is past
+    /// retention.
+    ///
+    /// Counted rather than audited: no reader can reach them, so measuring their
+    /// coverage would report gaps nothing can suffer. Counted rather than
+    /// dropped silently, because they are physical debt an operator is paying
+    /// for and the number is the only place it shows.
+    pub retired_substreams: usize,
 }
 
 impl AuditReport {
@@ -352,8 +364,12 @@ impl Audit {
             ..Default::default()
         };
 
-        // (topic, partition) -> the slices every segment contributes to it.
-        let mut slices: BTreeMap<(String, i32), Vec<Slice>> = BTreeMap::new();
+        // (sub-stream, topic, partition) -> the slices every segment contributes
+        // to it. Identified as well as named (#442): a topic deleted and
+        // recreated leaves its predecessor's slices in the shared segments, and
+        // auditing the two incarnations as one log reports overlaps and holes
+        // that no reader can see — a reader resolves one identity at a time.
+        let mut slices: BTreeMap<(Substream, String, i32), Vec<Slice>> = BTreeMap::new();
         let mut prefixes = BTreeSet::new();
 
         let located = self.locate_segments().await?;
@@ -423,7 +439,7 @@ impl Audit {
 
             for entry in &footer.entries {
                 slices
-                    .entry((entry.topic.clone(), entry.partition))
+                    .entry((entry.substream(), entry.topic.clone(), entry.partition))
                     .or_default()
                     .push(Slice {
                         prefix: prefix.clone(),
@@ -449,30 +465,50 @@ impl Audit {
         report.legacy_batches = legacy.values().sum();
 
         let policies = self.cleanup_policies().await?;
+        let identities = self.substream_identities().await?;
 
         // A topition with only legacy objects has no segment slices, so seed the
         // topic list from both: the audit cannot measure its gaps, but silently
         // omitting a topic that has data would read as "clean".
-        let topitions: BTreeSet<(String, i32)> = slices
+        let topitions: BTreeSet<(Substream, String, i32)> = slices
             .keys()
             .cloned()
-            .chain(legacy.keys().cloned())
+            .chain(
+                legacy
+                    .keys()
+                    .map(|(topic, partition)| {
+                        // A legacy `records/` object predates segments entirely,
+                        // so its sub-stream is keyed by name by construction.
+                        (Substream::Name(topic.clone()), topic.clone(), *partition)
+                    })
+                    .collect::<Vec<_>>(),
+            )
             .collect();
 
         let mut by_topic: BTreeMap<String, Vec<PartitionAudit>> = BTreeMap::new();
 
-        for (topic, partition) in topitions {
-            let mut audit = audit_partition(
-                partition,
-                slices
-                    .remove(&(topic.clone(), partition))
-                    .unwrap_or_default(),
-            );
-
-            audit.legacy_batches = legacy
-                .get(&(topic.clone(), partition))
-                .copied()
+        for (substream, topic, partition) in topitions {
+            let held = slices
+                .remove(&(substream.clone(), topic.clone(), partition))
                 .unwrap_or_default();
+
+            // Not the incarnation this name resolves to: unreachable, so
+            // counted rather than audited (#442).
+            if current_substream(&identities, &topic) != substream {
+                report.retired_substreams += 1;
+                continue;
+            }
+
+            let mut audit = audit_partition(partition, held);
+
+            // Legacy `records/` objects predate segments entirely, so they
+            // belong to a name-keyed sub-stream and to no other.
+            if matches!(substream, Substream::Name(_)) {
+                audit.legacy_batches = legacy
+                    .get(&(topic.clone(), partition))
+                    .copied()
+                    .unwrap_or_default();
+            }
 
             by_topic.entry(topic).or_default().push(audit);
         }
@@ -594,6 +630,66 @@ impl Audit {
     /// none. A topic absent from the map has no `topic-metadata` object at all,
     /// which [`TopicAudit::metadata_missing`] reports separately — the two are
     /// different facts.
+    /// Each topic's pinned sub-stream id (#442), by name — `None` for a
+    /// name-keyed topic, absent for a name with no routing pin at all (which is
+    /// what a deleted topic leaves).
+    ///
+    /// One listing of `topic-routing/` plus a GET each, exactly as
+    /// [`Self::cleanup_policies`] does for `topic-metadata/`. Read as untyped
+    /// JSON for the same reason: the audit is a forensic tool pointed at buckets
+    /// written by other releases, and a field it does not model must not make it
+    /// refuse to run.
+    async fn substream_identities(&self) -> Result<BTreeMap<String, Option<Uuid>>> {
+        let prefix = Path::from(format!("clusters/{}/topic-routing", self.cluster));
+
+        let locations: Vec<Path> = self
+            .object_store
+            .list(Some(&prefix))
+            .map_err(Error::from)
+            .try_filter_map(|meta| async move {
+                Ok(meta
+                    .location
+                    .as_ref()
+                    .ends_with(".json")
+                    .then_some(meta.location))
+            })
+            .try_collect()
+            .await?;
+
+        let mut identities = BTreeMap::new();
+
+        let mut fetched = stream::iter(locations.into_iter().map(|location| async move {
+            let bytes = self.object_store.get(&location).await?.bytes().await?;
+            Result::<(Path, Bytes)>::Ok((location, bytes))
+        }))
+        .buffer_unordered(self.concurrency);
+
+        while let Some(fetched) = fetched.next().await {
+            let (location, bytes) = fetched?;
+
+            let Some(topic) = location
+                .filename()
+                .and_then(|name| name.strip_suffix(".json"))
+            else {
+                continue;
+            };
+
+            let routing: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+                Error::Message(format!("{location}: unreadable topic routing: {error}"))
+            })?;
+
+            _ = identities.insert(
+                topic.to_owned(),
+                routing
+                    .get("substream_id")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|id| Uuid::parse_str(id).ok()),
+            );
+        }
+
+        Ok(identities)
+    }
+
     async fn cleanup_policies(&self) -> Result<BTreeMap<String, Option<String>>> {
         let prefix = Path::from(format!("clusters/{}/topic-metadata", self.cluster));
 
@@ -655,6 +751,17 @@ struct Decoded {
 /// is a defect that shipped — an entry claiming bytes past the object (#393,
 /// #395), a region the index describes wrongly (#397, #403) — so a bucket
 /// written by an older release can still be carrying one.
+/// What `topic` resolves to in this bucket right now (#442). A name with no
+/// routing pin — what a deleted topic leaves behind — resolves to itself, so a
+/// name-keyed orphan is still audited as the topic it was.
+fn current_substream(identities: &BTreeMap<String, Option<Uuid>>, topic: &str) -> Substream {
+    identities
+        .get(topic)
+        .copied()
+        .flatten()
+        .map_or_else(|| Substream::Name(topic.to_owned()), Substream::Id)
+}
+
 fn structural_faults(size: u64, footer_len: usize, footer: &SegmentFooter) -> Vec<String> {
     let mut faults = Vec::new();
 

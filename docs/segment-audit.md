@@ -60,6 +60,7 @@ about a surviving object.
 segments      3 054 in 35 prefixes (v3 3054)
 unreadable    0
 legacy        26 149 abandoned records/ objects — the broker has served none since #179
+retired       4 sub-streams of deleted topic incarnations — unreachable, held until every co-tenant of their segments is past retention
 
 records lost  32 424 376 of 253 966 964 offsets — 12.77 %
               cleanup.policy=delete only, and a floor: a hole is visible only
@@ -68,6 +69,13 @@ records lost  32 424 376 of 253 966 964 offsets — 12.77 %
 TOPIC                            P            SPAN            LOST        %  RANGES
 org.env.conn.tab_a               1      16 003 452      13 490 384   84.30%      37
 ```
+
+`retired` appears only on a bucket with id-keyed topics (`segment_format=4`,
+#442). A topic deleted and recreated under the same name leaves its
+predecessor's slices in the shared segments, and nothing can reach them — so
+they are counted, not audited. Auditing them would be a false positive with
+teeth: both incarnations' offset ranges start at 0, so read as one log they look
+like a mass of overlaps and holes, on exactly the number below.
 
 Three things about that headline are load-bearing.
 
