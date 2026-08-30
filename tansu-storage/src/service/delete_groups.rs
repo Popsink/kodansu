@@ -55,7 +55,13 @@ use crate::{Error, Result, Storage, authorized};
 /// let results = response.results.unwrap_or_default();
 /// assert_eq!(1, results.len());
 /// assert_eq!(group_id, results[0].group_id.as_str());
-/// assert_eq!(ErrorCode::None, ErrorCode::try_from(results[0].error_code)?);
+///
+/// // Nothing has created this group, and a delete says so rather than
+/// // reporting success for work it did not do (#445).
+/// assert_eq!(
+///     ErrorCode::GroupIdNotFound,
+///     ErrorCode::try_from(results[0].error_code)?
+/// );
 /// # Ok(())
 /// # }
 /// ```
@@ -167,7 +173,16 @@ mod tests {
         let results = response.results.unwrap_or_default();
         assert_eq!(1, results.len());
         assert_eq!(group_id, results[0].group_id.as_str());
-        assert_eq!(ErrorCode::None, ErrorCode::try_from(results[0].error_code)?);
+
+        // This test's own name is the assertion: deleting a group that does not
+        // exist reports that it does not exist. It answered `NONE` until #445,
+        // because existence was inferred from a delete — and a delete of an
+        // absent key succeeds. Tooling that distinguishes "idle group" from
+        // "nonexistent group" had nothing to read.
+        assert_eq!(
+            ErrorCode::GroupIdNotFound,
+            ErrorCode::try_from(results[0].error_code)?
+        );
 
         Ok(())
     }

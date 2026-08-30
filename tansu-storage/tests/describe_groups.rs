@@ -49,7 +49,12 @@ async fn req() -> Result<(), Error> {
     assert_eq!(1, groups.len());
     assert_eq!(ErrorCode::None, ErrorCode::try_from(groups[0].error_code)?);
     assert_eq!(group_id, groups[0].group_id.as_str());
-    assert_eq!("Empty", groups[0].group_state.as_str());
+    // A group nothing has ever created is `Dead`, not `Empty` (#445): Kafka
+    // reports `Empty` for a group that exists with nobody in it, and `Dead` for
+    // one it has never heard of. Reporting the two alike left
+    // cleanup-by-inactivity tooling unable to tell a group it should reap from
+    // one it has already reaped.
+    assert_eq!("Dead", groups[0].group_state.as_str());
 
     Ok(())
 }
