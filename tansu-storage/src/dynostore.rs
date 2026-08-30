@@ -1000,6 +1000,20 @@ static SEGMENT_FLUSHES: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Compaction runs refused rather than performed, by reason (#461).
+///
+/// Expected to be **flat zero**. A non-zero value means compaction met a prefix
+/// it could not merge without losing records and declined — so segments
+/// accumulate on that prefix until the underlying overlap is resolved, and
+/// `tansu_prefix_segments_live` will grow there. That is the intended trade: a
+/// stalled drain is recoverable and a deleted record is not.
+static SEGMENT_COMPACT_REFUSED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_segment_compact_refused")
+        .with_description("compaction runs refused to avoid losing records")
+        .build()
+});
+
 /// Segments merged away by compaction (#66) — bounds live segment count.
 static SEGMENT_COMPACTIONS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
@@ -6018,12 +6032,88 @@ impl DynoStore {
         for (_epoch, seq, entry) in segs {
             if entry.base_offset < covered_to {
                 // Overlaps an already-accepted (>= epoch) segment: stale, drop it.
+                //
+                // Sound only when the entry is *wholly* inside what is already
+                // covered — the merged segment's originals, which is what this
+                // rule is for. An entry that reaches PAST `covered_to` holds
+                // offsets nothing else holds, and dropping it loses them; see
+                // [`Self::substream_segments_reaching_past_frontier`], which is
+                // the guard compaction takes before it deletes anything (#461).
                 continue;
             }
             covered_to = covered_to.max(entry.base_offset + entry.record_count);
             out.push((seq, entry));
         }
         Ok(out)
+    }
+
+    /// Sequences the fenced view drops **while they still hold offsets past the
+    /// frontier** (#461).
+    ///
+    /// Empty for every healthy prefix: the overlap rule exists to drop a merged
+    /// segment's originals, and those are wholly inside what the merge covers.
+    /// A non-empty answer means the sweep is about to discard a segment whose
+    /// tail nothing else holds — and on the compaction path, discarding it is
+    /// followed by `retire_segments` deleting the object, so the records are
+    /// destroyed rather than merely hidden.
+    ///
+    /// The proper fix is to *clip* rather than drop, which every one of this
+    /// function's ten callers has to be taught: a partially-overlapping region
+    /// decodes to batches the caller must skip past `covered_to`, or the read
+    /// path serves duplicate offsets and the merge concatenates them. Until
+    /// then, compaction refuses the run — the same trade #388 took for an
+    /// undecodable region, and for the same reason: a stalled drain is
+    /// recoverable and a deleted record is not.
+    fn substream_segments_reaching_past_frontier(
+        &self,
+        prefix: &str,
+        topic: &str,
+        partition: i32,
+    ) -> Result<Vec<u64>> {
+        let mut segs: Vec<(i64, u64, SubstreamEntry)> = self
+            .prefix_index
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .get(prefix)
+            .map(|index| {
+                index
+                    .segments
+                    .iter()
+                    .filter_map(|(seq, cached)| {
+                        cached
+                            .footer
+                            .get(topic, partition)
+                            .map(|entry| (cached.footer.writer_epoch, *seq, entry.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        segs.sort_by(|a, b| {
+            a.2.base_offset
+                .cmp(&b.2.base_offset)
+                .then_with(|| b.0.cmp(&a.0))
+                .then_with(|| b.1.cmp(&a.1))
+        });
+
+        let mut lost = Vec::new();
+        let mut covered_to = i64::MIN;
+
+        for (_epoch, seq, entry) in segs {
+            let end = entry.base_offset + entry.record_count;
+
+            if entry.base_offset < covered_to {
+                if end > covered_to {
+                    lost.push(seq);
+                }
+
+                continue;
+            }
+
+            covered_to = covered_to.max(end);
+        }
+
+        Ok(lost)
     }
 
     /// Recover a prefix-coalesced sub-stream's next offset (#58) when the
@@ -8624,6 +8714,36 @@ impl DynoStore {
         let mut merged_epoch = i64::MIN;
 
         for (topic, partition) in substream_keys {
+            // Refuse the run rather than destroy a tail (#461). The fenced view
+            // below drops an entry whose `base_offset` falls under the frontier,
+            // and `retire_segments` at the end of this function deletes every
+            // object in the run — so a dropped entry that still held offsets
+            // past the frontier has those records deleted, not merely omitted.
+            //
+            // Failing the tick is the same trade #388 took for an undecodable
+            // region: compaction stalls on this prefix, `S` grows, and an
+            // operator sees it. That is recoverable; a deleted record is not.
+            let reaching =
+                self.substream_segments_reaching_past_frontier(prefix, &topic, partition)?;
+
+            if !reaching.is_empty() {
+                SEGMENT_COMPACT_REFUSED.add(
+                    1,
+                    &[KeyValue::new("reason", "overlap_reaching_past_frontier")],
+                );
+
+                error!(
+                    prefix,
+                    topic,
+                    partition,
+                    ?reaching,
+                    "refusing to compact: the fenced view would drop a segment whose \
+                     tail nothing else holds, and the run is retired after the merge"
+                );
+
+                return Ok(CompactRun::Drained);
+            }
+
             let in_run = self.decode_fenced_regions(prefix, &topic, partition, &objects)?;
 
             // Every run segment holding this sub-stream is superseded by a
