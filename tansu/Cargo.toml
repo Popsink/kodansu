@@ -15,12 +15,12 @@ workspace = true
 
 [dependencies]
 dotenv.workspace = true
-mimalloc.workspace = true
 tansu-broker = { workspace = true, default-features = false, optional = true }
 tansu-cli = { workspace = true, default-features = false, optional = true }
 tansu-sans-io.workspace = true
 tansu-storage = { workspace = true, default-features = false, optional = true }
 tansu-topic.workspace = true
+tikv-jemallocator.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 

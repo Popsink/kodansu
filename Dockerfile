@@ -16,7 +16,9 @@ FROM --platform=$BUILDPLATFORM tonistiigi/xx AS xx
 
 FROM --platform=$BUILDPLATFORM rust:1.88-alpine AS builder
 COPY --from=xx / /
-RUN apk add clang cmake lld
+# `make` is jemalloc's build system: `tikv-jemalloc-sys` shells out to
+# `./configure && make` (#476), where mimalloc only needed the `cc` crate.
+RUN apk add clang cmake lld make
 RUN rustup target add $(xx-cargo --print-target-triple)
 
 WORKDIR /usr/src
