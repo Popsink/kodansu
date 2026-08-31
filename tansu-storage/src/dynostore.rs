@@ -309,6 +309,29 @@ pub struct DynoStore {
     /// as segments retire.
     quarantined_segments: Arc<Mutex<BTreeMap<String, BTreeSet<u64>>>>,
 
+    /// Sequences at which a merge run's offset tiling is known to break (#399):
+    /// a **seam**. Run selection will not extend a run across one, exactly as it
+    /// will not extend across a quarantined sequence — but where a quarantined
+    /// segment is excluded outright, a seam segment is healthy and may *start*
+    /// the next run.
+    ///
+    /// This exists because the tiling check discovers a gap only after the run's
+    /// objects are fetched and decoded, and #461's holes are permanent: the
+    /// records between two segments are gone, so a run straddling one can
+    /// **never** become mergeable. Without the memo, selection — which always
+    /// picks the oldest eligible run — rebuilt the same straddling run every
+    /// tick, paid its reads, and refused: zero compaction forever on exactly the
+    /// damaged prefixes, including the segments *above* the hole. Measured on
+    /// the production fleet the day this landed: 21 054 segments created per
+    /// hour against 142 merged away, with 40/40 sampled refusals being a hole.
+    ///
+    /// In memory and per process for the same reason the quarantine is: it is a
+    /// *skip list*, not a verdict about the objects. A restart re-meets each
+    /// seam once — one refused run — and re-learns it. Bounded by
+    /// [`Self::PREFIX_QUARANTINE_CAP`] per prefix, and pruned against the index
+    /// as segments retire.
+    compact_seams: Arc<Mutex<BTreeMap<String, BTreeSet<u64>>>>,
+
     /// Per-prefix compaction leases this process holds (#66) — the maintenance
     /// side of the single-writer fence. The produce lease is gone with #177;
     /// this is the only remaining lease.
@@ -1080,11 +1103,14 @@ static SEGMENT_FLUSHES: LazyLock<Counter<u64>> = LazyLock::new(|| {
 
 /// Compaction runs refused rather than performed, by reason (#461).
 ///
-/// Expected to be **flat zero**. A non-zero value means compaction met a prefix
-/// it could not merge without losing records and declined — so segments
-/// accumulate on that prefix until the underlying overlap is resolved, and
-/// `tansu_prefix_segments_live` will grow there. That is the intended trade: a
-/// stalled drain is recoverable and a deleted record is not.
+/// Expected to be **flat zero**. A non-zero value means compaction met a run it
+/// could not merge without losing records and declined. Since #399 that costs
+/// one refusal per newly met seam per process, not a permanent stall: the break
+/// is memoized ([`DynoStore::compact_seams`]) and later runs are selected around
+/// it, so the segments on either side still merge. A *sustained* rate here
+/// therefore means seams are being newly discovered — run `tansu audit` on the
+/// bucket to see whether records are still being lost, or the fleet is merely
+/// restarting and re-learning old ones.
 static SEGMENT_COMPACT_REFUSED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_prefix_segment_compact_refused")
@@ -2821,6 +2847,7 @@ impl DynoStore {
             segment_reads: Arc::new(Mutex::new(BTreeMap::new())),
             group_offsets: Arc::new(Mutex::new(BTreeMap::new())),
             quarantined_segments: Arc::new(Mutex::new(BTreeMap::new())),
+            compact_seams: Arc::new(Mutex::new(BTreeMap::new())),
             compaction_leases: Arc::new(Mutex::new(BTreeMap::new())),
             era_epochs: Arc::new(Mutex::new(BTreeMap::new())),
             compacted_topics: Arc::new(Mutex::new(BTreeMap::new())),
@@ -8845,6 +8872,78 @@ impl DynoStore {
         Ok(())
     }
 
+    /// The seams of `prefix` (#399) — see [`Self::compact_seams`]. Snapshotted
+    /// for the same reason [`Self::quarantined_segments_of`] is.
+    fn compact_seams_of(&self, prefix: &str) -> Result<BTreeSet<u64>> {
+        Ok(self
+            .compact_seams
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .get(prefix)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    /// Record `seams` as run boundaries for `prefix` (#399), answering whether
+    /// anything **new** was learned.
+    ///
+    /// `false` is the caller's stop signal, exactly as it is for
+    /// [`Self::quarantine_segment`]: the run that just refused was selected with
+    /// every one of these seams already honoured (or the cap swallowed them), so
+    /// re-selecting would build the same run and refuse it again — retrying
+    /// would spin.
+    fn memo_compact_seams(&self, prefix: &str, seams: &BTreeSet<u64>) -> Result<bool> {
+        let mut learned = false;
+
+        {
+            let mut memo = self.compact_seams.lock().map_err(Into::<Error>::into)?;
+            let held = memo.entry(prefix.to_owned()).or_default();
+
+            for seam in seams {
+                if held.contains(seam) {
+                    continue;
+                }
+
+                if held.len() >= Self::PREFIX_QUARANTINE_CAP {
+                    warn!(
+                        prefix,
+                        seam,
+                        cap = Self::PREFIX_QUARANTINE_CAP,
+                        "seam cap reached; runs over this prefix may still meet \
+                         the tiling refusal"
+                    );
+
+                    break;
+                }
+
+                _ = held.insert(*seam);
+                learned = true;
+            }
+        }
+
+        Ok(learned)
+    }
+
+    /// Drop seams naming segments `prefix` no longer holds (#399), as
+    /// [`Self::prune_quarantine`] does for the quarantine and for the same
+    /// reason: a sequence is never reused (#77), so a seam whose segment is gone
+    /// bounds nothing and is dead weight.
+    fn prune_compact_seams(&self, prefix: &str, live: &BTreeSet<u64>) -> Result<()> {
+        let mut memo = self.compact_seams.lock().map_err(Into::<Error>::into)?;
+
+        let Some(seams) = memo.get_mut(prefix) else {
+            return Ok(());
+        };
+
+        seams.retain(|seam| live.contains(seam));
+
+        if seams.is_empty() {
+            _ = memo.remove(prefix);
+        }
+
+        Ok(())
+    }
+
     /// Compact a prefix's oldest segments into fewer, larger ones (#66) to bound
     /// the live segment count `S` (otherwise ≈ flush_rate × retention, unbounded)
     /// — keeping the footer index footprint and the per-fetch scan bounded.
@@ -8896,30 +8995,50 @@ impl DynoStore {
         };
         segs.sort_by_key(|(seq, ..)| *seq);
 
-        // Segments a previous run proved undecodable (#398). Read before the
-        // walk below so the lock is not held across it.
+        // Segments a previous run proved undecodable (#398), and seams a
+        // previous run's tiling check found (#399). Read before the walk below
+        // so the locks are not held across it.
         let quarantined = self.quarantined_segments_of(prefix)?;
+        let seams = self.compact_seams_of(prefix)?;
 
-        // The offset spans a run would cover, needed only once this prefix has a
-        // hole in its tiling — see [`RunCoverage`]. Skipped entirely otherwise:
-        // a prefix with no quarantined segment is contiguous by construction, and
-        // this clones a `Vec<SubstreamEntry>` per segment on a path that walks
-        // tens of thousands of them per drain.
-        let spans: BTreeMap<u64, Vec<SubstreamEntry>> = if quarantined.is_empty() {
-            BTreeMap::new()
-        } else {
-            let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
-            index
-                .get(prefix)
-                .map(|entry| {
-                    entry
-                        .segments
-                        .iter()
-                        .map(|(seq, cached)| (*seq, cached.footer.entries.clone()))
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
+        // The offset spans a run would cover, needed only once this prefix is
+        // known to have a hole in its tiling — a quarantined segment (#398) or a
+        // learned seam (#399) — see [`RunCoverage`]. Skipped entirely otherwise:
+        // a prefix with neither is contiguous by construction, and this clones a
+        // `Vec<SubstreamEntry>` per segment on a path that walks tens of
+        // thousands of them per drain.
+        //
+        // The coverage guard is what makes the seam memo *sufficient* rather
+        // than merely helpful. A seam is a sequence, but the tiling breaks in
+        // **offset** order, and the two disagree as soon as compaction runs: a
+        // merged segment holds low offsets at a fresh high sequence, so a run
+        // can meet the same hole from the other side in an arrangement no
+        // per-sequence boundary describes. `RunCoverage` reasons in offsets —
+        // a sub-stream's folded span must hold exactly as many records as it
+        // spans — so once armed, selection cannot build a straddling run in any
+        // sequence order, and the seam's own check below is just the cheap
+        // fast path for the boundary already learned.
+        //
+        // The cost of arming it on a seamed prefix: coverage folds *raw* footer
+        // entries, so a batch-aligned overlap the fenced merge could heal reads
+        // as over-full and bounds the run instead. On a damaged prefix that
+        // trade is taken deliberately — a smaller run beats a wedged one.
+        let spans: BTreeMap<u64, Vec<SubstreamEntry>> =
+            if quarantined.is_empty() && seams.is_empty() {
+                BTreeMap::new()
+            } else {
+                let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+                index
+                    .get(prefix)
+                    .map(|entry| {
+                        entry
+                            .segments
+                            .iter()
+                            .map(|(seq, cached)| (*seq, cached.footer.entries.clone()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
 
         // Only above the trigger, and never touch the hot (newest) tail.
         if segs.len() <= self.prefix_compact_min_segments {
@@ -8970,6 +9089,12 @@ impl DynoStore {
                 while end < eligible_end
                     && segs[end].3 < self.prefix_compact_target_bytes
                     && !quarantined.contains(&segs[end].0)
+                    // A seam (#399) ends the run *before* this segment but may
+                    // begin the next one with it: unlike a quarantined segment,
+                    // the segment itself is healthy — it is the offsets between
+                    // it and its predecessor that are gone, so the two sides
+                    // merge as their own runs and are never fused across it.
+                    && (end == start || !seams.contains(&segs[end].0))
                     && (end == start || bytes + segs[end].3 <= self.prefix_compact_target_bytes)
                     // A hole in the prefix's offset tiling ends the run here
                     // (#398). Only ever consulted when something is quarantined,
@@ -9059,6 +9184,7 @@ impl DynoStore {
 
         let mut substreams: Vec<SubstreamWrite> = Vec::new();
         let mut merged_epoch = i64::MIN;
+        let mut seams: BTreeSet<u64> = BTreeSet::new();
 
         for (substream, topic, partition) in substream_keys {
             let in_run = self.decode_fenced_regions(prefix, &substream, partition, &objects)?;
@@ -9075,39 +9201,60 @@ impl DynoStore {
             // another, no gap and no overlap. `decode_fenced_regions` clips a
             // region overlapping the frontier to whole batches past it (#461),
             // and when the clip lands on a batch boundary the tiling holds and
-            // the merge *heals* the overlap. It cannot hold when the frontier
-            // falls inside a batch (batches are opaque: splitting one is a
-            // re-encode this pass does not do) or when the segment that set the
-            // frontier sits outside the run — fusing either would shift every
-            // record above the seam onto the wrong offset, and `retire_segments`
-            // at the end of this function then deletes the originals they could
-            // still have been read from. Refuse the run instead: the same trade
-            // #388 took for an undecodable region — compaction stalls on this
-            // prefix, `S` grows, an operator sees it, and that is recoverable
-            // where a deleted or mislabeled record is not.
+            // the merge *heals* the overlap. It cannot hold when offsets between
+            // two regions are simply **gone** (#461's holes — permanent by
+            // definition), when the frontier falls inside a batch (batches are
+            // opaque: splitting one is a re-encode this pass does not do), or
+            // when the segment that set the frontier sits outside the run —
+            // fusing any of these would shift every record above the seam onto
+            // the wrong offset, and `retire_segments` at the end of this
+            // function then deletes the originals they could still have been
+            // read from.
+            //
+            // Refuse the run — but remember where it broke (#399). This used to
+            // refuse alone, on the reasoning that a stalled drain is recoverable
+            // where a deleted record is not. Both halves of that were right and
+            // it still wedged: selection always picks the *oldest* eligible run
+            // and a hole never closes, so the same straddling run was rebuilt,
+            // fetched and refused every tick, forever — no compaction at all on
+            // the damaged prefixes, including above the hole. Each break is a
+            // **seam**: selection treats it as a run boundary from now on, so
+            // the segments on either side merge as their own runs. Every seam is
+            // collected before returning, not just the first, so the prefix
+            // converges in one pass rather than one seam per pass.
             let mut expected = base;
-            for (_, region_base, region) in &in_run {
+            let mut tiles = true;
+            for (seq, region_base, region) in &in_run {
                 if *region_base != expected {
-                    SEGMENT_COMPACT_REFUSED
-                        .add(1, &[KeyValue::new("reason", "run_not_contiguous")]);
+                    tiles = false;
+                    _ = seams.insert(*seq);
 
                     error!(
                         prefix,
                         topic,
                         partition,
+                        seq,
                         expected,
                         region_base,
                         "refusing to compact: the run's fenced regions do not tile \
                          contiguously, and merging them would shift offsets"
                     );
 
-                    return Ok(CompactRun::Drained);
+                    // Re-anchor past the break so a second seam in the same
+                    // sub-stream is found in this pass too.
+                    expected = *region_base;
                 }
 
                 expected += region
                     .iter()
                     .map(|batch| batch.last_offset_delta as i64 + 1)
                     .sum::<i64>();
+            }
+
+            // The run is already refused; this sub-stream's batches would only
+            // be carried into a merge that will not happen.
+            if !tiles {
+                continue;
             }
 
             let mut batches = Vec::new();
@@ -9123,6 +9270,23 @@ impl DynoStore {
                 base_offset: base,
                 batches,
             });
+        }
+
+        if !seams.is_empty() {
+            SEGMENT_COMPACT_REFUSED.add(1, &[KeyValue::new("reason", "run_not_contiguous")]);
+
+            // `Retry` when something was learned: the drain loop re-selects at
+            // once with the seams honoured, so both sides of each break merge in
+            // *this* maintenance pass instead of one side per tick. `Drained`
+            // when nothing was — the cap swallowed them, or a peer of this
+            // store already knew them — because re-selecting would rebuild the
+            // same run and refuse it again: the same spin guard
+            // `quarantine_segment`'s `false` provides.
+            return if self.memo_compact_seams(prefix, &seams)? {
+                Ok(CompactRun::Retry)
+            } else {
+                Ok(CompactRun::Drained)
+            };
         }
 
         // Write the merged segment (create-only, no produce-lease fencing), index
@@ -9788,6 +9952,9 @@ impl DynoStore {
         if let Some(live) = live {
             _ = self
                 .prune_quarantine(prefix, &live)
+                .inspect_err(|err| error!(?err, prefix));
+            _ = self
+                .prune_compact_seams(prefix, &live)
                 .inspect_err(|err| error!(?err, prefix));
         }
 
