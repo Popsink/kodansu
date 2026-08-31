@@ -33,7 +33,7 @@
 //! `audit_partition` is the reference implementation of the clip these tests
 //! now pin on the engine.
 
-use std::time::Duration;
+use std::{collections::BTreeSet, time::Duration};
 
 use futures::TryStreamExt as _;
 use object_store::{ObjectStore as _, ObjectStoreExt as _, memory::InMemory, path::Path};
@@ -341,6 +341,11 @@ async fn compaction_heals_a_batch_aligned_overlap() -> Result<()> {
 /// — while the read path still serves the whole span, straddling batch
 /// included (its head duplicates `[50, 100)`, which a consumer discards by
 /// position).
+///
+/// The refusal answers `Retry` since #399: the break is memoized as a seam, so
+/// the immediate re-selection ends before it — a run of one on each side, and
+/// the pass drains instead of rebuilding, re-fetching and re-refusing the same
+/// straddling run on every tick for as long as the objects live.
 #[tokio::test]
 async fn compaction_refuses_a_frontier_inside_a_batch() -> Result<()> {
     let _guard = init_tracing()?;
@@ -357,6 +362,10 @@ async fn compaction_refuses_a_frontier_inside_a_batch() -> Result<()> {
     store.refresh_prefix_index_forced(PREFIX).await?;
     assert!(matches!(
         store.compact_prefix_segments(PREFIX).await?,
+        CompactRun::Retry,
+    ));
+    assert!(matches!(
+        store.compact_prefix_segments(PREFIX).await?,
         CompactRun::Drained,
     ));
     assert_eq!(
@@ -370,6 +379,114 @@ async fn compaction_refuses_a_frontier_inside_a_batch() -> Result<()> {
         vec![(0, 50), (50, 100), (50, 150)],
         fetched_spans(&store, &tp, 0).await?,
     );
+
+    Ok(())
+}
+
+/// A #461 hole — offsets that exist in **no** segment — must not wedge the
+/// prefix's compaction (#399).
+///
+/// It used to: run selection always picks the oldest eligible run and is blind
+/// to holes it has not been told about, so it rebuilt the straddling run,
+/// fetched it, and refused it on every tick — and since the missing records
+/// are gone, "until the underlying overlap is resolved" meant *forever*.
+/// Measured on the production fleet: 21 054 segments created per hour against
+/// 142 merged away, with every sampled refusal being a hole.
+///
+/// Now the first refusal memoizes the seam and answers `Retry`; re-selection
+/// treats the seam as a run boundary, and the segments on **both** sides merge
+/// — in the same pass, which is what `Retry` is for.
+#[tokio::test]
+async fn a_hole_bounds_the_runs_instead_of_wedging_them() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let store = new_store(&bucket);
+    create_topic(&store, TOPIC).await?;
+    let tp = Topition::new(TOPIC, 0);
+
+    // [0, 100) in two segments, then a hole — [100, 200) exists nowhere — then
+    // [200, 350) in three.
+    put_segment(&store, &bucket, 0, 0, vec![batch(50)?]).await?;
+    put_segment(&store, &bucket, 1, 50, vec![batch(50)?]).await?;
+    put_segment(&store, &bucket, 2, 200, vec![batch(50)?]).await?;
+    put_segment(&store, &bucket, 3, 250, vec![batch(50)?]).await?;
+    put_segment(&store, &bucket, 4, 300, vec![batch(50)?]).await?;
+
+    store.refresh_prefix_index_forced(PREFIX).await?;
+
+    // Pass 1: the oldest run straddles the hole. Refused once — and the seam
+    // (seq 2, the segment whose region no longer met the tiling) is learned.
+    assert!(matches!(
+        store.compact_prefix_segments(PREFIX).await?,
+        CompactRun::Retry,
+    ));
+
+    // Pass 2: the run below the hole merges — the seam bounds it.
+    assert!(matches!(
+        store.compact_prefix_segments(PREFIX).await?,
+        CompactRun::Merged(2),
+    ));
+
+    // Pass 3: the run above the hole merges — the segments the wedge used to
+    // strand. Its merged predecessor holds the pre-hole offsets at a fresh
+    // *high* sequence, so no per-sequence boundary describes this run; it is
+    // the offset-space coverage guard, armed by the seam, that keeps the
+    // straddler out of it.
+    assert!(matches!(
+        store.compact_prefix_segments(PREFIX).await?,
+        CompactRun::Merged(3),
+    ));
+
+    // The two merged segments are all that is left, one per side of the hole.
+    // Coverage keeps them apart without a refusal: the prefix is genuinely
+    // drained, nothing re-fetched, nothing re-refused.
+    assert!(matches!(
+        store.compact_prefix_segments(PREFIX).await?,
+        CompactRun::Drained,
+    ));
+
+    assert_eq!(2, segments(&bucket).await.len());
+
+    // Both sides of the hole still read back whole, at their own offsets — one
+    // fetch from 0 serves everything that survives, skipping the hole.
+    assert_eq!(350, store.high_watermark(&tp).await?);
+    assert_eq!(
+        vec![(0, 50), (50, 100), (200, 250), (250, 300), (300, 350)],
+        fetched_spans(&store, &tp, 0).await?,
+    );
+    assert_eq!(
+        vec![(200, 250), (250, 300), (300, 350)],
+        fetched_spans(&store, &tp, 200).await?,
+    );
+
+    Ok(())
+}
+
+/// A seam is a skip-list entry, not a verdict: pruning drops the ones whose
+/// segments are gone (#399), exactly as the quarantine's prune does, because a
+/// sequence is never reused and a seam naming a retired segment bounds nothing.
+#[tokio::test]
+async fn a_seam_is_pruned_with_its_segment() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let store = new_store(&bucket);
+
+    let seams = BTreeSet::from([2, 9]);
+    assert!(store.memo_compact_seams(PREFIX, &seams)?);
+    // Nothing new the second time: the caller reads that as "re-selecting would
+    // rebuild the same refused run" and drains instead of spinning.
+    assert!(!store.memo_compact_seams(PREFIX, &seams)?);
+
+    store.prune_compact_seams(PREFIX, &BTreeSet::from([2]))?;
+    assert_eq!(BTreeSet::from([2]), store.compact_seams_of(PREFIX)?);
+
+    // The last seam gone removes the prefix's entry entirely, and the seams
+    // become learnable again.
+    store.prune_compact_seams(PREFIX, &BTreeSet::new())?;
+    assert!(store.compact_seams_of(PREFIX)?.is_empty());
+    assert!(store.memo_compact_seams(PREFIX, &seams)?);
 
     Ok(())
 }
