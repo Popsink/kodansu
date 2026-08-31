@@ -45,6 +45,7 @@ mod offset_commit;
 mod prefix_coalesce;
 mod quarantine_segment;
 mod reachable_panics;
+mod retention_order;
 mod scaling;
 mod scram_credentials;
 mod segment;

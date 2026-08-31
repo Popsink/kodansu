@@ -490,3 +490,204 @@ async fn a_seam_is_pruned_with_its_segment() -> Result<()> {
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// The drain-preservation property (#388, #395, #403, #433, #434, #461, #465,
+// #469): whatever shape a damaged prefix holds, a compaction drain must never
+// make a previously readable offset unreadable. Each of those issues fixed one
+// path and the class recurred; this pins the invariant itself, over generated
+// shapes none of the pointwise tests thought of.
+// ---------------------------------------------------------------------------
+
+/// A fixed-sequence generator, so every seed is a reproducible shape: a
+/// failure names the seed, and the seed rebuilds the prefix byte-for-byte.
+struct Lcg(u64);
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        self.0 >> 11
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n.max(1)
+    }
+}
+
+/// Every offset served by any fetched batch, walking from `from` until fetch
+/// returns nothing new.
+async fn readable_offsets(store: &DynoStore, tp: &Topition) -> Result<BTreeSet<i64>> {
+    let mut out = BTreeSet::new();
+    let mut off = 0i64;
+    for _ in 0..64 {
+        let spans = fetched_spans(store, tp, off).await?;
+        let mut advanced = false;
+        for (base, end) in spans {
+            out.extend(base..end);
+            if end > off {
+                off = end;
+                advanced = true;
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+const TOPIC2: &str = "org.env.conn.tab2";
+const TOPIC3: &str = "org.env.conn.tab3";
+
+/// Write segment `seq` out of band holding one region per `(topic, base,
+/// batches)` triple — the multi-sub-stream shape every production segment has.
+async fn put_segment_multi(
+    store: &DynoStore,
+    bucket: &InMemory,
+    seq: u64,
+    substreams: Vec<(&'static str, i64, Vec<deflated::Batch>)>,
+) -> Result<()> {
+    let substreams: Vec<(Topition, i64, Vec<deflated::Batch>)> = substreams
+        .into_iter()
+        .map(|(topic, base, batches)| (Topition::new(topic, 0), base, batches))
+        .collect();
+    let (payload, _footer) = store.encode_segment_v3(&substreams, 1, seq)?;
+    _ = bucket.put(&segment_path(seq), payload).await?;
+
+    Ok(())
+}
+
+/// One generated prefix: 1-3 co-tenant sub-streams whose offset walks hole,
+/// overlap and back-track at random, sliced into segments whose sequence order
+/// is shuffled against offset order — the #461-era shapes, which no healthy
+/// write path produces — then drained to a fixed point as the maintenance
+/// tick does, with the index entries a stale peer would still hold re-inserted
+/// between ticks. Every offset readable before must be readable after.
+async fn probe_seed(seed: u64) -> Result<()> {
+    let mut rng = Lcg(seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1));
+
+    let bucket = InMemory::new();
+    let target = [1usize << 20, 4_000, 2_000][rng.below(3) as usize];
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).coalesce_tuning(CoalesceTuning {
+        prefix_compact_min_segments: Some(1),
+        prefix_compact_keep_hot: Some(rng.below(2) as usize),
+        prefix_compact_target_bytes: Some(target),
+        ..Default::default()
+    });
+    let topics: Vec<&'static str> = match rng.below(3) {
+        0 => vec![TOPIC],
+        1 => vec![TOPIC, TOPIC2],
+        _ => vec![TOPIC, TOPIC2, TOPIC3],
+    };
+    for topic in &topics {
+        create_topic(&store, topic).await?;
+    }
+
+    let nsegs = 4 + rng.below(9) as usize;
+
+    // Per topic, walk offset space with holes and overlaps, splitting the walk
+    // into `nsegs` slices (a topic may skip a segment).
+    let mut segments: Vec<Vec<(&'static str, i64, Vec<deflated::Batch>)>> = vec![Vec::new(); nsegs];
+    for topic in &topics {
+        let mut cur = 0i64;
+        for slot in segments.iter_mut() {
+            if rng.below(5) == 0 && topics.len() > 1 {
+                continue; // this topic sits this segment out
+            }
+            match rng.below(4) {
+                0 => cur += 10 + rng.below(200) as i64,       // hole
+                1 => cur -= (rng.below(120) as i64).min(cur), // overlap backwards
+                _ => {}
+            }
+            let mut batches = Vec::new();
+            let nb = 1 + rng.below(3) as usize;
+            let mut len = 0usize;
+            for _ in 0..nb {
+                let n = 10 + rng.below(90) as usize;
+                batches.push(batch(n)?);
+                len += n;
+            }
+            slot.push((topic, cur, batches));
+            cur += len as i64;
+        }
+    }
+
+    // Assign sequences in a random order.
+    let mut seqs: Vec<u64> = (0..nsegs as u64).collect();
+    for i in (1..seqs.len()).rev() {
+        let j = rng.below(i as u64 + 1) as usize;
+        seqs.swap(i, j);
+    }
+    for (i, substreams) in segments.into_iter().enumerate() {
+        if substreams.is_empty() {
+            continue;
+        }
+        put_segment_multi(&store, &bucket, seqs[i], substreams).await?;
+    }
+
+    store.refresh_prefix_index_forced(PREFIX).await?;
+    let mut before = Vec::new();
+    for topic in &topics {
+        before.push(readable_offsets(&store, &Topition::new(*topic, 0)).await?);
+    }
+
+    // Snapshot the whole cached index: (seq, footer, last_modified) — a stale
+    // peer replica's view of the prefix.
+    let stale: Vec<(u64, SegmentFooter, i64)> = {
+        let index = store.prefix_index.lock().unwrap();
+        index
+            .get(PREFIX)
+            .map(|entry| {
+                entry
+                    .segments
+                    .iter()
+                    .map(|(seq, cached)| (*seq, cached.footer.clone(), cached.last_modified_ms))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    // Drain as production does, over several maintenance ticks — and between
+    // ticks, restore any retired segment's index entry: the add-only index of a
+    // peer replica that never observed the deletes, now holding the lease.
+    for _ in 0..4 {
+        _ = store.drain_compact_prefix(PREFIX).await;
+
+        let live: BTreeSet<u64> = {
+            let index = store.prefix_index.lock().unwrap();
+            index
+                .get(PREFIX)
+                .map(|entry| entry.segments.keys().copied().collect())
+                .unwrap_or_default()
+        };
+        for (seq, footer, last_modified) in &stale {
+            if !live.contains(seq) {
+                store.index_insert(PREFIX, *seq, footer.clone(), *last_modified)?;
+            }
+        }
+    }
+
+    for (topic, before) in topics.iter().zip(before) {
+        let after = readable_offsets(&store, &Topition::new(*topic, 0)).await?;
+        let missing: Vec<i64> = before.difference(&after).copied().collect();
+        assert!(
+            missing.is_empty(),
+            "seed {seed} topic {topic}: {} offsets destroyed, first..last {:?}..{:?}",
+            missing.len(),
+            missing.first(),
+            missing.last(),
+        );
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_drain_preserves_every_readable_offset() -> Result<()> {
+    let _guard = init_tracing()?;
+    for seed in 0..300u64 {
+        probe_seed(seed).await?;
+    }
+    Ok(())
+}

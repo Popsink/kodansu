@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::TryStreamExt as _;
-use object_store::{ObjectStore as _, memory::InMemory, path::Path};
+use object_store::{ObjectStore as _, ObjectStoreExt as _, memory::InMemory, path::Path};
 use tansu_sans_io::{
     IsolationLevel, ListOffset, create_topics_request::CreatableTopic, record::Record,
     record::deflated, record::inflated,
@@ -61,36 +61,6 @@ fn batch(records: usize) -> Result<deflated::Batch> {
         .build()
         .and_then(deflated::Batch::try_from)
         .map_err(Into::into)
-}
-
-/// As [`batch`], but with an explicit record timestamp so retention can be
-/// driven deterministically. Timestamps are independent of offset order.
-fn batch_at(records: usize, timestamp: i64) -> Result<deflated::Batch> {
-    let mut builder = inflated::Batch::builder();
-
-    for i in 0..records {
-        builder = builder.record(Record::builder().value(Some(Bytes::copy_from_slice(
-            format!("record-{i}").as_bytes(),
-        ))));
-    }
-
-    builder
-        .last_offset_delta(records as i32 - 1)
-        .base_timestamp(timestamp)
-        .max_timestamp(timestamp)
-        .build()
-        .and_then(deflated::Batch::try_from)
-        .map_err(Into::into)
-}
-
-fn now_ms() -> i64 {
-    i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-    )
-    .unwrap_or_default()
 }
 
 async fn create_topic(storage: &DynoStore, name: &str, partitions: i32) -> Result<()> {
@@ -420,23 +390,18 @@ async fn segment_objects(bucket: &InMemory, prefix: &str) -> Vec<Path> {
 /// step 2 both fold it unconditionally. This test decides whether that
 /// divergence is reachable. It is.
 ///
-/// **The expiry pass drives it, and that is the point.** An earlier draft
-/// deleted the tail-holding object by hand and asserted the floor was already
-/// 8 — it was 0, because `watermark.high` has exactly one writer,
-/// `expire_prefix_segments`, which persists it write-ahead of its own deletes.
-/// So the floor and the deletion are two halves of one pass and a test that
-/// fakes the deletion cannot have a floor. Only a *precondition* assertion
-/// caught that; the conclusion would have passed and proved nothing.
-///
-/// The state under test — tail-holder gone, older survives — is reached here
-/// through record *timestamps*, which are independent of offset order: a batch
-/// produced second (so holding the higher offsets) may carry an older timestamp
-/// than the batch produced first. Whole-segment retention (#61) then reclaims
-/// the tail-holder while the lower-offset segment survives. Out-of-order
-/// timestamps are ordinary — a producer sets them, and a replayed or
-/// backfilled batch routinely carries older ones than its predecessor. The
-/// issue's own route, a *shared* segment kept alive by a hot sibling topic
-/// (#61), reaches the same state.
+/// The expiry pass used to drive it: timestamps are independent of offset
+/// order, so whole-segment retention (#61) reclaimed a tail-holder carrying an
+/// ancient timestamp while the lower-offset segment survived, persisting
+/// `watermark.high` write-ahead of its own delete. Since the 08-31 loss that
+/// route is closed — retention only ever trims a sub-stream's head
+/// (`retention_order`), so it can no longer delete a tail-holder above a
+/// survivor. The *state* is still real: every bucket a pre-fix expiry damaged
+/// holds it durably, and a peer's blind-window expiry still yields
+/// `floor > tail` (`scaling::coalesced_latest_survives_peer_expiry_via_floor_certification`).
+/// So the setup now constructs the two halves of that state directly — the
+/// persisted floor and the missing tail-holder — exactly as a pre-fix expiry
+/// left them.
 ///
 /// **The preconditions are asserted, not assumed.** If the tail-holder is not
 /// gone, or an older segment does not survive, or the cold store's tail is not
@@ -460,12 +425,8 @@ async fn a_cold_replica_must_not_reuse_offsets_below_the_persisted_floor() -> Re
     // The routed prefix, not the topic name — see `segment_objects`.
     let prefix = writer.routed_prefix_of(&tp).await?;
 
-    // Offsets 0..4 carry a *recent* timestamp, offsets 4..8 an ancient one.
-    let recent = now_ms();
-    let ancient = 1_000;
-
-    assert_eq!(0, writer.produce(None, &tp, batch_at(4, recent)?).await?);
-    assert_eq!(4, writer.produce(None, &tp, batch_at(4, ancient)?).await?);
+    assert_eq!(0, writer.produce(None, &tp, batch(4)?).await?);
+    assert_eq!(4, writer.produce(None, &tp, batch(4)?).await?);
 
     assert_eq!(
         8,
@@ -474,19 +435,29 @@ async fn a_cold_replica_must_not_reuse_offsets_below_the_persisted_floor() -> Re
     );
 
     // Precondition 1: two segments, so there is an older one to survive.
+    let objects = segment_objects(&bucket, &prefix).await;
     assert_eq!(
         2,
-        segment_objects(&bucket, &prefix).await.len(),
+        objects.len(),
         "the two flushes must be distinct segments"
     );
 
-    // Retention reclaims the ancient segment — which holds offsets 4..8, the
-    // tail — and keeps the recent one holding 0..4. This is the production
-    // pass, so it writes the floor itself.
-    let deleted = writer.expire_prefix_segments(&prefix, ancient + 1).await?;
+    // The state a pre-fix expiry left behind: `watermark.high` persisted at the
+    // acknowledged tail, and the tail-holding segment gone while the
+    // lower-offset one survives. Written in the expiry's order — floor first,
+    // delete second (#77).
+    writer
+        .watermark(&tp)?
+        .with_mut(&writer.object_store, |watermark| {
+            watermark.high = Some(8);
+            Ok(())
+        })
+        .await?;
+    bucket
+        .delete(objects.last().expect("tail-holding segment"))
+        .await?;
 
     // Precondition 2: exactly the tail-holder went.
-    assert_eq!(1, deleted, "exactly one segment must have been reclaimed");
     assert_eq!(
         1,
         segment_objects(&bucket, &prefix).await.len(),
