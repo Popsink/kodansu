@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use dotenv::dotenv;
-use mimalloc::MiMalloc;
 use tansu_broker::{TracingFormat, otel};
 use tansu_cli::{Cli, Result};
 use tansu_sans_io::ErrorCode;
@@ -21,8 +20,20 @@ use tracing::{debug, error};
 
 // The docker image is a statically linked musl binary: without a custom
 // allocator it would use musl's malloc, which contends badly across threads.
+//
+// jemalloc rather than mimalloc, for one reason: it can be *asked* what it is
+// holding. In production the broker's RSS is 1.0-3.0 GiB while every structure
+// that can be sized accounts for ~0.4 GiB of it, and `tansu-maintain` — the same
+// binary, the same object store, more index work, no Kafka clients — runs the
+// whole time at 90-290 MiB. Nothing in the process could say whether the rest is
+// live heap or memory the allocator has kept, and that is the fork every
+// subsequent decision hangs off. `libmimalloc-sys` exports only the allocation
+// functions, so reading mimalloc's own counters needs an `extern "C"` block of
+// our own and `unsafe_code` is `forbid`den workspace-wide; `tikv-jemalloc-ctl`
+// reports the same class of numbers through a safe API. See
+// `tansu-broker/src/otel/allocator.rs`.
 #[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 const CLIENT_ERROR_MESSAGE: &str = "A client error occurred. Possible causes:
   • No network connection

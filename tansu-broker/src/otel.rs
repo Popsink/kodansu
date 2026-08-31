@@ -20,6 +20,7 @@ use url::Url;
 
 use crate::{Result, TracingFormat};
 
+mod allocator;
 mod tracing;
 
 #[derive(Debug)]
@@ -53,6 +54,10 @@ pub fn metric_exporter(endpoint: Url) -> Result<()> {
         .build();
 
     global::set_meter_provider(meter_provider);
+
+    // After the provider, never before: an instrument built against the no-op
+    // provider is silently never collected.
+    allocator::register();
 
     Ok(())
 }

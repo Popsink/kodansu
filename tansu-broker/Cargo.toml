@@ -42,6 +42,7 @@ tansu-sans-io.workspace = true
 tansu-service.workspace = true
 tansu-storage.workspace = true
 thiserror.workspace = true
+tikv-jemalloc-ctl.workspace = true
 tokio-rustls.workspace = true
 tokio-util.workspace = true
 tokio.workspace = true

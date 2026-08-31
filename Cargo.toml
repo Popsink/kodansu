@@ -93,7 +93,6 @@ indicatif = "0.18.3"
 lazy_static = "1.4.0"
 libfuzzer-sys = "0.4"
 lz4 = "1.28.1"
-mimalloc = "0.1.52"
 nanoid = "0.4.0"
 nonzero_ext = "0.3.0"
 num-bigint = "0.4"
@@ -137,6 +136,8 @@ tansu-storage = { version = "1.0.0-alpha.1", path = "tansu-storage", default-fea
 tansu-topic = { version = "1.0.0-alpha.1", path = "tansu-topic", default-features = false }
 tempfile = "3"
 thiserror = "2.0"
+tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
+tikv-jemallocator = { version = "0.6", features = ["stats"] }
 time = { version = "0.3.47", features = ["formatting", "macros"] }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-rustls = "0.26.4"
