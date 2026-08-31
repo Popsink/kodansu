@@ -1078,11 +1078,12 @@ async fn expires_aged_segments_keeps_recent_ones() -> Result<(), Error> {
     Ok(())
 }
 
-/// **#290, named.** Ordinary retention can leave a sub-stream advertising
-/// offsets that no surviving segment holds, and a consumer parked in that gap
-/// reads empty on every poll, forever, with no error on either side.
+/// **#290, named — and closed at the source since the 08-31 loss.** Ordinary
+/// retention could leave a sub-stream advertising offsets that no surviving
+/// segment holds, and a consumer parked in that gap read empty on every poll,
+/// forever, with no error on either side.
 ///
-/// No damage is simulated here. Every step is the retention path working as
+/// No damage was simulated. Every step was the retention path working as then
 /// designed:
 ///
 /// 1. `expire_prefix_segments` persists `watermark.high = max(current, tail)`
@@ -1145,8 +1146,19 @@ async fn expires_aged_segments_keeps_recent_ones() -> Result<(), Error> {
 /// `OFFSET_OUT_OF_RANGE` instead of empty — bounded, loud, and recoverable via
 /// `auto.offset.reset`, exactly the #337 discipline extended from the empty
 /// log to the mid-log gap.
+///
+/// **The 08-31 loss inverted point 2.** Certification made the destruction
+/// loud; it still destroyed, and a week after #461's zombie era disordered the
+/// fleet's offsets it destroyed 6M records out of the middle of live logs as
+/// each segment's newest record crossed the rolling threshold. Retention now
+/// only ever trims a sub-stream's head (`retention_order`), so this shape —
+/// the tail-holder all-old, a lower segment surviving — is *refused* rather
+/// than certified: both segments stay, every offset keeps being served, and
+/// no floor moves. The certification machinery stays for the states pre-fix
+/// expiries already left durable and for a peer's blind window, which the
+/// tests around this one construct directly.
 #[tokio::test]
-async fn retention_can_orphan_offsets_below_the_advertised_watermark() -> Result<(), Error> {
+async fn retention_refuses_to_orphan_offsets_below_the_advertised_watermark() -> Result<(), Error> {
     let bucket = InMemory::new();
     let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
@@ -1165,66 +1177,41 @@ async fn retention_can_orphan_offsets_below_the_advertised_watermark() -> Result
     assert_eq!(2, segments(&bucket).await.len());
     assert_eq!(4, store.high_watermark(&a).await?);
 
-    // Retention with a threshold between the two: the *tail-holding* segment is
-    // the one that expires, and the lower one survives.
+    // Retention with a threshold between the two: the tail-holding segment is
+    // all-old, and it is exactly what must NOT expire — the lower segment
+    // survives, so deleting the tail-holder orphans offsets [2, 4) below the
+    // floor the delete itself would persist.
     let deleted = store.expire_prefix_segments(PREFIX, recent - 1_000).await?;
-    assert_eq!(1, deleted, "exactly the ancient, tail-holding segment");
-    assert_eq!(1, segments(&bucket).await.len());
+    assert_eq!(
+        0, deleted,
+        "an all-old tail above a survivor must be refused"
+    );
+    assert_eq!(2, segments(&bucket).await.len());
 
-    // The advertised end offset has not moved: the durable floor, written
-    // write-ahead of the delete, still says 4. That is deliberate — the floor
-    // is where the next record will be assigned, and regressing it under
-    // offsets a peer may have acked is worse than the gap (see the doc above).
+    // Nothing moved and nothing was certified: there is no gap to describe.
+    assert_eq!(4, store.high_watermark(&a).await?);
+
+    // Every acknowledged offset keeps being served — the 08-31 probes read
+    // `fetch@lost_from -> lost_to+1..` with no error, and this is the refusal
+    // that keeps that from ever being the answer again.
+    assert!(!fetch_from(&store, &a, 0).await?.is_empty());
+    assert!(!fetch_from(&store, &a, 2).await?.is_empty());
+
+    // Once the lower segment ages out too — a threshold past `recent` — the
+    // whole log is an expired head and both go in one pass: the refusal defers
+    // reclaim, it does not lose it.
+    assert_eq!(
+        2,
+        store
+            .expire_prefix_segments(PREFIX, now_ms() + 1_000)
+            .await?,
+        "with nothing below it left to shelter, the whole head expires"
+    );
+    assert_eq!(0, segments(&bucket).await.len());
     assert_eq!(
         4,
         store.high_watermark(&a).await?,
-        "the write-ahead floor keeps advertising the pre-delete tail"
-    );
-
-    // The expiry certified what it left behind: offsets [2, 4) are dead, by
-    // the one writer that could know.
-    assert_eq!(
-        (4, Some(ServedEnd { end: 2, at_high: 4 })),
-        store.persisted_watermark_bounds(&a).await?,
-        "expiry must certify the surviving tail alongside the floor it raised"
-    );
-
-    // Offsets 0 and 1 are still served: the log is not empty, which is why
-    // #299's "starts where it ends" never reached this case.
-    assert!(
-        !fetch_from(&store, &a, 0).await?.is_empty(),
-        "the surviving segment still serves its own offsets"
-    );
-
-    // Offsets 2 and 3 are advertised and destroyed — and the fetch now says
-    // so, instead of answering empty on every poll forever (#290). This is
-    // what un-parks a consumer committed inside the gap: `auto.offset.reset`
-    // moves it to a live position, and `none` fails loudly.
-    for offset in [2, 3] {
-        assert!(
-            matches!(
-                fetch_from(&store, &a, offset).await,
-                Err(Error::Api(ErrorCode::OffsetOutOfRange))
-            ),
-            "offset {offset} is in the certified-dead gap and must answer OFFSET_OUT_OF_RANGE"
-        );
-    }
-
-    // Fetching at the surviving tail itself is not an error: that is the
-    // caught-up position for a consumer of what remains.
-    assert!(fetch_from(&store, &a, 4).await?.is_empty());
-
-    // A cold reader reaches the same answers, so this is a property of the
-    // store and not of one process's memory: same advertised end, and the
-    // same error once its read path has warmed the watermark cache.
-    let cold = DynoStore::new(CLUSTER, NODE, bucket.clone());
-    assert_eq!(4, cold.high_watermark(&a).await?);
-    assert!(
-        matches!(
-            fetch_from(&cold, &a, 2).await,
-            Err(Error::Api(ErrorCode::OffsetOutOfRange))
-        ),
-        "a cold replica must refuse the certified-dead gap too"
+        "the write-ahead floor keeps advertising the acknowledged tail"
     );
 
     Ok(())
@@ -1246,16 +1233,27 @@ async fn a_stale_served_end_is_ignored_not_misread() -> Result<(), Error> {
     create_topic(&store, topic).await?;
     let a = Topition::new(topic, 0);
 
-    let recent = now_ms();
-    let ancient = 1_000;
-    _ = store.produce(None, &a, batch_at(2, recent)?).await?;
-    _ = store.produce(None, &a, batch_at(2, ancient)?).await?;
+    _ = store.produce(None, &a, batch(2)?).await?;
+    _ = store.produce(None, &a, batch(2)?).await?;
 
-    // A certified expiry first: `served == {end: 2, at_high: 4}`.
-    assert_eq!(
-        1,
-        store.expire_prefix_segments(PREFIX, recent - 1_000).await?
-    );
+    // The certified state a pre-fix expiry left durably in damaged buckets:
+    // the tail-holding segment gone and `served == {end: 2, at_high: 4}`
+    // beside the floor it raised. Retention itself can no longer produce this
+    // (it only ever trims a sub-stream's head since the 08-31 loss,
+    // `retention_order`), so the two halves are written in its order — floor
+    // and certification first, delete second (#77).
+    store
+        .watermark(&a)?
+        .with_mut(&store.object_store, |watermark| {
+            watermark.high = Some(4);
+            watermark.served = Some(ServedEnd { end: 2, at_high: 4 });
+            Ok(())
+        })
+        .await?;
+    let objects = segments(&bucket).await;
+    bucket
+        .delete(objects.last().expect("tail-holding segment"))
+        .await?;
     assert_eq!(
         (4, Some(ServedEnd { end: 2, at_high: 4 })),
         store.persisted_watermark_bounds(&a).await?
@@ -5137,30 +5135,31 @@ async fn an_uncertified_gap_is_certified_by_the_reconciliation_pass() -> Result<
     let topic = "org.env.conn.tab_a";
     let a = Topition::new(topic, 0);
 
-    let recent = now_ms();
-    let ancient = 1_000;
-
     // The process that creates the gap, then forgets to say so — an expiry
     // running an older binary.
     {
         let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).prefix_lease_ttl(ttl);
         create_topic(&store, topic).await?;
 
-        _ = store.produce(None, &a, batch_at(2, recent)?).await?;
-        _ = store.produce(None, &a, batch_at(2, ancient)?).await?;
+        _ = store.produce(None, &a, batch(2)?).await?;
+        _ = store.produce(None, &a, batch(2)?).await?;
         assert_eq!(4, store.high_watermark(&a).await?);
 
-        assert_eq!(
-            1,
-            store.expire_prefix_segments(PREFIX, recent - 1_000).await?
-        );
-
+        // The bytes an older binary's expiry leaves behind: `watermark.high`
+        // raised to the acknowledged tail with no `served` pair beside it, and
+        // the tail-holding segment gone. Retention itself can no longer delete
+        // a tail-holder above a survivor (`retention_order`), so the state is
+        // written directly, floor before delete (#77).
         store
             .watermark(&a)?
             .with_mut(&bucket, |watermark| {
-                watermark.served = None;
+                watermark.high = Some(4);
                 Ok(())
             })
+            .await?;
+        let objects = segments(&bucket).await;
+        bucket
+            .delete(objects.last().expect("tail-holding segment"))
             .await?;
     }
 

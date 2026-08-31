@@ -8615,9 +8615,8 @@ impl DynoStore {
                 .unwrap_or_default()
         };
 
-        let mut expirable: Vec<u64> = Vec::new();
-        let mut affected: BTreeSet<(Substream, String, i32)> = BTreeSet::new();
-        let mut surviving_oldest_ms: Option<i64> = None;
+        let mut aged: BTreeSet<u64> = BTreeSet::new();
+        let mut truncated: BTreeSet<u64> = BTreeSet::new();
 
         for (seq, age_ms, ends) in &segments_snapshot {
             // Fully truncated (#176): every sub-stream slice ends at/below its
@@ -8640,7 +8639,95 @@ impl DynoStore {
                 }
             }
 
-            if *age_ms < threshold_ms || fully_truncated {
+            if fully_truncated {
+                _ = truncated.insert(*seq);
+            } else if *age_ms < threshold_ms {
+                _ = aged.insert(*seq);
+            }
+        }
+
+        // Age alone must not expire a segment out of the MIDDLE of a
+        // sub-stream's offset space (the 08-31 loss). Retention is keyed on
+        // record timestamps, and on a sub-stream whose offset order and
+        // timestamp order disagree — a CDC backfill stamping source
+        // timestamps, or any prefix #461's zombie era disordered — an all-old
+        // segment can sit between two segments that survive. Kafka's
+        // `deleteOldSegments` walks the log in offset order and stops at the
+        // first segment it keeps; deleting past that point is what put the
+        // fleet's 08-24 incident records into 621 fetch-verified mid-log holes
+        // exactly seven days later, minute by minute as each segment's newest
+        // record crossed the rolling threshold. #290 met the same shape at the
+        // tail and certified the destroyed range so a parked fetch fails loud;
+        // this stops the destruction itself.
+        //
+        // So: an aged segment expires only while every surviving segment of
+        // each sub-stream it holds sits wholly ABOVE it — the maximal
+        // expirable head prefix of the fenced (servable) view. A superseded
+        // slice is not in that view and neither blocks nor is blocked: its
+        // offsets are served by the superseding segment, which answers for
+        // them itself. A retained segment is itself a blocker, so demotion
+        // iterates to a fixpoint — one segment kept for a fresh co-tenant
+        // shelters everything above it, exactly as it sheltered them before a
+        // merge regrouped the slices (the #469-exposed half of the loss).
+        //
+        // The deliberate cost: mid-log expired records are retained until
+        // everything below them expires too — physical debt on a disordered
+        // sub-stream, bounded by its disorder horizon, and the price of never
+        // deleting a record a fetch below the high watermark can still reach.
+        // A fully-truncated segment (#176) is exempt: every offset it holds is
+        // below a DeleteRecords floor, so nothing observable sits above it.
+        if !aged.is_empty() {
+            let substream_keys: BTreeSet<(Substream, i32)> = segments_snapshot
+                .iter()
+                .flat_map(|(_, _, ends)| {
+                    ends.iter()
+                        .map(|(substream, _, partition, _)| (substream.clone(), *partition))
+                })
+                .collect();
+
+            // Each sub-stream's fenced order, resolved ONCE. The view is a
+            // function of the cached index, which nothing here mutates — only
+            // `aged` changes as the fixpoint runs — so re-deriving it per
+            // iteration would re-take the `prefix_index` lock and re-scan every
+            // segment of the prefix per sub-stream per pass. On the fleet's
+            // worst prefix that is 25 779 segments against a few hundred
+            // sub-streams, on the path this whole change exists to make safe.
+            let mut orders: Vec<Vec<u64>> = Vec::with_capacity(substream_keys.len());
+            for (substream, partition) in &substream_keys {
+                orders.push(
+                    self.valid_substream_segments(prefix, substream, *partition)?
+                        .into_iter()
+                        .map(|fenced| fenced.seq)
+                        .collect(),
+                );
+            }
+
+            loop {
+                let mut demoted = false;
+
+                for order in &orders {
+                    let mut blocked = false;
+                    for seq in order {
+                        if blocked {
+                            demoted |= aged.remove(seq);
+                        } else if !aged.contains(seq) && !truncated.contains(seq) {
+                            blocked = true;
+                        }
+                    }
+                }
+
+                if !demoted {
+                    break;
+                }
+            }
+        }
+
+        let mut expirable: Vec<u64> = Vec::new();
+        let mut affected: BTreeSet<(Substream, String, i32)> = BTreeSet::new();
+        let mut surviving_oldest_ms: Option<i64> = None;
+
+        for (seq, age_ms, ends) in &segments_snapshot {
+            if aged.contains(seq) || truncated.contains(seq) {
                 expirable.push(*seq);
                 for (substream, topic, partition, _) in ends {
                     _ = affected.insert((substream.clone(), topic.clone(), *partition));
