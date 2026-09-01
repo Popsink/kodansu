@@ -21,6 +21,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
+    time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
@@ -246,6 +247,158 @@ async fn members_are_listed_by_id() -> Result<()> {
             .await?
             .into_keys()
             .collect::<Vec<_>>()
+    );
+
+    Ok(())
+}
+
+/// A member document no generation names is reclaimed once it is old enough
+/// (#486).
+///
+/// The bucket held **46 686** of these for **348** live members, growing
+/// ~24 k/day: the document is written before the generation admits the member,
+/// and nothing deletes one for an id the generation never admitted — the sweep
+/// only iterates `generation.members`, `leave` only deletes the member that
+/// left, and group expiry only fires after seven days of a group being entirely
+/// idle, which a busy group never is.
+#[tokio::test]
+async fn a_member_document_no_generation_names_is_reclaimed() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let storage = DynoStore::new(CLUSTER, NODE, InMemory::new());
+    let now = SystemTime::now();
+
+    for member_id in ["named", "abandoned"] {
+        _ = storage
+            .write_group_member("g-1", member_id, member(1_000), None)
+            .await
+            .expect("member");
+    }
+
+    _ = storage
+        .update_group_generation(
+            "g-1",
+            GenerationDoc {
+                members: BTreeMap::from([("named".into(), MemberRef::default())]),
+                ..generation(0)
+            },
+            None,
+        )
+        .await
+        .expect("generation");
+
+    // Not yet: both documents were written a moment ago, and one of them could
+    // be a join this maintenance tick is racing.
+    storage.maintain(now).await?;
+
+    assert_eq!(
+        vec!["abandoned".to_owned(), "named".to_owned()],
+        storage
+            .list_group_members("g-1")
+            .await?
+            .into_keys()
+            .collect::<Vec<_>>(),
+        "a document younger than the orphan age is left alone"
+    );
+
+    // An hour on, the unnamed one is unreachable: no join is still in flight for
+    // it, the sweep will never see it, and nothing will ever read it again.
+    storage.maintain(now + Duration::from_hours(2)).await?;
+
+    assert_eq!(
+        vec!["named".to_owned()],
+        storage
+            .list_group_members("g-1")
+            .await?
+            .into_keys()
+            .collect::<Vec<_>>(),
+        "the orphan is reclaimed and the member the generation names is not"
+    );
+
+    // And the group itself survives: reclaiming a document is not expiring a
+    // group, whose retention is seven days of no activity at all.
+    assert!(storage.read_group_generation("g-1").await?.is_some());
+
+    Ok(())
+}
+
+/// A group with no generation at all still has its aged member documents
+/// reclaimed — absent is a verdict, not a reason to keep them: nothing names
+/// them, and after the orphan age nothing is about to.
+#[tokio::test]
+async fn member_documents_of_a_group_with_no_generation_are_reclaimed() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let storage = DynoStore::new(CLUSTER, NODE, InMemory::new());
+    let now = SystemTime::now();
+
+    _ = storage
+        .write_group_member("g-1", "m-1", member(1_000), None)
+        .await
+        .expect("member");
+
+    storage.maintain(now + Duration::from_hours(2)).await?;
+
+    assert!(storage.list_group_members("g-1").await?.is_empty());
+
+    Ok(())
+}
+
+/// What the reclaim will and will not judge (#486).
+///
+/// The round trip is the safety property: a member id is client-chosen, so a
+/// name parsed one way and compared against a member set written another way is
+/// how a live member's document gets deleted. Anything that does not rebuild
+/// into the very location listed is not a member document as far as this is
+/// concerned.
+#[tokio::test]
+async fn only_a_member_document_that_rebuilds_its_own_name_is_judged() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let storage = DynoStore::new(CLUSTER, NODE, InMemory::new());
+    let root = Path::from(format!("clusters/{CLUSTER}/groups/consumers/"));
+
+    let member = |group: &str, member: &str| {
+        storage.member_document_of(
+            &root,
+            &Path::from(format!("{root}/{group}/members/{member}")),
+        )
+    };
+
+    assert_eq!(
+        Some(("g-1".to_owned(), "m-1".to_owned())),
+        member("g-1", "m-1.json")
+    );
+
+    // A member id with a delimiter in it spans two path components, and is
+    // rebuilt from both.
+    assert_eq!(
+        Some(("g-1".to_owned(), "consumer-1/0".to_owned())),
+        member("g-1", "consumer-1/0.json")
+    );
+
+    // Not a member document: the group's other objects, and the members prefix
+    // itself.
+    assert_eq!(
+        None,
+        storage.member_document_of(&root, &Path::from(format!("{root}/g-1/generation.json")))
+    );
+    assert_eq!(
+        None,
+        storage.member_document_of(
+            &root,
+            &Path::from(format!("{root}/g-1/offsets/topic/0000000000.json"))
+        )
+    );
+    assert_eq!(None, member("g-1", "not-json"));
+
+    // And nothing outside the consumer tree, whatever it is named.
+    assert_eq!(
+        None,
+        storage.member_document_of(
+            &root,
+            &Path::from(format!("clusters/{CLUSTER}/topics/g-1/members/m-1.json"))
+        )
     );
 
     Ok(())

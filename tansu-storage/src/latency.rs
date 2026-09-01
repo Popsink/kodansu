@@ -75,6 +75,18 @@ pub struct LatencyIntroducingStorage<S> {
     generation_cas_conflicts: Arc<AtomicU64>,
     member_lists: Arc<AtomicU64>,
     member_reads: Arc<AtomicU64>,
+
+    /// Generation updates still to be refused as a lost CAS before the real one
+    /// is attempted (#486).
+    ///
+    /// The one thing here that is not a counter, and it is why: a join that
+    /// loses the generation CAS retries, and what a retry does with the member's
+    /// *identity* is the whole of #486. Racing two live coordinators reproduces
+    /// it only sometimes; this reproduces it every time, without any test having
+    /// to reason about which of two futures the runtime polls first.
+    ///
+    /// Zero by default, so every other user of this store is unaffected.
+    outdate_generation_updates: Arc<AtomicU64>,
 }
 
 impl<S> LatencyIntroducingStorage<S>
@@ -91,6 +103,7 @@ where
             generation_cas_conflicts: Arc::new(AtomicU64::new(0)),
             member_lists: Arc::new(AtomicU64::new(0)),
             member_reads: Arc::new(AtomicU64::new(0)),
+            outdate_generation_updates: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -122,6 +135,19 @@ where
     /// before the read rather than after it.
     pub fn member_reads_handle(&self) -> Arc<AtomicU64> {
         self.member_reads.clone()
+    }
+
+    /// Refuse the next `updates` generation writes as a lost CAS, whatever the
+    /// store beneath would have answered (#486).
+    ///
+    /// The refusal carries the generation as it stands, which is what a real
+    /// `Outdated` carries and what the caller's retry re-reads — so a caller
+    /// that handles a genuine race handles this, and one that does not is
+    /// exercised here rather than in production.
+    pub fn outdating_generation_updates(self, updates: u64) -> Self {
+        self.outdate_generation_updates
+            .store(updates, Ordering::Relaxed);
+        self
     }
 
     pub fn with_seed(self, seed: u64) -> Self {
@@ -364,6 +390,31 @@ where
         self.introduce_latency().await?;
 
         _ = self.generation_updates.fetch_add(1, Ordering::Relaxed);
+
+        // Injected loss (#486), before the write rather than after it: a CAS the
+        // store accepted and this reported as lost would leave the two
+        // disagreeing about what the group holds.
+        let held = self.outdate_generation_updates.load(Ordering::Relaxed);
+
+        if let Some(left) = held.checked_sub(1) {
+            self.outdate_generation_updates
+                .store(left, Ordering::Relaxed);
+
+            _ = self
+                .generation_cas_conflicts
+                .fetch_add(1, Ordering::Relaxed);
+
+            let (current, version) = self
+                .storage
+                .read_group_generation(group_id)
+                .await?
+                .unwrap_or_default();
+
+            return Err(UpdateError::Outdated {
+                current: Box::new(current),
+                version,
+            });
+        }
 
         let result = self
             .storage

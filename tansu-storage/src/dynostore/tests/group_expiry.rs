@@ -53,14 +53,14 @@ async fn expires_only_stale_groups() -> Result<()> {
     let now = SystemTime::now();
 
     // Freshly written groups are within the retention window → survive.
-    assert_eq!(0, store.expire_groups(now).await?);
+    assert_eq!((0, 0), store.expire_groups(now).await?);
 
     // Eight days later both are past the 7-day retention window → expired.
     let later = now + Duration::from_secs(8 * 24 * 60 * 60);
-    assert_eq!(2, store.expire_groups(later).await?);
+    assert_eq!((2, 0), store.expire_groups(later).await?);
 
     // They were actually removed: a second sweep finds nothing to expire.
-    assert_eq!(0, store.expire_groups(later).await?);
+    assert_eq!((0, 0), store.expire_groups(later).await?);
 
     Ok(())
 }
@@ -279,7 +279,7 @@ async fn a_group_that_only_commits_offsets_survives() -> Result<()> {
     // The state object reads as 8 days old, the committed offsets as current.
     // Before the fix the first fact decided and the offsets went with it.
     assert_eq!(
-        0,
+        (0, 0),
         store.expire_groups(SystemTime::now()).await?,
         "a group still committing offsets must not be expired",
     );
@@ -327,7 +327,7 @@ async fn an_abandoned_group_is_still_reclaimed() -> Result<()> {
     seed_legacy_group(&bucket, CLUSTER, "group-abandoned").await?;
 
     assert_eq!(
-        1,
+        (1, 0),
         store.expire_groups(SystemTime::now()).await?,
         "a group with no committed-offset activity is still reclaimed",
     );
@@ -395,7 +395,7 @@ async fn a_group_with_no_state_object_is_still_reclaimed() -> Result<()> {
     );
 
     assert_eq!(
-        1,
+        (1, 0),
         store.expire_groups(SystemTime::now()).await?,
         "a group with no state object is still a group",
     );
@@ -463,7 +463,7 @@ async fn a_group_whose_only_activity_is_member_liveness_survives() -> Result<()>
         .expect("seed member");
 
     assert_eq!(
-        0,
+        (0, 0),
         store.expire_groups(SystemTime::now()).await?,
         "a member writing liveness is activity",
     );

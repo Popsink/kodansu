@@ -1584,6 +1584,19 @@ where
         let polling_since = Instant::now();
         let mut conflicts = 0u32;
 
+        // The id minted for a static member whose instance this group does not
+        // yet hold, kept **across iterations** (#486).
+        //
+        // Minting inside the loop meant every lost generation CAS re-derived a
+        // *fresh* uuid against a generation that still did not name the
+        // instance — and since the member's document is written before the
+        // generation admits it, each retry left one behind that nothing would
+        // ever delete: `join_outdated` ran at 0.35/s on the production fleet,
+        // and the bucket held 46 686 member documents for 348 live members,
+        // every sampled one written exactly once. A retry is the same join, so
+        // it is the same member.
+        let mut minted_for_instance: Option<String> = None;
+
         loop {
             COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_loop")]);
 
@@ -1690,7 +1703,18 @@ where
                             held.group_instance_id.as_deref() == Some(group_instance_id)
                         })
                         .map_or_else(
-                            || format!("{group_instance_id}-{}", Uuid::new_v4()),
+                            || {
+                                minted_for_instance
+                                    .get_or_insert_with(|| {
+                                        format!("{group_instance_id}-{}", Uuid::new_v4())
+                                    })
+                                    .clone()
+                            },
+                            // A generation that has come to name the instance
+                            // wins over anything minted earlier in this call:
+                            // that is either this join's own write landing, or a
+                            // peer registering the instance, and both are the id
+                            // the group is agreed on.
                             |(member_id, _)| member_id.to_owned(),
                         )
                 },
@@ -3414,6 +3438,84 @@ mod tests {
             reads + 3,
             member_reads.load(std::sync::atomic::Ordering::Relaxed),
             "a replica with nothing memoized must read the document"
+        );
+
+        Ok(())
+    }
+
+    /// A static member's join that loses the generation CAS must come back as
+    /// the **same** member (#486).
+    ///
+    /// The member id was derived inside the retry loop, so a lost CAS re-derived
+    /// it against a generation that still did not name the instance and minted a
+    /// *fresh* uuid — while the document for the previous one had already been
+    /// written, because a member the generation names must always have one. Each
+    /// retry therefore left an object nothing would ever delete or read: the
+    /// production bucket held 46 686 member documents for 348 live members,
+    /// every sampled one written exactly once and never renewed, against
+    /// `join_outdated` at 0.35/s.
+    #[tokio::test(start_paused = true)]
+    async fn a_static_member_that_retries_its_join_stays_one_member() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "static-retry-group";
+        const INSTANCE: &str = "connector-0";
+
+        // One lost generation CAS, injected rather than raced, so this is the
+        // same test on every machine.
+        let storage = counted_storage().await?.outdating_generation_updates(1);
+        let conflicts = storage.generation_cas_conflicts_handle();
+
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+        let metadata = encode_subscription(&["t"], None);
+
+        // A static member joins with an empty member id: it is the group
+        // instance that identifies it, and the coordinator mints an id for it.
+        let join = match controller
+            .join(
+                Some(CLIENT_ID),
+                GROUP_ID,
+                SESSION_TIMEOUT_MS,
+                REBALANCE_TIMEOUT_MS,
+                "",
+                Some(INSTANCE),
+                CONSUMER,
+                Some(&protocols(&metadata)[..]),
+                None,
+            )
+            .await?
+        {
+            Body::JoinGroupResponse(join) => join,
+            otherwise => panic!("{otherwise:?}"),
+        };
+
+        assert_eq!(i16::from(ErrorCode::None), join.error_code);
+        assert!(
+            conflicts.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the join must have retried for this to be testing anything"
+        );
+
+        let documents = storage
+            .list_group_members(GROUP_ID)
+            .await?
+            .into_keys()
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            BTreeSet::from([join.member_id.clone()]),
+            documents,
+            "a retried join must leave one member document, for the member it answered with"
+        );
+
+        assert_eq!(
+            BTreeSet::from([join.member_id]),
+            generation_of(&storage, GROUP_ID)
+                .await?
+                .members
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            "and the generation must name exactly that member"
         );
 
         Ok(())

@@ -1679,6 +1679,19 @@ static PREFIX_INDEX_RECONCILED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Member documents deleted because no generation named them (#486).
+///
+/// Expected to be non-zero while a fleet's abandoned member ids drain and near
+/// zero after: it counts objects that could never be read again, so a rate that
+/// stays high is a join path minting ids it does not register — which is what
+/// produced 46 686 documents for 348 live members.
+static MEMBER_DOCUMENTS_RECLAIMED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_group_member_documents_reclaimed")
+        .with_description("member documents deleted because no generation named them")
+        .build()
+});
+
 /// Segment objects listed under a prefix whose footer could not be decoded
 /// (#157). Expected to be zero: nonzero means something is squatting the
 /// create-only segment namespace, and the arbiter is stepping over those names.
@@ -8711,6 +8724,22 @@ impl DynoStore {
         (!group_id.is_empty()).then_some(group_id)
     }
 
+    /// How long a member document must have been untouched before the reclaim
+    /// will consider it (#486).
+    ///
+    /// The window that makes deleting an unnamed document safe: it is far longer
+    /// than any join can be in flight, and longer than the largest session
+    /// timeout Kafka lets a client ask for, so a document this old is one no
+    /// generation is about to name.
+    const GROUP_MEMBER_ORPHAN_AGE: Duration = Duration::from_hours(1);
+
+    /// Member documents reclaimed per maintenance tick (#486).
+    ///
+    /// As `GROUP_EXPIRE_CHUNK` bounds expiry: a 46 k-document backlog drains over
+    /// ticks rather than issuing tens of thousands of deletes at once, which is
+    /// the concentrated object-store pressure #8 was about.
+    const GROUP_MEMBER_RECLAIM_CHUNK: u64 = 10_000;
+
     /// Enforce the `delete` cleanup policy: for every topic configured with
     /// `cleanup.policy` containing `delete`, drop the batches whose records are
     /// older than `retention.ms` (defaulting to 7 days, matching the SQL
@@ -8751,7 +8780,7 @@ impl DynoStore {
     /// deletes at once — the concentrated object-store pressure that degraded
     /// the broker in #8. See #45. The oldest go first, so a backlog drains in
     /// the order it accumulated rather than in listing order.
-    async fn expire_groups(&self, now: SystemTime) -> Result<u64> {
+    async fn expire_groups(&self, now: SystemTime) -> Result<(u64, u64)> {
         /// Kafka's default `offsets.retention.minutes` is 7 days; match it.
         const GROUP_RETENTION: Duration = Duration::from_hours(7 * 24);
         /// Maximum number of groups expired per maintenance tick.
@@ -8764,6 +8793,7 @@ impl DynoStore {
         )
         .unwrap_or(i64::MAX);
         let threshold_ms = now_ms.saturating_sub(GROUP_RETENTION.as_millis() as i64);
+        let orphan_ms = now_ms.saturating_sub(Self::GROUP_MEMBER_ORPHAN_AGE.as_millis() as i64);
 
         let root = self.groups_root();
 
@@ -8771,6 +8801,14 @@ impl DynoStore {
         // object, so the tick's memory is the group count however many objects
         // each group owns.
         let mut latest: BTreeMap<String, i64> = BTreeMap::new();
+
+        // Which groups hold a member document old enough to be worth a second
+        // look (#486) — a group id, not a document, so the memory discipline
+        // above is untouched. Empty in steady state: a member the generation
+        // names renews inside `session/2`, so a document an hour old is one
+        // nothing is renewing, and a group with none costs this pass nothing.
+        let mut aged_members: BTreeSet<String> = BTreeSet::new();
+
         let mut listing = self.scan(Scan::Group, &root);
 
         while let Some(meta) = listing
@@ -8785,6 +8823,12 @@ impl DynoStore {
 
             let modified = meta.last_modified.timestamp_millis();
 
+            if modified < orphan_ms
+                && let Some((member_group, _)) = self.member_document_of(&root, &meta.location)
+            {
+                _ = aged_members.insert(member_group);
+            }
+
             _ = latest
                 .entry(group_id)
                 .and_modify(|held| *held = (*held).max(modified))
@@ -8797,7 +8841,12 @@ impl DynoStore {
             .collect::<Vec<_>>();
 
         if stale.is_empty() {
-            return Ok(0);
+            // The group set is unchanged, so every group with an aged member
+            // document survives this tick and is the reclaim's to judge.
+            return self
+                .reclaim_member_documents(orphan_ms, aged_members)
+                .await
+                .map(|reclaimed| (0, reclaimed));
         }
 
         // Oldest first, so a backlog drains in the order it accumulated.
@@ -8827,7 +8876,174 @@ impl DynoStore {
             debug!(expired, cluster = self.cluster, "expire_groups");
         }
 
-        Ok(expired)
+        // A group that has just been deleted took its member documents with it,
+        // so looking for its orphans would be a generation read and a listing of
+        // objects that are already gone.
+        let expired_ids = stale.into_iter().collect::<BTreeSet<_>>();
+        aged_members.retain(|group_id| !expired_ids.contains(group_id));
+
+        let reclaimed = self
+            .reclaim_member_documents(orphan_ms, aged_members)
+            .await?;
+
+        Ok((expired, reclaimed))
+    }
+
+    /// Delete member documents no generation names (#486).
+    ///
+    /// A member document is written **before** the generation admits the member —
+    /// the sweep reads a missing document as a lapsed session, so a member the
+    /// generation names must always have one — and nothing deletes the document
+    /// of an id the generation never admitted. The sweep only iterates
+    /// `generation.members`, `leave` only deletes the member that left, and
+    /// `expire_groups` only fires after seven days of a group being *entirely*
+    /// idle, which a busy group never is. So such a group accumulates one object
+    /// per abandoned id for ever: the production bucket held **46 686 documents
+    /// for 348 live members**, growing ~24 k/day, and every one of them was
+    /// walked by the listing above on every tick.
+    ///
+    /// Three things make deleting safe rather than merely likely to be safe:
+    ///
+    /// - **age.** A document has not been touched for
+    ///   [`Self::GROUP_MEMBER_ORPHAN_AGE`], where a member the generation names
+    ///   renews inside `session/2`. That is also why the caller can hand this
+    ///   nothing but a *group* id: in steady state no group qualifies.
+    /// - **identity.** The member id is derived from the object's own path and
+    ///   then rebuilt into a location that must equal the one listed
+    ///   ([`Self::member_document_of`]), so what is compared against the
+    ///   generation's member set is the same string the coordinator writes. A
+    ///   name that does not round-trip is left alone rather than guessed at.
+    /// - **freshness.** The mtimes are read here, from this group's own listing,
+    ///   *after* its generation — not from the whole-tree listing that chose the
+    ///   group, which by now is as old as the tick. A join admitting a member
+    ///   writes its document first, so a document being re-admitted has a fresh
+    ///   mtime by the time it is looked at.
+    ///
+    /// What that leaves is a join whose document write lands in the moment
+    /// between this listing and the delete. Nothing in an object store closes
+    /// that — there is no conditional delete — and the cost if it happens is one
+    /// rebalance: the member is in the generation with no document, which the
+    /// sweep reads as a lapsed session and the member rejoins.
+    ///
+    /// A generation that cannot be read leaves the group alone. The failure
+    /// direction is expiry's: every way this can be wrong keeps a document, and
+    /// the next tick reconsiders it.
+    async fn reclaim_member_documents(
+        &self,
+        orphan_ms: i64,
+        groups: BTreeSet<String>,
+    ) -> Result<u64> {
+        let root = self.groups_root();
+        let mut reclaimed = 0u64;
+
+        for group_id in groups {
+            let Some(budget) = Self::GROUP_MEMBER_RECLAIM_CHUNK.checked_sub(reclaimed) else {
+                info!(
+                    reclaimed,
+                    cluster = self.cluster,
+                    "member reclaim hit the per-tick cap; more orphans remain for the next tick"
+                );
+                break;
+            };
+
+            // Absent is a verdict: a group with no generation names no member,
+            // and a document older than the orphan age is not one a group still
+            // forming is about to admit.
+            let named = match self.read_group_generation(&group_id).await {
+                Ok(held) => held
+                    .map(|(generation, _)| generation.members)
+                    .unwrap_or_default(),
+
+                Err(error) => {
+                    debug!(?error, group_id, "not reclaiming without a generation");
+                    continue;
+                }
+            };
+
+            let Some(prefix) = self.group_members_prefix(&group_id) else {
+                continue;
+            };
+
+            let mut doomed = Vec::new();
+            let mut listing = self.scan(Scan::Group, &prefix);
+
+            while let Some(meta) = listing
+                .next()
+                .await
+                .transpose()
+                .inspect_err(|err| error!(?err, group_id))?
+            {
+                if meta.last_modified.timestamp_millis() >= orphan_ms {
+                    continue;
+                }
+
+                let Some((_, member_id)) = self.member_document_of(&root, &meta.location) else {
+                    continue;
+                };
+
+                if named.contains_key(&member_id) {
+                    continue;
+                }
+
+                doomed.push(meta.location);
+
+                if doomed.len() as u64 >= budget {
+                    break;
+                }
+            }
+
+            if doomed.is_empty() {
+                continue;
+            }
+
+            let deleted = self
+                .object_store
+                .delete_stream(futures::stream::iter(doomed.into_iter().map(Ok)).boxed())
+                .try_collect::<Vec<Path>>()
+                .await
+                .inspect_err(|err| warn!(?err, group_id, "reclaiming member documents"))
+                .unwrap_or_default();
+
+            if !deleted.is_empty() {
+                MEMBER_DOCUMENTS_RECLAIMED.add(deleted.len() as u64, &[]);
+                info!(
+                    group_id,
+                    reclaimed = deleted.len(),
+                    "reclaimed member documents no generation names"
+                );
+            }
+
+            reclaimed += deleted.len() as u64;
+        }
+
+        Ok(reclaimed)
+    }
+
+    /// The `(group, member)` a listed object addresses, iff it is a member
+    /// document *and* that pair rebuilds the very location listed (#486).
+    ///
+    /// The round trip is the point: a member id is client-chosen and may contain
+    /// anything a path component may, so a name parsed one way and compared
+    /// against a member set written another way is how a live member's document
+    /// gets deleted. What does not rebuild is not judged.
+    fn member_document_of(&self, root: &Path, location: &Path) -> Option<(String, String)> {
+        let mut parts = location.prefix_match(root)?;
+
+        let group_id = parts.next()?.as_ref().to_owned();
+
+        if parts.next()?.as_ref() != "members" {
+            return None;
+        }
+
+        let member_id = parts
+            .map(|part| part.as_ref().to_owned())
+            .collect::<Vec<_>>()
+            .join("/")
+            .strip_suffix(".json")?
+            .to_owned();
+
+        (self.group_member_location(&group_id, &member_id).as_ref() == Some(location))
+            .then_some((group_id, member_id))
     }
 
     /// Record the size of the cluster-global `meta.json` and of the two tables
@@ -15302,7 +15518,7 @@ impl Storage for DynoStore {
         // with that layout (#179).
         let (deleted_segments, compacted_segments) =
             self.maintain_prefix_segments(now_ms, owned).await?;
-        let expired_groups = self.expire_groups(now).await?;
+        let (expired_groups, reclaimed_members) = self.expire_groups(now).await?;
 
         // Converge the per-topic caches of topics another replica deleted (#283).
         // Not `?`: this is memory hygiene, and a failed topic listing must not
@@ -15325,6 +15541,7 @@ impl Storage for DynoStore {
             deleted_segments,
             compacted_segments,
             expired_groups,
+            reclaimed_members,
             evicted_topics,
             ?meta
         );
