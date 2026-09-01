@@ -315,12 +315,22 @@ data the two rules agree.
   the topic is deleted: the name can come back with a different id).
 
   Do **not** recompute the prefix from `cleanup.policy`: a compacted topic is
-  routed under its own name and everything else under its connector prefix (the
-  first three dotted components), but that derivation is only correct until an
+  routed under its own name and everything else under its connector prefix (by
+  default the first three dotted components, and the shape is per-cluster — see
+  `prefix-shape.json` below), but that derivation is only correct until an
   `AlterConfigs` changes the policy — after which the records stay where they
   were, and only the pin still says where that is. Topics created before this
   object existed have no pin until a broker resolves their routing once, at which
   point it writes the derivation they were already using.
+- **The prefix shape** — how many leading components of a topic name form the
+  connector prefix, and what separates them — is sealed once per cluster at
+  `clusters/{cluster}/prefix-shape.json` — `{"depth": 3, "separator": "."}`
+  (#464). It is written create-only by whichever broker first builds a store
+  against the bucket and is never rewritten: a broker configured with a different
+  shape fails to start rather than joining. A reader that derives prefixes from
+  topic names should read it rather than assume `3` / `.`; a reader that resolves
+  through the routing pin above does not need it at all. An absent object means
+  no broker has built a store here yet.
 - **Retention** is whole-segment, per prefix: a segment is deleted only once
   every sub-stream in it is past retention (`max_timestamp`), so a live topic
   never loses a shared segment.

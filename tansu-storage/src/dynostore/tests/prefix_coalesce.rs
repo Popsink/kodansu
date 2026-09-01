@@ -1482,7 +1482,8 @@ async fn maintainer_with_cold_index_compacts() -> Result<(), Error> {
 
     // A producer writes four segments, then goes away.
     {
-        let producer = DynoStore::new(CLUSTER, NODE, bucket.clone()).coalesce_tuning(tuning);
+        let producer =
+            DynoStore::new(CLUSTER, NODE, bucket.clone()).coalesce_tuning(tuning.clone());
         create_topic(&producer, topic).await?;
         for _ in 0..4 {
             _ = producer.produce(None, &a, batch(1)?).await?;

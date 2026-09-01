@@ -43,6 +43,7 @@ mod metadata_visibility;
 mod offset_assignment;
 mod offset_commit;
 mod prefix_coalesce;
+mod prefix_shape;
 mod quarantine_segment;
 mod reachable_panics;
 mod retention_order;
