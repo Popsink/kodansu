@@ -331,6 +331,11 @@ pub(crate) static THROTTLED_TIME: LazyLock<Counter<u64>> = LazyLock::new(|| {
 pub enum Error {
     Auth(#[from] tansu_auth::Error),
     DuplicateRoute(i16),
+
+    /// A frame prefix that is not a length: negative, so it announces nothing
+    /// that can be read (see [`frame_length`]).
+    FrameLength(i32),
+
     FrameTooBig(usize),
     Io(Arc<io::Error>),
     Join(Arc<JoinError>),
@@ -405,9 +410,9 @@ impl Classify for Error {
                 Severity::Expected
             }
 
-            // A client asked for more than the cap allows: its problem, but
-            // worth seeing.
-            Self::FrameTooBig(_) => Severity::Unexpected,
+            // A client asked for more than the cap allows, or sent a prefix that
+            // is not a length at all: its problem, but worth seeing.
+            Self::FrameTooBig(_) | Self::FrameLength(_) => Severity::Unexpected,
 
             _ => Severity::Failure,
         }
@@ -432,8 +437,19 @@ impl<T> From<PoisonError<T>> for Error {
     }
 }
 
-fn frame_length(encoded: [u8; 4]) -> usize {
-    i32::from_be_bytes(encoded) as usize + encoded.len()
+/// The whole frame's length — the four-byte prefix plus the payload it announces
+/// — or `None` when the prefix is not a length at all.
+///
+/// Kafka writes the payload length as a signed `i32`, so a peer can send one that
+/// is negative. `as usize` turned `-1` into `usize::MAX`, and the `+ 4` then
+/// wrapped it back to `3`: a garbage prefix silently became a plausible tiny
+/// frame and the connection went on to mis-frame everything after it. `try_from`
+/// refuses instead, and the caller closes the connection — which is what a peer
+/// that is not speaking the protocol has earned.
+fn frame_length(encoded: [u8; 4]) -> Option<usize> {
+    usize::try_from(i32::from_be_bytes(encoded))
+        .ok()
+        .map(|payload| payload + encoded.len())
 }
 
 pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {

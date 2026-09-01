@@ -289,7 +289,7 @@ where
 
 /// A [context state][`Context#method.state`] state used by [`TcpContextLayer`] and [`TcpContextService`]
 #[non_exhaustive]
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct TcpContext {
     cluster_id: Option<String>,
     maximum_frame_size: Option<usize>,
@@ -313,7 +313,36 @@ pub struct TcpContext {
     drain: CancellationToken,
 }
 
+/// Armed, unlike every `Option` beside it.
+///
+/// The cap existed and was `None` — the guard that reads it is
+/// `is_some_and(...)`, so the broker allocated whatever a client's four-byte
+/// prefix claimed, before any validation and before a byte of the frame had
+/// arrived (#477). Kafka has had `socket.request.max.bytes` since the beginning
+/// and defaults it to 100 MiB; a broker without one is missing a limit, not
+/// offering a feature.
+///
+/// It stays an `Option` so an operator can still turn it off deliberately, which
+/// is different from never having turned it on.
+impl Default for TcpContext {
+    fn default() -> Self {
+        Self {
+            cluster_id: None,
+            maximum_frame_size: Some(Self::MAXIMUM_FRAME_SIZE),
+            drain: CancellationToken::default(),
+        }
+    }
+}
+
 impl TcpContext {
+    /// Kafka's `socket.request.max.bytes` default, and ours.
+    ///
+    /// Comfortably above any frame this broker can legitimately be sent: the
+    /// engine's own `message_max_bytes` defaults to Kafka's 1 048 588, and a
+    /// deployment that raises it past this has to raise this too — hence
+    /// `--socket-request-max-bytes`.
+    pub const MAXIMUM_FRAME_SIZE: usize = 100 * 1024 * 1024;
+
     pub fn cluster_id(self, cluster_id: Option<String>) -> Self {
         Self { cluster_id, ..self }
     }
@@ -387,6 +416,66 @@ where
     }
 }
 
+/// Read the rest of a frame whose four-byte prefix has already been taken,
+/// returning the whole frame — prefix included, which is what every layer above
+/// expects to decode.
+///
+/// **The commitment grows with what has arrived, not with what was announced**
+/// (#477). This used to be `vec![0u8; frame_length(size)]`: one zeroed
+/// allocation of exactly the length a client claimed, made before a byte of it
+/// had been read. With no cap armed that was unbounded, and with a cap armed it
+/// is still the cap — a peer that announces the maximum and then dribbles holds
+/// the whole thing, times however many connections it opens. Growing in chunks
+/// makes the memory a function of the traffic instead of the claim.
+///
+/// The chunk is a compromise, not a tuning knob. A frame that fits in one — which
+/// is every ordinary request — is allocated once at exactly its size and read in
+/// one `read_exact`, precisely as before, so nothing is paid on the hot path.
+/// Above that, each round grows the buffer geometrically, so the copying stays
+/// amortised and the capacity stays within a factor of two of the bytes actually
+/// received.
+async fn read_frame<R, E>(req: &mut R, size: [u8; 4]) -> Result<Bytes, E>
+where
+    R: AsyncReadExt + Unpin,
+    E: From<Error> + From<io::Error>,
+{
+    /// How much of an oversized frame is committed at a time.
+    const CHUNK: usize = 64 * 1024;
+
+    let Some(length) = frame_length(size) else {
+        let announced = i32::from_be_bytes(size);
+
+        warn!(
+            announced,
+            "frame prefix is not a length; closing the connection"
+        );
+
+        return Err(E::from(Error::FrameLength(announced)));
+    };
+
+    let mut request = Vec::with_capacity(length.min(CHUNK));
+    request.extend_from_slice(&size[..]);
+
+    while request.len() < length {
+        let filled = request.len();
+        let want = length.min(filled + CHUNK);
+
+        // `resize` zeroes only the window about to be filled and `read_exact`
+        // then overwrites it, so nothing is zeroed that is not immediately
+        // written — unlike the whole announced length, which was.
+        request.resize(want, 0);
+
+        _ = req
+            .read_exact(&mut request[filled..want])
+            .await
+            .inspect_err(|err| error!(?err))?;
+    }
+
+    BYTES_RECEIVED.add(request.len() as u64, &[]);
+
+    Ok(Bytes::from(request))
+}
+
 /// A [`Service`] writing [`Bytes`] into a [`TcpStream`], responding with a length delimited frame of [`Bytes`]
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BytesTcpService;
@@ -409,12 +498,25 @@ impl Service<TcpStream, Bytes> for BytesTcpService {
         let mut size = [0u8; 4];
         _ = stream.read_exact(&mut size).await?;
 
-        let mut buffer: Vec<u8> = vec![0u8; frame_length(size)];
-        buffer[0..size.len()].copy_from_slice(&size[..]);
-        _ = stream.read_exact(&mut buffer[4..]).await?;
-        BYTES_RECEIVED.add(buffer.len() as u64, &[]);
+        // The response direction gets the same cap as the request direction
+        // (#477). This side has no [`TcpContext`] to read an operator's value
+        // from — it is one request on a socket this service owns — so the
+        // constant is the whole policy: a peer claiming more than a broker could
+        // ever legitimately answer with is not answering, and reading it would be
+        // taking its word for how much memory to commit.
+        if frame_length(size).is_some_and(|length| length > TcpContext::MAXIMUM_FRAME_SIZE) {
+            let length = frame_length(size).unwrap_or_default();
 
-        Ok(Bytes::from(buffer))
+            warn!(
+                length,
+                maximum_frame_size = TcpContext::MAXIMUM_FRAME_SIZE,
+                "rejecting an oversized response frame"
+            );
+
+            return Err(Error::FrameTooBig(length));
+        }
+
+        read_frame(stream, size).await
     }
 }
 
@@ -478,14 +580,24 @@ where
             .await
             .inspect_err(|err| debug!(?err))?;
 
-        let length = frame_length(size);
+        let Some(length) = frame_length(size) else {
+            let announced = i32::from_be_bytes(size);
+
+            warn!(
+                announced,
+                "frame prefix is not a length; closing the connection"
+            );
+
+            return Err(Into::into(Error::FrameLength(announced)));
+        };
 
         // Reject a frame LARGER than the cap (#244). The comparison used to run the
         // other way round, so the guard fired on every frame *smaller* than the
         // limit and passed everything above it: the cap did not cap, and it refused
-        // ordinary traffic. Nothing set `maximum_frame_size`, so it was inert — but
-        // the first operator to arm it, which is the natural response to a
-        // payload-size incident, would have taken every connection down instead.
+        // ordinary traffic. Nothing set `maximum_frame_size`, so it was inert until
+        // #477 gave [`TcpContext`] a default — and the first operator to arm it,
+        // which is the natural response to a payload-size incident, would have taken
+        // every connection down instead.
         //
         // Rejection ends the connection task, so the peer sees a close mid-request
         // rather than an error response — `early eof` on the client side. Hence the
@@ -509,17 +621,7 @@ where
     where
         R: AsyncReadExt + Unpin,
     {
-        let mut request: Vec<u8> = vec![0u8; frame_length(size)];
-
-        request[0..size.len()].copy_from_slice(&size[..]);
-
-        _ = req
-            .read_exact(&mut request[4..])
-            .await
-            .inspect_err(|err| error!(?err))?;
-        BYTES_RECEIVED.add(request.len() as u64, &[]);
-
-        Ok(Bytes::from(request))
+        read_frame(req, size).await
     }
 
     #[instrument(skip_all)]
@@ -825,7 +927,7 @@ mod tests {
         // 96 is a 100-byte frame.
         const DECLARED: i32 = 96;
         let size = DECLARED.to_be_bytes();
-        let length = frame_length(size);
+        let length = frame_length(size).expect("a length");
         assert_eq!(100, length);
 
         let service: TcpBytesService<EchoBytes, ()> = TcpBytesService {
@@ -833,8 +935,8 @@ mod tests {
             _state: PhantomData,
         };
 
-        // No cap configured: every frame passes, which is the behaviour of every
-        // deployment today.
+        // No cap configured: every frame passes. Reachable only by an operator
+        // asking for it since #477 armed the default.
         assert!(service.wait(&mut &size[..], None).await.is_ok());
 
         // At the limit, and one byte of headroom: accepted.
@@ -849,6 +951,87 @@ mod tests {
                 .is_err(),
             "a frame larger than the cap must be rejected"
         );
+    }
+
+    /// **The bug #477 closes: the cap was armed by nobody.**
+    ///
+    /// The guard reads `Option<usize>` through `is_some_and`, so a `None` is not
+    /// "no limit configured yet", it is "no limit, ever" — and
+    /// `TcpContext::default()` produced exactly that, on every listener, which is
+    /// what let a four-byte prefix decide how much the broker allocated. The
+    /// #244 test above proves the comparison is the right way round; only this
+    /// one proves anybody is doing the comparing.
+    #[test]
+    fn the_default_context_arms_the_cap() {
+        assert_eq!(
+            Some(TcpContext::MAXIMUM_FRAME_SIZE),
+            TcpContext::default().maximum_frame_size,
+        );
+
+        // Kafka's `socket.request.max.bytes`, so a client that works against a
+        // Kafka broker works against this one.
+        assert_eq!(104_857_600, TcpContext::MAXIMUM_FRAME_SIZE);
+
+        // And an operator can still turn it off, which is a different thing from
+        // it never having been on.
+        assert_eq!(
+            None,
+            TcpContext::default()
+                .maximum_frame_size(None)
+                .maximum_frame_size
+        );
+    }
+
+    /// A negative prefix is not a length, and it must not become one.
+    ///
+    /// `i32::from_be_bytes(..) as usize + 4` turned `-1` into `usize::MAX` and
+    /// then wrapped it to **3**: a garbage prefix became a plausible tiny frame,
+    /// the guard passed it because 3 is under any cap, and everything read after
+    /// it on that connection was mis-framed. Both ends of the range are asserted
+    /// because the wrap is silent in release builds.
+    #[test]
+    fn a_negative_frame_prefix_is_not_a_length() {
+        for announced in [-1i32, -4, i32::MIN] {
+            assert_eq!(
+                None,
+                frame_length(announced.to_be_bytes()),
+                "{announced} must not be read as a length"
+            );
+        }
+
+        // The boundary either side of it still is one.
+        assert_eq!(Some(4), frame_length(0i32.to_be_bytes()));
+        assert_eq!(
+            Some(i32::MAX as usize + 4),
+            frame_length(i32::MAX.to_be_bytes())
+        );
+    }
+
+    /// A frame bigger than one chunk arrives whole (#477).
+    ///
+    /// `read_frame` grows the buffer as bytes arrive instead of allocating the
+    /// announced length up front, which means the multi-round path is real code
+    /// on any frame over 64 KiB — and an off-by-one in the window it reads into
+    /// would corrupt a large `Produce` rather than fail it. So this asserts the
+    /// bytes, not the length.
+    #[tokio::test]
+    async fn a_frame_larger_than_one_chunk_is_read_whole() {
+        // Three chunks and a bit, and a payload whose every byte is a function of
+        // its position, so a chunk read into the wrong window shows up.
+        const PAYLOAD: usize = 3 * 64 * 1024 + 17;
+
+        let payload = (0..PAYLOAD).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+        let framed = frame(&payload[..]);
+
+        let mut size = [0u8; 4];
+        size.copy_from_slice(&framed[..4]);
+
+        let read = read_frame::<_, Error>(&mut &framed[4..], size)
+            .await
+            .expect("a whole frame");
+
+        assert_eq!(framed.len(), read.len());
+        assert_eq!(&framed[..], &read[..]);
     }
 
     /// A `Service<(), Bytes>` that satisfies `TcpBytesService`'s bounds. `wait`

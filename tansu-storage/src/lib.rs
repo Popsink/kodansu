@@ -2690,8 +2690,11 @@ impl<N, C, A, S> Builder<N, C, A, S> {
 }
 
 /// The largest record batch this broker accepts, from the storage URL query
-/// string (`?message_max_bytes=1MiB`), falling back to Kafka's own default
-/// (#443).
+/// string (`?message_max_bytes=1m`), falling back to Kafka's own default (#443).
+///
+/// The suffixes are `human_units`' IEC ones — `1m` is one MiB — and it does *not*
+/// accept `1MiB`, which this comment used to say. Following it got the default
+/// back, silently, which is the failure the paragraph below is about.
 ///
 /// A key here rather than a broker CLI flag, alongside `auto_create_topics` and
 /// the `coalesce_*` keys, because that is where this deployment's engine

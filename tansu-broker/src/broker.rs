@@ -39,7 +39,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tansu_sans_io::{ErrorCode, RootMessageMeta};
-use tansu_service::{Classify as _, Peer, Severity};
+use tansu_service::{Classify as _, Peer, Severity, TcpContext};
 use tansu_storage::{
     ArcDynStorage, Authorizer, BrokerRegistrationRequest, QuotaEnforcer, QuotaLimits, Storage,
     StorageContainer, TopicDefaults,
@@ -265,6 +265,11 @@ pub struct Broker<G, S> {
 
     tls_server_config: Option<Arc<ServerConfig>>,
     silent: bool,
+
+    /// The largest request frame this listener will read, `None` to accept any
+    /// (#477). Kafka's `socket.request.max.bytes`.
+    maximum_frame_size: Option<usize>,
+
     maintenance: Maintenance,
 
     cancellation: CancellationToken,
@@ -300,6 +305,10 @@ where
             tls_server_config: None,
 
             silent: false,
+
+            // Armed, as `TcpContext::default()` is: a `Broker` built directly
+            // rather than through the builder gets the same cap (#477).
+            maximum_frame_size: Some(TcpContext::MAXIMUM_FRAME_SIZE),
 
             maintenance: Maintenance::default(),
 
@@ -731,14 +740,16 @@ where
         stream.set_nodelay(true)?;
 
         let service = services(
-            self.cluster_id.as_str(),
+            TcpContext::default()
+                .cluster_id(Some(self.cluster_id.clone()))
+                .maximum_frame_size(self.maximum_frame_size)
+                // So this connection is closed the next time it is idle between
+                // requests, rather than held open until the client goes away and
+                // the drain runs out of patience (#361).
+                .drain(self.cancellation.clone()),
             groups,
             self.storage.clone(),
             self.sasl_config.clone(),
-            // So this connection is closed the next time it is idle between
-            // requests, rather than held open until the client goes away and
-            // the drain runs out of patience (#361).
-            self.cancellation.clone(),
             self.authorizer.clone(),
             self.enforcer.clone(),
         )?;
@@ -884,6 +895,10 @@ pub struct Builder<N, C, I, A, S, L> {
     /// which is what #360 removed and what must not come back.
     quota_fleet_size: u32,
 
+    /// The largest request frame the listener will read (#477), `None` to accept
+    /// any. Defaults to Kafka's `socket.request.max.bytes`.
+    maximum_frame_size: Option<usize>,
+
     cancellation: CancellationToken,
 }
 
@@ -917,6 +932,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             super_users: self.super_users,
             quota_defaults: self.quota_defaults,
             quota_fleet_size: self.quota_fleet_size,
+            maximum_frame_size: self.maximum_frame_size,
             cancellation: self.cancellation,
         }
     }
@@ -939,6 +955,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             super_users: self.super_users,
             quota_defaults: self.quota_defaults,
             quota_fleet_size: self.quota_fleet_size,
+            maximum_frame_size: self.maximum_frame_size,
             cancellation: self.cancellation,
         }
     }
@@ -961,6 +978,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             super_users: self.super_users,
             quota_defaults: self.quota_defaults,
             quota_fleet_size: self.quota_fleet_size,
+            maximum_frame_size: self.maximum_frame_size,
             cancellation: self.cancellation,
         }
     }
@@ -986,6 +1004,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             super_users: self.super_users,
             quota_defaults: self.quota_defaults,
             quota_fleet_size: self.quota_fleet_size,
+            maximum_frame_size: self.maximum_frame_size,
             cancellation: self.cancellation,
         }
     }
@@ -1047,6 +1066,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             super_users: self.super_users,
             quota_defaults: self.quota_defaults,
             quota_fleet_size: self.quota_fleet_size,
+            maximum_frame_size: self.maximum_frame_size,
             cancellation: self.cancellation,
         }
     }
@@ -1071,6 +1091,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             super_users: self.super_users,
             quota_defaults: self.quota_defaults,
             quota_fleet_size: self.quota_fleet_size,
+            maximum_frame_size: self.maximum_frame_size,
             cancellation: self.cancellation,
         }
     }
@@ -1119,6 +1140,19 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
 
     /// How many replicas a configured quota is shared between (#384). `1`
     /// enforces each configured limit on every replica, as Apache Kafka does.
+    /// Cap the request frames this listener will read, `None` to accept any
+    /// (#477).
+    ///
+    /// `None` is an operator deliberately turning the cap off, which is not the
+    /// same thing as the cap never having been armed — which is what it was
+    /// until #477.
+    pub fn maximum_frame_size(self, maximum_frame_size: Option<usize>) -> Self {
+        Self {
+            maximum_frame_size,
+            ..self
+        }
+    }
+
     pub fn quota_fleet_size(self, quota_fleet_size: u32) -> Self {
         Self {
             quota_fleet_size,
@@ -1214,6 +1248,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
 
             silent: self.silent,
             maintenance: self.maintenance,
+            maximum_frame_size: self.maximum_frame_size,
             cancellation: self.cancellation,
         })
     }

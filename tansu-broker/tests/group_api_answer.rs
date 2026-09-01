@@ -59,10 +59,9 @@ use tansu_sans_io::{
     },
     sync_group_request::SyncGroupRequestAssignment,
 };
-use tansu_service::FrameBytesLayer;
+use tansu_service::{FrameBytesLayer, TcpContext};
 use tansu_storage::{Storage, StorageContainer};
 use tokio::{net::TcpListener, time::timeout};
-use tokio_util::sync::CancellationToken;
 use url::Url;
 
 /// A frame-level Kafka client over a real socket.
@@ -219,11 +218,10 @@ async fn serve_broker_stack() -> Result<u16> {
             };
 
             let Ok(service) = services(
-                "tansu-300",
+                TcpContext::default().cluster_id(Some("tansu-300".into())),
                 AlwaysNotCoordinator,
                 storage.clone(),
                 None,
-                CancellationToken::new(),
                 None,
                 None,
             ) else {
@@ -479,11 +477,10 @@ async fn a_non_api_error_still_ends_the_connection() -> Result<()> {
     _ = tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             let Ok(service) = services(
-                "tansu-300",
+                TcpContext::default().cluster_id(Some("tansu-300".into())),
                 AlwaysBroken,
                 storage.clone(),
                 None,
-                CancellationToken::new(),
                 None,
                 None,
             ) else {

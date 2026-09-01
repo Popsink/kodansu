@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    str::FromStr as _,
+};
 
 use crate::{EnvVarExp, Result, cli::storage_engines};
 
@@ -26,7 +29,10 @@ use rustls::{
         pem::{Error as TlsPkiPemError, PemObject as _},
     },
 };
-use tansu_broker::{NODE_ID, broker::Broker, coordinator::group::administrator::Controller};
+use tansu_broker::{
+    NODE_ID, SOCKET_REQUEST_MAX_BYTES, broker::Broker,
+    coordinator::group::administrator::Controller,
+};
 use tansu_sans_io::ErrorCode;
 use tansu_storage::{ArcDynStorage, DEFAULT_CLEANUP_POLICY, QuotaLimits, TopicDefaults};
 use tokio::time::Instant;
@@ -116,9 +122,38 @@ pub(super) struct Arg {
     #[arg(long, env = "QUOTA_FLEET_SIZE", default_value_t = 1)]
     quota_fleet_size: u32,
 
+    /// Largest request frame this broker will read, Kafka's `socket.request.max.bytes`. Accepts a size in the IEC units the storage keys use (100M is 100MiB, 8m is 8MiB), or 0/unlimited to read whatever a client announces. Must be at least the engine's `message_max_bytes`, or a legitimate oversized produce has its connection closed instead of being answered.
+    #[arg(long, env = "SOCKET_REQUEST_MAX_BYTES", value_parser = parse_frame_size, default_value_t = SOCKET_REQUEST_MAX_BYTES)]
+    socket_request_max_bytes: usize,
+
     /// Silent
     #[arg(long)]
     silent: bool,
+}
+
+/// Parse the frame cap: a size, or an explicit request for none.
+///
+/// `0` and `unlimited` both mean "read whatever a client announces", which is
+/// what this broker did unconditionally before #477 — kept reachable, because an
+/// operator turning a limit off deliberately is not the same thing as a limit
+/// that was never armed, and only one of those is a decision somebody made.
+/// Zero rather than `None` because clap's derive owns `Option<T>` and will not
+/// take a parser that produces one; it becomes the `None` the service layer wants
+/// at the point the builder is called.
+///
+/// Rejected at parse time rather than clamped, for the reason `parse_rate` gives
+/// just below: a size limit that silently became something else is worse than one
+/// that was refused at startup.
+fn parse_frame_size(value: &str) -> Result<usize, String> {
+    let value = value.trim();
+
+    if value.eq_ignore_ascii_case("unlimited") {
+        return Ok(0);
+    }
+
+    human_units::Size::from_str(value)
+        .map_err(|err| err.to_string())
+        .and_then(|size| usize::try_from(size.0).map_err(|err| err.to_string()))
 }
 
 /// Parse a quota rate: a non-negative, finite number.
@@ -257,6 +292,11 @@ impl Arg {
                 request_rate: self.quota_request_rate,
             })
             .quota_fleet_size(self.quota_fleet_size)
+            // Zero is the CLI's way of saying "no cap"; the service layer says
+            // it with `None` (#477).
+            .maximum_frame_size(
+                (self.socket_request_max_bytes > 0).then_some(self.socket_request_max_bytes),
+            )
             .silent(self.silent);
 
         if !self.silent {
@@ -317,6 +357,44 @@ mod tests {
     use super::*;
     use clap::CommandFactory as _;
     use tansu_storage::DEFAULT_RETENTION_MS;
+
+    /// A broker started with no flag caps frames where the service layer says it
+    /// does (#477). Asserted through clap rather than on the constant, because
+    /// the bug this closes was never a wrong value — it was a default that was
+    /// never applied.
+    #[test]
+    fn the_frame_cap_is_armed_by_default() {
+        assert_eq!(
+            SOCKET_REQUEST_MAX_BYTES,
+            Arg::try_parse_from(["tansu"])
+                .expect("no arguments")
+                .socket_request_max_bytes,
+        );
+    }
+
+    /// `0` and `unlimited` are how an operator turns the cap off *on purpose* —
+    /// which is the state every deployment was in by accident until #477, and
+    /// keeping the distinction is the point.
+    #[test]
+    fn the_frame_cap_can_be_turned_off_deliberately() {
+        assert_eq!(Ok(0), parse_frame_size("0"));
+        assert_eq!(Ok(0), parse_frame_size("unlimited"));
+        assert_eq!(Ok(0), parse_frame_size(" UNLIMITED "));
+
+        // A size parses in the IEC idiom the storage keys already use, and as a
+        // plain byte count.
+        assert_eq!(Ok(8 * 1024 * 1024), parse_frame_size("8m"));
+        assert_eq!(Ok(100 * 1024 * 1024), parse_frame_size("100M"));
+        assert_eq!(Ok(104_857_600), parse_frame_size("104857600"));
+
+        // A value that is not a size is refused at startup rather than silently
+        // becoming something else. `1MiB` is in here deliberately: it is the
+        // spelling `message_max_bytes`' own doc comment used to suggest, and it
+        // does not parse.
+        assert!(parse_frame_size("plenty").is_err());
+        assert!(parse_frame_size("-1").is_err());
+        assert!(parse_frame_size("1MiB").is_err());
+    }
 
     /// #360's acceptance criterion, as a test: **no configuration option
     /// mentions a peer, a pod IP, or a DNS name.**

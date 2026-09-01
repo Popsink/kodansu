@@ -214,6 +214,7 @@ The options that matter in a deployment, each with its environment variable:
 | `--quota-consumer-byte-rate` | `QUOTA_CONSUMER_BYTE_RATE` | — | Default fetch bytes/second, likewise. |
 | `--quota-request-rate` | `QUOTA_REQUEST_RATE` | — | Default requests/second, likewise. |
 | `--quota-fleet-size` | `QUOTA_FLEET_SIZE` | `1` | How many replicas a configured quota is shared between. `1` enforces each limit on every replica, as Apache Kafka does. |
+| `--socket-request-max-bytes` | `SOCKET_REQUEST_MAX_BYTES` | `104857600` | Largest request frame the listener will read, Kafka's `socket.request.max.bytes`. A size in the IEC units the storage keys use (`100M`, `8m`) or a byte count; `0`/`unlimited` reads whatever a client announces. Must be at least the engine's `message_max_bytes`. |
 
 The URL and address options accept `${VAR}` references, expanded when the argument is
 parsed.

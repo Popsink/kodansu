@@ -24,6 +24,7 @@ dynostore = ["tansu-broker/dynostore", "tansu-storage/dynostore"]
 bytes.workspace = true
 clap.workspace = true
 dotenv.workspace = true
+human-units.workspace = true
 humantime.workspace = true
 owo-colors.workspace = true
 pbkdf2.workspace = true

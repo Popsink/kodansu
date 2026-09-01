@@ -24,7 +24,6 @@ use tansu_storage::{Authorizer, QuotaEnforcer, Storage};
 
 use crate::service::principal::{RequesterLayer, RequesterService};
 use crate::service::quota::{QuotaLayer, QuotaService};
-use tokio_util::sync::CancellationToken;
 use tracing::debug;
 
 use crate::{Error, Result, coordinator::group::Coordinator};
@@ -44,9 +43,16 @@ type TcpRouteFrame = TcpContextService<
 
 /// The per-connection service stack.
 ///
-/// `drain` is cancelled when this process has been asked to stop: a connection
-/// sitting idle between requests is then closed, and one with a request in
-/// flight answers it first (#361). Pass a fresh token to serve connections
+/// `tcp` carries everything that is a property of the connection rather than of
+/// a request: the cluster id every metric is labelled with, the frame cap the
+/// listener reads within (#477), and the drain token. It arrives already built
+/// because the caller is the only thing that knows an operator's values — and
+/// because three more positional arguments here is how a signature stops being
+/// readable.
+///
+/// `tcp.drain` is cancelled when this process has been asked to stop: a
+/// connection sitting idle between requests is then closed, and one with a
+/// request in flight answers it first (#361). A default token serves connections
 /// until the client goes away.
 ///
 /// `authorizer` is `None` on a broker without `--authentication`, and its
@@ -54,11 +60,10 @@ type TcpRouteFrame = TcpContextService<
 /// (#363). `enforcer` is `None` for the same reason and on the same switch:
 /// with no principal there is nothing to write a quota against (#384).
 pub fn services<C, S>(
-    cluster_id: &str,
+    tcp: TcpContext,
     coordinator: C,
     storage: S,
     sasl_config: Option<Arc<SASLConfig>>,
-    drain: CancellationToken,
     authorizer: Option<Authorizer>,
     enforcer: Option<QuotaEnforcer>,
 ) -> Result<TcpRouteFrame, Error>
@@ -75,11 +80,7 @@ where
         .and_then(|builder| builder.build().map_err(Into::into))
         .map(|route| {
             (
-                TcpContextLayer::new(
-                    TcpContext::default()
-                        .cluster_id(Some(cluster_id.into()))
-                        .drain(drain),
-                ),
+                TcpContextLayer::new(tcp),
                 TcpBytesLayer::default(),
                 BytesFrameLayer::default().with_sasl_config(sasl_config),
                 RequesterLayer::new(authorizer),
