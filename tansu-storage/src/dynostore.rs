@@ -8176,7 +8176,28 @@ impl DynoStore {
         .collect::<BTreeMap<_, _>>()
         .await;
 
-        let state = match (generation.leader.clone(), assignment) {
+        Ok(Some(GroupDetail {
+            session_timeout_ms: generation.session_timeout_ms,
+            rebalance_timeout_ms: generation.rebalance_timeout_ms,
+            members,
+            generation_id: generation.generation_id,
+            skip_assignment: generation.skip_assignment,
+            inception: to_system_time(generation.inception_ms).unwrap_or(SystemTime::UNIX_EPOCH),
+            state: Self::composed_group_state(&generation, assignment),
+        }))
+    }
+
+    /// The state a generation and the assignment of that same generation put a
+    /// group in.
+    ///
+    /// Shared by the full view above and the state-only read
+    /// [`Self::group_state`], so a group cannot be listed in one state and
+    /// described in another (#475).
+    fn composed_group_state(
+        generation: &GenerationDoc,
+        assignment: Option<AssignmentDoc>,
+    ) -> GroupState {
+        match (generation.leader.clone(), assignment) {
             (Some(leader), Some(assignment))
                 if assignment.generation_id == generation.generation_id =>
             {
@@ -8193,16 +8214,43 @@ impl DynoStore {
                 protocol_name: generation.protocol_name.clone(),
                 leader,
             },
+        }
+    }
+
+    /// The state of a group the listing has already found, without reading its
+    /// members' documents (#475).
+    ///
+    /// One GET, or two for a group that has a leader — never one per member,
+    /// which is what [`Self::group_view`] costs. The state turns on whether the
+    /// member set is *empty* and never on what a member document holds, and the
+    /// generation names the set, so the documents themselves are not read here.
+    ///
+    /// A group with no `generation.json` is `Empty`, the same answer
+    /// `describe_groups` gives it (#445): only a group that owns something under
+    /// the consumer root is listed in the first place, so reaching here means
+    /// the group is there with nobody in it — committed offsets it never joined
+    /// to write, or the legacy object the cutover left behind. A group deleted
+    /// between the listing and this read has the same shape and is reported the
+    /// same way; a listing is a snapshot, and the next one does not name it.
+    async fn group_state(&self, group_id: &str) -> Result<ConsumerGroupState> {
+        let Some((generation, _)) = self.read_group_generation(group_id).await? else {
+            return Ok(ConsumerGroupState::Empty);
         };
 
-        Ok(Some(GroupDetail {
-            session_timeout_ms: generation.session_timeout_ms,
-            rebalance_timeout_ms: generation.rebalance_timeout_ms,
+        let assignment = self
+            .read_group_assignment(group_id, generation.generation_id)
+            .await?;
+
+        let members = generation
+            .members
+            .keys()
+            .map(|member_id| (member_id.clone(), GroupMember::default()))
+            .collect();
+
+        Ok(ConsumerGroupState::from(&GroupDetail {
             members,
-            generation_id: generation.generation_id,
-            skip_assignment: generation.skip_assignment,
-            inception: to_system_time(generation.inception_ms).unwrap_or(SystemTime::UNIX_EPOCH),
-            state,
+            state: Self::composed_group_state(&generation, assignment),
+            ..Default::default()
         }))
     }
 
@@ -13559,12 +13607,22 @@ impl Storage for DynoStore {
     /// collected, which fixes a group that has state but has never committed an
     /// offset being omitted from its own cluster's listing.
     ///
-    /// `states_filter` costs a read fan-out, because that is what the filter
-    /// means: the state is derived per group, and deriving it is reading the
-    /// group. An **unfiltered** listing stays one delimited listing and reports
-    /// `Unknown`, as it always has — a client that did not ask to filter by
-    /// state should not pay for one read per group in the cluster to be told
-    /// something it did not ask for.
+    /// Every listed group reports its real state, filtered or not (#475). That
+    /// costs a read per group — the state is derived per group, and deriving it
+    /// is reading the group — which is what [`Self::group_state`] keeps to one
+    /// GET instead of one per member. Reporting `Unknown` unless the caller
+    /// filtered was not the saving it looked like: the response field exists
+    /// from `ListGroups` v4 on, every admin client surfaces it, and the tooling
+    /// this request is for — find the idle groups, lag-dashboard the committed
+    /// ones — filters on it *client side*, so `Unknown` for all of them just
+    /// moved the failure. `Unknown` now means only what it says: this replica
+    /// could not read that group.
+    ///
+    /// An **empty** `states_filter` is not a filter, it is the absence of one,
+    /// which is Kafka's reading of the same field. Taking it as "match nothing"
+    /// answered a plain `listConsumerGroups()` with nothing at all, because that
+    /// is the request librdkafka and the Java admin client both send when no
+    /// state was asked for (#475).
     async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
         /// As the describe fan-out.
         const LIST_STATE_CONCURRENCY: usize = 32;
@@ -13598,39 +13656,30 @@ impl Storage for DynoStore {
                 .group_type(Some("classic".into()))
         };
 
-        let Some(states_filter) = states_filter else {
-            return Ok(group_ids
-                .into_iter()
-                .map(|group_id| listed(group_id, String::from("Unknown")))
-                .collect());
-        };
-
-        let wanted = states_filter.iter().cloned().collect::<BTreeSet<_>>();
+        let wanted = states_filter
+            .filter(|states| !states.is_empty())
+            .map(|states| states.iter().cloned().collect::<BTreeSet<_>>());
 
         Ok(
             futures::stream::iter(group_ids.into_iter().map(|group_id| async move {
-                // `Unknown` covers three things a caller cannot act on
-                // differently: a group that went away between the listing and
-                // now, one this replica could not read, and a legacy
-                // `{group}.json` left behind by the cutover, which owns a
-                // listed name and nothing this binary can describe.
+                // `Unknown` is a read that did not answer — a throttle, a
+                // 5xx. Not knowing is not a state the group is in, and a
+                // filter that names it is asking for exactly the groups this
+                // replica could not read.
                 let state = self
-                    .group_view(&group_id)
+                    .group_state(&group_id)
                     .await
                     .inspect_err(|err| debug!(?err, group_id))
-                    .ok()
-                    .flatten();
-
-                let state = state.as_ref().map_or_else(
-                    || String::from("Unknown"),
-                    |detail| ConsumerGroupState::from(detail).to_string(),
-                );
+                    .unwrap_or(ConsumerGroupState::Unknown)
+                    .to_string();
 
                 (group_id, state)
             }))
             .buffered(LIST_STATE_CONCURRENCY)
             .filter_map(|(group_id, state)| {
-                let keep = wanted.contains(&state);
+                let keep = wanted
+                    .as_ref()
+                    .is_none_or(|wanted| wanted.contains(state.as_str()));
 
                 async move { keep.then(|| listed(group_id, state)) }
             })

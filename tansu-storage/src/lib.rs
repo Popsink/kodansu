@@ -1535,6 +1535,17 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ) -> Result<DescribeConfigsResult>;
 
     /// Query available groups optionally with a state filter.
+    ///
+    /// The filter is the wire field, with the wire's meaning: `None` is a
+    /// client too old to have one, and `Some([])` is a client that has one and
+    /// asked for no filtering. **Both mean every group** — an empty filter is
+    /// the absence of a filter, not a filter nothing matches, and reading it
+    /// the other way answers a plain `listConsumerGroups()` with nothing at all
+    /// (#475).
+    ///
+    /// Every listed group reports its state, filtered or not: the response
+    /// carries one from `ListGroups` v4 on and admin tooling filters on it
+    /// client side.
     async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>>;
 
     /// Delete one or more groups from storage.

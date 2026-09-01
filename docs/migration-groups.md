@@ -130,10 +130,14 @@ still reads `2`, so the assertion passes and the groups re-form.
   join, `DescribeGroups` reports it as **empty** rather than reporting the
   membership the old object records — which is the honest answer, because the
   quiesce made that membership vacuous. `ListGroups` still *names* such a group
-  (it owns an object under the consumer root) with state `Unknown`. Both
-  converge on the truth the moment the group re-forms.
-- `ListGroups` gains a real `states_filter` — it used to report `Unknown` for
-  every group.
+  (it owns an object under the consumer root) and reports it `Empty` too, the
+  same answer for the same reason (#475). Both converge on the truth the moment
+  the group re-forms.
+- `ListGroups` reports the state each group is actually in, filtered or not, and
+  `Unknown` means only that this replica could not read the group. It used to
+  report `Unknown` for every group unless a `states_filter` was given, and to
+  read an **empty** filter — which is what a client sends when it asks for no
+  filtering at all — as a filter nothing matches (#475).
 
 ## Quick reference
 

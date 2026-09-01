@@ -31,14 +31,17 @@ use object_store::{
     path::Path,
 };
 
-use tansu_sans_io::{ErrorCode, join_group_response::JoinGroupResponseMember};
+use tansu_sans_io::{
+    ErrorCode, create_topics_request::CreatableTopic, join_group_response::JoinGroupResponseMember,
+};
 
 use tansu_sans_io::{acl, resource};
 
 use crate::{
     AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, ConsumerGroupState, Error,
     GROUP_SCHEMA_VERSION, GenerationDoc, GroupDetail, GroupDetailResponse, GroupSchema, MemberDoc,
-    MemberRef, NamedGroupDetail, Result, Storage, UpdateError, WILDCARD_HOST,
+    MemberRef, NamedGroupDetail, OffsetCommitRequest, Result, Storage, Topition, UpdateError,
+    WILDCARD_HOST,
     dynostore::{
         DynoStore,
         tests::{init_tracing, legacy_group_exists, seed_legacy_group},
@@ -76,6 +79,20 @@ fn detail_of(named: &NamedGroupDetail) -> Option<GroupDetail> {
 
 fn state_of(named: &NamedGroupDetail) -> Option<ConsumerGroupState> {
     detail_of(named).map(|detail| ConsumerGroupState::from(&detail))
+}
+
+/// What a listing reports, as `(group id, state)` — the two things a caller
+/// reads off it.
+async fn listing(
+    storage: &DynoStore,
+    states_filter: Option<&[String]>,
+) -> Result<Vec<(String, Option<String>)>> {
+    storage.list_groups(states_filter).await.map(|listed| {
+        listed
+            .into_iter()
+            .map(|group| (group.group_id, group.group_state))
+            .collect()
+    })
 }
 
 fn assignment(generation_id: i32) -> AssignmentDoc {
@@ -633,62 +650,163 @@ async fn groups_are_listed_by_anything_they_own() -> Result<()> {
         .await
         .expect("generation");
 
+    // Decomposed, with a leader and the assignment of that generation: Stable.
+    _ = storage
+        .update_group_generation(
+            "g-stable",
+            GenerationDoc {
+                generation_id: 7,
+                leader: Some("m-1".into()),
+                members: BTreeMap::from([("m-1".to_owned(), MemberRef::default())]),
+                session_timeout_ms: 45_000,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("generation");
+
+    _ = storage
+        .create_group_assignment("g-stable", 7, assignment(7))
+        .await?;
+
     // A leftover `{group}.json`, which owns a listed name and nothing this
     // binary can describe.
     seed_legacy_group(&bucket, CLUSTER, "g-legacy").await?;
 
-    let listed = storage.list_groups(None).await?;
+    // Every group, with the state it is actually in — the unfiltered listing
+    // reported `Unknown` for all of them, which is the field admin tooling
+    // filters on client side (#475).
+    //
+    // The leftover is `Empty`, the same answer a describe gives it: it owns an
+    // object under the root, so it is there, and nobody is in it.
     assert_eq!(
         vec![
-            "g-empty".to_owned(),
-            "g-legacy".to_owned(),
-            "g-rebalancing".to_owned()
+            ("g-empty".to_owned(), Some("Empty".to_owned())),
+            ("g-legacy".to_owned(), Some("Empty".to_owned())),
+            (
+                "g-rebalancing".to_owned(),
+                Some("CompletingRebalance".to_owned())
+            ),
+            ("g-stable".to_owned(), Some("Stable".to_owned())),
         ],
-        listed
-            .iter()
-            .map(|group| group.group_id.clone())
-            .collect::<Vec<_>>()
+        listing(&storage, None).await?
     );
 
-    // Unfiltered stays cheap and says so: one listing, no per-group read.
-    assert!(
-        listed
-            .iter()
-            .all(|group| group.group_state.as_deref() == Some("Unknown"))
+    // An empty filter is not a filter, it is the absence of one — and it is
+    // what every client sends for an unfiltered list (#475).
+    assert_eq!(
+        listing(&storage, None).await?,
+        listing(&storage, Some(&[])).await?
     );
 
-    let filtered = storage
-        .list_groups(Some(&["CompletingRebalance".into()]))
+    // Two states named, and each group answers to the one it is in.
+    assert_eq!(
+        vec![
+            (
+                "g-rebalancing".to_owned(),
+                Some("CompletingRebalance".to_owned())
+            ),
+            ("g-stable".to_owned(), Some("Stable".to_owned())),
+        ],
+        listing(
+            &storage,
+            Some(&["CompletingRebalance".into(), "Stable".into()])
+        )
+        .await?
+    );
+
+    assert_eq!(
+        vec![
+            ("g-empty".to_owned(), Some("Empty".to_owned())),
+            ("g-legacy".to_owned(), Some("Empty".to_owned())),
+        ],
+        listing(&storage, Some(&["Empty".into()])).await?
+    );
+
+    // `Unknown` is a group this replica could not read, and every one of these
+    // read.
+    assert_eq!(
+        Vec::<(String, Option<String>)>::new(),
+        listing(&storage, Some(&["Unknown".into()])).await?
+    );
+
+    Ok(())
+}
+
+/// A group that committed an offset and never joined is listed, in the state a
+/// describe of it reports (#475).
+///
+/// This is the population the request exists to manage: monitoring finds idle
+/// groups by enumerating them, and a group holding offsets with no live member
+/// is the one it is looking for. Listing said it was not there while a describe
+/// of the same id, on the same broker, said `Empty` with no members.
+#[tokio::test]
+async fn a_group_that_only_committed_is_listed_as_empty() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let storage = DynoStore::new(CLUSTER, NODE, InMemory::new());
+
+    _ = storage
+        .create_topic(
+            CreatableTopic::default()
+                .name("t-1".into())
+                .num_partitions(1)
+                .replication_factor(1)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    let topition = Topition::new("t-1", 0);
+
+    for (_, error_code) in storage
+        .offset_commit(
+            "g-committed",
+            None,
+            &[(
+                topition.clone(),
+                OffsetCommitRequest::default().offset(1_234),
+            )],
+        )
+        .await?
+    {
+        assert_eq!(ErrorCode::None, error_code);
+    }
+
+    let described = storage
+        .describe_groups(Some(&["g-committed".into()]), false)
         .await?;
 
     assert_eq!(
-        vec!["g-rebalancing".to_owned()],
-        filtered
-            .iter()
-            .map(|group| group.group_id.clone())
-            .collect::<Vec<_>>()
+        Some(ConsumerGroupState::Empty),
+        state_of(described.first().expect("described"))
     );
 
-    let empty = storage.list_groups(Some(&["Empty".into()])).await?;
-    assert_eq!(
-        vec!["g-empty".to_owned()],
-        empty
-            .iter()
-            .map(|group| group.group_id.clone())
-            .collect::<Vec<_>>()
-    );
+    // Unfiltered, as `listConsumerGroups()` asks for it...
+    let expected = vec![("g-committed".to_owned(), Some("Empty".to_owned()))];
 
-    // The leftover is still *named* — it owns an object under the root, so an
-    // unfiltered listing has to report it or the name would look free — but it
-    // has no state this binary can derive, and `Unknown` is what a caller can
-    // act on: it is not a group that is Empty, it is a group that is not there.
-    let unknown = storage.list_groups(Some(&["Unknown".into()])).await?;
+    assert_eq!(expected, listing(&storage, None).await?);
+
+    // ...as every client actually sends it...
+    assert_eq!(expected, listing(&storage, Some(&[])).await?);
+
+    // ...and as the tooling that wants exactly this group asks for it.
+    assert_eq!(expected, listing(&storage, Some(&["Empty".into()])).await?);
+
+    // Its offsets are still there to be read off the id the listing gave back.
     assert_eq!(
-        vec!["g-legacy".to_owned()],
-        unknown
-            .iter()
-            .map(|group| group.group_id.clone())
-            .collect::<Vec<_>>()
+        Some(1_234),
+        storage
+            .offset_fetch(
+                Some("g-committed"),
+                std::slice::from_ref(&topition),
+                Some(false)
+            )
+            .await?
+            .get(&topition)
+            .map(|committed| committed.offset)
     );
 
     Ok(())
