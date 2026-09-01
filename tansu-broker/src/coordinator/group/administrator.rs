@@ -69,7 +69,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use cached::stores::ExpiringSizedCache;
 use futures::StreamExt as _;
-use opentelemetry::{KeyValue, metrics::Counter};
+use opentelemetry::{
+    KeyValue,
+    metrics::{Counter, Histogram},
+};
 use rand::{prelude::*, rng};
 use tansu_sans_io::{
     Body, ErrorCode,
@@ -444,6 +447,48 @@ static REBALANCE_STALLS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_group_rebalance_stalled")
         .with_description("rebalances still incomplete past the stall threshold")
+        .build()
+});
+
+/// Members the sweep removed from a generation, by `reason` (#488).
+///
+/// `lapsed` is the ordinary one: the member's persisted `last_contact_ms` is
+/// older than its session timeout. `no_document` is the other verdict the sweep
+/// can reach — the generation names a member whose document has gone, which
+/// `MemberDoc` cannot date because there is none to date.
+///
+/// Every eviction is a rebalance, and until this counter there was **no series
+/// for them at all**: the sweep says so in an `info!` and the production fleet
+/// runs `RUST_LOG=warn`, so the one signal that existed was switched off. The
+/// question it exists to answer is whether the ~69 rejoins per member per day
+/// #486 measured are evictions — if they are, the window in
+/// [`MEMBER_EVICTION_AGE`] is the next thing to look at, and if they are not,
+/// the churn has another cause.
+static MEMBERS_EVICTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_group_members_evicted")
+        .with_description("members the sweep removed from a generation, by reason")
+        .build()
+});
+
+/// How stale an evicted member's `last_contact_ms` was when the sweep reached
+/// it (#488), in milliseconds.
+///
+/// **Not the member's silence**, and the difference is the issue: liveness is
+/// persisted at most once per `session/2` ([`liveness_renewal_due`]), so this
+/// age is an *upper* bound on how long the member had actually been quiet — a
+/// member evicted at an age of `session` may have stopped heartbeating only
+/// `session/2` ago.
+///
+/// What the distribution says is where the sweep is catching them. A dead
+/// member's age at eviction is bounded by `session + session/2`, since the sweep
+/// runs once per `session/2`: values above that band mean the sweep itself is
+/// running late, which is a different fault from the window and has to be
+/// excluded before the window is blamed.
+static MEMBER_EVICTION_AGE: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    METER
+        .u64_histogram("tansu_group_member_eviction_age_milliseconds")
+        .with_description("staleness of an evicted member's last contact stamp")
         .build()
 });
 
@@ -1083,21 +1128,43 @@ where
                     self.note_liveness(group_id, &member_id, member.last_contact_ms);
                 }
 
-                held.is_none_or(|(member, _)| member.is_expired(now_ms))
-                    .then_some(member_id)
+                // The verdict, and *why* (#488). Recorded here rather than after
+                // the generation write, so a sweep that loses the CAS still
+                // reports what it found: the peer that won reached the same
+                // verdict from the same documents, and counting both would
+                // double it.
+                match held {
+                    None => Some((member_id, None)),
+
+                    Some((member, _)) => member.is_expired(now_ms).then(|| {
+                        (
+                            member_id,
+                            Some(now_ms.saturating_sub(member.last_contact_ms)),
+                        )
+                    }),
+                }
             },
         ))
         .buffered(MEMBER_FETCH_CONCURRENCY)
         .filter_map(|expired| async move { expired })
-        .collect::<BTreeSet<_>>()
+        .collect::<BTreeMap<_, _>>()
         .await;
 
         let mut next = view.generation.clone();
         next.swept_at_ms = now_ms;
 
         if !expired.is_empty() {
-            for member_id in &expired {
+            for (member_id, age_ms) in &expired {
                 _ = next.members.remove(member_id);
+
+                match age_ms {
+                    Some(age_ms) => {
+                        MEMBERS_EVICTED.add(1, &[KeyValue::new("reason", "lapsed")]);
+                        MEMBER_EVICTION_AGE.record(u64::try_from(*age_ms).unwrap_or_default(), &[]);
+                    }
+
+                    None => MEMBERS_EVICTED.add(1, &[KeyValue::new("reason", "no_document")]),
+                }
             }
 
             // A membership change is a rebalance, and the leader is re-elected
@@ -1106,10 +1173,16 @@ where
             next = GroupView::rebalanced(next, now_ms);
             next.leader = None;
 
+            // The ages go in the line, not just the ids (#488): liveness is
+            // persisted once per `session/2`, so an eviction at an age of barely
+            // one session is one where the member may have been quiet for only
+            // half of it, and an operator reading "evicted" cannot tell the two
+            // apart without the number.
             info!(
                 group_id,
                 generation_id = next.generation_id,
                 evicted = ?expired,
+                session_timeout_ms = view.session_timeout_ms(),
                 "evicting members whose sessions lapsed",
             );
         }
@@ -1121,8 +1194,9 @@ where
         {
             Ok(_) => {
                 // Best-effort: an orphaned document is harmless, since the
-                // generation's member set is what is authoritative.
-                for member_id in &expired {
+                // generation's member set is what is authoritative — and it is
+                // reclaimed by maintenance either way (#486).
+                for member_id in expired.keys() {
                     _ = self
                         .storage
                         .delete_group_member(group_id, member_id)
@@ -1704,6 +1778,18 @@ where
                         })
                         .map_or_else(
                             || {
+                                // The churn at its source (#488). A static
+                                // member exists so that its rejoin is *not* a
+                                // membership change; one that has to be given a
+                                // new id is one this group had lost, and the
+                                // ratio of these two is how often that happens.
+                                // Counted per derivation, so a retry that reuses
+                                // what it minted is counted once (#486).
+                                if minted_for_instance.is_none() {
+                                    COORDINATOR_REQUESTS
+                                        .add(1, &[KeyValue::new("method", "join_instance_minted")]);
+                                }
+
                                 minted_for_instance
                                     .get_or_insert_with(|| {
                                         format!("{group_instance_id}-{}", Uuid::new_v4())
@@ -1715,7 +1801,12 @@ where
                             // that is either this join's own write landing, or a
                             // peer registering the instance, and both are the id
                             // the group is agreed on.
-                            |(member_id, _)| member_id.to_owned(),
+                            |(member_id, _)| {
+                                COORDINATOR_REQUESTS
+                                    .add(1, &[KeyValue::new("method", "join_instance_reused")]);
+
+                                member_id.to_owned()
+                            },
                         )
                 },
             );
