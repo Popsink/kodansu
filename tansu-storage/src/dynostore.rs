@@ -16,7 +16,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, BTreeSet, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet, HashMap, btree_map::Entry},
     fmt::{Debug, Display, Write as _},
     str::FromStr,
     sync::{
@@ -562,7 +562,36 @@ struct CachedSegment {
 struct PrefixIndex {
     /// `seq -> segment` for every segment known to this process. Immutable
     /// content, so an entry never needs re-reading.
+    ///
+    /// Mutate through [`Self::insert_segment`] / [`Self::remove_segment`] /
+    /// [`Self::retain_segments`] only: `by_substream` below is derived from this
+    /// map and the two drift silently if it is written directly.
     segments: BTreeMap<u64, CachedSegment>,
+    /// `(sub-stream, partition) -> (seq, index into that footer's entries)`,
+    /// derived from `segments` (#492).
+    ///
+    /// Without it [`DynoStore::valid_substream_segments`] answers one
+    /// `(sub-stream, partition)` by walking **every segment in the prefix** and,
+    /// inside each, linearly scanning **every sub-stream entry in its footer** —
+    /// so the cost of asking about one topic is the size of the whole prefix, and
+    /// a topic with *nothing* in the prefix pays it in full. That call is made
+    /// once per partition per `Fetch`, once per partition per `ListOffsets`, and
+    /// twice per topition per flush attempt, all of it holding the process-wide
+    /// `prefix_index` lock. Measured at this fleet's prefix scale it is
+    /// milliseconds per call, which is where a serving replica's CPU goes and why
+    /// every `await` in the process — object-store requests included — reads ~23x
+    /// slower on a broker than on a maintainer running the same binary against
+    /// the same bucket.
+    ///
+    /// Keyed by identity **and partition**, because a footer holds a separate
+    /// entry per partition. The entry index is stored beside the sequence so the
+    /// lookup lands on `footer.entries[i]` directly: resolving the identity again
+    /// per segment is the inner scan this exists to remove.
+    ///
+    /// Cost: one `(u64, u32)` per sub-stream entry, plus one key per
+    /// `(sub-stream, partition)` — and the distinct keys are the cluster's
+    /// partition count, not the entry count.
+    by_substream: HashMap<SubstreamKey, Vec<(u64, u32)>>,
     /// When the live segment set was last reconciled by a listing; gates the
     /// TTL so a hot prefix lists at most once per [`DynoStore::HIGH_WATERMARK_HINT_TTL`].
     refreshed_at: Option<SystemTime>,
@@ -631,6 +660,107 @@ impl PrefixIndex {
             .next_back()
             .copied()
             .max(self.opaque.iter().next_back().copied())
+    }
+
+    /// Add (or replace) `seq`'s cached footer, keeping [`Self::by_substream`] in
+    /// step (#492).
+    ///
+    /// A replace is real: the tail probe, the incremental listing and the
+    /// winner-fold can all resolve the same sequence, and the footer they decode
+    /// is identical (segments are immutable), but the entry *indices* are only
+    /// guaranteed to match because it is the same object — so the old
+    /// contribution is withdrawn first rather than assumed equal.
+    fn insert_segment(&mut self, seq: u64, cached: CachedSegment) {
+        self.unindex_segment(seq);
+
+        for (position, entry) in cached.footer.entries.iter().enumerate() {
+            // A footer wide enough to overflow `u32` cannot be encoded — the
+            // entry count is a `u32` on the wire — so the cast cannot lose.
+            let at = (seq, position as u32);
+            let seqs = self
+                .by_substream
+                .entry((entry.substream(), entry.partition))
+                .or_default();
+
+            // Ascending by sequence, which is how `valid_substream_segments`
+            // wants them and how a refresh supplies them: the common case is a
+            // push at the end, and an out-of-order fold binary-searches.
+            match seqs.binary_search(&at) {
+                Ok(_) => {}
+                Err(position) => seqs.insert(position, at),
+            }
+        }
+
+        _ = self.segments.insert(seq, cached);
+    }
+
+    /// Keep exactly the segments `keep` admits, keeping [`Self::by_substream`] in
+    /// step. Returns how many were dropped.
+    ///
+    /// One compacting pass over the derived map rather than a withdrawal per
+    /// dropped segment. Both bulk callers — #408's reconciling pass and
+    /// `retire_segments`' prune — drop thousands at a time, and removing from
+    /// the middle of a sub-stream's sequence list shifts its tail, so per-segment
+    /// withdrawal is quadratic in the sub-stream's segment count. This is linear
+    /// in the prefix, once, under a lock the request path also wants.
+    fn retain_segments(&mut self, keep: impl Fn(u64) -> bool) -> usize {
+        let before = self.segments.len();
+        self.segments.retain(|seq, _| keep(*seq));
+        let dropped = before - self.segments.len();
+
+        if dropped > 0 {
+            self.by_substream.retain(|_, seqs| {
+                seqs.retain(|(seq, _)| keep(*seq));
+                !seqs.is_empty()
+            });
+        }
+
+        dropped
+    }
+
+    /// Withdraw `seq`'s contribution to [`Self::by_substream`]. Reads the footer
+    /// still in `segments`, so it must run *before* the map is written.
+    fn unindex_segment(&mut self, seq: u64) {
+        let Some(cached) = self.segments.get(&seq) else {
+            return;
+        };
+
+        for (position, entry) in cached.footer.entries.iter().enumerate() {
+            let key = (entry.substream(), entry.partition);
+            let Some(seqs) = self.by_substream.get_mut(&key) else {
+                continue;
+            };
+
+            if let Ok(at) = seqs.binary_search(&(seq, position as u32)) {
+                _ = seqs.remove(at);
+            }
+
+            // A sub-stream with no segments left keeps no key: the map is sized
+            // by the cluster's live partitions, not by everything it has ever
+            // held.
+            if seqs.is_empty() {
+                _ = self.by_substream.remove(&key);
+            }
+        }
+    }
+
+    /// Every `(sequence, writer epoch, entry)` this prefix holds for one
+    /// sub-stream, ascending by sequence — without touching a segment that does
+    /// not hold it (#492).
+    fn substream_entries(
+        &self,
+        substream: &Substream,
+        partition: i32,
+    ) -> impl Iterator<Item = (u64, i64, &SubstreamEntry)> {
+        self.by_substream
+            .get(&(substream.clone(), partition))
+            .into_iter()
+            .flatten()
+            .filter_map(move |(seq, position)| {
+                let cached = self.segments.get(seq)?;
+                let entry = cached.footer.entries.get(*position as usize)?;
+                Some((*seq, cached.footer.writer_epoch, entry))
+            })
     }
 }
 
@@ -5790,7 +5920,7 @@ impl DynoStore {
         };
 
         let entry = index.entry(prefix.to_owned()).or_default();
-        _ = entry.segments.insert(
+        entry.insert_segment(
             seq,
             CachedSegment {
                 footer,
@@ -5970,7 +6100,7 @@ impl DynoStore {
             match Self::decode_segment_footer(&bytes) {
                 Ok(Some(footer)) => {
                     if let Ok(mut index) = self.prefix_index.lock() {
-                        _ = index.entry(prefix.to_owned()).or_default().segments.insert(
+                        index.entry(prefix.to_owned()).or_default().insert_segment(
                             seq,
                             CachedSegment {
                                 footer,
@@ -6220,7 +6350,7 @@ impl DynoStore {
             let entry = index.entry(prefix.to_owned()).or_default();
             match footer {
                 FooterOutcome::Decoded(footer) => {
-                    _ = entry.segments.insert(
+                    entry.insert_segment(
                         seq,
                         CachedSegment {
                             footer,
@@ -6299,17 +6429,15 @@ impl DynoStore {
             // sequence write-ahead of removing it, and every candidate is
             // `max(tail + 1, floor)`.
             if reconcile && let Some(listed_max) = live.iter().next_back().copied() {
-                let before = entry.segments.len() + entry.opaque.len();
+                let before = entry.opaque.len();
 
-                entry
-                    .segments
-                    .retain(|seq, _| *seq >= listed_max || live.contains(seq));
+                let dropped_segments =
+                    entry.retain_segments(|seq| seq >= listed_max || live.contains(&seq));
                 entry
                     .opaque
                     .retain(|seq| *seq >= listed_max || live.contains(seq));
 
-                let dropped =
-                    before.saturating_sub(entry.segments.len() + entry.opaque.len()) as u64;
+                let dropped = (dropped_segments + before.saturating_sub(entry.opaque.len())) as u64;
 
                 if dropped > 0 {
                     PREFIX_INDEX_RECONCILED
@@ -6375,7 +6503,7 @@ impl DynoStore {
             .map_err(Into::into)
             .map(|mut index| {
                 let entry = index.entry(prefix.to_owned()).or_default();
-                _ = entry.segments.insert(
+                entry.insert_segment(
                     seq,
                     CachedSegment {
                         footer,
@@ -6439,9 +6567,12 @@ impl DynoStore {
             .map_err(Into::into)
             .map(|mut index| {
                 if let Some(entry) = index.get_mut(prefix) {
-                    for seq in seqs {
-                        _ = entry.segments.remove(seq);
-                    }
+                    // Through `retain_segments`, not a `remove_segment` loop:
+                    // `retire_segments` prunes a whole retirement batch here, and
+                    // withdrawing one segment at a time from the derived map is
+                    // quadratic in a sub-stream's segment count (#492).
+                    let pruned: BTreeSet<u64> = seqs.iter().copied().collect();
+                    _ = entry.retain_segments(|seq| !pruned.contains(&seq));
                     entry.generation += 1;
                 }
             })
@@ -6662,6 +6793,8 @@ impl DynoStore {
         substream: &Substream,
         partition: i32,
     ) -> Result<Vec<FencedSegment>> {
+        // Through `substream_entries` (#492), so the lock is held for this
+        // sub-stream's own segments rather than for a scan of the whole prefix.
         let mut segs: Vec<(i64, u64, SubstreamEntry)> = self
             .prefix_index
             .lock()
@@ -6669,14 +6802,8 @@ impl DynoStore {
             .get(prefix)
             .map(|index| {
                 index
-                    .segments
-                    .iter()
-                    .filter_map(|(seq, cached)| {
-                        cached
-                            .footer
-                            .get(substream, partition)
-                            .map(|entry| (cached.footer.writer_epoch, *seq, entry.clone()))
-                    })
+                    .substream_entries(substream, partition)
+                    .map(|(seq, writer_epoch, entry)| (writer_epoch, seq, entry.clone()))
                     .collect()
             })
             .unwrap_or_default();
@@ -16374,5 +16501,176 @@ mod served_end_tests {
         let served = ServedEnd { end: 4, at_high: 4 };
         assert!(!served.gap_contains(3));
         assert!(!served.gap_contains(4));
+    }
+}
+
+#[cfg(test)]
+mod prefix_index_substream_tests {
+    use super::{CachedSegment, PrefixIndex, SegmentFooter, Substream, SubstreamEntry};
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    fn entry(topic: &str, topic_id: Option<Uuid>, partition: i32, base: i64) -> SubstreamEntry {
+        SubstreamEntry {
+            topic: topic.into(),
+            topic_id,
+            partition,
+            base_offset: base,
+            record_count: 10,
+            byte_start: 0,
+            byte_len: 64,
+            max_timestamp: 0,
+            producers: vec![],
+        }
+    }
+
+    fn segment(writer_epoch: i64, entries: Vec<SubstreamEntry>) -> CachedSegment {
+        CachedSegment {
+            footer: SegmentFooter {
+                writer_epoch,
+                nonce: 0,
+                entries,
+            },
+            last_modified_ms: 0,
+        }
+    }
+
+    /// What `by_substream` must equal at all times, derived the slow way: the
+    /// scan `valid_substream_segments` used to do on every call.
+    fn derived(index: &PrefixIndex) -> HashMap<(Substream, i32), Vec<(u64, u32)>> {
+        let mut out: HashMap<(Substream, i32), Vec<(u64, u32)>> = HashMap::new();
+        for (seq, cached) in &index.segments {
+            for (position, entry) in cached.footer.entries.iter().enumerate() {
+                out.entry((entry.substream(), entry.partition))
+                    .or_default()
+                    .push((*seq, position as u32));
+            }
+        }
+        for seqs in out.values_mut() {
+            seqs.sort_unstable();
+        }
+        out
+    }
+
+    fn assert_in_step(index: &PrefixIndex) {
+        assert_eq!(derived(index), index.by_substream);
+    }
+
+    /// The derived map survives every mutation the refresh paths make — an
+    /// insert, the *replace* the tail probe and the winner-fold both perform on
+    /// a sequence already held, a prune, and #408's reconciling retain — because
+    /// a map that drifts serves a sub-stream the wrong segments, silently.
+    #[test]
+    fn the_substream_map_tracks_every_mutation() {
+        let id = Uuid::new_v4();
+        let mut index = PrefixIndex::default();
+        assert_in_step(&index);
+
+        index.insert_segment(
+            1,
+            segment(
+                7,
+                vec![
+                    entry("alpha", None, 0, 0),
+                    entry("alpha", None, 1, 0),
+                    entry("beta", Some(id), 0, 0),
+                ],
+            ),
+        );
+        index.insert_segment(2, segment(7, vec![entry("alpha", None, 0, 10)]));
+        index.insert_segment(3, segment(7, vec![entry("beta", Some(id), 0, 10)]));
+        assert_in_step(&index);
+
+        // A replace withdraws the old footer's contribution first: the entry
+        // *positions* are what the map holds, and assuming they are unchanged is
+        // how a stale index would survive undetected.
+        index.insert_segment(
+            2,
+            segment(
+                9,
+                vec![entry("beta", Some(id), 0, 10), entry("alpha", None, 0, 10)],
+            ),
+        );
+        assert_in_step(&index);
+        assert_eq!(
+            index
+                .substream_entries(&Substream::Name("alpha".into()), 0)
+                .map(|(seq, epoch, _)| (seq, epoch))
+                .collect::<Vec<_>>(),
+            vec![(1, 7), (2, 9)]
+        );
+
+        assert_eq!(index.retain_segments(|seq| seq != 3), 1);
+        assert_in_step(&index);
+
+        assert_eq!(index.retain_segments(|seq| seq != 1), 1);
+        assert_in_step(&index);
+
+        // Nothing left for `alpha` partition 1, so nothing keyed for it: the map
+        // is sized by live partitions, not by everything the prefix ever held.
+        assert!(
+            !index
+                .by_substream
+                .contains_key(&(Substream::Name("alpha".into()), 1))
+        );
+    }
+
+    /// A name-keyed read must never pick up an id-keyed entry carrying the same
+    /// name, or a recreated topic's records are served as its predecessor's
+    /// (#442). The map keys on the same rule `SubstreamEntry::is` applies, so
+    /// this holds by construction — assert it, because it is the one property
+    /// the keying could get wrong.
+    #[test]
+    fn a_name_never_reaches_an_id_keyed_entry_of_the_same_name() {
+        let id = Uuid::new_v4();
+        let mut index = PrefixIndex::default();
+
+        index.insert_segment(
+            1,
+            segment(
+                1,
+                vec![entry("shared", None, 0, 0), entry("shared", Some(id), 0, 0)],
+            ),
+        );
+
+        assert_eq!(
+            index
+                .substream_entries(&Substream::Name("shared".into()), 0)
+                .map(|(seq, _, e)| (seq, e.topic_id))
+                .collect::<Vec<_>>(),
+            vec![(1, None)]
+        );
+        assert_eq!(
+            index
+                .substream_entries(&Substream::Id(id), 0)
+                .map(|(seq, _, e)| (seq, e.topic_id))
+                .collect::<Vec<_>>(),
+            vec![(1, Some(id))]
+        );
+    }
+
+    /// The point of the map (#492): asking about a sub-stream the prefix does
+    /// not hold costs a lookup, not a walk of every segment's every entry.
+    #[test]
+    fn an_absent_substream_touches_no_segment() {
+        let mut index = PrefixIndex::default();
+        for seq in 0..64 {
+            index.insert_segment(
+                seq,
+                segment(1, vec![entry("held", None, 0, seq as i64 * 10)]),
+            );
+        }
+
+        assert_eq!(
+            index
+                .substream_entries(&Substream::Name("never-written".into()), 0)
+                .count(),
+            0
+        );
+        assert!(
+            !index
+                .by_substream
+                .contains_key(&(Substream::Name("never-written".into()), 0))
+        );
     }
 }
