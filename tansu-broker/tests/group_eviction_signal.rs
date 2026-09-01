@@ -85,6 +85,12 @@ fn counter(exporter: &InMemoryMetricExporter, name: &str) -> u64 {
 
 /// As [`counter`], but only the data points carrying `reason`.
 fn counted(exporter: &InMemoryMetricExporter, name: &str, reason: Option<&str>) -> u64 {
+    labelled(exporter, name, reason.map(|reason| ("reason", reason)))
+}
+
+/// As [`counted`], for any label — the eviction counter also carries the group
+/// it came from (#497).
+fn labelled(exporter: &InMemoryMetricExporter, name: &str, label: Option<(&str, &str)>) -> u64 {
     exporter
         .get_finished_metrics()
         .expect("metrics")
@@ -98,10 +104,10 @@ fn counted(exporter: &InMemoryMetricExporter, name: &str, reason: Option<&str>) 
                     AggregatedMetrics::U64(MetricData::Sum(sum)) => Some(
                         sum.data_points()
                             .filter(|point| {
-                                reason.is_none_or(|reason| {
+                                label.is_none_or(|(key, value)| {
                                     point.attributes().any(|attribute| {
-                                        attribute.key.as_str() == "reason"
-                                            && attribute.value.as_str() == reason
+                                        attribute.key.as_str() == key
+                                            && attribute.value.as_str() == value
                                     })
                                 })
                             })
@@ -259,6 +265,19 @@ async fn a_member_whose_session_lapses_is_counted_as_evicted() -> Result<()> {
         1,
         counted(&exporter, "tansu_group_members_evicted", Some("lapsed")),
         "a member with a document is evicted for its stamp, not for the document's absence"
+    );
+
+    // And it says which group lost the member (#497): "1 280 evictions/hour"
+    // spread over 77 groups and the same number coming from two of them are
+    // different investigations, and the counter could not tell them apart.
+    assert_eq!(
+        1,
+        labelled(
+            &exporter,
+            "tansu_group_members_evicted",
+            Some(("group_id", group_id.as_str()))
+        ),
+        "an eviction must name the group it came from"
     );
 
     // And the age it was evicted at is reported, which is the number #488 needs:
