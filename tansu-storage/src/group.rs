@@ -111,16 +111,36 @@ impl MemberDoc {
         self
     }
 
+    /// The silence this member is allowed before the sweep evicts it: its
+    /// session, plus the window its stamp may lag its last contact by (#488).
+    ///
+    /// `last_contact_ms` is persisted at most once per `session/2` — that
+    /// bound is the whole point of the liveness work in #359 and #406 — so the
+    /// stamp a verdict is taken against is up to half a session older than the
+    /// member's last actual contact. Expiring at the session itself spends
+    /// that gap out of the *member's* grace rather than the broker's: a member
+    /// that fell silent just before its next renewal came due was evicted
+    /// after as little as `session/2` of silence. Adding the renewal window
+    /// back restores the contract the client is given — no member is evicted
+    /// before it has been silent for a whole session — at the cost of noticing
+    /// a genuinely dead one up to half a session later.
+    #[must_use]
+    pub fn lapses_after_ms(&self) -> i64 {
+        let session = i64::from(self.session_timeout_ms);
+        session.saturating_add(session / 2)
+    }
+
     /// Whether this member's session has lapsed at `now_ms` — the whole of the
     /// dead-member sweep's verdict, as a pure function of the document and the
     /// clock, so that N replicas evaluating it concurrently reach identical
     /// conclusions and their racing CASes are interchangeable.
     ///
-    /// Strictly greater: a member last heard from exactly `session_timeout_ms`
-    /// ago is still live, matching the broker's existing comparison.
+    /// Strictly greater: a member last heard from exactly
+    /// [`Self::lapses_after_ms`] ago is still live, matching the broker's
+    /// existing comparison.
     #[must_use]
     pub fn is_expired(&self, now_ms: i64) -> bool {
-        now_ms.saturating_sub(self.last_contact_ms) > i64::from(self.session_timeout_ms)
+        now_ms.saturating_sub(self.last_contact_ms) > self.lapses_after_ms()
     }
 }
 
@@ -560,9 +580,16 @@ mod tests {
         };
 
         assert!(!doc.is_expired(1_000));
-        // Exactly at the timeout is still live, matching today's comparison.
+
+        // A member whose stamp is one session old may have been silent for
+        // only half of one, because that is how often the stamp is written
+        // (#488): still live.
         assert!(!doc.is_expired(46_000));
-        assert!(doc.is_expired(46_001));
+        assert_eq!(67_500, doc.lapses_after_ms());
+
+        // Exactly at the deadline is still live, matching today's comparison.
+        assert!(!doc.is_expired(68_500));
+        assert!(doc.is_expired(68_501));
 
         // A clock that steps backwards must not expire anyone: saturating
         // subtraction keeps the verdict at "live" rather than wrapping into a
