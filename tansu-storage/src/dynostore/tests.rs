@@ -54,6 +54,7 @@ mod segment_create;
 mod short_region;
 mod substream_identity;
 mod topic_churn;
+mod watermark_hint;
 
 /// Write a legacy `{group}.json` — the single group object the #359 cutover
 /// left behind.
