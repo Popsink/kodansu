@@ -377,6 +377,21 @@ pub struct DynoStore {
     coalesce_batches: usize,
     coalesce_bytes: usize,
 
+    /// The shape of the coalescing prefix derivation (#464): how many leading
+    /// components of a topic name form the prefix, and what separates them.
+    /// [`Self::PREFIX_DEPTH`] / [`Self::PREFIX_SEPARATOR`] by default —
+    /// `org.env.conn` out of `org.env.conn.<schema>.<table>` — and overridable
+    /// per deployment via `prefix_depth` / `prefix_separator`. A depth of `0`
+    /// makes every topic its own prefix.
+    ///
+    /// This is not a tuning knob like the ones above it: it decides the
+    /// tenant/retention/isolation boundary every segment is keyed on, so it
+    /// cannot move under a populated bucket. It is sealed per cluster by
+    /// [`Self::sealed_prefix_shape`] at store build, and a store whose
+    /// configuration disagrees with the seal never gets built.
+    prefix_depth: usize,
+    prefix_separator: String,
+
     /// The segment footer version this deployment **writes** (#442).
     /// [`SEGMENT_FORMAT_VERSION_V3`] by default; `segment_format=4` in the
     /// storage URL raises it to [`SEGMENT_FORMAT_VERSION_V4`], which is what
@@ -1098,7 +1113,7 @@ struct HeldLease {
 /// compile-time default, so omitting every key reproduces the shipped
 /// behaviour. Populated from the storage URL query string; see the storage
 /// tuning docs for the fan-out tradeoff these expose.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct CoalesceTuning {
     pub coalesce_linger: Option<Duration>,
     pub coalesce_batches: Option<usize>,
@@ -1118,6 +1133,13 @@ pub struct CoalesceTuning {
     /// [`DynoStore::segment_format_version`] — including why raising it is a
     /// one-way move.
     pub segment_format_version: Option<u16>,
+    /// Leading components of a topic name that form its coalescing prefix
+    /// (#464); `0` gives every topic its own prefix. See
+    /// [`DynoStore::prefix_depth`] — this one is sealed per cluster, not tuned.
+    pub prefix_depth: Option<usize>,
+    /// The separator those components are split on (#464). See
+    /// [`DynoStore::prefix_separator`].
+    pub prefix_separator: Option<String>,
 }
 
 /// Process-wide counter making each [`DynoStore`]'s `writer_id` unique (#59), so
@@ -2674,6 +2696,38 @@ impl OptiCon<TopicMetadata> {
     }
 }
 
+/// The coalescing prefix shape this cluster is sealed at, held once at
+/// `clusters/{cluster}/prefix-shape.json` (#464): the depth and separator
+/// [`DynoStore::prefix_of`] derives with.
+///
+/// Written create-only the first time any store is built against the bucket, and
+/// never rewritten. A store configured with a different shape fails to build
+/// rather than joining the cluster ([`DynoStore::sealed_prefix_shape`]).
+///
+/// The seal exists because the shape is only half-pinned. Since #236 a topic's
+/// routing prefix is pinned per topic, so produce and fetch keep using the
+/// prefix a topic's segments are actually under whatever the configuration says
+/// — no records are lost or misrouted by a shape change. Maintenance does not
+/// read that pin: retention grouping and the compaction universe **re-derive**
+/// the prefix from the topic name, because resolving through the pin would cost
+/// a GET per topic per tick on a cold pod, the read amplification #407 objects
+/// to. Move the shape under a populated cluster and those sweeps go looking
+/// under prefixes that hold nothing: segments stop expiring, stop compacting,
+/// and the live count per prefix grows without bound — with **nothing logged**,
+/// because the empty prefixes really are clean. Sealing the shape makes derived
+/// == pinned true by construction, so the free derivation stays correct.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct PrefixShape {
+    depth: usize,
+    separator: String,
+}
+
+impl Display for PrefixShape {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "depth {} separator {:?}", self.depth, self.separator)
+    }
+}
+
 /// The pinned routing prefix at `topic-routing/{name}.json`: the prefix a topic's
 /// records coalesce under, decided **once, at creation**, and never re-derived
 /// (#236).
@@ -2902,6 +2956,8 @@ impl DynoStore {
             coalesce_linger: Self::COALESCE_LINGER,
             coalesce_batches: Self::COALESCE_BATCHES,
             coalesce_bytes: Self::COALESCE_BYTES,
+            prefix_depth: Self::PREFIX_DEPTH,
+            prefix_separator: Self::PREFIX_SEPARATOR.to_owned(),
             segment_format_version: SEGMENT_FORMAT_VERSION_V3,
             prefix_compact_min_segments: Self::PREFIX_COMPACT_MIN_SEGMENTS,
             prefix_compact_target_bytes: Self::PREFIX_COMPACT_TARGET_BYTES,
@@ -3008,6 +3064,10 @@ impl DynoStore {
             segment_format_version: tuning
                 .segment_format_version
                 .unwrap_or(self.segment_format_version),
+            prefix_depth: tuning.prefix_depth.unwrap_or(self.prefix_depth),
+            prefix_separator: tuning
+                .prefix_separator
+                .unwrap_or_else(|| self.prefix_separator.clone()),
             ..self
         }
     }
@@ -3048,6 +3108,15 @@ impl DynoStore {
             "clusters/{}/topic-routing/{}.json",
             self.cluster, name
         ))
+    }
+
+    /// The cluster's sealed coalescing prefix shape (see [`PrefixShape`]).
+    ///
+    /// A cluster-level sibling of `meta.json` rather than anything under
+    /// `prefixes/`, so the prefix listing that drives maintenance and `tansu
+    /// audit` never returns it.
+    fn prefix_shape_path(&self) -> Path {
+        Path::from(format!("clusters/{}/prefix-shape.json", self.cluster))
     }
 
     /// Marker object recording that the one-shot legacy-metadata backfill has
@@ -3162,6 +3231,17 @@ impl DynoStore {
     /// point — an application that fits here fits on a stock Kafka, which is
     /// what a drop-in replacement owes its users (#443).
     pub const MESSAGE_MAX_BYTES: usize = 1_048_588;
+
+    /// Leading topic-name components that form the coalescing prefix (#57):
+    /// Popsink topics are `org.env.conn.<schema>.<table>` and the prefix is the
+    /// connector unit `org.env.conn`. Overridable via `prefix_depth` (#464) —
+    /// see [`Self::prefix_depth`] for why it is sealed per cluster rather than
+    /// freely tunable.
+    const PREFIX_DEPTH: usize = 3;
+
+    /// What those components are separated by (#464). Overridable via
+    /// `prefix_separator`.
+    const PREFIX_SEPARATOR: &'static str = ".";
 
     const COALESCE_LINGER: Duration = Duration::from_millis(50);
     const COALESCE_BATCHES: usize = 64;
@@ -4254,23 +4334,39 @@ impl DynoStore {
         Ok(high)
     }
 
-    /// The connector prefix a topition's records coalesce under (#57). Popsink
-    /// topics are `org.env.conn.<schema>.<table>`; the prefix is the connector
-    /// unit `org.env.conn` (the first three dotted components) — the
-    /// tenant/retention/isolation boundary the epic coalesces on. A topic with
-    /// fewer than three components is its own prefix. A configurable
-    /// `prefix_map` override (custom topic-glob → prefix) is not yet implemented;
-    /// tracked as a follow-up. This derivation is the only mapping today.
+    /// The connector prefix a topition's records coalesce under (#57): the
+    /// first [`Self::prefix_depth`] components of the topic name, split on
+    /// [`Self::prefix_separator`] — the tenant/retention/isolation boundary the
+    /// epic coalesces on. Popsink topics are `org.env.conn.<schema>.<table>` and
+    /// the defaults (`3` / `.`) give the connector unit `org.env.conn`, which is
+    /// what every deployment before #464 derived and what an unconfigured
+    /// storage URL still derives byte for byte.
+    ///
+    /// A topic with fewer components than the depth is its own prefix, and so is
+    /// every topic at depth `0` — the setting for a deployment whose topic names
+    /// carry no grouping to coalesce on, at the PUT bill #56 set out to kill.
+    ///
+    /// The shape is fixed for the life of a cluster ([`Self::sealed_prefix_shape`]),
+    /// which is what lets the maintenance paths keep deriving it rather than
+    /// resolving each topic's pin (#236) at a GET apiece.
+    ///
+    /// A `prefix_map` override (custom topic-glob → prefix) is still not
+    /// implemented; depth plus separator is deliberately the whole of #464.
     fn prefix_of(&self, topition: &Topition) -> String {
         let topic = topition.topic();
-        let mut parts = topic.split('.');
+
+        if self.prefix_depth == 0 {
+            return topic.to_owned();
+        }
+
+        let mut parts = topic.split(self.prefix_separator.as_str());
         let mut prefix = String::new();
 
-        for i in 0..3 {
+        for i in 0..self.prefix_depth {
             match parts.next() {
                 Some(part) => {
                     if i > 0 {
-                        prefix.push('.');
+                        prefix.push_str(&self.prefix_separator);
                     }
                     prefix.push_str(part);
                 }
@@ -4337,10 +4433,10 @@ impl DynoStore {
     ///    different answer would route the topic's new records to a prefix its
     ///    existing segments are not under, which is not a cost regression but data
     ///    becoming unreachable.
-    /// 3. A topic whose connector prefix already equals its own name (fewer than
-    ///    three dotted components) and which has no pin needs no *write*: both
-    ///    routings agree, so there is nothing to pin down and a create would be
-    ///    an object per topic bought for nothing.
+    /// 3. A topic whose connector prefix already equals its own name (fewer
+    ///    components than the configured depth, #464) and which has no pin needs
+    ///    no *write*: both routings agree, so there is nothing to pin down and a
+    ///    create would be an object per topic bought for nothing.
     ///
     /// Step 3 used to short-circuit the whole function — no memo, no read, no
     /// request at all. It cannot any more: whether a topic is id-keyed is not
@@ -4413,6 +4509,87 @@ impl DynoStore {
             .map(|mut locked| locked.insert(topic.to_owned(), pinned.clone()));
 
         Ok(pinned)
+    }
+
+    /// Seal this cluster's coalescing prefix shape (#464) and hand the store
+    /// back, or refuse to build one that disagrees with the seal already there.
+    ///
+    /// One GET at startup, and — once per cluster, ever — one create-only PUT.
+    ///
+    /// - Sealed already, and it matches: nothing to do.
+    /// - Sealed already, and it does not: [`Error::PrefixShapeSealed`], naming
+    ///   both shapes. Nothing is written. This is the whole point of the object
+    ///   — see [`PrefixShape`] for what silently rots otherwise.
+    /// - Not sealed: adopt the configured shape and write it. A bucket that has
+    ///   been running on the pre-#464 derivation seals `depth 3 separator "."`,
+    ///   which is what its routing pins (#236) already say, so an existing
+    ///   cluster keeps its object layout untouched.
+    ///
+    /// The create is what makes a fleet converge rather than split: replicas
+    /// starting together race for it, the winner's value is the cluster's, and a
+    /// loser reads it back — adopting it if they agree, failing if they do not.
+    /// Whichever way that race goes, every replica ends up on one shape or not
+    /// running at all.
+    pub async fn sealed_prefix_shape(self) -> Result<Self> {
+        let configured = PrefixShape {
+            depth: self.prefix_depth,
+            separator: self.prefix_separator.clone(),
+        };
+
+        let sealed = match self.read_prefix_shape().await? {
+            Some(sealed) => sealed,
+
+            None => {
+                let won = self
+                    .put_create(
+                        &self.prefix_shape_path(),
+                        serde_json::to_vec(&configured)
+                            .map(Bytes::from)
+                            .map(PutPayload::from)?,
+                    )
+                    .await?;
+
+                if won {
+                    info!(shape = %configured, cluster = self.cluster, "sealed the coalescing prefix shape");
+                    configured.clone()
+                } else {
+                    // A peer sealed it between the read and the create: its
+                    // value is the cluster's, whatever this replica configured.
+                    self.read_prefix_shape()
+                        .await?
+                        .unwrap_or_else(|| configured.clone())
+                }
+            }
+        };
+
+        if sealed == configured {
+            Ok(self)
+        } else {
+            Err(Error::PrefixShapeSealed {
+                sealed: sealed.to_string(),
+                configured: configured.to_string(),
+            })
+        }
+    }
+
+    /// The cluster's sealed prefix shape, or `None` on a bucket nothing has
+    /// sealed yet. One GET, uncached — [`Self::sealed_prefix_shape`] is the only
+    /// caller and it runs once per store.
+    async fn read_prefix_shape(&self) -> Result<Option<PrefixShape>> {
+        match self.object_store.get(&self.prefix_shape_path()).await {
+            Ok(get_result) => get_result
+                .bytes()
+                .await
+                .map_err(Into::into)
+                .and_then(|encoded| {
+                    serde_json::from_slice::<PrefixShape>(&encoded).map_err(Into::into)
+                })
+                .map(Some),
+
+            Err(object_store::Error::NotFound { .. }) => Ok(None),
+
+            Err(otherwise) => Err(otherwise.into()),
+        }
     }
 
     /// What identifies `topition`'s sub-stream in a segment footer (#442), and

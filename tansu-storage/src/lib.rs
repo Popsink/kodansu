@@ -303,6 +303,21 @@ pub enum Error {
     PhantomCached(),
     Poison,
 
+    /// The coalescing prefix shape on the storage URL (`prefix_depth` /
+    /// `prefix_separator`) is not the one this cluster is sealed at (#464), so
+    /// the store is not built. Both shapes are named because either one could be
+    /// the mistake: the config may be wrong, or the bucket may be the wrong
+    /// bucket.
+    ///
+    /// Fatal on purpose. Running with a shape the cluster's segments are not
+    /// under leaves produce and fetch correct — they read the per-topic routing
+    /// pin (#236) — while retention and compaction sweep prefixes that hold
+    /// nothing, reporting themselves clean forever.
+    PrefixShapeSealed {
+        sealed: String,
+        configured: String,
+    },
+
     SansIo(#[from] tansu_sans_io::Error),
 
     SerdeJson(Arc<serde_json::Error>),
@@ -2872,6 +2887,35 @@ fn coalesce_tuning(storage: &Url) -> CoalesceTuning {
                     )
                     .ok();
             }
+            // The shape of the coalescing prefix (#464). Not a threshold like
+            // everything above: it decides *where* records live, is sealed per
+            // cluster at store build (`DynoStore::sealed_prefix_shape`), and
+            // cannot be moved on a populated bucket. An unparseable value is
+            // ignored with a warning as usual, which leaves the shape at the
+            // default — and if the bucket is sealed at something else, the seal
+            // turns that typo into a failed build rather than a silently
+            // different layout.
+            "prefix_depth" => {
+                tuning.prefix_depth = value
+                    .parse()
+                    .inspect_err(|err| warn!(storage = %storage, key = "prefix_depth", value, ?err))
+                    .ok();
+            }
+            // Rejected empty rather than accepted: splitting on "" yields one
+            // component per character, which is not a prefix shape anyone asked
+            // for and would seal the cluster into it.
+            "prefix_separator" => {
+                tuning.prefix_separator = if value.is_empty() {
+                    warn!(
+                        storage = %storage,
+                        key = "prefix_separator",
+                        "ignoring an empty prefix separator"
+                    );
+                    None
+                } else {
+                    Some(value.to_owned())
+                };
+            }
             // The one key here that changes what is *written* rather than how
             // often (#442), and the only one whose effect does not reverse when
             // it is unset again — see `DynoStore::segment_format_version`. An
@@ -2971,6 +3015,9 @@ impl Builder<i32, String, Url, Url> {
                             .coalesce_tuning(coalesce_tuning(&self.storage))
                             .message_max_bytes(message_max_bytes(&self.storage))
                     })
+                    .map_err(Error::from)?
+                    .sealed_prefix_shape()
+                    .await
                     .map(|storage| {
                         ProduceRequestBatcher::new(storage)
                             .with_minimum_size(minimum_size)
@@ -2978,7 +3025,6 @@ impl Builder<i32, String, Url, Url> {
                     })
                     .map(|storage| Box::new(storage) as Box<dyn Storage>)
                     .map(Arc::new)
-                    .map_err(Into::into)
             }
 
             #[cfg(feature = "dynostore")]
@@ -3049,6 +3095,9 @@ impl Builder<i32, String, Url, Url> {
                             .coalesce_tuning(coalesce_tuning(&self.storage))
                             .message_max_bytes(message_max_bytes(&self.storage))
                     })
+                    .map_err(Error::from)?
+                    .sealed_prefix_shape()
+                    .await
                     .map(|storage| {
                         ProduceRequestBatcher::new(storage)
                             .with_minimum_size(minimum_size)
@@ -3056,20 +3105,19 @@ impl Builder<i32, String, Url, Url> {
                     })
                     .map(|storage| Box::new(storage) as Box<dyn Storage>)
                     .map(Arc::new)
-                    .map_err(Into::into)
             }
 
             #[cfg(feature = "dynostore")]
-            "memory" => Ok(
-                DynoStore::new(self.cluster_id.as_str(), self.node_id, InMemory::new())
-                    .advertised_listener(self.advertised_listener.clone())
-                    .auto_create(auto_topic_create(&self.storage))
-                    .topic_defaults(self.topic_defaults.clone())
-                    .coalesce_tuning(coalesce_tuning(&self.storage))
-                    .message_max_bytes(message_max_bytes(&self.storage)),
-            )
-            .map(|storage| Box::new(storage) as Box<dyn Storage>)
-            .map(Arc::new),
+            "memory" => DynoStore::new(self.cluster_id.as_str(), self.node_id, InMemory::new())
+                .advertised_listener(self.advertised_listener.clone())
+                .auto_create(auto_topic_create(&self.storage))
+                .topic_defaults(self.topic_defaults.clone())
+                .coalesce_tuning(coalesce_tuning(&self.storage))
+                .message_max_bytes(message_max_bytes(&self.storage))
+                .sealed_prefix_shape()
+                .await
+                .map(|storage| Box::new(storage) as Box<dyn Storage>)
+                .map(Arc::new),
 
             "null" => Ok(null::Engine::new(
                 self.cluster_id.clone(),
@@ -3448,6 +3496,39 @@ mod tests {
         )?);
         assert_eq!(None, tuning.coalesce_linger);
         assert_eq!(None, tuning.coalesce_batches);
+        Ok(())
+    }
+
+    /// The prefix shape keys (#464), including what "absent" has to mean: the
+    /// pre-#464 derivation, so a storage URL that has never carried them keeps
+    /// its exact object layout.
+    #[cfg(feature = "dynostore")]
+    #[test]
+    fn coalesce_tuning_parses_the_prefix_shape() -> Result<()> {
+        let parse = |query: &str| -> Result<(Option<usize>, Option<String>)> {
+            let tuning = coalesce_tuning(&Url::parse(&format!("s3://tansu/?{query}"))?);
+            Ok((tuning.prefix_depth, tuning.prefix_separator))
+        };
+
+        assert_eq!((None, None), parse("")?);
+        assert_eq!((Some(2), None), parse("prefix_depth=2")?);
+        assert_eq!((Some(0), None), parse("prefix_depth=0")?);
+        assert_eq!((None, Some("_".into())), parse("prefix_separator=_")?);
+        assert_eq!(
+            (Some(4), Some("-".into())),
+            parse("prefix_depth=4&prefix_separator=-")?
+        );
+
+        // A typo leaves the shape at the default — and the per-cluster seal then
+        // turns that into a failed build rather than a different layout.
+        assert_eq!((None, None), parse("prefix_depth=three")?);
+        assert_eq!((None, None), parse("prefix_depth=-1")?);
+        assert_eq!((None, None), parse("prefix_depth=")?);
+
+        // An empty separator would split a name into one component per
+        // character; ignored, like any other unusable value.
+        assert_eq!((None, None), parse("prefix_separator=")?);
+
         Ok(())
     }
 

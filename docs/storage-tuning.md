@@ -230,10 +230,12 @@ URL still carrying them starts and logs one warning, rather than failing.
 
 ## Prefix coalescing — virtual topics
 
-The broker coalesces per **connector prefix** (`org.env.conn` — the first three
-dotted components of a topic) rather than per partition (#56). The batches
-produced across *every* topic under a prefix within a linger window are flushed
-into one shared, immutable segment object:
+The broker coalesces per **connector prefix** (`org.env.conn` — by default the
+first three dotted components of a topic; see
+[the prefix shape](#prefix_depth--prefix_separator--the-shape-of-the-prefix))
+rather than per partition (#56). The batches produced across *every* topic under
+a prefix within a linger window are flushed into one shared, immutable segment
+object:
 
 ```
 clusters/{cluster}/prefixes/{org.env.conn}/segments/{seq:020}.seg
@@ -266,6 +268,8 @@ prefix's topics).
 
 | Query param | Default | Meaning |
 |---|---|---|
+| `prefix_depth` | `3` | Leading components of the topic name that form its prefix. `0` gives every topic its own prefix (no cross-topic coalescing). Sealed per cluster — see below. |
+| `prefix_separator` | `.` | What those components are separated by. An empty value is ignored with a warning. Sealed per cluster — see below. |
 | `prefix_compact_min_segments` | `256` | Compact a prefix once it holds more than this many live segments (`0` disables). |
 | `prefix_compact_target_bytes` | `16m` | Target size of a merged segment. Kept modest because the merged create currently shares the producer tail create-CAS namespace (#130); a larger target lengthens each merged PUT, loses the create race more often, and re-uploads its whole payload on retry, amplifying S3 write cost. The live segment count is bounded by `prefix_compact_min_segments` (a count trigger), not by this size. |
 | `prefix_compact_keep_hot` | `16` | Newest segments never compacted (leaves the active tail alone). |
@@ -275,6 +279,56 @@ prefix's topics).
 
 The linger / batch-count / byte thresholds are the `coalesce_linger` /
 `coalesce_batches` / `coalesce_bytes` keys documented above.
+
+### `prefix_depth` / `prefix_separator` — the shape of the prefix
+
+```
+s3://my-bucket/?prefix_depth=2&prefix_separator=_
+```
+
+The prefix is the first `prefix_depth` components of the topic name, split on
+`prefix_separator`. `a.b.c.d` at the defaults gives `a.b.c`; at
+`prefix_depth=2`, `a.b`; at `prefix_depth=4` or `prefix_depth=0`, `a.b.c.d`
+(a topic with fewer components than the depth is always its own prefix, and
+depth `0` means every topic is). With `prefix_separator=_`, `a_b_c_d` gives
+`a_b_c`.
+
+The defaults reproduce the pre-#464 derivation byte for byte, so a storage URL
+carrying neither key keeps its exact object layout.
+
+Get this wrong in either direction and the epic stops paying. Too coarse and
+unrelated tenants share a segment — and therefore share a *retention*, since
+retention is whole-segment and per-prefix under the longest `retention.ms` in
+the prefix. Too fine and every topic is its own prefix, which is one PUT per
+topic per flush: the bill #56 exists to remove.
+
+**The shape is sealed for the life of a cluster.** The first store built against
+a bucket writes `clusters/{cluster}/prefix-shape.json` create-only
+(`{"depth":3,"separator":"."}`); every store built after it reads that object and
+**fails to start** if its configuration disagrees, naming both shapes. An
+existing bucket that has always run on the defaults seals `3` / `.` on its next
+start, which is what its data already says. Replicas starting together race for
+the create and converge on the winner.
+
+The seal read is the first object-store request a store makes, so a bucket that
+is unreachable or misconfigured now fails the build rather than the first
+produce.
+
+Failing to start is the point. Since #236 each topic's routing prefix is pinned
+at creation, so produce and fetch keep using the prefix a topic's segments are
+actually under whatever the URL says — no records are lost or misrouted by a
+shape change. Retention and compaction do **not** read that pin; they re-derive
+the prefix from the topic name, because resolving each topic's pin would cost a
+GET per topic per tick on a cold pod. Change the depth on a live cluster without
+the seal and the two halves disagree: the sweeps visit prefixes that hold
+nothing, so old segments stop expiring and stop compacting, live segments per
+prefix grow without bound, and **nothing is logged** — the empty prefixes they
+visit really are clean. A failed rollout is a much better outcome than a silent
+one.
+
+Changing the shape on a populated bucket is therefore a migration (rewrite the
+objects, or dual-read both layouts), not a config change. There is no support
+for it today.
 
 ### Scaling maintenance across stateless replicas (`maintenance_recency`)
 
