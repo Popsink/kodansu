@@ -453,11 +453,15 @@ Do not adopt a figure blind. Sweep it in one deployment and watch
 Three of these series have been misread in cost analyses, so:
 
 - **`tansu_prefix_segments_live` is per replica.** It is the size of *that
-  process's* cached footer index, and the incremental refresh is add-only below
-  the tail, so an entry for a segment a peer retired survives until this replica
-  reads a 404 for it. Four maintainers once reported 17 517, 14 374, 13 932 and
-  67 for the same prefix at the same instant. `max()` across the fleet is the
-  staleness of the worst index, not a backlog.
+  process's* cached footer index. The incremental refresh is add-only below the
+  tail, so an entry for a segment a peer retired survives until something lists
+  the prefix whole; since #408 that happens on a schedule — once per five minutes
+  per prefix a refresh lists the whole prefix and drops what it does not find, and
+  `tansu_prefix_index_reconciled` counts the drops. It is bounded staleness, not
+  agreement: four maintainers once reported 17 517, 14 374, 13 932 and 67 for the
+  same prefix at the same instant, and `max()` across the fleet is still the
+  worst index rather than a backlog. Read `tansu_prefix_index_segments` against
+  the objects in the bucket: it should track them, not climb with uptime.
 - **`tansu_objectstore_cache_entries` is a counter, not a size.** It counts etag
   memo *insertions*. `tansu_objectstore_cache_size` is the size.
 - **A cache "miss" is not a lost request.** The etag memo answers a
