@@ -108,7 +108,32 @@ use crate::{Error, METER, Result};
 
 use super::{Coordinator, OffsetCommit};
 
+/// How long a static member with nothing to act on is damped on the **sync**
+/// path before it is answered (#486).
+///
+/// No longer on the join path (#498). Measured on the production fleet after
+/// #499 moved it behind the fast paths, it still fired **0.81 times per
+/// `JoinGroup`** — because a follower mid-rebalance is neither leader nor
+/// assigned, so it fell through to the pause exactly as before. There it was
+/// three seconds of *blindness* at the worst possible moment: the leader writes
+/// the assignment the follower is waiting for inside that window, and a sleeping
+/// call cannot see it land. The 1s settle wait that followed damps the same spin
+/// and re-checks every second, which the pause cannot, so the pause was pure
+/// latency and is gone from `join_long_poll`.
 const PAUSE_MS: u128 = 3_000;
+
+/// How long a follower's `SyncGroup` waits for the leader's assignment before it
+/// is told to re-join (#498).
+///
+/// This is where the wait for an assignment belongs, and it is short because it
+/// now can be: `SyncGroup` fell to **456ms** on the production fleet once #499
+/// stopped delaying the leader, so the assignment a follower waits for lands
+/// sub-second in the common case. Deliberately far below the session timeout: a
+/// connection is served strictly sequentially (`tansu-service`'s frame loop) and
+/// the Java client heartbeats over the connection it syncs on, so a parked sync
+/// holds that connection shut — a few seconds is nothing against a 30s
+/// `sessionTimeoutExpired`, and 0.8 × session would not be.
+const SYNC_ASSIGNMENT_WAIT_MS: u128 = 3_000;
 
 /// Join-window barrier: how long the persisted member set must stay unchanged
 /// before a Forming group's leader is released from `Controller::join` with its
@@ -300,14 +325,28 @@ enum LongPoll {
 
 /// `join`'s long-poll decision (see [`LongPoll`]).
 ///
-/// Any member with something to act on — told to retry under a broker-issued
-/// member id, leader, or assigned — is answered immediately, and the leader of
-/// a still-`Forming` group is first held by the join-window barrier until
+/// A member with something to act on — told to retry under a broker-issued
+/// member id, or already named by the assignment — is answered immediately. The
+/// leader of a still-`Forming` group is held by the join-window barrier until
 /// membership is quiescent or the rebalance window closes, so it assigns over
-/// the complete member list. Anyone else — a member with nothing to act on,
-/// whose next move is therefore to ask again — is damped: a static member out
-/// to [`PAUSE_MS`] so its rejoin does not spin, then up to **half** its session
-/// timeout, and is answered anyway at the end of it.
+/// the complete member list.
+///
+/// **A follower is released by that same barrier** (#498), not by the arrival of
+/// an assignment. `is_assigned` on a `JoinGroupResponse` means the leader's
+/// assignment document *exists*, so waiting for it serialised a follower's join
+/// behind the whole sync phase — and when that outran the cap the member was
+/// answered success with nothing to act on, sent a sync, was bounced, and
+/// re-joined. Measured on the production fleet: **42% of joins were answered by
+/// the cap**, which is a timer rather than a barrier. Kafka releases every parked
+/// `JoinGroup` when the *join* phase completes (`DelayedJoin`) and makes
+/// followers wait in `SyncGroup` (`DelayedSync`); this is that shape, with the
+/// membership-quiescence proxy this broker uses in place of Kafka's
+/// `hasAllMembersJoined` — no-op rejoins leave no trace to count.
+///
+/// What is left of the old wait is the damper it always was: a member with
+/// nothing to act on **while the membership is still moving** waits up to half
+/// its session timeout and is answered anyway. The static-member pause is gone
+/// from this path entirely — see [`PAUSE_MS`].
 ///
 /// **The fast paths come first, and the pause after** (#498). The pause used to
 /// be the first question asked, so a static member paid it even when the answer
@@ -325,7 +364,6 @@ enum LongPoll {
 fn join_long_poll(
     updated: &GroupView,
     body: &Body,
-    group_instance_id: Option<&str>,
     elapsed_ms: u128,
     is_forming: bool,
     membership_quiescent: bool,
@@ -343,29 +381,36 @@ fn join_long_poll(
     };
 
     let decision = if is_member_id_required {
-        // KIP-394: the group was left untouched, so there is nothing to damp
-        // and nothing to wait for. The member registers on the join that
-        // follows, and that one takes the branches below.
+        // KIP-394: the group was left untouched, so there is nothing to wait
+        // for. The member registers on the join that follows, and that one takes
+        // the branches below.
         //
         // Defensive, and its counter should stay at **zero**: `join` answers a
         // minted member id by returning, before any long poll, so the only body
         // reaching here carries `ErrorCode::None`. Kept because the predicate is
-        // what the branch means, not because the branch is reachable today —
-        // and counted so that a future path which does reach it says so instead
-        // of silently taking a member's rejoin through the pause below.
+        // what the branch means, not because the branch is reachable today.
         answered("member_id_required")
     } else if is_leader && is_forming && !membership_quiescent && elapsed_ms < join_window_ms {
         LongPoll::Wait(Duration::from_secs(1), "join_window_hold")
     } else if is_leader {
         answered("leader")
     } else if is_assigned {
+        // The assignment already names this member: a settled member's poll, or
+        // a rejoin into a group that has not moved. (Mutually exclusive with the
+        // barrier above — an assignment for this generation means the group is
+        // not forming.)
         answered("assigned")
-    } else if group_instance_id.is_some() && elapsed_ms < PAUSE_MS {
-        LongPoll::Wait(
-            Duration::from_millis(PAUSE_MS.saturating_sub(elapsed_ms) as u64),
-            "join_static_pause",
-        )
+    } else if membership_quiescent && is_forming {
+        // The join phase is over — the membership has stopped moving — and the
+        // leader has yet to assign. Answered here rather than held until the
+        // assignment exists (#498): what the member does next is send a
+        // `SyncGroup`, which is where the wait belongs, and where its heartbeat
+        // thread is running again.
+        answered("barrier")
     } else if elapsed_ms < session_timeout_ms.div(2) {
+        // Still moving, or a stable group whose assignment does not name this
+        // member — the corner that would otherwise spin. Damped at 1s and
+        // capped.
         LongPoll::Wait(Duration::from_secs(1), "join_settle_wait")
     } else {
         // The cap, not the barrier: `session/2` elapsed and this member is
@@ -391,12 +436,18 @@ fn join_long_poll(
 
 /// `sync`'s long-poll decision (see [`LongPoll`]).
 ///
-/// A member is answered as soon as its assignment has arrived, or the group has
-/// fallen back to `Forming` (a fresh rebalance to follow). Otherwise it waits up
-/// to **eight tenths** of its session timeout — longer than `join`'s half,
-/// because a sync is waiting on the leader's single assignment write — and is
-/// then terminated with `RebalanceInProgress`, so the client rejoins instead of
-/// settling on an empty assignment.
+/// A member is answered as soon as its assignment has arrived. A **follower
+/// whose generation is current and whose leader has not written the assignment
+/// yet waits for it** (#498), up to [`SYNC_ASSIGNMENT_WAIT_MS`] — Kafka's
+/// `DelayedSync`, and the other half of releasing that member from its join.
+/// Without it, the early release would hand the member a bounce instead of a
+/// wait, and join → bounce → re-join would spin.
+///
+/// A member the group has already moved past is *not* held: it is told to
+/// re-join at once, because nothing it waits for can arrive. Otherwise a member
+/// with nothing to act on waits up to **eight tenths** of its session timeout
+/// and is then terminated with `RebalanceInProgress`, so the client rejoins
+/// instead of settling on an empty assignment.
 ///
 /// The static-member pause of [`join_long_poll`], and, as there, **after the
 /// answers rather than before them** (#498). This is the path it cost the most
@@ -410,13 +461,26 @@ fn sync_long_poll(
     body: &Body,
     group_instance_id: Option<&str>,
     elapsed_ms: u128,
+    generation_id: i32,
 ) -> LongPoll {
     let is_forming = updated.is_forming();
     let is_assigned = updated.is_assigned(body);
     let is_ok = updated.is_ok(body);
     let session_timeout_ms = updated.session_timeout_ms() as u128;
 
-    let decision = if is_forming || is_assigned {
+    // The member is on the generation the group is on, and the assignment for
+    // it does not exist yet: the leader has not synced. That is the one wait
+    // here that can be satisfied by something other than a new generation.
+    let awaiting_leader =
+        generation_id == updated.generation_id() && updated.assignments().is_none();
+
+    let decision = if is_assigned {
+        LongPoll::Respond(None)
+    } else if awaiting_leader && elapsed_ms < SYNC_ASSIGNMENT_WAIT_MS {
+        LongPoll::Wait(Duration::from_secs(1), "sync_awaiting_leader")
+    } else if is_forming {
+        // Either the group moved past this member, or the wait above ran out.
+        // Both mean re-join, and the body already says so.
         LongPoll::Respond(None)
     } else if group_instance_id.is_some() && elapsed_ms < PAUSE_MS {
         LongPoll::Wait(
@@ -434,6 +498,7 @@ fn sync_long_poll(
         is_forming,
         is_assigned,
         is_ok,
+        awaiting_leader,
         session_timeout_ms,
         ?decision,
     );
@@ -534,6 +599,20 @@ static JOIN_ANSWERED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .with_description("why a parked JoinGroup was answered")
         .build()
 });
+
+/// One [`Controller::sync_once`] outcome: the group as it stands, the answer,
+/// and — when the answer is `RebalanceInProgress` — why (#497).
+///
+/// The cause is carried out rather than counted where it is decided, because a
+/// `SyncGroup` runs `sync_once` on **every** long-poll iteration: counting at
+/// the decision would report one bounce per second of waiting instead of one
+/// per request, and `awaiting_leader` — the one cause a member now waits on
+/// (#498) — would be inflated by exactly the length of that wait.
+struct SyncOnce {
+    view: GroupView,
+    body: Body,
+    rebalance_cause: Option<&'static str>,
+}
 
 /// Why a `SyncGroup` was answered `RebalanceInProgress`, by `cause` (#497).
 ///
@@ -2316,7 +2395,6 @@ where
             let decision = join_long_poll(
                 &view,
                 &body,
-                group_instance_id,
                 polling_since.elapsed().as_millis(),
                 view.is_forming(),
                 membership_quiescent,
@@ -2404,7 +2482,11 @@ where
             // as `join`'s — see there.
             _ = self.observe_rebalance(group_id, &view, now);
 
-            let (view, body) = self
+            let SyncOnce {
+                view,
+                body,
+                rebalance_cause,
+            } = self
                 .sync_once(group_id, generation_id, member_id, view, assignments, now)
                 .await?;
 
@@ -2416,7 +2498,16 @@ where
                 &body,
                 group_instance_id,
                 polling_since.elapsed().as_millis(),
+                generation_id,
             );
+
+            // Counted here, once, on the iteration that answers — not where the
+            // verdict is reached, which is every second of a wait (#497).
+            if !matches!(decision, LongPoll::Wait(..))
+                && let Some(cause) = rebalance_cause
+            {
+                SYNC_REBALANCE_IN_PROGRESS.add(1, &[KeyValue::new("cause", cause)]);
+            }
 
             match decision {
                 LongPoll::Respond(None) => return Ok(body),
@@ -2759,24 +2850,38 @@ where
         view: GroupView,
         assignments: Option<&[SyncGroupRequestAssignment]>,
         now: SystemTime,
-    ) -> Result<(GroupView, Body)> {
+    ) -> Result<SyncOnce> {
+        let answered = |view: GroupView, body: Body| SyncOnce {
+            view,
+            body,
+            rebalance_cause: None,
+        };
+
+        let rebalancing = |view: GroupView, cause: &'static str| {
+            let body = sync_error(&view, ErrorCode::RebalanceInProgress);
+
+            SyncOnce {
+                view,
+                body,
+                rebalance_cause: Some(cause),
+            }
+        };
+
         if !view.exists() || !view.generation.members.contains_key(member_id) {
             debug!(?member_id, sync_outcome = ?ErrorCode::UnknownMemberId);
             let body = sync_error(&view, ErrorCode::UnknownMemberId);
-            return Ok((view, body));
+            return Ok(answered(view, body));
         }
 
         if generation_id > view.generation_id() {
             debug!(current = view.generation_id(), sync_outcome = ?ErrorCode::IllegalGeneration);
             let body = sync_error(&view, ErrorCode::IllegalGeneration);
-            return Ok((view, body));
+            return Ok(answered(view, body));
         }
 
         if generation_id < view.generation_id() {
             debug!(current = view.generation_id(), sync_outcome = ?ErrorCode::RebalanceInProgress);
-            SYNC_REBALANCE_IN_PROGRESS.add(1, &[KeyValue::new("cause", "generation_moved")]);
-            let body = sync_error(&view, ErrorCode::RebalanceInProgress);
-            return Ok((view, body));
+            return Ok(rebalancing(view, "generation_moved"));
         }
 
         // The assignment is immutable and create-only, so if it is there it is
@@ -2788,9 +2893,7 @@ where
             // valid empty assignment, and it then sits idle forever.
             let Some(assignment) = assignments.get(member_id).cloned() else {
                 debug!(sync_outcome = ?ErrorCode::RebalanceInProgress, "not in the assignment");
-                SYNC_REBALANCE_IN_PROGRESS.add(1, &[KeyValue::new("cause", "not_in_assignment")]);
-                let body = sync_error(&view, ErrorCode::RebalanceInProgress);
-                return Ok((view, body));
+                return Ok(rebalancing(view, "not_in_assignment"));
             };
 
             debug!(sync_outcome = ?ErrorCode::None, sync_assignment = true);
@@ -2803,19 +2906,18 @@ where
                 .assignment(assignment)
                 .into();
 
-            return Ok((view, body));
+            return Ok(answered(view, body));
         }
 
         // No assignment for this generation yet, so only the leader has
         // anything to do here.
         if view.leader() != Some(member_id) {
             debug!(leader = ?view.leader(), sync_outcome = ?ErrorCode::RebalanceInProgress);
-            // The follower that arrived before the leader wrote the assignment:
-            // the size of the sync-bounce-rejoin cycle, and the number that
-            // decides whether the deferred half of #498 is worth doing.
-            SYNC_REBALANCE_IN_PROGRESS.add(1, &[KeyValue::new("cause", "awaiting_leader")]);
-            let body = sync_error(&view, ErrorCode::RebalanceInProgress);
-            return Ok((view, body));
+            // The follower that arrived before the leader wrote the assignment.
+            // Since #498 this is a *wait* rather than a bounce — the long poll
+            // holds it for [`SYNC_ASSIGNMENT_WAIT_MS`] — and it is only counted
+            // if that wait runs out.
+            return Ok(rebalancing(view, "awaiting_leader"));
         }
 
         let requested = assignments
@@ -2828,10 +2930,7 @@ where
         // form the group, for the same reason as above.
         if !requested.contains_key(member_id) {
             debug!(sync_outcome = ?ErrorCode::RebalanceInProgress, "leader not in its own assignment");
-            SYNC_REBALANCE_IN_PROGRESS
-                .add(1, &[KeyValue::new("cause", "leader_not_in_assignment")]);
-            let body = sync_error(&view, ErrorCode::RebalanceInProgress);
-            return Ok((view, body));
+            return Ok(rebalancing(view, "leader_not_in_assignment"));
         }
 
         let assignment = AssignmentDoc {
@@ -2873,9 +2972,7 @@ where
                 sync_outcome = ?ErrorCode::RebalanceInProgress,
             );
 
-            SYNC_REBALANCE_IN_PROGRESS.add(1, &[KeyValue::new("cause", "assignment_raced")]);
-            let body = sync_error(&after, ErrorCode::RebalanceInProgress);
-            return Ok((after, body));
+            return Ok(rebalancing(after, "assignment_raced"));
         }
 
         // Housekeeping, not correctness: keep this generation and the one
@@ -2903,7 +3000,7 @@ where
 
         debug!(sync_outcome = ?ErrorCode::None, generation_id = after.generation_id());
 
-        Ok((after, body))
+        Ok(answered(after, body))
     }
 }
 
@@ -4724,6 +4821,241 @@ mod tests {
 
         assert_eq!(i16::from(ErrorCode::None), join.error_code);
         assert_eq!(LEADER, join.leader);
+
+        Ok(())
+    }
+
+    /// A group of two as the store holds it mid-rebalance: membership settled
+    /// `settled_ago` ago, and the leader has not written an assignment yet.
+    async fn forming_group_of_two<O>(
+        storage: &O,
+        group_id: &str,
+        leader: &str,
+        follower: &str,
+        settled_ago: Duration,
+    ) -> Result<i32>
+    where
+        O: Storage,
+    {
+        const GENERATION_ID: i32 = 7;
+
+        let now_ms = epoch_ms(paused_clock());
+        let settled_ms = now_ms - settled_ago.as_millis() as i64;
+
+        for member_id in [leader, follower] {
+            _ = storage
+                .write_group_member(
+                    group_id,
+                    member_id,
+                    MemberDoc {
+                        last_contact_ms: now_ms,
+                        session_timeout_ms: SESSION_TIMEOUT_MS,
+                        rebalance_timeout_ms: REBALANCE_TIMEOUT_MS,
+                        join_response: JoinGroupResponseMember::default()
+                            .member_id(member_id.to_owned())
+                            .metadata(encode_subscription(&["t"], None)),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .map_err(update_error)?;
+        }
+
+        _ = storage
+            .update_group_generation(
+                group_id,
+                GenerationDoc {
+                    generation_id: GENERATION_ID,
+                    protocol_type: Some(CONSUMER.into()),
+                    protocol_name: Some(RANGE.into()),
+                    leader: Some(leader.to_owned()),
+                    members: BTreeMap::from([
+                        (leader.to_owned(), MemberRef::default()),
+                        (follower.to_owned(), MemberRef::default()),
+                    ]),
+                    members_changed_at_ms: settled_ms,
+                    state_since_ms: settled_ms,
+                    // Just swept, so none of these requests runs one.
+                    swept_at_ms: now_ms,
+                    session_timeout_ms: SESSION_TIMEOUT_MS,
+                    rebalance_timeout_ms: REBALANCE_TIMEOUT_MS,
+                    inception_ms: settled_ms,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .map_err(update_error)?;
+
+        Ok(GENERATION_ID)
+    }
+
+    /// A follower is released when the membership settles, not when its leader
+    /// finishes syncing (#498).
+    ///
+    /// `is_assigned` on a `JoinGroupResponse` means the leader's assignment
+    /// *exists*, so waiting for it serialised a follower's join behind the whole
+    /// sync phase — and the production fleet answered **42% of joins from the
+    /// `session/2` cap**, which is a timer rather than a barrier. Kafka releases
+    /// every parked `JoinGroup` when the join phase completes.
+    #[tokio::test(start_paused = true)]
+    async fn a_follower_is_released_when_the_membership_settles() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "settled-membership";
+        const LEADER: &str = "m-1";
+        const FOLLOWER: &str = "m-2";
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+
+        // Quiescent: the membership has not moved for longer than the join
+        // window, and no assignment exists for this generation.
+        let generation_id = forming_group_of_two(
+            &storage,
+            GROUP_ID,
+            LEADER,
+            FOLLOWER,
+            JOIN_QUIESCENCE + Duration::from_secs(1),
+        )
+        .await?;
+
+        let started = Instant::now();
+
+        let join = join_group(
+            &controller,
+            GROUP_ID,
+            FOLLOWER,
+            &encode_subscription(&["t"], None),
+        )
+        .await?;
+
+        assert_eq!(i16::from(ErrorCode::None), join.error_code);
+        assert_eq!(generation_id, join.generation_id);
+        assert_eq!(LEADER, join.leader, "the follower is told who leads");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(SESSION_TIMEOUT_MS as u64 / 2),
+            "a follower whose group has settled must not wait out the cap, waited {:?}",
+            started.elapsed()
+        );
+
+        Ok(())
+    }
+
+    /// The other half: released early, a follower waits for the assignment in
+    /// `sync` instead of being bounced (#498).
+    ///
+    /// Without this the early release would hand the member a
+    /// `RebalanceInProgress` instead of a wait, and join -> bounce -> re-join
+    /// would spin where it used to park.
+    #[tokio::test(start_paused = true)]
+    async fn a_follower_waits_in_sync_for_its_leader_to_assign() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "awaiting-leader";
+        const LEADER: &str = "m-1";
+        const FOLLOWER: &str = "m-2";
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+
+        let generation_id = forming_group_of_two(
+            &storage,
+            GROUP_ID,
+            LEADER,
+            FOLLOWER,
+            JOIN_QUIESCENCE + Duration::from_secs(1),
+        )
+        .await?;
+
+        // The follower syncs first, while there is nothing to give it.
+        let follower = {
+            let controller = controller.clone();
+
+            async move { sync_group(&controller, GROUP_ID, generation_id, FOLLOWER, &[]).await }
+        };
+
+        // The leader assigns a moment later, well inside the follower's wait.
+        let leader = {
+            let controller = controller.clone();
+
+            async move {
+                sleep(Duration::from_millis(250)).await;
+
+                sync_group(
+                    &controller,
+                    GROUP_ID,
+                    generation_id,
+                    LEADER,
+                    &[assignment_of(LEADER), assignment_of(FOLLOWER)],
+                )
+                .await
+            }
+        };
+
+        let (follower, leader) = tokio::join!(follower, leader);
+        let (follower, leader) = (follower?, leader?);
+
+        assert_eq!(i16::from(ErrorCode::None), leader.error_code);
+
+        assert_eq!(
+            i16::from(ErrorCode::None),
+            follower.error_code,
+            "a follower that waited must be given the assignment, not told to re-join"
+        );
+        assert_eq!(
+            Bytes::from(format!("assignment-{FOLLOWER}")),
+            follower.assignment,
+            "and it must be its own assignment"
+        );
+
+        Ok(())
+    }
+
+    /// A wait that is not satisfied still ends: the leader never assigns, and
+    /// the follower is told to re-join rather than held (#498).
+    #[tokio::test(start_paused = true)]
+    async fn a_follower_whose_leader_never_assigns_is_told_to_rejoin() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "leaderless-assignment";
+        const LEADER: &str = "m-1";
+        const FOLLOWER: &str = "m-2";
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+
+        let generation_id = forming_group_of_two(
+            &storage,
+            GROUP_ID,
+            LEADER,
+            FOLLOWER,
+            JOIN_QUIESCENCE + Duration::from_secs(1),
+        )
+        .await?;
+
+        let started = Instant::now();
+
+        let sync = sync_group(&controller, GROUP_ID, generation_id, FOLLOWER, &[]).await?;
+
+        assert_eq!(
+            i16::from(ErrorCode::RebalanceInProgress),
+            sync.error_code,
+            "the wait ends in the answer it would have given at once"
+        );
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(SYNC_ASSIGNMENT_WAIT_MS as u64),
+            "and only after waiting for the assignment, waited {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(SESSION_TIMEOUT_MS as u64),
+            "well inside the session it must not spend, waited {:?}",
+            started.elapsed()
+        );
 
         Ok(())
     }
