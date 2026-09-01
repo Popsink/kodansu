@@ -47,10 +47,9 @@ use tansu_sans_io::{
     produce_request::{PartitionProduceData, TopicProduceData},
     record::{Record, deflated, inflated},
 };
-use tansu_service::FrameBytesLayer;
+use tansu_service::{FrameBytesLayer, TcpContext};
 use tansu_storage::{Storage, StorageContainer};
 use tokio::{net::TcpListener, time::timeout};
-use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
@@ -166,11 +165,10 @@ async fn serve_broker_stack() -> Result<(u16, Arc<Box<dyn Storage>>)> {
             };
 
             let Ok(service) = services(
-                "tansu-441",
+                TcpContext::default().cluster_id(Some("tansu-441".into())),
                 coordinator,
                 served.clone(),
                 None,
-                CancellationToken::new(),
                 None,
                 None,
             ) else {

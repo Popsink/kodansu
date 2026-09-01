@@ -64,6 +64,14 @@ impl From<CancelKind> for Duration {
 
 pub const NODE_ID: i32 = 111;
 
+/// The default cap on a request frame, Kafka's `socket.request.max.bytes`
+/// (#477).
+///
+/// Re-exported from the service layer that enforces it so the CLI can name the
+/// default without depending on `tansu-service`, the same way it names
+/// [`NODE_ID`].
+pub const SOCKET_REQUEST_MAX_BYTES: usize = tansu_service::TcpContext::MAXIMUM_FRAME_SIZE;
+
 pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {
     global::meter_with_scope(
         InstrumentationScope::builder(env!("CARGO_PKG_NAME"))

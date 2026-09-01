@@ -40,13 +40,13 @@ use tansu_sans_io::{
     produce_request::{PartitionProduceData, TopicProduceData},
     record::{Record, deflated, inflated},
 };
+use tansu_service::TcpContext;
 use tansu_storage::{Storage, StorageContainer};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     time::timeout,
 };
-use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
@@ -93,11 +93,10 @@ async fn serve_broker_stack() -> Result<u16> {
             };
 
             let Ok(service) = services(
-                "tansu-440",
+                TcpContext::default().cluster_id(Some("tansu-440".into())),
                 coordinator,
                 storage.clone(),
                 None,
-                CancellationToken::new(),
                 None,
                 None,
             ) else {
