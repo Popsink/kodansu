@@ -300,13 +300,28 @@ enum LongPoll {
 
 /// `join`'s long-poll decision (see [`LongPoll`]).
 ///
-/// A static member is paused out to [`PAUSE_MS`] so its rejoin does not spin.
-/// The leader of a still-`Forming` group is then held by the join-window
-/// barrier until membership is quiescent or the rebalance window closes, so it
-/// assigns over the complete member list. Any member with something to act on —
-/// leader, assigned, or told to retry under a broker-issued member id — is
-/// answered immediately; anyone else waits up to **half** its session timeout
-/// and is then answered anyway.
+/// Any member with something to act on — told to retry under a broker-issued
+/// member id, leader, or assigned — is answered immediately, and the leader of
+/// a still-`Forming` group is first held by the join-window barrier until
+/// membership is quiescent or the rebalance window closes, so it assigns over
+/// the complete member list. Anyone else — a member with nothing to act on,
+/// whose next move is therefore to ask again — is damped: a static member out
+/// to [`PAUSE_MS`] so its rejoin does not spin, then up to **half** its session
+/// timeout, and is answered anyway at the end of it.
+///
+/// **The fast paths come first, and the pause after** (#498). The pause used to
+/// be the first question asked, so a static member paid it even when the answer
+/// was already waiting for it — 3 s on a leader that had a member list to
+/// assign over, and 3 s on a member the assignment already named. Measured on
+/// the production fleet, where every member carries a `group.instance.id`, that
+/// was **one full pause on every join and every sync**: ~3 s of a 10.6 s
+/// `JoinGroup` mean directly, and another ~3 s indirectly, because a follower
+/// waits for the assignment document and the leader's own response was held for
+/// the same 3 s before it could go and write one.
+///
+/// What the pause was written for (#486) is unaffected: it damps a rejoin that
+/// would otherwise spin, and a member that is leader or assigned has been given
+/// something to do rather than a reason to ask again.
 fn join_long_poll(
     updated: &GroupView,
     body: &Body,
@@ -322,17 +337,22 @@ fn join_long_poll(
     let is_ok = updated.is_ok(body);
     let session_timeout_ms = updated.session_timeout_ms() as u128;
 
-    let decision = if group_instance_id.is_some() && elapsed_ms < PAUSE_MS {
-        LongPoll::Wait(
-            Duration::from_millis(PAUSE_MS.saturating_sub(elapsed_ms) as u64),
-            "join_group_instance_pause",
-        )
+    let decision = if is_member_id_required {
+        // KIP-394: the group was left untouched, so there is nothing to damp
+        // and nothing to wait for. The member registers on the join that
+        // follows, and that one takes the branches below.
+        LongPoll::Respond(None)
     } else if is_leader && is_forming && !membership_quiescent && elapsed_ms < join_window_ms {
         LongPoll::Wait(Duration::from_secs(1), "join_window_hold")
-    } else if is_leader || is_assigned || is_member_id_required {
+    } else if is_leader || is_assigned {
         LongPoll::Respond(None)
+    } else if group_instance_id.is_some() && elapsed_ms < PAUSE_MS {
+        LongPoll::Wait(
+            Duration::from_millis(PAUSE_MS.saturating_sub(elapsed_ms) as u64),
+            "join_static_pause",
+        )
     } else if elapsed_ms < session_timeout_ms.div(2) {
-        LongPoll::Wait(Duration::from_secs(1), "join_group_instance_pause")
+        LongPoll::Wait(Duration::from_secs(1), "join_settle_wait")
     } else {
         LongPoll::Respond(None)
     };
@@ -355,13 +375,20 @@ fn join_long_poll(
 
 /// `sync`'s long-poll decision (see [`LongPoll`]).
 ///
-/// The same static-member pause as [`join_long_poll`]. A member is answered as
-/// soon as the group has fallen back to `Forming` (a fresh rebalance to follow)
-/// or its assignment has arrived. Otherwise it waits up to **eight tenths** of
-/// its session timeout — longer than `join`'s half, because a sync is waiting
-/// on the leader's single assignment write — and is then terminated with
-/// `RebalanceInProgress`, so the client rejoins instead of settling on an empty
-/// assignment.
+/// A member is answered as soon as its assignment has arrived, or the group has
+/// fallen back to `Forming` (a fresh rebalance to follow). Otherwise it waits up
+/// to **eight tenths** of its session timeout — longer than `join`'s half,
+/// because a sync is waiting on the leader's single assignment write — and is
+/// then terminated with `RebalanceInProgress`, so the client rejoins instead of
+/// settling on an empty assignment.
+///
+/// The static-member pause of [`join_long_poll`], and, as there, **after the
+/// answers rather than before them** (#498). This is the path it cost the most
+/// on: the leader's assignment is written on the first iteration, so the pause
+/// delayed no writing — only the leader's own return to consuming, and the
+/// `RebalanceInProgress` that tells a member to go and rejoin. Both were held 3 s
+/// for a spin the member was not going to make. What still reaches the pause is
+/// the member with nothing to act on, which is what it was written to damp.
 fn sync_long_poll(
     updated: &GroupView,
     body: &Body,
@@ -373,15 +400,15 @@ fn sync_long_poll(
     let is_ok = updated.is_ok(body);
     let session_timeout_ms = updated.session_timeout_ms() as u128;
 
-    let decision = if group_instance_id.is_some() && elapsed_ms < PAUSE_MS {
+    let decision = if is_forming || is_assigned {
+        LongPoll::Respond(None)
+    } else if group_instance_id.is_some() && elapsed_ms < PAUSE_MS {
         LongPoll::Wait(
             Duration::from_millis(PAUSE_MS.saturating_sub(elapsed_ms) as u64),
-            "sync_group_instance_pause",
+            "sync_static_pause",
         )
-    } else if is_forming || is_assigned {
-        LongPoll::Respond(None)
     } else if elapsed_ms < session_timeout_ms.mul(8).div(10) {
-        LongPoll::Wait(Duration::from_secs(1), "sync_group_instance_pause")
+        LongPoll::Wait(Duration::from_secs(1), "sync_settle_wait")
     } else {
         LongPoll::Respond(Some(ErrorCode::RebalanceInProgress))
     };
@@ -2896,6 +2923,65 @@ mod tests {
         }
     }
 
+    /// [`join_group`] for a member that carries a `group.instance.id`.
+    async fn join_group_static<O>(
+        controller: &Controller<O>,
+        group_id: &str,
+        member_id: &str,
+        group_instance_id: &str,
+        metadata: &Bytes,
+    ) -> Result<JoinGroupResponse>
+    where
+        O: Storage + Clone,
+    {
+        match controller
+            .join(
+                Some(CLIENT_ID),
+                group_id,
+                SESSION_TIMEOUT_MS,
+                REBALANCE_TIMEOUT_MS,
+                member_id,
+                Some(group_instance_id),
+                CONSUMER,
+                Some(&protocols(metadata)[..]),
+                None,
+            )
+            .await?
+        {
+            Body::JoinGroupResponse(join) => Ok(join),
+            otherwise => panic!("{otherwise:?}"),
+        }
+    }
+
+    /// [`sync_group`] for a member that carries a `group.instance.id`.
+    async fn sync_group_static<O>(
+        controller: &Controller<O>,
+        group_id: &str,
+        generation_id: i32,
+        member_id: &str,
+        group_instance_id: &str,
+        assignments: &[SyncGroupRequestAssignment],
+    ) -> Result<SyncGroupResponse>
+    where
+        O: Storage + Clone,
+    {
+        match controller
+            .sync(
+                group_id,
+                generation_id,
+                member_id,
+                Some(group_instance_id),
+                Some(CONSUMER),
+                Some(RANGE),
+                Some(assignments),
+            )
+            .await?
+        {
+            Body::SyncGroupResponse(sync) => Ok(sync),
+            otherwise => panic!("{otherwise:?}"),
+        }
+    }
+
     /// The KIP-394 dance, as far as a registered member: mint an id, then join
     /// with it.
     async fn register<O>(
@@ -4542,6 +4628,94 @@ mod tests {
 
         assert_eq!(i16::from(ErrorCode::None), join.error_code);
         assert_eq!(LEADER, join.leader);
+
+        Ok(())
+    }
+
+    /// The rejoin pause damps a member with nothing to do, not one that is
+    /// already being answered (#498).
+    ///
+    /// Every member on the production fleet carries a `group.instance.id`, and
+    /// the pause was the first question `join_long_poll` and `sync_long_poll`
+    /// asked — so a settled member paid a full 3 s on every join *and* every
+    /// sync, for a spin it was never going to make. It cost twice over: once on
+    /// the member's own request, and again on every follower, because the
+    /// leader's answer was held for the same 3 s before it could go and write
+    /// the assignment they were all waiting for.
+    ///
+    /// On `tokio`'s paused clock, so what is asserted is the wait itself and
+    /// not how fast the machine is.
+    #[tokio::test(start_paused = true)]
+    async fn a_settled_static_member_is_answered_without_its_rejoin_pause() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "static-group";
+        const INSTANCE_ID: &str = "i-1";
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+        let metadata = encode_subscription(&["t"], None);
+
+        // Forming the group is allowed to take the join window: the barrier is
+        // what makes a leader assign over the complete member list.
+        let join = join_group_static(&controller, GROUP_ID, "", INSTANCE_ID, &metadata).await?;
+        assert_eq!(i16::from(ErrorCode::None), join.error_code);
+
+        let member_id = join.member_id.clone();
+        assert_eq!(member_id, join.leader, "the first member leads");
+
+        let settled = Instant::now();
+
+        let sync = sync_group_static(
+            &controller,
+            GROUP_ID,
+            join.generation_id,
+            &member_id,
+            INSTANCE_ID,
+            &[assignment_of(&member_id)],
+        )
+        .await?;
+
+        assert_eq!(i16::from(ErrorCode::None), sync.error_code);
+        assert!(!sync.assignment.is_empty());
+
+        // The leader's assignment is written on the first iteration, so the
+        // pause delayed nothing but the leader's own return to consuming.
+        assert!(
+            settled.elapsed() < Duration::from_millis(PAUSE_MS as u64),
+            "a leader whose assignment is written must not wait out the rejoin pause, \
+             waited {:?}",
+            settled.elapsed()
+        );
+
+        // The settled member polls again: re-join, re-sync. Both answers are
+        // already waiting for it — the assignment names it — so neither may
+        // pause.
+        let polled = Instant::now();
+
+        let join =
+            join_group_static(&controller, GROUP_ID, &member_id, INSTANCE_ID, &metadata).await?;
+        assert_eq!(i16::from(ErrorCode::None), join.error_code);
+
+        let sync = sync_group_static(
+            &controller,
+            GROUP_ID,
+            join.generation_id,
+            &member_id,
+            INSTANCE_ID,
+            &[assignment_of(&member_id)],
+        )
+        .await?;
+
+        assert_eq!(i16::from(ErrorCode::None), sync.error_code);
+        assert!(!sync.assignment.is_empty());
+
+        assert!(
+            polled.elapsed() < Duration::from_millis(PAUSE_MS as u64),
+            "a settled member's whole poll must cost less than one rejoin pause, \
+             took {:?}",
+            polled.elapsed()
+        );
 
         Ok(())
     }
