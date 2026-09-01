@@ -246,6 +246,29 @@ const LIVENESS_STAMP_TTL: Duration = Duration::from_hours(1);
 /// the one least likely to prove anything.
 const LIVENESS_STAMPS_HELD: usize = 16_384;
 
+/// How long a sweep attempt is remembered (#490).
+///
+/// A memory bound rather than a correctness one: the window an entry
+/// suppresses is the group's `session/2`, so nothing is decided from one older
+/// than that, and this is simply above the session timeouts a Kafka client may
+/// ask for. An entry that expires early costs one claim attempt, which is what
+/// every request used to cost.
+const SWEEP_ATTEMPT_TTL: Duration = Duration::from_hours(1);
+
+/// Groups whose sweep attempt this replica remembers at once (#490).
+///
+/// One `i64` under a group id, and unlike the liveness stamps the key does not
+/// churn — a group id is an operator's name for a workload, not a per-session
+/// uuid — so this bounds the number of *groups* a replica serves in an hour.
+const SWEEP_ATTEMPTS_HELD: usize = 4_096;
+
+/// The memo behind [`Controller::sweep_attempts`] (#490).
+fn sweep_attempts() -> ExpiringSizedCache<String, i64> {
+    let mut attempts = ExpiringSizedCache::new(SWEEP_ATTEMPT_TTL);
+    _ = attempts.size_limit(SWEEP_ATTEMPTS_HELD);
+    attempts
+}
+
 /// The memo behind [`Controller::liveness_stamps`].
 ///
 /// Keyed by the pair rather than by a joined string: both halves are
@@ -692,8 +715,8 @@ pub struct Controller<O> {
     storage: O,
 
     /// Which groups this replica has already logged a stalled rebalance for
-    /// (#240) — the one thing in this struct keyed by a group id, and the
-    /// reason it is a self-expiring cache rather than a map.
+    /// (#240) — a self-expiring cache rather than a map, for the same reason
+    /// as every other memo here.
     ///
     /// Only the *dedup* is in memory. When the episode started is
     /// `GenerationDoc::state_since_ms`, persisted with the group, so a restart
@@ -737,6 +760,21 @@ pub struct Controller<O> {
     /// done — a cold process, a restart or an evicted entry reads exactly as
     /// before.
     liveness_stamps: Arc<Mutex<ExpiringSizedCache<(String, String), i64>>>,
+
+    /// When this replica last tried to claim each group's sweep (#490).
+    ///
+    /// `swept_at_ms` in the store deduplicates sweeps *between* replicas. This
+    /// deduplicates them between the concurrent requests *of one* replica,
+    /// which nothing did: with 320 members heartbeating at ~107/s against a
+    /// group, every request that arrived while a sweep was in flight read the
+    /// stamp the running sweep had not written yet and started its own fan-out
+    /// over all 320 member documents.
+    ///
+    /// Like the stall memo it expires rather than being swept, so it is not
+    /// state a replica has to be kept alive to maintain (#360), and like the
+    /// liveness stamps it can only ever *suppress* work this replica would have
+    /// done.
+    sweep_attempts: Arc<Mutex<ExpiringSizedCache<String, i64>>>,
 
     /// Cancelled when this process has been asked to stop (#361).
     ///
@@ -789,6 +827,7 @@ where
                 REBALANCE_STALL_REPORT_EVERY,
             ))),
             liveness_stamps: Arc::new(Mutex::new(liveness_stamps())),
+            sweep_attempts: Arc::new(Mutex::new(sweep_attempts())),
             cancellation: CancellationToken::new(),
             now: SystemTime::now,
         })
@@ -1069,12 +1108,70 @@ where
         }
     }
 
+    /// Whether this request is the one that goes on to claim `group_id`'s
+    /// sweep on this replica (#490).
+    ///
+    /// Purely a suppressor: it stops this replica repeating an attempt it has
+    /// already made inside the same window, and can therefore only ever remove
+    /// work — a cold process, a restart or an evicted entry behaves exactly as
+    /// one with no memo. The window is the group's own `session/2`, the cadence
+    /// the sweep runs on, so a replica makes **one** claim attempt per group
+    /// per window however many requests it is serving concurrently.
+    ///
+    /// Recorded whether or not the claim goes on to win, because losing it
+    /// means another replica has just swept — which is precisely the case for
+    /// not trying again this window. Check and record are one critical section:
+    /// two heartbeats arriving together must not both come away believing they
+    /// are the one attempt.
+    fn claim_sweep_locally(&self, group_id: &str, now_ms: i64, window_ms: i64) -> bool {
+        let Ok(mut attempts) = self.sweep_attempts.lock() else {
+            // A poisoned memo suppresses nothing: `swept_at_ms` in the store is
+            // still the authority, so this degrades to the behaviour of a
+            // replica that has no memo at all.
+            return true;
+        };
+
+        if attempts
+            .get(&group_id.to_owned())
+            .is_some_and(|attempted_ms| now_ms.saturating_sub(*attempted_ms) < window_ms)
+        {
+            return false;
+        }
+
+        _ = attempts.insert_evict(group_id.to_owned(), now_ms, true);
+
+        true
+    }
+
     /// The dead-member sweep, which replaces `missed_heartbeat` (#359).
     ///
-    /// Every join, sync and heartbeat runs this, and it does something only when
-    /// the group's own `swept_at_ms` says the last sweep was more than
-    /// session/2 ago — so N replicas serving a group cost **one** sweep per
-    /// group per session/2 between them, not one each.
+    /// Every join, sync and heartbeat asks for one, and it does something only
+    /// when the group's own `swept_at_ms` says the last sweep was more than
+    /// session/2 ago — so a group costs **one** sweep per session/2 across the
+    /// fleet: not one per replica, and above all not one per request.
+    ///
+    /// That last clause is the whole of #490, and it did not hold. `swept_at_ms`
+    /// was stamped by the CAS that *ended* a sweep, so it suppressed nothing
+    /// while one was running: every request arriving in the meantime read the
+    /// same stale stamp and started its own fan-out over the group's members.
+    /// On the production fleet — one tenant with 320 members in a group, ~107
+    /// heartbeats/s against it, ~20 object-store requests in flight per replica
+    /// — the stamp stayed stale for as long as a fan-out took, and every
+    /// request landing in that window demanded another N GETs. Group
+    /// bookkeeping was **66% of the fleet's object-store operations and 76% of
+    /// its in-flight time**, at ~12 member GETs per heartbeat; the 138 GET/s
+    /// measured was the store's ceiling rather than the demand, which is why
+    /// every class of request, group or not, averaged around a second and a
+    /// heartbeat averaged 3.1s.
+    ///
+    /// So the stamp is written **before** the reads. A sweep is *claimed* by
+    /// the CAS that advances `swept_at_ms`, and only the replica that wins that
+    /// CAS reads a member document. A claimer that dies mid-sweep costs one
+    /// skipped window — anyone lapsed is reclaimed at the next one — where the
+    /// alternative was every request in the fleet re-running the fan-out.
+    /// [`Self::claim_sweep_locally`] is the same guard one step earlier, so
+    /// that the concurrent requests of a single replica cost one claim attempt
+    /// between them rather than one each.
     ///
     /// The verdict is a pure function of the member documents and the clock
     /// ([`MemberDoc::is_expired`]), which is what makes racing replicas safe:
@@ -1084,8 +1181,10 @@ where
     /// expired — the document is written before the generation admits the
     /// member, so its absence cannot be a member that has not arrived yet.
     ///
-    /// Returns the group as it now stands when it wrote, so the caller
-    /// continues against the state it produced rather than the one it read.
+    /// Returns the group as it now stands when it wrote — composed from what it
+    /// wrote rather than read back, since a CAS that succeeded says exactly
+    /// what the object holds — so the caller continues against the state this
+    /// produced rather than the one it started from.
     async fn sweep(
         &self,
         group_id: &str,
@@ -1103,6 +1202,51 @@ where
             return Ok(None);
         }
 
+        if !self.claim_sweep_locally(group_id, now_ms, due_after) {
+            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sweep_deduped")]);
+            return Ok(None);
+        }
+
+        // The claim (#490): `swept_at_ms` is advanced **before** a single
+        // member document is read, so every other request — on this replica or
+        // any other — sees a sweep that has already happened and skips. Only
+        // the winner of this CAS fans out.
+        let claimed = GenerationDoc {
+            swept_at_ms: now_ms,
+            ..view.generation.clone()
+        }
+        .bumped();
+
+        let version = match self
+            .storage
+            .update_group_generation(group_id, claimed.clone(), view.version.clone())
+            .await
+        {
+            Ok(version) => version,
+
+            // Another replica claimed this window, or the group moved. Either
+            // way there is nothing here to sweep; the caller continues against
+            // whatever won.
+            Err(UpdateError::Outdated { .. } | UpdateError::Vanished) => {
+                COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sweep_claim_lost")]);
+                return self.read_view(group_id).await.map(Some);
+            }
+
+            Err(error) => return Err(update_error(error)),
+        };
+
+        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sweep_claimed")]);
+
+        // The group as this claim left it — composed from what was written
+        // rather than read back, because a CAS that succeeded says exactly what
+        // the object now holds. Only the sweep stamp moved, so the assignment
+        // this generation had is still the one it has.
+        let claimed = GroupView {
+            generation: claimed,
+            version: Some(version),
+            assignment: view.assignment.clone(),
+        };
+
         // From the generation's member set, never a LIST: the set is
         // authoritative, and listing would put one on the request path.
         //
@@ -1114,7 +1258,7 @@ where
         // (#431) — is expired *however fresh its last stamp was*, and only the
         // read finds that. So the sweep reads, and what it learns feeds the memo
         // rather than the other way round.
-        let expired = futures::stream::iter(view.generation.members.keys().cloned().map(
+        let expired = futures::stream::iter(claimed.generation.members.keys().cloned().map(
             |member_id| async move {
                 let held = self
                     .storage
@@ -1150,49 +1294,52 @@ where
         .collect::<BTreeMap<_, _>>()
         .await;
 
-        let mut next = view.generation.clone();
-        next.swept_at_ms = now_ms;
-
-        if !expired.is_empty() {
-            for (member_id, age_ms) in &expired {
-                _ = next.members.remove(member_id);
-
-                match age_ms {
-                    Some(age_ms) => {
-                        MEMBERS_EVICTED.add(1, &[KeyValue::new("reason", "lapsed")]);
-                        MEMBER_EVICTION_AGE.record(u64::try_from(*age_ms).unwrap_or_default(), &[]);
-                    }
-
-                    None => MEMBERS_EVICTED.add(1, &[KeyValue::new("reason", "no_document")]),
-                }
-            }
-
-            // A membership change is a rebalance, and the leader is re-elected
-            // by the first member to join: the same rule that heals an orphan,
-            // rather than a second one that has to agree with it.
-            next = GroupView::rebalanced(next, now_ms);
-            next.leader = None;
-
-            // The ages go in the line, not just the ids (#488): liveness is
-            // persisted once per `session/2`, so an eviction at an age of barely
-            // one session is one where the member may have been quiet for only
-            // half of it, and an operator reading "evicted" cannot tell the two
-            // apart without the number.
-            info!(
-                group_id,
-                generation_id = next.generation_id,
-                evicted = ?expired,
-                session_timeout_ms = view.session_timeout_ms(),
-                "evicting members whose sessions lapsed",
-            );
+        if expired.is_empty() {
+            return Ok(Some(claimed));
         }
+
+        let mut next = claimed.generation.clone();
+
+        for (member_id, age_ms) in &expired {
+            _ = next.members.remove(member_id);
+
+            match age_ms {
+                Some(age_ms) => {
+                    MEMBERS_EVICTED.add(1, &[KeyValue::new("reason", "lapsed")]);
+                    MEMBER_EVICTION_AGE.record(u64::try_from(*age_ms).unwrap_or_default(), &[]);
+                }
+
+                None => MEMBERS_EVICTED.add(1, &[KeyValue::new("reason", "no_document")]),
+            }
+        }
+
+        // A membership change is a rebalance, and the leader is re-elected
+        // by the first member to join: the same rule that heals an orphan,
+        // rather than a second one that has to agree with it.
+        let mut next = GroupView::rebalanced(next, now_ms);
+        next.leader = None;
+
+        // The ages go in the line, not just the ids (#488): liveness is
+        // persisted once per `session/2`, so an eviction at an age of barely
+        // one session is one where the member may have been quiet for only
+        // half of it, and an operator reading "evicted" cannot tell the two
+        // apart without the number.
+        info!(
+            group_id,
+            generation_id = next.generation_id,
+            evicted = ?expired,
+            session_timeout_ms = claimed.session_timeout_ms(),
+            "evicting members whose sessions lapsed",
+        );
+
+        let next = next.bumped();
 
         match self
             .storage
-            .update_group_generation(group_id, next.bumped(), view.version.clone())
+            .update_group_generation(group_id, next.clone(), claimed.version.clone())
             .await
         {
-            Ok(_) => {
+            Ok(version) => {
                 // Best-effort: an orphaned document is harmless, since the
                 // generation's member set is what is authoritative — and it is
                 // reclaimed by maintenance either way (#486).
@@ -1203,18 +1350,28 @@ where
                         .await
                         .inspect_err(|error| debug!(?error, group_id, member_id));
                 }
+
+                Ok(Some(GroupView {
+                    generation: next,
+                    version: Some(version),
+                    // The eviction moved the generation on, and
+                    // `assignment/{generation}` is create-only: this generation
+                    // cannot have one yet.
+                    assignment: None,
+                }))
             }
 
-            // Another replica swept first, or the group moved. Either way its
-            // verdict was computed from the same documents as ours — and a
-            // generation document that has gone entirely says the same thing
-            // more loudly (#431).
-            Err(UpdateError::Outdated { .. } | UpdateError::Vanished) => (),
+            // Membership changed between the claim and here — a join, a leave,
+            // or the group going entirely (#431). The eviction is not replayed
+            // onto a generation it was not computed against: the next window
+            // reaches the same verdict about anyone still lapsed.
+            Err(UpdateError::Outdated { .. } | UpdateError::Vanished) => {
+                COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sweep_eviction_lost")]);
+                self.read_view(group_id).await.map(Some)
+            }
 
-            Err(error) => return Err(update_error(error)),
+            Err(error) => Err(update_error(error)),
         }
-
-        self.read_view(group_id).await.map(Some)
     }
 
     /// The member list a leader's `JoinGroup` response carries.
@@ -4445,6 +4602,106 @@ mod tests {
         Ok(())
     }
 
+    /// A group costs one sweep per window however many requests are in flight
+    /// (#490).
+    ///
+    /// [`a_sweep_is_deduped_across_replicas`] pins the *sequential* case, which
+    /// held: a replica that reads `swept_at_ms` after another replica has
+    /// finished sweeping does nothing. The case that did not hold is this one —
+    /// requests that overlap the sweep itself. The stamp was written by the CAS
+    /// that *ended* a sweep, so while one ran it suppressed nothing, and every
+    /// heartbeat, join and sync arriving in the meantime read the same stale
+    /// stamp and started its own fan-out over every member document of the
+    /// group.
+    ///
+    /// On the production fleet that is ~107 heartbeats/s against a 320-member
+    /// group, each demanding 320 GETs: `group_*` was 66% of the fleet's
+    /// object-store operations and 76% of its in-flight time, at ~12 member
+    /// GETs per heartbeat, and a heartbeat averaged 3.1s because it was queued
+    /// behind them.
+    ///
+    /// So the assertion is a count, not a behaviour: `MEMBERS` reads for the one
+    /// fan-out and one renewal each, whatever the concurrency. Without the
+    /// claim it is one fan-out *per concurrent request*.
+    #[tokio::test(start_paused = true)]
+    async fn a_sweep_is_one_fan_out_however_many_requests_overlap_it() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "stampeding-group";
+        const MEMBERS: usize = 6;
+        const REPLICAS: usize = 2;
+
+        // Enough latency that the requests genuinely overlap: with none, each
+        // task runs to completion before the next is polled and the sweep is
+        // never concurrent with anything, which is the one thing being tested.
+        let storage = counted_storage().await?.with_latency(5..10);
+        let member_reads = storage.member_reads_handle();
+        let generation_updates = storage.generation_updates_handle();
+
+        let replicas = (0..REPLICAS)
+            .map(|_| Controller::with_storage(storage.clone()).map(|c| c.with_now(paused_clock)))
+            .collect::<Result<Vec<_>>>()?;
+
+        let joining = (0..MEMBERS)
+            .map(|index| {
+                let controller = replicas[index % REPLICAS].clone();
+                tokio::spawn(async move { drive_member(controller, GROUP_ID, index).await })
+            })
+            .collect::<Vec<_>>();
+
+        let mut members = Vec::new();
+
+        for handle in joining {
+            let (member_id, assignment) = handle.await.expect("member task panicked")?;
+            assert!(!assignment.is_empty());
+            members.push(member_id);
+        }
+
+        let generation_id = generation_of(&storage, GROUP_ID).await?.generation_id;
+
+        // Past the sweep interval, with nobody to evict: every member is live,
+        // so what this counts is the cost of finding that out.
+        advance(Duration::from_millis(SESSION_TIMEOUT_MS as u64 / 2 + 1)).await;
+
+        let reads = member_reads.load(std::sync::atomic::Ordering::Relaxed);
+        let updates = generation_updates.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Every member heartbeats at once, which is what a group does: they all
+        // read the same stale sweep stamp before any of them can write one.
+        let beating = members
+            .iter()
+            .enumerate()
+            .map(|(index, member_id)| {
+                let controller = replicas[index % REPLICAS].clone();
+                let member_id = member_id.clone();
+
+                tokio::spawn(async move {
+                    heartbeat(&controller, GROUP_ID, generation_id, &member_id).await
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for handle in beating {
+            let beat = handle.await.expect("heartbeat task panicked")?;
+            assert_eq!(i16::from(ErrorCode::None), beat.error_code);
+        }
+
+        assert_eq!(
+            reads + (2 * MEMBERS) as u64,
+            member_reads.load(std::sync::atomic::Ordering::Relaxed),
+            "one fan-out over {MEMBERS} members, and one renewal each: \
+             an unclaimed sweep costs a fan-out per overlapping request"
+        );
+
+        assert!(
+            generation_updates.load(std::sync::atomic::Ordering::Relaxed) - updates
+                <= REPLICAS as u64,
+            "at most one claim attempt per replica, not one per in-flight request"
+        );
+
+        Ok(())
+    }
+
     /// Kafka's fencing rules on the commit path (#359), which this broker did
     /// not apply at all: a commit claiming a generation the group has left, or
     /// naming a member the group does not know, is a zombie and must be
@@ -4766,12 +5023,17 @@ mod tests {
 
             _ = leave_group(&controller, &group_id, &member_id).await?;
 
-            // The stall memo is the only map, and only a group observed
-            // mid-rebalance past its threshold ever enters it. None of these
-            // did.
+            // Only a group observed mid-rebalance past its threshold enters
+            // the stall memo, and only one whose sweep came due enters the
+            // sweep memo (#490). None of these did either.
             assert_eq!(
                 0,
                 controller.rebalance_stalls.lock().unwrap().len(),
+                "round {round}",
+            );
+            assert_eq!(
+                0,
+                controller.sweep_attempts.lock().unwrap().len(),
                 "round {round}",
             );
         }
