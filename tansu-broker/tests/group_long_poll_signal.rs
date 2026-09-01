@@ -50,7 +50,11 @@ use uuid::Uuid;
 
 mod common;
 
-const SESSION_TIMEOUT_MS: i32 = 45_000;
+/// Short, because a follower now waits **half its session** for the leader's
+/// assignment (#498) and this test drives that wait on a real clock — the
+/// metric reader exports on a timer of its own, which `tokio`'s paused clock
+/// never reaches. Kafka's own floor for a session timeout is 6s.
+const SESSION_TIMEOUT_MS: i32 = 6_000;
 const REBALANCE_TIMEOUT_MS: Option<i32> = Some(300_000);
 const PROTOCOL_TYPE: &str = "consumer";
 const RANGE: &str = "range";

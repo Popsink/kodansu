@@ -122,19 +122,6 @@ use super::{Coordinator, OffsetCommit};
 /// latency and is gone from `join_long_poll`.
 const PAUSE_MS: u128 = 3_000;
 
-/// How long a follower's `SyncGroup` waits for the leader's assignment before it
-/// is told to re-join (#498).
-///
-/// This is where the wait for an assignment belongs, and it is short because it
-/// now can be: `SyncGroup` fell to **456ms** on the production fleet once #499
-/// stopped delaying the leader, so the assignment a follower waits for lands
-/// sub-second in the common case. Deliberately far below the session timeout: a
-/// connection is served strictly sequentially (`tansu-service`'s frame loop) and
-/// the Java client heartbeats over the connection it syncs on, so a parked sync
-/// holds that connection shut — a few seconds is nothing against a 30s
-/// `sessionTimeoutExpired`, and 0.8 × session would not be.
-const SYNC_ASSIGNMENT_WAIT_MS: u128 = 3_000;
-
 /// Join-window barrier: how long the persisted member set must stay unchanged
 /// before a Forming group's leader is released from `Controller::join` with its
 /// (now complete) member list. Kafka holds every JoinGroup — the leader above
@@ -438,7 +425,7 @@ fn join_long_poll(
 ///
 /// A member is answered as soon as its assignment has arrived. A **follower
 /// whose generation is current and whose leader has not written the assignment
-/// yet waits for it** (#498), up to [`SYNC_ASSIGNMENT_WAIT_MS`] — Kafka's
+/// yet waits for it** (#498), up to half its session timeout — Kafka's
 /// `DelayedSync`, and the other half of releasing that member from its join.
 /// Without it, the early release would hand the member a bounce instead of a
 /// wait, and join → bounce → re-join would spin.
@@ -476,7 +463,23 @@ fn sync_long_poll(
 
     let decision = if is_assigned {
         LongPoll::Respond(None)
-    } else if awaiting_leader && elapsed_ms < SYNC_ASSIGNMENT_WAIT_MS {
+    } else if awaiting_leader && elapsed_ms < session_timeout_ms.div(2) {
+        // **Half the session**, which is the budget this wait had before it
+        // moved here (#498). It shipped at a flat 3s, sized against the 456ms
+        // `SyncGroup` mean #499 produced — and that was the wrong quantity to
+        // size it against. What a follower waits for is not a broker round trip
+        // but the **leader's client-side assignor**: a `CooperativeStickyAssignor`
+        // over ~1500 topics and 32 members does not finish in 3s, and the fleet
+        // said so — **45% of syncs still ended `awaiting_leader`**, so the
+        // follower gave up, re-joined, and paid the round trip again.
+        //
+        // The transport bound is what keeps this from going further. A
+        // connection is served strictly sequentially (`tansu-service`'s frame
+        // loop) and the Java client heartbeats over the connection it syncs on,
+        // so a parked sync holds that connection shut against the client's
+        // `sessionTimeoutExpired`. Half the session leaves the other half as
+        // margin for a heartbeat queued behind this wait; `0.8 × session` — what
+        // the settle wait below still allows — would leave a fifth.
         LongPoll::Wait(Duration::from_secs(1), "sync_awaiting_leader")
     } else if is_forming {
         // Either the group moved past this member, or the wait above ran out.
@@ -2915,7 +2918,7 @@ where
             debug!(leader = ?view.leader(), sync_outcome = ?ErrorCode::RebalanceInProgress);
             // The follower that arrived before the leader wrote the assignment.
             // Since #498 this is a *wait* rather than a bounce — the long poll
-            // holds it for [`SYNC_ASSIGNMENT_WAIT_MS`] — and it is only counted
+            // holds it for half the member's session — and it is only counted
             // if that wait runs out.
             return Ok(rebalancing(view, "awaiting_leader"));
         }
@@ -4977,12 +4980,17 @@ mod tests {
             async move { sync_group(&controller, GROUP_ID, generation_id, FOLLOWER, &[]).await }
         };
 
-        // The leader assigns a moment later, well inside the follower's wait.
+        // The leader assigns five seconds later — longer than the flat 3s this
+        // wait first shipped with, and well inside the half-session it has now.
+        // What a follower waits for is the leader's *client-side* assignor, not
+        // a broker round trip, and on the production fleet a
+        // `CooperativeStickyAssignor` over ~1500 topics left **45% of syncs**
+        // ending `awaiting_leader` at three seconds.
         let leader = {
             let controller = controller.clone();
 
             async move {
-                sleep(Duration::from_millis(250)).await;
+                sleep(Duration::from_secs(5)).await;
 
                 sync_group(
                     &controller,
@@ -5047,13 +5055,14 @@ mod tests {
         );
 
         assert!(
-            started.elapsed() >= Duration::from_millis(SYNC_ASSIGNMENT_WAIT_MS as u64),
-            "and only after waiting for the assignment, waited {:?}",
+            started.elapsed() >= Duration::from_millis(SESSION_TIMEOUT_MS as u64 / 2),
+            "and only after waiting half a session for the assignment, waited {:?}",
             started.elapsed()
         );
         assert!(
             started.elapsed() < Duration::from_millis(SESSION_TIMEOUT_MS as u64),
-            "well inside the session it must not spend, waited {:?}",
+            "leaving the other half as margin for a heartbeat queued behind it, \
+             waited {:?}",
             started.elapsed()
         );
 
