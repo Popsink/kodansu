@@ -67,10 +67,14 @@ pub struct LatencyIntroducingStorage<S> {
     ///   without a per-group owner.
     /// - `member_lists`: listings of a group's member documents. The claim is
     ///   that no request path issues one.
+    /// - `member_reads`: reads of a member's own document. Bounded by the same
+    ///   one per member per session/2 as the writes (#406) — for a long time it
+    ///   was not, because the read came *before* the guard that bounds them.
     member_puts: Arc<AtomicU64>,
     generation_updates: Arc<AtomicU64>,
     generation_cas_conflicts: Arc<AtomicU64>,
     member_lists: Arc<AtomicU64>,
+    member_reads: Arc<AtomicU64>,
 }
 
 impl<S> LatencyIntroducingStorage<S>
@@ -86,6 +90,7 @@ where
             generation_updates: Arc::new(AtomicU64::new(0)),
             generation_cas_conflicts: Arc::new(AtomicU64::new(0)),
             member_lists: Arc::new(AtomicU64::new(0)),
+            member_reads: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -110,6 +115,13 @@ where
     /// (#359) — the LIST no request path is supposed to issue.
     pub fn member_lists_handle(&self) -> Arc<AtomicU64> {
         self.member_lists.clone()
+    }
+
+    /// A shared handle to this store's count of member-document reads (#406) —
+    /// the request the renewal guard could not bound until it was consulted
+    /// before the read rather than after it.
+    pub fn member_reads_handle(&self) -> Arc<AtomicU64> {
+        self.member_reads.clone()
     }
 
     pub fn with_seed(self, seed: u64) -> Self {
@@ -257,6 +269,8 @@ where
         member_id: &str,
     ) -> Result<Option<(MemberDoc, Version)>> {
         self.introduce_latency().await?;
+
+        _ = self.member_reads.fetch_add(1, Ordering::Relaxed);
 
         self.storage.read_group_member(group_id, member_id).await
     }
