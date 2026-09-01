@@ -1324,6 +1324,23 @@ fn floor_above_tail(tail: Option<i64>, watermark_floor: i64) -> Option<i64> {
         .map(|tail| watermark_floor - tail)
 }
 
+/// The prefix population a completed listing is entitled to report, or `None`
+/// when it saw too little of the prefix to have one (#399).
+///
+/// The whole subtlety is `whole_prefix == false`. An incremental refresh lists
+/// from a `start_after` cursor, so it returns the handful of segments above the
+/// index's watermark — a number that looks like a healthy prefix whatever the
+/// prefix holds, and one that would overwrite a truthful reading taken minutes
+/// earlier. Reporting nothing leaves the gauge at the last whole listing's
+/// answer, which is stale but true, and `PREFIX_INDEX_RECONCILE_INTERVAL` bounds
+/// how stale.
+///
+/// Pure, so the distinction that matters can be asserted without standing up a
+/// metrics reader.
+fn listed_population(discovered: usize, whole_prefix: bool) -> Option<u64> {
+    whole_prefix.then_some(discovered as u64)
+}
+
 /// High-watermark resolutions where the persisted floor was **above** the
 /// surviving segment tail, on a sub-stream that still holds segments (#290).
 ///
@@ -1378,25 +1395,51 @@ static SERVED_END_CERTIFIED: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
-/// Segments **this replica has indexed** for a prefix after a maintenance tick
-/// (#66) — the signal that tells whether compaction is keeping `S` bounded (a
-/// counter can't).
+/// Segment objects a **whole-prefix listing** returned, by prefix (#66, #399) —
+/// the signal that tells whether compaction is keeping `S` bounded (a counter
+/// can't).
 ///
-/// Carries a `prefix` attribute: without one the last write of a pass won and the
-/// gauge reported an arbitrary prefix rather than the growing one (#284).
+/// Recorded from the listing itself, which is the object store's own answer for
+/// the prefix at that instant, and only when the listing covered the whole
+/// prefix: the cold build and the reconciling pass
+/// ([`DynoStore::PREFIX_INDEX_RECONCILE_INTERVAL`]) both do, an incremental
+/// refresh from a `start_after` cursor sees only the tail and records nothing.
+/// No request is issued for it — the listing was already being walked.
 ///
-/// Read it per replica, not aggregated (#399). It is `PrefixIndex::segments.len()`
-/// — the size of this process's cached footer index — and the incremental refresh
-/// is add-only below the tail, so an entry for a segment a *peer* retired stays
-/// until this replica reads a 404 for it. Four maintainers reported 17 517,
-/// 14 374, 13 932 and 67 for the same prefix at the same instant, and none of
-/// those is the number of objects in the bucket. `max()` over the fleet is the
-/// staleness of the worst index, not a backlog. What makes the gauge converge on
-/// the truth is the drain pruning what it finds gone
-/// ([`CompactRun::Retry`]) rather than stopping on the first of it.
+/// It used to be `PrefixIndex::segments.len()`, this process's cached footer
+/// index, which is a different quantity and was wrong in both directions at
+/// once: against a full bucket listing on 2026-08-28 the busiest prefix read 484
+/// against **826** real objects while the prefix count read 1 256 against **228**,
+/// because each replica indexes only the prefixes it has touched and the
+/// incremental refresh is add-only below the tail. It is the gauge anyone reaches
+/// for to decide whether compaction is healthy, and it filed #399 in one
+/// direction and closed it in the other. What that quantity measures is now
+/// `tansu_prefix_index_entries`, which says so in its name.
+///
+/// Every replica that lists a prefix reports it, so read `max by (prefix)` — the
+/// freshest observation, not an aggregate. Summing across replicas counts the
+/// same objects once per pod, as it always did.
 static SEGMENTS_LIVE: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("tansu_prefix_segments_live")
+        .with_description("segment objects a whole-prefix listing returned, by prefix")
+        .build()
+});
+
+/// Segments **this replica has indexed** for a prefix after a maintenance tick
+/// (#284), against `tansu_prefix_segments_live`'s count of what is really there.
+///
+/// The per-prefix half of `tansu_prefix_index_segments`, and what
+/// `tansu_prefix_segments_live` used to hold. Read it per replica, never
+/// aggregated: the incremental refresh is add-only below the tail, so an entry
+/// for a segment a *peer* retired stays until a reconciling listing drops it, and
+/// four maintainers reported 17 517, 14 374, 13 932 and 67 for the same prefix at
+/// the same instant. The gap to `tansu_prefix_segments_live` on the same prefix
+/// is this replica's index staleness — the thing #408 is about — rather than a
+/// compaction backlog.
+static PREFIX_INDEX_ENTRIES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("tansu_prefix_index_entries")
         .with_description("segments this replica has indexed for a prefix, by prefix")
         .build()
 });
@@ -6075,6 +6118,16 @@ impl DynoStore {
             discovered.push((seq, meta.location, meta.last_modified.timestamp_millis()));
         }
 
+        // What is really under the prefix, from the store's own answer (#399).
+        //
+        // Only a whole-prefix listing may say so — see [`listed_population`].
+        // Costs nothing, the listing was walked anyway, and it is the count the
+        // index-derived gauge could never be: an index holds what a replica has
+        // seen, not what a bucket holds.
+        if let Some(population) = listed_population(discovered.len(), whole_prefix) {
+            SEGMENTS_LIVE.record(population, &[KeyValue::new("prefix", prefix.to_string())]);
+        }
+
         // The whole live set, kept only for the downward pass — a listing that
         // completed, so what it did not return below its own maximum is retired
         // (#408). Collected before the footers are consumed; an incremental
@@ -10313,16 +10366,20 @@ impl DynoStore {
 
         PREFIX_DRAIN_STOPS.add(1, &[KeyValue::new("reason", reason)]);
 
-        // Report the live segment count so runaway `S` is observable even if the
-        // drain can't keep up.
+        // Report what this replica has indexed for the prefix, so runaway `S` is
+        // observable even if the drain can't keep up.
         //
         // Labelled by prefix (#284). Recorded once per prefix per pass with no
         // attributes, last write won, so the gauge showed whichever prefix
         // happened to be drained last — never the one running away, which is the
         // only reason to look at it. Cardinality is tens of prefixes.
+        //
+        // This is the index's size, not the bucket's (#399): what is really under
+        // the prefix is `tansu_prefix_segments_live`, recorded from the listing
+        // that reconciled this index rather than from the index it produced.
         let live: Option<BTreeSet<u64>> = self.prefix_index.lock().ok().and_then(|index| {
             index.get(prefix).map(|entry| {
-                SEGMENTS_LIVE.record(
+                PREFIX_INDEX_ENTRIES.record(
                     entry.segments.len() as u64,
                     &[KeyValue::new("prefix", prefix.to_string())],
                 );
@@ -16000,6 +16057,36 @@ mod throttle_tests {
 
         // The whole budget, at the cap, stays sub-second.
         assert!(64 * cas_conflict_backoff(64) < Duration::from_secs(3));
+    }
+}
+
+#[cfg(test)]
+mod listed_population_tests {
+    use super::listed_population;
+
+    /// The cold build and the reconciling pass both list the whole prefix, so what
+    /// came back *is* the prefix's population — the number #399 asked the gauge for
+    /// and never got.
+    #[test]
+    fn a_whole_prefix_listing_reports_what_it_found() {
+        assert_eq!(Some(826), listed_population(826, true));
+    }
+
+    /// An empty whole-prefix listing is still an answer: a prefix whose segments
+    /// have all been retired holds none, and leaving the last non-zero reading in
+    /// place would show a drained prefix as a backlog for ever.
+    #[test]
+    fn an_empty_whole_prefix_listing_reports_zero() {
+        assert_eq!(Some(0), listed_population(0, true));
+    }
+
+    /// The one that matters: an incremental refresh returns the tail above its
+    /// cursor. Three segments discovered on a prefix holding 826 is not a
+    /// population, and recording it would say compaction is healthy on precisely
+    /// the prefix that is running away.
+    #[test]
+    fn an_incremental_listing_has_no_population_to_report() {
+        assert_eq!(None, listed_population(3, false));
     }
 }
 
