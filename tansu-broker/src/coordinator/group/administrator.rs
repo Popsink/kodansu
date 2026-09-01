@@ -483,10 +483,13 @@ static REBALANCE_STALLS: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// Every eviction is a rebalance, and until this counter there was **no series
 /// for them at all**: the sweep says so in an `info!` and the production fleet
 /// runs `RUST_LOG=warn`, so the one signal that existed was switched off. The
-/// question it exists to answer is whether the ~69 rejoins per member per day
-/// #486 measured are evictions — if they are, the window in
-/// [`MEMBER_EVICTION_AGE`] is the next thing to look at, and if they are not,
-/// the churn has another cause.
+/// The question it existed to answer — whether the ~69 rejoins per member per
+/// day #486 measured are evictions — the production fleet answered on the first
+/// release that carried it: **4 790 evictions/hour across ~348 members**, on a
+/// fleet whose consumers do not restart. They were false, and both halves of
+/// that are now fixed (#488) — the heartbeat that renews nothing, and the
+/// deadline that did not carry the renewal window. This is the series that says
+/// whether they stay fixed.
 static MEMBERS_EVICTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_group_members_evicted")
@@ -497,17 +500,19 @@ static MEMBERS_EVICTED: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// How stale an evicted member's `last_contact_ms` was when the sweep reached
 /// it (#488), in milliseconds.
 ///
-/// **Not the member's silence**, and the difference is the issue: liveness is
-/// persisted at most once per `session/2` ([`liveness_renewal_due`]), so this
-/// age is an *upper* bound on how long the member had actually been quiet — a
-/// member evicted at an age of `session` may have stopped heartbeating only
-/// `session/2` ago.
+/// **Not the member's silence**: liveness is persisted at most once per
+/// `session/2` ([`liveness_renewal_due`]), so this age is an *upper* bound on
+/// how long the member had actually been quiet — a member evicted at an age of
+/// `session + session/2` may have stopped talking only one session ago. That
+/// gap is why the deadline itself carries the renewal window
+/// ([`MemberDoc::lapses_after_ms`]): the arithmetic is the same, and it is now
+/// spent out of the broker's grace rather than the member's.
 ///
 /// What the distribution says is where the sweep is catching them. A dead
-/// member's age at eviction is bounded by `session + session/2`, since the sweep
-/// runs once per `session/2`: values above that band mean the sweep itself is
-/// running late, which is a different fault from the window and has to be
-/// excluded before the window is blamed.
+/// member's age at eviction is bounded by `session × 2` — the deadline of
+/// `session × 1.5`, plus the `session/2` window the sweep runs on: values above
+/// that band mean the sweep itself is running late, which is a different fault
+/// from the window and has to be excluded before the window is blamed.
 static MEMBER_EVICTION_AGE: LazyLock<Histogram<u64>> = LazyLock::new(|| {
     METER
         .u64_histogram("tansu_group_member_eviction_age_milliseconds")
@@ -2565,20 +2570,53 @@ where
         _ = self.observe_rebalance(group_id, &view, now);
 
         let error_code = if !view.exists() || !view.generation.members.contains_key(member_id) {
+            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "heartbeat_unknown_member")]);
             ErrorCode::UnknownMemberId
-        } else if generation_id > view.generation_id() {
-            ErrorCode::IllegalGeneration
-        } else if generation_id < view.generation_id() {
-            // Someone joined, left or was swept: the member's generation is
-            // behind, so it must re-join.
-            ErrorCode::RebalanceInProgress
         } else {
-            // Steady state: two reads, and one member-document write per
+            // A member this generation names has just contacted us, so it is
+            // alive — whatever generation it believes it is on (#488).
+            //
+            // Renewing only in the steady-state branch below made a rebalance
+            // self-sustaining. Every membership change moves the generation, so
+            // every other member's heartbeat is answered `RebalanceInProgress`
+            // until it re-joins — and a Kafka consumer only re-joins from
+            // `poll()`, which may be a whole batch of processing away, while
+            // its heartbeat thread beats on regardless. Those beats renewed
+            // nothing, so the member's stamp aged out and the sweep evicted a
+            // member that had never stopped talking to us: one more membership
+            // change, and the next group of members to fall behind.
+            //
+            // Kafka renews here too, and has always done: its heartbeat
+            // handler reschedules the member's session expiry — 4.x
+            // `GroupMetadataManager.classicGroupHeartbeatToClassicGroup`, the
+            // older `completeAndScheduleNextHeartbeatExpiration` — for a known
+            // member of a group in `PreparingRebalance` *before* answering
+            // `REBALANCE_IN_PROGRESS`. Liveness is about contact; the
+            // generation is about what the member may do next, and the two
+            // verdicts are separate.
+            //
+            // Steady state remains two reads and one member-document write per
             // session/2. No LIST, no shared CAS, no forwarding.
             self.renew_member(group_id, member_id, view.session_timeout_ms(), now)
                 .await?;
 
-            ErrorCode::None
+            if generation_id > view.generation_id() {
+                COORDINATOR_REQUESTS.add(
+                    1,
+                    &[KeyValue::new("method", "heartbeat_illegal_generation")],
+                );
+                ErrorCode::IllegalGeneration
+            } else if generation_id < view.generation_id() {
+                // Someone joined, left or was swept: the member's generation is
+                // behind, so it must re-join.
+                COORDINATOR_REQUESTS.add(
+                    1,
+                    &[KeyValue::new("method", "heartbeat_rebalance_in_progress")],
+                );
+                ErrorCode::RebalanceInProgress
+            } else {
+                ErrorCode::None
+            }
         };
 
         debug!(?error_code, generation_id = view.generation_id());
@@ -4392,6 +4430,12 @@ mod tests {
         const LEADER: &str = "m-1";
         const LAPSED: &str = "m-2";
 
+        /// Silent for longer than a session, but not for the renewal window
+        /// the deadline carries: its stamp may be `session/2` older than its
+        /// last contact, so it has not provably been quiet for a session and
+        /// must survive (#488).
+        const QUIET: &str = "m-3";
+
         let storage = memory_storage().await?;
         let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
 
@@ -4408,7 +4452,11 @@ mod tests {
             ..Default::default()
         };
 
-        for (member_id, last_contact_ms) in [(LEADER, now_ms), (LAPSED, now_ms - session - 1)] {
+        for (member_id, last_contact_ms) in [
+            (LEADER, now_ms),
+            (QUIET, now_ms - session - 1),
+            (LAPSED, now_ms - session - session / 2 - 1),
+        ] {
             _ = storage
                 .write_group_member(
                     GROUP_ID,
@@ -4431,6 +4479,7 @@ mod tests {
                     leader: Some(LEADER.into()),
                     members: BTreeMap::from([
                         (LEADER.to_owned(), MemberRef::default()),
+                        (QUIET.to_owned(), MemberRef::default()),
                         (LAPSED.to_owned(), MemberRef::default()),
                     ]),
                     members_changed_at_ms: now_ms - session,
@@ -4455,9 +4504,9 @@ mod tests {
         let generation = generation_of(&storage, GROUP_ID).await?;
 
         assert_eq!(
-            BTreeSet::from([LEADER.to_owned()]),
+            BTreeSet::from([LEADER.to_owned(), QUIET.to_owned()]),
             generation.members.keys().cloned().collect::<BTreeSet<_>>(),
-            "the lapsed member must be evicted"
+            "the lapsed member must be evicted, and only it"
         );
         assert!(
             generation.generation_id > 7,
@@ -4476,6 +4525,11 @@ mod tests {
             storage.read_group_member(GROUP_ID, LEADER).await?.is_some(),
             "a live member's document must be left alone"
         );
+        assert!(
+            storage.read_group_member(GROUP_ID, QUIET).await?.is_some(),
+            "a member silent for less than a session, plus the window its stamp \
+             may lag by, is not one that has lapsed"
+        );
 
         // The survivor rejoins and takes the group on.
         let join = join_group(
@@ -4488,6 +4542,110 @@ mod tests {
 
         assert_eq!(i16::from(ErrorCode::None), join.error_code);
         assert_eq!(LEADER, join.leader);
+
+        Ok(())
+    }
+
+    /// A rebalance must not evict the members that are waiting it out (#488).
+    ///
+    /// The production shape this reproduces: the generation has moved, so the
+    /// member's heartbeat is answered `RebalanceInProgress` until it re-joins —
+    /// and a Kafka consumer re-joins from `poll()`, which may be a whole batch
+    /// of processing away, while its heartbeat thread beats on throughout. When
+    /// those beats renewed nothing, the member's stamp aged out and the sweep
+    /// evicted a member that had never stopped talking: one more membership
+    /// change, and the next set of members to fall behind. Two sessions of
+    /// heartbeats here, all of them behind the generation.
+    #[tokio::test(start_paused = true)]
+    async fn a_member_heartbeating_behind_the_generation_keeps_its_session() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "rebalancing-group";
+        const MEMBER: &str = "m-1";
+        const GENERATION_ID: i32 = 7;
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+
+        let now_ms = epoch_ms(paused_clock());
+        let session = i64::from(SESSION_TIMEOUT_MS);
+
+        _ = storage
+            .write_group_member(
+                GROUP_ID,
+                MEMBER,
+                MemberDoc {
+                    last_contact_ms: now_ms,
+                    session_timeout_ms: SESSION_TIMEOUT_MS,
+                    rebalance_timeout_ms: REBALANCE_TIMEOUT_MS,
+                    join_response: JoinGroupResponseMember::default()
+                        .member_id(MEMBER.to_owned())
+                        .metadata(encode_subscription(&["t"], None)),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .map_err(update_error)?;
+
+        _ = storage
+            .update_group_generation(
+                GROUP_ID,
+                GenerationDoc {
+                    generation_id: GENERATION_ID,
+                    protocol_type: Some(CONSUMER.into()),
+                    protocol_name: Some(RANGE.into()),
+                    leader: Some(MEMBER.into()),
+                    members: BTreeMap::from([(MEMBER.to_owned(), MemberRef::default())]),
+                    members_changed_at_ms: now_ms,
+                    state_since_ms: now_ms,
+                    swept_at_ms: now_ms,
+                    session_timeout_ms: SESSION_TIMEOUT_MS,
+                    rebalance_timeout_ms: REBALANCE_TIMEOUT_MS,
+                    inception_ms: now_ms,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .map_err(update_error)?;
+
+        // Long enough that every renewal comes due, and long enough in total to
+        // pass the eviction deadline twice over. Each of these also runs a
+        // sweep, since the sweep comes due on the same cadence.
+        for _ in 0..4 {
+            advance(Duration::from_millis(session as u64 / 2 + 1)).await;
+
+            let beat = heartbeat(&controller, GROUP_ID, GENERATION_ID - 1, MEMBER).await?;
+
+            assert_eq!(
+                i16::from(ErrorCode::RebalanceInProgress),
+                beat.error_code,
+                "a member behind the generation must still be told to re-join"
+            );
+        }
+
+        let generation = generation_of(&storage, GROUP_ID).await?;
+
+        assert_eq!(
+            BTreeSet::from([MEMBER.to_owned()]),
+            generation.members.keys().cloned().collect::<BTreeSet<_>>(),
+            "a member that has heartbeated throughout has not lapsed"
+        );
+        assert_eq!(
+            GENERATION_ID, generation.generation_id,
+            "nothing was evicted, so nothing rebalanced"
+        );
+
+        let (member, _) = storage
+            .read_group_member(GROUP_ID, MEMBER)
+            .await?
+            .expect("the member's document must still be there");
+
+        assert!(
+            member.last_contact_ms > now_ms + session,
+            "the heartbeats must have renewed the member's liveness"
+        );
 
         Ok(())
     }
