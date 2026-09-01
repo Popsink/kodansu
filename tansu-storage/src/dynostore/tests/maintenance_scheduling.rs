@@ -35,8 +35,9 @@
 //!    incremental refresh is add-only below the tail, so those stale entries
 //!    accumulate for the life of the process — four maintainers reported 17 517,
 //!    14 374, 13 932 and **67** indexed segments for the same prefix at the same
-//!    instant. Which is also why `tansu_prefix_segments_live` could not be read as
-//!    a backlog.
+//!    instant. Which is also why `tansu_prefix_index_entries` cannot be read as a
+//!    backlog — what is really under the prefix is `tansu_prefix_segments_live`,
+//!    recorded from a whole-prefix listing rather than from an index (#399).
 //!
 //! The two are one fix: a run that finds its segments gone prunes them and the
 //! drain *takes the next run*, so a drain walks its index through the ghosts
@@ -222,9 +223,10 @@ async fn a_run_of_gone_segments_does_not_end_the_drain() -> Result<(), Error> {
 /// segments gone prunes them, so the drain walks the ghosts out rather than
 /// stopping at the first of them.
 ///
-/// This is what makes `tansu_prefix_segments_live` mean something again. Four
-/// maintainers reporting 17 517, 14 374, 13 932 and 67 for one prefix were all
-/// reporting how stale their own index was.
+/// This is what keeps `tansu_prefix_index_entries` within reach of the bucket.
+/// Four maintainers reporting 17 517, 14 374, 13 932 and 67 for one prefix were
+/// all reporting how stale their own index was; the count of what is actually
+/// there comes from the listing, as `tansu_prefix_segments_live` (#399).
 #[tokio::test]
 async fn the_drain_prunes_the_index_down_to_what_the_bucket_holds() -> Result<(), Error> {
     let _guard = super::init_tracing()?;
