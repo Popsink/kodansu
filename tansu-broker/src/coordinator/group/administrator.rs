@@ -225,6 +225,35 @@ fn liveness_renewal_due(member: Option<&MemberDoc>, now_ms: i64, session_timeout
         >= i64::from(session_timeout_or_default(session_timeout_ms)) / 2
 }
 
+/// How long a liveness stamp is kept after this replica saw it (#406).
+///
+/// Nothing is decided from an entry older than the group's session timeout —
+/// past that it can prove neither "no renewal due" nor "not expired" — so this
+/// is a memory bound rather than a correctness one, set above the session
+/// timeouts a Kafka client may ask for. An entry that expires early costs one
+/// read, which is what every read cost before.
+const LIVENESS_STAMP_TTL: Duration = Duration::from_hours(1);
+
+/// Liveness stamps this replica holds at once (#406).
+///
+/// One `i64` under a `group/member` key, so the bound is about member-id churn
+/// rather than size: a fleet whose consumers rejoin under a fresh id — which a
+/// dynamic member does on every session it loses — would otherwise accrue an
+/// entry per id per hour. Eviction takes the entry closest to expiry, which is
+/// the one least likely to prove anything.
+const LIVENESS_STAMPS_HELD: usize = 16_384;
+
+/// The memo behind [`Controller::liveness_stamps`].
+///
+/// Keyed by the pair rather than by a joined string: both halves are
+/// client-chosen, and a separator two ids can contain is a way for one member to
+/// answer for another.
+fn liveness_stamps() -> ExpiringSizedCache<(String, String), i64> {
+    let mut stamps = ExpiringSizedCache::new(LIVENESS_STAMP_TTL);
+    _ = stamps.size_limit(LIVENESS_STAMPS_HELD);
+    stamps
+}
+
 /// What a `join` or `sync` iteration does once this member's group state is
 /// settled: wait and re-poll, or answer now.
 ///
@@ -636,6 +665,34 @@ pub struct Controller<O> {
     /// operator who missed the first line still sees one.
     rebalance_stalls: Arc<Mutex<ExpiringSizedCache<String, ()>>>,
 
+    /// Liveness stamps this replica has **seen persisted**, by `group/member`
+    /// (#406) — the read that `session/2` could not bound.
+    ///
+    /// `renew_member` read the member document on every heartbeat and every
+    /// commit and *then* asked whether a renewal was due, so the guard bounded
+    /// the writes to one per `session/2` and did nothing at all for the reads:
+    /// 92 group-member GETs/s against 58 heartbeats and commits/s on the
+    /// production fleet, and the sweep read every member of a group again on top.
+    ///
+    /// Every value here was either read from a document or written to one by
+    /// this replica, and `last_contact_ms` only ever moves forward, so a stamp
+    /// held here is a **lower bound** on what the object store holds. That is
+    /// what makes consulting it exact rather than approximate: a stamp inside
+    /// `session/2` is the reading [`liveness_renewal_due`] would have taken to
+    /// answer `false`. The verdict does not change; only the request does not
+    /// happen.
+    ///
+    /// It is read by the renewal path alone. The sweep's question is whether a
+    /// member's document is still *there* — a document deleted behind the
+    /// coordinator's back expires the member however fresh its last stamp was
+    /// (#431) — and a stamp cannot answer that, so the sweep keeps reading and
+    /// feeds this instead.
+    ///
+    /// Per replica, so it can only ever *suppress* work this replica would have
+    /// done — a cold process, a restart or an evicted entry reads exactly as
+    /// before.
+    liveness_stamps: Arc<Mutex<ExpiringSizedCache<(String, String), i64>>>,
+
     /// Cancelled when this process has been asked to stop (#361).
     ///
     /// Only the long polls read it, and only to stop *waiting*: a cancelled
@@ -686,6 +743,7 @@ where
             rebalance_stalls: Arc::new(Mutex::new(ExpiringSizedCache::new(
                 REBALANCE_STALL_REPORT_EVERY,
             ))),
+            liveness_stamps: Arc::new(Mutex::new(liveness_stamps())),
             cancellation: CancellationToken::new(),
             now: SystemTime::now,
         })
@@ -844,12 +902,62 @@ where
         sleep(cas_conflict_backoff(*conflicts)).await;
     }
 
+    /// Whether this replica already knows `member_id`'s persisted stamp to be
+    /// inside `window_ms`, and can therefore skip reading the document (#406).
+    ///
+    /// The stamps in [`Self::liveness_stamps`] are lower bounds — each was read
+    /// from a document or written to one, and `last_contact_ms` only moves
+    /// forward — so a stamp inside the window means the document's is too. At
+    /// `session/2` that is exactly [`liveness_renewal_due`] answering `false`,
+    /// which is the read this replaces: the same verdict, one request fewer.
+    ///
+    /// It proves liveness and nothing else. The sweep needs to know whether a
+    /// document is *there*, which no stamp can say, so it reads — see
+    /// [`Self::sweep`].
+    fn liveness_known_within(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        now_ms: i64,
+        window_ms: i64,
+    ) -> bool {
+        self.liveness_stamps
+            .lock()
+            .ok()
+            .and_then(|stamps| {
+                stamps
+                    .get(&(group_id.to_owned(), member_id.to_owned()))
+                    .copied()
+            })
+            .is_some_and(|stamp_ms| now_ms.saturating_sub(stamp_ms) < window_ms)
+    }
+
+    /// Remember a stamp this replica has seen persisted for `member_id` (#406).
+    ///
+    /// Only ever called with a value the object store holds — a document's own
+    /// `last_contact_ms`, or the one a write of ours has just put there — which
+    /// is what keeps [`Self::liveness_known_within`] a lower bound rather than a
+    /// guess.
+    fn note_liveness(&self, group_id: &str, member_id: &str, stamp_ms: i64) {
+        if let Ok(mut stamps) = self.liveness_stamps.lock() {
+            _ = stamps.insert_evict((group_id.to_owned(), member_id.to_owned()), stamp_ms, true);
+        }
+    }
+
     /// Refresh this member's liveness, if it is due.
     ///
     /// This is the write that used to churn the shared `{group}.json` etag once
     /// a second per member and starve the leader's assignment CAS. It now goes
     /// to the member's own object, at most once per session/2, and contends
     /// with nothing.
+    ///
+    /// The **read** is bounded by the same window (#406), which for a long time
+    /// it was not: the document was fetched on every heartbeat and every commit
+    /// and only then asked whether a renewal was due, so `session/2` bounded the
+    /// writes and did nothing whatever for the reads — 92 group-member GETs/s
+    /// against 58 heartbeats and commits/s on the production fleet. A stamp this
+    /// replica has already seen inside the window is that read's answer, and
+    /// making the request again could only produce a stamp at least as fresh.
     async fn renew_member(
         &self,
         group_id: &str,
@@ -861,6 +969,13 @@ where
             return Ok(());
         }
 
+        let now_ms = epoch_ms(now);
+        let renewal_window_ms = i64::from(session_timeout_or_default(session_timeout_ms)) / 2;
+
+        if self.liveness_known_within(group_id, member_id, now_ms, renewal_window_ms) {
+            return Ok(());
+        }
+
         let Some((member, version)) = self.storage.read_group_member(group_id, member_id).await?
         else {
             // Nothing to renew: a member with no document is one this request
@@ -869,7 +984,7 @@ where
             return Ok(());
         };
 
-        let now_ms = epoch_ms(now);
+        self.note_liveness(group_id, member_id, member.last_contact_ms);
 
         if !liveness_renewal_due(Some(&member), now_ms, session_timeout_ms) {
             return Ok(());
@@ -886,7 +1001,12 @@ where
             .write_group_member(group_id, member_id, renewed, Some(version))
             .await
         {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                // The store now holds this stamp, so nothing need read it back
+                // for another `session/2` (#406).
+                self.note_liveness(group_id, member_id, now_ms);
+                Ok(())
+            }
 
             // Lost to this member's own other in-flight request, on this
             // replica or another. That write carried a reading at least as
@@ -940,6 +1060,15 @@ where
 
         // From the generation's member set, never a LIST: the set is
         // authoritative, and listing would put one on the request path.
+        //
+        // These reads are deliberately **not** answered from
+        // [`Self::liveness_stamps`] (#406), though a stamp inside the member's
+        // session would prove it unexpired. What the memo cannot prove is the
+        // other half of the verdict: a member whose document has gone behind the
+        // coordinator's back — a partial `delete_groups`, a half-finished leave
+        // (#431) — is expired *however fresh its last stamp was*, and only the
+        // read finds that. So the sweep reads, and what it learns feeds the memo
+        // rather than the other way round.
         let expired = futures::stream::iter(view.generation.members.keys().cloned().map(
             |member_id| async move {
                 let held = self
@@ -949,6 +1078,10 @@ where
                     .inspect_err(|error| debug!(?error, group_id, member_id))
                     .ok()
                     .flatten();
+
+                if let Some((member, _)) = held.as_ref() {
+                    self.note_liveness(group_id, &member_id, member.last_contact_ms);
+                }
 
                 held.is_none_or(|(member, _)| member.is_expired(now_ms))
                     .then_some(member_id)
@@ -1701,7 +1834,9 @@ where
                     )
                     .await
                 {
-                    Ok(_) => (),
+                    // A join stamps the member as surely as a renewal does, so
+                    // the heartbeat that follows it needs no read (#406).
+                    Ok(_) => self.note_liveness(group_id, member_id.as_str(), now_ms),
 
                     // This member's other in-flight request won. Re-read
                     // everything rather than reason about which is newer —
@@ -3183,6 +3318,102 @@ mod tests {
         assert!(
             after.swept_at_ms > before.swept_at_ms,
             "the write must be the sweep's stamp"
+        );
+
+        Ok(())
+    }
+
+    /// The read `session/2` never bounded (#406).
+    ///
+    /// `renew_member` fetched the member document on every heartbeat and every
+    /// commit and *then* asked whether a renewal was due, so the guard bounded
+    /// the writes and did nothing at all for the reads: 92 group-member GETs/s
+    /// against 58 heartbeats and commits/s on the production fleet, plus the
+    /// sweep reading every member of the group again on top. A stamp this
+    /// replica has already seen persisted is that read's answer.
+    #[tokio::test(start_paused = true)]
+    async fn a_settled_member_is_read_once_per_session_half_not_once_per_request() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "liveness-read-group";
+        const BEATS: usize = 8;
+
+        let storage = counted_storage().await?;
+        let member_reads = storage.member_reads_handle();
+        let member_puts = storage.member_puts_handle();
+
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+        let metadata = encode_subscription(&["t"], None);
+
+        let (member_id, join) = register(&controller, GROUP_ID, &metadata).await?;
+
+        let sync = sync_group(
+            &controller,
+            GROUP_ID,
+            join.generation_id,
+            &member_id,
+            &[assignment_of(&member_id)],
+        )
+        .await?;
+        assert_eq!(i16::from(ErrorCode::None), sync.error_code);
+
+        let reads = member_reads.load(std::sync::atomic::Ordering::Relaxed);
+        let puts = member_puts.load(std::sync::atomic::Ordering::Relaxed);
+
+        // Heartbeats inside session/2 of the join that stamped this member. The
+        // renewal is not due, and this replica already knows the stamp that says
+        // so — nothing to write, and nothing to read to find that out.
+        for _ in 0..BEATS {
+            let beat = heartbeat(&controller, GROUP_ID, join.generation_id, &member_id).await?;
+            assert_eq!(i16::from(ErrorCode::None), beat.error_code);
+        }
+
+        assert_eq!(
+            reads,
+            member_reads.load(std::sync::atomic::Ordering::Relaxed),
+            "a heartbeat inside session/2 must not read the member document"
+        );
+        assert_eq!(
+            puts,
+            member_puts.load(std::sync::atomic::Ordering::Relaxed),
+            "nor write it"
+        );
+
+        // Past session/2, two reads and one write for the whole batch: the
+        // renewal's, and the sweep's, which comes due on the same cadence and
+        // asks a question no stamp can answer (whether the document is still
+        // there). That is the "two reads and one write per session/2" the design
+        // claims — per *window*, where it used to be per request.
+        advance(Duration::from_millis(SESSION_TIMEOUT_MS as u64 / 2 + 1)).await;
+
+        for _ in 0..BEATS {
+            let beat = heartbeat(&controller, GROUP_ID, join.generation_id, &member_id).await?;
+            assert_eq!(i16::from(ErrorCode::None), beat.error_code);
+        }
+
+        assert_eq!(
+            reads + 2,
+            member_reads.load(std::sync::atomic::Ordering::Relaxed),
+            "a due renewal and a due sweep read once each, for {BEATS} heartbeats"
+        );
+        assert_eq!(
+            puts + 1,
+            member_puts.load(std::sync::atomic::Ordering::Relaxed),
+            "and writes once"
+        );
+
+        // And it is a memo, not a rule: a replica that has never seen this
+        // member reads it, so this can only ever remove a request the *same*
+        // replica would have made twice for one answer.
+        let cold = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+
+        let beat = heartbeat(&cold, GROUP_ID, join.generation_id, &member_id).await?;
+        assert_eq!(i16::from(ErrorCode::None), beat.error_code);
+
+        assert_eq!(
+            reads + 3,
+            member_reads.load(std::sync::atomic::Ordering::Relaxed),
+            "a replica with nothing memoized must read the document"
         );
 
         Ok(())
