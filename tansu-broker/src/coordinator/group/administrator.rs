@@ -337,15 +337,29 @@ fn join_long_poll(
     let is_ok = updated.is_ok(body);
     let session_timeout_ms = updated.session_timeout_ms() as u128;
 
+    let answered = |reason: &'static str| {
+        JOIN_ANSWERED.add(1, &[KeyValue::new("reason", reason)]);
+        LongPoll::Respond(None)
+    };
+
     let decision = if is_member_id_required {
         // KIP-394: the group was left untouched, so there is nothing to damp
         // and nothing to wait for. The member registers on the join that
         // follows, and that one takes the branches below.
-        LongPoll::Respond(None)
+        //
+        // Defensive, and its counter should stay at **zero**: `join` answers a
+        // minted member id by returning, before any long poll, so the only body
+        // reaching here carries `ErrorCode::None`. Kept because the predicate is
+        // what the branch means, not because the branch is reachable today —
+        // and counted so that a future path which does reach it says so instead
+        // of silently taking a member's rejoin through the pause below.
+        answered("member_id_required")
     } else if is_leader && is_forming && !membership_quiescent && elapsed_ms < join_window_ms {
         LongPoll::Wait(Duration::from_secs(1), "join_window_hold")
-    } else if is_leader || is_assigned {
-        LongPoll::Respond(None)
+    } else if is_leader {
+        answered("leader")
+    } else if is_assigned {
+        answered("assigned")
     } else if group_instance_id.is_some() && elapsed_ms < PAUSE_MS {
         LongPoll::Wait(
             Duration::from_millis(PAUSE_MS.saturating_sub(elapsed_ms) as u64),
@@ -354,7 +368,9 @@ fn join_long_poll(
     } else if elapsed_ms < session_timeout_ms.div(2) {
         LongPoll::Wait(Duration::from_secs(1), "join_settle_wait")
     } else {
-        LongPoll::Respond(None)
+        // The cap, not the barrier: `session/2` elapsed and this member is
+        // answered success with nothing to act on (#497).
+        answered("cap")
     };
 
     debug!(
@@ -500,12 +516,53 @@ static REBALANCE_STALLS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Why a parked `JoinGroup` was finally answered (#497).
+///
+/// The long poll has two ways to end and they mean opposite things: the barrier
+/// fired — the member is the leader, or the assignment already names it — or the
+/// **cap** fired, `session/2` elapsed and the member is answered success with
+/// nothing to act on, which sends it round the sync-bounce-rejoin cycle. Until
+/// this counter both were the same event, and "is the barrier working?" could
+/// only be answered by arithmetic against the duration histogram.
+///
+/// `cap` is the number to watch: on a healthy fleet it is near zero, and a
+/// fleet where it dominates is one whose followers are waiting out a timer
+/// rather than a barrier.
+static JOIN_ANSWERED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_group_join_answered")
+        .with_description("why a parked JoinGroup was answered")
+        .build()
+});
+
+/// Why a `SyncGroup` was answered `RebalanceInProgress`, by `cause` (#497).
+///
+/// The one error code covers five distinct situations, and they call for
+/// different things: `generation_moved` and `assignment_raced` are a member
+/// arriving after the group moved on, which is ordinary; `awaiting_leader` is a
+/// follower that got there before the leader wrote the assignment, and its
+/// volume is the size of the sync-bounce-rejoin cycle; `not_in_assignment` and
+/// `leader_not_in_assignment` are a leader's assignment that omits a member the
+/// generation names, which is the assignor disagreeing with the group.
+static SYNC_REBALANCE_IN_PROGRESS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_group_sync_rebalance_in_progress")
+        .with_description("why a SyncGroup was answered RebalanceInProgress")
+        .build()
+});
+
 /// Members the sweep removed from a generation, by `reason` (#488).
 ///
 /// `lapsed` is the ordinary one: the member's persisted `last_contact_ms` is
 /// older than its session timeout. `no_document` is the other verdict the sweep
 /// can reach — the generation names a member whose document has gone, which
 /// `MemberDoc` cannot date because there is none to date.
+///
+/// Also by `group_id` (#497), because "1 280 evictions/hour" spread over 77
+/// groups and the same number coming from two of them lead to different
+/// investigations, and nothing could tell them apart. A group id is bounded and
+/// does not churn — unlike a member id, which the mint cycle would turn into
+/// unbounded cardinality, and which is why this label stops at the group.
 ///
 /// Every eviction is a rebalance, and until this counter there was **no series
 /// for them at all**: the sweep says so in an `info!` and the production fleet
@@ -544,6 +601,18 @@ static MEMBER_EVICTION_AGE: LazyLock<Histogram<u64>> = LazyLock::new(|| {
     METER
         .u64_histogram("tansu_group_member_eviction_age_milliseconds")
         .with_description("staleness of an evicted member's last contact stamp")
+        // The default boundaries stop at 10 s and an eviction age starts at
+        // `session × 1.5` by construction, so every observation landed in
+        // `+Inf` and only sum/count were usable (#497). These are laid out
+        // around the two thresholds that mean something — the deadline, and the
+        // deadline plus one sweep window — for the session timeouts a Kafka
+        // client actually asks for: 30 s (45/60), 45 s (67.5/90) and 60 s
+        // (90/120). Mass above the top of a group's band is a sweep running
+        // late, which is a different fault from an early deadline.
+        .with_boundaries(vec![
+            15_000.0, 30_000.0, 45_000.0, 50_000.0, 55_000.0, 60_000.0, 67_500.0, 75_000.0,
+            90_000.0, 120_000.0, 300_000.0, 600_000.0,
+        ])
         .build()
 });
 
@@ -1335,13 +1404,17 @@ where
         for (member_id, age_ms) in &expired {
             _ = next.members.remove(member_id);
 
+            let group = KeyValue::new("group_id", group_id.to_owned());
+
             match age_ms {
                 Some(age_ms) => {
-                    MEMBERS_EVICTED.add(1, &[KeyValue::new("reason", "lapsed")]);
+                    MEMBERS_EVICTED.add(1, &[KeyValue::new("reason", "lapsed"), group]);
                     MEMBER_EVICTION_AGE.record(u64::try_from(*age_ms).unwrap_or_default(), &[]);
                 }
 
-                None => MEMBERS_EVICTED.add(1, &[KeyValue::new("reason", "no_document")]),
+                None => {
+                    MEMBERS_EVICTED.add(1, &[KeyValue::new("reason", "no_document"), group]);
+                }
             }
         }
 
@@ -1356,7 +1429,13 @@ where
         // one session is one where the member may have been quiet for only
         // half of it, and an operator reading "evicted" cannot tell the two
         // apart without the number.
-        info!(
+        // `warn!`, not `info!` (#497): every eviction is a rebalance, and the
+        // production fleet runs `RUST_LOG=warn` — so the one line that names
+        // *which* members of *which* group went, and how stale each stamp was,
+        // was switched off exactly where it was needed. A group that is losing
+        // members is not routine, and this says so at the level an operator
+        // reads.
+        warn!(
             group_id,
             generation_id = next.generation_id,
             evicted = ?expired,
@@ -2520,6 +2599,22 @@ where
                 ));
             }
 
+            // A member that commits is a member that is alive. Folding liveness
+            // into the commit path — commits arrive every ~5s — makes most
+            // heartbeat renewals no-ops, and it goes to the member's own
+            // document rather than to the offsets object, so nothing about
+            // group expiry changes.
+            //
+            // Renewed **before** the generation is judged (#497), for the same
+            // reason `heartbeat` was (#495): a member this generation names has
+            // just contacted us, so it is alive whatever generation it believes
+            // it is on. Liveness is about contact; the generation is about what
+            // the member may do next, and the commit is refused below either
+            // way. The two paths agreed on everything except this, and the
+            // disagreement could only ever cost a member its session.
+            self.renew_member(group_id, member_id, generation.session_timeout_ms, now)
+                .await?;
+
             if generation.generation_id != generation_id {
                 debug!(
                     group_id,
@@ -2534,14 +2629,6 @@ where
                     ErrorCode::IllegalGeneration,
                 ));
             }
-
-            // A member that commits is a member that is alive. Folding liveness
-            // into the commit path — commits arrive every ~5s — makes most
-            // heartbeat renewals no-ops, and it goes to the member's own
-            // document rather than to the offsets object, so nothing about
-            // group expiry changes.
-            self.renew_member(group_id, member_id, generation.session_timeout_ms, now)
-                .await?;
         }
 
         match self.commit_offset(&offset_commit).await {
@@ -2687,6 +2774,7 @@ where
 
         if generation_id < view.generation_id() {
             debug!(current = view.generation_id(), sync_outcome = ?ErrorCode::RebalanceInProgress);
+            SYNC_REBALANCE_IN_PROGRESS.add(1, &[KeyValue::new("cause", "generation_moved")]);
             let body = sync_error(&view, ErrorCode::RebalanceInProgress);
             return Ok((view, body));
         }
@@ -2700,6 +2788,7 @@ where
             // valid empty assignment, and it then sits idle forever.
             let Some(assignment) = assignments.get(member_id).cloned() else {
                 debug!(sync_outcome = ?ErrorCode::RebalanceInProgress, "not in the assignment");
+                SYNC_REBALANCE_IN_PROGRESS.add(1, &[KeyValue::new("cause", "not_in_assignment")]);
                 let body = sync_error(&view, ErrorCode::RebalanceInProgress);
                 return Ok((view, body));
             };
@@ -2721,6 +2810,10 @@ where
         // anything to do here.
         if view.leader() != Some(member_id) {
             debug!(leader = ?view.leader(), sync_outcome = ?ErrorCode::RebalanceInProgress);
+            // The follower that arrived before the leader wrote the assignment:
+            // the size of the sync-bounce-rejoin cycle, and the number that
+            // decides whether the deferred half of #498 is worth doing.
+            SYNC_REBALANCE_IN_PROGRESS.add(1, &[KeyValue::new("cause", "awaiting_leader")]);
             let body = sync_error(&view, ErrorCode::RebalanceInProgress);
             return Ok((view, body));
         }
@@ -2735,6 +2828,8 @@ where
         // form the group, for the same reason as above.
         if !requested.contains_key(member_id) {
             debug!(sync_outcome = ?ErrorCode::RebalanceInProgress, "leader not in its own assignment");
+            SYNC_REBALANCE_IN_PROGRESS
+                .add(1, &[KeyValue::new("cause", "leader_not_in_assignment")]);
             let body = sync_error(&view, ErrorCode::RebalanceInProgress);
             return Ok((view, body));
         }
@@ -2778,6 +2873,7 @@ where
                 sync_outcome = ?ErrorCode::RebalanceInProgress,
             );
 
+            SYNC_REBALANCE_IN_PROGRESS.add(1, &[KeyValue::new("cause", "assignment_raced")]);
             let body = sync_error(&after, ErrorCode::RebalanceInProgress);
             return Ok((after, body));
         }
@@ -4628,6 +4724,104 @@ mod tests {
 
         assert_eq!(i16::from(ErrorCode::None), join.error_code);
         assert_eq!(LEADER, join.leader);
+
+        Ok(())
+    }
+
+    /// A commit is contact, whatever generation the member believes it is on
+    /// (#497).
+    ///
+    /// `offset_commit` returned `IllegalGeneration` before it reached
+    /// `renew_member`, so a member of the current generation whose commit was
+    /// fenced renewed nothing — the same asymmetry #495 removed from
+    /// `heartbeat`. Liveness is about contact; the generation is about what the
+    /// member may do next, and the commit is still refused.
+    #[tokio::test(start_paused = true)]
+    async fn a_fenced_commit_still_renews_the_member_that_sent_it() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "fenced-commit-liveness";
+        const TOPIC: &str = "t";
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+        let metadata = encode_subscription(&[TOPIC], None);
+
+        let (member_id, join) = register(&controller, GROUP_ID, &metadata).await?;
+
+        let stamp = || {
+            let storage = storage.clone();
+            let member_id = member_id.clone();
+
+            async move {
+                storage
+                    .read_group_member(GROUP_ID, member_id.as_str())
+                    .await
+                    .map(|held| {
+                        held.expect("the member must have a document")
+                            .0
+                            .last_contact_ms
+                    })
+            }
+        };
+
+        let before = stamp().await?;
+
+        // Past the renewal window, so a renewal is due and a write is what
+        // proves the path was reached.
+        advance(Duration::from_millis(SESSION_TIMEOUT_MS as u64 / 2 + 1)).await;
+
+        let topics = [OffsetCommitRequestTopic::default()
+            .name(TOPIC.into())
+            .partitions(Some(vec![
+                OffsetCommitRequestPartition::default()
+                    .partition_index(0)
+                    .committed_offset(1)
+                    .committed_leader_epoch(Some(0))
+                    .commit_timestamp(None)
+                    .committed_metadata(Some("".into())),
+            ]))];
+
+        let body = controller
+            .offset_commit(OffsetCommit {
+                group_id: GROUP_ID,
+                // A generation the group has left, which is what a member
+                // commits under while it is still catching up with a rebalance.
+                generation_id_or_member_epoch: Some(join.generation_id + 1),
+                member_id: Some(member_id.as_str()),
+                group_instance_id: None,
+                retention_time_ms: None,
+                topics: Some(&topics[..]),
+            })
+            .await?;
+
+        let Body::OffsetCommitResponse(response) = body else {
+            panic!("{body:?}");
+        };
+
+        let error_code = response
+            .topics
+            .and_then(|topics| {
+                topics.first().and_then(|topic| {
+                    topic
+                        .partitions
+                        .as_ref()
+                        .and_then(|partitions| partitions.first().cloned())
+                })
+            })
+            .map(|partition| partition.error_code)
+            .expect("a partition response");
+
+        assert_eq!(
+            i16::from(ErrorCode::IllegalGeneration),
+            error_code,
+            "the commit itself is still fenced"
+        );
+
+        assert!(
+            stamp().await? > before,
+            "a member the generation names has just contacted us, so it is alive"
+        );
 
         Ok(())
     }
