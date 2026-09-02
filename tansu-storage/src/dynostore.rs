@@ -1492,6 +1492,28 @@ fn listed_population(discovered: usize, whole_prefix: bool) -> Option<u64> {
     whole_prefix.then_some(discovered as u64)
 }
 
+/// The timestamp to report as a prefix's oldest retained segment, or `None` when
+/// there is nothing truthful to report (#509).
+///
+/// Two rejections, and the second is the one that matters:
+///
+/// - **`None` survivors** — the scan expired everything, so no segment is
+///   retained and there is no age to describe.
+/// - **A non-positive timestamp** — `OLDEST_RETAINED` is a `u64` gauge, and the
+///   value it is fed comes from a chain with two negative sentinels in it: an
+///   empty footer's `max_timestamp` fold is `i64::MIN`, and the
+///   `last_modified_ms` fallback is only positive for an object a store actually
+///   stamped. Casting either to `u64` does not clamp, it *wraps* — `i64::MIN as
+///   u64` is 9.2 × 10^18, which would export a prefix as retaining data from the
+///   year 292 million and, worse, make `time() - gauge` hugely negative rather
+///   than obviously broken. Dropping the sample leaves the series at its last
+///   true reading, which is the same trade [`listed_population`] makes.
+///
+/// Pure, so the wrap is asserted without standing up a metrics reader.
+fn retained_timestamp(oldest_ms: Option<i64>) -> Option<u64> {
+    oldest_ms.filter(|ms| *ms > 0).map(|ms| ms as u64)
+}
+
 /// High-watermark resolutions where the persisted floor was **above** the
 /// surviving segment tail, on a sub-stream that still holds segments (#290).
 ///
@@ -1827,6 +1849,116 @@ static PREFIX_INDEX_RECONCILED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_prefix_index_reconciled")
         .with_description("index entries dropped by a reconciling listing, by prefix")
+        .build()
+});
+
+/// Segment objects whole-segment retention deleted, by prefix (#61, #509).
+///
+/// The retention half of [`SEGMENT_CREATES`]. Until #509 the count existed,
+/// was threaded up three call frames, and died in a `debug!` that production's
+/// `RUST_LOG=warn` discarded — so whether the object store was bounded could
+/// only be inferred from successive bucket listings, and #476's two readings of
+/// the same 18 h window projected working sets 10× apart.
+///
+/// Read it against [`SEGMENT_CREATES`] on the same window: creates minus expiries
+/// is the bucket's net segment growth, and a bucket at steady state has them
+/// equal. Labelled by prefix for the same reason [`SEGMENTS_LIVE`] is — a
+/// fleet-wide sum cannot show that one prefix stopped expiring while the rest
+/// carried on.
+static SEGMENTS_EXPIRED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_segments_expired")
+        .with_description("segment objects whole-segment retention deleted, by prefix")
+        .build()
+});
+
+/// Sub-stream region bytes reclaimed by whole-segment retention, by prefix
+/// (#509).
+///
+/// Summed from the `byte_len` of the expired segments' cached footer entries —
+/// the same snapshot the expiry decision is made from, so no object read and no
+/// new field on `CachedSegment` (which would grow the very index #476 is trying
+/// to shrink). It is therefore the **data region** total and excludes each
+/// object's footer, so it reads slightly under the bytes a listing shows going
+/// away. That gap is the footers, not lost accounting.
+static EXPIRY_BYTES_RECLAIMED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_expiry_bytes_reclaimed")
+        .with_description("sub-stream region bytes reclaimed by retention, by prefix")
+        .build()
+});
+
+/// Prefix-ticks on which retention deleted nothing, by `reason` (#509).
+///
+/// Every variant is a *correct* outcome — this is not an error counter. It
+/// exists because "retention deleted nothing" and "retention never ran" are
+/// indistinguishable from [`SEGMENTS_EXPIRED`] alone, and that ambiguity is what
+/// makes a wedged retention path look like a quiet one:
+///
+/// - `not_due` — the per-prefix oldest-retained hint proved nothing could be past
+///   the threshold, so the tick skipped without a LIST or a lease round-trip
+///   (#49). The overwhelmingly common case, and the one to watch: a prefix that
+///   reports `not_due` forever while its segment count climbs has a hint that is
+///   wrong, and [`OLDEST_RETAINED`] says which.
+/// - `nothing_expirable` — the prefix was scanned and every segment is either
+///   young or blocked by the mid-log fence (#471), so age alone may not remove it.
+/// - `lease_held_elsewhere` — a peer maintainer holds the compaction lease and is
+///   doing this prefix's expiry (#115). Expected on a multi-maintainer fleet;
+///   sustained across *every* replica means no one is acquiring it.
+///
+/// The unit is prefix-ticks, so it is comparable with
+/// [`MAINTENANCE_PREFIXES`] and not with a topic or segment count.
+static EXPIRY_SKIPPED: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_expiry_skipped")
+        .with_description("prefix-ticks on which retention deleted nothing, by reason")
+        .build()
+});
+
+/// Greatest record timestamp (ms) of the **oldest surviving** segment under a
+/// prefix, after a retention scan (#509).
+///
+/// This is the number that has to cross `now - retention.ms` for the next expiry
+/// to happen, which makes it the plateau signal: **while it rises, the retention
+/// window is still filling; once it parks at roughly `retention.ms` behind now,
+/// the prefix is at steady state and its contribution to the index has stopped
+/// growing.** #476 needed exactly this and had to infer it from two bucket
+/// listings a day apart.
+///
+/// Exported as an absolute epoch timestamp rather than an age on purpose: it is
+/// recorded once per maintenance tick (10 m in production), so an age would read
+/// up to a full interval stale and an operator could not tell. Compute the age in
+/// the query — `time() * 1000 - tansu_prefix_oldest_retained_timestamp_ms` — and
+/// it is correct whatever the record and scrape cadences are.
+///
+/// It is the max footer timestamp of that segment, i.e. its *newest* record, not
+/// the oldest record under the prefix: retention is keyed on the newest record in
+/// a segment so a shared segment is never dropped while any topic in it is live,
+/// and this gauge reports the quantity the decision actually uses. Not recorded
+/// when a scan leaves no survivors — there is then nothing retained to describe.
+static OLDEST_RETAINED: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("tansu_prefix_oldest_retained_timestamp_ms")
+        .with_description("greatest record timestamp of the oldest surviving segment, by prefix")
+        .build()
+});
+
+/// Topics exempt from time-based expiry because their `cleanup.policy` is
+/// `compact` without `delete` (#175, #509).
+///
+/// By design: the latest value of a key must survive indefinitely, so a
+/// compact-only topic's routed prefix gets no retention threshold at all and
+/// `expire_prefix_segments` is never called for it. Recorded so that "this part
+/// of the bucket can never expire" is a legible policy decision rather than
+/// looking like retention failing to fire on it.
+///
+/// A gauge over topics, not prefixes: the exemption is decided per topic from its
+/// config, and computing the routed prefixes of the topics being skipped would
+/// add work to the threshold build to report a number nothing acts on.
+static RETENTION_EXEMPT_TOPICS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("tansu_prefix_retention_exempt_topics")
+        .with_description("topics exempt from time-based expiry by cleanup.policy")
         .build()
 });
 
@@ -9463,7 +9595,17 @@ impl DynoStore {
 
         self.record_prefix_oldest_retained(prefix, surviving_oldest_ms)?;
 
+        // The plateau signal (#509). Recorded here rather than inside
+        // `record_prefix_oldest_retained`, which is also called with `None` from
+        // the DeleteRecords path purely to *invalidate* the hint (#176) — that
+        // call says "rescan this prefix", not "nothing is retained", and
+        // exporting it would report a prefix as empty while it is full.
+        if let Some(oldest_ms) = retained_timestamp(surviving_oldest_ms) {
+            OLDEST_RETAINED.record(oldest_ms, &[KeyValue::new("prefix", prefix.to_string())]);
+        }
+
         if expirable.is_empty() {
+            EXPIRY_SKIPPED.add(1, &[KeyValue::new("reason", "nothing_expirable")]);
             return Ok(0);
         }
 
@@ -9485,6 +9627,7 @@ impl DynoStore {
         // — but it no longer drives redundant floor writes or deletes here.
         if self.acquire_compaction_lease(prefix).await.is_err() {
             debug!(prefix, "yielding segment expiry to the lease holder");
+            EXPIRY_SKIPPED.add(1, &[KeyValue::new("reason", "lease_held_elsewhere")]);
             return Ok(0);
         }
 
@@ -9558,8 +9701,52 @@ impl DynoStore {
             }
         }
 
+        // Size what is about to go, while the index still names it:
+        // `retire_segments` prunes these entries, so after it there is nothing
+        // left to measure. Summing `byte_len` from the cached footers keeps
+        // [`EXPIRY_BYTES_RECLAIMED`] free of object reads and of a size field on
+        // `CachedSegment` — the index is the term #476 is trying to shrink, so
+        // retention's own accounting must not grow it — and makes the figure a
+        // data-region total, each object's footer excluded.
+        //
+        // Over `expirable` rather than the whole prefix: a scan that finds nothing
+        // to expire is the common case (the mid-log fence, #471, holds old
+        // segments back routinely), and the fleet's worst prefix carries 25 779
+        // segments. This is O(expired), not O(prefix).
+        let expired_bytes: u64 = {
+            let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+
+            index
+                .get(prefix)
+                .map(|entry| {
+                    expirable
+                        .iter()
+                        .filter_map(|seq| entry.segments.get(seq))
+                        .flat_map(|cached| cached.footer.entries.iter())
+                        .map(|e| e.byte_len)
+                        .sum()
+                })
+                .unwrap_or_default()
+        };
+
         // Floor before delete, then prune (#77) — see [`Self::retire_segments`].
         let deleted = self.retire_segments(prefix, &expirable).await?;
+
+        // Report what retention removed (#509), after the delete rather than from
+        // `expirable`, so a counter never claims a bucket shrank on a delete that
+        // did not happen: `retire_segments` propagates a failed `DeleteObjects`
+        // chunk, taking this whole function with it, so reaching here means the
+        // set went in full and `deleted == expirable.len()`. There is deliberately
+        // no partial-success branch — that shape cannot occur, and writing one
+        // would only invent a case in which the bytes go uncounted.
+        //
+        // Bytes were measured above, before the prune took the entries away.
+        if deleted > 0 {
+            let prefix_label = [KeyValue::new("prefix", prefix.to_string())];
+
+            SEGMENTS_EXPIRED.add(deleted, &prefix_label);
+            EXPIRY_BYTES_RECLAIMED.add(expired_bytes, &prefix_label);
+        }
 
         // This process's next-offset hints and cached watermark floors for the
         // affected sub-streams predate the delete: drop them so the next read
@@ -11081,6 +11268,7 @@ impl DynoStore {
         const DEFAULT_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
 
         let mut retention_by_prefix: BTreeMap<String, i64> = BTreeMap::new();
+        let mut exempt_topics = 0u64;
 
         for metadata in self.topics_index().await?.iter() {
             let configs = metadata.topic.configs.as_deref().unwrap_or_default();
@@ -11109,6 +11297,11 @@ impl DynoStore {
             // engine follows. The legacy per-partition pass was the odd one out —
             // it read absent as retain-forever until #177 — and is gone (#179).
             if compact && !policy.contains("delete") {
+                // Counted, not merely skipped (#509): a compact-only topic's
+                // prefix never reaches `expire_prefix_segments` at all, so
+                // without this the bytes it holds forever are invisible to every
+                // retention metric and read as retention failing to fire.
+                exempt_topics += 1;
                 continue;
             }
 
@@ -11143,6 +11336,8 @@ impl DynoStore {
             }
         }
 
+        RETENTION_EXEMPT_TOPICS.record(exempt_topics, &[]);
+
         Ok(retention_by_prefix
             .into_iter()
             // Honour this tick's maintenance claim (#126): only expire prefixes
@@ -11157,6 +11352,7 @@ impl DynoStore {
     /// threshold yet (#49) — no LIST, no lease round-trip.
     async fn expire_prefix_segments_if_due(&self, prefix: &str, threshold_ms: i64) -> Result<u64> {
         if !self.prefix_maybe_expirable(prefix, threshold_ms)? {
+            EXPIRY_SKIPPED.add(1, &[KeyValue::new("reason", "not_due")]);
             return Ok(0);
         }
 
@@ -16458,6 +16654,49 @@ mod listed_population_tests {
     #[test]
     fn an_incremental_listing_has_no_population_to_report() {
         assert_eq!(None, listed_population(3, false));
+    }
+}
+
+#[cfg(test)]
+mod retained_timestamp_tests {
+    use super::retained_timestamp;
+
+    /// The ordinary case: a surviving segment's greatest record timestamp is what
+    /// has to cross `now - retention.ms` for the next expiry, so it is what the
+    /// plateau signal reports.
+    #[test]
+    fn a_surviving_segment_reports_its_timestamp() {
+        assert_eq!(
+            Some(1_788_363_546_000),
+            retained_timestamp(Some(1_788_363_546_000))
+        );
+    }
+
+    /// A scan that expired everything retains nothing, so there is no age to
+    /// describe — as distinct from describing it as zero, which would export the
+    /// prefix as holding data from 1970 and read as infinitely stale.
+    #[test]
+    fn no_survivors_report_nothing() {
+        assert_eq!(None, retained_timestamp(None));
+    }
+
+    /// The one that matters. `i64::MIN` reaches here from an empty footer's
+    /// `max_timestamp` fold, and `as u64` **wraps** rather than clamping: the
+    /// gauge would read 9 223 372 036 854 775 808 ms — the year 292 277 026 596 —
+    /// and `time() * 1000 - gauge` would go hugely negative instead of visibly
+    /// wrong. Rejected, leaving the last true reading in place.
+    #[test]
+    fn a_sentinel_timestamp_is_rejected_rather_than_wrapped() {
+        assert_eq!(None, retained_timestamp(Some(i64::MIN)));
+        assert_eq!(9_223_372_036_854_775_808, i64::MIN as u64);
+    }
+
+    /// The `last_modified_ms` fallback is only meaningful for an object a store
+    /// stamped. Zero and negative are both "unstamped", and neither is a time.
+    #[test]
+    fn an_unstamped_object_is_rejected() {
+        assert_eq!(None, retained_timestamp(Some(0)));
+        assert_eq!(None, retained_timestamp(Some(-1)));
     }
 }
 
