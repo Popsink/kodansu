@@ -2887,6 +2887,14 @@ fn coalesce_tuning(storage: &Url) -> CoalesceTuning {
                     )
                     .ok();
             }
+            "watermark_hint_ttl" => {
+                tuning.watermark_hint_ttl = human_units::Duration::from_str(value)
+                    .map(|duration| duration.0)
+                    .inspect_err(
+                        |err| warn!(storage = %storage, key = "watermark_hint_ttl", value, ?err),
+                    )
+                    .ok();
+            }
             // The shape of the coalescing prefix (#464). Not a threshold like
             // everything above: it decides *where* records live, is sealed per
             // cluster at store build (`DynoStore::sealed_prefix_shape`), and
@@ -3496,6 +3504,22 @@ mod tests {
         )?);
         assert_eq!(None, tuning.coalesce_linger);
         assert_eq!(None, tuning.coalesce_batches);
+        Ok(())
+    }
+
+    /// The watermark-view freshness window (#500): parsed as a human duration,
+    /// absent or unparseable keeps the compile-time default.
+    #[cfg(feature = "dynostore")]
+    #[test]
+    fn coalesce_tuning_parses_watermark_hint_ttl() -> Result<()> {
+        let tuning = coalesce_tuning(&Url::parse("s3://tansu/?watermark_hint_ttl=30s")?);
+        assert_eq!(Some(Duration::from_secs(30)), tuning.watermark_hint_ttl);
+
+        let absent = coalesce_tuning(&Url::parse("s3://tansu/")?);
+        assert_eq!(None, absent.watermark_hint_ttl);
+
+        let unparseable = coalesce_tuning(&Url::parse("s3://tansu/?watermark_hint_ttl=whenever")?);
+        assert_eq!(None, unparseable.watermark_hint_ttl);
         Ok(())
     }
 

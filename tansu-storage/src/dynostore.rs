@@ -377,6 +377,18 @@ pub struct DynoStore {
     coalesce_batches: usize,
     coalesce_bytes: usize,
 
+    /// How long the high-watermark view (per-partition hint and prefix index)
+    /// is served from memory before a read re-lists (#500). Defaults to
+    /// [`Self::HIGH_WATERMARK_HINT_TTL`] and overridable per deployment via
+    /// `watermark_hint_ttl`, so a fleet whose watermark readers are periodic
+    /// diagnostics (a lag check every 30s) can widen the window to match and
+    /// stay on the zero-request path. The cost is cross-replica visibility: a
+    /// peer replica's produce can stay invisible to this replica's
+    /// `ListOffsets(LATEST)` *and fetch* for up to the window. Staleness only
+    /// ever under-reports (the hint is monotonic, never above the true end),
+    /// and a same-replica produce advances the hint immediately.
+    watermark_hint_ttl: Duration,
+
     /// The shape of the coalescing prefix derivation (#464): how many leading
     /// components of a topic name form the prefix, and what separates them.
     /// [`Self::PREFIX_DEPTH`] / [`Self::PREFIX_SEPARATOR`] by default —
@@ -1259,6 +1271,15 @@ pub struct CoalesceTuning {
     /// (#192). Hard-coded at 10s before that issue, which is too small to admit
     /// a useful number of attempts once one attempt costs seconds.
     pub flush_max_elapsed: Option<Duration>,
+    /// Freshness window of the in-memory high-watermark view (#500): the
+    /// per-partition hint and the prefix index are served without a listing
+    /// while younger than this. Widening it keeps periodic wide `endOffsets`
+    /// callers (lag diagnostics) on the zero-request path; the price is that a
+    /// peer replica's produce stays invisible to `ListOffsets(LATEST)` and to
+    /// fetch on this replica for up to the window. Staleness only ever
+    /// under-reports the end offset, so a consumer acting on it sees
+    /// duplicates, never loss.
+    pub watermark_hint_ttl: Option<Duration>,
     /// The segment footer version this deployment writes (#442). See
     /// [`DynoStore::segment_format_version`] — including why raising it is a
     /// one-way move.
@@ -3142,6 +3163,7 @@ impl DynoStore {
             coalesce_linger: Self::COALESCE_LINGER,
             coalesce_batches: Self::COALESCE_BATCHES,
             coalesce_bytes: Self::COALESCE_BYTES,
+            watermark_hint_ttl: Self::HIGH_WATERMARK_HINT_TTL,
             prefix_depth: Self::PREFIX_DEPTH,
             prefix_separator: Self::PREFIX_SEPARATOR.to_owned(),
             segment_format_version: SEGMENT_FORMAT_VERSION_V3,
@@ -3247,6 +3269,7 @@ impl DynoStore {
                 .maintenance_recency
                 .unwrap_or(self.maintenance_recency),
             flush_max_elapsed: tuning.flush_max_elapsed.unwrap_or(self.flush_max_elapsed),
+            watermark_hint_ttl: tuning.watermark_hint_ttl.unwrap_or(self.watermark_hint_ttl),
             segment_format_version: tuning
                 .segment_format_version
                 .unwrap_or(self.segment_format_version),
@@ -3403,6 +3426,10 @@ impl DynoStore {
     /// `ListObjectsV2` per poll in steady state (#40). Read-committed is
     /// unaffected in semantics — a stale (lower) high watermark can only *delay*
     /// visibility, never expose unstable offsets.
+    ///
+    /// The compile-time default; overridable per deployment via
+    /// `watermark_hint_ttl` (#500, [`Self::coalesce_tuning`]), so the window can
+    /// be aligned with the cadence of the fleet's watermark readers.
     const HIGH_WATERMARK_HINT_TTL: Duration = Duration::from_secs(5);
 
     /// Default coalescing flush triggers (#50), whichever is reached first:
@@ -4172,7 +4199,7 @@ impl DynoStore {
                     let fresh = hint.listed_at.is_some_and(|at| {
                         SystemTime::now()
                             .duration_since(at)
-                            .is_ok_and(|elapsed| elapsed < Self::HIGH_WATERMARK_HINT_TTL)
+                            .is_ok_and(|elapsed| elapsed < self.watermark_hint_ttl)
                     });
                     fresh.then_some(hint.next)
                 })
@@ -5943,7 +5970,7 @@ impl DynoStore {
 
                 let fresh = entry.refreshed_at.is_some_and(|at| {
                     now.duration_since(at)
-                        .is_ok_and(|elapsed| elapsed < Self::HIGH_WATERMARK_HINT_TTL)
+                        .is_ok_and(|elapsed| elapsed < self.watermark_hint_ttl)
                 });
 
                 // Due only for an index that holds something: a cold one has
