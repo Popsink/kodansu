@@ -2744,6 +2744,43 @@ fn message_max_bytes(storage: &Url) -> usize {
         .unwrap_or(DynoStore::MESSAGE_MAX_BYTES)
 }
 
+/// `?batch_min_size=` — the smallest produce batch
+/// [`ProduceRequestBatcher`](crate::batch::ProduceRequestBatcher) will flush,
+/// or `None` for its own default. Unparseable values warn and fall back rather
+/// than failing the build: a bad tuning knob is not worth refusing to start
+/// over.
+#[cfg(feature = "dynostore")]
+fn batch_minimum_size(storage: &Url) -> Option<usize> {
+    storage.query_pairs().find_map(|(k, v)| {
+        if k == "batch_min_size" {
+            human_units::Size::from_str(v.as_ref())
+                .map(|size| size.0)
+                .inspect_err(|err| warn!(%storage, v = v.as_ref(), ?err))
+                .ok()
+                .and_then(|size| usize::try_from(size).ok())
+        } else {
+            None
+        }
+    })
+}
+
+/// `?batch_max_delay=` — how long the produce batcher will hold a batch short of
+/// [`batch_minimum_size`] before flushing it anyway. As above, `None` means the
+/// batcher's default.
+#[cfg(feature = "dynostore")]
+fn batch_maximum_delay(storage: &Url) -> Option<Duration> {
+    storage.query_pairs().find_map(|(k, v)| {
+        if k == "batch_max_delay" {
+            human_units::Duration::from_str(v.as_ref())
+                .map(|duration| duration.0)
+                .inspect_err(|err| warn!(%storage, v = v.as_ref(), ?err))
+                .ok()
+        } else {
+            None
+        }
+    })
+}
+
 /// Parse the auto-topic-creation policy from the storage URL query string
 /// (`?auto_create_topics=false&num_partitions=3&default_replication_factor=2`),
 /// falling back to [`AutoTopicCreate::default`] for any absent or unparseable key.
@@ -2966,28 +3003,8 @@ impl Builder<i32, String, Url, Url> {
 
                 let bucket_name = self.storage.host_str().unwrap_or("tansu");
 
-                let minimum_size = self.storage.query_pairs().find_map(|(k, v)| {
-                    if k == "batch_min_size" {
-                        human_units::Size::from_str(v.as_ref())
-                            .map(|size| size.0)
-                            .inspect_err(|err| warn!(storage = %self.storage, v = v.as_ref(), ?err))
-                            .ok()
-                            .and_then(|size| usize::try_from(size).ok())
-                    } else {
-                        None
-                    }
-                });
-
-                let maximum_delay = self.storage.query_pairs().find_map(|(k, v)| {
-                    if k == "batch_max_delay" {
-                        human_units::Duration::from_str(v.as_ref())
-                            .map(|duration| duration.0)
-                            .inspect_err(|err| warn!(storage = %self.storage, v = v.as_ref(), ?err))
-                            .ok()
-                    } else {
-                        None
-                    }
-                });
+                let minimum_size = batch_minimum_size(&self.storage);
+                let maximum_delay = batch_maximum_delay(&self.storage);
 
                 warn_deprecated_layout_flags(&self.storage);
 
@@ -3045,28 +3062,8 @@ impl Builder<i32, String, Url, Url> {
 
                 let bucket_name = self.storage.host_str().unwrap_or("tansu");
 
-                let minimum_size = self.storage.query_pairs().find_map(|(k, v)| {
-                    if k == "batch_min_size" {
-                        human_units::Size::from_str(v.as_ref())
-                            .map(|size| size.0)
-                            .inspect_err(|err| warn!(storage = %self.storage, v = v.as_ref(), ?err))
-                            .ok()
-                            .and_then(|size| usize::try_from(size).ok())
-                    } else {
-                        None
-                    }
-                });
-
-                let maximum_delay = self.storage.query_pairs().find_map(|(k, v)| {
-                    if k == "batch_max_delay" {
-                        human_units::Duration::from_str(v.as_ref())
-                            .map(|duration| duration.0)
-                            .inspect_err(|err| warn!(storage = %self.storage, v = v.as_ref(), ?err))
-                            .ok()
-                    } else {
-                        None
-                    }
-                });
+                let minimum_size = batch_minimum_size(&self.storage);
+                let maximum_delay = batch_maximum_delay(&self.storage);
 
                 warn_deprecated_layout_flags(&self.storage);
 
@@ -3095,6 +3092,101 @@ impl Builder<i32, String, Url, Url> {
                             .with_rate_per_second(NonZeroU32::new(1))
                             .with_jitter(Some(Duration::from_millis(50)))
                     })
+                    .map(|object_store| {
+                        DynoStore::new(self.cluster_id.as_str(), self.node_id, object_store)
+                            .advertised_listener(self.advertised_listener.clone())
+                            .auto_create(auto_topic_create(&self.storage))
+                            .topic_defaults(self.topic_defaults.clone())
+                            .coalesce_tuning(coalesce_tuning(&self.storage))
+                            .message_max_bytes(message_max_bytes(&self.storage))
+                    })
+                    .map_err(Error::from)?
+                    .sealed_prefix_shape()
+                    .await
+                    .map(|storage| {
+                        ProduceRequestBatcher::new(storage)
+                            .with_minimum_size(minimum_size)
+                            .with_maximum_delay(maximum_delay)
+                    })
+                    .map(|storage| Box::new(storage) as Box<dyn Storage>)
+                    .map(Arc::new)
+            }
+
+            // Azure Data Lake Storage Gen2, hierarchical namespace on (#418).
+            //
+            // `abfss://<container>@<account>.dfs.core.windows.net/` is canonical:
+            // it is what an ADLS Gen2 user already writes, and it carries the
+            // account. `az://<container>/` is the short form, with the account
+            // from `AZURE_STORAGE_ACCOUNT_NAME`.
+            //
+            // The whole URL goes to `with_url` rather than being taken apart
+            // here the way the `s3` arm takes its bucket from `host_str()`,
+            // because the container is the URL's *username* in the canonical
+            // form and its host in the short one — and `object_store`'s parser
+            // already tells the two apart. That parser reads scheme, host and
+            // username only, so every scheme-independent query parameter
+            // (`batch_min_size`, `coalesce_*`, …) passes through untouched.
+            //
+            // `object_store` speaks the *blob* endpoint against an ADLS Gen2
+            // account, so a `dfs` host in the URL is resolved to
+            // `<account>.blob.core.windows.net`. A tenant whose network team
+            // provisioned a private endpoint for the `dfs` sub-resource only —
+            // the usual default for a data-lake account — will not reach us.
+            //
+            // Reads do not work yet: Azure has no suffix range GET and the
+            // segment footer lives at the tail of the object, so every fetch
+            // fails until the translating decorator lands (#419). That split is
+            // deliberate.
+            #[cfg(feature = "dynostore")]
+            "abfss" | "abfs" | "az" => {
+                use object_store::azure::MicrosoftAzureBuilder;
+
+                use crate::batch::ProduceRequestBatcher;
+
+                let minimum_size = batch_minimum_size(&self.storage);
+                let maximum_delay = batch_maximum_delay(&self.storage);
+
+                warn_deprecated_layout_flags(&self.storage);
+
+                debug!(?minimum_size, ?maximum_delay);
+
+                // Credentials come from the environment and nowhere else:
+                // `from_env` already covers account key, client secret, MSI and
+                // workload identity federation (`AZURE_FEDERATED_TOKEN_FILE`).
+                // The last is the AKS path, and the direct analogue of IRSA in
+                // the serverless roadmap (#364).
+                MicrosoftAzureBuilder::from_env()
+                    .with_url(self.storage.as_str())
+                    // Azure throttles at the *account* and storage-partition
+                    // level (`503 ServerBusy`, `500 OperationTimedOut`), not per
+                    // object. That is S3's failure shape, not GCS's, so this
+                    // takes the `s3` arm's long, gentle budget and deliberately
+                    // not the `gs` arm's fail-fast one — which exists only
+                    // because a GCS per-object throttle cannot be won by
+                    // waiting (#13).
+                    .with_retry(RetryConfig {
+                        backoff: BackoffConfig {
+                            init_backoff: Duration::from_millis(200),
+                            max_backoff: Duration::from_secs(30),
+                            base: 2.0,
+                        },
+                        max_retries: 32,
+                        retry_timeout: Duration::from_secs(300),
+                    })
+                    // Two things this arm deliberately does *not* do, both of
+                    // which the arms above it do:
+                    //
+                    // No `PutRateLimiter`. `gcs/limit.rs` is a workaround for
+                    // GCS capping a single object at ~1 write/s (#13); Azure's
+                    // per-blob ceiling is ~500 req/s. Wrapping the store here
+                    // would be cargo-culting a fix for a limit that does not
+                    // exist, and it would cost a real per-put delay.
+                    //
+                    // No `with_conditional_put`. Azure implements natively what
+                    // S3 needs `S3ConditionalPut::ETagMatch` to opt into, and
+                    // create-only puts plus etag CAS are what this layout is
+                    // built on.
+                    .build()
                     .map(|object_store| {
                         DynoStore::new(self.cluster_id.as_str(), self.node_id, object_store)
                             .advertised_listener(self.advertised_listener.clone())
@@ -3456,6 +3548,73 @@ mod tests {
             storage.is_ok(),
             "a URL carrying the removed keys must still start"
         );
+        Ok(())
+    }
+
+    /// #418: the Azure schemes we accept, and the Azure-adjacent ones we do not.
+    ///
+    /// `object_store`'s own parser accepts `adl://`, `azure://` and
+    /// `https://<account>.blob.core.windows.net/` as well, and this arm
+    /// deliberately does not: `abfss://` is what an ADLS Gen2 user writes and
+    /// `az://` is the short form, and every extra alias is another spelling a
+    /// deployment can drift onto. `wasbs://` is the legacy Blob scheme and is
+    /// the one someone migrating is most likely to try — it must fail loudly
+    /// rather than be quietly treated as Gen2.
+    ///
+    /// This asserts the *routing*, not a working store: building an Azure store
+    /// needs an account, and `--storage-engine` reaching `ping()` is asserted
+    /// against a real ADLS Gen2 account (#417), not here.
+    #[cfg(feature = "dynostore")]
+    #[tokio::test]
+    async fn azure_adjacent_schemes_are_unsupported() -> Result<()> {
+        for url in [
+            "wasbs://tansu@acct.blob.core.windows.net/",
+            "wasb://tansu@acct.blob.core.windows.net/",
+            "adl://tansu/",
+            "azure://tansu/",
+            "https://acct.blob.core.windows.net/tansu",
+        ] {
+            let storage = StorageContainer::builder()
+                .cluster_id("tansu")
+                .node_id(111)
+                .advertised_listener(Url::parse("tcp://localhost:9092")?)
+                .storage(Url::parse(url)?)
+                .build()
+                .await;
+
+            assert!(
+                matches!(storage, Err(Error::UnsupportedStorageUrl(_))),
+                "{url} must not resolve to a storage engine, got {storage:?}",
+            );
+        }
+
+        Ok(())
+    }
+
+    /// #418: every query parameter is scheme-independent, including on Azure.
+    ///
+    /// The tuning knobs are read off the URL by free functions that never look
+    /// at the scheme, so this is a property of the parsing rather than of the
+    /// arm — which is exactly why it is worth pinning. The `s3` and `gs` arms
+    /// each carried their own copy of the two batch readers before this ticket;
+    /// a third copy is how one arm silently stops honouring a knob.
+    #[cfg(feature = "dynostore")]
+    #[test]
+    fn storage_url_query_parameters_are_scheme_independent() -> Result<()> {
+        let url = Url::parse(
+            "abfss://tansu@acct.dfs.core.windows.net/\
+             ?batch_min_size=32k&batch_max_delay=250ms\
+             &message_max_bytes=8m\
+             &auto_create_topics=false\
+             &prefix_compact_min_segments=512",
+        )?;
+
+        assert_eq!(Some(32 * 1_024), batch_minimum_size(&url));
+        assert_eq!(Some(Duration::from_millis(250)), batch_maximum_delay(&url));
+        assert_eq!(8 * 1_024 * 1_024, message_max_bytes(&url));
+        assert!(!auto_topic_create(&url).enable);
+        assert_eq!(Some(512), coalesce_tuning(&url).prefix_compact_min_segments,);
+
         Ok(())
     }
 
