@@ -196,6 +196,9 @@ pub use service::{
 };
 
 #[cfg(feature = "dynostore")]
+mod azure;
+
+#[cfg(feature = "dynostore")]
 mod gcs;
 
 #[cfg(feature = "dynostore")]
@@ -3133,15 +3136,16 @@ impl Builder<i32, String, Url, Url> {
             // provisioned a private endpoint for the `dfs` sub-resource only —
             // the usual default for a data-lake account — will not reach us.
             //
-            // Reads do not work yet: Azure has no suffix range GET and the
-            // segment footer lives at the tail of the object, so every fetch
-            // fails until the translating decorator lands (#419). That split is
-            // deliberate.
+            // Azure has no suffix range GET and the segment footer lives at
+            // the tail of the object, so the store is wrapped in `SuffixRange`,
+            // which translates each one into a `head` plus a bounded range
+            // (#419). Without it every fetch fails and `probe_prefix_tail`
+            // degrades to a permanent LIST fallback.
             #[cfg(feature = "dynostore")]
             "abfss" | "abfs" | "az" => {
                 use object_store::azure::MicrosoftAzureBuilder;
 
-                use crate::batch::ProduceRequestBatcher;
+                use crate::{azure::suffix::SuffixRange, batch::ProduceRequestBatcher};
 
                 let minimum_size = batch_minimum_size(&self.storage);
                 let maximum_delay = batch_maximum_delay(&self.storage);
@@ -3187,6 +3191,7 @@ impl Builder<i32, String, Url, Url> {
                     // create-only puts plus etag CAS are what this layout is
                     // built on.
                     .build()
+                    .map(SuffixRange::new)
                     .map(|object_store| {
                         DynoStore::new(self.cluster_id.as_str(), self.node_id, object_store)
                             .advertised_listener(self.advertised_listener.clone())
