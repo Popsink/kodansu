@@ -23,6 +23,7 @@ use crate::{Error, Result, Topition};
 
 use super::{DynoStore, ServedEnd, Watermark};
 
+mod azure_suffix;
 mod compact_segments;
 mod corrupt_region;
 mod delete_groups;
