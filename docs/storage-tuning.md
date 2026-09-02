@@ -539,6 +539,63 @@ These series have been misread in cost analyses, so:
   a 24 ms mean and the brokers 350 ms against the same bucket. Same region, same
   objects; the difference is on the client side.
 
+### Is the object store bounded? (retention metrics, #509)
+
+Broker memory is proportional to the bucket's segment count — the prefix index is
+the dominant term (#476) — so "will this bucket stop growing?" and "will this
+replica stop growing?" are the same question. These four series answer it:
+
+| Series | Type | Reading |
+|---|---|---|
+| `tansu_prefix_segments_expired_total{prefix}` | counter | Segments retention deleted. The retention half of `tansu_prefix_segment_creates_total`: **creates − expiries is the bucket's net segment growth**, and a bucket at steady state has them equal over a window. |
+| `tansu_prefix_expiry_bytes_reclaimed_total{prefix}` | counter | Sub-stream region bytes reclaimed. Summed from cached footers, so it excludes each object's own footer and reads slightly under what a listing shows going away. |
+| `tansu_prefix_oldest_retained_timestamp_ms{prefix}` | gauge | **The plateau signal** — see below. |
+| `tansu_prefix_expiry_skipped_total{reason}` | counter | Prefix-ticks on which retention deleted nothing. Every reason is a correct outcome; it exists because "deleted nothing" and "never ran" are otherwise indistinguishable. |
+
+**The plateau signal.** `tansu_prefix_oldest_retained_timestamp_ms` is the greatest
+record timestamp of the *oldest surviving* segment under a prefix — the value that
+has to cross `now - retention.ms` for the next expiry to happen. So:
+
+```promql
+# age of the oldest retained data, in seconds
+(time() * 1000 - tansu_prefix_oldest_retained_timestamp_ms) / 1000
+```
+
+> **While that age rises, the retention window is still filling and the bucket is
+> still growing. Once it parks at roughly `retention.ms`, the prefix is at steady
+> state and its contribution to the index has stopped growing.**
+
+It is exported as an absolute epoch timestamp rather than an age on purpose: it is
+recorded once per maintenance tick, so an age would read up to a full
+`maintenance_interval` stale with no way for a reader to tell. It is also the
+segment's *newest* record, not the oldest record in the prefix — retention keys on
+the newest record so a shared segment is never dropped while any topic in it is
+live, and the gauge reports the quantity the decision actually uses.
+
+**Skip reasons**, in descending order of how often you will see them:
+
+- `not_due` — the per-prefix oldest-retained hint proved nothing could be past the
+  threshold, so the tick skipped without a LIST or a lease round-trip (#49). The
+  normal case. **The one to watch:** a prefix reporting `not_due` for ever *while
+  its segment count climbs* has a wrong hint, and the gauge above says which.
+- `nothing_expirable` — the prefix was scanned and every segment is either young or
+  held by the mid-log fence (#471), which refuses to delete a segment out of the
+  middle of a sub-stream's offset space even when its records are all old. Expected
+  on a prefix whose offset order and timestamp order disagree (a CDC backfill
+  stamping source timestamps); its physical debt is bounded by that disorder.
+- `lease_held_elsewhere` — a peer maintainer holds the compaction lease and is doing
+  this prefix's expiry (#115). Expected on a multi-maintainer fleet. Sustained
+  across *every* replica means nobody is acquiring it.
+
+**`tansu_prefix_retention_exempt_topics`** counts topics whose `cleanup.policy` is
+`compact` without `delete`. Those get no retention threshold at all by design — the
+latest value of a key must survive indefinitely — so their prefixes never appear in
+any of the series above. A non-zero reading is the difference between "that part of
+the bucket can never expire, by policy" and "retention is broken on it".
+
+An absent `cleanup.policy` is **not** exempt: it falls through to Kafka's default,
+`delete` at 7 days (#223).
+
 ## Coalescing vs the `batch_*` request batcher
 
 There are two independent write-batching paths:
