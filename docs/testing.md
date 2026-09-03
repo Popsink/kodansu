@@ -308,6 +308,41 @@ handling rather than about a store. The one exception is a unit test in
 `src/service/delete_groups.rs`, which builds a real store and cannot reach
 `tests/common`; it runs on `memory://` only.
 
+**No client library, of any language, is driven against a broker.** The suite
+calls the services directly through `rama`, so what it can check is that a
+response matches this repo's reading of the message definition — not that a
+client accepts it. #515 is what that costs: `GetTelemetrySubscriptionsResponse`
+documents `ClientInstanceId` as "assigned client instance id if ClientInstanceId
+was 0 in the request, **else 0**", the service implemented that sentence, and
+`tansu-storage/tests/get_telemetry_subscriptions.rs` asserted the 0. It read as
+a conformance test. It was a transcription of the same misreading, so it would
+have passed forever — while every Java client in the fleet, from `alpha.5` on,
+took an `IllegalArgumentException` out of `poll()` 300 s after start, because
+the reference client rejects that field non-zero unconditionally.
+
+The lesson is narrower than "add a Java client to CI": a test written from the
+same document as the code under test is one statement, asserted twice. Where the
+reference implementation and the message definition can disagree — and KIP-714
+is not the only place they do — read `apache/kafka`, and say in the test which
+one is the contract.
+
+Driving a real client is still the only thing that would have caught it, and it
+does not need CI to be useful. #515 was verified by hand this way, and the recipe
+is short enough to repeat:
+
+```shell
+cargo build --bin tansu --features dynostore
+target/debug/tansu broker --storage-engine=memory://tansu/ &
+# a JDK, kafka-clients on the classpath, a KafkaConsumer polling in a loop,
+# org.apache.kafka.common.telemetry at DEBUG, left running for 340 s
+```
+
+Two subscription intervals is the shortest run that proves anything here,
+because the first `GetTelemetrySubscriptions` carries a zero id and the second
+carries the assigned one — the whole defect is in the difference. `340 s`
+rather than `340 ms` is why no unit test was ever going to be the thing that
+found it.
+
 **`tansu-topic`.** The `tansu topic` subcommand is at or near 0%. It is a thin
 shell over code that is covered, but it has no test that would notice if the
 shell stopped delegating.
