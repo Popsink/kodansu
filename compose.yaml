@@ -36,6 +36,32 @@ services:
       retries: 1
       start_period: 5s
       timeout: 5s
+  # Microsoft's own Blob emulator (#420). Blob only — `azurite-blob` rather than
+  # `azurite` — because the queue and table services are 10001/10002 and nothing
+  # here speaks either.
+  #
+  # No `--skipApiVersionCheck`: `object_store` pins `x-ms-version: 2023-11-03`
+  # (`azure/credential.rs:49`) and this image accepts it, which was worth
+  # confirming rather than assuming — the flag would have hidden a real
+  # incompatibility behind a green run.
+  #
+  # What a green run here does NOT prove is in `docs/testing.md`, next to the
+  # job. Three things, and the sharp one is that `object_store` detects the
+  # emulator and bypasses `startFrom` entirely.
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite
+    command: azurite-blob --blobHost 0.0.0.0 --location /data
+    volumes:
+      - azurite:/data
+    ports:
+      - 10000:10000
+    healthcheck:
+      # The image is Alpine with no bash, so not minio's `/dev/tcp` idiom.
+      test: nc -z 127.0.0.1 10000 || exit 1
+      interval: 5s
+      retries: 3
+      start_period: 5s
+      timeout: 5s
   tansu:
     image: ${TANSU_IMAGE}
     restart: unless-stopped
@@ -76,6 +102,8 @@ configs:
     file: etc/prometheus.yaml
 volumes:
   minio:
+    driver: local
+  azurite:
     driver: local
   grafana:
     driver: local

@@ -49,6 +49,22 @@ test-conditional-put url="memory://tansu/":
     TANSU_TEST_STORAGE_URL="{{ url }}" \
       cargo nextest run --package tansu-storage --all-features -E 'binary(conditional_put)'
 
+# The same conformance target against Azurite — the first backend where it runs
+# on every PR rather than nightly or never (#420, docs/testing.md).
+#
+# A recipe of its own rather than `just test-conditional-put az://tansu/`,
+# because that form would need `AZURE_STORAGE_USE_EMULATOR` in the caller's
+# environment, and the one place it could come from silently is `.env` — see
+# `broker-az` for why that is the wrong place for it.
+#
+# Read `docs/testing.md` before trusting a green run here. It proves conditional
+# put against a real implementation of `If-None-Match`, which is more than S3 or
+# GCS get today; it proves nothing about `list_with_offset`, hierarchical
+# namespace or throttling.
+test-conditional-put-azurite: az-up
+    AZURE_STORAGE_USE_EMULATOR=true TANSU_TEST_STORAGE_URL="az://tansu/" \
+      cargo nextest run --package tansu-storage --all-features -E 'binary(conditional_put)'
+
 # Many groups at once: the program exit criterion for #359.
 #
 # `#[ignore]`d in the suite because it is wall clock rather than a regression
@@ -175,6 +191,16 @@ minio-local-alias: (minio-mc "alias" "set" "local" "http://localhost:9000" "mini
 minio-tansu-bucket: (minio-mc "mb" "local/tansu")
 
 minio-ready-local: (minio-mc "ready" "local")
+
+azurite-up: (docker-compose-up "azurite")
+
+azurite-down: (docker-compose-down "azurite")
+
+# The container, which Azurite starts without. `etc/azurite-container.py` says
+# why this is a signed REST call rather than a CLI: Azurite ships no client, and
+# the Azure CLI image is ~500 MB to pull on a per-PR job.
+azurite-tansu-container:
+    python3 etc/azurite-container.py tansu
 
 tansu-up: (docker-compose-up "tansu")
 
@@ -376,6 +402,20 @@ broker-null profile="profiling": (build profile "default") (tansu-broker profile
 s3-up: docker-compose-down minio-up minio-ready-local minio-local-alias minio-tansu-bucket
 
 broker-s3 profile="profiling": (build profile "dynostore") s3-up (tansu-broker profile "--storage-engine=s3://tansu/")
+
+# Azurite and the `tansu` container, the `s3-up` shape for ADLS Gen2 (#420).
+az-up: docker-compose-down azurite-up azurite-tansu-container
+
+# `AZURE_STORAGE_USE_EMULATOR` is set here rather than in `.env` on purpose: it
+# rewrites the account to Azurite's development pair and the endpoint to
+# `AZURITE_BLOB_STORAGE_URL` (default `http://127.0.0.1:10000`), so a stray copy
+# of it in an operator's environment would silently point a real deployment at
+# localhost. `broker-s3` can take its credentials from `.env` because
+# `AWS_ENDPOINT` fails loudly when it is wrong; this does not.
+broker-az profile="profiling": (build profile "dynostore") az-up
+    AZURE_STORAGE_USE_EMULATOR=true \
+      target/{{ replace(profile, "dev", "debug") }}/tansu broker \
+      --storage-engine=az://tansu/ 2>&1 >broker.log
 
 samply-null profile="profiling":
     cargo build --profile {{ profile }} --bin tansu

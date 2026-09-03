@@ -29,7 +29,20 @@ just test-storage                          # memory://tansu/, same as just test
 just test-storage-minio                    # starts minio in compose, runs on s3://tansu/
 just test-storage s3://my-bucket/          # any bucket, credentials from the AWS_* env
 just test-conditional-put s3://tansu/      # only the conformance target
+just test-conditional-put-azurite          # starts Azurite in compose, runs on az://tansu/
 ```
+
+`test-conditional-put-azurite` is a recipe of its own rather than
+`just test-conditional-put az://tansu/`, because the emulator needs
+`AZURE_STORAGE_USE_EMULATOR=true` and the only place that could come from
+silently is `.env`. It rewrites the account to Azurite's development pair and
+the endpoint to localhost, so a stray copy in an operator's environment would
+point a real deployment at nothing — `AWS_ENDPOINT` fails loudly when it is
+wrong, this does not.
+
+For the broker rather than the suite, `just broker-az` is the `broker-s3` shape:
+Azurite in compose, the `tansu` container created, and
+`--storage-engine=az://tansu/`.
 
 Two helpers in `tansu-storage/tests/common/mod.rs` make that work, and a new test
 should use both rather than hardcoding a URL:
@@ -103,8 +116,9 @@ maintenance work-splitting is a per-prefix lease. `InMemory`
 target that pins them, and it runs against whichever store
 `TANSU_TEST_STORAGE_URL` names.
 
-Verified green on both `memory://` and `s3://` against minio (`object_store`
-0.14.1, `quay.io/minio/minio`):
+Verified green on `memory://`, on `s3://` against minio and on `az://` against
+Azurite (`object_store` 0.14.1, `quay.io/minio/minio`,
+`mcr.microsoft.com/azure-storage/azurite`):
 
 | property | how it is pinned |
 |---|---|
@@ -118,6 +132,15 @@ Verified green on both `memory://` and `s3://` against minio (`object_store`
 The whole `tansu-storage` suite — 324 tests, not just the conformance target —
 also passes on `s3://` against minio, twice in a row against an already-populated
 bucket, which is what establishes that the per-test prefixing actually isolates.
+
+**Azurite is the only one of the three that runs on every PR** (#420). minio's
+run is nightly (`storage.yml`) and GCS has never had one, so before this the
+per-PR evidence for conditional put was `InMemory` emulating it behind a mutex.
+`just test-conditional-put-azurite` needs nothing but Docker, and the
+`conditional-put-azurite` job in `pr.yml` feeds `all-green`.
+
+That is a real gain and it is also the *whole* gain. What a green Azurite run
+does not prove is below, and it is not a short list.
 
 ### One divergence between `InMemory` and S3
 
@@ -196,6 +219,38 @@ owner.
 
 ## What is not covered
 
+**Azure, as opposed to Azurite — three exclusions, and the first is the sharp
+one.** The `conditional-put-azurite` job in `pr.yml` is the only per-PR evidence
+we have of a conditional put against a real implementation, which makes it
+tempting to read a green badge as "Azure is tested". It is not.
+
+1. **`list_with_offset` is not exercised at all.** `object_store` detects the
+   emulator and bypasses `startFrom`, falling back to client-side filtering over
+   a full listing (`azure/mod.rs`, citing Azurite#2619). So the tail-offset
+   listing `scan_from` depends on for its O(new) prefix-index refresh is the one
+   thing the emulator structurally cannot check — and a client-side filter
+   returns the *same set*, so nothing goes red. Answered against a real HNS
+   account instead (#417): `startFrom` is honoured server-side and is
+   **inclusive**, which `object_store` compensates for by dropping the leading
+   exact match.
+2. **Azurite has no hierarchical namespace**, so nothing here covers ADLS Gen2
+   as such: not directory entries in listings, not the directory residue a
+   delete leaves behind, not Blob Batch on HNS, not the `/`-sorts-lowest
+   ordering. All four were answered by hand, once, against a real HNS account
+   (#417, findings in `docs/rfc-adls.md` §4 and §5) — and "once, by hand" is
+   exactly as durable as it sounds.
+3. **It does not throttle.** Azure throttles at account and storage-partition
+   level, which is the failure shape the `abfss` arm's retry budget is written
+   against (`lib.rs`, the S3-shaped 32/300 s). Nothing here tests that budget.
+
+A fourth, from #419 and worth stating because it changes what a smoke test is
+worth: a broker **reads its own writes from its own `PrefixIndex`** and never
+reads a segment footer back. So a single-process produce-then-consume passes on
+Azure even with the suffix-range translation removed entirely. Any read-path
+check has to involve a second broker over the same container, or a restarted one
+— `just broker-az`, produce, restart, consume is the smallest version that
+actually exercises it.
+
 **GCS.** `gs://` is a supported target and every test in the conformance target
 would run against it unchanged — that is the whole point of the URL being a
 parameter — but none of them ever has. Generation preconditions remain assumed
@@ -271,8 +326,21 @@ real.
 | `check-no-default-features` | every crate still compiles with its optional features off |
 | `build-storage` | the binary links |
 | `test` | nextest over the workspace, plus doc tests |
+| `conditional-put-azurite` | the conformance target against a real `If-None-Match`, not an emulation of one |
 | `coverage` | line coverage, floored |
-| `all-green` | one status summarising the six above |
+| `all-green` | one status summarising the seven above |
+
+`conditional-put-azurite` is the one exception to the paragraph above, and it is
+worth being precise about why. It is Docker-dependent, so it is deliberately not
+upstream of `test` — it feeds `all-green` only, and becomes enforced when branch
+protection moves. What earns it a place on the PR path at all is that no other
+job can establish what it establishes: every other test in the workspace runs on
+`memory://`, and conditional put is precisely where `InMemory` and a real store
+diverge. It is also cheap, because Azurite needs no credentials and no bucket
+setup beyond one signed REST call (`etc/azurite-container.py`).
+
+Read the Azure exclusions under *What is not covered* before treating it as
+evidence about ADLS Gen2. It is evidence about conditional put.
 
 There is no `check` job: `clippy` runs over the same `--workspace --all-features
 --all-targets` selection and type-checks before it lints, so a separate
