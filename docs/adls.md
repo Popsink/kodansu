@@ -12,8 +12,12 @@ would be a claim CI cannot stand behind.
 
 So what has been verified against a real hierarchical-namespace account was
 verified **once, by hand** (#417) — true of `object_store` 0.14.1 on 3 September
-2026, and nothing will notice if a future version changes it. Re-run that spike
-before promoting this backend, or when `object_store` changes its Azure client.
+2026, and nothing will notice if a future version changes it. Before promoting
+this backend, or when `object_store` changes its Azure client, reproduce that
+spike from [docs/rfc-adls.md](rfc-adls.md) §4 and §5: they record the method and
+the observed result for each question, deliberately, because the harness itself
+was throwaway and is not in the tree.
+
 [docs/testing.md](testing.md) is precise about the shape of the gap.
 
 ## The URL
