@@ -23,9 +23,8 @@ use tansu_sans_io::{
     DeleteTopicsRequest, DescribeAclsRequest, DescribeClientQuotasRequest, DescribeClusterRequest,
     DescribeConfigsRequest, DescribeGroupsRequest, DescribeTopicPartitionsRequest,
     DescribeUserScramCredentialsRequest, EndTxnRequest, FetchRequest, FindCoordinatorRequest,
-    GetTelemetrySubscriptionsRequest, IncrementalAlterConfigsRequest, InitProducerIdRequest,
-    ListGroupsRequest, ListOffsetsRequest, ListPartitionReassignmentsRequest, MetadataRequest,
-    ProduceRequest, TxnOffsetCommitRequest,
+    IncrementalAlterConfigsRequest, InitProducerIdRequest, ListGroupsRequest, ListOffsetsRequest,
+    ListPartitionReassignmentsRequest, MetadataRequest, ProduceRequest, TxnOffsetCommitRequest,
 };
 use tansu_service::{FrameRequestLayer, FrameRouteBuilder, NoResponse};
 use tansu_storage::{
@@ -34,15 +33,39 @@ use tansu_storage::{
     DeleteRecordsService, DeleteTopicsService, DescribeAclsService, DescribeClientQuotasService,
     DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
     DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
-    FindCoordinatorService, GetTelemetrySubscriptionsService, IncrementalAlterConfigsService,
-    InitProducerIdService, ListGroupsService, ListOffsetsService,
-    ListPartitionReassignmentsService, MetadataService, ProduceService, Storage,
-    TxnAddOffsetsService, TxnAddPartitionService, TxnEndService, TxnOffsetCommitService,
+    FindCoordinatorService, IncrementalAlterConfigsService, InitProducerIdService,
+    ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService, MetadataService,
+    ProduceService, Storage, TxnAddOffsetsService, TxnAddPartitionService, TxnEndService,
+    TxnOffsetCommitService,
 };
 use tracing::warn;
 
 use crate::Error;
 
+/// The [`Storage`]-backed routes, and with them the API keys this broker
+/// advertises: `ApiVersionsService::supported` is derived from the routes
+/// registered here (`FrameRouteBuilder::build`), so this list *is* the
+/// advertisement.
+///
+/// **`GetTelemetrySubscriptions` (api_key 71) is deliberately absent** (#515).
+/// KIP-714 is a two-call protocol and only the handshake was ever implemented:
+/// `PushTelemetry` (api_key 72) has no route, `requested_metrics` was answered
+/// empty and always would be, because nothing in this fork configures a
+/// subscription. Advertising 71 bought a capability the broker does not have,
+/// 20 % of all Kafka API traffic at its peak (#410), and one class of bug with
+/// a real blast radius — answering the field wrong threw
+/// `IllegalArgumentException` out of every Java client's `poll()`.
+///
+/// Not advertising it is the path clients are written for, and it is silent:
+/// `NetworkClient.doSend` aborts the internal request locally with
+/// `UnsupportedVersionException`, `ClientTelemetryReporter.handleFailedRequest`
+/// takes the non-retryable branch, suppresses the warn log for exactly that
+/// exception, and sets the retry interval to `Integer.MAX_VALUE`. No request
+/// reaches the wire and telemetry stays off for the life of the client.
+///
+/// [`tansu_storage::GetTelemetrySubscriptionsService`] is still correct and
+/// still tested; it is what anything re-adding the route should inherit. Re-add
+/// it with api_key 72, or not at all.
 pub fn services<S>(
     builder: FrameRouteBuilder<(), Error>,
     storage: S,
@@ -72,7 +95,6 @@ where
         end_txn,
         fetch,
         find_coordinator,
-        get_telemetry_subscriptions,
         incremental_alter_configs,
         init_producer_id,
         list_groups,
@@ -656,27 +678,6 @@ where
                 FrameRequestLayer::<ProduceRequest>::new(),
             )
                 .into_layer(Acks(ProduceService))
-                .boxed(),
-        )
-        .map_err(Into::into)
-}
-
-pub fn get_telemetry_subscriptions<S>(
-    builder: FrameRouteBuilder<(), Error>,
-    storage: S,
-) -> Result<FrameRouteBuilder<(), Error>, Error>
-where
-    S: Storage + Clone,
-{
-    builder
-        .with_route(
-            GetTelemetrySubscriptionsRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<GetTelemetrySubscriptionsRequest>::new(),
-            )
-                .into_layer(GetTelemetrySubscriptionsService)
                 .boxed(),
         )
         .map_err(Into::into)
