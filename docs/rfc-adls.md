@@ -74,16 +74,29 @@ The coalesced-segment reader is built entirely on suffix GETs — the footer ind
 lives at the *tail* of the object (#58/#64), and the read path never learns the
 object length first. Four call sites, all hot:
 
-| Site | Function | Role |
-|---|---|---|
-| `dynostore.rs:4790` | `read_segment_footer` | speculative 64 KiB tail (`SEGMENT_FOOTER_OVER_READ`, `dynostore.rs:1591`) |
-| `dynostore.rs:4822` | `read_segment_footer` | exact `[footer‖trailer]` for an oversized footer |
-| `dynostore.rs:4985` | `fold_segment_footer` | fold a lost create-CAS without a LIST (#411) |
-| `dynostore.rs:5105` | `probe_prefix_tail` | tail probe; **a 404 here is the absence proof** |
+| Function | Role |
+|---|---|
+| `read_segment_footer` | speculative 64 KiB tail (`SEGMENT_FOOTER_OVER_READ`) |
+| `read_segment_footer` | exact `[footer‖trailer]` for an oversized footer |
+| `fold_segment_footer` | fold a lost create-CAS without a LIST (#411) |
+| `probe_prefix_tail` | tail probe; **a 404 here is the absence proof** |
 
-On Azure today: every fetch fails, and `probe_prefix_tail` degrades to permanent
-`Inconclusive` — so every read falls back to a LIST, which is the expensive tier
-and precisely what #411/#412 exist to avoid.
+*(Located by name rather than by line: the line numbers revision 2 carried are
+~1200 lines stale.)*
+
+On Azure without the decorator: `probe_prefix_tail` degrades to permanent
+`Inconclusive`, so every read falls back to a LIST — the expensive tier, and
+precisely what #411/#412 exist to avoid.
+
+**And a fetch fails, but only from a replica that did not write the segment.**
+Revision 2 said "every fetch fails", which is the more alarming and less useful
+statement. A writer's flush populates its own `PrefixIndex` with the footers it
+just wrote and never reads one back, so it serves its own partition perfectly
+well. Measured while implementing #419: the same four-record partition reads
+`Ok(4)` in the writing process and `NotSupported` from any other one. That is
+every replica in a fleet and none in a single-process test — which is why #420's
+Azurite job cannot be the thing that catches a regression here, and why the
+#419 tests all read from a second store over the same bucket.
 
 ### 3.1 Options
 
@@ -112,6 +125,19 @@ revisited only if Azure read amplification shows up in the bill.
 
 ## 4. Questions revision 1 left open, now answered
 
+**Spike, 3 September 2026 (#417).** Four of the answers below were behaviours of
+a hierarchical-namespace account rather than statements in a reference, and
+Azurite has no hierarchical namespace, so they were run against a purpose-made
+account: `StorageV2`, `Standard_LRS`, hot tier, **HNS enabled**, `northeurope`
+(`westeurope` refuses new customers). Two layers, because the questions are not
+all about the same one — raw `List Blobs` / `Delete Blob` over the REST API with
+`x-ms-version: 2023-11-03` for what the *service* does, and `object_store` 0.14.1
+for what the broker actually sees. Each finding below says which layer observed
+it. The harness was throwaway and is not in the tree; the deliverable is this
+section.
+
+One result contradicts revision 2 outright, and it is §5.2.
+
 ### 4.1 `startFrom` is not HNS-gated, and our `x-ms-version` is new enough
 
 Revision 1's highest-risk unknown. Answered by the `List Blobs` reference:
@@ -131,10 +157,31 @@ the `ResourceType` list element that the HNS directory filter depends on
 `object_store` already reconciles this by dropping a leading exact match
 (`azure/client.rs:1276-1302`). So `scan_from` keeps its O(new) refresh.
 
-**Residual risk, and it is the sharp one:** `object_store` detects the emulator
-and bypasses `startFrom` entirely, falling back to client-side filtering
-(`azure/mod.rs:127-140`, Azurite issue #2619). **An Azurite-green CI run proves
-nothing about `list_with_offset`.** That one assertion needs a real account.
+**Observed, and this was revision 1's highest-risk unknown, so it is worth the
+detail.** At the REST layer, `prefix=q1/&startFrom=q1/0009.seg` over ten seeded
+blobs returned **one** entry. The offset at the last name is the sharp form of
+the question: a client-side filter and a server-side skip are indistinguishable
+from an offset in the middle, which is why asserting through `list_with_offset`
+proves less than it looks. One entry means the *service* skipped. Two further
+observations:
+
+- the entry returned was `q1/0009.seg` itself, confirming `startFrom` is
+  inclusive — so the exclusive semantics `list_with_offset` presents are
+  `object_store` dropping the first entry, not Azure's;
+- `startFrom=q1/0004.zzz`, a name that does not exist, resumed at `q1/0005.seg`.
+  The offset need not name a real blob, which matters because
+  `segment_location(prefix, seq)` is synthesised from a cached sequence and may
+  name a segment a peer has since retired.
+
+Through `object_store`, offsetting at the fifth of ten returned exactly five and
+excluded the offset. **So `scan_from` keeps its O(new) refresh on ADLS Gen2, and
+this ticket does not become a redesign.**
+
+**The CI hedge stands, because it is about CI and not about Azure:**
+`object_store` detects the emulator and bypasses `startFrom` entirely, falling
+back to client-side filtering (`azure/mod.rs:127-140`, Azurite issue #2619). **An
+Azurite-green run still proves nothing about `list_with_offset`** — what changed
+is that the behaviour is now known, not that the emulator can check it.
 
 ### 4.2 HNS sort order does not reach us — and that is a property to preserve
 
@@ -157,9 +204,19 @@ directory. `segment_prefix` is `clusters/{cluster}/prefixes/{prefix}/segments/`
 (`dynostore.rs:4100`). Every key in a `scan_from` shares the full prefix and the
 remainder contains no `/` — so there is nothing for the `/` rule to reorder.
 
-**This is now a constraint, not an observation.** Any future layout that puts a
-`/` *below* the listing prefix, and relies on ordering across it, is correct on
-S3 and wrong on ADLS. It belongs in a comment next to `segment_location`.
+**Observed.** Four blobs seeded as `q5/a-b`, `q5/a.b`, `q5/a/b`, `q5/a0b` came
+back from a recursive `List Blobs` in the order
+
+    q5/a/b, q5/a-b, q5/a.b, q5/a0b
+
+against the ASCII order `a-b, a.b, a/b, a0b` (`-`=0x2D, `.`=0x2E, `/`=0x2F,
+`0`=0x30). `/` does sort lowest, ahead of both characters a Kafka topic name
+admits, so the divergence is real and not a documentation artefact.
+
+**This is therefore a constraint, not an observation.** Any future layout that
+puts a `/` *below* the listing prefix, and relies on ordering across it, is
+correct on S3 and wrong on ADLS. It belongs in a comment next to
+`segment_location`.
 
 ### 4.3 CI account: same question as GCS, one answer
 
@@ -171,7 +228,19 @@ hole exists because nobody owned an account.
 So this is not an Azure decision: it is one decision about **who owns
 credentials for a nightly non-emulator run**, answered once for `gs://` and
 `az://` together. Until it is answered, the Azurite job (§7) is the ceiling of
-what we can claim, and §4.1's residual risk stays open.
+what we can claim.
+
+**One datapoint from #417, because it changes the calculus rather than the
+decision.** Standing up a throwaway HNS account was three commands — register
+`Microsoft.Storage`, `az group create`, `az storage account create
+--enable-hierarchical-namespace true` — plus one `Storage Blob Data Contributor`
+assignment, and the whole spike (a few hundred one-byte blobs, deleted) costs
+pennies. The obstacle to a nightly Azure run is therefore *ownership of a
+credential*, not provisioning effort or spend. That is the same obstacle GCS has,
+and it is worth saying plainly: nothing technical is in the way.
+
+Note also that §4.1's specific residual risk is now closed by observation — the
+emulator still cannot check `startFrom`, but we know what a real account does.
 
 ## 5. ADLS Gen2 / hierarchical namespace
 
@@ -179,6 +248,17 @@ what we can claim, and §4.1's residual risk stays open.
 works against HNS accounts. Per *Known issues with Azure Data Lake Storage*, the
 unsupported Blob REST APIs are all page-blob / append-blob / incremental-copy
 operations — **none that we call**. Blob Batch is not listed as unsupported.
+
+**Blob Batch observed working on HNS, across the chunk boundary.** 300 blobs
+deleted through `object_store`'s `delete_stream` — which chunks at 256, so this
+was two batch requests — reported 300 deletions and left the prefix empty. The
+five `delete_stream` call sites in `dynostore` are sound as written.
+
+The timing is a second datapoint and it is the one that matters for §6.1: the
+same 300 blobs took **12.2 s** to create one `Put Blob` at a time and **393 ms**
+to delete in two batches. Batching is ~31x on wall clock. It is not a saving on
+transactions — each subrequest is billed, so those two batches are 302 billed
+transactions, not 2.
 
 ### 5.1 Directory entries in listings — already handled
 
@@ -189,42 +269,73 @@ operations — **none that we call**. Blob Batch is not listed as unsupported.
 (`azure/client.rs:1339`), which is shared by both `list` and
 `list_with_delimiter`. So directory placeholders do not reach `segment_seq_of`.
 
-Note they are still *enumerated* — we pay to list them and then discard them.
-With one directory level per topic-partition prefix, that is a permanent
-per-listing overhead proportional to topic count, and it is the kind of thing
-the 1500-topic rig would show.
+**Observed, and the answer has two halves.** The filter works: listing one level
+up from a segments directory returned **five** entries over raw REST — two
+`ResourceType=directory` and three `file` — and **three** through `object_store`.
+It is load-bearing, not belt-and-braces, for any layout that nests below a
+listing prefix.
 
-### 5.2 Empty directories are a new GC obligation — the biggest new finding
+But it never fires on the listing we actually issue. An undelimited raw list of
+`…/prefixes/org.env.conn/segments/` returned three entries, all
+`ResourceType=file`, and no directory. That follows from the layout rather than
+from luck: `segment_location` appends `{seq:0>20}.seg` with no `/` in it, so a
+`segments/` directory has no directory children to enumerate — the same property
+§4.2 turns into a constraint.
+
+**So revision 2's "permanent per-listing overhead proportional to topic count"
+is wrong, and it is retracted.** We do not pay to enumerate and discard a
+directory per prefix on the refresh path, because there is none below the listing
+prefix. Nothing for the 1500-topic rig to show here.
+
+### 5.2 Empty directories are residue, not a leak — revision 2 was wrong here
 
 > If you use the `Delete Blob` API to delete a directory, the directory is
 > deleted only if it's empty. This condition means that you can't use the Blob
 > API to delete directories recursively.
 
-Retention deletes segment blobs. It never deletes the
-`clusters/…/prefixes/…/segments/` directories that HNS materialised to hold them.
-So on ADLS Gen2, **deleting a topic leaves its directory skeleton behind
-forever** — invisible in `object_store` listings, but real objects, enumerated on
-every undelimited list and counted in ACL evaluation.
+Retention deletes segment blobs. It does not delete the
+`clusters/…/prefixes/…/segments/` directories that HNS materialised to hold them,
+and that much is confirmed: after deleting all three segments under a seeded
+prefix, an undelimited list still returned `q3/prefixes`,
+`q3/prefixes/org.env.conn` and `q3/prefixes/org.env.conn/segments`, all
+`ResourceType=directory`.
 
-`object_store` exposes no recursive-delete and does not speak the DFS endpoint
-(`Path - Delete?recursive=true`), which is the only API that cleans this up. So
-the options are:
+**But revision 2 called this "the biggest new finding" and concluded the skeleton
+survives *forever*, and that is wrong.** It read "cannot delete recursively" as
+"cannot delete", on the evidence of a `409` returned by `Delete Blob` against the
+*top* of the skeleton. `409` is what a non-empty directory returns. Deleting the
+same skeleton **deepest-first** through the plain Blob API returned `202` on
+every one, and left the prefix empty:
 
-1. **Accept the leak.** Directories are not billed for capacity. The cost is
-   listing overhead and an untidy account. Simplest, and probably correct for a
-   first release.
+    DELETE q3/prefixes/org.env.conn/segments  -> 202
+    DELETE q3/prefixes/org.env.conn           -> 202
+    DELETE q3/prefixes                        -> 202
+
+And the DFS endpoint's recursive delete works on the same account with the same
+bearer token — `DELETE …dfs.core.windows.net/{container}/q3?recursive=true` →
+`200`, one call.
+
+So the residue is real, and it is removable two ways, one of which needs nothing
+`object_store` does not already do. The options, re-weighed:
+
+1. **Accept the residue.** Directories are not billed for capacity, and §5.1 now
+   says they are not enumerated on the refresh path either — so the cost is an
+   untidy account and an undelimited list that nobody on the hot path issues.
 2. **Delete directories bottom-up in `maintain`**, once a prefix's last segment
-   goes. Doable through the Blob API (`Delete Blob` on an empty directory), but
-   it races every writer that is about to re-create the prefix — and the race
-   loses in the direction that matters, because a re-create is a `PutMode::Create`
-   that would now have to re-materialise the parent.
-3. **Add a DFS-endpoint recursive delete** for topic deletion only, as a
-   narrowly-scoped raw call outside `object_store`. Blocked on the same
-   credential-access problem as §6.2.
+   goes. Now known to work through the Blob API, at one `Delete Blob` per level.
+   The race with a writer about to re-create the prefix is the real objection and
+   it is unchanged: a re-create is a `PutMode::Create` that would have to
+   re-materialise the parent, and losing that race costs a produce.
+3. **DFS-endpoint recursive delete** for topic deletion only. Now known to work,
+   and topic deletion is the one path with no concurrent writer to race, which is
+   what made (2) unattractive. It is a raw call outside `object_store`, using the
+   credential we already hold.
 
-**Recommendation: (1), documented, with (3) revisited if an account ever
-accumulates enough dead prefixes to matter.** This is worth an explicit decision
-rather than a discovery in production.
+**Recommendation: still (1) for a first release, but the reason has changed.** It
+is no longer "we cannot fix this" — it is "this is not worth fixing yet", with
+(3) available for topic deletion whenever an account accumulates enough dead
+prefixes to matter. That is a much cheaper position than revision 2's, and it
+means §5.2 is not a blocker on anything.
 
 ### 5.3 Private endpoints need both sub-resources
 
@@ -250,6 +361,12 @@ connections, not money. On S3, DELETE requests are not billed at all — which
 means the maintenance delete flood, currently a free-but-throttled path (#5, #6,
 `UPSTREAM_ISSUE_object_store_deleteobjects.md`), becomes a **billed** path on
 Azure, at the "other operations" tier.
+
+**Observed (#417).** 300 blobs deleted through `delete_stream`, which chunks at
+256, is two batch requests and **302** billed transactions — not 2. The same 300
+took 12.2 s to create one at a time against 393 ms to delete in two batches, so
+what batching buys is wall clock (~31x), and it buys nothing on the bill. That is
+the shape §6.1 asserts, now measured rather than derived from the reference.
 
 This should be modelled before the first customer, not after. `docs/storage-tuning.md`
 already has the S3 request-bill section to extend.
@@ -292,6 +409,16 @@ The container must therefore be created with:
 - **no immutability / legal-hold policy** — it would break the delete path;
 - **hot tier** — cool/cold add per-GB read charges this access pattern pays
   constantly.
+
+**Observed (#417): a freshly created account already satisfies all four.** On a
+`StorageV2` / HNS account created with `az storage account create
+--enable-hierarchical-namespace true --access-tier Hot` and nothing else,
+`blob-service-properties` reports `isVersioningEnabled: null`,
+`deleteRetentionPolicy.enabled: false` and `containerDeleteRetentionPolicy:
+null`. So this contract is **"do not turn these on"**, not "remember to turn them
+off" — which is a materially easier thing to write in a deployment doc, and it
+means the failure mode is a tenant who hardened an existing data-lake account
+rather than one who followed the default path.
 
 These belong in the docs and, ideally, in a `ping()`-time warning.
 
@@ -351,9 +478,9 @@ axis in the build matrix. Revisit only if binary size bites.
 
 | PR | Content |
 |---|---|
-| 1 | Live spike against a real ADLS Gen2 account: `list_with_offset` with `startFrom` (§4.1), directory entries in listings (§5.1), empty-directory residue after delete (§5.2), Blob Batch on HNS (§5). Findings appended here. No product code. |
-| 2 | `object_store` `azure` feature; `abfss`/`az`/`abfs` arm in `Builder::build` (`lib.rs:2732`), S3-shaped retry, no rate limiter. Fetch still broken. |
-| 3 | Suffix-range decorator (§3, option A) + unit tests over `InMemory` with suffix rejection injected. Fetch works. |
+| 1 | **Done (#417).** Live spike against a real ADLS Gen2 account: `list_with_offset` with `startFrom` (§4.1), directory entries in listings (§5.1), empty-directory residue after delete (§5.2), Blob Batch on HNS (§5), and HNS sort order (§4.2, which #421 depends on). Findings in §4 and §5. No product code. |
+| 2 | **Done (#418).** `object_store` `azure` feature; `abfss`/`az`/`abfs` arm in `Builder::build`, S3-shaped retry, no rate limiter. Fetch still broken. |
+| 3 | **Done (#419).** Suffix-range decorator (§3, option A) + unit tests over `InMemory` with suffix rejection injected. Fetch works. |
 | 4 | Azurite in `compose.yaml`, `just az-up` / `just broker-az`, `just test-conditional-put az://tansu/` wired into `pr.yml` with §7's exclusions written down. |
 | 5 | `example.env`, README storage table, account-configuration contract (§6.3), private-endpoint note (§5.3), the ordering constraint comment at `segment_location` (§4.2). |
 | 6 | `docs/storage-tuning.md`: Azure transaction model, including the billed-delete change (§6.1). |
