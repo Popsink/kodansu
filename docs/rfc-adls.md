@@ -6,10 +6,19 @@
 Storage Gen2** (Blob Storage with hierarchical namespace enabled).
 **Non-goal:** running Kodansu against an S3-compatible gateway in front of ADLS.
 
-> Revision 2 resolves three of revision 1's open questions from the Azure REST
-> reference and from `object_store`'s source. It also surfaces two things
-> revision 1 missed, both consequences of HNS: an empty-directory GC obligation
-> (§5.2) and a retention path that is billed on Azure but free on S3 (§6).
+> Revision 2 resolved three of revision 1's open questions from the Azure REST
+> reference and from `object_store`'s source, and surfaced two more it claimed
+> were consequences of HNS: an empty-directory GC obligation (§5.2) and a
+> retention path billed on Azure but free on S3 (§6.1).
+>
+> **Revision 3 retracts both of those.** The directory residue is removable —
+> deepest-first through the plain Blob API, or one recursive call against the DFS
+> endpoint — and deletes are free on Azure exactly as on S3. Both were verified
+> against a real hierarchical-namespace account and against Microsoft's own
+> billing references (#417, #422). Revision 3 also closes revision 2's four
+> remaining HNS unknowns by observation, and the answers are in §4 and §5. Two
+> smaller claims are retracted along the way, in §5.1 and §6.3 — every retraction
+> in the direction of less work.
 
 ## 1. Why not the S3 gateway
 
@@ -349,18 +358,32 @@ docs; it will otherwise be someone's afternoon.
 
 ## 6. Costs and the retention path
 
-### 6.1 Deletes are free on S3 and billed on Azure
+### 6.1 Deletes are free on Azure too — revision 2 was wrong, and #422 retracted it
 
-`Blob Batch` billing:
+Revision 2 read the `Blob Batch` billing note
 
 > The `Blob Batch` REST request is counted as one transaction, and each
 > individual subrequest is also counted as one transaction.
 
-So a 256-blob batch delete is **257** transactions. Batching on Azure saves
-connections, not money. On S3, DELETE requests are not billed at all — which
-means the maintenance delete flood, currently a free-but-throttled path (#5, #6,
-`UPSTREAM_ISSUE_object_store_deleteobjects.md`), becomes a **billed** path on
-Azure, at the "other operations" tier.
+as meaning a 256-blob batch delete costs 257 *billed* transactions, and built a
+whole cost concern on it. **It is a statement about counting, not charging.**
+The `Delete Blob` reference is explicit — *"Storage accounts are not charged for
+`Delete Blob` requests"* — the pricing page's fourth category is verbatim "All
+other Operations (per 10,000), except Delete, which is free", and the retail
+prices API returns a real zero-priced `Hot LRS Delete Operations` meter.
+
+So the maintenance delete flood is free-but-throttled on **both** backends, and
+the "deletes are free" assumption carries over intact. #5, #6 and
+`UPSTREAM_ISSUE_object_store_deleteobjects.md` stay about throttling, and no
+tuning knob acquires a cost dimension.
+
+What *is* different, measured and written up in `docs/storage-tuning.md`: a list
+is billed as a **read** on ADLS Gen2 where S3 prices `LIST` with `PUT`, which is
+~9× cheaper and drops the LIST plane from 18 % of a measured fleet's bill to
+under 2 %; and read/write transactions are metered **per 4 MiB**, which makes
+`prefix_compact_target_bytes` (default `16m`) four write transactions per merged
+segment. Re-pricing that fleet end to end gives ~1.11× the S3 bill, almost all of
+it the ~1.30× hierarchical-namespace write premium.
 
 **Observed (#417).** 300 blobs deleted through `delete_stream`, which chunks at
 256, is two batch requests and **302** billed transactions — not 2. The same 300

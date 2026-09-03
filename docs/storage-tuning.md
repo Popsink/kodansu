@@ -596,6 +596,131 @@ the bucket can never expire, by policy" and "retention is broken on it".
 An absent `cleanup.policy` is **not** exempt: it falls through to Kafka's default,
 `delete` at 7 days (#223).
 
+## The Azure transaction bill
+
+The same fleet, re-priced for ADLS Gen2. Read this after *The S3 request bill* —
+it is the same measurement, and what changes is which planes are expensive.
+
+### #422's premise was wrong: deletes are free on Azure too
+
+This section was filed (#422) on the reading that a `Blob Batch` delete costs
+257 transactions, from the batch reference:
+
+> The `Blob Batch` REST request is counted as one transaction, and each
+> individual subrequest is also counted as one transaction.
+
+That is a statement about *counting*, not about charging. The `Delete Blob`
+reference is explicit:
+
+> Storage accounts are not charged for `Delete Blob` requests.
+
+And the pricing page's fourth transaction category is, verbatim, **"All other
+Operations (per 10,000), except Delete, which is free"** — which the retail
+prices API confirms as a real zero-priced meter, `Hot LRS Delete Operations`, at
+`$0.0`.
+
+So **the retention delete flood is free on Azure exactly as it is on S3**, and
+the "deletes are free" assumption *does* carry over. #5, #6 and
+`UPSTREAM_ISSUE_object_store_deleteobjects.md` remain about throttling, on both
+backends. Nothing in `maintenance_recency` or the `coalesce_*` knobs acquires a
+cost dimension it did not have.
+
+### What is actually different: LIST
+
+| operation | S3 (eu-west-3) | ADLS Gen2 (west-europe, hot, LRS, HNS) |
+|---|---|---|
+| write / PUT | $0.054 / 10 k | $0.070 / 10 k |
+| read / GET | $0.0043 / 10 k | $0.006 / 10 k |
+| **list** | **$0.054 / 10 k** — priced with PUT | **$0.006 / 10 k** — priced as a *read* |
+| delete | free | free |
+| `head` / `Get Blob Properties` | $0.0043 / 10 k | $0.006 / 10 k ("other") |
+
+Retail prices read 3 September 2026; **quote your own region and redundancy from
+the pricing page rather than these figures.** What is stable is the *shape*:
+
+- **write : read is ~11.7× on Azure and ~12.6× on S3** — near-identical, so
+  every conclusion in the S3 section about PUTs dominating carries over
+  unchanged;
+- **a list costs ~9× less on ADLS Gen2 than on S3.** ADLS Gen2 bills
+  `ListFilesystemFile` as a *read* operation, where S3 prices `LIST` with `PUT`.
+  This is the one structural difference that matters to this broker;
+- **hierarchical namespace is ~1.30× flat Blob Storage on writes** ($0.070 vs
+  $0.054), which is the documented ~15–20 % HNS premium, at the high end.
+
+The same fleet — 10 brokers, 0.23 MiB/s of produce, 34 put/s, 388 get/s,
+15 list/s, 4 delete/s:
+
+| class | rate | S3 $/day | Azure $/day | Azure share |
+|---|---|---|---|---|
+| `put_opts` | 34 /s | $15.90 | $20.56 | 50 % |
+| `get_opts` | 388 /s | $14.42 | $20.11 | 49 % |
+| `list*` | 15 /s | $6.86 | **$0.78** | **1.9 %** |
+| `delete_stream` | 4 /s | free | free | — |
+| **total** | | **$37.18** | **$41.45** | 1.11× S3 |
+
+**The headline is the last two rows, and neither is the one #422 expected.** The
+LIST plane falls from 18 % of the bill to under 2 %, and the delete plane is free
+on both. An ADLS Gen2 deployment of this workload costs ~1.11× the S3 one, and
+the difference is almost entirely the HNS write premium — not requests we issue
+differently.
+
+The corollary is a tuning one: **the LIST-avoidance work is worth an order of
+magnitude less on Azure than on S3.** #411, #412 and the tail probe are still
+right — a list is still a list, and the latency and the read amplification are
+unchanged — but if the argument for a further LIST optimisation is purely the
+bill, on Azure it is arguing about 2 %.
+
+### The 4 MiB transaction, which *is* a new dimension
+
+ADLS Gen2 meters read and write transactions **per 4 MiB of payload**, unlike S3
+and flat Blob Storage, where a request is a request:
+
+- an operation under 4 MiB is one full transaction — a 7 KiB segment write and a
+  4 MiB one cost the same;
+- an operation over 4 MiB is `ceil(bytes / 4 MiB)` transactions. A 16 MiB write
+  is four.
+
+Where that lands on our knobs:
+
+| knob | default | transactions per operation on ADLS Gen2 |
+|---|---|---|
+| `coalesce_bytes` | `1M` | 1 — under the boundary, so raising `coalesce_linger` divides the write count exactly as it does on S3 |
+| `prefix_compact_target_bytes` | `16m` | **4** — every merged segment write bills four times |
+| footer over-read | 64 KiB | 1 |
+| fetch region GET | region-sized | 1 below 4 MiB |
+
+**`prefix_compact_target_bytes` is the one to know about.** At the default 16 MiB
+a compaction that merges 256 segments into 16 writes one object and pays for
+four — so on Azure the size trigger has a cost consequence the S3 section does
+not describe. It is still overwhelmingly worth it (256 write transactions become
+4), and the reason the default is kept modest is the create-CAS race in #130
+rather than cost, so nothing here argues for changing it. It does mean the
+arithmetic in *Bounding the segment count* understates the Azure saving rather
+than overstating it.
+
+The same rule makes the extra request #419's suffix-range decorator issues cheap
+in the right way: a `Get Blob Properties` bills as "other", which is the read
+rate, so the size probe costs exactly what the ranged GET it enables costs. The
+size-caching optimisation the ADLS RFC defers (§3, option B) would halve the
+count of that plane at read-tier prices — on this fleet, single dollars a day.
+Worth doing when read amplification shows up in latency, not in the bill.
+
+### Cool and cold are not a saving here
+
+`docs/adls.md` requires the hot tier, and the meters say why. Same region and
+redundancy, per 10 k:
+
+| tier | read | write | data $/GB/month |
+|---|---|---|---|
+| hot | $0.006 | $0.070 | $0.020 |
+| cool | $0.013 (2.2×) | $0.130 (1.9×) | $0.010 |
+| cold | $0.130 (21.7×) | $0.234 (3.3×) | $0.0045 |
+
+Cold trades a 4.4× storage saving for a **21.7×** read-transaction cost, plus
+per-GB retrieval. This backend's bill is requests and not bytes — that is the
+first sentence of the S3 section — so a tier that trades bytes for requests is
+backwards for it at any volume where the trade is visible.
+
 ## Coalescing vs the `batch_*` request batcher
 
 There are two independent write-batching paths:
