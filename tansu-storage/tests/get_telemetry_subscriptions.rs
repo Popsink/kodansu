@@ -55,13 +55,22 @@ async fn req() -> Result<(), Error> {
     Ok(())
 }
 
-/// KIP-714's two halves of the same sentence (#410).
+/// A client is answered with the id it presents (#515).
 ///
-/// The message definition says `ClientInstanceId` is the "assigned client
-/// instance id if ClientInstanceId was 0 in the request, **else 0**". A fresh
-/// `Uuid::new_v4()` was minted on every request, so a client that identified
-/// itself with the id this broker had given it was told, every five seconds,
-/// that its id had changed — which is the one thing the field exists to prevent.
+/// Two ways to get this wrong, and this fork has shipped both. Before #410 a
+/// fresh `Uuid::new_v4()` was minted on every request, so a client that
+/// identified itself with the id this broker had given it was told, every five
+/// seconds, that its id had changed — the one thing the field exists to
+/// prevent. #446 then implemented the message definition's "assigned client
+/// instance id if ClientInstanceId was 0 in the request, **else 0**" verbatim,
+/// and that sentence is not obeyable:
+/// `ClientTelemetryUtils.validateClientInstanceId` rejects `ZERO_UUID` on
+/// *every* response, so a returning client threw `IllegalArgumentException`
+/// out of `poll()` — one per Java client per process, from `alpha.5` on.
+///
+/// This test asserted the zero. It reads as a conformance test and encoded the
+/// misreading, so it would have passed forever. Both halves are pinned now:
+/// the id is neither reassigned nor zeroed.
 #[tokio::test]
 async fn an_already_assigned_instance_id_is_not_reassigned() -> Result<(), Error> {
     let _guard = init_tracing()?;
@@ -97,8 +106,12 @@ async fn an_already_assigned_instance_id_is_not_reassigned() -> Result<(), Error
 
     assert_eq!(ErrorCode::None, ErrorCode::try_from(returning.error_code)?);
     assert_eq!(
+        assigned, returning.client_instance_id,
+        "an id the client already holds must be echoed, not reassigned",
+    );
+    assert_ne!(
         [0; 16], returning.client_instance_id,
-        "an id the client already holds must not be reassigned",
+        "a zero id in a response is rejected by the reference client on sight",
     );
 
     Ok(())

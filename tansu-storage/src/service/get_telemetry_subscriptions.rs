@@ -58,8 +58,10 @@ use crate::{Error, Result, Storage};
 /// # Ok(())
 /// # }
 /// ```
-/// The `ClientInstanceId` a client sends before it has been assigned one, and the
-/// value KIP-714 requires the broker to answer with once it has.
+/// The `ClientInstanceId` a client sends before it has been assigned one.
+///
+/// It is only ever a *request* value. A response carrying it is rejected by the
+/// reference client on sight — see the response's assignment below (#515).
 const UNASSIGNED_CLIENT_INSTANCE_ID: [u8; 16] = [0; 16];
 
 /// How long a client is told to wait before asking again when there is **no**
@@ -111,20 +113,30 @@ where
     ) -> Result<Self::Response, Self::Error> {
         let _ = ctx;
 
-        // KIP-714, verbatim from the message definition: "Assigned client
-        // instance id if ClientInstanceId was 0 in the request, else 0." The
-        // request's field is documented "must be set to 0 on the first request",
-        // so a non-zero one is the id this broker already handed out and the
-        // client is identifying itself with it.
+        // The request's field is documented "must be set to 0 on the first
+        // request", so a non-zero one is the id this broker already handed out
+        // and the client is identifying itself with it. Mint one only in the
+        // first case; echo it in the second. Either way the response carries a
+        // non-zero id.
         //
-        // This minted a fresh `Uuid::new_v4()` on *every* request, so a client
-        // was told its instance id had changed each time it asked — which is
-        // exactly what the field exists to prevent, and it is inert here only
-        // because nothing collects the metrics it identifies.
+        // The *response* field is documented "Assigned client instance id if
+        // ClientInstanceId was 0 in the request, **else 0**", and that half of
+        // the sentence cannot be obeyed (#515).
+        // `ClientTelemetryUtils.validateClientInstanceId` rejects null *and*
+        // `ZERO_UUID`, unconditionally, on every response — so a broker
+        // answering 0 throws `IllegalArgumentException` out of the Java
+        // client's `poll()`. `apache/kafka`'s own `ClientMetricsManager` never
+        // answers 0 either: it filters `Uuid.ZERO_UUID` out of the request and
+        // otherwise reuses what the request carried. The reference
+        // implementation is the contract; the message definition is not.
+        //
+        // Before that, this minted a fresh `Uuid::new_v4()` on *every* request,
+        // so a client was told its instance id had changed each time it asked —
+        // which is the one thing the field exists to prevent.
         let client_instance_id = if req.client_instance_id == UNASSIGNED_CLIENT_INSTANCE_ID {
             *Uuid::new_v4().as_bytes()
         } else {
-            UNASSIGNED_CLIENT_INSTANCE_ID
+            req.client_instance_id
         };
 
         Ok(GetTelemetrySubscriptionsResponse::default()
