@@ -5198,6 +5198,16 @@ impl DynoStore {
     /// two cannot disagree about which listed objects are segments — a
     /// reconciler that parsed one name differently from the refresher would drop
     /// live entries.
+    ///
+    /// It is also what would reject an ADLS Gen2 directory entry, and it has
+    /// never had to. An undelimited `List Blobs` on a hierarchical-namespace
+    /// account returns directories alongside blobs, but a `segments/` directory
+    /// has no directory children — [`Self::segment_location`] appends
+    /// `{seq:0>20}.seg` with no `/` — so the listing is all files. Observed on a
+    /// real HNS account (#417), where the level *above* returns two directory
+    /// entries and `segments/` returns none. `object_store` filters
+    /// `ResourceType == "directory"` in any case; that filter is load-bearing
+    /// only for a layout that nests below a listing prefix.
     fn segment_seq_of(location: &Path) -> Option<u64> {
         let name = location.parts().next_back()?;
         let name = name.as_ref();
@@ -5220,6 +5230,27 @@ impl DynoStore {
     /// The object name of the `seq`-th segment under a connector prefix (#57).
     /// The zero-padded sequence makes the name monotonic and, written
     /// create-only, the ordering authority (as `{offset}.batch` is for #50).
+    ///
+    /// **The name must not contain a `/` below [`Self::segment_prefix`], and that
+    /// is a portability constraint rather than a style choice (#421).** On an
+    /// ADLS Gen2 account with hierarchical namespace enabled, `/` sorts
+    /// **lowest** — below `-` (0x2D) and `.` (0x2E), which is the opposite of
+    /// ASCII, and both of which a Kafka topic name admits. Observed on a real
+    /// HNS account (#417): `a/b`, `a-b`, `a.b`, `a0b` comes back in exactly that
+    /// order, where S3 and GCS return `a-b`, `a.b`, `a/b`, `a0b`.
+    ///
+    /// Today nothing is exposed to it. `segment_prefix` runs to `…/segments/`
+    /// and this appends `{seq:0>20}.seg`, so every key a `scan_from` returns
+    /// shares the full prefix and the remainder has no `/` in it — there is
+    /// nothing for the rule to reorder. A layout that nested below the listing
+    /// prefix and relied on ordering across the separator would be correct on
+    /// S3 and silently wrong on ADLS, and `scan_from` is where that lands:
+    /// [`Self::refresh_prefix_index_inner`] resumes from the highest sequence it
+    /// knows, so a reordering means it resumes from the wrong place and misses
+    /// segments rather than erroring.
+    ///
+    /// The same property is why an HNS `segments/` listing contains no directory
+    /// entries — see [`Self::segment_seq_of`].
     fn segment_location(&self, prefix: &str, seq: u64) -> Path {
         Path::from(format!(
             "clusters/{}/prefixes/{}/segments/{:0>20}.seg",

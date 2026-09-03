@@ -18,7 +18,8 @@ a stateless Kafka-compatible broker whose only durable state is an object store
 Kodansu speaks the Apache Kafka wire protocol and keeps nothing of its own. There is
 no local disk, no ZooKeeper, no KRaft quorum and no inter-broker replication: every
 record it accepts is persisted into an object store — [S3][aws-s3], Google Cloud
-Storage, or an in-memory store for tests — and durability is the bucket's. S3 alone is
+Storage, Azure Data Lake Storage Gen2, or an in-memory store for tests — and
+durability is the bucket's. S3 alone is
 designed to exceed [99.999999999% (11 nines)][aws-s3-storage-classes].
 
 **Every replica is interchangeable.** All of them report themselves as node `111`
@@ -227,12 +228,21 @@ The engine is chosen by URL scheme:
 |---|---|
 | `s3://bucket/` | S3, minio, or any S3-compatible store |
 | `gs://bucket/` | Google Cloud Storage |
+| `abfss://container@account.dfs.core.windows.net/` | Azure Data Lake Storage Gen2 — **experimental**, see [docs/adls.md](docs/adls.md) |
 | `memory://name/` | in-process; tests, demos, local experiments |
 | `null://name/` | discards writes; for isolating broker cost in benchmarks |
 
 Credentials come from the environment following the usual `object_store` conventions
 (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, and
-`AWS_ENDPOINT` + `AWS_ALLOW_HTTP` for a local minio).
+`AWS_ENDPOINT` + `AWS_ALLOW_HTTP` for a local minio; `AZURE_STORAGE_ACCOUNT_NAME`
+plus one of the account-key, client-secret, managed-identity or
+workload-identity sets for Azure).
+
+`az://container/` is the short form of the Azure URL, taking the account from
+`AZURE_STORAGE_ACCOUNT_NAME`. Azure is marked experimental because there is no
+nightly run against a real ADLS Gen2 account — not because anything is known to
+be missing; [docs/adls.md](docs/adls.md) states exactly what is and is not
+verified.
 
 The storage URL's **query string tunes the write path** — coalescing thresholds,
 compaction triggers, maintenance coordination:
@@ -484,6 +494,7 @@ just grafana-ui   # opens http://localhost:3000
 |---|---|
 | [docs/quotas.md](docs/quotas.md) | Client quotas: the three dimensions, configuring them with `kafka-configs.sh`, and why the accounting is per replica |
 | [docs/storage-tuning.md](docs/storage-tuning.md) | Every storage-URL tuning key: coalescing, compaction, maintenance coordination |
+| [docs/adls.md](docs/adls.md) | Running on Azure Data Lake Storage Gen2: the URL, credentials, the account settings that are part of the contract |
 | [docs/virtual-topics-format.md](docs/virtual-topics-format.md) | The segment frame and footer — the contract for external S3-direct readers |
 | [docs/segment-audit.md](docs/segment-audit.md) | `tansu audit`: measuring, offline, the offsets a bucket's segments cannot serve |
 | [docs/design-multiwriter-segments.md](docs/design-multiwriter-segments.md) | Why the create-only segment sequence is the offset arbiter |

@@ -25,6 +25,24 @@ impl From<Version> for UpdateVersion {
     }
 }
 
+/// A [`Version`] from a *listing* is not interchangeable with one from a put or
+/// a head, on Azure (#421).
+///
+/// `object_store`'s Azure client reads `x-ms-version-id` into the version on a
+/// put and on a get, but hard-codes `version: None` when converting a listed
+/// `Blob` — "for consistency with S3 and GCP which don't include this"
+/// (`azure/client.rs:1394`). With blob versioning enabled on the account, the
+/// same object therefore yields `Some(..)` through one path and `None` through
+/// the other.
+///
+/// Harmless today, twice over: `PutMode::Update` on Azure conditions on the
+/// etag alone and ignores the version entirely (`azure/client.rs:762`), and
+/// nothing here compares two [`Version`]s. It is written down because both of
+/// those would have to stay true — a conditional write that started keying on
+/// the version, or a cache that compared a listed version against a fetched
+/// one, would work on S3 and be wrong on a versioned Azure account.
+///
+/// Blob versioning is off in a correct deployment either way (`docs/adls.md`).
 impl From<ObjectMeta> for Version {
     fn from(value: ObjectMeta) -> Self {
         Self {
