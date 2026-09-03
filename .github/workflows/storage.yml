@@ -101,6 +101,13 @@ jobs:
   # exist, because a fork has no reason to hold them — and a skipped job is
   # honest, where a job that silently ran against nothing was the arrangement
   # #357 was filed about.
+  #
+  # `STORAGE_TEST_AWS_*` is deliberately unset, and will stay unset: running a
+  # nightly against real credentials was decided against on 2026-09-03, for
+  # `gs://` and `az://` together (`docs/rfc-adls.md` §4.3, `docs/testing.md`).
+  # So this job exists for an operator who brings their own bucket to a
+  # `workflow_dispatch` — not as a slot waiting for secrets to be added. Do not
+  # read its permanently-skipped state as an oversight.
   object-store:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest-8-cores
