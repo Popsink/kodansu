@@ -251,9 +251,20 @@ to be rediscovered:
   account on 3 September 2026, and nothing will notice if a future version
   changes one. That is the cost of this decision and it is worth stating
   plainly.
-- **Re-run the spike by hand when `object_store` changes its Azure client**, or
-  before promoting the backend. It took three commands and a role assignment;
-  §4 records the shape.
+- **Reproduce the spike from §4 and §5 when `object_store` changes its Azure
+  client**, or before promoting the backend. The harness was throwaway by design
+  and is not in the tree, so this means writing it again — which is why §4 and
+  §5 record the *method* and not only the results: each question says which
+  layer answered it, why that layer and not the other, and what the sharp form
+  of the assertion is. §4.1 is the one to read first, because the obvious
+  assertion for it does not work.
+
+  The account is three commands (`az provider register -n Microsoft.Storage`,
+  `az group create`, `az storage account create --kind StorageV2
+  --enable-hierarchical-namespace true --access-tier Hot`) plus a `Storage Blob
+  Data Contributor` assignment, and it costs pennies. Two things that will
+  otherwise waste an afternoon: `westeurope` refuses new customers, and `Owner`
+  grants no data-plane access.
 
 **One datapoint from #417, because it changes the calculus rather than the
 decision.** Standing up a throwaway HNS account was three commands — register

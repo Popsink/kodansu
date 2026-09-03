@@ -240,9 +240,11 @@ tempting to read a green badge as "Azure is tested". It is not.
    (#417, findings in `docs/rfc-adls.md` §4 and §5) — and "once, by hand" is
    exactly as durable as it sounds. **That is now permanent**, per the decision
    above: those four answers describe `object_store` 0.14.1 against a real
-   account on 3 September 2026, and no job will notice if one changes. Re-run
-   the spike by hand when the Azure client changes, or before promoting the
-   backend past experimental.
+   account on 3 September 2026, and no job will notice if one changes. When the
+   Azure client changes, or before promoting the backend past experimental,
+   reproduce the spike from `docs/rfc-adls.md` §4 and §5 — they record the
+   method as well as the results, because the harness was throwaway and is not
+   in the tree.
 3. **It does not throttle.** Azure throttles at account and storage-partition
    level, which is the failure shape the `abfss` arm's retry budget is written
    against (`lib.rs`, the S3-shaped 32/300 s). Nothing here tests that budget.
