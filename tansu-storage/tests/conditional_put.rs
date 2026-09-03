@@ -52,6 +52,7 @@ use futures::{StreamExt as _, stream::FuturesUnordered};
 use object_store::{
     GetOptions, ObjectStore, ObjectStoreExt as _, PutMode, PutOptions, PutPayload, UpdateVersion,
     aws::{AmazonS3Builder, S3ConditionalPut},
+    azure::MicrosoftAzureBuilder,
     gcp::GoogleCloudStorageBuilder,
     memory::InMemory,
     path::Path,
@@ -95,6 +96,21 @@ fn object_store() -> Result<Arc<dyn ObjectStore>, Error> {
 
         "gs" => GoogleCloudStorageBuilder::from_env()
             .with_bucket_name(bucket)
+            .build()
+            .map(|object_store| Arc::new(object_store) as Arc<dyn ObjectStore>)
+            .map_err(Into::into),
+
+        // `with_url` rather than `with_container_name`, mirroring the `abfss`
+        // arm in `StorageContainer::builder`: the container is the URL's
+        // username in the canonical form and its host in the short one, and
+        // this target must not build the store any differently to the broker.
+        //
+        // No `SuffixRange` wrapper, unlike the broker. It is `pub(crate)` and
+        // out of reach from an integration test, and it translates reads —
+        // which is nothing a conditional put does. What this target asserts is
+        // untouched by its absence, and #419's own tests cover the translation.
+        "az" | "abfs" | "abfss" => MicrosoftAzureBuilder::from_env()
+            .with_url(storage.as_str())
             .build()
             .map(|object_store| Arc::new(object_store) as Arc<dyn ObjectStore>)
             .map_err(Into::into),

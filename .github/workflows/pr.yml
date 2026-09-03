@@ -214,6 +214,58 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
 
+  # The conditional-put conformance target against a real implementation of
+  # `If-None-Match` (#420).
+  #
+  # This is the one job on the board that tests something no other job can.
+  # `docs/testing.md` records that S3 and GCS are both untested — every other
+  # test in the workspace runs on `memory://`, which *emulates* create-only and
+  # etag CAS behind a mutex. Azurite implements them. So for the first time the
+  # ten assertions in `tansu-storage/tests/conditional_put.rs` run against a
+  # store that could actually disagree with `InMemory`, on every PR rather than
+  # nightly (minio) or never (GCS).
+  #
+  # It is Docker-dependent, which is why it is NOT upstream of `test`: `test` is
+  # the required check today and `storage.yml`'s comment explains at length why
+  # nothing needing a service belongs in front of it. This job feeds `all-green`
+  # instead, so it becomes enforced the moment branch protection moves.
+  #
+  # **Read `docs/testing.md` before reading a green badge here as "Azure is
+  # tested".** Three things this does not cover, and the first is the sharp one:
+  # `object_store` detects the emulator and bypasses `startFrom` entirely, so
+  # nothing here exercises `list_with_offset`; Azurite has no hierarchical
+  # namespace, so nothing here covers ADLS Gen2 as such; and it does not throttle.
+  # Those were answered against a real HNS account in #417, by hand, once.
+  conditional-put-azurite:
+    runs-on: ubuntu-latest-8-cores
+    env:
+      CARGO_BUILD_BUILD_DIR: /mnt/build
+      NEXTEST_PROFILE: ci
+      RUST_BACKTRACE: 1
+      RUST_LOG: debug,tansu_sans_io=warn,tansu_model=warn
+    steps:
+      - run: sudo mkdir /mnt/build
+      - run: sudo chmod a+rwxt /mnt/build
+      - uses: actions/checkout@v6
+      - uses: extractions/setup-just@v3
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+      - uses: taiki-e/install-action@nextest
+      # The justfile loads `.env`, and `COMPOSE_FILE` lives there. Azurite needs
+      # no credentials of its own — the development account and key are
+      # well-known and `etc/azurite-container.py` carries them.
+      - run: cp example.env .env
+      - run: just test-conditional-put-azurite
+      - run: tar --create --gzip --file=logs.tar.gz logs
+        if: always()
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: logs-conditional-put-azurite
+          path: logs.tar.gz
+          if-no-files-found: error
+
   # One check to require on `main` in place of `test`.
   #
   # `test` is what branch protection requires today, which is the only reason it
@@ -233,6 +285,7 @@ jobs:
       - check-no-default-features
       - build-storage
       - test
+      - conditional-put-azurite
       - coverage
     runs-on: ubuntu-latest
     steps:
