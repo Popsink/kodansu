@@ -3,12 +3,18 @@
 Operator guide for `abfss://` and `az://`. The design reasoning is in
 [docs/rfc-adls.md](rfc-adls.md); this page is what you need to run the thing.
 
-**Support level: experimental.** Every assertion the broker makes about
-conditional put is verified against Azurite on every PR, which is more than the
-S3 or GCS arms get — but there is no nightly run against a real ADLS Gen2
-account, because nobody owns a credential for one. What *has* been verified
-against a real hierarchical-namespace account was verified once, by hand (#417).
-See [docs/testing.md](testing.md) for the precise shape of that gap.
+**Support level: experimental, by decision rather than by omission.** Every
+assertion the broker makes about conditional put is verified against Azurite on
+every PR, which is more than the S3 or GCS arms get. There is no nightly run
+against a real ADLS Gen2 account and there is not going to be one: that was
+decided for `gs://` and `az://` together (RFC §4.3), and without it "supported"
+would be a claim CI cannot stand behind.
+
+So what has been verified against a real hierarchical-namespace account was
+verified **once, by hand** (#417) — true of `object_store` 0.14.1 on 3 September
+2026, and nothing will notice if a future version changes it. Re-run that spike
+before promoting this backend, or when `object_store` changes its Azure client.
+[docs/testing.md](testing.md) is precise about the shape of the gap.
 
 ## The URL
 

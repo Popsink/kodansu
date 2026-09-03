@@ -238,7 +238,11 @@ tempting to read a green badge as "Azure is tested". It is not.
    delete leaves behind, not Blob Batch on HNS, not the `/`-sorts-lowest
    ordering. All four were answered by hand, once, against a real HNS account
    (#417, findings in `docs/rfc-adls.md` §4 and §5) — and "once, by hand" is
-   exactly as durable as it sounds.
+   exactly as durable as it sounds. **That is now permanent**, per the decision
+   above: those four answers describe `object_store` 0.14.1 against a real
+   account on 3 September 2026, and no job will notice if one changes. Re-run
+   the spike by hand when the Azure client changes, or before promoting the
+   backend past experimental.
 3. **It does not throttle.** Azure throttles at account and storage-partition
    level, which is the failure shape the `abfss` arm's retry budget is written
    against (`lib.rs`, the S3-shaped 32/300 s). Nothing here tests that budget.
@@ -274,12 +278,20 @@ tries it twice (#357):
   fail, all on the write, none of them reaching a precondition.
 
 So an emulator would not fake the assertions — it cannot run them at all. The
-route that closes this is pointing the `object-store` job in
-`.github/workflows/storage.yml` at a real `gs://` bucket, which needs
-credentials this repository does not have.
+only route that closes this is pointing the `object-store` job in
+`.github/workflows/storage.yml` at a real `gs://` bucket.
+
+**Decided 3 September 2026: that is not happening.** No nightly runs against
+real credentials, on `gs://` or `az://`. It is a decision rather than a backlog
+item, so `gs://` generation preconditions stay assumed for as long as the arm
+exists, and `STORAGE_TEST_AWS_*` stays unset — the `object-store` job is there
+for an operator who brings their own bucket to a `workflow_dispatch`, and skips
+otherwise.
 
 Worth re-checking if `object_store` moves its GCS writes to the JSON API, or if
-`fake-gcs-server` implements the XML upload path.
+`fake-gcs-server` implements the XML upload path. Either would reopen the
+emulator route, which the decision above does not close — it closes the
+*credentials* route.
 
 **Real S3, as opposed to minio.** The `object-store` job is
 `workflow_dispatch`-only and skips itself unless `STORAGE_TEST_AWS_*` secrets

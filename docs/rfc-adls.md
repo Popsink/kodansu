@@ -227,17 +227,33 @@ puts a `/` *below* the listing prefix, and relies on ordering across it, is
 correct on S3 and wrong on ADLS. It belongs in a comment next to
 `segment_location`.
 
-### 4.3 CI account: same question as GCS, one answer
+### 4.3 CI account: decided, and the answer is no
 
 Deferred, and deliberately merged with the GCS gap. `docs/testing.md` records
 that S3 and GCS are both untested — every test runs on `memory://`, and
 conditional put is exactly where `InMemory` and a real store diverge. The GCS
 hole exists because nobody owned an account.
 
-So this is not an Azure decision: it is one decision about **who owns
-credentials for a nightly non-emulator run**, answered once for `gs://` and
-`az://` together. Until it is answered, the Azurite job (§7) is the ceiling of
-what we can claim.
+So this was never an Azure decision: it was one decision about **who owns
+credentials for a nightly non-emulator run**, to be answered once for `gs://`
+and `az://` together.
+
+**Decided 3 September 2026: we are not running a nightly against real
+credentials, on either backend.** Not deferred — decided. The Azurite job (§7)
+is therefore the permanent ceiling of what CI can claim about Azure, and `gs://`
+keeps none. Everything that follows from that is written down rather than left
+to be rediscovered:
+
+- **ADLS ships experimental and stays experimental**, which resolves the first
+  item in §10. `docs/adls.md` says so and says what *is* verified.
+- **The four HNS behaviours in §4 and §5 are a point-in-time observation, not a
+  regression gate.** They were true of `object_store` 0.14.1 against a real
+  account on 3 September 2026, and nothing will notice if a future version
+  changes one. That is the cost of this decision and it is worth stating
+  plainly.
+- **Re-run the spike by hand when `object_store` changes its Azure client**, or
+  before promoting the backend. It took three commands and a role assignment;
+  §4 records the shape.
 
 **One datapoint from #417, because it changes the calculus rather than the
 decision.** Standing up a throwaway HNS account was three commands — register
@@ -511,8 +527,9 @@ axis in the build matrix. Revisit only if binary size bites.
 
 ## 10. What this RFC deliberately does not decide
 
-- Whether ADLS becomes a *supported* backend (README, SLA) or an experimental
-  one. Depends on §4.3.
+- ~~Whether ADLS becomes a *supported* backend (README, SLA) or an experimental
+  one.~~ **Resolved by §4.3: experimental.** With no nightly against a real
+  account, "supported" would be a claim CI cannot stand behind.
 - Any change to the segment format (§3, option C).
 - `Set Blob Expiry`-based retention (§6.2).
 - Absolute pricing figures — region- and redundancy-dependent, and to be quoted
