@@ -260,27 +260,46 @@ actually exercises it.
 **GCS.** `gs://` is a supported target and every test in the conformance target
 would run against it unchanged — that is the whole point of the URL being a
 parameter — but none of them ever has. Generation preconditions remain assumed
-rather than observed.
+rather than observed *on the wire*; what the semantics **are** is now covered
+without a bucket, by `dynostore::tests::gcs_generation` over a store that
+conditions on the generation and drops it from listings the way `object_store`
+does. That closes the part of the gap that is a semantic difference rather than
+a behaviour under load. `docs/gcs.md` says which is which.
 
-An emulator was tried and does not work, which is worth recording so nobody
-tries it twice (#357):
+Two emulators were tried and neither works, which is worth recording in detail so
+nobody tries a fourth time (#357, #429):
 
 - `object_store` **does** support pointing at one with no code change: a service
   account file containing `{"gcs_base_url": "...", "disable_oauth": true}` is
   read by `GoogleCloudStorageBuilder::from_env`, so `GOOGLE_SERVICE_ACCOUNT`
   alone would redirect the engine.
-- `fake-gcs-server` gained generation preconditions in July 2026 (upstream
-  fsouza/fake-gcs-server#2260, #2308), so the semantics under test are no longer
-  the obstacle.
 - **The obstacle is the API.** `object_store` 0.14's GCS client writes through
-  the **XML** API — `PUT /{bucket}/{object}` with `x-goog-if-generation-match` —
-  and `fake-gcs-server` answers every such write `400 invalid uploadType`. It
-  implements the JSON upload API. Measured against
-  `fsouza/fake-gcs-server:latest` on 2026-08-09: 10 of 10 conformance tests
-  fail, all on the write, none of them reaching a precondition.
+  the **XML** API — `PUT /{bucket}/{object}` with `x-goog-if-generation-match`.
+- `fake-gcs-server` gained generation preconditions in July 2026 (upstream
+  fsouza/fake-gcs-server#2260, #2308), so the semantics are not the obstacle
+  there — but it answers every XML write `400 invalid uploadType`, routing it to
+  its JSON upload handler. Measured against `fsouza/fake-gcs-server:latest` on
+  2026-08-09 (10 of 10 conformance tests fail on the write) and again on
+  2026-09-04, unchanged.
+- **`googleapis/storage-testbench` gets much further, and is the one to watch.**
+  Google's own emulator implements the XML `PUT` *including the precondition*: a
+  second `x-goog-if-generation-match: 0` answers `412` with
+  `"x-goog-if-generation-match validation failed. Expected = 0 vs Actual = ..."`,
+  and its XML `GET` returns `x-goog-generation`. Three things stop it, all
+  measured against v0.45.0 on 2026-09-04:
 
-So an emulator would not fake the assertions — it cannot run them at all. The
-only route that closes this is pointing the `object-store` job in
+  | gap | what it does |
+  |---|---|
+  | XML `PUT` returns no `ETag` and no `x-goog-generation` | `object_store` fails `Metadata { MissingEtag }` before reading the precondition result |
+  | no XML bucket-list route | `GET /{bucket}?list-type=2` is `404` |
+  | no XML `DELETE` route | `405 Method Not Allowed` |
+
+  Two of those three are response headers on a route that already exists. If they
+  land upstream, GCS gets per-PR conditional-put coverage the way `az://` did
+  from Azurite (#420), at no credential cost.
+
+So an emulator would not fake the assertions today — it cannot run them at all.
+The other route that closes this is pointing the `object-store` job in
 `.github/workflows/storage.yml` at a real `gs://` bucket.
 
 **Decided 3 September 2026: that is not happening.** No nightly runs against
@@ -290,10 +309,11 @@ exists, and `STORAGE_TEST_AWS_*` stays unset — the `object-store` job is there
 for an operator who brings their own bucket to a `workflow_dispatch`, and skips
 otherwise.
 
-Worth re-checking if `object_store` moves its GCS writes to the JSON API, or if
-`fake-gcs-server` implements the XML upload path. Either would reopen the
-emulator route, which the decision above does not close — it closes the
-*credentials* route.
+Worth re-checking if `object_store` moves its GCS writes to the JSON API, if
+`fake-gcs-server` implements the XML upload path, or if `storage-testbench`
+returns `ETag` and `x-goog-generation` from its XML `PUT`. Any of the three
+reopens the emulator route, which the decision above does not close — it closes
+the *credentials* route. The third is the nearest.
 
 **Real S3, as opposed to minio.** The `object-store` job is
 `workflow_dispatch`-only and skips itself unless `STORAGE_TEST_AWS_*` secrets

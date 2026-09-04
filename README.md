@@ -227,16 +227,23 @@ The engine is chosen by URL scheme:
 | Scheme | Use |
 |---|---|
 | `s3://bucket/` | S3, minio, or any S3-compatible store |
-| `gs://bucket/` | Google Cloud Storage |
+| `gs://bucket/` | Google Cloud Storage — see [docs/gcs.md](docs/gcs.md), the bucket settings are part of the contract |
 | `abfss://container@account.dfs.core.windows.net/` | Azure Data Lake Storage Gen2 — **experimental**, see [docs/adls.md](docs/adls.md) |
 | `memory://name/` | in-process; tests, demos, local experiments |
 | `null://name/` | discards writes; for isolating broker cost in benchmarks |
 
 Credentials come from the environment following the usual `object_store` conventions
 (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_DEFAULT_REGION`, and
-`AWS_ENDPOINT` + `AWS_ALLOW_HTTP` for a local minio; `AZURE_STORAGE_ACCOUNT_NAME`
-plus one of the account-key, client-secret, managed-identity or
-workload-identity sets for Azure).
+`AWS_ENDPOINT` + `AWS_ALLOW_HTTP` for a local minio; `GOOGLE_SERVICE_ACCOUNT`,
+`GOOGLE_SERVICE_ACCOUNT_KEY` or `GOOGLE_APPLICATION_CREDENTIALS` for GCS, or
+nothing at all on GKE, where Workload Identity is reached through the metadata
+server; `AZURE_STORAGE_ACCOUNT_NAME` plus one of the account-key, client-secret,
+managed-identity or workload-identity sets for Azure).
+
+A GCS bucket needs configuring before it is correct: **soft delete is on by
+default, at seven days, and it is billed** — on a layout that deletes what
+compaction has just merged, that bills the churn twice for a week.
+[docs/gcs.md](docs/gcs.md) has that and the rest of the contract.
 
 `az://container/` is the short form of the Azure URL, taking the account from
 `AZURE_STORAGE_ACCOUNT_NAME`. Azure is marked experimental because there is no
@@ -494,6 +501,7 @@ just grafana-ui   # opens http://localhost:3000
 |---|---|
 | [docs/quotas.md](docs/quotas.md) | Client quotas: the three dimensions, configuring them with `kafka-configs.sh`, and why the accounting is per replica |
 | [docs/storage-tuning.md](docs/storage-tuning.md) | Every storage-URL tuning key: coalescing, compaction, maintenance coordination |
+| [docs/gcs.md](docs/gcs.md) | Running on Google Cloud Storage: the bucket settings that are part of the contract, and what GCS does that S3 does not |
 | [docs/adls.md](docs/adls.md) | Running on Azure Data Lake Storage Gen2: the URL, credentials, the account settings that are part of the contract |
 | [docs/virtual-topics-format.md](docs/virtual-topics-format.md) | The segment frame and footer — the contract for external S3-direct readers |
 | [docs/segment-audit.md](docs/segment-audit.md) | `tansu audit`: measuring, offline, the offsets a bucket's segments cannot serve |

@@ -41,8 +41,16 @@
 //! data plane never writes one key twice and so never meets the cap;
 //! `group_formation_under_the_per_object_cap` shows `generation.json` does.
 //!
-//! What none of this observes is GCS itself: the 429 body, the generation
-//! precondition, the per-bucket write ramp. Those need a real bucket.
+//! What none of this observes is GCS itself: the 429 body and the per-bucket
+//! write ramp. Those need a real bucket. The generation precondition no longer
+//! belongs on that list — `dynostore::tests::gcs_generation` models it over
+//! `InMemory`, because it is a semantic difference rather than a behaviour under
+//! load.
+//!
+//! `rate_per_second_is_not_a_knob` lived here and has gone: it demonstrated
+//! #428, #428 is fixed, and it asserted nothing. The guard that replaced it is
+//! `a_configured_rate_admits_that_many_puts_per_second` in `gcs::limit`, which
+//! fails if the defect comes back.
 //!
 //! `#[ignore]` throughout: these are wall clock, not regression gates.
 //! `just test-gcs` runs them.
@@ -74,37 +82,6 @@ fn gcs_shaped<O>(inner: O) -> PutRateLimiter<O> {
     PutRateLimiter::new(inner, Duration::from_mins(5))
         .with_rate_per_second(NonZeroU32::new(1))
         .with_jitter(Some(Duration::from_millis(50)))
-}
-
-/// `rate_per_second` is not a knob. Four puts to one key at a configured 4/s
-/// take ~3s, not ~0.75s: `rate_limit` asks `until_n_ready_with_jitter` for
-/// `rate_per_second` cells out of a bucket that refills at `rate_per_second`
-/// per second, so every setting resolves to one put per second.
-#[ignore]
-#[tokio::test]
-async fn rate_per_second_is_not_a_knob() -> Result<()> {
-    let _guard = init_tracing()?;
-
-    let store = PutRateLimiter::new(InMemory::new(), Duration::from_mins(5))
-        .with_rate_per_second(NonZeroU32::new(4));
-
-    let location = Path::from("a");
-    let started = SystemTime::now();
-
-    for _ in 0..4 {
-        _ = store
-            .put_opts(
-                &location,
-                PutPayload::from(Bytes::from_static(b"x")),
-                PutOptions::default(),
-            )
-            .await?;
-    }
-
-    let elapsed = started.elapsed().map_or(0, |d| d.as_millis() as u64);
-    println!("4 puts at a configured 4/s took {elapsed}ms");
-
-    Ok(())
 }
 
 /// One group of `MEMBERS`, every member racing to add itself to
@@ -186,6 +163,53 @@ async fn group_formation_under_the_per_object_cap() -> Result<()> {
         "gcs-cap",
     )
     .await?;
+
+    // The target #427 proposes, measured rather than estimated: admit every
+    // member that arrived in the join window in ONE CAS instead of one each.
+    //
+    // This is not a fix — it does not go through `join`, which is where the
+    // per-member CAS lives — it is the number the fix has to hit. It also shows
+    // where the ~54 s goes: not into 16 unavoidable writes (that would be 16 s)
+    // but into the ~3.4 conflicting attempts each member makes, every one of
+    // which waits out a full cell before losing.
+    //
+    // In-process serialisation would collect the same conflicts and cost ~16 s,
+    // which is inside a 45 s session timeout for 16 members and outside it for
+    // 50. It is also a per-group lock, and "`Controller` holds no per-group
+    // state" is an acceptance criterion #360 shipped. Batching is the one route
+    // that is both sufficient and allowed.
+    {
+        let storage = Arc::new(DynoStore::new(CLUSTER, NODE, gcs_shaped(InMemory::new())));
+        let started = SystemTime::now();
+
+        let (mut doc, version) = storage
+            .read_group_generation("g-1")
+            .await?
+            .map(|(doc, version)| (doc, Some(version)))
+            .unwrap_or_default();
+
+        doc.seq += 1;
+        doc.generation_id += 1;
+
+        for member in 0..MEMBERS {
+            _ = doc
+                .members
+                .insert(format!("m-{member}"), MemberRef::default());
+        }
+
+        _ = storage
+            .update_group_generation("g-1", doc, version)
+            .await
+            .expect("batched admission");
+
+        let elapsed = started.elapsed().map_or(0, |d| d.as_millis() as u64);
+        let landed = storage
+            .read_group_generation("g-1")
+            .await?
+            .map_or(0, |(doc, _)| doc.members.len());
+
+        println!("batched: {MEMBERS} members, 1 CAS attempt, {landed} landed, {elapsed}ms");
+    }
 
     Ok(())
 }

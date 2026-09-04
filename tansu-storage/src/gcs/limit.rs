@@ -196,6 +196,33 @@ where
         self.object_store.list(prefix)
     }
 
+    /// Forward `list_with_offset` rather than inherit the default (#512).
+    ///
+    /// `list_with_offset` is one of the `ObjectStore` methods that ships a
+    /// default body instead of a required one, and that default is not a
+    /// delegation — it lists the whole prefix and filters client-side
+    /// (`object_store-0.14.1/src/lib.rs:1253`). A decorator that omits it does
+    /// not pass the call through, it *replaces* GCS's server-side `start-after`
+    /// with a full listing. The impl still compiles, so nothing but this comment
+    /// stands between the next reader and a whole-prefix LIST.
+    ///
+    /// The caller that pays is `refresh_prefix_index`'s incremental branch,
+    /// whose whole point is to cost O(new) rather than O(total) — on GCS alone
+    /// it was costing `ceil(N/1000)` class-A operations per refresh.
+    ///
+    /// `Cache` and `Metron` carry the same forward for the same reason
+    /// (`b7c6846`); this decorator predates that fix and was not part of it.
+    /// Reads are not rate-limited here at all, so there is nothing to add beyond
+    /// the delegation.
+    #[instrument(skip_all, fields(prefix, offset = %offset))]
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.object_store.list_with_offset(prefix, offset)
+    }
+
     #[instrument(skip_all, fields(prefix))]
     async fn list_with_delimiter(
         &self,
