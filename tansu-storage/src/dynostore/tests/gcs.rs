@@ -164,6 +164,53 @@ async fn group_formation_under_the_per_object_cap() -> Result<()> {
     )
     .await?;
 
+    // The target #427 proposes, measured rather than estimated: admit every
+    // member that arrived in the join window in ONE CAS instead of one each.
+    //
+    // This is not a fix — it does not go through `join`, which is where the
+    // per-member CAS lives — it is the number the fix has to hit. It also shows
+    // where the ~54 s goes: not into 16 unavoidable writes (that would be 16 s)
+    // but into the ~3.4 conflicting attempts each member makes, every one of
+    // which waits out a full cell before losing.
+    //
+    // In-process serialisation would collect the same conflicts and cost ~16 s,
+    // which is inside a 45 s session timeout for 16 members and outside it for
+    // 50. It is also a per-group lock, and "`Controller` holds no per-group
+    // state" is an acceptance criterion #360 shipped. Batching is the one route
+    // that is both sufficient and allowed.
+    {
+        let storage = Arc::new(DynoStore::new(CLUSTER, NODE, gcs_shaped(InMemory::new())));
+        let started = SystemTime::now();
+
+        let (mut doc, version) = storage
+            .read_group_generation("g-1")
+            .await?
+            .map(|(doc, version)| (doc, Some(version)))
+            .unwrap_or_default();
+
+        doc.seq += 1;
+        doc.generation_id += 1;
+
+        for member in 0..MEMBERS {
+            _ = doc
+                .members
+                .insert(format!("m-{member}"), MemberRef::default());
+        }
+
+        _ = storage
+            .update_group_generation("g-1", doc, version)
+            .await
+            .expect("batched admission");
+
+        let elapsed = started.elapsed().map_or(0, |d| d.as_millis() as u64);
+        let landed = storage
+            .read_group_generation("g-1")
+            .await?
+            .map_or(0, |(doc, _)| doc.members.len());
+
+        println!("batched: {MEMBERS} members, 1 CAS attempt, {landed} landed, {elapsed}ms");
+    }
+
     Ok(())
 }
 
