@@ -38,6 +38,7 @@ mod group_offsets;
 mod idempotent;
 mod index_reconcile;
 mod latency;
+mod list_offset_forwarding;
 mod maintenance_scheduling;
 mod meta_growth;
 mod metadata_visibility;
