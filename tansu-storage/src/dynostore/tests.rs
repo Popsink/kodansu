@@ -31,6 +31,7 @@ mod divergent_batch;
 mod fenced_overlap;
 mod flush_conflict;
 mod gcs;
+mod gcs_generation;
 mod group_describe;
 mod group_documents;
 mod group_expiry;
