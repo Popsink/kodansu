@@ -120,7 +120,7 @@ write different objects), and the limiter is a **local delay**, so the cost is
 paid whether or not a real bucket would have rejected the burst. Nothing has
 observed what GCS actually does under this pattern.
 
-### The bucket ramps, and the retry budget is not sized for it
+### The bucket ramps, and the retry budget is not sized for it (#519)
 
 A GCS bucket starts at roughly **1,000 object writes/s and 5,000 reads/s** and
 scales from there by redistributing load, which *"typically takes on the order of
@@ -135,7 +135,7 @@ failure. It is the wrong budget for the per-bucket ramp, which produces the
 S3's long budget exists to ride out. A cold bucket meeting an autoscaled fleet is
 the case #364 creates.
 
-### Deletes are serial, ten at a time
+### Deletes are serial, ten at a time (#518)
 
 `object_store` implements bulk delete for S3 (`DeleteObjects`, 1,000 per request,
 20 requests in flight) and for Azure (Blob Batch, 256 per request, 20 in flight).
@@ -187,8 +187,9 @@ per-request:
 
 There is nothing to run. `memory://` covers the engine and minio covers the S3
 shape; neither says anything about GCS, and no GCS emulator serves
-`object_store`'s client — [docs/testing.md](testing.md) has the current state of
-that, measured rather than assumed.
+`object_store`'s client today — though Google's own is close, and #520 is the
+route.  [docs/testing.md](testing.md) has the current state of that, measured
+rather than assumed.
 
 What can be run without a bucket:
 
