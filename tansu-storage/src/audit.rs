@@ -65,6 +65,7 @@ use futures::{StreamExt, TryStreamExt, stream};
 use object_store::{
     GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt,
     aws::{AmazonS3Builder, S3ConditionalPut},
+    azure::MicrosoftAzureBuilder,
     gcp::GoogleCloudStorageBuilder,
     local::LocalFileSystem,
     memory::InMemory,
@@ -76,7 +77,8 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    Error, Result,
+    Backend, Error, Result,
+    azure::suffix::SuffixRange,
     dynostore::{
         DynoStore, SEGMENT_FOOTER_OVER_READ, SEGMENT_MAGIC, SEGMENT_TRAILER_LEN, SegmentFooter,
         Substream,
@@ -306,36 +308,66 @@ impl Audit {
     /// An audit over the object store a storage URL names.
     ///
     /// The schemes the broker runs on — `s3://bucket`, `gs://bucket`,
-    /// `memory://` — plus **`file:///path/to/copy`**, which is the one this
-    /// exists for: the measurement is taken offline, from a copy of the bucket,
-    /// so it depends on no live broker and cannot be perturbed by one still
-    /// writing.
+    /// `abfss://container@account.dfs.core.windows.net` (and its `abfs://` and
+    /// `az://` spellings), `memory://` — plus **`file:///path/to/copy`**, which
+    /// is the one this exists for: the measurement is taken offline, from a copy
+    /// of the bucket, so it depends on no live broker and cannot be perturbed by
+    /// one still writing.
+    ///
+    /// The scheme is resolved by [`Backend`], shared with
+    /// [`crate::StorageContainer::builder`], so the two agree on what a valid
+    /// storage URL is — they did not, and `tansu audit` was the only tool that
+    /// could not be pointed at ADLS Gen2 (#531).
     pub fn try_from_url(url: &Url, cluster: impl Into<String>) -> Result<Self> {
         let bucket = url.host_str().unwrap_or("tansu");
 
-        let object_store: Arc<dyn ObjectStore> = match url.scheme() {
-            "s3" => Arc::new(
+        let object_store: Arc<dyn ObjectStore> = match Backend::try_from_url(url)? {
+            Backend::S3 => Arc::new(
                 AmazonS3Builder::from_env()
                     .with_bucket_name(bucket)
                     .with_conditional_put(S3ConditionalPut::ETagMatch)
                     .build()?,
             ),
 
-            "gs" => Arc::new(
+            Backend::Google => Arc::new(
                 GoogleCloudStorageBuilder::from_env()
                     .with_bucket_name(bucket)
                     .build()?,
             ),
 
+            // `with_url` rather than a bucket taken from `host_str()`, mirroring
+            // the `abfss` arm of `StorageContainer::builder`: the container is
+            // the URL's *username* in the canonical form and its host in the
+            // short one, and `object_store`'s parser already tells the two apart
+            // and resolves a `dfs` host to the blob endpoint it speaks (#418).
+            //
+            // `SuffixRange` is not optional here. Every read this makes is a
+            // suffix GET — [`Audit::tail`] has no other shape — and
+            // `object_store` refuses `Range: bytes=-N` against Azure
+            // client-side, before sending it (#419). The arm without the wrap
+            // would fail on the first segment instead of on the URL, which
+            // reads as a corrupt bucket rather than as an unsupported backend.
+            //
+            // No retry budget, unlike the broker's arm, and for the same reason
+            // the `s3` and `gs` arms above take none: this is a read-only sweep
+            // someone runs and watches, not a broker that has to ride out a
+            // throttle unattended.
+            Backend::Azure => Arc::new(SuffixRange::new(
+                MicrosoftAzureBuilder::from_env()
+                    .with_url(url.as_str())
+                    .build()?,
+            )),
+
             // `url::Url` puts the whole path in `path()` for `file://`, and an
             // absolute path is what `LocalFileSystem` wants — a copy pulled with
             // `aws s3 sync` is rooted at the bucket, so the layout below it is
             // the bucket's.
-            "file" => Arc::new(LocalFileSystem::new_with_prefix(url.path())?),
+            Backend::Local => Arc::new(LocalFileSystem::new_with_prefix(url.path())?),
 
-            "memory" => Arc::new(InMemory::new()),
+            Backend::Memory => Arc::new(InMemory::new()),
 
-            _unsupported => return Err(Error::UnsupportedStorageUrl(url.clone())),
+            // The engine that stores nothing has no segments to walk.
+            Backend::Null => return Err(Error::UnsupportedStorageUrl(url.clone())),
         };
 
         Ok(Self::new(object_store, cluster))

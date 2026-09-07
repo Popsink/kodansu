@@ -30,6 +30,8 @@ just test-storage-minio                    # starts minio in compose, runs on s3
 just test-storage s3://my-bucket/          # any bucket, credentials from the AWS_* env
 just test-conditional-put s3://tansu/      # only the conformance target
 just test-conditional-put-azurite          # starts Azurite in compose, runs on az://tansu/
+just test-audit-azurite                    # the offline audit against az://tansu/
+just test-azurite                          # both of the above, which is what pr.yml runs
 ```
 
 `test-conditional-put-azurite` is a recipe of its own rather than
@@ -136,8 +138,8 @@ bucket, which is what establishes that the per-test prefixing actually isolates.
 **Azurite is the only one of the three that runs on every PR** (#420). minio's
 run is nightly (`storage.yml`) and GCS has never had one, so before this the
 per-PR evidence for conditional put was `InMemory` emulating it behind a mutex.
-`just test-conditional-put-azurite` needs nothing but Docker, and the
-`conditional-put-azurite` job in `pr.yml` feeds `all-green`.
+`just test-azurite` needs nothing but Docker, and the `azurite` job in `pr.yml`
+feeds `all-green`.
 
 That is a real gain and it is also the *whole* gain. What a green Azurite run
 does not prove is below, and it is not a short list.
@@ -220,9 +222,9 @@ owner.
 ## What is not covered
 
 **Azure, as opposed to Azurite — three exclusions, and the first is the sharp
-one.** The `conditional-put-azurite` job in `pr.yml` is the only per-PR evidence
-we have of a conditional put against a real implementation, which makes it
-tempting to read a green badge as "Azure is tested". It is not.
+one.** The `azurite` job in `pr.yml` is the only per-PR evidence we have of a
+conditional put against a real implementation, which makes it tempting to read a
+green badge as "Azure is tested". It is not.
 
 1. **`list_with_offset` is not exercised at all.** `object_store` detects the
    emulator and bypasses `startFrom`, falling back to client-side filtering over
@@ -443,11 +445,11 @@ real.
 | `check-no-default-features` | every crate still compiles with its optional features off |
 | `build-storage` | the binary links |
 | `test` | nextest over the workspace, plus doc tests |
-| `conditional-put-azurite` | the conformance target against a real `If-None-Match`, not an emulation of one |
+| `azurite` | the conformance target against a real `If-None-Match`, not an emulation of one, plus the offline audit against a store that refuses a suffix range |
 | `coverage` | line coverage, floored |
 | `all-green` | one status summarising the seven above |
 
-`conditional-put-azurite` is the one exception to the paragraph above, and it is
+`azurite` is the one exception to the paragraph above, and it is
 worth being precise about why. It is Docker-dependent, so it is deliberately not
 upstream of `test` — it feeds `all-green` only, and becomes enforced when branch
 protection moves. What earns it a place on the PR path at all is that no other
@@ -455,6 +457,13 @@ job can establish what it establishes: every other test in the workspace runs on
 `memory://`, and conditional put is precisely where `InMemory` and a real store
 diverge. It is also cheap, because Azurite needs no credentials and no bucket
 setup beyond one signed REST call (`etc/azurite-container.py`).
+
+The second target it carries is there for a related reason: `memory://` is the
+one storage URL that does not name a *shared* store, so
+`tansu-storage/tests/audit.rs` cannot walk a broker's log over it — each
+resolution of `memory://` is a fresh `InMemory`. Azurite is the cheapest store
+two processes can share, and it happens to be the backend where the audit was
+broken (#531).
 
 Read the Azure exclusions under *What is not covered* before treating it as
 evidence about ADLS Gen2. It is evidence about conditional put.

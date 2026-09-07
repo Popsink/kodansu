@@ -150,6 +150,7 @@ pub use audit::{Audit, AuditReport, Bracket, Gap, PartitionAudit, SegmentFault, 
 
 mod acl;
 mod authorizer;
+mod backend;
 mod batch;
 mod enforcer;
 mod group;
@@ -163,6 +164,11 @@ pub use acl::{
     AclBinding, AclFilter, Acls, CLUSTER_RESOURCE, WILDCARD_HOST, WILDCARD_PRINCIPAL,
     WILDCARD_RESOURCE,
 };
+
+// `pub` so that the `conditional_put` conformance target — the third builder,
+// and an integration test rather than a module — routes through the same table
+// as the broker and the audit (#531).
+pub use backend::Backend;
 
 pub use authorizer::{
     ACL_SNAPSHOT_TTL, Authorizer, Requester, authorized, authorized_cluster, enforcing,
@@ -3066,9 +3072,12 @@ fn coalesce_tuning(storage: &Url) -> CoalesceTuning {
 
 impl Builder<i32, String, Url, Url> {
     pub async fn build(self) -> Result<Arc<Box<dyn Storage>>> {
-        let storage = match self.storage.scheme() {
+        // Routed through [`Backend`] rather than matching `scheme()` here, so
+        // that a backend added to one builder cannot be missing from the other
+        // two: this match is exhaustive over the enum (#531).
+        let storage = match Backend::try_from_url(&self.storage)? {
             #[cfg(feature = "dynostore")]
-            "s3" => {
+            Backend::S3 => {
                 use crate::batch::ProduceRequestBatcher;
 
                 let bucket_name = self.storage.host_str().unwrap_or("tansu");
@@ -3129,7 +3138,7 @@ impl Builder<i32, String, Url, Url> {
             }
 
             #[cfg(feature = "dynostore")]
-            "gs" => {
+            Backend::Google => {
                 use std::num::NonZeroU32;
 
                 use object_store::gcp::GoogleCloudStorageBuilder;
@@ -3229,7 +3238,7 @@ impl Builder<i32, String, Url, Url> {
             // (#419). Without it every fetch fails and `probe_prefix_tail`
             // degrades to a permanent LIST fallback.
             #[cfg(feature = "dynostore")]
-            "abfss" | "abfs" | "az" => {
+            Backend::Azure => {
                 use object_store::azure::MicrosoftAzureBuilder;
 
                 use crate::{azure::suffix::SuffixRange, batch::ProduceRequestBatcher};
@@ -3302,18 +3311,20 @@ impl Builder<i32, String, Url, Url> {
             }
 
             #[cfg(feature = "dynostore")]
-            "memory" => DynoStore::new(self.cluster_id.as_str(), self.node_id, InMemory::new())
-                .advertised_listener(self.advertised_listener.clone())
-                .auto_create(auto_topic_create(&self.storage))
-                .topic_defaults(self.topic_defaults.clone())
-                .coalesce_tuning(coalesce_tuning(&self.storage))
-                .message_max_bytes(message_max_bytes(&self.storage))
-                .sealed_prefix_shape()
-                .await
-                .map(|storage| Box::new(storage) as Box<dyn Storage>)
-                .map(Arc::new),
+            Backend::Memory => {
+                DynoStore::new(self.cluster_id.as_str(), self.node_id, InMemory::new())
+                    .advertised_listener(self.advertised_listener.clone())
+                    .auto_create(auto_topic_create(&self.storage))
+                    .topic_defaults(self.topic_defaults.clone())
+                    .coalesce_tuning(coalesce_tuning(&self.storage))
+                    .message_max_bytes(message_max_bytes(&self.storage))
+                    .sealed_prefix_shape()
+                    .await
+                    .map(|storage| Box::new(storage) as Box<dyn Storage>)
+                    .map(Arc::new)
+            }
 
-            "null" => Ok(null::Engine::new(
+            Backend::Null => Ok(null::Engine::new(
                 self.cluster_id.clone(),
                 self.node_id,
                 self.advertised_listener.clone(),
@@ -3321,7 +3332,18 @@ impl Builder<i32, String, Url, Url> {
             .map(|storage| Box::new(storage) as Box<dyn Storage>)
             .map(Arc::new),
 
-            _unsupported => Err(Error::UnsupportedStorageUrl(self.storage.clone())),
+            // `file:///path/to/copy` is the offline audit's, and only the
+            // audit's: a deployment already past the damage cannot be measured
+            // by starting a broker on a copy of its bucket.
+            Backend::Local => Err(Error::UnsupportedStorageUrl(self.storage.clone())),
+
+            // Without `dynostore` there is no object store to build, and the
+            // arms above are compiled out — the schemes still route, they just
+            // have nothing to route to.
+            #[cfg(not(feature = "dynostore"))]
+            Backend::S3 | Backend::Google | Backend::Azure | Backend::Memory => {
+                Err(Error::UnsupportedStorageUrl(self.storage.clone()))
+            }
         }?;
 
         let pb = if self.silent {
