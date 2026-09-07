@@ -18,9 +18,15 @@ why the emulator route is still closed and exactly how far it now gets.
 ## The URL
 
 `gs://<bucket>/`. The bucket is the URL host; the path is ignored, as it is for
-`s3://`. Every storage-URL query parameter is scheme-independent and applies
-unchanged — `coalesce_*`, `batch_min_size`, `batch_max_delay`, `segment_format`
-and the rest of [docs/storage-tuning.md](storage-tuning.md).
+`s3://`. Nearly every storage-URL query parameter is scheme-independent and
+applies unchanged — `coalesce_*`, `batch_min_size`, `batch_max_delay`,
+`segment_format` and the rest of
+[docs/storage-tuning.md](storage-tuning.md).
+
+The one exception is **`delete_concurrency`**, which is read on this arm and
+nowhere else, because GCS is the one backend with no bulk delete to widen. See
+[Deletes are one request per object](#deletes-are-one-request-per-object-518)
+below.
 
 ## Credentials
 
@@ -154,17 +160,72 @@ failure. It is the wrong budget for the per-bucket ramp, which produces the
 S3's long budget exists to ride out. A cold bucket meeting an autoscaled fleet is
 the case #364 creates.
 
-### Deletes are serial, ten at a time (#518)
+### Deletes are one request per object (#518)
 
 `object_store` implements bulk delete for S3 (`DeleteObjects`, 1,000 per request,
 20 requests in flight) and for Azure (Blob Batch, 256 per request, 20 in flight).
-For GCS it issues **one `DELETE` per object, ten in flight** — the XML API has no
-batch delete and `object_store` does not use the JSON batch endpoint.
+For GCS it issues **one `DELETE` per object** — the XML API has no batch delete,
+and `object_store` does not use the JSON batch endpoint (`POST
+/batch/storage/v1`, 100 sub-requests), which Google's own guidance discourages
+for Storage anyway. That is structural and this fork cannot change it.
 
-So the retention and compaction delete path is two orders of magnitude narrower
-on GCS than on S3 in objects per wave, and each of those deletes counts against
-the bucket's object-write rate. Deletes themselves are free of charge, as on S3
-and Azure; what they cost here is wall clock and ramp headroom.
+What it could change is the fan-out. Upstream's was **ten**
+(`object_store-0.14.1/src/gcp/mod.rs:187`), the same ten the `ObjectStore` doc
+example uses — inherited by every delete this engine issues, and unreachable,
+since `GoogleCloudStorageBuilder` has no option for it. It is now
+`gcs::limit::PutRateLimiter`'s, which the `gs` arm already wraps the store in,
+and it defaults to **16**:
+
+| | objects per request | requests in flight | objects in flight |
+|---|---|---|---|
+| S3 | 1,000 | 20 | 20,000 |
+| Azure | 256 | 20 | 5,120 |
+| GCS, upstream | 1 | 10 | 10 |
+| **GCS, here** | 1 | **`delete_concurrency`, default 16** | 16 |
+
+Sixteen because that is the number this engine already picked for the identical
+shape — `dynostore`'s `delete_each`, the per-key fallback it drops to when S3
+throttles a bulk delete, wide enough to make progress and narrow enough not to
+re-create the burst that caused the throttle. On GCS every delete is that shape.
+
+```
+gs://my-bucket/?delete_concurrency=64
+```
+
+**Before raising it**, the arithmetic, none of which has been measured against a
+bucket:
+
+- at a nominal 30 ms per `DELETE`, 16 in flight is ~530 deletes/s per
+  `delete_stream`;
+- a maintainer runs up to **four** prefixes concurrently
+  (`PREFIX_MAINTENANCE_CONCURRENCY`) and each of them deletes, so the per-replica
+  ceiling is ~4× that — ~2,100 deletes/s;
+- a bucket starts at ~1,000 **object writes**/s, deletes count against that
+  budget, and it ramps by redistribution rather than instantly (see the section
+  above);
+- and the fleet multiplies all of it by the replica count.
+
+So there is not 60× of headroom here, whatever the S3 column suggests. What a
+wider fan-out buys is a **shorter delete wave, not a higher sustained delete
+rate** — the sustained rate is whatever retention and compaction have to retire,
+which is set by the write rate and not by this number. The case that needs it is
+a maintenance tick that retires more than it can drain, and the signal for that
+already exists: `tansu_maintenance_duration` approaching the maintenance
+interval, or `tansu_prefix_drain_stops{reason!="drained"}` above zero. Raise it
+then, on one replica first, and not before.
+
+A value below ten is legitimate and is why the key parses freely rather than
+clamping upwards: a large fleet against a cold bucket has more replicas than it
+has ramp. `0` is rejected — it would be a `delete_stream` that never yields — and
+falls back to the default with a warning, as an unparseable value does.
+
+Deletes themselves are free of charge, as on S3 and Azure. What they cost here is
+wall clock and ramp headroom — and, until the bucket's soft-delete retention is
+set to `0`, seven days of storage for every byte retired.
+
+Measured in `dynostore::tests::delete_fan_out`, whose control arm is
+`gcp/mod.rs:187` copied verbatim, so the ten and the sixteen are both observed
+rather than quoted.
 
 ### Object names should be random, and ours are sequential
 
@@ -200,7 +261,7 @@ per-request:
 - **soft delete**, which bills churned bytes for seven days unless it is turned
   off — the largest single avoidable cost on this backend;
 - **delete concurrency**, which is throughput rather than money, but it is what
-  decides whether retention keeps up.
+  decides whether retention keeps up — `?delete_concurrency=`, default 16.
 
 ## Running it locally
 

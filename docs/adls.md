@@ -40,7 +40,9 @@ DFS one. That matters for private endpoints, below.
 
 Every storage-URL query parameter is scheme-independent and applies unchanged —
 `coalesce_*`, `batch_min_size`, `batch_max_delay`, and the rest of
-[docs/storage-tuning.md](storage-tuning.md).
+[docs/storage-tuning.md](storage-tuning.md). The single exception is
+`delete_concurrency`, which only the `gs` arm reads: Azure has a batch delete
+and so has no per-object fan-out to widen ([docs/gcs.md](gcs.md)).
 
 ## Credentials
 

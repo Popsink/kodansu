@@ -2821,6 +2821,36 @@ fn batch_maximum_delay(storage: &Url) -> Option<Duration> {
     })
 }
 
+/// `?delete_concurrency=` — how many objects the `gs` arm deletes at once,
+/// or `None` for [`PutRateLimiter`]'s stated default (#518).
+///
+/// **The one storage-URL key only one arm reads.** Parsing it is
+/// scheme-independent like everything else here — see
+/// `storage_url_query_parameters_are_scheme_independent` — but the value only
+/// reaches `gcs::limit::PutRateLimiter`, which is built on the `gs` arm and
+/// nowhere else, because GCS is the one backend `object_store` gives no bulk
+/// delete: S3 and Azure delete a batch per request and have no per-object
+/// fan-out to widen. On any other scheme it is accepted and ignored, as every
+/// key an arm does not read already is.
+///
+/// Zero is rejected rather than clamped: a fan-out of none is a `delete_stream`
+/// that never yields, and an operator who typed it meant something else.
+/// Unparseable values warn and fall back, as everywhere else here.
+#[cfg(feature = "dynostore")]
+fn delete_concurrency(storage: &Url) -> Option<std::num::NonZeroUsize> {
+    storage.query_pairs().find_map(|(k, v)| {
+        if k == "delete_concurrency" {
+            v.parse::<std::num::NonZeroUsize>()
+                .inspect_err(
+                    |err| warn!(%storage, key = "delete_concurrency", v = v.as_ref(), ?err),
+                )
+                .ok()
+        } else {
+            None
+        }
+    })
+}
+
 /// Parse the auto-topic-creation policy from the storage URL query string
 /// (`?auto_create_topics=false&num_partitions=3&default_replication_factor=2`),
 /// falling back to [`AutoTopicCreate::default`] for any absent or unparseable key.
@@ -3131,6 +3161,10 @@ impl Builder<i32, String, Url, Url> {
                         PutRateLimiter::new(object_store, Duration::from_mins(5))
                             .with_rate_per_second(NonZeroU32::new(1))
                             .with_jitter(Some(Duration::from_millis(50)))
+                            // GCS has no bulk delete, so the delete fan-out is
+                            // this decorator's and not `object_store`'s ten
+                            // (#518).
+                            .with_delete_concurrency(delete_concurrency(&self.storage))
                     })
                     .map(|object_store| {
                         DynoStore::new(self.cluster_id.as_str(), self.node_id, object_store)
@@ -3672,6 +3706,35 @@ mod tests {
         // Absent keys stay None (compile-time defaults).
         let empty = coalesce_tuning(&Url::parse("s3://tansu/")?);
         assert_eq!(None, empty.prefix_compact_min_segments);
+        Ok(())
+    }
+
+    /// `?delete_concurrency=` — the GCS delete fan-out (#518).
+    ///
+    /// `None` for absent, unparseable *and* zero, all three of which mean
+    /// `PutRateLimiter`'s stated default rather than a fan-out of none.
+    #[cfg(feature = "dynostore")]
+    #[test]
+    fn delete_concurrency_parses() -> Result<()> {
+        use std::num::NonZeroUsize;
+
+        assert_eq!(
+            NonZeroUsize::new(64),
+            delete_concurrency(&Url::parse("gs://tansu/?delete_concurrency=64")?)
+        );
+
+        assert_eq!(None, delete_concurrency(&Url::parse("gs://tansu/")?));
+
+        assert_eq!(
+            None,
+            delete_concurrency(&Url::parse("gs://tansu/?delete_concurrency=wide")?)
+        );
+
+        assert_eq!(
+            None,
+            delete_concurrency(&Url::parse("gs://tansu/?delete_concurrency=0")?)
+        );
+
         Ok(())
     }
 

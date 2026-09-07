@@ -14,18 +14,18 @@
 
 use std::{
     fmt::{Debug, Display},
-    num::NonZero,
+    num::{NonZero, NonZeroUsize},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
 use cached::stores::ExpiringSizedCache;
-use futures::stream::BoxStream;
+use futures::stream::{BoxStream, StreamExt as _};
 use governor::{DefaultDirectRateLimiter, Jitter, Quota, RateLimiter};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
+    ObjectStoreExt as _, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
 };
 use tracing::{debug, instrument, warn};
 
@@ -33,12 +33,51 @@ use crate::Result;
 
 const DEFAULT_JITTER: Duration = Duration::from_millis(0);
 
+/// Objects deleted concurrently on `gs://`, and the reason this decorator
+/// implements [`ObjectStore::delete_stream`] at all (#518).
+///
+/// GCS has no bulk delete. `object_store` gives S3 `DeleteObjects` (1,000 keys
+/// per request, 20 requests in flight) and Azure the Blob Batch endpoint (256 ×
+/// 20), and for GCS it issues one `DELETE` per object at a hardcoded
+/// `buffered(10)` (`object_store-0.14.1/src/gcp/mod.rs:187`) — the same 10 the
+/// trait's own doc example uses. Every delete this engine issues, which is
+/// retention, compaction retiring the segments it just merged, and group and
+/// topic teardown, inherited that number without anyone choosing it.
+///
+/// Sixteen is chosen, and it is the number [`crate::dynostore`]'s `delete_each`
+/// already picked for the identical shape: a per-key delete fan-out wide enough
+/// to make progress and narrow enough not to re-create the request burst that
+/// throttling punishes. On GCS *every* delete is that shape, so it takes that
+/// width.
+///
+/// The arithmetic an operator needs before raising it, none of it measured
+/// against a bucket:
+///
+/// - at a nominal 30 ms per `DELETE`, 16 in flight is ~530 deletes/s per
+///   `delete_stream`;
+/// - a maintainer runs up to `PREFIX_MAINTENANCE_CONCURRENCY` (4) prefixes at
+///   once and each one deletes, so the per-replica ceiling is ~4× that;
+/// - a bucket starts at ~1,000 **object writes**/s and deletes count against
+///   that budget, and it ramps by redistribution rather than instantly.
+///
+/// So this is not a knob with 60× of headroom in it. What widening buys is a
+/// shorter delete wave, not a higher sustained delete rate — the sustained rate
+/// is whatever retention has to retire, which is set by the write rate. Raise it
+/// with `?delete_concurrency=` when `tansu_maintenance_duration` approaches the
+/// maintenance interval, or `tansu_prefix_drain_stops{reason!="drained"}` is
+/// non-zero, and not before.
+pub(crate) const DEFAULT_DELETE_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(16).unwrap();
+
 #[derive(Clone)]
 pub struct PutRateLimiter<O> {
     entries: Arc<Mutex<ExpiringSizedCache<Path, Arc<DefaultDirectRateLimiter>>>>,
     rate_per_second: Option<NonZero<u32>>,
     jitter: Option<Duration>,
-    object_store: O,
+    delete_concurrency: NonZeroUsize,
+    // `Arc` rather than the store itself so `delete_stream` can hand an owned
+    // handle to the `'static` stream it returns, the way every `ObjectStore`
+    // implementation of that method does.
+    object_store: Arc<O>,
 }
 
 impl<O> Debug for PutRateLimiter<O> {
@@ -56,10 +95,11 @@ impl<O> Display for PutRateLimiter<O> {
 impl<O> PutRateLimiter<O> {
     pub fn new(object_store: O, ttl: Duration) -> Self {
         Self {
-            object_store,
+            object_store: Arc::new(object_store),
             entries: Arc::new(Mutex::new(ExpiringSizedCache::new(ttl))),
             rate_per_second: Default::default(),
             jitter: Default::default(),
+            delete_concurrency: DEFAULT_DELETE_CONCURRENCY,
         }
     }
 
@@ -72,6 +112,20 @@ impl<O> PutRateLimiter<O> {
 
     pub fn with_jitter(self, jitter: Option<Duration>) -> Self {
         Self { jitter, ..self }
+    }
+
+    /// How many objects [`ObjectStore::delete_stream`] deletes at once, or
+    /// `None` for [`DEFAULT_DELETE_CONCURRENCY`] (#518).
+    ///
+    /// `None` rather than a second constructor because that is how the storage
+    /// URL arrives: an absent `?delete_concurrency=` and an unparseable one are
+    /// the same thing to `StorageContainer::builder`, and both mean the stated
+    /// default.
+    pub fn with_delete_concurrency(self, delete_concurrency: Option<NonZeroUsize>) -> Self {
+        Self {
+            delete_concurrency: delete_concurrency.unwrap_or(DEFAULT_DELETE_CONCURRENCY),
+            ..self
+        }
     }
 
     fn rate_limiter(&self) -> Option<Arc<DefaultDirectRateLimiter>> {
@@ -181,11 +235,53 @@ where
         self.object_store.get_opts(location, options.clone()).await
     }
 
+    /// Delete at a width this fork chose, not at `object_store`'s (#518).
+    ///
+    /// The inner store's own `delete_stream` is *not* called: on GCS it is a
+    /// per-object `DELETE` at a hardcoded `buffered(10)`, and re-buffering the
+    /// stream it returns cannot widen what it already narrowed. So the fan-out
+    /// is rebuilt here out of single-object deletes —
+    /// [`DEFAULT_DELETE_CONCURRENCY`] carries the width and the arithmetic
+    /// behind it.
+    ///
+    /// `ObjectStoreExt::delete` bottoms out in the inner store's
+    /// `delete_stream` with one location, which for GCS is exactly the one
+    /// `DELETE` upstream would have issued. Same request, same per-location
+    /// `Result`, same ordering — `buffered` and not `buffer_unordered`, because
+    /// `Metron` counts what this stream yields and `dynostore::bulk_delete`
+    /// `try_collect`s it.
+    ///
+    /// **This override is only correct because GCS has no bulk delete**, and
+    /// this decorator is only ever built on the `gs` arm. Wrapping a store that
+    /// *does* have one — S3's `DeleteObjects`, Azure's Blob Batch — would
+    /// replace a thousand keys per request with a thousand requests. `gcs/`
+    /// is where that stays true.
+    ///
+    /// Deletes are deliberately not rate-limited, unlike puts. The cap this
+    /// decorator exists for is one write per second to the same *object name*,
+    /// and the layout is create-only: a key is written once and deleted once,
+    /// minutes to days later, so a delete never races a put to the same name.
     fn delete_stream(
         &self,
         locations: BoxStream<'static, Result<Path, object_store::Error>>,
     ) -> BoxStream<'static, Result<Path, object_store::Error>> {
-        self.object_store.delete_stream(locations)
+        let object_store = self.object_store.clone();
+        let delete_concurrency = self.delete_concurrency.get();
+
+        debug!(delete_concurrency);
+
+        locations
+            .map(move |location| {
+                let object_store = object_store.clone();
+
+                async move {
+                    let location = location?;
+                    object_store.delete(&location).await?;
+                    Ok(location)
+                }
+            })
+            .buffered(delete_concurrency)
+            .boxed()
     }
 
     #[instrument(skip_all, fields(prefix))]
