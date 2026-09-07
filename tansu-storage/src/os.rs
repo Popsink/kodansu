@@ -26,23 +26,41 @@ impl From<Version> for UpdateVersion {
 }
 
 /// A [`Version`] from a *listing* is not interchangeable with one from a put or
-/// a head, on Azure (#421).
+/// a head (#421, #512).
 ///
-/// `object_store`'s Azure client reads `x-ms-version-id` into the version on a
-/// put and on a get, but hard-codes `version: None` when converting a listed
-/// `Blob` — "for consistency with S3 and GCP which don't include this"
-/// (`azure/client.rs:1394`). With blob versioning enabled on the account, the
-/// same object therefore yields `Some(..)` through one path and `None` through
-/// the other.
+/// A listed `ObjectMeta` carries the etag and **no version**, on every backend:
+/// `object_store` deserialises both the S3 and the GCS listing into the same
+/// S3-shaped `ListContents`, which has no version element at all and converts to
+/// `version: None` (`client/s3.rs:85`); Azure's listing has one and it is
+/// hard-coded away anyway, "for consistency with S3 and GCP which don't include
+/// this" (`azure/client.rs:1394`). A put and a get, by contrast, read the
+/// version out of a response header on all three.
 ///
-/// Harmless today, twice over: `PutMode::Update` on Azure conditions on the
-/// etag alone and ignores the version entirely (`azure/client.rs:762`), and
-/// nothing here compares two [`Version`]s. It is written down because both of
-/// those would have to stay true — a conditional write that started keying on
-/// the version, or a cache that compared a listed version against a fetched
-/// one, would work on S3 and be wrong on a versioned Azure account.
+/// What that costs depends entirely on the backend, and the spread is the whole
+/// reason this is written down:
 ///
-/// Blob versioning is off in a correct deployment either way (`docs/adls.md`).
+/// - **S3** conditions `PutMode::Update` on the etag. A listed version works.
+/// - **Azure** conditions on the etag too and ignores `version` outright
+///   (`azure/client.rs:762`), so a listed version works there as well — and
+///   would keep working on a versioned account, where the same object differs by
+///   path.
+/// - **GCS** conditions on the *generation*, which is exactly the field a
+///   listing drops: `PutMode::Update(v)` reads `v.version` and returns
+///   `Error::MissingVersion` when it is absent (`gcp/client.rs:407`). A listed
+///   version there is not a stale version, it is not a version — and the
+///   `Generic` it produces is not `Precondition`, so no CAS loop in this crate
+///   retries it and the coordinator returns it to the client.
+///
+/// The invariant, therefore: **every `Version` handed to a conditional update
+/// must have come from a GET or a PUT of that object, never from a listing.** It
+/// holds today — all four `PutMode::Update` sites in `dynostore` take theirs
+/// from a preceding `get` — and `dynostore::tests::gcs_generation` is what keeps
+/// it holding, because nothing else can: `InMemory` leaves `version` empty and
+/// conditions on the etag, so the whole suite runs on `memory://` with the field
+/// GCS requires unset and passes.
+///
+/// Blob versioning is off in a correct deployment either way (`docs/adls.md`),
+/// and GCS object versioning likewise (`docs/gcs.md`).
 impl From<ObjectMeta> for Version {
     fn from(value: ObjectMeta) -> Self {
         Self {

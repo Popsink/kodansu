@@ -408,10 +408,20 @@ bounded:
   it runs on the maintenance workers without holding or fencing the produce
   writer. Set `prefix_compact_min_segments=0` to disable.
 
-**GCS:** safe by construction. The segment data objects are create-only
-(immutable) and the read path is footer-only (no per-flush-mutated manifest), so
-nothing on the produce or fetch hot path mutates a hot object — the ~1/s/object
-mutation cap (#13) is never approached.
+**GCS:** safe by construction, **on the data plane**. The segment data objects
+are create-only (immutable) and the read path is footer-only (no
+per-flush-mutated manifest), so nothing on the produce or fetch hot path mutates
+a hot object and the ~1/s/object mutation cap (#13) is never approached. That is
+now asserted rather than argued — `dynostore::tests::gcs_generation` measures
+produce and fetch issuing **zero** conditional updates.
+
+The clause the sentence used to be missing is the group plane, which does mutate
+one object: `generation.json`, once per member admission. Under the cap that
+serialises, and a 16-member group takes ~54 s to form — past a client's session
+timeout (#427). The delete path is also GCS-specific in a way this section is
+not: `object_store` has no batch delete for GCS and issues one request per
+object, ten in flight, against 1,000-per-request for S3. See
+[docs/gcs.md](gcs.md).
 
 **Coexistence with pre-segment data:** a topic that predates segments keeps its
 per-topic `records/` objects; new data goes to segments and the old objects stay
