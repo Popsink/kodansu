@@ -76,7 +76,7 @@ use opentelemetry::{
 use rand::{prelude::*, rng};
 use tansu_sans_io::{
     Body, ErrorCode,
-    consumer::{MemberAssignment, MemberMetadata},
+    consumer::{CONSUMER, MemberAssignment, MemberMetadata},
     heartbeat_response::HeartbeatResponse,
     join_group_request::JoinGroupRequestProtocol,
     join_group_response::{JoinGroupResponse, JoinGroupResponseMember},
@@ -182,6 +182,16 @@ const DEFAULT_SESSION_TIMEOUT_MS: i32 = 45_000;
 /// Concurrency of the per-member document fan-outs (the leader's join response
 /// and the sweep), matching the fan-outs in the storage engine.
 const MEMBER_FETCH_CONCURRENCY: usize = 32;
+
+/// The two bytes `ConsumerProtocol.deserializeVersion` reads before anything
+/// else: the version at the head of every encoded member subscription and
+/// assignment.
+///
+/// A `JoinGroup` member entry shorter than this is not an empty subscription,
+/// it is a buffer the reference client refuses — `SchemaException: Buffer
+/// underflow while parsing consumer protocol's header`, thrown out of the
+/// leader's `poll()` before it assigns anything (#530).
+const CONSUMER_PROTOCOL_HEADER_LEN: usize = 2;
 
 /// Backoff before retrying a group write that lost the object-store CAS race
 /// (another replica updated the same object first). Without it the retry loop
@@ -1753,39 +1763,114 @@ where
         .await
     }
 
-    /// The member list a leader's `JoinGroup` response carries.
+    /// The member list a leader's `JoinGroup` response carries — or `None`
+    /// when it cannot be built completely.
     ///
     /// One document per member the generation names — no listing, and only on
     /// the response that needs it, which is one member's join per rebalance.
-    /// A member named by the generation whose document has gone is reported
-    /// with empty metadata rather than dropped: the generation is what says it
-    /// is a member.
+    ///
+    /// **Every member the generation names must contribute a parseable entry,
+    /// or there is no answer at all** (#530). A member whose document cannot be
+    /// read used to be reported with empty metadata, on the reasoning that the
+    /// generation is what says it is a member — but the leader does not merely
+    /// carry that list, it *decodes* it. `ConsumerProtocol.deserializeVersion`
+    /// reads a two-byte version before anything else, so an entry shorter than
+    /// that throws `SchemaException: Buffer underflow while parsing consumer
+    /// protocol's header` out of the leader's `poll()`, and one such entry
+    /// poisons the assignor for the **whole** group: nobody is assigned, the
+    /// leader re-joins, and it throws again.
+    ///
+    /// This is the join-path twin of the guard [`Self::sync_once`] already
+    /// applies one API later — a member of this generation the leader's
+    /// assignment does not cover is told to re-join rather than parked on a
+    /// valid-looking empty answer. Refusing here is likewise better than
+    /// degrading: the caller answers `RebalanceInProgress`, the leader retries,
+    /// and the condition clears on its own, because a member whose document has
+    /// gone rewrites it on its next join and the sweep evicts it if it does not
+    /// come back.
     async fn join_members(
         &self,
         group_id: &str,
         generation: &GenerationDoc,
-    ) -> Vec<JoinGroupResponseMember> {
-        futures::stream::iter(generation.members.clone().into_iter().map(
-            |(member_id, held)| async move {
-                self.storage
-                    .read_group_member(group_id, &member_id)
-                    .await
-                    .inspect_err(|error| debug!(?error, group_id, member_id))
-                    .ok()
-                    .flatten()
-                    .map_or_else(
-                        || {
-                            JoinGroupResponseMember::default()
-                                .member_id(member_id.clone())
-                                .group_instance_id(held.group_instance_id.clone())
-                        },
-                        |(member, _)| member.join_response,
-                    )
-            },
-        ))
+    ) -> Option<Vec<JoinGroupResponseMember>> {
+        let consumer_protocol = generation.protocol_type.as_deref() == Some(CONSUMER);
+
+        futures::stream::iter(
+            generation
+                .members
+                .keys()
+                .cloned()
+                .map(|member_id| async move {
+                    let held = match self.storage.read_group_member(group_id, &member_id).await {
+                        Ok(held) => held,
+
+                        // A throttle, a reset connection, a read that simply failed:
+                        // transient, and a retryable join is the right answer to it.
+                        Err(error) => {
+                            warn!(
+                                ?error,
+                                group_id,
+                                member_id,
+                                "cannot read the document of a member of this generation"
+                            );
+
+                            COORDINATOR_REQUESTS
+                                .add(1, &[KeyValue::new("method", "join_member_unreadable")]);
+
+                            return None;
+                        }
+                    };
+
+                    // The generation names a member that has no document. The reverse —
+                    // a document with no member — is harmless and documented as such on
+                    // `delete_group_member`; this direction is not, and until #530 it
+                    // was invisible: nothing logged it and nothing counted it.
+                    let Some((member, _)) = held else {
+                        warn!(
+                            group_id,
+                            member_id, "no document for a member of this generation"
+                        );
+
+                        COORDINATOR_REQUESTS
+                            .add(1, &[KeyValue::new("method", "join_member_absent")]);
+
+                        return None;
+                    };
+
+                    let join_response = member.join_response;
+
+                    // The edge assertion, so no future path can reintroduce a buffer
+                    // the reference client rejects — including a document that was
+                    // stored short rather than synthesised here.
+                    //
+                    // Only for a group that declares `protocol_type=consumer`: the
+                    // length is `ConsumerProtocol`'s, and what a group speaking some
+                    // other protocol puts in `metadata` — including nothing at all —
+                    // is between its own members.
+                    if consumer_protocol
+                        && join_response.metadata.len() < CONSUMER_PROTOCOL_HEADER_LEN
+                    {
+                        warn!(
+                            group_id,
+                            member_id,
+                            metadata_len = join_response.metadata.len(),
+                            "member metadata is too short for the consumer protocol header"
+                        );
+
+                        COORDINATOR_REQUESTS
+                            .add(1, &[KeyValue::new("method", "join_member_short_metadata")]);
+
+                        return None;
+                    }
+
+                    Some(join_response)
+                }),
+        )
         .buffered(MEMBER_FETCH_CONCURRENCY)
         .collect::<Vec<_>>()
         .await
+        .into_iter()
+        .collect()
     }
 
     async fn fetch_offset(
@@ -2684,13 +2769,43 @@ where
 
                     // Only the leader is handed the membership, and only now
                     // that it is being answered.
-                    return Ok(response
-                        .members(Some(if is_leader {
-                            self.join_members(group_id, &view.generation).await
-                        } else {
-                            [].into()
-                        }))
-                        .into());
+                    let members = if is_leader {
+                        // A list the leader's assignor cannot decode is worse
+                        // than no answer: it throws out of `poll()` and no
+                        // member of the group is assigned (#530). Bounce this
+                        // join instead — `RebalanceInProgress` is the client's
+                        // documented retry, and the divergence between the
+                        // generation and the member documents clears on the
+                        // retry, either because the member rewrites its
+                        // document on its own re-join or because the sweep
+                        // evicts it.
+                        let Some(members) = self.join_members(group_id, &view.generation).await
+                        else {
+                            COORDINATOR_REQUESTS
+                                .add(1, &[KeyValue::new("method", "join_members_incomplete")]);
+
+                            warn!(
+                                group_id,
+                                member_id,
+                                generation_id = view.generation_id(),
+                                join_outcome = ?ErrorCode::RebalanceInProgress,
+                                "refusing a leader join whose member list is incomplete"
+                            );
+
+                            return Ok(join_error(
+                                &view,
+                                ErrorCode::RebalanceInProgress,
+                                member_id.as_str(),
+                                protocol_type,
+                            ));
+                        };
+
+                        members
+                    } else {
+                        [].into()
+                    };
+
+                    return Ok(response.members(Some(members)).into());
                 }
             }
         }
@@ -3314,7 +3429,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::sync::OnceLock;
     use tansu_sans_io::{
-        consumer::{CONSUMER, ConsumerProtocolSubscription},
+        consumer::ConsumerProtocolSubscription,
         offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
     };
     use tansu_storage::{LatencyIntroducingStorage, StorageContainer};
@@ -5914,6 +6029,123 @@ mod tests {
         Ok(())
     }
 
+    /// #530: a member the generation names whose document cannot be read must
+    /// refuse the leader's join, not degrade it.
+    ///
+    /// The fallback used to answer with the member id and no metadata at all,
+    /// and an empty `Bytes` is not an empty subscription — it is two bytes
+    /// short of the version `ConsumerProtocol.deserializeVersion` reads first,
+    /// so `kafka-clients` throws `SchemaException: Buffer underflow while
+    /// parsing consumer protocol's header` out of `poll()` before it assigns
+    /// anything. One such entry breaks the rebalance for the *whole* group: on
+    /// a 24-member group over 1 000 topics it was 226 throws from the one
+    /// process holding the leader and none from the other 16 members, and 107 s
+    /// to converge against 12.5 s clean.
+    #[tokio::test(start_paused = true)]
+    async fn a_leader_join_is_refused_when_a_member_document_is_missing() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "unreadable-member";
+        const LEADER: &str = "m-00";
+        const OTHER: &str = "m-01";
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+        let metadata = encode_subscription(&["t"], None);
+
+        let join = join_group(&controller, GROUP_ID, LEADER, &metadata).await?;
+        assert_eq!(LEADER, join.leader);
+
+        let join = join_group(&controller, GROUP_ID, OTHER, &metadata).await?;
+
+        _ = sync_group(
+            &controller,
+            GROUP_ID,
+            join.generation_id,
+            LEADER,
+            &[assignment_of(LEADER), assignment_of(OTHER)],
+        )
+        .await?;
+
+        // The control: with both documents in place the leader is answered a
+        // list it can decode, so what the refusal below rests on is the missing
+        // document and nothing else.
+        let answered = join_group(&controller, GROUP_ID, LEADER, &metadata).await?;
+
+        assert_eq!(i16::from(ErrorCode::None), answered.error_code);
+        assert_eq!(
+            vec![LEADER.to_owned(), OTHER.to_owned()],
+            answered
+                .members
+                .as_ref()
+                .expect("the leader is handed the membership")
+                .iter()
+                .map(|member| member.member_id.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            answered.members.as_ref().is_some_and(|members| members
+                .iter()
+                .all(|member| member.metadata.len() >= CONSUMER_PROTOCOL_HEADER_LEN)),
+            "every entry must carry a decodable subscription"
+        );
+
+        // The condition, as a `PUT` that never landed leaves it: the generation
+        // still names the member, its document is gone.
+        storage.delete_group_member(GROUP_ID, OTHER).await?;
+
+        // ... and the sweep — which would reclaim that membership, and which
+        // every request asks for — is not due, so this join has to answer for
+        // the divergence itself.
+        let (generation, version) = storage
+            .read_group_generation(GROUP_ID)
+            .await?
+            .expect("generation");
+
+        assert!(generation.members.contains_key(OTHER));
+
+        _ = storage
+            .update_group_generation(
+                GROUP_ID,
+                GenerationDoc {
+                    swept_at_ms: epoch_ms(paused_clock()),
+                    ..generation
+                },
+                Some(version),
+            )
+            .await
+            .map_err(update_error)?;
+
+        let refused = join_group(&controller, GROUP_ID, LEADER, &metadata).await?;
+
+        assert_eq!(
+            i16::from(ErrorCode::RebalanceInProgress),
+            refused.error_code,
+            "a member list the leader cannot decode must be a retryable join, \
+             not a successful answer"
+        );
+        assert_eq!(
+            Some(vec![]),
+            refused.members,
+            "and it must carry no member at all rather than a short one"
+        );
+
+        // Pinning what the refusal was for: the sweep did not run, so the
+        // generation still names a member with no document and the next join
+        // meets the same condition. The divergence clears on its own — that
+        // member rewrites its document when it re-joins, and the sweep evicts
+        // it when it does not.
+        assert!(
+            generation_of(&storage, GROUP_ID)
+                .await?
+                .members
+                .contains_key(OTHER),
+            "the join must refuse rather than reclaim: the sweep owns that"
+        );
+
+        Ok(())
+    }
+
     /// The sweep costs one write per group per session/2 across the fleet, not
     /// one per replica: its verdict is a pure function of the documents and the
     /// clock, and `swept_at_ms` is what stops every replica repeating it.
@@ -6629,7 +6861,10 @@ mod tests {
         let storage = memory_storage().await?;
         let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
 
-        // A document with a lower id, fresh, and no request behind it.
+        // A document with a lower id, fresh, and no request behind it. It
+        // carries a subscription because every document the join path writes
+        // does — and since #530 a batch-admitted member with metadata the
+        // leader's assignor cannot decode is refused rather than served.
         _ = storage
             .write_group_member(
                 GROUP_ID,
@@ -6637,7 +6872,9 @@ mod tests {
                 MemberDoc {
                     last_contact_ms: epoch_ms(paused_clock()),
                     session_timeout_ms: SESSION_TIMEOUT_MS,
-                    join_response: JoinGroupResponseMember::default().member_id(PHANTOM.into()),
+                    join_response: JoinGroupResponseMember::default()
+                        .member_id(PHANTOM.into())
+                        .metadata(encode_subscription(&["t"], None)),
                     ..Default::default()
                 },
                 None,
