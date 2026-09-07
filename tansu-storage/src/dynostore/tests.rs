@@ -33,6 +33,7 @@ mod fenced_overlap;
 mod flush_conflict;
 mod gcs;
 mod gcs_generation;
+mod gcs_retry;
 mod group_describe;
 mod group_documents;
 mod group_expiry;

@@ -3092,6 +3092,12 @@ impl Builder<i32, String, Url, Url> {
                     // 10 retries over 180s isn't enough and deletes/produces are
                     // dropped (#5, #6). Give throttles a longer, gentler ceiling
                     // so they ride out a SlowDown burst instead of failing.
+                    //
+                    // `gs`'s data plane takes these same numbers, via
+                    // `gcs::retry::BUCKET_RAMP_RETRY`, for the same reason
+                    // wearing a different status code (#519). Duplicated rather
+                    // than shared: the two arms are throttled by different
+                    // things and only happen to want the same patience.
                     .with_retry(RetryConfig {
                         backoff: BackoffConfig {
                             init_backoff: Duration::from_millis(200),
@@ -3128,7 +3134,13 @@ impl Builder<i32, String, Url, Url> {
 
                 use object_store::gcp::GoogleCloudStorageBuilder;
 
-                use crate::{batch::ProduceRequestBatcher, gcs::limit::PutRateLimiter};
+                use crate::{
+                    batch::ProduceRequestBatcher,
+                    gcs::{
+                        limit::PutRateLimiter,
+                        retry::{BUCKET_RAMP_RETRY, OBJECT_CAP_RETRY, RetrySplit},
+                    },
+                };
 
                 let bucket_name = self.storage.host_str().unwrap_or("tansu");
 
@@ -3137,26 +3149,30 @@ impl Builder<i32, String, Url, Url> {
 
                 warn_deprecated_layout_flags(&self.storage);
 
-                GoogleCloudStorageBuilder::from_env()
-                    .with_bucket_name(bucket_name)
-                    // GCS caps updates to a single object at ~1 write/second; an
-                    // over-the-cap conditional update returns `429 rateLimitExceeded`.
-                    // The object_store default RetryConfig (10 retries over 180s) backs
-                    // off *silently*, which is exactly the "30s produce latency with zero
-                    // log lines" reported in #13. Bound the budget so a throttled object
-                    // fails fast instead of hanging tens of seconds. `PutMode::Create`
-                    // conflicts are NOT retried here — they surface as `AlreadyExists`
-                    // and are resolved by the dynostore offset-assignment loop.
-                    .with_retry(RetryConfig {
-                        backoff: BackoffConfig {
-                            init_backoff: Duration::from_millis(100),
-                            max_backoff: Duration::from_secs(3),
-                            base: 2.0,
-                        },
-                        max_retries: 5,
-                        retry_timeout: Duration::from_secs(15),
+                // Two clients on one bucket, because GCS has two rate limits and
+                // one retry budget cannot be right for both (#519). The bucket
+                // ramps and answers a retryable `429 rateLimitExceeded` above
+                // the guideline, which is `503 SlowDown` in a different colour
+                // and wants the `s3` arm's patience; a single *object name*
+                // caps at ~1 write/s, and waiting inside `object_store` for
+                // that is #13's 30-second produce. `RetrySplit` picks per
+                // request — see `gcs/retry.rs` for the table and for what the
+                // second client costs.
+                //
+                // Everything else about the two is identical, so the closure
+                // holds the whole configuration and the budget is the argument.
+                let client = |retry| {
+                    GoogleCloudStorageBuilder::from_env()
+                        .with_bucket_name(bucket_name)
+                        .with_retry(retry)
+                        .build()
+                };
+
+                client(BUCKET_RAMP_RETRY)
+                    .and_then(|bucket_ramp| {
+                        client(OBJECT_CAP_RETRY)
+                            .map(|object_cap| RetrySplit::new(bucket_ramp, object_cap))
                     })
-                    .build()
                     .map(|object_store| {
                         PutRateLimiter::new(object_store, Duration::from_mins(5))
                             .with_rate_per_second(NonZeroU32::new(1))
@@ -3235,10 +3251,12 @@ impl Builder<i32, String, Url, Url> {
                     // Azure throttles at the *account* and storage-partition
                     // level (`503 ServerBusy`, `500 OperationTimedOut`), not per
                     // object. That is S3's failure shape, not GCS's, so this
-                    // takes the `s3` arm's long, gentle budget and deliberately
-                    // not the `gs` arm's fail-fast one — which exists only
-                    // because a GCS per-object throttle cannot be won by
-                    // waiting (#13).
+                    // takes the `s3` arm's long, gentle budget for every request
+                    // and deliberately not the fail-fast one — which exists
+                    // only because a GCS per-object throttle cannot be won by
+                    // waiting (#13), and which on the `gs` arm is now one of
+                    // two budgets picked per request (#519). There is nothing
+                    // to pick between here: Azure has one throttle.
                     .with_retry(RetryConfig {
                         backoff: BackoffConfig {
                             init_backoff: Duration::from_millis(200),

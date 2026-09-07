@@ -78,6 +78,10 @@ use uuid::Uuid;
 mod metadata;
 mod opticon;
 
+// Re-exported rather than opening `metadata` up: `gcs::retry` needs exactly this
+// one predicate and nothing else in there (#519).
+pub(crate) use metadata::is_immutable;
+
 #[cfg(test)]
 mod tests;
 
@@ -16215,6 +16219,45 @@ fn is_s3_throttle(error: &object_store::Error) -> bool {
     false
 }
 
+/// True if `error` is a `429 Too Many Requests` — on `gs://`, the only shape a
+/// request-rate throttle takes (#519).
+///
+/// GCS throttles a bucket that is still redistributing key ranges, and a single
+/// object name written more than once a second, and answers both with a
+/// retryable `429 rateLimitExceeded`. Neither was distinguishable in
+/// [`object_store_error_name`]: `object_store` maps every status it has no
+/// variant for onto `Error::Generic` (`client/retry.rs:159-186`), so an
+/// exhausted 429 arrived as `Generic { store: "GCS" }` and was labelled
+/// `reason="otherwise"` — which is where #519's retry-budget split cannot be
+/// validated from, since the two budgets are told apart by `class` on a
+/// `reason="throttle"` series.
+///
+/// Text-matched, like [`is_s3_throttle`], and for the same reason and with the
+/// same trade-off (#284). Two markers: the status line, because that is what
+/// `object_store` formats into the error (`StatusCode`'s own `Display` is
+/// `"429 Too Many Requests"`), and Google's reason string, which the response
+/// body carries.
+///
+/// Deliberately *not* folded into [`is_s3_throttle`], which is not merely a
+/// classifier: it also drives `delete_batches`' retry-the-bulk-delete-then-fall-
+/// back-to-per-key loop, and on GCS both halves of that loop are already
+/// per-object deletes, so there would be nothing to fall back to.
+fn is_too_many_requests(error: &object_store::Error) -> bool {
+    let mut current: Option<&dyn std::error::Error> = Some(error);
+
+    while let Some(err) = current {
+        let text = err.to_string();
+
+        if text.contains("429 Too Many Requests") || text.contains("rateLimitExceeded") {
+            return true;
+        }
+
+        current = err.source();
+    }
+
+    false
+}
+
 /// True if `error` looks like a request that ran out of time rather than one the
 /// store answered.
 ///
@@ -16263,7 +16306,12 @@ fn object_store_error_name(error: &object_store::Error) -> &'static str {
 
         object_store::Error::NotFound { .. } => "not_found",
 
-        throttled if is_s3_throttle(throttled) => "throttle",
+        // Both shapes under one label: S3's `503 SlowDown` and GCS's `429
+        // rateLimitExceeded` are the same event and no backend emits both, so
+        // `reason="throttle"` stays the series it already was and now covers
+        // `gs://` too. Which of GCS's two rate limits was hit is read off
+        // `class`, not off `reason` — see `gcs/retry.rs`.
+        throttled if is_s3_throttle(throttled) || is_too_many_requests(throttled) => "throttle",
 
         timed_out if is_timeout(timed_out) => "timeout",
 
@@ -16686,12 +16734,20 @@ where
 #[cfg(test)]
 mod throttle_tests {
     use super::{
-        Duration, cas_conflict_backoff, is_s3_throttle, object_store_error_name, throttle_backoff,
+        Duration, cas_conflict_backoff, is_s3_throttle, is_too_many_requests,
+        object_store_error_name, throttle_backoff,
     };
 
     fn generic_s3(source: &'static str) -> object_store::Error {
         object_store::Error::Generic {
             store: "S3",
+            source: source.into(),
+        }
+    }
+
+    fn generic_gcs(source: &'static str) -> object_store::Error {
+        object_store::Error::Generic {
+            store: "GCS",
             source: source.into(),
         }
     }
@@ -16713,6 +16769,36 @@ mod throttle_tests {
         )));
     }
 
+    /// A GCS throttle is a `429`, and it reaches the `throttle` label (#519).
+    ///
+    /// Both of GCS's rate limits answer this way — the per-bucket ramp and the
+    /// per-object write cap — which is why the two retry budgets are told apart
+    /// by the `class` label and not by `reason`.
+    #[test]
+    fn a_gcs_429_is_throttle() {
+        // What an exhausted budget actually surfaces: `object_store` has no
+        // variant for 429, so it is `Generic` wrapping the formatted status
+        // line and body.
+        let ramp = generic_gcs(
+            "Server returned non-2xx status code: 429 Too Many Requests: \
+             {\"error\":{\"code\":429,\"message\":\"The object exceeded its rate limit\",\
+             \"errors\":[{\"reason\":\"rateLimitExceeded\"}]}}",
+        );
+
+        assert!(is_too_many_requests(&ramp));
+        assert_eq!("throttle", object_store_error_name(&ramp));
+
+        // The reason string on its own, for a 429 whose status line is not in
+        // the text this walk can reach.
+        assert!(is_too_many_requests(&generic_gcs(
+            "Error performing PUT in 15s, after 5 retries - rateLimitExceeded"
+        )));
+
+        // And it is not the S3 predicate, which drives the bulk-delete
+        // fall-back rather than the label.
+        assert!(!is_s3_throttle(&ramp));
+    }
+
     #[test]
     fn unrelated_errors_are_not_throttle() {
         assert!(!is_s3_throttle(&object_store::Error::NotFound {
@@ -16720,6 +16806,16 @@ mod throttle_tests {
             source: "missing".into(),
         }));
         assert!(!is_s3_throttle(&generic_s3("connection reset by peer")));
+
+        // The 429 walk must not claim an unrelated error that merely mentions a
+        // number, or a `412` a lost CAS produces — which `object_store` does
+        // not retry and this must not relabel.
+        assert!(!is_too_many_requests(&generic_gcs(
+            "Server returned non-2xx status code: 412 Precondition Failed: "
+        )));
+        assert!(!is_too_many_requests(&generic_gcs(
+            "Object at location x has size 429"
+        )));
     }
 
     /// #284's acceptance: a throttle is distinguishable from a 404 and from a

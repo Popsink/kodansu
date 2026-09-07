@@ -516,8 +516,13 @@ the serverless roadmap (#364). No credential code of our own.
 Azure throttles at the *account* and *storage-partition* level (`503 ServerBusy`,
 `500 OperationTimedOut`), not per object. That failure shape is S3's, not GCS's —
 so the Azure arm takes the S3 arm's long, gentle budget (32 retries / 300 s,
-`lib.rs:2784`), **not** the GCS arm's fail-fast one (5 retries / 15 s), which
-exists only because a GCS per-object throttle is unwinnable by waiting.
+`lib.rs:2784`) for every request, **not** the fail-fast one (5 retries / 15 s),
+which exists only because a GCS per-object throttle is unwinnable by waiting.
+
+*Updated by #519*: the GCS arm no longer has one budget. GCS has two rate limits
+— a per-object write cap and a per-bucket ramp — so `gs` now builds two clients
+and picks per request (`docs/gcs.md`). Azure still has one throttle and so still
+has one budget; the conclusion above is unchanged, only the comparison is.
 
 ### 8.4 Feature flag
 

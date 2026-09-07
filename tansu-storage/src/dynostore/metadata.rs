@@ -153,6 +153,13 @@ pub(super) fn key_class(path: &Path) -> &'static str {
 /// Whether `path` names an immutable data object — a segment (#64) or a legacy
 /// `records/` batch (#50) — for which memoizing an etag can never pay (#400).
 ///
+/// `pub(crate)` for a second caller that asks the same question of the same
+/// paths for a different reason: `gcs::retry::RetrySplit` needs to know which
+/// keys are written once, because a key written once cannot meet GCS's
+/// per-object write cap (#519). Shared rather than restated so that a new
+/// create-only object class is a data-plane write there and a non-memoized key
+/// here in one edit.
+///
 /// These are create-only and read by **ranged** GET for their bytes, so no
 /// caller presents `If-None-Match` for one, and answering a body read
 /// `NotModified` would be wrong if one did. Measured over an hour on the
@@ -161,7 +168,7 @@ pub(super) fn key_class(path: &Path) -> &'static str {
 /// exists for. Every segment path is distinct, so those insertions are also the
 /// churn: an evicting insert into the shared, locked map on the read hot path,
 /// serialised against the `meta` revalidations that do work.
-fn is_immutable(path: &Path) -> bool {
+pub(crate) fn is_immutable(path: &Path) -> bool {
     let path = path.as_ref();
 
     path.ends_with(".seg") || path.ends_with(".batch")

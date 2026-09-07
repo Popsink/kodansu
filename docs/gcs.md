@@ -145,20 +145,78 @@ different objects), and the limiter is a **local delay**, so the cost was paid
 whether or not a real bucket would have rejected the burst. Nothing has observed
 what GCS actually does under this pattern.
 
-### The bucket ramps, and the retry budget is not sized for it (#519)
+### The bucket ramps, and there are two retry budgets (#519)
 
 A GCS bucket starts at roughly **1,000 object writes/s and 5,000 reads/s** and
 scales from there by redistributing load, which *"typically takes on the order of
 minutes"*; Google asks that you ramp no faster than doubling every 20 minutes.
 S3, by contrast, scales per key prefix and needs no warm-up.
 
-The `gs` arm's retry budget is **5 retries over 15 s**, against the `s3` arm's
-32 over 300 s. That was chosen for the per-object cap — #13's symptom was a 30 s
-produce latency with no log lines, and a short budget turns it into a fast
-failure. It is the wrong budget for the per-bucket ramp, which produces the
-*other* failure shape: a fleet-wide 429 storm during a scale-up, which is what
-S3's long budget exists to ride out. A cold bucket meeting an autoscaled fleet is
-the case #364 creates.
+That is GCS's *second* rate limit, and it has the opposite failure shape to the
+one above. The per-object cap is a key that cannot go faster, so waiting is
+pointless. The per-bucket ramp answers a retryable **`429 rateLimitExceeded`**
+while it redistributes, which is `503 SlowDown` in a different colour:
+transient, fleet-wide, and cured by waiting. A cold bucket meeting an autoscaled
+fleet is the case #364 creates by design, and a maintenance tick's retirement
+flood spends the same object-write allowance, because deletes count against it.
+
+Both arrive as a `429`, so the retry policy cannot tell them apart. What can is
+the request — the per-object cap is reachable only by writing one object name
+twice — so the `gs` arm builds **two clients on the one bucket** and picks per
+request:
+
+| request | budget | why |
+|---|---|---|
+| write of a `*.seg` or `*.batch` | **32 retries / 300 s**, 200 ms → 30 s | create-only: a key is minted, written once and never rewritten, so a `429` here met the bucket |
+| write of anything else | **5 retries / 15 s**, 100 ms → 3 s | `meta.json`, `watermark.json`, `generation.json`, member documents, leases — the same name written again, which is the per-object cap |
+| GET, any key | 32 / 300 s | there is no per-object *read* cap; the read limit is the bucket's ~5,000/s and it ramps |
+| LIST | 32 / 300 s | ditto, and a listing addresses a prefix rather than a name |
+| DELETE | 32 / 300 s | deletes count against the bucket's object-write budget, but a key is deleted once |
+
+The long one is the `s3` arm's budget, unchanged and for the same reason (#5,
+#6). The short one is what the whole arm used to carry: it is the right answer
+for a hot key, because what resolves a hot key is *not* waiting inside
+`object_store` but the CAS loop above giving up on this attempt, re-reading, and
+re-applying — and `PutRateLimiter` pacing the next one. #13's symptom was a
+30-second produce with no log lines, and that budget is what turned it into a
+fast, visible failure.
+
+So the fix was not to lengthen the budget, and it is held that way in two
+places: `dynostore::tests::gcs_retry` asserts the mapping over the decorator
+stack the arm actually builds, and `gcs/retry.rs` asserts *at compile time* that
+the short budget is the shorter of the two — an edit that relaxes it to make a
+ramp survivable fails to build rather than failing in a bucket.
+
+**What it costs**: a second connection pool and a second credential cache.
+`RetryConfig` is captured by `GoogleCloudStorageBuilder::build` and there is no
+per-request override, so two budgets means two clients. Nothing else about them
+differs, and both address the same bucket with the same identity.
+
+It does mean a GET is served by one client and the conditional PUT that follows
+it by the other, which is the invariant two sections up. That holds: a generation
+is a property of the object in the bucket and not of the connection that saw it,
+so a version crosses the split intact.
+
+**Neither budget is silent.** `object_store` logs every attempt at `INFO` —
+`"Encountered server error with status 429, backing off for N seconds, retry n of
+m"` — so a ramp being ridden out is visible in the broker's own logs, which is
+what #13's 30 seconds were not.
+
+**What to watch.** A `429` that a budget absorbs is invisible except as latency:
+only an *exhausted* budget reaches a metric. When it does, it is
+`tansu_object_store_request_error{reason="throttle"}` — the same label S3's
+`SlowDown` gets, since no backend emits both — and the two throttles are told
+apart by the `class` label on that series:
+
+| series | reading |
+|---|---|
+| `reason="throttle", class=~"segment\|records"` | the **bucket**: the ramp is behind the fleet's write rate. Slow the ramp down, or add replicas more gradually. |
+| `reason="throttle"`, any other class | a **hot key**. `class` names which: `group_generation` is #427's, `watermark` is a hot partition. |
+| `tansu_object_store_request_duration` climbing with no errors | a budget absorbing `429`s. This is the leading signal; the error counter is the trailing one. |
+
+`reason="throttle"` covering GCS is new in #519 — a `429` used to land in
+`reason="otherwise"`, because `object_store` has no variant for that status and
+maps it to `Generic`.
 
 ### Deletes are one request per object (#518)
 
