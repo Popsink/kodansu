@@ -124,7 +124,7 @@ Azurite (`object_store` 0.14.1, `quay.io/minio/minio`,
 |---|---|
 | create-only | 16 concurrent creators of one key: exactly one wins, every loser is `AlreadyExists` |
 | etag CAS | 16 writers race one version: one wins, every loser is `Precondition`, and the spent version stays spent |
-| CAS is not a create | an invented etag, and a CAS against an absent key, are both `Precondition` — never a silent write |
+| CAS is not a create | a version the store never issued, and a CAS against an absent key, are both `Precondition` — never a silent write. `invented_version()` builds that version in the shape the store refuses *on the wire*: an etag on S3 and Azure, a generation on GCS (#520) |
 | etag stability | an unchanged object keeps its etag across repeated `head`/`get` and across unrelated writes in the same prefix, and a CAS against it still succeeds (the #111 GET-first skip depends on this) |
 | conditional read | `If-None-Match` is `NotModified` on an unchanged object and returns the body once it changes |
 | `UpdateError::Outdated` | a stale `update_group_generation` carries the value that won and its version, which is what the coordinator re-derives from rather than retrying blindly (#157) |
@@ -258,47 +258,95 @@ check has to involve a second broker over the same container, or a restarted one
 actually exercises it.
 
 **GCS.** `gs://` is a supported target and every test in the conformance target
-would run against it unchanged — that is the whole point of the URL being a
-parameter — but none of them ever has. Generation preconditions remain assumed
-rather than observed *on the wire*; what the semantics **are** is now covered
-without a bucket, by `dynostore::tests::gcs_generation` over a store that
-conditions on the generation and drops it from listings the way `object_store`
-does. That closes the part of the gap that is a semantic difference rather than
-a behaviour under load. `docs/gcs.md` says which is which.
+runs against it unchanged — that is the whole point of the URL being a parameter
+— but no run of it has ever been observed against Google's own service.
+Generation preconditions remain assumed rather than observed *on the wire*; what
+the semantics **are** is covered without a bucket, by
+`dynostore::tests::gcs_generation` over a store that conditions on the generation
+and drops it from listings the way `object_store` does. That closes the part of
+the gap that is a semantic difference rather than a behaviour under load.
+`docs/gcs.md` says which is which.
 
-Two emulators were tried and neither works, which is worth recording in detail so
-nobody tries a fourth time (#357, #429):
+"Runs unchanged" was nominal until #520 and is now true. Two of the ten
+assertions built a version the store never issued as an etag with no generation,
+which is what S3 and Azure refuse with `412` — GCS refuses it *in the client*,
+with `Generic { MissingVersion }`, before a request is sent. So those two
+measured `object_store` rather than the store and would have failed against a
+real bucket just as surely as against an emulator. `invented_version()` in
+`conditional_put.rs` now builds the invented version in the shape the store under
+test refuses on the wire: `x-goog-if-generation-match: 1` on `gs://`, since GCS
+generations are microsecond timestamps and `1` is never issued.
+
+Two emulators have been tried. Neither works today, and the reasons are worth
+recording in detail so nobody re-derives them a fifth time (#357, #429, #520):
 
 - `object_store` **does** support pointing at one with no code change: a service
   account file containing `{"gcs_base_url": "...", "disable_oauth": true}` is
-  read by `GoogleCloudStorageBuilder::from_env`, so `GOOGLE_SERVICE_ACCOUNT`
-  alone would redirect the engine.
-- **The obstacle is the API.** `object_store` 0.14's GCS client writes through
-  the **XML** API — `PUT /{bucket}/{object}` with `x-goog-if-generation-match`.
+  read by `GoogleCloudStorageBuilder::from_env`, so `GOOGLE_SERVICE_ACCOUNT_KEY`
+  alone redirects the engine. `GOOGLE_SKIP_SIGNATURE=true` does **not**: the
+  builder still wires the IMDS token provider and the put goes to
+  `169.254.169.254`.
+- **The API is what matters, and only for some verbs.** `object_store` 0.14's
+  GCS client puts, gets, lists and deletes through the **XML** API — `PUT
+  /{bucket}/{object}` with `x-goog-if-generation-match`, `GET
+  /{bucket}?list-type=2`, `DELETE /{bucket}/{object}`. Nothing it does on this
+  path touches the JSON API, so an emulator's JSON coverage buys nothing here.
 - `fake-gcs-server` gained generation preconditions in July 2026 (upstream
   fsouza/fake-gcs-server#2260, #2308), so the semantics are not the obstacle
   there — but it answers every XML write `400 invalid uploadType`, routing it to
   its JSON upload handler. Measured against `fsouza/fake-gcs-server:latest` on
   2026-08-09 (10 of 10 conformance tests fail on the write) and again on
   2026-09-04, unchanged.
-- **`googleapis/storage-testbench` gets much further, and is the one to watch.**
+- **`googleapis/storage-testbench` is three small changes away**, and they are
+  changes to *its* fidelity to GCS rather than accommodations of this fork.
   Google's own emulator implements the XML `PUT` *including the precondition*: a
   second `x-goog-if-generation-match: 0` answers `412` with
-  `"x-goog-if-generation-match validation failed. Expected = 0 vs Actual = ..."`,
-  and its XML `GET` returns `x-goog-generation`. Three things stop it, all
-  measured against v0.45.0 on 2026-09-04:
+  `"x-goog-if-generation-match validation failed. Expected = 0 vs Actual = ..."`.
+  Measured 2026-09-07 against `main` at `20d12d8` — `pip show` reports `0.45.0`
+  because `setup.py`'s version is unbumped, so do not read that as an old
+  release:
 
-  | gap | what it does |
-  |---|---|
-  | XML `PUT` returns no `ETag` and no `x-goog-generation` | `object_store` fails `Metadata { MissingEtag }` before reading the precondition result |
-  | no XML bucket-list route | `GET /{bucket}?list-type=2` is `404` |
-  | no XML `DELETE` route | `405 Method Not Allowed` |
+  | gap | what it does | where |
+  |---|---|---|
+  | XML `PUT` answers with neither `ETag` nor `x-goog-generation` | `object_store` fails `Metadata { MissingEtag }` before it can read the precondition result | `testbench/rest_server.py`, `xml_put_object` — which holds the blob and both values |
+  | the object etag is `md5(metageneration)`, and an XML `PUT` creates a fresh object at metageneration 1 | every write hands back the *same* etag, so "an unchanged object keeps its etag" and "a write that changed the object moved it" cannot both hold. Real GCS moves the etag on every generation | `gcs/object.py`, `_metadata_etag` |
+  | XML `GET` ignores `If-None-Match` | `200` and a body where GCS answers `304`; `make_xml_preconditions` handles only the generation and metageneration headers | `testbench/rest_server.py`, `xml_get_object` |
 
-  Two of those three are response headers on a route that already exists. If they
-  land upstream, GCS gets per-PR conditional-put coverage the way `az://` did
-  from Azurite (#420), at no credential cost.
+  Patched locally, those three take the conformance target from *cannot run* to
+  **10 of 10 green on `gs://`**. That is the measurement behind #520 — 16 lines
+  in the emulator, none of them in this repository.
 
-So an emulator would not fake the assertions today — it cannot run them at all.
+**What is not in the way, contrary to #520 as filed:** the missing XML bucket-list
+route (`GET /{bucket}?list-type=2` is `404`) and the missing XML `DELETE`
+(`405`). The conformance target issues **zero** list requests and zero deletes —
+including its `Storage`-trait half, because `sealed_prefix_shape()` is a
+create-only `PUT` and a `GET`, not a listing. All four `Storage` tests pass with
+the list route still `404`. Listing and deleting are what block the *whole*
+`tansu-storage` suite on `gs://` (`just test-storage gs://tansu/`), which is a
+larger and separate ask.
+
+Reproducing the measurement needs Python **3.11** — grpcio has no 3.14 arm64
+wheel — and the bucket to exist:
+
+```shell
+python3.11 -m venv /tmp/tb && /tmp/tb/bin/pip install \
+  git+https://github.com/googleapis/storage-testbench.git
+GOOGLE_CLOUD_CPP_STORAGE_TEST_BUCKET_NAME=tansu /tmp/tb/bin/python -m testbench --port 9099
+```
+
+That environment variable is not optional dressing: without it the testbench
+creates no bucket and every XML `PUT` is `404 Bucket tansu does not exist`, which
+looks exactly like a missing route. Then
+
+```shell
+export GOOGLE_SERVICE_ACCOUNT_KEY='{"private_key":"private_key","private_key_id":"x","client_email":"x","disable_oauth":true,"gcs_base_url":"http://localhost:9099"}'
+just test-conditional-put gs://tansu/
+```
+
+Probing it by hand needs `-H "Content-Type: application/octet-stream"` on the
+`PUT`: with curl's default the testbench form-parses the body and stores zero
+bytes, so the object reads back empty and the gap looks like a media bug.
+
 The other route that closes this is pointing the `object-store` job in
 `.github/workflows/storage.yml` at a real `gs://` bucket.
 
@@ -310,10 +358,10 @@ for an operator who brings their own bucket to a `workflow_dispatch`, and skips
 otherwise.
 
 Worth re-checking if `object_store` moves its GCS writes to the JSON API, if
-`fake-gcs-server` implements the XML upload path, or if `storage-testbench`
-returns `ETag` and `x-goog-generation` from its XML `PUT`. Any of the three
-reopens the emulator route, which the decision above does not close — it closes
-the *credentials* route. The third is the nearest.
+`fake-gcs-server` implements the XML upload path, or if `storage-testbench` takes
+the three changes above. Any of the three reopens the emulator route, which the
+decision above does not close — it closes the *credentials* route. The third is
+the nearest, and it is the only one where the work is small and known.
 
 **Real S3, as opposed to minio.** The `object-store` job is
 `workflow_dispatch`-only and skips itself unless `STORAGE_TEST_AWS_*` secrets
