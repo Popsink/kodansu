@@ -26,6 +26,7 @@ use super::{DynoStore, ServedEnd, Watermark};
 mod azure_suffix;
 mod compact_segments;
 mod corrupt_region;
+mod delete_fan_out;
 mod delete_groups;
 mod divergent_batch;
 mod fenced_overlap;
