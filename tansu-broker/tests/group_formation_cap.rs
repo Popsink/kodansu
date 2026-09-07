@@ -35,6 +35,12 @@
 //!
 //! Wall clock throughout, and a real one: `governor` keeps its own monotonic
 //! clock, which `tokio`'s paused time never reaches.
+//!
+//! Gated on `dynostore`, which is what `DynoStore` and [`PutRateLimiter`] are
+//! behind: `check-no-default-features` builds every target of every crate
+//! without it, and an integration test is a target.
+
+#![cfg(feature = "dynostore")]
 
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
