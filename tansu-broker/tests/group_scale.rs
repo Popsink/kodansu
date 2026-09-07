@@ -157,18 +157,28 @@ struct Scale {
     /// included, and won or lost — a conditional PUT the store rejects is
     /// still a request it charged for.
     ///
-    /// Formation is inherently one landed CAS per member joining, so the
-    /// budget is per member rather than a constant. The rest is the race: 16
-    /// members contending for those 16 slots lose the CAS and re-apply, and
-    /// nothing serializes them any more — the per-group in-process lock went
-    /// with the rest of the per-group state (#360), so members served by the
-    /// same replica race exactly as members on different ones do.
+    /// Per member, not a constant, because that is what this had to bound
+    /// before #427: formation was one landed CAS per member joining, plus the
+    /// race for those slots — 16 members contending lose the CAS and re-apply,
+    /// and nothing serializes them (the per-group in-process lock went with the
+    /// rest of the per-group state, #360). **5010 attempts for 1024 members**,
+    /// 1024 landing: 4.9 per member, and the reason a group of 16 could not
+    /// form at all on GCS, where one put per second per object turns each lost
+    /// attempt into a second of waiting.
     ///
-    /// Measured at the default size: **5010 attempts for 1024 members**, 1024
-    /// of them landing — 4.9 per member. Eight leaves ~40% headroom while
-    /// still catching a *regression in kind*: a path that writes the
-    /// generation per heartbeat, or a retry loop that rewrites it once per
-    /// round, blows through it immediately.
+    /// Batch admission (#427) took formation off the per-member shape
+    /// altogether: the members that arrive in one join window are admitted by
+    /// one CAS, so a group costs a small constant however many members it has.
+    /// Re-measured at 8 groups × 16 members: **16 writes and 0 conflicts — two
+    /// per group, 0.125 per member.**
+    ///
+    /// So the number came down from 8 to 2, and the unit stayed per member on
+    /// purpose. Two is 16× the measurement, which is slack this does not need
+    /// — but it is also well under the 4.9 the old shape produced, so it still
+    /// fails the moment formation goes back to one CAS a member, at any size,
+    /// with no threshold to re-derive. A path that writes the generation per
+    /// heartbeat, or a retry loop that rewrites it once per round, blows
+    /// through it immediately as before.
     put_budget_per_member: u64,
     /// Per-member deadline. Only reached when a member never converges — a
     /// converged one returns immediately — so it is generous on purpose.
@@ -194,7 +204,7 @@ impl Scale {
             groups: from_env("TANSU_SCALE_GROUPS", 64)?,
             members: from_env("TANSU_SCALE_MEMBERS", 16)?,
             replicas: from_env("TANSU_SCALE_REPLICAS", 10)?,
-            put_budget_per_member: from_env("TANSU_SCALE_PUT_BUDGET_PER_MEMBER", 8)?,
+            put_budget_per_member: from_env("TANSU_SCALE_PUT_BUDGET_PER_MEMBER", 2)?,
             deadline: Duration::from_secs(from_env("TANSU_SCALE_DEADLINE_SECS", 120)?),
         })
     }
@@ -608,6 +618,11 @@ async fn groups_converge_within_their_write_budget() -> Result<()> {
     // The "no LIST on the request path" promise, stated as a count rather than
     // as a comment: the sweep and the leader's join both fan out over the
     // generation's member set, which needs no listing.
+    //
+    // Batch admission (#427) added one — the cheap ids-and-stamps listing it
+    // elects an admitter from — and this is where that stays honest. It is
+    // reached only by a member the generation does not name yet, so a converged
+    // group's heartbeats do not touch it, and the counter sees both listings.
     assert_eq!(
         lists_before,
         Counters::lists(&counters),

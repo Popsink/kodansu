@@ -3721,6 +3721,7 @@ dependencies = [
  "futures",
  "humantime",
  "indicatif",
+ "object_store",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",

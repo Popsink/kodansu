@@ -34,7 +34,7 @@ use crate::Result;
 const DEFAULT_JITTER: Duration = Duration::from_millis(0);
 
 #[derive(Clone)]
-pub(crate) struct PutRateLimiter<O> {
+pub struct PutRateLimiter<O> {
     entries: Arc<Mutex<ExpiringSizedCache<Path, Arc<DefaultDirectRateLimiter>>>>,
     rate_per_second: Option<NonZero<u32>>,
     jitter: Option<Duration>,
@@ -54,7 +54,7 @@ impl<O> Display for PutRateLimiter<O> {
 }
 
 impl<O> PutRateLimiter<O> {
-    pub(crate) fn new(object_store: O, ttl: Duration) -> Self {
+    pub fn new(object_store: O, ttl: Duration) -> Self {
         Self {
             object_store,
             entries: Arc::new(Mutex::new(ExpiringSizedCache::new(ttl))),
@@ -63,14 +63,14 @@ impl<O> PutRateLimiter<O> {
         }
     }
 
-    pub(crate) fn with_rate_per_second(self, rate_per_second: Option<NonZero<u32>>) -> Self {
+    pub fn with_rate_per_second(self, rate_per_second: Option<NonZero<u32>>) -> Self {
         Self {
             rate_per_second,
             ..self
         }
     }
 
-    pub(crate) fn with_jitter(self, jitter: Option<Duration>) -> Self {
+    pub fn with_jitter(self, jitter: Option<Duration>) -> Self {
         Self { jitter, ..self }
     }
 

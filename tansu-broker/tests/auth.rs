@@ -975,6 +975,14 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
+    async fn list_group_member_stamps(
+        &self,
+        _group_id: &str,
+    ) -> tansu_storage::Result<BTreeMap<String, i64>> {
+        unimplemented!()
+    }
+
+    #[instrument(skip_all)]
     #[instrument(skip_all)]
     async fn create_acls(&self, _bindings: &[AclBinding]) -> tansu_storage::Result<Vec<ErrorCode>> {
         unimplemented!()

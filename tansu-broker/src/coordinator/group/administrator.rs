@@ -137,6 +137,28 @@ const PAUSE_MS: u128 = 3_000;
 /// missed.
 const JOIN_QUIESCENCE: Duration = Duration::from_secs(3);
 
+/// How long a member mid-join waits for a lower-id peer to admit it in a batch
+/// before admitting itself (#427).
+///
+/// A budget, not a barrier. The election is decided from persisted documents,
+/// so it is right exactly when those documents describe members that really are
+/// mid-join — and wrong when one of them does not: a graceful leave whose
+/// best-effort document delete failed, a request that died between writing its
+/// document and its CAS. Nothing distinguishes those from a peer that is merely
+/// slower, so nothing tries to. The deferral expires instead, and what it
+/// expires into is the behaviour it replaced — every member admitting itself.
+///
+/// Shorter than [`JOIN_QUIESCENCE`] on purpose: a group whose election picked a
+/// member that will never write still forms inside the join window it would
+/// have taken anyway, so the worst case costs a client nothing.
+const ADMISSION_DEFER: Duration = Duration::from_secs(2);
+
+/// How long a deferring member waits before looking again — the cadence of
+/// [`LongPoll::Wait`] everywhere else on this path, and for the same reason:
+/// a shorter one buys nothing (the peer's CAS is one write, not a fan-out) and
+/// costs another listing per member per round.
+const ADMISSION_RECHECK: Duration = Duration::from_secs(1);
+
 /// After this many consecutive CAS conflicts on a single group's generation,
 /// log a warning. Sustained conflicts now mean something is genuinely wrong:
 /// the generation only changes when the group's composition does, so a healthy
@@ -188,6 +210,63 @@ fn session_timeout_or_default(session_timeout_ms: i32) -> i32 {
         session_timeout_ms
     } else {
         DEFAULT_SESSION_TIMEOUT_MS
+    }
+}
+
+/// How recently a member document must have been written for another member to
+/// treat it as a join in progress — to fold it into a batch admission, or to
+/// defer to it (#427).
+///
+/// A quarter of the group's session, which is a *much* tighter reading of
+/// "alive" than the sweep's (a session and a half, see
+/// [`MemberDoc::lapses_after_ms`]) and deliberately so. The sweep asks whether
+/// a member should be evicted, and errs towards leaving it be; this asks
+/// whether a member is joining *right now*, and errs the other way, because the
+/// document a batch admission must not act on is one left behind by a member
+/// that has gone — a leave whose delete failed. At the default session that is
+/// 11.25s against a join window of 3s: room for a member to be retried across
+/// several rounds, and nowhere near long enough for a departed member to be
+/// pulled back into the group.
+fn admission_freshness_ms(session_timeout_ms: i32) -> i64 {
+    i64::from(session_timeout_or_default(session_timeout_ms)) / 4
+}
+
+/// What a member mid-join does about the CAS that would admit it (#427).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Admission {
+    /// A lower-id peer is mid-join too, and its CAS will admit this member
+    /// along with itself. Wait for it.
+    Defer,
+
+    /// Write, folding every peer that is also mid-join into the same CAS.
+    Batch,
+}
+
+/// Which member of a join window does the one write that admits them all.
+///
+/// The lowest id, and nothing else. Every replica reads the same documents, so
+/// every replica elects the same member; a member that is the lowest id it can
+/// see goes ahead, and that covers the group forming one member at a time —
+/// there the pending set is empty and this is what `join` always did.
+///
+/// The rule is deliberately not "the leader admits", which is what Kafka's
+/// single coordinator amounts to: a forming group has no leader, and a settled
+/// one's leader is not necessarily in a `JoinGroup` when a straggler arrives, so
+/// that rule would leave the straggler waiting on a request nobody is making.
+/// Electing from the *pending* set instead means the member elected is one that
+/// has just written a document — which is a much better bet on there being a
+/// live join behind it, and still only a bet.
+///
+/// `deferred_for` — how long this call has been polling — bounds the wait, so a
+/// pending document that no request is actually behind delays the group by
+/// [`ADMISSION_DEFER`] rather than stalling it.
+fn admission(pending: &BTreeSet<String>, member_id: &str, deferred_for: Duration) -> Admission {
+    match pending.first() {
+        Some(admitter) if admitter.as_str() < member_id && deferred_for < ADMISSION_DEFER => {
+            Admission::Defer
+        }
+
+        _ => Admission::Batch,
     }
 }
 
@@ -1567,6 +1646,113 @@ where
         }
     }
 
+    /// The members whose documents say they are mid-join: fresh, and not named
+    /// by the generation (#427). `member_id` itself is never in the answer.
+    ///
+    /// **One LIST, and no document reads.** That is the whole reason
+    /// [`Storage::list_group_member_stamps`] exists: electing an admitter needs
+    /// ids and how recently each was written, and the listing carries both.
+    /// Only the member that goes on to admit reads anything, and only the
+    /// documents it is admitting.
+    ///
+    /// Reached only by a member the generation does not name — a heartbeat, a
+    /// commit, a rejoin that changes nothing and the leader's own long poll all
+    /// return before here, which is why the "no LIST on the request path" count
+    /// in `group_scale` still holds at zero in steady state.
+    async fn pending_admissions(
+        &self,
+        group_id: &str,
+        generation: &GenerationDoc,
+        member_id: &str,
+        now_ms: i64,
+    ) -> BTreeSet<String> {
+        let freshness_ms = admission_freshness_ms(generation.session_timeout_ms);
+
+        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_admission_listed")]);
+
+        // A listing that fails is answered as "nobody else is joining", not as
+        // a failed join: this is an optimisation over a member admitting
+        // itself, and degrading to that is what it degrades to. `?` here would
+        // have made a transient LIST error the difference between a member
+        // joining and a member being told it could not.
+        let stamps = match self.storage.list_group_member_stamps(group_id).await {
+            Ok(stamps) => stamps,
+
+            Err(error) => {
+                debug!(?error, group_id, member_id, "admission listing");
+                COORDINATOR_REQUESTS
+                    .add(1, &[KeyValue::new("method", "join_admission_list_failed")]);
+
+                return BTreeSet::new();
+            }
+        };
+
+        stamps
+            .into_iter()
+            .filter(|(candidate, stamp_ms)| {
+                candidate != member_id
+                    && !generation.members.contains_key(candidate)
+                    && now_ms.saturating_sub(*stamp_ms) <= freshness_ms
+            })
+            .map(|(candidate, _)| candidate)
+            .collect()
+    }
+
+    /// The generation entries for the members a batch admission is about to add
+    /// (#427), one document read each, buffered like every other member fan-out
+    /// here.
+    ///
+    /// The read is for `group_instance_id`, which the generation has to record
+    /// and only the member's own document holds: it is how a static member's
+    /// restart resolves to the id the group already has for its instance, and
+    /// admitting one without it is the re-minting churn #488 measured.
+    ///
+    /// Two members are dropped rather than admitted. One whose document has
+    /// gone between the listing and the read has left in the meantime. One that
+    /// joined under a protocol the group has since settled *differently* would
+    /// be refused at its own join with `InconsistentGroupProtocol` — every
+    /// member of a forming group writes its document before the group has a
+    /// protocol, so this is where that refusal has to be repeated.
+    async fn member_refs(
+        &self,
+        group_id: &str,
+        protocol_name: Option<&str>,
+        pending: &BTreeSet<String>,
+    ) -> BTreeMap<String, MemberRef> {
+        futures::stream::iter(pending.iter().cloned().map(|member_id| async move {
+            let (member, _) = self
+                .storage
+                .read_group_member(group_id, &member_id)
+                .await
+                .inspect_err(|error| debug!(?error, group_id, member_id))
+                .ok()
+                .flatten()?;
+
+            if let (Some(joined_under), Some(protocol_name)) =
+                (member.protocol_name.as_deref(), protocol_name)
+                && joined_under != protocol_name
+            {
+                debug!(
+                    group_id,
+                    member_id, joined_under, protocol_name, "not admitting: protocol differs"
+                );
+
+                return None;
+            }
+
+            Some((
+                member_id,
+                MemberRef {
+                    group_instance_id: member.group_instance_id,
+                },
+            ))
+        }))
+        .buffered(MEMBER_FETCH_CONCURRENCY)
+        .filter_map(|held| async move { held })
+        .collect()
+        .await
+    }
+
     /// The member list a leader's `JoinGroup` response carries.
     ///
     /// One document per member the generation names — no listing, and only on
@@ -2271,6 +2457,11 @@ where
                 session_timeout_ms: next.session_timeout_ms,
                 rebalance_timeout_ms: next.rebalance_timeout_ms,
                 group_instance_id: group_instance_id.map(ToOwned::to_owned),
+                // What another member has to know before folding this one into
+                // a batch admission (#427), and the reason it is on the
+                // document rather than inferred: a member of a forming group
+                // writes this before the group has settled a protocol at all.
+                protocol_name: Some(protocol.name.clone()),
                 join_response: join_response.clone(),
                 rest: held
                     .as_ref()
@@ -2278,9 +2469,16 @@ where
                     .unwrap_or_default(),
             };
 
-            let member_changed = held
-                .as_ref()
-                .is_none_or(|(held, _)| held.join_response != join_response);
+            // `protocol_name` as well as the subscription (#427): a member that
+            // switches assignor without changing the topics it wants is a
+            // no-op rejoin by every other measure, and the document is what
+            // another member reads before admitting this one. Comparing it here
+            // is also what backfills the field on the first join a member makes
+            // against a broker that has it.
+            let member_changed = held.as_ref().is_none_or(|(held, _)| {
+                held.join_response != join_response
+                    || held.protocol_name.as_deref() != Some(protocol.name.as_str())
+            });
 
             if member_changed
                 || liveness_renewal_due(
@@ -2319,6 +2517,65 @@ where
                     }
 
                     Err(error) => return Err(update_error(error)),
+                }
+            }
+
+            // Batch admission (#427). A member the generation does not name is
+            // mid-join — and so is every other member whose document is fresh
+            // and unnamed. One CAS admits them all.
+            //
+            // One CAS *each* is what a group could not afford under the GCS
+            // per-object write cap of one put per second: 16 members racing to
+            // admit themselves measured ~52s against a 45s session timeout, and
+            // only 16s of that was the 16 writes that had to land. The rest was
+            // the ~3.5 attempts per member that each waited out a full second
+            // before losing the CAS. Batching removes the conflicts; the
+            // election above removes the attempts that would have made them.
+            //
+            // It is not only a GCS fix: #406 measured consumer-group PUTs at
+            // 67% of the S3 PUT bill, and a formation's worth of them is what
+            // this collapses into one.
+            if write && !view.generation.members.contains_key(member_id.as_str()) {
+                let pending = self
+                    .pending_admissions(group_id, &view.generation, member_id.as_str(), now_ms)
+                    .await;
+
+                match admission(&pending, member_id.as_str(), polling_since.elapsed()) {
+                    Admission::Defer => {
+                        COORDINATOR_REQUESTS
+                            .add(1, &[KeyValue::new("method", "join_admission_deferred")]);
+
+                        // The member's document is already written, which is
+                        // what makes deferring safe: the peer this waits for
+                        // finds it in the listing whether or not this request
+                        // survives (#359's document-before-admission ordering,
+                        // now load-bearing for a second reason).
+                        if self.waited(ADMISSION_RECHECK, "join_admission_wait").await {
+                            continue;
+                        }
+
+                        // Cancelled. This replica is stopping, so the peer's
+                        // CAS cannot be waited for on this connection either:
+                        // fall through and admit this member alone, which is
+                        // an answer rather than a dropped join (#361).
+                    }
+
+                    Admission::Batch => {
+                        let admitted = self
+                            .member_refs(group_id, next.protocol_name.as_deref(), &pending)
+                            .await;
+
+                        if !admitted.is_empty() {
+                            COORDINATOR_REQUESTS.add(
+                                admitted.len() as u64,
+                                &[KeyValue::new("method", "join_admission_batched")],
+                            );
+
+                            debug!(group_id, admitting = ?admitted.keys().collect::<Vec<_>>());
+
+                            next.members.extend(admitted);
+                        }
+                    }
                 }
             }
 
@@ -3026,6 +3283,7 @@ mod tests {
         offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
     };
     use tansu_storage::{LatencyIntroducingStorage, StorageContainer};
+    use tokio::task::JoinSet;
     use tokio::time::{advance, timeout};
     use tracing::subscriber::DefaultGuard;
     use url::Url;
@@ -5904,6 +6162,340 @@ mod tests {
                 "round {round}",
             );
         }
+
+        Ok(())
+    }
+
+    /// The election batch admission rests on (#427): the lowest id of the
+    /// members mid-join does the one write, everybody else waits for it, and
+    /// the wait expires.
+    #[test]
+    fn admission_elects_the_lowest_id_and_gives_up_on_it() {
+        let none = BTreeSet::new();
+        let peers = BTreeSet::from(["m-1".to_owned(), "m-3".to_owned()]);
+
+        // Nobody else is joining: this is a group forming one member at a
+        // time, and the answer is what `join` always did.
+        assert_eq!(
+            Admission::Batch,
+            admission(&none, "m-2", Duration::from_millis(0))
+        );
+
+        // The lowest id writes for everyone, including peers above it.
+        assert_eq!(
+            Admission::Batch,
+            admission(&peers, "m-0", Duration::from_millis(0))
+        );
+
+        // Everyone above it waits.
+        assert_eq!(
+            Admission::Defer,
+            admission(&peers, "m-2", Duration::from_millis(0))
+        );
+        assert_eq!(
+            Admission::Defer,
+            admission(&peers, "m-4", ADMISSION_DEFER - Duration::from_millis(1))
+        );
+
+        // Until the budget runs out, at which point the peer it was waiting
+        // for is assumed not to be coming and it admits itself — the behaviour
+        // this replaced, arrived at late rather than never.
+        assert_eq!(Admission::Batch, admission(&peers, "m-2", ADMISSION_DEFER));
+        assert_eq!(
+            Admission::Batch,
+            admission(&peers, "m-4", ADMISSION_DEFER * 2)
+        );
+    }
+
+    /// The freshness window is much tighter than the sweep's verdict, and for
+    /// the opposite reason (#427).
+    #[test]
+    fn admission_freshness_is_a_quarter_of_the_session() {
+        assert_eq!(11_250, admission_freshness_ms(SESSION_TIMEOUT_MS));
+        assert_eq!(
+            i64::from(DEFAULT_SESSION_TIMEOUT_MS) / 4,
+            admission_freshness_ms(0),
+            "a group that declares nothing gets the default's quarter"
+        );
+
+        // Strictly inside a member's own session, so a document left behind by
+        // a member that has gone stops being admittable long before the sweep
+        // would even look at it.
+        assert!(
+            admission_freshness_ms(SESSION_TIMEOUT_MS)
+                < MemberDoc {
+                    session_timeout_ms: SESSION_TIMEOUT_MS,
+                    ..Default::default()
+                }
+                .lapses_after_ms()
+        );
+    }
+
+    /// **The fix, as a count** (#427): a join window of many members costs one
+    /// write of `generation.json`, not one per member and not the conflicts
+    /// that racing for one each produced.
+    ///
+    /// The number this replaces was measured in `group_scale`: 5010 CAS
+    /// attempts for 1024 members, 4.9 per member, all against the single object
+    /// a group's members contend on. On a store with no per-object write cap
+    /// that is merely expensive — #406 put consumer-group PUTs at 67% of the S3
+    /// PUT bill. On GCS, where the cap is one put per second per object, it is
+    /// the difference between a group that forms and one that cannot: every
+    /// losing attempt waits out a full second before it is told it lost.
+    #[tokio::test(start_paused = true)]
+    async fn a_join_window_is_admitted_by_one_write() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "one-write";
+        const MEMBERS: usize = 16;
+
+        // Latency, and not the `0..1` the cost assertions elsewhere use: over
+        // `InMemory` a store call that never sleeps never yields, so sixteen
+        // spawned joins run strictly one after another and there is no join
+        // window to admit. A millisecond per call is what makes them overlap —
+        // which is the arrangement the fix is for, and the one the old code
+        // pays 4.9 attempts per member in.
+        let storage = LatencyIntroducingStorage::new(memory_storage().await?).with_latency(1..2);
+        let updates = storage.generation_updates_handle();
+        let conflicts = storage.generation_cas_conflicts_handle();
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+
+        let mut joining = JoinSet::new();
+
+        for member in 0..MEMBERS {
+            let controller = controller.clone();
+
+            _ = joining.spawn(async move {
+                join_group(
+                    &controller,
+                    GROUP_ID,
+                    &format!("m-{member:02}"),
+                    &encode_subscription(&["t"], None),
+                )
+                .await
+            });
+        }
+
+        while let Some(joined) = joining.join_next().await {
+            let join = joined.expect("member")?;
+            assert_eq!(i16::from(ErrorCode::None), join.error_code);
+        }
+
+        let generation = generation_of(&storage, GROUP_ID).await?;
+
+        assert_eq!(
+            MEMBERS,
+            generation.members.len(),
+            "every member is in the group it joined: {:?}",
+            generation.members.keys().collect::<Vec<_>>()
+        );
+
+        // Measured on this arrangement: **one** write and **zero** conflicts
+        // for the sixteen of them. The bound is a quarter of one-each rather
+        // than the measurement, because which members are in the listing when
+        // the first of them elects is a matter of scheduling — a straggler that
+        // arrives after the batch has landed pays its own write, and should.
+        // What is pinned is the shape: a handful between them, not one each.
+        let budget = MEMBERS as u64 / 4;
+        let updates = updates.load(std::sync::atomic::Ordering::Relaxed);
+        let conflicts = conflicts.load(std::sync::atomic::Ordering::Relaxed);
+
+        assert!(
+            updates <= budget,
+            "{MEMBERS} members cost {updates} writes of generation.json against \
+             a budget of {budget}: that is one each rather than one between them"
+        );
+
+        assert!(
+            conflicts <= budget,
+            "{MEMBERS} members lost {conflicts} generation CASes against a budget \
+             of {budget}; the point of electing one writer is that the others do \
+             not race it for the object"
+        );
+
+        Ok(())
+    }
+
+    /// A batch admission carries each member's `group.instance.id` into the
+    /// generation (#427).
+    ///
+    /// The generation is where a static member's restart looks up the id the
+    /// group already holds for its instance; admitting one without it is the
+    /// re-minting churn #488 measured, arrived at by a new route.
+    #[tokio::test(start_paused = true)]
+    async fn a_batched_static_member_keeps_its_instance() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "batched-static";
+        const MEMBERS: usize = 4;
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+
+        let mut joining = JoinSet::new();
+
+        for member in 0..MEMBERS {
+            let controller = controller.clone();
+
+            _ = joining.spawn(async move {
+                join_group_static(
+                    &controller,
+                    GROUP_ID,
+                    &format!("m-{member:02}"),
+                    &format!("static-{member:02}"),
+                    &encode_subscription(&["t"], None),
+                )
+                .await
+            });
+        }
+
+        while let Some(joined) = joining.join_next().await {
+            assert_eq!(
+                i16::from(ErrorCode::None),
+                joined.expect("member")?.error_code
+            );
+        }
+
+        let generation = generation_of(&storage, GROUP_ID).await?;
+
+        for member in 0..MEMBERS {
+            assert_eq!(
+                Some(format!("static-{member:02}")),
+                generation
+                    .members
+                    .get(&format!("m-{member:02}"))
+                    .and_then(|held| held.group_instance_id.clone()),
+                "the instance a batch admitted this member under",
+            );
+        }
+
+        Ok(())
+    }
+
+    /// A member document nothing is behind does not hold the group up (#427).
+    ///
+    /// The election reads persisted documents, so it cannot tell a peer that is
+    /// slower from one that is gone — a graceful leave whose best-effort
+    /// document delete failed leaves exactly the second. The deferral is a
+    /// budget for that reason: it expires, and the member admits itself.
+    #[tokio::test(start_paused = true)]
+    async fn a_member_deferring_to_a_document_nobody_is_behind_admits_itself() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "phantom-peer";
+        const PHANTOM: &str = "m-00";
+        const JOINING: &str = "m-01";
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+
+        // A document with a lower id, fresh, and no request behind it.
+        _ = storage
+            .write_group_member(
+                GROUP_ID,
+                PHANTOM,
+                MemberDoc {
+                    last_contact_ms: epoch_ms(paused_clock()),
+                    session_timeout_ms: SESSION_TIMEOUT_MS,
+                    join_response: JoinGroupResponseMember::default().member_id(PHANTOM.into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .map_err(update_error)?;
+
+        let started = Instant::now();
+
+        let join = join_group(
+            &controller,
+            GROUP_ID,
+            JOINING,
+            &encode_subscription(&["t"], None),
+        )
+        .await?;
+
+        assert_eq!(i16::from(ErrorCode::None), join.error_code);
+        assert_eq!(JOINING, join.member_id);
+        assert_eq!(
+            JOINING, join.leader,
+            "the member that gave up waiting is the one that formed the group"
+        );
+
+        assert!(
+            started.elapsed() >= ADMISSION_DEFER,
+            "it waited for the peer before giving up on it, {:?}",
+            started.elapsed()
+        );
+
+        // Both are in: giving up on the peer means admitting it too, which is
+        // what stops the next member deferring to the same document. It has no
+        // session of its own to renew, so the sweep takes it from here.
+        let generation = generation_of(&storage, GROUP_ID).await?;
+
+        assert_eq!(
+            vec![PHANTOM, JOINING],
+            generation.members.keys().collect::<Vec<_>>()
+        );
+
+        Ok(())
+    }
+
+    /// A member that joined under a protocol the group has since settled
+    /// differently is not batched in (#427).
+    ///
+    /// Its own join is refused with `InconsistentGroupProtocol` before it
+    /// writes anything, so refusing it here is what keeps batch admission from
+    /// putting a member in a group it cannot speak to. The window is real: every
+    /// member of a forming group writes its document *before* the group has a
+    /// protocol at all.
+    #[tokio::test(start_paused = true)]
+    async fn a_member_that_joined_under_another_protocol_is_not_batched() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "mixed-protocol";
+        const OTHER: &str = "m-00";
+        const JOINING: &str = "m-01";
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+
+        _ = storage
+            .write_group_member(
+                GROUP_ID,
+                OTHER,
+                MemberDoc {
+                    last_contact_ms: epoch_ms(paused_clock()),
+                    session_timeout_ms: SESSION_TIMEOUT_MS,
+                    protocol_name: Some("roundrobin".into()),
+                    join_response: JoinGroupResponseMember::default().member_id(OTHER.into()),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .map_err(update_error)?;
+
+        // `JOINING` settles the group on `range`, and waits out the deferral
+        // for a peer it then declines to admit.
+        let join = join_group(
+            &controller,
+            GROUP_ID,
+            JOINING,
+            &encode_subscription(&["t"], None),
+        )
+        .await?;
+
+        assert_eq!(i16::from(ErrorCode::None), join.error_code);
+
+        let generation = generation_of(&storage, GROUP_ID).await?;
+
+        assert_eq!(Some(RANGE), generation.protocol_name.as_deref());
+        assert_eq!(
+            vec![JOINING],
+            generation.members.keys().collect::<Vec<_>>(),
+            "a member that cannot speak the group's protocol was admitted to it"
+        );
 
         Ok(())
     }
