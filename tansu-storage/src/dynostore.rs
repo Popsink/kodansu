@@ -8615,25 +8615,6 @@ impl DynoStore {
             .map(|prefix| Path::from(format!("{prefix}/{generation_id:0>10}.json")))
     }
 
-    /// A group's decomposed objects, composed back into the [`GroupDetail`]
-    /// every reader already projects from (#359).
-    ///
-    /// `None` when the group has no `generation.json`, which is how a group
-    /// that does not exist and a group still in the legacy layout both read —
-    /// the caller falls back to `{group}.json`.
-    ///
-    /// Deliberately **not** a trait method: the composition is a property of
-    /// this layout, not of storage, and putting it on the trait would oblige
-    /// every engine to reproduce a fan-out it has no objects for.
-    ///
-    /// Torn reads are answered, never failed. Between reading the generation
-    /// and reading the member documents a member can leave, and between
-    /// observing a leader and reading the assignment a rebalance can start.
-    /// So a member the generation names whose document is gone is reported
-    /// with empty metadata rather than dropped — it *is* a member, the
-    /// generation is what says so — and a generation with a leader but no
-    /// assignment reports `CompletingRebalance`, which is true, rather than a
-    /// phantom `Stable`.
     /// The legacy `{group}.json` a pre-#359 cutover may have left, by existence
     /// alone (#445).
     ///
@@ -8678,6 +8659,50 @@ impl DynoStore {
             .map(|topitions| !topitions.is_empty())
     }
 
+    /// A group's decomposed objects, composed back into the [`GroupDetail`]
+    /// every reader already projects from (#359).
+    ///
+    /// `None` when the group has no `generation.json`, which is how a group
+    /// that does not exist and a group still in the legacy layout both read —
+    /// the caller falls back to `{group}.json`.
+    ///
+    /// Deliberately **not** a trait method: the composition is a property of
+    /// this layout, not of storage, and putting it on the trait would oblige
+    /// every engine to reproduce a fan-out it has no objects for.
+    ///
+    /// Torn reads are answered, never failed. Between reading the generation
+    /// and reading the member documents a member can leave, and between
+    /// observing a leader and reading the assignment a rebalance can start.
+    /// So a member the generation names whose document is gone is reported
+    /// with empty metadata rather than dropped — it *is* a member, the
+    /// generation is what says so — and a generation with a leader but no
+    /// assignment reports `CompletingRebalance`, which is true, rather than a
+    /// phantom `Stable`.
+    ///
+    /// **A member whose document says its session lapsed is not reported at
+    /// all (#523).** Expiry is otherwise reachable only from `join`, `sync` and
+    /// `heartbeat` — the dead-member sweep is driven entirely by traffic from
+    /// the very group being expired — so a group whose members all fall silent
+    /// at once, which is what a consumer being stopped, redeployed or
+    /// OOMKilled looks like, has nobody left to trigger the sweep that would
+    /// notice. It reported `Stable` with its full member list indefinitely:
+    /// observed in production 52 minutes past a 45s session timeout. That
+    /// blocks *every* offset-admin operation, because `kafka-consumer-groups`
+    /// refuses `--reset-offsets`, `--delete-offsets` and `--delete` on a group
+    /// that is not inactive, and `delete_groups` below answers `NonEmptyGroup`
+    /// from this same member set — so the standard recovery for a consumer
+    /// stuck on a poison record was unavailable, with no client-side
+    /// workaround.
+    ///
+    /// The verdict is [`MemberDoc::is_expired`], the same pure function of the
+    /// document and the clock the sweep takes, so a describe reports the
+    /// membership the next sweep would leave rather than a second opinion. It
+    /// costs nothing: the documents carrying `last_contact_ms` are already
+    /// read here.
+    ///
+    /// Only a document that *was read* can condemn its member. Absent or
+    /// unreadable stays a member, as above — a throttle or a 5xx must not
+    /// report a live group as reapable, and this read feeds `delete_groups`.
     async fn group_view(&self, group_id: &str) -> Result<Option<GroupDetail>> {
         /// As `describe_groups`' own fan-out: one round trip per member, and a
         /// group is tens of members.
@@ -8690,6 +8715,8 @@ impl DynoStore {
         let assignment = self
             .read_group_assignment(group_id, generation.generation_id)
             .await?;
+
+        let now_ms = Self::now_ms();
 
         // From the generation's member set, not from a listing: the set is
         // authoritative, and a LIST here would put one on the describe path for
@@ -8704,6 +8731,15 @@ impl DynoStore {
                     .inspect_err(|err| debug!(?err, group_id, member_id))
                     .ok()
                     .flatten();
+
+                // The clock's verdict, taken before anything is composed (#523):
+                // a member that has not been heard from within its session is
+                // not one this group has, whether or not anything has since
+                // asked the coordinator to notice.
+                if held.as_ref().is_some_and(|(doc, _)| doc.is_expired(now_ms)) {
+                    debug!(group_id, member_id, "not reporting a lapsed member");
+                    return None;
+                }
 
                 let join_response = held
                     .as_ref()
@@ -8723,16 +8759,17 @@ impl DynoStore {
                     .as_ref()
                     .and_then(|(doc, _)| to_system_time(doc.last_contact_ms).ok());
 
-                (
+                Some((
                     member_id,
                     GroupMember {
                         join_response,
                         last_contact,
                     },
-                )
+                ))
             }
         }))
         .buffered(MEMBER_FETCH_CONCURRENCY)
+        .filter_map(|member| async move { member })
         .collect::<BTreeMap<_, _>>()
         .await;
 
@@ -8792,6 +8829,15 @@ impl DynoStore {
     /// to write, or the legacy object the cutover left behind. A group deleted
     /// between the listing and this read has the same shape and is reported the
     /// same way; a listing is a snapshot, and the next one does not name it.
+    ///
+    /// A member set that is non-empty is not the same as a group that has
+    /// members (#523): the set only says whom the last rebalance admitted, and
+    /// nothing retires an entry until something asks the coordinator to sweep.
+    /// So the set is taken as empty when the clock says every one of them has
+    /// lapsed, which is what [`Self::group_view`] reports on the describe path —
+    /// a group listed `Stable` and described `Empty` is exactly the
+    /// disagreement #475 closed. [`Self::any_member_live`] is what keeps that
+    /// agreement affordable here.
     async fn group_state(&self, group_id: &str) -> Result<ConsumerGroupState> {
         let Some((generation, _)) = self.read_group_generation(group_id).await? else {
             return Ok(ConsumerGroupState::Empty);
@@ -8801,17 +8847,77 @@ impl DynoStore {
             .read_group_assignment(group_id, generation.generation_id)
             .await?;
 
-        let members = generation
-            .members
-            .keys()
-            .map(|member_id| (member_id.clone(), GroupMember::default()))
-            .collect();
+        let members = if self
+            .any_member_live(group_id, &generation, Self::now_ms())
+            .await
+        {
+            generation
+                .members
+                .keys()
+                .map(|member_id| (member_id.clone(), GroupMember::default()))
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
 
         Ok(ConsumerGroupState::from(&GroupDetail {
             members,
             state: Self::composed_group_state(&generation, assignment),
             ..Default::default()
         }))
+    }
+
+    /// Whether any member this generation names has been heard from inside its
+    /// session (#523).
+    ///
+    /// The cheap half of the verdict [`Self::group_view`] takes in full. The
+    /// listing needs one bit — is this group empty by the clock — and the first
+    /// live member settles it, so `any` short-circuits and a healthy group pays
+    /// at most `PROBE_CONCURRENCY` reads however many members it has. Composing
+    /// the whole view instead would cost one read per member for every group in
+    /// the cluster, which is the price #475 deliberately kept off this path.
+    ///
+    /// A group whose members have *all* lapsed pays one read each, once per
+    /// listing, until an operator reaps it — which is the pathology this is
+    /// here to make visible, and reaping it is now possible again.
+    ///
+    /// A document that is absent or unreadable counts as **live**, exactly as
+    /// `group_view` keeps such a member: not knowing is not a verdict, and the
+    /// two reads must not disagree about the same group. The failure direction
+    /// is the one every group rule takes — a throttle keeps a group, it never
+    /// invents an empty one.
+    async fn any_member_live(
+        &self,
+        group_id: &str,
+        generation: &GenerationDoc,
+        now_ms: i64,
+    ) -> bool {
+        /// Narrower than the describe fan-out on purpose: this stream is
+        /// short-circuited, so the width is what a *live* group pays rather
+        /// than how fast a dead one drains.
+        const PROBE_CONCURRENCY: usize = 8;
+
+        futures::stream::iter(
+            generation
+                .members
+                .keys()
+                .cloned()
+                .map(|member_id| async move {
+                    match self.read_group_member(group_id, &member_id).await {
+                        Ok(Some((member, _))) => !member.is_expired(now_ms),
+
+                        Ok(None) => true,
+
+                        Err(error) => {
+                            debug!(?error, group_id, member_id, "probing member liveness");
+                            true
+                        }
+                    }
+                }),
+        )
+        .buffered(PROBE_CONCURRENCY)
+        .any(|live| async move { live })
+        .await
     }
 
     /// Every ACL in the cluster, as one object (#363).
@@ -14568,8 +14674,13 @@ impl Storage for DynoStore {
                 // so the two APIs cannot disagree about a group an operator is
                 // looking at while deciding to delete it. It is the generation's
                 // member set, which `SyncGroup` maintains and a session-timeout
-                // sweep retires, so a group whose consumers have all gone away
-                // becomes deletable on its own.
+                // sweep retires, less whatever the clock has since condemned
+                // (#523) — so a group whose consumers have all gone away becomes
+                // deletable on its own, rather than only once some *other*
+                // member of it comes back to trigger the sweep that retires
+                // them. Nothing else was going to: with every member silent
+                // there is by construction nobody left to make the request the
+                // sweep hangs off.
                 let view = self
                     .group_view(group_id)
                     .await

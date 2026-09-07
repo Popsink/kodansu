@@ -60,6 +60,18 @@ fn member(last_contact_ms: i64) -> MemberDoc {
     }
 }
 
+/// Wall-clock milliseconds, as the broker stamps them.
+///
+/// A member document is judged against the clock on the read path (#523), so a
+/// test that wants a *live* member has to stamp one — a literal
+/// `last_contact_ms` is a member that fell silent in 1970.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or_default()
+}
+
 fn generation(generation_id: i32) -> GenerationDoc {
     GenerationDoc {
         generation_id,
@@ -604,7 +616,7 @@ async fn describe_composes_the_decomposed_objects() -> Result<()> {
                 "g-1",
                 member_id,
                 MemberDoc {
-                    last_contact_ms: 1_000,
+                    last_contact_ms: now_ms(),
                     session_timeout_ms: 45_000,
                     join_response: JoinGroupResponseMember::default()
                         .member_id(member_id.into())
@@ -718,6 +730,322 @@ async fn a_member_with_no_document_is_still_a_member() -> Result<()> {
         member.join_response.group_instance_id
     );
     assert_eq!(None, member.last_contact);
+
+    Ok(())
+}
+
+/// An [`ObjectStore`] whose reads fail for one prefix, the way a throttle or a
+/// 5xx does for whatever it lands on.
+#[derive(Clone)]
+struct FailingReads {
+    inner: Arc<InMemory>,
+    deny: String,
+}
+
+impl Debug for FailingReads {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FailingReads").finish()
+    }
+}
+
+impl Display for FailingReads {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FailingReads").finish()
+    }
+}
+
+#[async_trait]
+impl ObjectStore for FailingReads {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> Result<PutResult, object_store::Error> {
+        self.inner.put_opts(location, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        options: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> Result<GetResult, object_store::Error> {
+        if location.as_ref().contains(&self.deny) {
+            return Err(object_store::Error::Generic {
+                store: "FailingReads",
+                source: "unavailable".into(),
+            });
+        }
+
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, Result<Path, object_store::Error>>,
+    ) -> futures::stream::BoxStream<'static, Result<Path, object_store::Error>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> Result<ListResult, object_store::Error> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> Result<(), object_store::Error> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// A group every one of whose members has fallen silent is `Empty` — described,
+/// listed and deleted — with **no request made to it in the interval** (#523).
+///
+/// This is the case the dead-member sweep has no answer for. Expiry is reached
+/// only from `join`, `sync` and `heartbeat`, so it is driven entirely by traffic
+/// from the group being expired; when the last member goes without a
+/// `LeaveGroup` — a consumer stopped, redeployed or OOMKilled — there is by
+/// construction nobody left to make the request that would notice. In
+/// production a group held three members of a pod that had not existed for 52
+/// minutes, against a 45s session, and reported `Stable 3` at every sample.
+///
+/// What that costs is every offset-admin operation:
+/// `kafka-consumer-groups --reset-offsets`, `--delete-offsets` and `--delete`
+/// all refuse a group that is not inactive, and `DeleteGroups` answers
+/// `NonEmptyGroup` off this same member set. So the standard recovery for a
+/// consumer wedged on a poison record — park it, skip the offset — was
+/// unavailable, and unavailable in a way no client could work around: waiting
+/// does not make the group inactive, and removing the members is itself an
+/// admin operation on an "active" group.
+///
+/// The clock is frozen only in the sense that matters: nothing here touches the
+/// coordinator between the writes and the reads.
+#[tokio::test]
+async fn a_group_whose_members_all_fell_silent_is_empty() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let storage = DynoStore::new(CLUSTER, NODE, InMemory::new());
+
+    // Long enough ago to be past `session + session/2`, which is the silence
+    // #488 gives a member before the sweep would take it.
+    let lapsed = now_ms() - 10 * 45_000;
+
+    for member_id in ["m-1", "m-2", "m-3"] {
+        _ = storage
+            .write_group_member("g-silent", member_id, member(lapsed), None)
+            .await
+            .expect("member");
+    }
+
+    _ = storage
+        .update_group_generation(
+            "g-silent",
+            GenerationDoc {
+                generation_id: 7,
+                leader: Some("m-1".into()),
+                members: BTreeMap::from([
+                    ("m-1".to_owned(), MemberRef::default()),
+                    ("m-2".to_owned(), MemberRef::default()),
+                    ("m-3".to_owned(), MemberRef::default()),
+                ]),
+                session_timeout_ms: 45_000,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("generation");
+
+    _ = storage
+        .create_group_assignment("g-silent", 7, assignment(7))
+        .await?;
+
+    // Fully formed: leader, assignment, three members. `Stable`, but for the
+    // clock.
+    let described = storage
+        .describe_groups(Some(&["g-silent".into()]), false)
+        .await?;
+    let detail = detail_of(described.first().expect("described")).expect("found");
+
+    assert!(
+        detail.members.is_empty(),
+        "a member silent for ten sessions is still reported: {detail:?}"
+    );
+    assert_eq!(ConsumerGroupState::Empty, ConsumerGroupState::from(&detail));
+
+    // And the listing agrees, which is the property #475 is about.
+    assert_eq!(
+        vec![("g-silent".to_owned(), Some("Empty".to_owned()))],
+        listing(&storage, None).await?
+    );
+
+    // Which is what unblocks the operator: `--delete` no longer meets
+    // `NonEmptyGroup`.
+    let deleted = storage
+        .delete_groups(Some(&["g-silent".to_owned()]))
+        .await?;
+
+    assert_eq!(1, deleted.len());
+    assert_eq!(i16::from(ErrorCode::None), deleted[0].error_code);
+
+    Ok(())
+}
+
+/// One live member is enough: the group is still its whole self.
+///
+/// The verdict is per member and is the sweep's own, so a straggler is dropped
+/// from the report while the members that are talking to the broker keep their
+/// subscriptions, their assignment and the group's state. The failure this
+/// guards is the mirror of #523 — a read path that condemned a group because
+/// *some* of it had lapsed would take a live consumer's group out from under it
+/// the moment an operator ran `--delete`.
+#[tokio::test]
+async fn a_live_member_keeps_the_group() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let storage = DynoStore::new(CLUSTER, NODE, InMemory::new());
+
+    for (member_id, last_contact_ms) in [("m-1", now_ms()), ("m-2", now_ms() - 10 * 45_000)] {
+        _ = storage
+            .write_group_member("g-mixed", member_id, member(last_contact_ms), None)
+            .await
+            .expect("member");
+    }
+
+    _ = storage
+        .update_group_generation(
+            "g-mixed",
+            GenerationDoc {
+                generation_id: 3,
+                leader: Some("m-1".into()),
+                members: BTreeMap::from([
+                    ("m-1".to_owned(), MemberRef::default()),
+                    ("m-2".to_owned(), MemberRef::default()),
+                ]),
+                session_timeout_ms: 45_000,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("generation");
+
+    _ = storage
+        .create_group_assignment("g-mixed", 3, assignment(3))
+        .await?;
+
+    let described = storage
+        .describe_groups(Some(&["g-mixed".into()]), false)
+        .await?;
+    let detail = detail_of(described.first().expect("described")).expect("found");
+
+    assert_eq!(
+        vec!["m-1".to_owned()],
+        detail.members.keys().cloned().collect::<Vec<_>>(),
+        "only the lapsed member goes: {detail:?}"
+    );
+    assert_eq!(
+        ConsumerGroupState::Stable,
+        ConsumerGroupState::from(&detail)
+    );
+
+    assert_eq!(
+        vec![("g-mixed".to_owned(), Some("Stable".to_owned()))],
+        listing(&storage, None).await?
+    );
+
+    let deleted = storage.delete_groups(Some(&["g-mixed".to_owned()])).await?;
+    assert_eq!(
+        Some(i16::from(ErrorCode::NonEmptyGroup)),
+        deleted.first().map(|result| result.error_code),
+        "a group with a live member must not be deletable",
+    );
+
+    Ok(())
+}
+
+/// A member document that cannot be read leaves its group alone.
+///
+/// Not knowing is not a verdict — the same rule the rest of the group path
+/// takes (#445) — and here it is load-bearing twice over: the describe feeds
+/// `delete_groups`, so a throttle that made a live group look empty would let
+/// an operator delete it, and the listing must not disagree with the describe
+/// about the same group (#475). Both paths therefore count an unreadable
+/// document as a live member.
+#[tokio::test]
+async fn an_unreadable_member_document_is_not_a_lapsed_one() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let storage = DynoStore::new(
+        CLUSTER,
+        NODE,
+        FailingReads {
+            inner: Arc::new(InMemory::new()),
+            deny: "/members/".into(),
+        },
+    );
+
+    _ = storage
+        .write_group_member("g-unreadable", "m-1", member(now_ms() - 10 * 45_000), None)
+        .await
+        .expect("member");
+
+    _ = storage
+        .update_group_generation(
+            "g-unreadable",
+            GenerationDoc {
+                generation_id: 1,
+                leader: Some("m-1".into()),
+                members: BTreeMap::from([("m-1".to_owned(), MemberRef::default())]),
+                session_timeout_ms: 45_000,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("generation");
+
+    _ = storage
+        .create_group_assignment("g-unreadable", 1, assignment(1))
+        .await?;
+
+    // The document says lapsed, but nothing here got to read it.
+    let described = storage
+        .describe_groups(Some(&["g-unreadable".into()]), false)
+        .await?;
+    let detail = detail_of(described.first().expect("described")).expect("found");
+
+    assert_eq!(
+        vec!["m-1".to_owned()],
+        detail.members.keys().cloned().collect::<Vec<_>>(),
+        "an unread document must not condemn its member: {detail:?}"
+    );
+
+    assert_eq!(
+        vec![("g-unreadable".to_owned(), Some("Stable".to_owned()))],
+        listing(&storage, None).await?
+    );
 
     Ok(())
 }

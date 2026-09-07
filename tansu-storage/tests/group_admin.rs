@@ -24,7 +24,7 @@
 //! safety property — an admin API that cannot be run by mistake — and a
 //! distinction is what tooling reads.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::SystemTime};
 
 use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
 use tansu_sans_io::{
@@ -68,12 +68,34 @@ async fn storage() -> Result<Arc<Box<dyn Storage>>, Error> {
     Ok(storage)
 }
 
+/// Wall-clock milliseconds, as the broker stamps a member's last contact.
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or_default()
+}
+
 /// A group with one member in it, written the way `SyncGroup` leaves it: the
 /// generation's member set is the authority, and a member document beside it.
+///
+/// `last_contact_ms` is stamped from the clock, not a literal: the read path
+/// judges a member document against its session (#523), so a fixed stamp is a
+/// member that fell silent in 1970 and a group that describes as `Empty`.
 async fn join(
     storage: &Arc<Box<dyn Storage>>,
     group_id: &str,
     member_id: &str,
+) -> Result<(), Error> {
+    joined_at(storage, group_id, member_id, now_ms()).await
+}
+
+/// As [`join`], with the member's last contact placed on the clock.
+async fn joined_at(
+    storage: &Arc<Box<dyn Storage>>,
+    group_id: &str,
+    member_id: &str,
+    last_contact_ms: i64,
 ) -> Result<(), Error> {
     _ = storage
         .write_group_member(
@@ -81,7 +103,7 @@ async fn join(
             member_id,
             MemberDoc {
                 seq: 0,
-                last_contact_ms: 1_000,
+                last_contact_ms,
                 session_timeout_ms: 45_000,
                 ..Default::default()
             },
@@ -171,6 +193,43 @@ async fn a_group_with_a_live_member_is_not_deleted() -> Result<(), Error> {
     let described = describe(&storage, group_id).await?;
     assert_eq!(ErrorCode::None, ErrorCode::try_from(described.error_code)?);
     assert_eq!(1, described.members.unwrap_or_default().len());
+
+    Ok(())
+}
+
+/// A group all of whose members fell silent describes as `Empty`, through the
+/// service, with nothing having asked the coordinator about it (#523).
+///
+/// The shape `kafka-consumer-groups` reads before it decides whether to let an
+/// operator run `--reset-offsets`, `--delete-offsets` or `--delete`: it refuses
+/// all three unless the group is inactive. Expiry is otherwise reachable only
+/// from `join`, `sync` and `heartbeat`, so a group that loses its last member
+/// without a `LeaveGroup` — a pod scaled to zero, an OOMKill — has nobody left
+/// to trigger the sweep that retires them, and reported `Stable` with its full
+/// member list indefinitely. That leaves an operator with no way to skip a
+/// poison record: waiting does not make the group inactive, and removing the
+/// members is itself an admin operation on an "active" group.
+#[tokio::test]
+async fn a_group_whose_members_fell_silent_describes_as_empty() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = storage().await?;
+    let group_id = "silent";
+
+    // Past `session + session/2`, the silence #488 allows before the sweep
+    // would take the member.
+    joined_at(&storage, group_id, "m-1", now_ms() - 10 * 45_000).await?;
+
+    let described = describe(&storage, group_id).await?;
+
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(described.error_code)?);
+    assert_eq!("Empty", described.group_state);
+    assert!(described.members.unwrap_or_default().is_empty());
+
+    // Which is what the operator was blocked on.
+    let deleted = storage.delete_groups(Some(&[group_id.into()])).await?;
+    assert_eq!(1, deleted.len());
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(deleted[0].error_code)?);
 
     Ok(())
 }
