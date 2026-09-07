@@ -2195,19 +2195,27 @@ where
                 next.generation_id = -1;
             }
 
+            // A known member's rejoin changes the group's composition only
+            // when the set of topics it subscribes to changes. Metadata that
+            // merely differs does not: a static member re-encodes its
+            // subscription on a soft update, and a cooperative consumer
+            // re-encodes it on *every* rejoin (KIP-792 — fresh generationId /
+            // ownedPartitions / sticky userData, same topics). Such a rejoin is
+            // recorded in the member's own document — which is what the leader
+            // reads — WITHOUT bumping the generation, because bumping would
+            // invalidate any in-flight SyncGroup and, with many members
+            // re-joining, keep the group from ever converging.
+            //
+            // A genuinely changed topic set is the opposite case and must
+            // rebalance, for static and dynamic members alike (#522). Static
+            // membership used to answer `false` here unconditionally, which made
+            // the two indistinguishable: the generation stayed put, SyncGroup
+            // handed the member back the previous generation's assignment,
+            // kafka-clients rejected an assignment that does not match its
+            // subscription and re-joined forever — while the group read as
+            // `Stable` and fully assigned and nothing consumed.
             let membership_changed = match view.generation.members.get(member_id.as_str()) {
                 None => true,
-
-                // The encoded metadata changed but the subscribed topic set did
-                // not: a static member's soft update, or a cooperative
-                // consumer's KIP-792-only rejoin (fresh generationId /
-                // ownedPartitions / sticky userData, same topics). The new
-                // metadata is recorded in the member's own document — which is
-                // what the leader reads — WITHOUT bumping the generation.
-                // Bumping here would invalidate any in-flight SyncGroup and,
-                // with many members re-joining, keep the group from ever
-                // converging.
-                Some(_) if group_instance_id.is_some() => false,
 
                 Some(_) => held.as_ref().is_none_or(|(member, _)| {
                     member.join_response.metadata != protocol.metadata
@@ -2576,12 +2584,39 @@ where
             let responses = departing
                 .iter()
                 .map(|(member_id, group_instance_id)| {
-                    let known = next.members.remove(member_id).is_some();
+                    // Who this identity names in the group. Removal was by
+                    // `member_id` alone, which made
+                    // `Admin.removeMembersFromConsumerGroup` unusable: it names
+                    // a static member by its `group.instance.id` and sends the
+                    // empty member id (KIP-345), so every such request came back
+                    // `UnknownMemberId`. An id the generation does not know now
+                    // falls back to the instance the identity claims — which is
+                    // also the only way to name a static member that came back
+                    // holding a different member id (#522).
+                    let named = if next.members.contains_key(member_id) {
+                        Some(member_id.clone())
+                    } else {
+                        group_instance_id.as_deref().and_then(|group_instance_id| {
+                            next.members
+                                .iter()
+                                .find(|(_, held)| {
+                                    held.group_instance_id.as_deref() == Some(group_instance_id)
+                                })
+                                .map(|(member_id, _)| member_id.clone())
+                        })
+                    };
 
-                    if known {
-                        _ = left.insert(member_id.clone());
+                    let known = named.is_some();
+
+                    if let Some(named) = named {
+                        _ = next.members.remove(&named);
+                        _ = left.insert(named);
                     }
 
+                    // The response echoes the identity as it was sent, member id
+                    // and all: that is the key `KafkaAdminClient` matches its
+                    // per-member futures on, and Kafka's own coordinator echoes
+                    // it too.
                     MemberResponse::default()
                         .member_id(member_id.clone())
                         .group_instance_id(group_instance_id.clone())
@@ -3420,6 +3455,211 @@ mod tests {
             !same_subscription_topics(&a, &Bytes::from_static(b"garbage")),
             "undecodable metadata must be conservatively treated as changed"
         );
+    }
+
+    /// A static member whose subscription changes must rebalance (#522).
+    ///
+    /// The production shape: a reconciliation changed the set of topics four
+    /// static members subscribed to, and the join path answered a known
+    /// `group.instance.id` with "not a membership change" unconditionally — the
+    /// `same_subscription_topics` guard above was only ever asked about dynamic
+    /// members. So the generation stayed put, SyncGroup handed each member the
+    /// assignment computed for the previous generation, and kafka-clients threw
+    /// it away (`ConsumerCoordinator`: *received assignment does not match the
+    /// current subscription*) and re-joined — forever. 4h40 without a record,
+    /// while `describeConsumerGroups` reported `Stable` with 1455 partitions
+    /// assigned across members that subscribed to 978 topics and held none of
+    /// them.
+    ///
+    /// Both halves are asserted here, because the fix has to keep the first:
+    /// KIP-792 churn on a static member is still a no-op, a changed topic set
+    /// is not.
+    #[tokio::test(start_paused = true)]
+    async fn a_static_member_that_changes_its_subscription_rebalances() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "static-resubscribe";
+        const INSTANCE_ID: &str = "i-1";
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+
+        let subscribed = encode_subscription(&["t.a", "t.b"], Some(1));
+
+        let join = join_group_static(&controller, GROUP_ID, "", INSTANCE_ID, &subscribed).await?;
+        assert_eq!(i16::from(ErrorCode::None), join.error_code);
+
+        let member_id = join.member_id.clone();
+        assert_eq!(member_id, join.leader, "the first member leads");
+
+        let sync = sync_group_static(
+            &controller,
+            GROUP_ID,
+            join.generation_id,
+            &member_id,
+            INSTANCE_ID,
+            &[assignment_of(&member_id)],
+        )
+        .await?;
+
+        assert_eq!(i16::from(ErrorCode::None), sync.error_code);
+        assert_eq!(
+            Bytes::from(format!("assignment-{member_id}")),
+            sync.assignment
+        );
+
+        // KIP-792 churn: the same two topics, re-encoded with a fresh
+        // generationId. Nothing about the group's composition changed.
+        let churned = encode_subscription(&["t.b", "t.a"], Some(2));
+        assert_ne!(subscribed, churned, "raw metadata must differ");
+
+        let rejoin =
+            join_group_static(&controller, GROUP_ID, &member_id, INSTANCE_ID, &churned).await?;
+
+        assert_eq!(i16::from(ErrorCode::None), rejoin.error_code);
+        assert_eq!(
+            join.generation_id, rejoin.generation_id,
+            "a static member's KIP-792-only rejoin must not bump the generation"
+        );
+
+        // The subscription itself changes: t.b is dropped, t.c is added.
+        let resubscribed = encode_subscription(&["t.a", "t.c"], Some(3));
+
+        let rejoin = join_group_static(
+            &controller,
+            GROUP_ID,
+            &member_id,
+            INSTANCE_ID,
+            &resubscribed,
+        )
+        .await?;
+
+        assert_eq!(i16::from(ErrorCode::None), rejoin.error_code);
+        assert!(
+            rejoin.generation_id > join.generation_id,
+            "a changed topic set must bump the generation, stayed at {}",
+            rejoin.generation_id
+        );
+
+        // ...and the leader is handed the subscription it now has to assign
+        // over, not the one the stale assignment was computed from.
+        assert_eq!(
+            Some(&resubscribed),
+            rejoin
+                .members
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .find(|member| member.member_id == member_id)
+                .map(|member| &member.metadata),
+            "the leader must see the new subscription"
+        );
+
+        // The new generation has no assignment yet, so the leader's own is what
+        // it gets back — the previous generation's is not carried over.
+        let reassignment = Bytes::from_static(b"reassignment");
+
+        let sync = sync_group_static(
+            &controller,
+            GROUP_ID,
+            rejoin.generation_id,
+            &member_id,
+            INSTANCE_ID,
+            &[SyncGroupRequestAssignment::default()
+                .member_id(member_id.clone())
+                .assignment(reassignment.clone())],
+        )
+        .await?;
+
+        assert_eq!(i16::from(ErrorCode::None), sync.error_code);
+        assert_eq!(
+            reassignment, sync.assignment,
+            "the member must not be handed the previous generation's assignment"
+        );
+
+        Ok(())
+    }
+
+    /// `Admin.removeMembersFromConsumerGroup` names a static member by its
+    /// `group.instance.id` and sends the empty member id (KIP-345) — so it has
+    /// to be a way out of a wedged static group (#522).
+    #[tokio::test(start_paused = true)]
+    async fn a_static_member_is_removable_by_its_instance_id() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "static-removal";
+        const INSTANCE_ID: &str = "i-1";
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+        let metadata = encode_subscription(&["t"], None);
+
+        let join = join_group_static(&controller, GROUP_ID, "", INSTANCE_ID, &metadata).await?;
+        assert_eq!(i16::from(ErrorCode::None), join.error_code);
+
+        let member_id = join.member_id.clone();
+
+        let identity = || {
+            MemberIdentity::default()
+                .member_id("".into())
+                .group_instance_id(Some(INSTANCE_ID.into()))
+                .reason(Some("removeMembersFromConsumerGroup".into()))
+        };
+
+        let leave = match controller
+            .leave(GROUP_ID, None, Some(&[identity()]))
+            .await?
+        {
+            Body::LeaveGroupResponse(leave) => leave,
+            otherwise => panic!("{otherwise:?}"),
+        };
+
+        assert_eq!(i16::from(ErrorCode::None), leave.error_code);
+
+        let members = leave.members.as_deref().unwrap_or_default();
+        assert_eq!(1, members.len());
+        assert_eq!(i16::from(ErrorCode::None), members[0].error_code);
+
+        // Echoed as sent: the admin client matches its per-member futures on the
+        // identity it asked with, empty member id and all.
+        assert_eq!("", members[0].member_id);
+        assert_eq!(Some(INSTANCE_ID), members[0].group_instance_id.as_deref());
+
+        let generation = generation_of(&storage, GROUP_ID).await?;
+
+        assert!(
+            generation.members.is_empty(),
+            "the instance must be gone from the group: {:?}",
+            generation.members
+        );
+        assert!(
+            generation.generation_id > join.generation_id,
+            "a departure is a membership change"
+        );
+        assert!(
+            storage
+                .read_group_member(GROUP_ID, &member_id)
+                .await?
+                .is_none(),
+            "the member's own document goes with it"
+        );
+
+        // Nothing left to name: the same request is now an unknown member,
+        // which is what it always was before the instance id was honoured.
+        let leave = match controller
+            .leave(GROUP_ID, None, Some(&[identity()]))
+            .await?
+        {
+            Body::LeaveGroupResponse(leave) => leave,
+            otherwise => panic!("{otherwise:?}"),
+        };
+
+        assert_eq!(
+            i16::from(ErrorCode::UnknownMemberId),
+            leave.members.as_deref().unwrap_or_default()[0].error_code
+        );
+
+        Ok(())
     }
 
     /// #240: the stall threshold comes from the group, not from a constant.
