@@ -107,6 +107,11 @@ const APPLICATION_JSON: &str = "application/json";
 /// only one of them is the topic that name resolves to today.
 type SegmentExpirySnapshot = (u64, i64, Vec<(Substream, String, i32, i64)>);
 
+/// This process's view of the cluster's retired-prefix markers (#532): prefix ->
+/// (the etag it was last read at, the marker), so a refresh GETs only what
+/// changed. See [`DynoStore::retired_prefixes`].
+type RetiredPrefixCache = BTreeMap<String, (Option<String>, RetiredPrefix)>;
+
 #[derive(Clone, Debug)]
 pub struct DynoStore {
     cluster: String,
@@ -238,6 +243,13 @@ pub struct DynoStore {
     /// prefix whose oldest segment is still within retention. Same lower-bound
     /// soundness as the per-partition hint. In-memory only.
     oldest_retained_prefix: Arc<Mutex<BTreeMap<String, i64>>>,
+
+    /// Etag-delta cache of the cluster's retired-prefix markers (#532): prefix
+    /// -> (last-seen etag, marker). A marker changes only when another topic on
+    /// the same prefix is deleted, so refreshing it costs the LIST and nothing
+    /// else — which is what lets both maintenance universes (the claim and the
+    /// retention thresholds) read the set in one tick. In-memory only.
+    retired_prefixes: Arc<Mutex<RetiredPrefixCache>>,
 
     /// Per-prefix coalescing buffer (#57) — the only produce buffer since #177.
     /// Keyed by prefix, so one buffer accumulates `PrefixPending` batches across
@@ -1966,6 +1978,26 @@ static RETENTION_EXEMPT_TOPICS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// Prefixes whose last topic has been deleted and whose segments are still being
+/// reclaimed under a retired-prefix marker (#532).
+///
+/// The outstanding physical debt of every deleted topic, in prefixes: each one
+/// holds segments no client can read and that only retention can remove. It
+/// rises with topic deletions and falls back to zero as each prefix drains,
+/// because the marker is dropped once the prefix holds no segments — so a
+/// count that only ever rises says the reclaim is not running, which is the
+/// state #532 found (27 899 segments surviving the deletion of every topic).
+///
+/// A gauge over prefixes rather than deleted topics: the prefix is the unit
+/// retention acts on, and many topics of one connector retire onto the same
+/// marker.
+static RETIRED_PREFIXES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("tansu_retired_prefixes")
+        .with_description("prefixes whose deleted topics' segments are still being reclaimed")
+        .build()
+});
+
 /// Member documents deleted because no generation named them (#486).
 ///
 /// Expected to be non-zero while a fleet's abandoned member ids drain and near
@@ -2188,6 +2220,9 @@ enum Scan {
     TopicMetadata,
     /// Deleting a topic or a consumer group.
     AdminDelete,
+    /// The retired-prefix marker listing that keeps a deleted topic's prefix
+    /// expirable (#532).
+    RetiredPrefix,
     /// Connectivity check.
     Ping,
 }
@@ -2199,6 +2234,7 @@ impl Scan {
             Self::Group => "group",
             Self::TopicMetadata => "topic_metadata",
             Self::AdminDelete => "admin_delete",
+            Self::RetiredPrefix => "retired_prefix",
             Self::Ping => "ping",
         }
     }
@@ -3117,6 +3153,57 @@ impl TopicRouting {
     }
 }
 
+/// The retired-prefix marker at `retired-prefixes/{prefix}.json`: the retention
+/// obligation a coalescing prefix keeps after the last topic on it is deleted
+/// (#532).
+///
+/// `delete_topic` cannot delete the topic's records — a coalesced segment
+/// multiplexes many topics and is immutable, so its slices are reclaimed only
+/// when the whole segment passes retention (#61/#246) — and it writes a
+/// truncation tombstone per partition instead. That trade assumes retention
+/// still runs on the prefix. It stopped: every maintenance universe is derived
+/// from `topic-metadata/`, so deleting the last topic of a prefix removed the
+/// only thing that gave the prefix a threshold, and its segments became
+/// unreclaimable at any retention setting. A real account kept 27 899 of
+/// 27 899 `.seg` objects (2.75 GiB) after every one of its 1 000 topics was
+/// deleted.
+///
+/// This marker is that threshold, outliving the topic. Kept in its own
+/// top-level prefix: not under `topic-metadata/`, which
+/// [`DynoStore::all_topics`] lists (a marker is not a topic and must never be
+/// served as one), and not under `prefixes/{prefix}/`, so it can never be
+/// mistaken for a segment or reported as one by `tansu audit`.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct RetiredPrefix {
+    /// The effective `retention.ms` this prefix keeps: the **longest** among the
+    /// topics retired onto it, `i64::MAX` for retain-forever, in the same
+    /// convention [`DynoStore::segment_retention_thresholds`] folds a live
+    /// topic's into. Longest wins for the same reason it does among live
+    /// siblings (#61): a segment is shared, so the shortest retention on it must
+    /// never be the one that deletes it.
+    retention_ms: i64,
+
+    /// The topic whose deletion last wrote this marker, and when. Nothing reads
+    /// them: they are what tells an operator where a stranded prefix came from,
+    /// which is otherwise unrecoverable once the topic metadata is gone.
+    topic: String,
+    retired_at_ms: i64,
+}
+
+impl RetiredPrefix {
+    /// Fold another retiring topic's obligation into this marker.
+    ///
+    /// `Default::default()` is `retention_ms: 0` — expire everything — which is
+    /// safe only because this is the sole writer and every call passes a real
+    /// obligation: `max` over `0` is that obligation. A marker that could be
+    /// created empty would time-expire the prefix on the next tick.
+    fn retire(&mut self, topic: &str, retention_ms: i64, now_ms: i64) {
+        self.retention_ms = self.retention_ms.max(retention_ms);
+        self.topic = topic.to_owned();
+        self.retired_at_ms = now_ms;
+    }
+}
+
 /// Pointer object at `topic-ids/{uuid}.json` mapping a topic's id back to its
 /// name, so a metadata lookup by topic-id can resolve to the per-topic
 /// `topic-metadata/{name}.json` object. Written create-only alongside the
@@ -3272,6 +3359,7 @@ impl DynoStore {
             prefix_read_sync_locks: Arc::new(Mutex::new(BTreeMap::new())),
             producers: Arc::new(Mutex::new(BTreeMap::new())),
             oldest_retained_prefix: Arc::new(Mutex::new(BTreeMap::new())),
+            retired_prefixes: Arc::new(Mutex::new(RetiredPrefixCache::new())),
             message_max_bytes: Self::MESSAGE_MAX_BYTES,
             prefix_coalesce_buffers: Arc::new(Mutex::new(BTreeMap::new())),
             segment_seqs: Arc::new(Mutex::new(BTreeMap::new())),
@@ -3453,6 +3541,27 @@ impl DynoStore {
             "clusters/{}/topic-routing/{}.json",
             self.cluster, name
         ))
+    }
+
+    /// The retired-prefix marker object for `prefix` (see [`RetiredPrefix`]).
+    fn retired_prefix_path(&self, prefix: &str) -> Path {
+        Path::from(format!(
+            "clusters/{}/retired-prefixes/{}.json",
+            self.cluster, prefix
+        ))
+    }
+
+    /// Optimistic-concurrency handle on `retired-prefixes/{prefix}.json`.
+    ///
+    /// Built per call rather than memoized like [`Self::topic_meta`]: it is
+    /// written once per topic deletion and read through the etag-delta cache
+    /// ([`Self::retired_prefixes`]), so a permanent per-prefix handle would hold
+    /// a second copy of the value for no read it serves. A fresh handle has no
+    /// cached version, so its first `with_mut` attempts a create and falls back
+    /// to a conditional update on conflict — exactly the merge a second topic
+    /// retiring onto the same prefix needs.
+    fn retired_prefix(&self, prefix: &str) -> OptiCon<RetiredPrefix> {
+        OptiCon::<RetiredPrefix>::path(self.retired_prefix_path(prefix))
     }
 
     /// The cluster's sealed coalescing prefix shape (see [`PrefixShape`]).
@@ -9816,6 +9925,11 @@ impl DynoStore {
             }
         }
 
+        // Whether each affected name still resolves to a topic, memoized and
+        // resolved lazily: only a sub-stream that keeps no surviving segment
+        // asks, which is rare, and the answer costs a conditional GET.
+        let mut live_topics: BTreeMap<&String, bool> = BTreeMap::new();
+
         let expirable_seqs: BTreeSet<u64> = expirable.iter().copied().collect();
         for (substream, topic, partition) in &affected {
             if current.get(topic) != Some(substream) {
@@ -9833,6 +9947,45 @@ impl DynoStore {
                 .filter(|fenced| !expirable_seqs.contains(&fenced.seq))
                 .map(FencedSegment::end)
                 .max();
+
+            // The truncation tombstone of a DELETED topic whose last slice is
+            // going has nothing left to hide, and keeping it now does harm
+            // (#532). `delete_topic` rewrites `watermark.json` as a floor at the
+            // deleted log end rather than deleting it, because the slices it
+            // hides survive inside shared segments and a same-named successor
+            // would otherwise find them by name (#246). Once retention has taken
+            // the last of those segments, every record below the floor is
+            // physically gone — and a successor, whose `create_topic` clears
+            // `high` and folds its base from the segments (none), would start at
+            // 0 *below* a floor of N and have its own first N records hidden by
+            // it. So the tombstone goes with the records it was hiding, and the
+            // name starts clean, exactly as an id-keyed recreation already does.
+            //
+            // Guarded on all three facts, because each one alone is not enough:
+            // the sub-stream keeps no surviving segment, the identity is the
+            // current one (checked above), and the topic really is gone —
+            // resolved from its own object, not from the topic index, whose
+            // bounded staleness would read a peer's 5-second-old create as a
+            // deletion and drop a LIVE topic's floor and offset floor with it
+            // (#241's offset reuse, arriving through the cleanup).
+            //
+            // This is also what makes `delete_topic`'s "one small object per
+            // partition, kept indefinitely" finite: the tombstones drain with
+            // the segments instead of accumulating for the life of the cluster.
+            if surviving.is_none() && !self.is_live_topic(topic, &mut live_topics).await? {
+                debug!(
+                    ?substream,
+                    topic, partition, "dropping a fully reclaimed topic's truncation tombstone"
+                );
+
+                self.watermark(&Topition::new(topic.clone(), *partition))?
+                    .remove(&self.object_store)
+                    .await?;
+                self.invalidate_topic_caches(topic);
+
+                continue;
+            }
+
             if let Some(tail) = tail {
                 let tp = Topition::new(topic.clone(), *partition);
                 _ = self
@@ -9917,6 +10070,33 @@ impl DynoStore {
         })?;
 
         Ok(deleted)
+    }
+
+    /// Whether `topic` still resolves to a topic, memoized in `live` for the
+    /// caller's run (#532).
+    ///
+    /// Read from the topic's own object rather than from the topic index: the
+    /// index has a bounded staleness by design, and the caller — retention,
+    /// deciding whether to drop a truncation tombstone — reads a `false` here as
+    /// permission to delete a durable floor. A peer's five-second-old create
+    /// answered as a deletion would take a live topic's floor with it, which is
+    /// #241's offset reuse arriving through the cleanup.
+    async fn is_live_topic<'topic>(
+        &self,
+        topic: &'topic String,
+        live: &mut BTreeMap<&'topic String, bool>,
+    ) -> Result<bool> {
+        if let Some(&known) = live.get(topic) {
+            return Ok(known);
+        }
+
+        let known = self
+            .topic_metadata(&TopicId::Name(topic.clone()))
+            .await?
+            .is_some();
+        _ = live.insert(topic, known);
+
+        Ok(known)
     }
 
     /// The segments of `prefix` this process has proved undecodable (#398).
@@ -10790,7 +10970,8 @@ impl DynoStore {
 
     /// Claim this tick's maintenance work-set, stateless and coordinator-free
     /// (#126). Every maintainer enumerates the full prefix universe (the
-    /// non-compacted topics' prefixes ∪ locally-indexed prefixes), shuffles it
+    /// non-compacted topics' prefixes ∪ locally-indexed prefixes ∪ the retired
+    /// prefixes of deleted topics, #532), shuffles it
     /// with a per-process seed so N replicas sweep in independent orders, and for
     /// each prefix:
     ///
@@ -10843,6 +11024,12 @@ impl DynoStore {
                 ));
             }
         }
+
+        // And the prefixes whose last topic has been deleted (#532): their
+        // threshold comes from a retired marker rather than from a topic, and a
+        // prefix outside this claim is filtered out of both maintenance passes —
+        // so without them here the marker would never be acted on.
+        universe.extend(self.retired_prefixes().await?.into_keys());
 
         let mut prefixes: Vec<String> = universe.into_iter().collect();
         let mut rng = SmallRng::seed_from_u64(self.maintenance_seed ^ now_ms as u64);
@@ -11195,6 +11382,15 @@ impl DynoStore {
         const PREFIX_MAINTENANCE_CONCURRENCY: usize = 4;
 
         let thresholds = self.segment_retention_thresholds(now_ms, owned).await?;
+
+        // Which of the prefixes below are only being maintained because a
+        // deleted topic left segments on them (#532), so a drained one can give
+        // its marker up. Read here rather than returned by the threshold build
+        // so that build keeps its signature and its single job; the set is
+        // served from the same etag-delta cache, so this costs the listing and
+        // no GET.
+        let retired = self.retired_prefixes().await?;
+
         let compactable: BTreeSet<String> = self
             .compactable_prefixes(owned)
             .await?
@@ -11233,6 +11429,7 @@ impl DynoStore {
             let thresholds = &thresholds;
             let compactable = &compactable;
             let per_key = &per_key;
+            let retired = &retired;
 
             async move {
                 let deleted = match thresholds.get(&prefix) {
@@ -11259,6 +11456,20 @@ impl DynoStore {
                 } else {
                     0
                 };
+
+                // A retired prefix that has now given up every segment needs
+                // no marker (#532): the threshold it carried has done its work,
+                // and leaving it would keep the prefix in every maintainer's
+                // claim universe — a lease GET per tick per replica, forever,
+                // for a prefix with nothing in it. After the expiry above, which
+                // is what refreshed the index this reads. A failure is this
+                // prefix's alone: the next tick retries.
+                if retired.contains_key(&prefix) {
+                    _ = self
+                        .drop_retired_prefix_if_drained(&prefix)
+                        .await
+                        .inspect_err(|err| error!(?err, prefix));
+                }
 
                 // Retro-certify gaps no expiry will reach (#290). Once per
                 // prefix per process, and after the two passes above so it reads
@@ -11393,6 +11604,187 @@ impl DynoStore {
         backlogged.into_iter().map(|(_, prefix)| prefix).collect()
     }
 
+    /// Kafka's `retention.ms` default: 7 days.
+    const DEFAULT_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
+
+    /// The effective `retention.ms` of a topic's stored config: the configured
+    /// value, `i64::MAX` for `-1` (retain forever — the threshold then floors to
+    /// the log start, so nothing expires), or Kafka's 7-day default when the
+    /// config is absent or unparseable.
+    ///
+    /// Shared so that the threshold a live topic contributes and the one its
+    /// retired-prefix marker keeps after it is deleted (#532) cannot disagree:
+    /// a marker that recorded a different number would either delete a
+    /// prefix's segments earlier than the topic asked or keep them longer.
+    fn effective_retention_ms(topic: &CreatableTopic) -> i64 {
+        match topic
+            .configs
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .find(|config| config.name == "retention.ms")
+            .and_then(|config| config.value.as_deref())
+            .and_then(|value| i64::from_str(value).ok())
+        {
+            Some(ms) if ms < 0 => i64::MAX,
+            Some(ms) => ms,
+            None => Self::DEFAULT_RETENTION_MS,
+        }
+    }
+
+    /// The cluster's retired-prefix markers (#532): prefix -> the effective
+    /// `retention.ms` its stranded segments keep, in
+    /// [`Self::effective_retention_ms`]'s convention.
+    ///
+    /// One LIST of `retired-prefixes/`, then a GET of only the markers whose
+    /// etag this process has not already read — the same etag-delta shape as
+    /// [`Self::refresh_topic_index`], and for the same reason: a marker is
+    /// rewritten only when another topic on its prefix is deleted, so in steady
+    /// state the LIST is the entire cost and both maintenance universes can
+    /// afford to read the set every tick.
+    ///
+    /// Markers a peer has dropped leave the cache with the listing that no
+    /// longer names them, so a drained prefix stops being claimed and stops
+    /// being counted here without a restart.
+    async fn retired_prefixes(&self) -> Result<BTreeMap<String, i64>> {
+        /// Matches [`Self::refresh_topic_index`]'s fan-out: the cold read of a
+        /// fleet that has just deleted a thousand topics is otherwise a
+        /// thousand sequential round-trips.
+        const FETCH_EACH_CONCURRENCY: usize = 32;
+
+        let listed = self
+            .scan_delimited(
+                Scan::RetiredPrefix,
+                &Path::from(format!("clusters/{}/retired-prefixes/", self.cluster)),
+            )
+            .await?;
+
+        let mut stale = Vec::new();
+        let mut named: BTreeSet<String> = BTreeSet::new();
+
+        {
+            let cached = self.retired_prefixes.lock()?;
+
+            for object in &listed.objects {
+                let Some(prefix) = object
+                    .location
+                    .filename()
+                    .and_then(|file| file.strip_suffix(".json"))
+                else {
+                    continue;
+                };
+
+                _ = named.insert(prefix.to_owned());
+
+                match cached.get(prefix) {
+                    Some((etag, _)) if etag.is_some() && *etag == object.e_tag => {}
+                    _ => stale.push((
+                        prefix.to_owned(),
+                        object.location.clone(),
+                        object.e_tag.clone(),
+                    )),
+                }
+            }
+        }
+
+        let object_store = &self.object_store;
+        let fetched = futures::stream::iter(stale)
+            .map(|(prefix, location, etag)| async move {
+                let encoded = object_store.get(&location).await?.bytes().await?;
+                let marker = serde_json::from_slice::<RetiredPrefix>(&encoded)?;
+                Ok::<_, Error>((prefix, (etag, marker)))
+            })
+            .buffer_unordered(FETCH_EACH_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let markers = {
+            let mut cached = self.retired_prefixes.lock()?;
+
+            cached.retain(|prefix, _| named.contains(prefix));
+            for (prefix, entry) in fetched {
+                _ = cached.insert(prefix, entry);
+            }
+
+            cached
+                .iter()
+                .map(|(prefix, (_, marker))| (prefix.clone(), marker.retention_ms))
+                .collect::<BTreeMap<String, i64>>()
+        };
+
+        RETIRED_PREFIXES.record(markers.len() as u64, &[]);
+
+        Ok(markers)
+    }
+
+    /// Record that `prefix` now carries `topic`'s retention obligation after its
+    /// deletion (#532), so retention keeps running on the segments the delete
+    /// could not remove.
+    ///
+    /// A read-modify-write rather than a create: several topics retire onto one
+    /// connector prefix, and the marker has to end up holding the longest of
+    /// their retentions — a create-only write would pin whichever topic was
+    /// deleted first and could then delete a later, longer-lived sibling's
+    /// slices early.
+    async fn retire_prefix(&self, prefix: &str, topic: &str, retention_ms: i64) -> Result<()> {
+        let now_ms = i64::try_from(
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
+
+        // Nothing seeds the etag-delta cache from here: the marker is in the
+        // listing the moment it is written, so every maintainer — including this
+        // one — picks it up on its next refresh, and a hand-seeded entry would be
+        // a second source of truth for a value that cache re-reads anyway.
+        self.retired_prefix(prefix)
+            .with_mut(&self.object_store, |marker| {
+                marker.retire(topic, retention_ms, now_ms);
+                Ok(())
+            })
+            .await
+            .and(Ok(()))
+    }
+
+    /// Drop `prefix`'s retired marker once its segments are all gone (#532).
+    /// `Ok(true)` when this call dropped it.
+    ///
+    /// Judged from the index entry the expiry pass just refreshed, never from
+    /// the *absence* of one: a maintainer that has never indexed the prefix
+    /// holds no entry at all, and reading that as "empty" would drop the only
+    /// threshold that can ever reclaim a prefix still full of segments — the
+    /// leak this marker exists to close, re-created by its own cleanup.
+    ///
+    /// Dropping it early is a leak, never a loss: the marker only ever *adds* a
+    /// threshold, and new segments can appear under the prefix only from a live
+    /// topic routed there, which supplies its own.
+    async fn drop_retired_prefix_if_drained(&self, prefix: &str) -> Result<bool> {
+        let drained = self
+            .prefix_index
+            .lock()
+            .map_err(Into::<Error>::into)?
+            .get(prefix)
+            .is_some_and(|entry| entry.segments.is_empty());
+
+        if !drained {
+            return Ok(false);
+        }
+
+        self.retired_prefix(prefix)
+            .remove(&self.object_store)
+            .await?;
+
+        self.retired_prefixes.lock().map(|mut cached| {
+            _ = cached.remove(prefix);
+        })?;
+
+        debug!(prefix, "dropped a drained prefix's retired marker");
+
+        Ok(true)
+    }
+
     /// Whole-segment retention across all coalesced prefixes (#61). Groups the
     /// topics by connector prefix and expires each prefix's segments under one
     /// **uniform** retention — the longest `retention.ms` among the prefix's
@@ -11407,6 +11799,13 @@ impl DynoStore {
     /// unless segment-routed (#175): a compact-only topic's dedicated prefix
     /// gets no threshold at all, `compact,delete` gets the topic's own.
     ///
+    /// A prefix whose last topic has been *deleted* keeps its threshold from
+    /// its retired-prefix marker (#532): the topics here are the live ones, and
+    /// deriving the whole map from them alone meant a deleted topic's prefix
+    /// dropped out of it permanently — no threshold, so
+    /// [`Self::expire_prefix_segments`] was never called for it and its
+    /// segments could not be reclaimed at any retention setting.
+    ///
     /// Restricted to this tick's maintenance claim (#126), and paired with
     /// [`Self::expire_prefix_segments_if_due`] by
     /// [`Self::maintain_prefix_segments`].
@@ -11415,9 +11814,8 @@ impl DynoStore {
         now_ms: i64,
         owned: Option<&BTreeSet<String>>,
     ) -> Result<BTreeMap<String, i64>> {
-        const DEFAULT_RETENTION_MS: i64 = 7 * 24 * 60 * 60 * 1_000;
-
         let mut retention_by_prefix: BTreeMap<String, i64> = BTreeMap::new();
+        let mut exempt_prefixes: BTreeSet<String> = BTreeSet::new();
         let mut exempt_topics = 0u64;
 
         for metadata in self.topics_index().await?.iter() {
@@ -11451,6 +11849,18 @@ impl DynoStore {
                 // prefix never reaches `expire_prefix_segments` at all, so
                 // without this the bytes it holds forever are invisible to every
                 // retention metric and read as retention failing to fire.
+                //
+                // The prefix is also remembered, so that a retired marker on it
+                // cannot hand it the threshold this branch is refusing (#532).
+                // Reachable: a compacted topic's routed prefix is its own name
+                // (#175), so a deleted topic that retired onto that name — a
+                // same-named predecessor, or any topic whose connector prefix
+                // is that name — leaves a marker sitting on it. One insert per
+                // topic, not per partition: every partition of a compacted
+                // topic routes to that one dedicated prefix.
+                _ = exempt_prefixes.insert(
+                    self.routed_prefix(&Topition::new(metadata.topic.name.clone(), 0), true),
+                );
                 exempt_topics += 1;
                 continue;
             }
@@ -11458,16 +11868,10 @@ impl DynoStore {
             // `retention.ms=-1` is retain-forever → treat as effectively infinite
             // (mapped to i64::MAX, so `now - retention` floors to the log start and
             // nothing expires). Absent → the 7-day default.
-            let retention_ms = match configs
-                .iter()
-                .find(|config| config.name == "retention.ms")
-                .and_then(|config| config.value.as_deref())
-                .and_then(|value| i64::from_str(value).ok())
-            {
-                Some(ms) if ms < 0 => i64::MAX,
-                Some(ms) => ms,
-                None => DEFAULT_RETENTION_MS,
-            };
+            //
+            // Read through the shared helper, which is also what a retiring
+            // topic records in its prefix's marker (#532).
+            let retention_ms = Self::effective_retention_ms(&metadata.topic);
 
             for partition in 0..metadata.topic.num_partitions {
                 let prefix = self.routed_prefix(
@@ -11487,6 +11891,21 @@ impl DynoStore {
         }
 
         RETENTION_EXEMPT_TOPICS.record(exempt_topics, &[]);
+
+        // Then the prefixes whose last topic is gone (#532). A live topic on the
+        // prefix wins outright — its threshold is the one that must not lose
+        // data, and a retired sibling's marker must never shorten it; the
+        // marker only speaks for a prefix nothing live occupies. A compact-only
+        // occupant wins the same way, by keeping the exemption above (#175): the
+        // latest value of a key must survive indefinitely, and a marker cannot
+        // overrule that.
+        for (prefix, retention_ms) in self.retired_prefixes().await? {
+            if retention_by_prefix.contains_key(&prefix) || exempt_prefixes.contains(&prefix) {
+                continue;
+            }
+
+            _ = retention_by_prefix.insert(prefix, retention_ms);
+        }
 
         Ok(retention_by_prefix
             .into_iter()
@@ -13062,6 +13481,12 @@ impl Storage for DynoStore {
             // `high` is still cleared: it re-derives from the segment fold, and
             // `expire_prefix_segments` stays its single writer (#179, #237).
             //
+            // A name whose predecessor's segments have since been reclaimed has
+            // no watermark object at all — retention drops the tombstone with
+            // the last slice it was hiding (#532) — so this preserves nothing
+            // and the successor starts at 0, which is correct: there is no
+            // longer anything for it to inherit.
+            //
             // An **id-keyed** topic clears the floor instead of preserving it
             // (#442). The floor's whole job was to hide a predecessor's slices
             // from a successor that would otherwise find them by name; keyed by
@@ -13192,9 +13617,12 @@ impl Storage for DynoStore {
             // argument unconditional (#237).
             //
             // The cost is one small object per partition of a deleted topic,
-            // kept indefinitely. It cannot be dropped once the slices are
-            // reclaimed without a scan costing more than the object does, and
-            // dropping it early resurrects the records it hides.
+            // for as long as the slices it hides survive. Dropping it early
+            // resurrects those records, so it is not dropped from here — the
+            // expiry that takes a sub-stream's last segment drops it, being the
+            // one operation that has just proved there is nothing left to hide
+            // (#532). Until then it stays, and a same-named successor starts
+            // past it.
             for partition in 0..metadata.topic.num_partitions {
                 let topition = Topition::new(metadata.topic.name.as_str(), partition);
 
@@ -13291,6 +13719,46 @@ impl Storage for DynoStore {
                         warn!(?error, %group_id, topic = %metadata.topic.name, "dropping a deleted topic's committed offsets")
                     });
             }
+
+            // Hand the prefix a retention threshold that outlives the topic
+            // (#532), before the metadata object that has been carrying it goes.
+            //
+            // The tombstones above are the whole of what the delete can do to a
+            // shared segment, and their cost was accepted on the understanding
+            // that the segments themselves are reclaimed later, as the other
+            // topics on the prefix expire. For a topic that is the last occupant
+            // of its prefix — every topic, when the names carry fewer components
+            // than the prefix depth — there is no later: every maintenance
+            // universe is derived from `topic-metadata/`, so this delete would
+            // remove the only thing giving the prefix a threshold and its
+            // segments would survive every retention setting, forever. A real
+            // account kept 27 899 of 27 899 `.seg` objects after all 1 000 of
+            // its topics were deleted.
+            //
+            // Written for every deleted topic, not only for a last occupant:
+            // whether a sibling survives is not knowable here without a race,
+            // and a marker on a prefix that still has live topics costs one
+            // small object and changes nothing — `segment_retention_thresholds`
+            // lets the live topic's threshold win.
+            //
+            // Under the *pinned* prefix (#236), which is where the topic's
+            // records actually are, rather than a re-derivation: the marker has
+            // to name the prefix holding the segments, and the pin is the only
+            // authority on that. Read before the pin is deleted below.
+            //
+            // Fatal on failure, like the deletions above and for the same reason
+            // (#251): the topic still exists, the failure is visible, and
+            // re-issuing `DeleteTopics` finishes the job. Swallowing it would
+            // strand the segments silently, which is the bug.
+            let retired = Topition::new(metadata.topic.name.as_str(), 0);
+            let retired_prefix = self.routed_prefix_of(&retired).await?;
+
+            self.retire_prefix(
+                &retired_prefix,
+                metadata.topic.name.as_str(),
+                Self::effective_retention_ms(&metadata.topic),
+            )
+            .await?;
 
             // Only now that the data is gone: the metadata object, its id ->
             // name pointer, and the routing pin. Past this point the topic no

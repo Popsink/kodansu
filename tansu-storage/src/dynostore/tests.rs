@@ -52,6 +52,7 @@ mod prefix_shape;
 mod quarantine_segment;
 mod reachable_panics;
 mod retention_order;
+mod retired_prefix;
 mod scaling;
 mod scram_credentials;
 mod segment;
