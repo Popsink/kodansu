@@ -34,6 +34,11 @@ was throwaway and is not in the tree.
 spelling a deployment can drift onto, and `wasbs://` in particular is the legacy
 Blob scheme — it should fail loudly rather than be quietly treated as Gen2.
 
+All three forms work wherever a storage URL does: `--storage-engine` on the
+broker, and `tansu audit` ([docs/segment-audit.md](segment-audit.md)). The audit
+carried its own scheme table and refused `abfss://` outright until #531; the
+table is shared now, so what the broker accepts is what the audit accepts.
+
 A `dfs` host in the URL is resolved to `<account>.blob.core.windows.net`:
 `object_store` speaks the **Blob** endpoint against an ADLS Gen2 account, not the
 DFS one. That matters for private endpoints, below.
@@ -151,6 +156,8 @@ why cool and cold tiers are backwards for this access pattern.
 ```shell
 just broker-az                    # Azurite in compose, az://tansu/
 just test-conditional-put-azurite # the conformance target against Azurite
+just test-audit-azurite           # the offline audit against Azurite
+just test-azurite                 # both, which is what pr.yml runs
 ```
 
 `just az-up` alone brings up Azurite and creates the container. Note that a

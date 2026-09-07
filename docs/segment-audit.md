@@ -27,6 +27,20 @@ bodies are never downloaded):
 tansu audit --storage-engine s3://my-bucket/ --cluster-id my-cluster
 ```
 
+The storage URL is resolved by the same table the broker's `--storage-engine`
+uses, so every backend the broker runs on can be audited and nothing else can:
+`s3://`, `gs://`, `abfss://<container>@<account>.dfs.core.windows.net/` (with its
+`abfs://` and `az://` spellings, see [docs/adls.md](adls.md)) and `memory://`.
+The two builders drifted apart once — #418 added the Azure schemes to the broker
+alone, and `tansu audit` refused ADLS Gen2 outright until #531 — which is why the
+scheme is now resolved in one place.
+
+On `abfss://` the per-segment cost is **two** requests rather than one. Azure
+serves no suffix range GET and every footer read is one, so the store is wrapped
+in the same `SuffixRange` decorator the broker uses (#419): a `Get Blob
+Properties` for the size, then the same bytes as a bounded range. Both are the
+same Azure billing tier, and a LIST is an order of magnitude above either.
+
 Against an **offline copy**, which is the form to prefer — it needs no broker, no
 credentials, and cannot be perturbed by a replica still writing:
 
@@ -35,9 +49,15 @@ aws s3 sync s3://my-bucket/ ./copy/
 tansu audit --storage-engine file://$PWD/copy --cluster-id my-cluster
 ```
 
-`file://` is deliberately not a storage engine the broker accepts. A deployment
-already past the damage cannot be measured by starting one; the audit resolves
-the URL itself.
+`file://` is deliberately not a storage engine the broker accepts, and the only
+place the two tables differ. A deployment already past the damage cannot be
+measured by starting a broker on a copy of its bucket.
+
+It is also the workaround worth knowing on any backend whose credentials you
+would rather not hand to a sweep: `LocalFileSystem` serves the suffix ranges the
+footer reads are made of, so a copy pulled to disk audits identically. It costs
+copying the whole bucket, which is the only reason it is not the first
+suggestion.
 
 Useful flags:
 

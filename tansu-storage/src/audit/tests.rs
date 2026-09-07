@@ -682,3 +682,66 @@ fn cleanup_policy_is_read_out_of_the_metadata_document() {
     );
     assert_eq!(None, cleanup_policy(&serde_json::json!({"unexpected": 1})));
 }
+
+/// #531: `tansu audit` could not be pointed at ADLS Gen2 at all.
+///
+/// `audit.rs` carries its own object-store builder and #418 added the Azure
+/// schemes only to the broker's, so the tool built to answer "which offsets can
+/// this bucket not serve" refused the one backend with the least coverage.
+///
+/// This asserts the *routing* and the decorator, not a working store: reaching
+/// a real container needs an account, and that was verified by hand against one
+/// (#417) rather than here. The canonical form is the one used because it
+/// carries the account — `az://` takes it from `AZURE_STORAGE_ACCOUNT_NAME`,
+/// which a unit test has no business setting.
+#[test]
+fn an_adls_gen2_url_builds_an_audit() -> Result<(), Error> {
+    for url in [
+        "abfss://tansu@acct.dfs.core.windows.net/",
+        "abfs://tansu@acct.dfs.core.windows.net/",
+    ] {
+        let audit = Audit::try_from_url(&Url::parse(url)?, CLUSTER)?;
+
+        // Every read the audit makes is a suffix GET and `object_store` refuses
+        // one against Azure client-side (#419), so the wrap is the half of the
+        // fix that decides whether the tool works or reports a corrupt bucket.
+        // The store is held as an `Arc<dyn ObjectStore>` with nothing to
+        // downcast to, and `SuffixRange`'s `Debug` names its inner store
+        // deliberately — so this is what there is to assert on.
+        let store = format!("{audit:?}");
+        assert!(
+            store.contains("SuffixRange(MicrosoftAzure"),
+            "{url} must wrap the Azure store in SuffixRange, got {store}"
+        );
+    }
+
+    Ok(())
+}
+
+/// #531: a URL the broker refuses is refused identically by the audit.
+///
+/// The two builders share [`crate::Backend`] now, so this is a property of one
+/// table rather than of two that happen to agree — which is what
+/// `azure_adjacent_schemes_are_unsupported` in `lib.rs` asserts from the other
+/// side. `null://` is here because it is the one direction the sharing does not
+/// make symmetric: the broker accepts it and the audit cannot, since an engine
+/// that stores nothing has no segments to walk.
+#[test]
+fn a_url_the_broker_refuses_is_refused_by_the_audit() -> Result<(), Error> {
+    for url in [
+        "wasbs://tansu@acct.blob.core.windows.net/",
+        "adl://tansu/",
+        "azure://tansu/",
+        "https://acct.blob.core.windows.net/tansu",
+        "null://tansu/",
+    ] {
+        let audit = Audit::try_from_url(&Url::parse(url)?, CLUSTER);
+
+        assert!(
+            matches!(audit, Err(Error::UnsupportedStorageUrl(_))),
+            "{url} must not resolve to an audit, got {audit:?}",
+        );
+    }
+
+    Ok(())
+}

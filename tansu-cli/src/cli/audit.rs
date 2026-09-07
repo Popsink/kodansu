@@ -48,7 +48,7 @@ pub(super) struct Arg {
     )]
     cluster_id: String,
 
-    /// What to audit: s3://tansu/, gs://tansu/, or file:///path/to/a/copy for an offline copy of the bucket
+    /// What to audit: s3://tansu/, gs://tansu/, abfss://tansu@acct.dfs.core.windows.net/, or file:///path/to/a/copy for an offline copy of the bucket
     #[arg(long, env = "STORAGE_ENGINE", default_value = "memory://tansu/")]
     storage_engine: EnvVarExp<Url>,
 

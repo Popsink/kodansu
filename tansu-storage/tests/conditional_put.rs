@@ -61,7 +61,7 @@ use object_store::{
     path::Path,
 };
 use tansu_storage::{
-    AssignmentDoc, AssignmentOutcome, GenerationDoc, MemberDoc, Storage, StorageContainer,
+    AssignmentDoc, AssignmentOutcome, Backend, GenerationDoc, MemberDoc, Storage, StorageContainer,
     UpdateError, Version,
 };
 use url::Url;
@@ -87,17 +87,21 @@ fn object_store() -> Result<Arc<dyn ObjectStore>, Error> {
     let storage = storage_url()?;
     let bucket = storage.host_str().unwrap_or("tansu");
 
-    match storage.scheme() {
-        "memory" => Ok(Arc::new(InMemory::new()) as Arc<dyn ObjectStore>),
+    // Routed through `Backend`, which is also what the broker and the offline
+    // audit match on: a scheme added to one builder and not the others is how
+    // this target once reported "conditional put is not a property of" a store
+    // it simply did not know (#420, #531).
+    match Backend::try_from_url(&storage)? {
+        Backend::Memory => Ok(Arc::new(InMemory::new()) as Arc<dyn ObjectStore>),
 
-        "s3" => AmazonS3Builder::from_env()
+        Backend::S3 => AmazonS3Builder::from_env()
             .with_bucket_name(bucket)
             .with_conditional_put(S3ConditionalPut::ETagMatch)
             .build()
             .map(|object_store| Arc::new(object_store) as Arc<dyn ObjectStore>)
             .map_err(Into::into),
 
-        "gs" => GoogleCloudStorageBuilder::from_env()
+        Backend::Google => GoogleCloudStorageBuilder::from_env()
             .with_bucket_name(bucket)
             .build()
             .map(|object_store| Arc::new(object_store) as Arc<dyn ObjectStore>)
@@ -108,18 +112,22 @@ fn object_store() -> Result<Arc<dyn ObjectStore>, Error> {
         // username in the canonical form and its host in the short one, and
         // this target must not build the store any differently to the broker.
         //
-        // No `SuffixRange` wrapper, unlike the broker. It is `pub(crate)` and
-        // out of reach from an integration test, and it translates reads —
-        // which is nothing a conditional put does. What this target asserts is
-        // untouched by its absence, and #419's own tests cover the translation.
-        "az" | "abfs" | "abfss" => MicrosoftAzureBuilder::from_env()
+        // No `SuffixRange` wrapper, unlike the broker and the audit. It is
+        // `pub(crate)` and out of reach from an integration test, and it
+        // translates reads — which is nothing a conditional put does. What this
+        // target asserts is untouched by its absence, and #419's own tests cover
+        // the translation.
+        Backend::Azure => MicrosoftAzureBuilder::from_env()
             .with_url(storage.as_str())
             .build()
             .map(|object_store| Arc::new(object_store) as Arc<dyn ObjectStore>)
             .map_err(Into::into),
 
-        _ => Err(Error::Message(format!(
-            "conditional put is not a property of {storage}"
+        // Neither is a store a broker writes to, so neither has a conditional
+        // put to conform to: `file://` is the offline audit's alone and
+        // `null://` stores nothing.
+        backend @ (Backend::Local | Backend::Null) => Err(Error::Message(format!(
+            "conditional put is not a property of {backend:?} ({storage})"
         ))),
     }
 }

@@ -65,6 +65,27 @@ test-conditional-put-azurite: az-up
     AZURE_STORAGE_USE_EMULATOR=true TANSU_TEST_STORAGE_URL="az://tansu/" \
       cargo nextest run --package tansu-storage --all-features -E 'binary(conditional_put)'
 
+# The offline audit against Azurite, which is the only automated proof that
+# `tansu audit` can read a footer out of an Azure store at all (#531).
+#
+# Every read the audit makes is a suffix GET and `object_store` refuses one
+# against Azure *client-side*, so this fails without the `SuffixRange` wrap even
+# though the emulator never sees the request. That client-side refusal is the
+# whole defect, which is why an emulator with no hierarchical namespace is
+# nevertheless the right place to catch it.
+test-audit-azurite: az-up
+    AZURE_STORAGE_USE_EMULATOR=true TANSU_TEST_STORAGE_URL="az://tansu/" \
+      cargo nextest run --package tansu-storage --all-features -E 'binary(audit)'
+
+# Every target that runs against Azurite, which is what `pr.yml` runs. `az-up`
+# tears compose down and back up, so the two cannot simply be listed as
+# dependencies of one recipe — the second would restart the container under the
+# first.
+test-azurite: az-up
+    AZURE_STORAGE_USE_EMULATOR=true TANSU_TEST_STORAGE_URL="az://tansu/" \
+      cargo nextest run --package tansu-storage --all-features \
+      -E 'binary(conditional_put) + binary(audit)'
+
 # Many groups at once: the program exit criterion for #359.
 #
 # `#[ignore]`d in the suite because it is wall clock rather than a regression

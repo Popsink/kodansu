@@ -214,8 +214,9 @@ jobs:
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
 
-  # The conditional-put conformance target against a real implementation of
-  # `If-None-Match` (#420).
+  # Everything that runs against Azurite: the conditional-put conformance target
+  # against a real implementation of `If-None-Match` (#420), and the offline
+  # audit against a store that refuses a suffix range (#531).
   #
   # This is the one job on the board that tests something no other job can.
   # `docs/testing.md` records that S3 and GCS are both untested — every other
@@ -230,13 +231,20 @@ jobs:
   # nothing needing a service belongs in front of it. This job feeds `all-green`
   # instead, so it becomes enforced the moment branch protection moves.
   #
+  # It also carries the offline audit's own target (#531). `tansu audit` has its
+  # own object-store builder, which is how it came to refuse `abfss://` outright
+  # while the broker ran on it; every read it makes is a suffix GET, and
+  # `object_store` refuses one against Azure *client-side*. That refusal never
+  # reaches the emulator, so Azurite catches the defect exactly despite being an
+  # emulator.
+  #
   # **Read `docs/testing.md` before reading a green badge here as "Azure is
   # tested".** Three things this does not cover, and the first is the sharp one:
   # `object_store` detects the emulator and bypasses `startFrom` entirely, so
   # nothing here exercises `list_with_offset`; Azurite has no hierarchical
   # namespace, so nothing here covers ADLS Gen2 as such; and it does not throttle.
   # Those were answered against a real HNS account in #417, by hand, once.
-  conditional-put-azurite:
+  azurite:
     runs-on: ubuntu-latest-8-cores
     env:
       CARGO_BUILD_BUILD_DIR: /mnt/build
@@ -256,13 +264,13 @@ jobs:
       # no credentials of its own — the development account and key are
       # well-known and `etc/azurite-container.py` carries them.
       - run: cp example.env .env
-      - run: just test-conditional-put-azurite
+      - run: just test-azurite
       - run: tar --create --gzip --file=logs.tar.gz logs
         if: always()
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: logs-conditional-put-azurite
+          name: logs-azurite
           path: logs.tar.gz
           if-no-files-found: error
 
@@ -285,7 +293,7 @@ jobs:
       - check-no-default-features
       - build-storage
       - test
-      - conditional-put-azurite
+      - azurite
       - coverage
     runs-on: ubuntu-latest
     steps:
