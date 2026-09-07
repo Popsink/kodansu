@@ -108,17 +108,36 @@ throttling errors."* The `gs` arm therefore wraps the store in a client-side
 
 This reaches exactly one object. The data plane is create-only — it issues no
 conditional update at all, asserted in `dynostore::tests::gcs_generation` — so
-produce and fetch never write one key twice and never meet the cap. What does
-meet it is a consumer group's `generation.json`, where every member's admission
-is its own CAS: **16 members racing to form one group take ~54 seconds** under
-the cap, against 3 ms without it, which is past a Kafka client's 45 s default
-session timeout. That is #427, it is a real inability to form a group of any size
-on GCS, and it is open.
+produce and fetch never write one key twice and never meet the cap. What used to
+meet it is a consumer group's `generation.json`.
 
-Two things bound it honestly: it is per group, not fleet-wide (different groups
-write different objects), and the limiter is a **local delay**, so the cost is
-paid whether or not a real bucket would have rejected the burst. Nothing has
-observed what GCS actually does under this pattern.
+Every member's admission was its own CAS, and the members race: **16 members
+forming one group took ~54 seconds** under the cap, against 3 ms without it,
+which is past a Kafka client's 45 s default session timeout. Not a slow group but
+one that cannot form — the sweep evicts members that have not been admitted yet
+and the group re-forms into the same wall. Only 16 s of that was the writes that
+had to land; the rest was ~3.4 conflicting attempts per member, each waiting out
+a full second before being told it lost.
+
+**Fixed in #427 by batching admission.** A member that the generation does not
+name is mid-join, and so is every other member whose document is fresh and
+unnamed; the lowest id among them does the one CAS that admits them all, and the
+others wait for it. The election is decided from the persisted documents, so
+every replica reaches the same verdict, and it is bounded — a member that waits
+two seconds for a peer that never writes admits itself, which is the old
+behaviour arrived at late rather than never. Measured through `Controller::join`
+over this exact store shape (`tansu-broker/tests/group_formation_cap.rs`): **two
+writes and 4.2 s for 16 members**, three seconds of which is the join window
+every group pays on every backend.
+
+It also pays on S3, where the same per-member CAS was not a wall but a bill:
+#406 put consumer-group PUTs at 67% of the PUT spend.
+
+Two things bounded the original problem honestly and are worth keeping in mind
+for the next one: it was per group, not fleet-wide (different groups write
+different objects), and the limiter is a **local delay**, so the cost was paid
+whether or not a real bucket would have rejected the burst. Nothing has observed
+what GCS actually does under this pattern.
 
 ### The bucket ramps, and the retry budget is not sized for it (#519)
 

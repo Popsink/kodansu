@@ -13,4 +13,6 @@
 // limitations under the License.
 
 pub(crate) mod generation;
+// `pub(crate)`, with the one type other crates need re-exported from the crate
+// root rather than the module opened up: see `PutRateLimiter` in `lib.rs`.
 pub(crate) mod limit;

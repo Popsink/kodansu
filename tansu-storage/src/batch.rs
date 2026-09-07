@@ -500,6 +500,10 @@ where
         self.storage.list_group_members(group_id).await
     }
 
+    async fn list_group_member_stamps(&self, group_id: &str) -> Result<BTreeMap<String, i64>> {
+        self.storage.list_group_member_stamps(group_id).await
+    }
+
     async fn create_acls(&self, bindings: &[AclBinding]) -> Result<Vec<ErrorCode>> {
         self.storage.create_acls(bindings).await
     }
@@ -1046,6 +1050,10 @@ mod tests {
             &self,
             _group_id: &str,
         ) -> Result<BTreeMap<String, (MemberDoc, Version)>> {
+            unimplemented!()
+        }
+
+        async fn list_group_member_stamps(&self, _group_id: &str) -> Result<BTreeMap<String, i64>> {
             unimplemented!()
         }
 

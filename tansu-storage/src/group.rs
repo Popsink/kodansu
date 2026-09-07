@@ -91,6 +91,23 @@ pub struct MemberDoc {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_instance_id: Option<String>,
 
+    /// The group protocol this member joined under — the assignor name, from
+    /// the `JoinGroupRequestProtocol` its subscription was taken from.
+    ///
+    /// Recorded because batch admission (#427) admits members from their
+    /// documents rather than from their own requests, and a member the group's
+    /// protocol has moved past must not be one of them. A member that cannot
+    /// speak the group's protocol is refused at its own join with
+    /// `InconsistentGroupProtocol`, before it writes anything — but a member
+    /// that wrote its document while the group had no protocol at all, which is
+    /// every member of a forming group, is refused by this field or not at all.
+    ///
+    /// `None` on a document written before this field existed, which is read as
+    /// "unknown" and admitted: the alternative would be a rolling deploy in
+    /// which no member of a forming group can be batched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_name: Option<String>,
+
     /// The subscription the member joined with, in the shape the group's
     /// leader is handed at `SyncGroup` and `DescribeGroups` reports.
     pub join_response: JoinGroupResponseMember,
@@ -334,18 +351,52 @@ mod tests {
         );
 
         assert_eq!(
-            r#"{"seq":3,"last_contact_ms":1000,"session_timeout_ms":45000,"rebalance_timeout_ms":300000,"group_instance_id":"static-1","join_response":{"member_id":"m-1","group_instance_id":null,"metadata":[97,98]}}"#,
+            r#"{"seq":3,"last_contact_ms":1000,"session_timeout_ms":45000,"rebalance_timeout_ms":300000,"group_instance_id":"static-1","protocol_name":"range","join_response":{"member_id":"m-1","group_instance_id":null,"metadata":[97,98]}}"#,
             serde_json::to_string(&MemberDoc {
                 seq: 3,
                 last_contact_ms: 1_000,
                 session_timeout_ms: 45_000,
                 rebalance_timeout_ms: Some(300_000),
                 group_instance_id: Some("static-1".into()),
+                protocol_name: Some("range".into()),
                 join_response: join_response("m-1"),
                 ..Default::default()
             })
             .unwrap()
         );
+    }
+
+    /// A member document written before `protocol_name` existed still parses,
+    /// and reads as "unknown" rather than as a protocol (#427).
+    ///
+    /// That distinction is the whole of the field's rollout behaviour: batch
+    /// admission drops a pending member whose document names a *different*
+    /// protocol from the group's, and admits one that names none — so a fleet
+    /// mid-deploy batches members an older process registered instead of
+    /// refusing them.
+    #[test]
+    fn a_member_doc_without_a_protocol_reads_as_unknown() {
+        let held: MemberDoc = serde_json::from_str(
+            r#"{"seq":1,"last_contact_ms":1000,"session_timeout_ms":45000,"join_response":{"member_id":"m-1","group_instance_id":null,"metadata":[97,98]}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(None, held.protocol_name);
+        assert!(
+            held.rest.is_empty(),
+            "the catch-all took a key the type models: {:?}",
+            held.rest
+        );
+
+        // And the other direction: a document an older process round-tripped
+        // through its `rest` catch-all comes back typed rather than stringly.
+        let carried: MemberDoc = serde_json::from_str(
+            r#"{"seq":1,"last_contact_ms":1000,"session_timeout_ms":45000,"protocol_name":"range","join_response":{"member_id":"m-1","group_instance_id":null,"metadata":[97,98]}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(Some("range"), carried.protocol_name.as_deref());
+        assert!(carried.rest.is_empty());
     }
 
     /// The same discipline for the contended object.

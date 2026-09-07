@@ -54,6 +54,12 @@ uuid.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+
+# `InMemory`, to compose the `gs` arm's per-object write cap over it and form a
+# group under GCS's one-put-per-second (#427). The limiter is a local delay, so
+# that reproduces the cap without a bucket.
+object_store.workspace = true
+
 pretty_assertions.workspace = true
 
 # A throwaway self-signed certificate for the TLS listener tests (#358), so the

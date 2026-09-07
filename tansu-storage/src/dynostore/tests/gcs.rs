@@ -39,7 +39,11 @@
 //! is a *local* throttle — it delays rather than sending — so what it costs is
 //! observable here too. `produce_fan_out_under_the_per_object_cap` shows the
 //! data plane never writes one key twice and so never meets the cap;
-//! `group_formation_under_the_per_object_cap` shows `generation.json` does.
+//! `group_formation_under_the_per_object_cap` shows `generation.json` does —
+//! and its third arm is the target #427 was closed by. That the *coordinator*
+//! reaches it is bounded in `tansu-broker/tests/group_formation_cap.rs`, which
+//! composes this same store and drives `Controller::join` over it; this one
+//! stays a measurement of the store.
 //!
 //! What none of this observes is GCS itself: the 429 body and the per-bucket
 //! write ramp. Those need a real bucket. The generation precondition no longer
@@ -164,20 +168,27 @@ async fn group_formation_under_the_per_object_cap() -> Result<()> {
     )
     .await?;
 
-    // The target #427 proposes, measured rather than estimated: admit every
-    // member that arrived in the join window in ONE CAS instead of one each.
+    // The target #427 proposed, and now what the fix does: admit every member
+    // that arrived in the join window in ONE CAS instead of one each.
     //
-    // This is not a fix — it does not go through `join`, which is where the
-    // per-member CAS lives — it is the number the fix has to hit. It also shows
-    // where the ~54 s goes: not into 16 unavoidable writes (that would be 16 s)
-    // but into the ~3.4 conflicting attempts each member makes, every one of
-    // which waits out a full cell before losing.
+    // Still not the fix itself — this does not go through `join`, where the
+    // per-member CAS lived — it is the number the fix had to hit, kept beside
+    // the other two arms because the three together are the whole argument. It
+    // also shows where the ~54 s went: not into 16 unavoidable writes (that
+    // would be 16 s) but into the ~3.4 conflicting attempts each member made,
+    // every one of which waited out a full cell before losing.
     //
     // In-process serialisation would collect the same conflicts and cost ~16 s,
     // which is inside a 45 s session timeout for 16 members and outside it for
     // 50. It is also a per-group lock, and "`Controller` holds no per-group
-    // state" is an acceptance criterion #360 shipped. Batching is the one route
-    // that is both sufficient and allowed.
+    // state" is an acceptance criterion #360 shipped. Batching was the one
+    // route both sufficient and allowed.
+    //
+    // The bound on the shipped path is
+    // `tansu-broker/tests/group_formation_cap.rs`: this same store, composed
+    // the same way, driven through `Controller::join`, where 16 members cost
+    // **two** writes of `generation.json` and 4.2 s — 3 s of which is the join
+    // window every group pays on every store.
     {
         let storage = Arc::new(DynoStore::new(CLUSTER, NODE, gcs_shaped(InMemory::new())));
         let started = SystemTime::now();

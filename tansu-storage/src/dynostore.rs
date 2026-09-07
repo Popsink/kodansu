@@ -8587,6 +8587,15 @@ impl DynoStore {
         (location != Path::from(format!("{prefix}/.json"))).then_some(location)
     }
 
+    /// The member id a listed `members/` object names, or `None` for anything
+    /// under that prefix which is not a member document.
+    fn listed_member_id(location: &Path) -> Option<String> {
+        location
+            .parts()
+            .next_back()
+            .and_then(|name| name.as_ref().strip_suffix(".json").map(ToOwned::to_owned))
+    }
+
     /// A group's composition document (#359).
     fn group_generation_location(&self, group_id: &str) -> Option<Path> {
         self.group_prefix(group_id)
@@ -14920,12 +14929,7 @@ impl Storage for DynoStore {
         let mut listing = self.scan(Scan::Group, &prefix);
 
         while let Some(meta) = listing.next().await.transpose()? {
-            let Some(member_id) = meta
-                .location
-                .parts()
-                .next_back()
-                .and_then(|name| name.as_ref().strip_suffix(".json").map(ToOwned::to_owned))
-            else {
+            let Some(member_id) = Self::listed_member_id(&meta.location) else {
                 continue;
             };
 
@@ -14937,6 +14941,31 @@ impl Storage for DynoStore {
         }
 
         Ok(members)
+    }
+
+    async fn list_group_member_stamps(&self, group_id: &str) -> Result<BTreeMap<String, i64>> {
+        let Some(prefix) = self.group_members_prefix(group_id) else {
+            return Ok(BTreeMap::new());
+        };
+
+        let mut stamps = BTreeMap::new();
+        let mut listing = self.scan(Scan::Group, &prefix);
+
+        // The listing and nothing else. `last_modified` is what the document
+        // would have said: `MemberDoc::last_contact_ms` is only ever written
+        // *as* `now`, so the object's write time and the stamp inside it are
+        // the same reading — one taken by the store's clock rather than the
+        // broker's, which for a window measured in seconds is a distinction
+        // without a difference (#427).
+        while let Some(meta) = listing.next().await.transpose()? {
+            let Some(member_id) = Self::listed_member_id(&meta.location) else {
+                continue;
+            };
+
+            _ = stamps.insert(member_id, meta.last_modified.timestamp_millis());
+        }
+
+        Ok(stamps)
     }
 
     async fn read_group_generation(

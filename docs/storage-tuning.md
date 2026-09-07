@@ -416,9 +416,11 @@ now asserted rather than argued — `dynostore::tests::gcs_generation` measures
 produce and fetch issuing **zero** conditional updates.
 
 The clause the sentence used to be missing is the group plane, which does mutate
-one object: `generation.json`, once per member admission. Under the cap that
-serialises, and a 16-member group takes ~54 s to form — past a client's session
-timeout (#427). The delete path is also GCS-specific in a way this section is
+one object: `generation.json`. That used to be once per member admission, which
+under the cap serialised into a 16-member group taking ~54 s to form — past a
+client's session timeout. #427 admits every member of a join window in one CAS
+instead, and the same 16 members now cost two writes and 4.2 s, most of it the
+3 s join window. The delete path is also GCS-specific in a way this section is
 not: `object_store` has no batch delete for GCS and issues one request per
 object, ten in flight, against 1,000-per-request for S3. See
 [docs/gcs.md](gcs.md).

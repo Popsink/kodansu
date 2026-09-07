@@ -65,8 +65,11 @@ pub struct LatencyIntroducingStorage<S> {
     /// - `generation_cas_conflicts`: how many of those lost the etag CAS. The
     ///   whole point of the decomposition is that this converges to zero
     ///   without a per-group owner.
-    /// - `member_lists`: listings of a group's member documents. The claim is
-    ///   that no request path issues one.
+    /// - `member_lists`: listings of a group's member documents, of either kind
+    ///   — the one that reads every document and the cheap one batch admission
+    ///   elects from (#427). The claim is that no *steady-state* request path
+    ///   issues either: only a member the generation does not name yet lists,
+    ///   which is a join and not a heartbeat.
     /// - `member_reads`: reads of a member's own document. Bounded by the same
     ///   one per member per session/2 as the writes (#406) — for a long time it
     ///   was not, because the read came *before* the guard that bounds them.
@@ -316,6 +319,18 @@ where
         _ = self.member_lists.fetch_add(1, Ordering::Relaxed);
 
         self.storage.list_group_members(group_id).await
+    }
+
+    async fn list_group_member_stamps(&self, group_id: &str) -> Result<BTreeMap<String, i64>> {
+        self.introduce_latency().await?;
+
+        // Counted as a listing of the group's member documents, because that
+        // is what it is: the "no LIST on the request path" assertion in
+        // `group_scale` has to see the cheap listing batch admission added
+        // (#427) as well as the expensive one it was written against.
+        _ = self.member_lists.fetch_add(1, Ordering::Relaxed);
+
+        self.storage.list_group_member_stamps(group_id).await
     }
 
     async fn create_acls(&self, bindings: &[AclBinding]) -> Result<Vec<ErrorCode>> {

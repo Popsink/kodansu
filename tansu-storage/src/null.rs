@@ -482,6 +482,19 @@ impl Storage for Engine {
         })
     }
 
+    async fn list_group_member_stamps(&self, group_id: &str) -> Result<BTreeMap<String, i64>> {
+        // The document's own stamp, where the object store answers with the
+        // object's `last_modified`. They are the same reading taken by two
+        // clocks (#427), and this engine holds documents rather than objects.
+        self.members.lock().map_err(Into::into).map(|members| {
+            members
+                .iter()
+                .filter(|((group, _), _)| group == group_id)
+                .map(|((_, member_id), (member, _))| (member_id.clone(), member.last_contact_ms))
+                .collect()
+        })
+    }
+
     /// In memory for the life of the process, like everything else this engine
     /// keeps.
     #[instrument(skip_all)]

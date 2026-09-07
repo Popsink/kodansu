@@ -201,6 +201,13 @@ mod azure;
 #[cfg(feature = "dynostore")]
 mod gcs;
 
+// The `gs` arm's per-object write cap, exported for the same reason
+// `LatencyIntroducingStorage` is: it is a *local* delay, so composing it over
+// `InMemory` reproduces GCS's one-write-per-second-per-object exactly, and the
+// test that has to see it is the group formation one in `tansu-broker` (#427).
+#[cfg(feature = "dynostore")]
+pub use gcs::limit::PutRateLimiter;
+
 #[cfg(feature = "dynostore")]
 mod os;
 
@@ -1633,6 +1640,28 @@ pub trait Storage: Debug + Send + Sync + 'static {
         group_id: &str,
     ) -> Result<BTreeMap<String, (MemberDoc, Version)>>;
 
+    /// Every member id a group holds a document for, with the epoch
+    /// milliseconds that document was last written.
+    ///
+    /// One LIST and **no GETs**: the stamp is the listed object's
+    /// `last_modified`, and a member document is written precisely when its
+    /// `last_contact_ms` moves, so the listing answers "how recently was this
+    /// member heard from" without reading a byte of any document.
+    ///
+    /// That is what batch admission needs (#427). A member the generation does
+    /// not name yet, whose document is fresh, is a member mid-join; the lowest
+    /// id among them does the one CAS that admits them all, and every replica
+    /// elects the same one because they read the same listing. Only the member
+    /// that goes on to admit reads documents, and only the ones it is admitting
+    /// — the `group_instance_id` the generation has to record lives nowhere
+    /// else.
+    ///
+    /// Contrast [`Self::list_group_members`], which reads every document: that
+    /// one is for reconciliation, this one is cheap enough to be reached from a
+    /// request — and only from the admission path, which a member the
+    /// generation already names never takes.
+    async fn list_group_member_stamps(&self, group_id: &str) -> Result<BTreeMap<String, i64>>;
+
     /// A group's composition and its version, or `None` when the group has no
     /// generation object — which is how a group that does not exist, and a
     /// group that exists only in the legacy layout, both read.
@@ -2020,6 +2049,10 @@ where
         self.as_ref().list_group_members(group_id).await
     }
 
+    async fn list_group_member_stamps(&self, group_id: &str) -> Result<BTreeMap<String, i64>> {
+        self.as_ref().list_group_member_stamps(group_id).await
+    }
+
     async fn read_group_generation(
         &self,
         group_id: &str,
@@ -2399,6 +2432,10 @@ where
         group_id: &str,
     ) -> Result<BTreeMap<String, (MemberDoc, Version)>> {
         self.as_ref().list_group_members(group_id).await
+    }
+
+    async fn list_group_member_stamps(&self, group_id: &str) -> Result<BTreeMap<String, i64>> {
+        self.as_ref().list_group_member_stamps(group_id).await
     }
 
     async fn read_group_generation(
