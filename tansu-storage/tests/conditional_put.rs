@@ -36,12 +36,15 @@
 //!   `UpdateError::Outdated` carrying the current value, which is the contract
 //!   the group coordinator's retry loop is written against.
 //!
-//! Not covered: GCS generation preconditions. There is no GCS emulator in
-//! `compose.yaml` and `GoogleCloudStorageBuilder::from_env` needs real
-//! credentials, so a `gs://` run has nothing to run against here. Pointing
-//! `TANSU_TEST_STORAGE_URL` at a real `gs://` bucket runs every test in this file
-//! unchanged — that is the whole reason the store is a parameter — but no
-//! assertion here has ever been observed against GCS, and none of them fakes one.
+//! Not covered on every PR: GCS. There is no GCS emulator in `compose.yaml`,
+//! so `just test-conditional-put gs://tansu/` needs either a real bucket or
+//! `googleapis/storage-testbench` with the XML-API headers it does not yet
+//! answer with (#520, `docs/testing.md`). Every test in this file runs against
+//! `gs://` unchanged — that is the whole reason the store is a parameter — and
+//! [`invented_version`] is what makes that true rather than nominal: GCS
+//! conditions on the generation, so a version the store never issued has to be
+//! built in the shape GCS refuses on the wire rather than the shape
+//! `object_store` refuses locally.
 
 #![cfg(feature = "dynostore")]
 
@@ -142,6 +145,36 @@ fn update(version: UpdateVersion) -> PutOptions {
         mode: PutMode::Update(version),
         ..Default::default()
     }
+}
+
+/// A version no store ever issued, shaped for the store under test.
+///
+/// An etag is enough everywhere but GCS. GCS conditions `PutMode::Update` on the
+/// object's *generation* and reads it from `UpdateVersion::version`, so an
+/// etag-only version is refused by `object_store` itself with
+/// `Generic { MissingVersion }` — before a request is sent, which measures the
+/// client rather than the store. `dynostore::tests::gcs_generation` is the
+/// standing statement of that difference; what this target is for is the wire,
+/// so the invented version carries a generation instead.
+///
+/// `1` is safe as a generation the store cannot have issued: GCS generations are
+/// microsecond timestamps, and `x-goog-if-generation-match: 1` is refused with
+/// the same `412` a stale etag gets on S3 and Azure — including against a key
+/// that does not exist, where the live generation is absent rather than 1.
+fn invented_version() -> Result<UpdateVersion, Error> {
+    let e_tag = Some(String::from("\"0bad0bad0bad0bad0bad0bad0bad0bad\""));
+
+    Ok(if storage_url()?.scheme() == "gs" {
+        UpdateVersion {
+            e_tag,
+            version: Some(String::from("1")),
+        }
+    } else {
+        UpdateVersion {
+            e_tag,
+            version: None,
+        }
+    })
 }
 
 /// A losing *create* is `AlreadyExists`, on both stores.
@@ -283,22 +316,16 @@ async fn a_stale_etag_cas_is_refused() -> Result<(), Error> {
         "a spent version must stay spent, got {replayed:?}"
     );
 
-    // An etag the store never issued is refused the same way, and a CAS against a
-    // key that does not exist is a precondition failure rather than a create —
+    // A version the store never issued is refused the same way, and a CAS against
+    // a key that does not exist is a precondition failure rather than a create —
     // the fallback that would silently turn a lost lease into a fresh one.
+    // `invented_version` is what keeps this on the wire on `gs://`.
     for (what, location) in [
         ("an invented etag", location.clone()),
         ("an absent key", key("stale_cas_absent")),
     ] {
         let refused = object_store
-            .put_opts(
-                &location,
-                payload("nope"),
-                update(UpdateVersion {
-                    e_tag: Some(String::from("\"0bad0bad0bad0bad0bad0bad0bad0bad\"")),
-                    version: None,
-                }),
-            )
+            .put_opts(&location, payload("nope"), update(invented_version()?))
             .await;
 
         assert!(
@@ -531,7 +558,7 @@ async fn a_version_the_store_never_issued_is_refused() -> Result<(), Error> {
         .await
         .map_err(|error| Error::Message(format!("{error:?}")))?;
 
-    let invented = Version::from(&Uuid::now_v7());
+    let invented = Version::from(invented_version()?);
 
     match storage
         .update_group_generation(&group, generation_doc(1), Some(invented))
