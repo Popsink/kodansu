@@ -32,18 +32,7 @@ pub struct Frame {
 
 impl ByteSize for Frame {
     fn size_in_bytes(&self) -> Result<usize> {
-        Ok(self
-            .batches
-            .iter()
-            .map(|batch| {
-                // base_offset
-                size_of::<i64>()
-                // batch length
-                + size_of::<i32>()
-                + FIXED_BATCH_LENGTH
-                + batch.record_data.len()
-            })
-            .sum())
+        Ok(self.batches.iter().map(Batch::wire_size).sum())
     }
 }
 
@@ -282,6 +271,32 @@ impl Batch {
     /// such a batch — `UNSUPPORTED_FOR_MESSAGE_FORMAT` — do not act on it.
     pub fn is_record_batch_v2(&self) -> bool {
         self.magic == Self::MAGIC_RECORD_BATCH_V2
+    }
+
+    /// What this batch costs a `Fetch` response, in bytes on the wire: the
+    /// `base_offset (i64) + batch_length (i32)` prefix that frames it, the fixed
+    /// v2 header, and `record_data`.
+    ///
+    /// The one place that number is defined, because three separate sites need
+    /// to agree on it and disagreeing is a bug rather than a rounding error. The
+    /// broker's request budget is settled against it
+    /// (`tansu_storage::service::fetch`'s `Budget`), the read path bounds a
+    /// response with it, and `Frame::size_in_bytes` reports it. A bound measured
+    /// in one unit and settled in another leaves the budget over- or
+    /// under-spent, which is how a `max_bytes` cap stops meaning anything.
+    ///
+    /// Derived from `record_data`, deliberately, and not from the
+    /// `batch_length` field: `encoded_batch_length` explains that a pre-v2 husk
+    /// keeps a `batch_length` describing bytes it does not hold, and a size used
+    /// to bound a response has to describe the bytes that will actually be
+    /// written.
+    pub fn wire_size(&self) -> usize {
+        // base_offset
+        size_of::<i64>()
+            // batch_length
+            + size_of::<i32>()
+            + FIXED_BATCH_LENGTH
+            + self.record_data.len()
     }
 
     pub fn is_transactional(&self) -> bool {
