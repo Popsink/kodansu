@@ -1026,3 +1026,214 @@ async fn compaction_prunes_a_vanished_segment_instead_of_failing() -> Result<(),
 
     Ok(())
 }
+
+/// A store whose sub-streams end up in FEW, LARGE regions — the shape a
+/// maintained production prefix is in, and the only shape in which a read
+/// budget smaller than a region can be observed at all.
+///
+/// [`new_store`] takes the defaults, where `prefix_compact_min_segments` is 256:
+/// a test that produces fewer segments than that gets no merge, keeps its
+/// sub-stream in many small regions, and cannot see the behaviour under test
+/// here. So this asks for one segment per produced batch (`coalesce_batches`,
+/// with no linger to wait out) and a merge from the first segment.
+fn new_merging_store(bucket: &InMemory) -> DynoStore {
+    DynoStore::new(CLUSTER, NODE, bucket.clone()).coalesce_tuning(crate::CoalesceTuning {
+        coalesce_linger: Some(Duration::from_millis(1)),
+        coalesce_batches: Some(1),
+        prefix_compact_min_segments: Some(1),
+        ..Default::default()
+    })
+}
+
+/// A batch of `records` records each carrying `value_bytes` of value, so a test
+/// can build a sub-stream region big enough for the read budget to bite.
+///
+/// [`keyed_batch`] is one small record, which is what the compaction tests above
+/// need; a byte-budget test needs regions measured in hundreds of KiB. Keys are
+/// distinct per record and per batch, so per-key compaction keeps them all and
+/// the merged region really does hold the bytes produced.
+fn bulk_batch(batch: usize, records: usize, value_bytes: usize) -> Result<deflated::Batch> {
+    let value = Bytes::from(vec![b'v'; value_bytes]);
+
+    (0..records)
+        .fold(inflated::Batch::builder(), |builder, n| {
+            builder.record(
+                Record::builder()
+                    .key(Some(Bytes::from(format!("k{batch}-{n}"))))
+                    .value(Some(value.clone())),
+            )
+        })
+        .build()
+        .and_then(deflated::Batch::try_from)
+        .map_err(Into::into)
+}
+
+/// Seed `batches` batches into a merged prefix and return the store.
+async fn merged_prefix(
+    bucket: &InMemory,
+    topic: &str,
+    tp: &Topition,
+    batches: usize,
+    records: usize,
+    value_bytes: usize,
+) -> Result<DynoStore> {
+    let store = new_merging_store(bucket);
+    create_topic_with_configs(&store, topic, &[("cleanup.policy", "compact")]).await?;
+
+    for batch in 0..batches {
+        _ = store
+            .produce(None, tp, bulk_batch(batch, records, value_bytes)?)
+            .await?;
+    }
+
+    store.maintain(SystemTime::now()).await?;
+    Ok(store)
+}
+
+/// A `Fetch` answers with at most `max_bytes` plus one batch — never plus a
+/// whole coalesced region (#535).
+///
+/// The plan that picks which regions to read admits the entry that crosses the
+/// byte budget and stops after it, deliberately, because `entry.byte_len` is the
+/// footer's claim over a whole sub-stream region and Kafka's `minOneMessage`
+/// requires a fetch to be able to return something. But nothing then bounded
+/// what that region *contributed*, so a response was `max_bytes` plus the whole
+/// crossing region — and a region is sized by the writer, not the reader:
+/// `coalesce_bytes` defaults to 1 MiB and is **64 MiB** on the production fleet,
+/// `message_max_bytes` defaults to 1 MiB and is 10 MiB there, against the 5 MiB
+/// that [`FetchService`] clamps a request budget to.
+///
+/// Measured on that fleet: ~14.7 MB per response against the 5 MiB clamp. A
+/// client sizes its receive buffers off `fetch.max.bytes`, and a consumer that
+/// drains its socket only from inside `poll()` — every JVM client — spends the
+/// whole overshoot returning empty polls before it sees a record.
+#[tokio::test]
+async fn a_fetch_is_bounded_by_max_bytes_and_not_by_the_region_it_read() -> Result<(), Error> {
+    let _guard = super::init_tracing()?;
+
+    // A budget an order of magnitude under the merged region, which is the
+    // production shape in miniature.
+    const MAX_BYTES: i32 = 64 * 1024;
+
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.bulk";
+    let tp = Topition::new(topic, 0);
+    let store = merged_prefix(&bucket, topic, &tp, 64, 16, 1024).await?;
+
+    let served = service_fetch(&store, &tp, 0, MAX_BYTES).await?;
+
+    assert!(
+        !served.is_empty(),
+        "a bounded response must still carry something to advance on"
+    );
+
+    let bytes: usize = served.iter().map(deflated::Batch::wire_size).sum();
+    let largest = served
+        .iter()
+        .map(deflated::Batch::wire_size)
+        .max()
+        .expect("non-empty");
+
+    // `max_bytes` plus at most the batch that crossed it. Before the fix this
+    // was the whole merged region — every batch produced above.
+    assert!(
+        bytes <= MAX_BYTES as usize + largest,
+        "a response of {bytes} B overshoots a {MAX_BYTES} B budget by more than \
+         the one batch `minOneMessage` allows (largest batch {largest} B)"
+    );
+
+    // And the bound is a bound, not a truncation to nothing: the response is
+    // contiguous from the requested offset, so the consumer resumes off it.
+    assert_eq!(0, served[0].base_offset);
+    let mut expected = 0;
+    for batch in &served {
+        assert_eq!(
+            expected, batch.base_offset,
+            "a bounded response must not skip offsets"
+        );
+        expected = batch.base_offset + i64::from(batch.last_offset_delta) + 1;
+    }
+
+    Ok(())
+}
+
+/// A budget smaller than the first batch still returns that batch (#535).
+///
+/// Kafka's `minOneMessage`, which the bound above must not cost: a partition
+/// whose next batch is larger than `max_bytes` would otherwise answer empty
+/// forever and the client would retry the same offset forever. The same rule
+/// [`crate::tests`]' `fetch_is_bounded_by_max_bytes` asserts on an unmerged log,
+/// asserted here against a *merged* region, which is where the new bound
+/// applies.
+#[tokio::test]
+async fn a_budget_smaller_than_the_first_batch_still_returns_it() -> Result<(), Error> {
+    let _guard = super::init_tracing()?;
+
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.oversized";
+    let tp = Topition::new(topic, 0);
+    let store = merged_prefix(&bucket, topic, &tp, 8, 8, 4096).await?;
+
+    let served = service_fetch(&store, &tp, 0, 1).await?;
+
+    assert_eq!(
+        1,
+        served.len(),
+        "a one-byte budget must return exactly one batch, not none and not the \
+         whole region"
+    );
+    assert_eq!(0, served[0].base_offset);
+
+    Ok(())
+}
+
+/// A mid-log fetch on a merged prefix does not spend its budget on records
+/// below the fetch offset (#535).
+///
+/// The plan drops a whole segment only when `fenced.end() <= offset`, so an
+/// admitted region routinely begins far below the position asked for. While the
+/// response was unbounded that merely wasted wire bytes — half of them, measured
+/// on a merged prefix: a fetch at offset 19 200 came back byte-identical to the
+/// fetch at 0, 19 200 of its 19 648 records below the position asked for. Once
+/// the byte bound above spends the budget in order, those records stop being
+/// waste and start being *displacement*: they crowd out the ones the client
+/// asked for, and the same fetch delivers 448 useful records instead of 18 688.
+///
+/// So this is not a separate improvement. It is what keeps the bound from
+/// costing a mid-log consumer its throughput, and the two must land together.
+#[tokio::test]
+async fn a_mid_log_fetch_does_not_spend_its_budget_below_the_offset() -> Result<(), Error> {
+    let _guard = super::init_tracing()?;
+
+    let bucket = InMemory::new();
+    let topic = "org.env.conn.midlog";
+    let tp = Topition::new(topic, 0);
+    let store = merged_prefix(&bucket, topic, &tp, 64, 16, 512).await?;
+
+    let high_watermark = store.high_watermark(&tp).await?;
+    let from = high_watermark / 2;
+    assert!(from > 0, "the log must be long enough to have a middle");
+
+    let served = service_fetch(&store, &tp, from, 64 * 1024).await?;
+
+    assert!(
+        !served.is_empty(),
+        "a mid-log fetch on a merged prefix must return records"
+    );
+
+    // Every batch must hold at least one offset at or above the position asked
+    // for. A batch straddling `from` is kept whole — a compressed batch that
+    // begins below the position still holds records above it, and the consumer
+    // drops what it has already seen — so the test is on the batch's END, not
+    // its base.
+    for batch in &served {
+        let end = batch.base_offset + i64::from(batch.last_offset_delta) + 1;
+        assert!(
+            end > from,
+            "a batch ending at {end} is wholly below the fetch offset {from} and \
+             spent budget the client asked to spend above it"
+        );
+    }
+
+    Ok(())
+}

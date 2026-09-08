@@ -7455,6 +7455,35 @@ impl DynoStore {
 
             let mut batches = vec![];
             let mut restart = false;
+            let mut spent = false;
+
+            // What the response may still carry (#535).
+            //
+            // A second budget, over the same `max_bytes` the plan spent above,
+            // because the two bound different things and only one of them was
+            // bounded. The plan's budget picks which regions to *read*, in units
+            // of `entry.byte_len` — the footer's claim over a whole sub-stream
+            // region. This one picks which decoded batches to *return*, in the
+            // units the client's `max_bytes` is written in.
+            //
+            // Without it, a response is `max_bytes` plus the whole of the region
+            // that crossed the budget, and a region is sized by the *writer*:
+            // `coalesce_bytes` (1 MiB by default, **64 MiB** on the production
+            // fleet) and `message_max_bytes` (1 MiB by default, 10 MiB there),
+            // against a `Fetch` budget that `FetchService` clamps to 5 MiB.
+            // Measured on that fleet: ~14.7 MB shipped per response against the
+            // 5 MiB clamp, 2.8-3.8x. That is not a rounding error a client can
+            // absorb — it sizes its buffers off `fetch.max.bytes`, and a
+            // single-threaded consumer that drains the socket only from inside
+            // `poll()` spends the whole overshoot returning empty polls.
+            //
+            // Kafka's `minOneMessage` survives, as it must: a budget smaller
+            // than the first batch still returns that batch, or a partition
+            // holding one oversized record could never make progress and the
+            // client would retry the same offset forever. So the bound is
+            // `max_bytes` plus at most one batch — never `max_bytes` plus one
+            // region.
+            let mut budget = max_bytes as u64;
 
             // Consumed in input order, so the assembled batches are the serial
             // loop's. Stopping early drops the futures still in flight, which
@@ -7481,6 +7510,34 @@ impl DynoStore {
                             batch.base_offset = running;
                             running += span;
 
+                            // The same skip against the *fetch offset* (#535).
+                            //
+                            // The plan drops a whole segment only when
+                            // `fenced.end() <= offset`, so an admitted region
+                            // routinely begins far below the position asked
+                            // for, and every batch of it used to be returned.
+                            // On an uncompacted log that costs little — the
+                            // regions are small and the plan skips most of them
+                            // — but a compacted prefix holds the sub-stream in
+                            // one large region, and then the answer to a mid-log
+                            // fetch is mostly records the client already has.
+                            // Measured on a merged prefix: of 19 648 records
+                            // returned for a fetch at offset 19 200, 19 200 were
+                            // below it. With the byte bound above now spending
+                            // the budget in order, those wasted records crowd
+                            // out the ones asked for, so this is not a separate
+                            // improvement — it is what keeps the bound from
+                            // costing a mid-log consumer its throughput.
+                            //
+                            // Straddling batches are kept whole, for the reason
+                            // the `served_from` comment below gives: a
+                            // compressed batch beginning below the position
+                            // still holds records above it, and a consumer drops
+                            // what it has already seen.
+                            if running <= offset {
+                                continue;
+                            }
+
                             // A batch wholly below `served_from` duplicates
                             // offsets the higher-priority segment before this
                             // one already served (#461): skip it. A batch
@@ -7493,7 +7550,32 @@ impl DynoStore {
                                 continue;
                             }
 
+                            // Spent, and something to show for it: stop here
+                            // rather than carry the rest of this region (#535).
+                            //
+                            // Tested before the push and not after, so the
+                            // batch that crosses the budget is still returned —
+                            // `max_bytes` is explicitly not an absolute maximum
+                            // in Kafka, and a reader that stopped short of the
+                            // crossing batch would make no progress on a
+                            // partition whose next batch is larger than the
+                            // budget. `batches.is_empty()` is what carries
+                            // `minOneMessage`: an exhausted budget still admits
+                            // the first batch of the response.
+                            if budget == 0 && !batches.is_empty() {
+                                spent = true;
+                                break;
+                            }
+
+                            budget = budget.saturating_sub(batch.wire_size() as u64);
                             batches.push(batch);
+                        }
+
+                        // Whole regions still in flight behind this one are
+                        // dropped unpolled, which cancels their GETs — the same
+                        // thing the deadline break above does.
+                        if spent {
+                            break;
                         }
                     }
 

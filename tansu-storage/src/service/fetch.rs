@@ -915,13 +915,6 @@ where
     }
 }
 
-/// Wire size of a record batch's fixed header: `base_offset` (8) +
-/// `batch_length` (4) + `partition_leader_epoch` (4) + `magic` (1) + `crc` (4) +
-/// `attributes` (2) + `last_offset_delta` (4) + `base_timestamp` (8) +
-/// `max_timestamp` (8) + `producer_id` (8) + `producer_epoch` (2) +
-/// `base_sequence` (4) + `record_count` (4).
-const BATCH_HEADER_BYTES: u64 = 61;
-
 impl ByteSize for Batch {
     /// A batch costs its header plus its records — NOT its records alone.
     ///
@@ -937,8 +930,15 @@ impl ByteSize for Batch {
     ///
     /// The header is real bytes on the wire and real bytes in memory, so charging
     /// it is both the bound and the honest accounting.
+    ///
+    /// Delegated to [`Batch::wire_size`] rather than adding up the header here,
+    /// so that this — the accounting `Budget::settle` charges a read against —
+    /// cannot drift from the bound the read path applies when it decides how
+    /// many batches to return (#535). The two were separate additions of the
+    /// same 61 bytes, and a budget bounded in one unit and settled in another is
+    /// a `max_bytes` cap that stops holding.
     fn byte_size(&self) -> u64 {
-        BATCH_HEADER_BYTES + self.record_data.len() as u64
+        self.wire_size() as u64
     }
 }
 
