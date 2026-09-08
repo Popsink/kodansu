@@ -350,6 +350,28 @@ data the two rules agree.
   cannot reach the slices at all — and its creation therefore *clears* the floor
   rather than preserving it. A reader that honours `truncate` sees the right
   thing either way; one that keys by name against an id-keyed bucket sees neither.
+
+  The tombstone is **not** permanent: the expiry that takes a deleted
+  sub-stream's last segment deletes it, having just proved there is nothing left
+  to hide (#532). A name whose predecessor's records are physically gone
+  therefore comes back clean and starts at 0 — a floor left behind past that
+  point would hide the *successor's* own records instead.
+- **A prefix outlives its topics, and `retired-prefixes/` is what keeps it
+  expirable (#532).** Deleting the last topic of a prefix used to remove the only
+  thing that gave the prefix a retention threshold — every maintenance universe
+  is derived from `topic-metadata/` — so its segments survived at any retention
+  setting (a real account kept 27 899 of 27 899 `.seg` objects after all 1 000 of
+  its topics were deleted). `DeleteTopics` now records the topic's effective
+  `retention.ms` at
+  `clusters/{cluster}/retired-prefixes/{prefix}.json` —
+  `{"retention_ms": 604800000, "topic": "...", "retired_at_ms": 1757…}` — and
+  retention reads it alongside the live topics: the longest of the retentions
+  retired onto a prefix, used only while no live topic occupies it (a live topic's
+  own threshold always wins, and a compact-only occupant keeps its exemption).
+  The marker is deleted once the prefix holds no segments. For a reader it is
+  metadata only — nothing in this format refers to it — but it is why a prefix
+  with no topic can still lose segments, and an operator auditing storage growth
+  should expect one small object per prefix that has ever had a topic deleted.
 - **Segments are immutable but not permanent.** Compaction deletes the originals
   once the merged segment exists, and retention deletes whole segments (by age,
   or fully-truncated per the previous note), so a GET of a segment a reader
