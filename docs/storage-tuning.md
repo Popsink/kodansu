@@ -562,7 +562,7 @@ replica stop growing?" are the same question. These four series answer it:
 | `tansu_prefix_segments_expired_total{prefix}` | counter | Segments retention deleted. The retention half of `tansu_prefix_segment_creates_total`: **creates − expiries is the bucket's net segment growth**, and a bucket at steady state has them equal over a window. |
 | `tansu_prefix_expiry_bytes_reclaimed_total{prefix}` | counter | Sub-stream region bytes reclaimed. Summed from cached footers, so it excludes each object's own footer and reads slightly under what a listing shows going away. |
 | `tansu_prefix_oldest_retained_timestamp_ms{prefix}` | gauge | **The plateau signal** — see below. |
-| `tansu_prefix_expiry_skipped_total{reason}` | counter | Prefix-ticks on which retention deleted nothing. Every reason is a correct outcome; it exists because "deleted nothing" and "never ran" are otherwise indistinguishable. |
+| `tansu_prefix_expiry_skipped_total{reason}` | counter | Prefix-ticks on which retention deleted nothing — including `no_threshold`, where it was never asked. Every reason is a correct outcome; it exists because "deleted nothing" and "never ran" are otherwise indistinguishable. |
 
 **The plateau signal.** `tansu_prefix_oldest_retained_timestamp_ms` is the greatest
 record timestamp of the *oldest surviving* segment under a prefix — the value that
@@ -584,6 +584,22 @@ segment's *newest* record, not the oldest record in the prefix — retention key
 the newest record so a shared segment is never dropped while any topic in it is
 live, and the gauge reports the quantity the decision actually uses.
 
+Every prefix-tick with a retention threshold reports it, whether the tick scanned
+or took the `not_due` fast path. Before #544 only the scanning tick did, and the
+fast path fires precisely when the oldest survivor is *newer* than the threshold —
+so the series was absent for exactly the prefixes that were still filling. 99 of
+266 non-empty prefixes reported on one fleet. A prefix that reports nothing now
+has no retention threshold at all, and `no_threshold` below counts it.
+
+```promql
+# non-empty prefixes with no plateau reading
+count(max by (prefix) (tansu_prefix_segments_live) > 0)
+  - count(max by (prefix) (tansu_prefix_oldest_retained_timestamp_ms))
+
+# and what accounts for them, per hour, rather than silence accounting for them
+sum(rate(tansu_prefix_expiry_skipped_total{reason="no_threshold"}[1h])) * 3600
+```
+
 **Skip reasons**, in descending order of how often you will see them:
 
 - `not_due` — the per-prefix oldest-retained hint proved nothing could be past the
@@ -595,15 +611,24 @@ live, and the gauge reports the quantity the decision actually uses.
   middle of a sub-stream's offset space even when its records are all old. Expected
   on a prefix whose offset order and timestamp order disagree (a CDC backfill
   stamping source timestamps); its physical debt is bounded by that disorder.
+- `no_threshold` — the prefix has no retention threshold, so no expiry path runs
+  for it at all (#544): a compact-only occupant (#175), or anything else the
+  threshold build leaves out. By design, and the reason the reason exists — without
+  it, a prefix deliberately outside retention and a prefix retention has stopped
+  visiting are both just absent. Subtract it from
+  `tansu_maintenance_prefixes_total{outcome="claimed"}` and what is left is the
+  prefix-ticks retention actually covers.
 - `lease_held_elsewhere` — a peer maintainer holds the compaction lease and is doing
   this prefix's expiry (#115). Expected on a multi-maintainer fleet. Sustained
   across *every* replica means nobody is acquiring it.
 
 **`tansu_prefix_retention_exempt_topics`** counts topics whose `cleanup.policy` is
 `compact` without `delete`. Those get no retention threshold at all by design — the
-latest value of a key must survive indefinitely — so their prefixes never appear in
-any of the series above. A non-zero reading is the difference between "that part of
-the bucket can never expire, by policy" and "retention is broken on it".
+latest value of a key must survive indefinitely — so their prefixes appear in none
+of the series above except as `no_threshold`. A non-zero reading is the difference
+between "that part of the bucket can never expire, by policy" and "retention is
+broken on it". It is a gauge over *topics* — the exemption is decided per topic
+from its config — so pair it with `no_threshold` when you want prefixes.
 
 An absent `cleanup.policy` is **not** exempt: it falls through to Kafka's default,
 `delete` at 7 days (#223).

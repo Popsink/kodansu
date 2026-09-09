@@ -1531,6 +1531,21 @@ fn retained_timestamp(oldest_ms: Option<i64>) -> Option<u64> {
     oldest_ms.filter(|ms| *ms > 0).map(|ms| ms as u64)
 }
 
+/// Whether a prefix might hold a segment older than `threshold_ms`, given the
+/// per-prefix oldest-retained `hint` (#61, #49). An unknown hint must scan.
+///
+/// A comparison against the threshold rather than a sticky flag, which is what
+/// makes the fast path survive a *tightened* `retention.ms`: lowering the setting
+/// raises the threshold past a hint that had marked the prefix skippable, and the
+/// prefix re-arms. A one-way ratchet would silently stop reclaiming instead, with
+/// no error and no metric.
+///
+/// Pure, and taking the hint rather than reading it, so both callers — the gate
+/// and the plateau gauge beside it (#544) — work from one lock acquisition.
+fn maybe_expirable(hint: Option<i64>, threshold_ms: i64) -> bool {
+    hint.is_none_or(|oldest| oldest < threshold_ms)
+}
+
 /// High-watermark resolutions where the persisted floor was **above** the
 /// surviving segment tail, on a sub-stream that still holds segments (#290).
 ///
@@ -1916,15 +1931,25 @@ static EXPIRY_BYTES_RECLAIMED: LazyLock<Counter<u64>> = LazyLock::new(|| {
 ///   the threshold, so the tick skipped without a LIST or a lease round-trip
 ///   (#49). The overwhelmingly common case, and the one to watch: a prefix that
 ///   reports `not_due` forever while its segment count climbs has a hint that is
-///   wrong, and [`OLDEST_RETAINED`] says which.
+///   wrong, and [`OLDEST_RETAINED`] says which — recorded on this path too since
+///   #544, without which that sentence was an instruction to read a series the
+///   path did not emit.
 /// - `nothing_expirable` — the prefix was scanned and every segment is either
 ///   young or blocked by the mid-log fence (#471), so age alone may not remove it.
+/// - `no_threshold` — the prefix has no retention threshold at all, so no expiry
+///   path runs for it (#544). Compact-only occupants (#175) and anything else
+///   `segment_retention_thresholds` leaves out. By design, and the
+///   reason this reason exists: without it, a prefix deliberately outside
+///   retention and a prefix retention has silently stopped visiting are both
+///   simply absent from every series here.
 /// - `lease_held_elsewhere` — a peer maintainer holds the compaction lease and is
 ///   doing this prefix's expiry (#115). Expected on a multi-maintainer fleet;
 ///   sustained across *every* replica means no one is acquiring it.
 ///
 /// The unit is prefix-ticks, so it is comparable with
-/// [`MAINTENANCE_PREFIXES`] and not with a topic or segment count.
+/// [`MAINTENANCE_PREFIXES`] and not with a topic or segment count. Against
+/// `outcome="claimed"` specifically: every claimed prefix reaches exactly one of
+/// these reasons, an expiry, or an error.
 static EXPIRY_SKIPPED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_prefix_expiry_skipped")
@@ -1953,6 +1978,15 @@ static EXPIRY_SKIPPED: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// a segment so a shared segment is never dropped while any topic in it is live,
 /// and this gauge reports the quantity the decision actually uses. Not recorded
 /// when a scan leaves no survivors — there is then nothing retained to describe.
+///
+/// Recorded on **every** prefix-tick that has a retention threshold, from the
+/// hint when the #49 fast path skips the scan and from the survivors when it does
+/// not (#544). It was originally recorded only inside the scan, below that gate,
+/// and the gate returns early precisely when the oldest survivor is *newer* than
+/// the threshold — so the series was absent for exactly the prefixes still
+/// filling, which is the inverse of the paragraph above. A prefix with no
+/// threshold at all still reports nothing, and that is what
+/// [`EXPIRY_SKIPPED`]`{reason="no_threshold"}` counts.
 static OLDEST_RETAINED: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("tansu_prefix_oldest_retained_timestamp_ms")
@@ -9715,18 +9749,20 @@ impl DynoStore {
         Ok(measured)
     }
 
-    /// Whether a prefix might hold a segment older than `threshold_ms`, from the
-    /// per-prefix oldest-retained hint (#61, the per-prefix analogue of
-    /// [`Self::partition_maybe_expirable`]). `true` (must scan) when unknown.
-    fn prefix_maybe_expirable(&self, prefix: &str, threshold_ms: i64) -> Result<bool> {
+    /// The per-prefix oldest-retained hint (#61, the per-prefix analogue of
+    /// [`Self::partition_maybe_expirable`]): the greatest record timestamp of the
+    /// oldest segment the last scan left behind, or `None` when this process has
+    /// never scanned the prefix and nothing can be concluded from it.
+    ///
+    /// Returns the hint rather than the `might this prefix hold something
+    /// expirable?` predicate it used to (#544). The predicate threw the value
+    /// away, and the value is the plateau signal — a caller that skips on it has
+    /// the one number [`OLDEST_RETAINED`] wants and could not report it.
+    fn prefix_oldest_retained(&self, prefix: &str) -> Result<Option<i64>> {
         self.oldest_retained_prefix
             .lock()
             .map_err(Into::into)
-            .map(|locked| {
-                locked
-                    .get(prefix)
-                    .is_none_or(|oldest| *oldest < threshold_ms)
-            })
+            .map(|locked| locked.get(prefix).copied())
     }
 
     /// Update the per-prefix oldest-retained hint after a segment scan (#61).
@@ -11520,7 +11556,19 @@ impl DynoStore {
                         .expire_prefix_segments_if_due(&prefix, threshold_ms)
                         .await
                         .unwrap_or(0),
-                    None => 0,
+
+                    // Retention was never asked about this prefix (#544). Its
+                    // occupants are compact-only (#175) or otherwise outside
+                    // `segment_retention_thresholds`, so no expiry path runs and
+                    // none of the retention series mention it — which is the same
+                    // silence a prefix retention has stopped visiting produces.
+                    // Counted so the denominator of "prefixes retention should be
+                    // covering" is `claimed` minus this, rather than a rate
+                    // arithmetic over `tansu_maintenance_prefixes_total`.
+                    None => {
+                        EXPIRY_SKIPPED.add(1, &[KeyValue::new("reason", "no_threshold")]);
+                        0
+                    }
                 };
 
                 // Per-key compaction of a compacted topic's dedicated prefix
@@ -12002,8 +12050,28 @@ impl DynoStore {
     /// Expire `prefix`'s segments older than `threshold_ms`, skipping the work
     /// entirely when the oldest-retained hint proves nothing can be past the
     /// threshold yet (#49) — no LIST, no lease round-trip.
+    ///
+    /// Both outcomes report [`OLDEST_RETAINED`], so the plateau signal's cadence
+    /// is the prefix-tick and not "did this prefix expire something" (#544).
     async fn expire_prefix_segments_if_due(&self, prefix: &str, threshold_ms: i64) -> Result<u64> {
-        if !self.prefix_maybe_expirable(prefix, threshold_ms)? {
+        let hint = self.prefix_oldest_retained(prefix)?;
+
+        if !maybe_expirable(hint, threshold_ms) {
+            // The plateau signal on the fast path (#544). It used to live only
+            // inside `expire_prefix_segments`, below this gate, which made the
+            // gauge silent for exactly the prefixes whose retention window is
+            // still filling: the gate returns here *because* the oldest survivor
+            // is newer than the threshold, which is the rising phase the gauge
+            // exists to show. 99 of 266 non-empty prefixes reported on the
+            // production fleet at 1.0.0-alpha.18.
+            //
+            // Through the same `> 0` filter as the scan path, which is not
+            // redundant here: the hint is whatever that scan stored, so a footer
+            // fold that produced a sentinel is re-read rather than re-derived.
+            if let Some(retained) = retained_timestamp(hint) {
+                OLDEST_RETAINED.record(retained, &[KeyValue::new("prefix", prefix.to_string())]);
+            }
+
             EXPIRY_SKIPPED.add(1, &[KeyValue::new("reason", "not_due")]);
             return Ok(0);
         }
@@ -12373,7 +12441,7 @@ impl DynoStore {
         self.memo_truncate_floor(topition, floor)?;
 
         // Wake the next maintenance pass for this prefix: the whole-segment
-        // reclaim gate (`prefix_maybe_expirable`) is age-based, so without
+        // reclaim gate (`maybe_expirable`) is age-based, so without
         // dropping the hint a prefix whose segments are young but now fully
         // truncated (#176) would not be re-examined until age retention fired
         // anyway. Best-effort like the reclaim itself — a peer maintainer

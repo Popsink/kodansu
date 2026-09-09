@@ -49,7 +49,7 @@ use crate::{
     Error, Result, Storage, TopicId, Topition, TxnAddPartitionsRequest,
     dynostore::{
         CoalesceTuning, CompactRun, DynoStore, Era, PrefixLease, SegmentFooter, ServedEnd,
-        Substream, SubstreamEntry, TxnProduceOffset,
+        Substream, SubstreamEntry, TxnProduceOffset, maybe_expirable,
     },
     storage_error_code,
 };
@@ -1323,7 +1323,7 @@ async fn lowered_retention_rescans_a_skipped_prefix() -> Result<(), Error> {
 
     // The hint now short-circuits the next tick at that same threshold.
     assert!(
-        !store.prefix_maybe_expirable(PREFIX, generous)?,
+        !maybe_expirable(store.prefix_oldest_retained(PREFIX)?, generous),
         "a prefix whose oldest record is newer than the threshold must be skipped",
     );
 
@@ -1332,7 +1332,7 @@ async fn lowered_retention_rescans_a_skipped_prefix() -> Result<(), Error> {
     // be permitted to run.
     let tightened = written + HOUR_MS;
     assert!(
-        store.prefix_maybe_expirable(PREFIX, tightened)?,
+        maybe_expirable(store.prefix_oldest_retained(PREFIX)?, tightened),
         "a threshold past the hint must re-arm the scan",
     );
     assert_eq!(
