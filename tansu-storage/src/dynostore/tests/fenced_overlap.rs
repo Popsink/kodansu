@@ -72,7 +72,7 @@ fn footer(base: i64, count: i64) -> SegmentFooter {
             byte_start: 0,
             byte_len: 64,
             max_timestamp: 0,
-            producers: Vec::new(),
+            producers: Box::default(),
         }],
     }
 }

@@ -164,7 +164,7 @@ fn entry(topic: &str, base: i64, count: i64) -> SubstreamEntry {
         byte_start: 0,
         byte_len: 8,
         max_timestamp: 0,
-        producers: Vec::new(),
+        producers: Box::default(),
     }
 }
 
@@ -1797,7 +1797,7 @@ async fn epoch_fencing_drops_stale_overlapping_segment() -> Result<(), Error> {
         byte_start: 0,
         byte_len: 8,
         max_timestamp: 0,
-        producers: Vec::new(),
+        producers: Box::default(),
     };
     let footer = |epoch: i64, base: i64, count: i64| SegmentFooter {
         writer_epoch: epoch,

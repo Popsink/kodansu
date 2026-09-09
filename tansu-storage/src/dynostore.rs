@@ -706,8 +706,20 @@ impl PrefixIndex {
     /// is identical (segments are immutable), but the entry *indices* are only
     /// guaranteed to match because it is the same object — so the old
     /// contribution is withdrawn first rather than assumed equal.
-    fn insert_segment(&mut self, seq: u64, cached: CachedSegment) {
+    ///
+    /// The single chokepoint into `segments`, which is why the resident footer
+    /// is pruned here (#543): every path that caches a footer — the writer's own
+    /// flush, the incremental listing, the tail probe, the compaction insert —
+    /// arrives through this call, so nothing can enter the index holding
+    /// coordinates the fold would never read. Entry *count* and order are
+    /// untouched, so the `(seq, position)` pairs below still address
+    /// `footer.entries` directly.
+    fn insert_segment(&mut self, seq: u64, mut cached: CachedSegment) {
         self.unindex_segment(seq);
+
+        for entry in &mut cached.footer.entries {
+            entry.retain_foldable_producers();
+        }
 
         for (position, entry) in cached.footer.entries.iter().enumerate() {
             // A footer wide enough to overflow `u32` cannot be encoded — the
@@ -1486,6 +1498,23 @@ static PREFIX_INDEX_SUBSTREAM_ENTRIES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("tansu_prefix_index_substream_entries")
         .with_description("sub-stream entries across every footer in the prefix index")
+        .build()
+});
+
+/// Producer coordinates retained across every cached footer (#543), after
+/// [`SubstreamEntry::retain_foldable_producers`] has pruned them.
+///
+/// The term this issue is about was ~847 MiB per replica and had to be measured
+/// by sampling footers out of the bucket, because nothing in the process
+/// reported it. Divided by `tansu_prefix_index_substream_entries` it is the
+/// coordinates per entry — the number that used to move with the bucket's
+/// segment-size distribution and now must not: pruning bounds it at
+/// [`IDEMPOTENT_WINDOW`] per distinct producer id per entry, so a rise here is a
+/// rise in producers per sub-stream and nothing else.
+static PREFIX_INDEX_PRODUCER_COORDS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("tansu_prefix_index_producer_coords")
+        .with_description("producer coordinates retained across every footer in the prefix index")
         .build()
 });
 
@@ -2434,7 +2463,18 @@ pub(crate) struct SubstreamEntry {
     /// v1 footer and for non-idempotent batches. Consumed by log-based idempotent
     /// dedup (#88) so duplicate detection derives from the durable log rather than
     /// a lazily-checkpointed `producers/{id}.json`.
-    producers: Vec<ProducerCoord>,
+    ///
+    /// Complete as encoded and as decoded — the footer is the durable dedup
+    /// authority and a published external-reader contract. The *resident* copy
+    /// is not: [`PrefixIndex::insert_segment`] prunes it to the coordinates that
+    /// can still change a [`ProducerTail`] (#543). See
+    /// [`Self::retain_foldable_producers`].
+    ///
+    /// `Box<[_]>` rather than `Vec`: 4.5 M of these are resident per replica and
+    /// none is ever pushed to after construction, so the capacity word is 36 MiB
+    /// of nothing, and the 12.6 % of entries with no coordinates hold a dangling
+    /// pointer instead of an allocation.
+    producers: Box<[ProducerCoord]>,
 }
 
 impl SubstreamEntry {
@@ -2457,6 +2497,93 @@ impl SubstreamEntry {
             Substream::Id(id) => self.topic_id == Some(*id),
             Substream::Name(name) => self.topic_id.is_none() && self.topic == *name,
         }
+    }
+
+    /// Drop the producer coordinates that cannot change the [`ProducerTail`]
+    /// this entry contributes to (#543), keeping the resident index's price per
+    /// entry off the length of the log it indexes.
+    ///
+    /// The index kept every coordinate ever written and the only thing that read
+    /// them — [`DynoStore::producer_tail_folded`] — folded them into a window of
+    /// [`IDEMPOTENT_WINDOW`] batches per producer id. On the production fleet
+    /// that was ~847 MiB per replica, 37 % of `allocated`, and it grew with
+    /// *compaction*: merging concatenates many batches into one sub-stream
+    /// region, so `> 10 MiB` segments carried 14.4 coordinates per entry against
+    /// 2.2 for `< 0.25 MiB` ones, and the index's per-entry price moved with the
+    /// bucket's size distribution instead of standing still.
+    ///
+    /// Three reductions, all of them exact — the fold's output is identical
+    /// coordinate-for-coordinate, for any prior tail and any following entries:
+    ///
+    /// 1. A coordinate that [`ProducerCoord::folds`] rejects is skipped by the
+    ///    fold, so it can be dropped.
+    /// 2. Only a producer's coordinates at its **highest epoch in this entry**
+    ///    survive. The fold's epoch is `max(prior epoch, epochs seen so far)`, so
+    ///    a coordinate below the running max is already ignored, and one at an
+    ///    epoch the entry later exceeds is folded and then cleared by the epoch
+    ///    bump — it can affect nothing downstream either way.
+    /// 3. Only the **last** [`IDEMPOTENT_WINDOW`] of those survive: the ones
+    ///    before them are pushed out of the window by their own successors, and
+    ///    `epoch` / `seen` / `next_sequence` are all set by the last coordinate.
+    ///    Hence the backwards walk below — "the last five" is the first five met
+    ///    — and the reversal after it, because the fold reads log order.
+    ///
+    /// A pure function of the entry, deliberately: the fold stays a pure function
+    /// of the observed footer set, so two replicas that have seen the same
+    /// segments still derive an identical tail — the property a connection
+    /// migration rests on (#88). Anything that instead folded *across* entries
+    /// and retained the result would be path-dependent — a replica that folded a
+    /// segment before a peer retired it could not withdraw it — and would diverge
+    /// exactly there.
+    ///
+    /// The residue is bounded by `5 × distinct producer ids` per entry however
+    /// long the log gets, which is what stops the compaction term.
+    fn retain_foldable_producers(&mut self) {
+        if self.producers.is_empty() {
+            return;
+        }
+
+        // Association lists rather than maps (#543): the mean coordinate count
+        // per entry is single digit and a sub-stream is normally written by one
+        // producer, so hashing costs more than the scan it replaces.
+        let mut top: Vec<(i64, i16)> = Vec::new();
+        for pc in self.producers.iter().filter(|pc| pc.folds()) {
+            match top.iter_mut().find(|(id, _)| *id == pc.producer_id) {
+                Some((_, epoch)) => *epoch = (*epoch).max(pc.producer_epoch),
+                None => top.push((pc.producer_id, pc.producer_epoch)),
+            }
+        }
+
+        let mut kept: Vec<ProducerCoord> = Vec::new();
+        let mut taken: Vec<(i64, usize)> = Vec::new();
+        for pc in self.producers.iter().rev() {
+            if !pc.folds()
+                || top
+                    .iter()
+                    .find(|(id, _)| *id == pc.producer_id)
+                    .is_none_or(|(_, epoch)| *epoch != pc.producer_epoch)
+            {
+                continue;
+            }
+
+            let at = taken
+                .iter()
+                .position(|(id, _)| *id == pc.producer_id)
+                .unwrap_or_else(|| {
+                    taken.push((pc.producer_id, 0));
+                    taken.len() - 1
+                });
+
+            if taken[at].1 == IDEMPOTENT_WINDOW {
+                continue;
+            }
+
+            taken[at].1 += 1;
+            kept.push(*pc);
+        }
+
+        kept.reverse();
+        self.producers = kept.into_boxed_slice();
     }
 }
 
@@ -2680,6 +2807,28 @@ pub(crate) struct ProducerCoord {
     flags: u8,
 }
 
+impl ProducerCoord {
+    /// Whether folding this coordinate into a [`ProducerTail`] is meaningful —
+    /// i.e. whether it carries an idempotent sequence at all.
+    ///
+    /// A transaction marker does not (#174): it carries
+    /// `base_sequence = last_sequence = -1`, so folding it would set
+    /// `next_sequence` to `seq_increment(-1) = 0` and mark the tail seen,
+    /// misclassifying the producer's genuine next in-order data batch as
+    /// `OutOfOrder`. The `base_sequence == -1` half is belt and braces: it also
+    /// catches any future non-sequenced coordinate that lacks the flag (a v2
+    /// footer decodes with `flags == 0`).
+    ///
+    /// One definition, two callers: [`DynoStore::producer_tail_folded`] skips
+    /// what it says, and [`SubstreamEntry::retain_foldable_producers`] drops it
+    /// from the resident index (#543). Those two must agree — a coordinate the
+    /// index discards but the fold would have used is silent dedup corruption —
+    /// so they read the same predicate rather than repeat the condition.
+    fn folds(&self) -> bool {
+        self.flags & FLAG_CONTROL == 0 && self.base_sequence != -1
+    }
+}
+
 /// Kafka's per-producer duplicate window: the last five batches are retained so
 /// a retried (duplicate) batch is acked with its *original* offset rather than
 /// re-appended.
@@ -2708,7 +2857,7 @@ enum IdempotentClass {
 /// dedup authority on the leaseless path. Folding is a pure function of the
 /// footer set; classification reads it plus the current flush's in-flight
 /// reservations.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct ProducerTail {
     /// Highest producer epoch folded so far. A lower-epoch batch is fenced; a
     /// higher-epoch batch resets the expected sequence to 0.
@@ -6822,19 +6971,27 @@ impl DynoStore {
             // path, so the O(segments) walk runs at most once per prefix per
             // `HIGH_WATERMARK_HINT_TTL`, and it is the point where the live set
             // has just been reconciled.
-            let (segments, entries) = index.values().fold((0u64, 0u64), |(s, e), entry| {
-                (
-                    s + entry.segments.len() as u64,
-                    e + entry
-                        .segments
-                        .values()
-                        .map(|cached| cached.footer.entries.len() as u64)
-                        .sum::<u64>(),
-                )
-            });
+            let (segments, entries, coords) =
+                index.values().fold((0u64, 0u64, 0u64), |(s, e, c), entry| {
+                    (
+                        s + entry.segments.len() as u64,
+                        e + entry
+                            .segments
+                            .values()
+                            .map(|cached| cached.footer.entries.len() as u64)
+                            .sum::<u64>(),
+                        c + entry
+                            .segments
+                            .values()
+                            .flat_map(|cached| cached.footer.entries.iter())
+                            .map(|entry| entry.producers.len() as u64)
+                            .sum::<u64>(),
+                    )
+                });
 
             PREFIX_INDEX_SEGMENTS.record(segments, &[]);
             PREFIX_INDEX_SUBSTREAM_ENTRIES.record(entries, &[]);
+            PREFIX_INDEX_PRODUCER_COORDS.record(coords, &[]);
         }
         Ok(())
     }
@@ -8703,10 +8860,7 @@ impl DynoStore {
         let mut tail = ProducerTail::default();
         for fenced in self.valid_substream_segments(prefix, substream, topition.partition())? {
             for pc in &fenced.entry.producers {
-                // Belt and braces: `base_sequence == -1` also catches any
-                // future non-sequenced coordinate that lacks the flag (a v2
-                // footer decodes with `flags == 0`).
-                if pc.flags & FLAG_CONTROL != 0 || pc.base_sequence == -1 {
+                if !pc.folds() {
                     continue;
                 }
                 if pc.producer_id == producer_id {
@@ -12871,7 +13025,7 @@ impl DynoStore {
                 max_timestamp,
                 // Populated when the writer emits v2 (#88); empty on the current
                 // v1 write path.
-                producers: Vec::new(),
+                producers: Box::default(),
             });
         }
 
@@ -13040,7 +13194,7 @@ impl DynoStore {
                 byte_start,
                 byte_len: body.len() as u64 - byte_start,
                 max_timestamp,
-                producers,
+                producers: producers.into_boxed_slice(),
             });
         }
 
@@ -13206,9 +13360,9 @@ impl DynoStore {
                         flags: if v3 { take(&mut cursor, 1)?[0] } else { 0 },
                     });
                 }
-                producers
+                producers.into_boxed_slice()
             } else {
-                Vec::new()
+                Box::default()
             };
 
             entries.push(SubstreamEntry {
@@ -17676,6 +17830,289 @@ mod served_end_tests {
 }
 
 #[cfg(test)]
+mod foldable_producers_tests {
+    use super::{
+        FLAG_CONTROL, FLAG_TRANSACTIONAL, IDEMPOTENT_WINDOW, ProducerCoord, ProducerTail,
+        SubstreamEntry,
+    };
+    use std::collections::BTreeSet;
+
+    fn entry(base_offset: i64, producers: Vec<ProducerCoord>) -> SubstreamEntry {
+        SubstreamEntry {
+            topic: "org.env.conn.tab_a".into(),
+            topic_id: None,
+            partition: 0,
+            base_offset,
+            record_count: producers.len() as i64,
+            byte_start: 0,
+            byte_len: 64,
+            max_timestamp: 0,
+            producers: producers.into_boxed_slice(),
+        }
+    }
+
+    fn coord(
+        producer_id: i64,
+        producer_epoch: i16,
+        base_sequence: i32,
+        offset_delta: u32,
+    ) -> ProducerCoord {
+        ProducerCoord {
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            last_sequence: base_sequence,
+            offset_delta,
+            flags: 0,
+        }
+    }
+
+    /// A transaction marker as the v3 writer emits it (#174): a real
+    /// producer/epoch, the -1 sequences, `flags = 0b11`.
+    fn marker(producer_id: i64, producer_epoch: i16, offset_delta: u32) -> ProducerCoord {
+        ProducerCoord {
+            producer_id,
+            producer_epoch,
+            base_sequence: -1,
+            last_sequence: -1,
+            offset_delta,
+            flags: FLAG_CONTROL | FLAG_TRANSACTIONAL,
+        }
+    }
+
+    /// `DynoStore::producer_tail_folded`'s inner loop, over entries already in
+    /// log order — the fold whose output pruning must not change.
+    fn fold(entries: &[SubstreamEntry], producer_id: i64) -> ProducerTail {
+        let mut tail = ProducerTail::default();
+        for entry in entries {
+            for pc in entry.producers.iter().filter(|pc| pc.folds()) {
+                if pc.producer_id == producer_id {
+                    tail.fold(
+                        pc.producer_epoch,
+                        pc.base_sequence,
+                        pc.last_sequence,
+                        entry.base_offset + pc.offset_delta as i64,
+                    );
+                }
+            }
+        }
+        tail
+    }
+
+    fn producer_ids(entries: &[SubstreamEntry]) -> BTreeSet<i64> {
+        entries
+            .iter()
+            .flat_map(|entry| entry.producers.iter())
+            .map(|pc| pc.producer_id)
+            .collect()
+    }
+
+    fn coord_count(entries: &[SubstreamEntry]) -> usize {
+        entries.iter().map(|entry| entry.producers.len()).sum()
+    }
+
+    fn pruned(entries: &[SubstreamEntry]) -> Vec<SubstreamEntry> {
+        entries
+            .iter()
+            .cloned()
+            .map(|mut entry| {
+                entry.retain_foldable_producers();
+                entry
+            })
+            .collect()
+    }
+
+    /// Every shape the pruner has to be exact on, as a whole sub-stream in log
+    /// order. Pruning is per entry but its correctness is a claim about the
+    /// *fold*, so each case is folded end to end: the prior tail an entry is met
+    /// with, and the entries that follow it, are both part of what could go
+    /// wrong.
+    fn cases() -> Vec<(&'static str, Vec<SubstreamEntry>)> {
+        vec![
+            (
+                "a compacted region: one producer, far more batches than the window",
+                vec![entry(
+                    0,
+                    (0..40).map(|n| coord(7, 3, n, n as u32)).collect(),
+                )],
+            ),
+            (
+                "the window spans entries: the tail is not wholly in the newest one",
+                (0..8)
+                    .map(|n| {
+                        entry(
+                            n * 3,
+                            vec![coord(7, 3, n as i32, 0), coord(7, 3, n as i32 + 100, 1)],
+                        )
+                    })
+                    .collect(),
+            ),
+            (
+                "markers interleaved with transactional data",
+                vec![entry(
+                    0,
+                    vec![
+                        coord(7, 1, 0, 0),
+                        marker(7, 1, 1),
+                        coord(7, 1, 1, 2),
+                        marker(7, 1, 3),
+                    ],
+                )],
+            ),
+            (
+                "a marker is the only coordinate: the tail must stay unseen",
+                vec![entry(0, vec![marker(7, 1, 0)])],
+            ),
+            (
+                "markers must not eat window slots: more than five data batches, \
+                 each followed by one",
+                vec![entry(
+                    0,
+                    (0..8)
+                        .flat_map(|n| {
+                            [coord(7, 1, n, n as u32 * 2), marker(7, 1, n as u32 * 2 + 1)]
+                        })
+                        .collect(),
+                )],
+            ),
+            (
+                "a marker at a higher epoch than the data does not fence the data",
+                vec![entry(
+                    0,
+                    vec![coord(7, 1, 0, 0), coord(7, 1, 1, 1), marker(7, 2, 2)],
+                )],
+            ),
+            (
+                "an epoch bump inside one entry clears what preceded it",
+                vec![entry(
+                    0,
+                    vec![
+                        coord(7, 1, 0, 0),
+                        coord(7, 1, 1, 1),
+                        coord(7, 2, 0, 2),
+                        coord(7, 2, 1, 3),
+                    ],
+                )],
+            ),
+            (
+                "a fenced writer's coordinate lands after the higher epoch",
+                vec![entry(
+                    0,
+                    vec![coord(7, 4, 0, 0), coord(7, 2, 9, 1), coord(7, 4, 1, 2)],
+                )],
+            ),
+            (
+                "the epoch bumps in a later entry, after the earlier one filled the window",
+                vec![
+                    entry(0, (0..7).map(|n| coord(7, 1, n, n as u32)).collect()),
+                    entry(7, vec![coord(7, 5, 0, 0)]),
+                ],
+            ),
+            (
+                "an entry wholly below the tail's epoch changes nothing",
+                vec![
+                    entry(0, vec![coord(7, 6, 0, 0)]),
+                    entry(1, (0..9).map(|n| coord(7, 2, n, n as u32)).collect()),
+                    entry(10, vec![coord(7, 6, 1, 0)]),
+                ],
+            ),
+            (
+                "three producers sharing a region, one of them fenced mid-entry",
+                vec![
+                    entry(
+                        0,
+                        vec![
+                            coord(1, 0, 0, 0),
+                            coord(2, 0, 0, 1),
+                            coord(1, 0, 1, 2),
+                            coord(3, 7, 40, 3),
+                            coord(2, 1, 0, 4),
+                            coord(2, 0, 1, 5),
+                        ],
+                    ),
+                    entry(
+                        6,
+                        (0..12)
+                            .map(|n| coord(1 + (n % 3), 1, n as i32, n as u32))
+                            .collect(),
+                    ),
+                ],
+            ),
+            ("nothing idempotent at all", vec![entry(0, vec![])]),
+        ]
+    }
+
+    /// The claim pruning rests on (#543): for every producer, the tail folded
+    /// from the pruned entries is the tail folded from the complete ones — not
+    /// merely equivalent to classify against, *equal*, window and all. Anything
+    /// weaker and two replicas holding different amounts of history would derive
+    /// different tails, which is the convergence #88 needs across a connection
+    /// migration.
+    #[test]
+    fn pruning_the_resident_coordinates_cannot_change_the_fold() {
+        for (what, entries) in cases() {
+            let pruned = pruned(&entries);
+
+            for producer_id in producer_ids(&entries) {
+                assert_eq!(
+                    fold(&entries, producer_id),
+                    fold(&pruned, producer_id),
+                    "{what}: producer {producer_id}"
+                );
+            }
+        }
+    }
+
+    /// Idempotence: the index prunes on insert and a *replace* of the same
+    /// sequence re-prunes what it already pruned, so a second pass must be a
+    /// no-op rather than eat further into the window.
+    #[test]
+    fn pruning_twice_prunes_no_further() {
+        for (what, entries) in cases() {
+            let once = pruned(&entries);
+            assert_eq!(once, pruned(&once), "{what}");
+        }
+    }
+
+    /// The point of the exercise: what an entry retains stops depending on how
+    /// much log was merged into it. A compacted region carrying 40 coordinates
+    /// for one producer holds five afterwards, and the bound is
+    /// `IDEMPOTENT_WINDOW × distinct producer ids` whatever compaction does
+    /// next.
+    #[test]
+    fn what_is_retained_is_bounded_by_the_window_not_by_the_history() {
+        for (what, entries) in cases() {
+            let pruned = pruned(&entries);
+            assert!(coord_count(&pruned) <= coord_count(&entries), "{what}");
+
+            for entry in &pruned {
+                let ids = entry
+                    .producers
+                    .iter()
+                    .map(|pc| pc.producer_id)
+                    .collect::<BTreeSet<_>>();
+                assert!(
+                    entry.producers.len() <= IDEMPOTENT_WINDOW * ids.len(),
+                    "{what}: {} coordinates for {} producers",
+                    entry.producers.len(),
+                    ids.len()
+                );
+            }
+        }
+
+        let compacted = vec![entry(
+            0,
+            (0..40).map(|n| coord(7, 3, n, n as u32)).collect(),
+        )];
+        assert_eq!(
+            IDEMPOTENT_WINDOW,
+            coord_count(&pruned(&compacted)),
+            "a pruner that quietly became a no-op passes every equivalence above"
+        );
+    }
+}
+
+#[cfg(test)]
 mod prefix_index_substream_tests {
     use super::{CachedSegment, PrefixIndex, SegmentFooter, Substream, SubstreamEntry};
     use std::collections::HashMap;
@@ -17691,7 +18128,7 @@ mod prefix_index_substream_tests {
             byte_start: 0,
             byte_len: 64,
             max_timestamp: 0,
-            producers: vec![],
+            producers: Box::default(),
         }
     }
 

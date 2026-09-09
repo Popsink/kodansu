@@ -346,6 +346,96 @@ async fn aborted_transaction_surfaces_in_offset_stage() -> Result<(), Error> {
     Ok(())
 }
 
+/// The resident index keeps only the coordinates that can still change a
+/// producer tail (#543), so a compacted region that once held every batch's
+/// coordinate now holds the last five. This is the acceptance for that: the
+/// duplicate window a producer actually observes must be unchanged — five
+/// batches deep, ending at the newest — whether or not the log was compacted
+/// into one region first.
+///
+/// Compaction is what makes it worth asserting. Merging concatenates a run into
+/// one sub-stream entry, so the pruning that used to be spread over ten entries
+/// (nothing to drop: each held one coordinate) now happens inside one, which is
+/// exactly where an off-by-one in "the last five" would surface.
+#[tokio::test]
+async fn a_compacted_region_still_dedups_the_last_five_batches() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    const PREFIX: &str = "org.env.conn";
+    const BATCHES: i32 = 10;
+
+    let store = DynoStore::new(CLUSTER, NODE, InMemory::new()).coalesce_tuning(CoalesceTuning {
+        prefix_compact_min_segments: Some(2),
+        prefix_compact_keep_hot: Some(0),
+        prefix_compact_target_bytes: Some(1 << 30),
+        ..Default::default()
+    });
+
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let tp = Topition::new(topic, 0);
+    let pid = init_idempotent(&store).await?;
+
+    for seq in 0..BATCHES {
+        assert_eq!(
+            seq as i64,
+            store
+                .produce(None, &tp, idempotent_batch(pid, 0, seq, 1)?)
+                .await?
+        );
+    }
+
+    assert!(matches!(
+        store.compact_prefix_segments(PREFIX).await?,
+        CompactRun::Merged(n) if n >= 2
+    ));
+    store.refresh_prefix_index(PREFIX).await?;
+
+    // One entry now, holding five coordinates rather than ten: the residue is
+    // the window, not the history.
+    let retained: Vec<i32> = store
+        .valid_substream_segments(PREFIX, &Substream::Name(topic.into()), 0)?
+        .into_iter()
+        .flat_map(|fenced| fenced.entry.producers)
+        .filter(|coord| coord.producer_id == pid)
+        .map(|coord| coord.base_sequence)
+        .collect();
+    assert_eq!(vec![5, 6, 7, 8, 9], retained);
+
+    // Every batch in the window dedups to the offset it was first written at.
+    for seq in 5..BATCHES {
+        assert_eq!(
+            seq as i64,
+            store
+                .produce(None, &tp, idempotent_batch(pid, 0, seq, 1)?)
+                .await?,
+            "sequence {seq} is inside the window"
+        );
+    }
+
+    // The batch one past the window is `OutOfOrderSequenceNumber` — Kafka's
+    // answer for a retry too old to verify, and the answer this fleet gave
+    // before the index stopped retaining the rest.
+    assert_eq!(
+        ErrorCode::OutOfOrderSequenceNumber,
+        api_error(
+            store
+                .produce(None, &tp, idempotent_batch(pid, 0, 4, 1)?)
+                .await
+        )
+    );
+
+    // And the stream carries on in order from where it left off.
+    assert_eq!(
+        BATCHES as i64,
+        store
+            .produce(None, &tp, idempotent_batch(pid, 0, BATCHES, 1)?)
+            .await?
+    );
+
+    Ok(())
+}
+
 /// Compaction of a run of v2 segments must carry the idempotent producer
 /// coordinates forward (#107): re-encoding the merged run as v2 re-derives them
 /// from the (byte-identical) merged batches, so log-based dedup (#88) still
