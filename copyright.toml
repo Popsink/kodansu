@@ -1,0 +1,255 @@
+# Copyright ⓒ 2026 Popsink SAS
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Which copyright notice each tracked `*.rs` file must open with.
+#
+# Checked by `.github/scripts/check-copyright.py`, run as the `copyright` job in
+# `.github/workflows/pr.yml` and by `just copyright`. See `docs/copyright.md` for
+# the policy and for how the classification below was derived.
+#
+# The default is Popsink's notice: a file listed in neither array under `[files]`
+# must open with it. That is deliberate — a new file added by copy-pasting an
+# existing one inherits the wrong header, and defaulting to Popsink is what makes
+# CI catch that instead of waving it through.
+
+[notice]
+# Popsink-authored files. Every commit at Popsink is dated 2026 (the fork point
+# is 2026-05-16), so the notice claims 2026 alone.
+popsink = "// Copyright ⓒ 2026 Popsink SAS"
+
+# Files derived from tansu keep upstream's notice byte-for-byte, per
+# Apache-2.0 §4(c). Both year ranges occur upstream and neither is ours to
+# renumber, so both are accepted wherever `files.inherited` applies.
+upstream = [
+    "// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>",
+    "// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>",
+]
+
+[files]
+# Files derived from tansu: they carry an `upstream` notice and nothing else.
+#
+# This list is closed to new code: it shrinks when an inherited file is deleted
+# and an entry is edited when one is moved, but it never grows on its own.
+# Upstream code can only enter the tree through a deliberate port, and adding a
+# line here is the reviewable act that records one. (Nine of these arrived that way already, via
+# 27df1fb porting tansu-io#680; they are new files by tree comparison but
+# upstream-authored, which is why classification keys off the authorship of the
+# commit that added a file, never off `git diff --diff-filter=A` alone.)
+inherited = [
+    "fuzz/fuzz_targets/fuzz_deflated_batch.rs",
+    "fuzz/fuzz_targets/fuzz_member_metadata.rs",
+    "fuzz/fuzz_targets/fuzz_request_decode.rs",
+    "fuzz/fuzz_targets/fuzz_response_decode.rs",
+    "fuzz/fuzz_targets/fuzz_varint.rs",
+    "fuzz/fuzz_targets/generate_seeds.rs",
+    "tansu-auth/src/authenticate.rs",
+    "tansu-auth/src/handshake.rs",
+    "tansu-auth/src/lib.rs",
+    "tansu-broker/src/broker.rs",
+    "tansu-broker/src/broker/group.rs",
+    "tansu-broker/src/broker/group/heartbeat.rs",
+    "tansu-broker/src/broker/group/join.rs",
+    "tansu-broker/src/broker/group/leave.rs",
+    "tansu-broker/src/broker/group/offset_commit.rs",
+    "tansu-broker/src/broker/group/offset_fetch.rs",
+    "tansu-broker/src/broker/group/sync.rs",
+    "tansu-broker/src/coordinator.rs",
+    "tansu-broker/src/coordinator/group.rs",
+    "tansu-broker/src/coordinator/group/administrator.rs",
+    "tansu-broker/src/lib.rs",
+    "tansu-broker/src/otel.rs",
+    "tansu-broker/src/otel/tracing.rs",
+    "tansu-broker/src/service.rs",
+    "tansu-broker/src/service/auth.rs",
+    "tansu-broker/src/service/coordinator.rs",
+    "tansu-broker/src/service/storage.rs",
+    "tansu-broker/tests/auth.rs",
+    "tansu-broker/tests/cg.rs",
+    "tansu-broker/tests/cg_dynamic.rs",
+    "tansu-broker/tests/cg_latency.rs",
+    "tansu-broker/tests/cg_static.rs",
+    "tansu-broker/tests/common/mod.rs",
+    "tansu-broker/tests/describe_cluster.rs",
+    "tansu-broker/tests/describe_configs.rs",
+    "tansu-broker/tests/fetch.rs",
+    "tansu-broker/tests/list_offsets.rs",
+    "tansu-broker/tests/metadata.rs",
+    "tansu-broker/tests/new_cg.rs",
+    "tansu-broker/tests/policy_compact_delete.rs",
+    "tansu-broker/tests/produce_fetch.rs",
+    "tansu-broker/tests/topic.rs",
+    "tansu-broker/tests/txn.rs",
+    "tansu-cli/src/cli.rs",
+    "tansu-cli/src/cli/broker.rs",
+    "tansu-cli/src/cli/topic.rs",
+    "tansu-cli/src/cli/user.rs",
+    "tansu-cli/src/lib.rs",
+    "tansu-client/examples/create_topic.rs",
+    "tansu-client/examples/fetch.rs",
+    "tansu-client/examples/group_consumer.rs",
+    "tansu-client/examples/list_offsets.rs",
+    "tansu-client/examples/metadata.rs",
+    "tansu-client/examples/produce.rs",
+    "tansu-client/src/consumer.rs",
+    "tansu-client/src/lib.rs",
+    "tansu-model/src/error.rs",
+    "tansu-model/src/lib.rs",
+    "tansu-model/src/wv.rs",
+    "tansu-sans-io/benches/decode_bench.rs",
+    "tansu-sans-io/build.rs",
+    "tansu-sans-io/src/acl.rs",
+    "tansu-sans-io/src/bin/bench.rs",
+    "tansu-sans-io/src/bin/bench_produce_v11.rs",
+    "tansu-sans-io/src/consumer.rs",
+    "tansu-sans-io/src/consumer/assignor.rs",
+    "tansu-sans-io/src/consumer/assignor/cooperative_sticky.rs",
+    "tansu-sans-io/src/consumer/assignor/range.rs",
+    "tansu-sans-io/src/consumer/assignor/round_robin.rs",
+    "tansu-sans-io/src/consumer/assignor/uniform.rs",
+    "tansu-sans-io/src/consumer/codec.rs",
+    "tansu-sans-io/src/de.rs",
+    "tansu-sans-io/src/lib.rs",
+    "tansu-sans-io/src/primitive.rs",
+    "tansu-sans-io/src/primitive/tagged.rs",
+    "tansu-sans-io/src/primitive/tagged/de.rs",
+    "tansu-sans-io/src/primitive/tagged/ser.rs",
+    "tansu-sans-io/src/primitive/uuid.rs",
+    "tansu-sans-io/src/primitive/varint.rs",
+    "tansu-sans-io/src/record.rs",
+    "tansu-sans-io/src/record/codec.rs",
+    "tansu-sans-io/src/record/deflated.rs",
+    "tansu-sans-io/src/record/header.rs",
+    "tansu-sans-io/src/record/inflated.rs",
+    "tansu-sans-io/src/resource.rs",
+    "tansu-sans-io/src/ser.rs",
+    "tansu-sans-io/tests/add_partitions_to_txn.rs",
+    "tansu-sans-io/tests/api.rs",
+    "tansu-sans-io/tests/codec.rs",
+    "tansu-sans-io/tests/common/mod.rs",
+    "tansu-sans-io/tests/consumer.rs",
+    "tansu-sans-io/tests/create_topics.rs",
+    "tansu-sans-io/tests/decode.rs",
+    "tansu-sans-io/tests/describe_configs.rs",
+    "tansu-sans-io/tests/describe_topic_partitions.rs",
+    "tansu-sans-io/tests/doctest.rs",
+    "tansu-sans-io/tests/encode.rs",
+    "tansu-sans-io/tests/fetch.rs",
+    "tansu-sans-io/tests/fetch_response.rs",
+    "tansu-sans-io/tests/find_coordinator.rs",
+    "tansu-sans-io/tests/gap6.rs",
+    "tansu-sans-io/tests/proptest.rs",
+    "tansu-sans-io/tests/snappy.rs",
+    "tansu-sans-io/tests/version.rs",
+    "tansu-service/src/api.rs",
+    "tansu-service/src/channel.rs",
+    "tansu-service/src/consumer.rs",
+    "tansu-service/src/frame.rs",
+    "tansu-service/src/lib.rs",
+    "tansu-service/src/stream.rs",
+    "tansu-service/tests/ch.rs",
+    "tansu-service/tests/common/mod.rs",
+    "tansu-service/tests/route.rs",
+    "tansu-service/tests/tcp.rs",
+    "tansu-storage/src/batch.rs",
+    "tansu-storage/src/dynostore.rs",
+    "tansu-storage/src/dynostore/metadata.rs",
+    "tansu-storage/src/dynostore/opticon.rs",
+    "tansu-storage/src/dynostore/tests.rs",
+    "tansu-storage/src/dynostore/tests/latency.rs",
+    "tansu-storage/src/gcs.rs",
+    "tansu-storage/src/gcs/limit.rs",
+    "tansu-storage/src/latency.rs",
+    "tansu-storage/src/lib.rs",
+    "tansu-storage/src/null.rs",
+    "tansu-storage/src/os.rs",
+    "tansu-storage/src/service.rs",
+    "tansu-storage/src/service/alter_user_scram_credentials.rs",
+    "tansu-storage/src/service/consumer_group_describe.rs",
+    "tansu-storage/src/service/create_acls.rs",
+    "tansu-storage/src/service/create_topics.rs",
+    "tansu-storage/src/service/delete_groups.rs",
+    "tansu-storage/src/service/delete_records.rs",
+    "tansu-storage/src/service/delete_topics.rs",
+    "tansu-storage/src/service/describe_acls.rs",
+    "tansu-storage/src/service/describe_cluster.rs",
+    "tansu-storage/src/service/describe_configs.rs",
+    "tansu-storage/src/service/describe_groups.rs",
+    "tansu-storage/src/service/describe_topic_partitions.rs",
+    "tansu-storage/src/service/describe_user_scram_credentials.rs",
+    "tansu-storage/src/service/fetch.rs",
+    "tansu-storage/src/service/find_coordinator.rs",
+    "tansu-storage/src/service/get_telemetry_subscriptions.rs",
+    "tansu-storage/src/service/incremental_alter_configs.rs",
+    "tansu-storage/src/service/init_producer_id.rs",
+    "tansu-storage/src/service/list_groups.rs",
+    "tansu-storage/src/service/list_offsets.rs",
+    "tansu-storage/src/service/list_partition_reassignments.rs",
+    "tansu-storage/src/service/metadata.rs",
+    "tansu-storage/src/service/produce.rs",
+    "tansu-storage/src/service/txn.rs",
+    "tansu-storage/src/service/txn/add_offsets.rs",
+    "tansu-storage/src/service/txn/add_partitions.rs",
+    "tansu-storage/src/service/txn/offset_commit.rs",
+    "tansu-storage/tests/common/mod.rs",
+    "tansu-storage/tests/consumer_group_describe.rs",
+    "tansu-storage/tests/create_topics.rs",
+    "tansu-storage/tests/delete_groups.rs",
+    "tansu-storage/tests/delete_records.rs",
+    "tansu-storage/tests/delete_topics.rs",
+    "tansu-storage/tests/describe_cluster.rs",
+    "tansu-storage/tests/describe_configs.rs",
+    "tansu-storage/tests/describe_groups.rs",
+    "tansu-storage/tests/describe_topic_partitions.rs",
+    "tansu-storage/tests/fetch.rs",
+    "tansu-storage/tests/find_coordinator.rs",
+    "tansu-storage/tests/get_telemetry_subscriptions.rs",
+    "tansu-storage/tests/incremental_alter_configs.rs",
+    "tansu-storage/tests/init_producer_id.rs",
+    "tansu-storage/tests/list_groups.rs",
+    "tansu-storage/tests/list_offsets.rs",
+    "tansu-storage/tests/metadata.rs",
+    "tansu-storage/tests/produce.rs",
+    "tansu-storage/tests/topic_lifecycle.rs",
+    "tansu-topic/src/create.rs",
+    "tansu-topic/src/delete.rs",
+    "tansu-topic/src/lib.rs",
+    "tansu-topic/src/list.rs",
+    "tansu/src/bin/tansu.rs",
+]
+
+# Inherited files rewritten in place at Popsink, where the lines added since the
+# fork are a majority of today's file (>50%) and material (>=100 lines). These
+# keep upstream's notice and add Popsink's directly beneath it: Apache-2.0 §4(c)
+# retains the original either way.
+#
+# Every entry must also appear in `inherited`.
+joint = [
+    "tansu-broker/src/broker.rs",
+    "tansu-broker/src/coordinator/group/administrator.rs",
+    "tansu-cli/src/cli/broker.rs",
+    "tansu-client/src/consumer.rs",
+    "tansu-sans-io/src/consumer.rs",
+    "tansu-sans-io/src/consumer/assignor/range.rs",
+    "tansu-sans-io/tests/consumer.rs",
+    "tansu-service/src/stream.rs",
+    "tansu-storage/src/dynostore.rs",
+    "tansu-storage/src/dynostore/tests.rs",
+    "tansu-storage/src/lib.rs",
+    "tansu-storage/src/service/fetch.rs",
+    "tansu-storage/tests/create_topics.rs",
+    "tansu-storage/tests/delete_groups.rs",
+    "tansu-storage/tests/fetch.rs",
+    "tansu-storage/tests/get_telemetry_subscriptions.rs",
+    "tansu-storage/tests/list_offsets.rs",
+]
