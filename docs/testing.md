@@ -426,9 +426,8 @@ with them, so the honest fix for their coverage was removal, not tests.
 
 ## CI layout
 
-`pr.yml` is the only workflow that runs on pull requests. `ci.yml` is disabled
-(it is upstream's, kept for reference), `publish.yml` runs on `v*` tags, and
-`storage.yml` runs nightly and on `workflow_dispatch`.
+`pr.yml` is the only workflow that runs on pull requests. `publish.yml` runs on
+`v*` tags, and `storage.yml` runs nightly and on `workflow_dispatch`.
 
 `storage.yml` is where the object store gets a service. It is off the PR path on
 purpose: `test` in `pr.yml` is the required check, so a Docker-dependent job
@@ -441,13 +440,14 @@ real.
 | job | what it establishes |
 |-----|--------------------|
 | `fmt` | `cargo fmt --check` |
+| `comments` | non-doc comment density, ratcheted (#540) — not a test, and the only job here needing no toolchain |
 | `clippy` | lints, and by construction type-checks everything `cargo check` would |
 | `check-no-default-features` | every crate still compiles with its optional features off |
 | `build-storage` | the binary links |
 | `test` | nextest over the workspace, plus doc tests |
 | `azurite` | the conformance target against a real `If-None-Match`, not an emulation of one, plus the offline audit against a store that refuses a suffix range |
 | `coverage` | line coverage, floored |
-| `all-green` | one status summarising the seven above |
+| `all-green` | one status summarising the eight above |
 
 `azurite` is the one exception to the paragraph above, and it is
 worth being precise about why. It is Docker-dependent, so it is deliberately not
