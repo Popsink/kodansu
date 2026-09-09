@@ -217,6 +217,41 @@ An unparseable value keeps the default and logs a warning: a size limit that
 silently became something else is worse than one that was ignored, because the
 operator believes a number that is not in force.
 
+## `fetch_max_bytes` — the largest `Fetch` response this broker returns
+
+The upper bound on one `Fetch` response, defaulting to `5m`. It is a **clamp,
+not a default**: a client configured with `fetch.max.bytes=16m` is answered with
+5 MiB and told nothing, because Kafka has no way for a broker to say "less than
+you asked for" other than by returning it.
+
+```
+s3://my-bucket/?fetch_max_bytes=16m
+```
+
+A request's own `max_bytes` still binds when it is smaller — the effective bound
+is `min(request, this)`. Neither is an absolute maximum: a partition answers with
+at least one whole batch whatever the budget, or a consumer whose next batch is
+larger than the bound would never make progress.
+
+**Raising it trades broker memory for round trips.** The bound is charged per
+fetch *in flight*, so `16m` on a replica serving 200 concurrent fetches is a
+different number from `16m` on one serving 10. Against that, what widening buys
+is records per round trip — which is the only cost a single-partition consumer
+can amortise, since one partition is one consumer thread and there is no
+parallelism to add. #539 measured the per-record cost at 70–105 µs against two
+production topics whose record sizes differ 8×, so the arithmetic is worth doing
+before the change: the gain is bounded by the fraction of a poll cycle that is
+*fixed* rather than per-record, and on the sink measured there that was about
+half.
+
+Treat it as an A/B knob rather than a setting to raise fleet-wide: put one
+replica on the wider bound, watch its RSS alongside its fetch latency, and
+compare. Nothing about the value is load-bearing for correctness — the shipped
+5 MiB was never chosen against a measurement, which is why it moved out of the
+binary rather than up.
+
+An unparseable value, or one past `u32`, keeps the default and logs a warning.
+
 ## Producer idempotency checkpoint — removed
 
 There is nothing to tune here any more. The lazily-checkpointed per-producer

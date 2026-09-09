@@ -88,13 +88,14 @@ mod tests;
 
 use crate::{
     AclBinding, AclFilter, Acls, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
-    BrokerRegistrationRequest, CommittedOffset, ConsumerGroupState, CorruptRegion, DivergentBatch,
-    Error, GROUP_SCHEMA_VERSION, GenerationDoc, GroupDetail, GroupMember, GroupSchema, GroupState,
-    ListOffsetResponse, METER, MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProducerIdResponse, QuotaAlteration, QuotaEntity, QuotaFilterComponent,
-    QuotaLimits, Quotas, Result, ScramCredential, Storage, TopicDefaults, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState,
-    UpdateError, Version, storage_error_code, validation,
+    BrokerRegistrationRequest, CommittedOffset, ConsumerGroupState, CorruptRegion,
+    DEFAULT_FETCH_MAX_BYTES, DivergentBatch, Error, GROUP_SCHEMA_VERSION, GenerationDoc,
+    GroupDetail, GroupMember, GroupSchema, GroupState, ListOffsetResponse, METER, MemberDoc,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
+    QuotaAlteration, QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas, Result,
+    ScramCredential, Storage, TopicDefaults, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    storage_error_code, validation,
 };
 
 const APPLICATION_JSON: &str = "application/json";
@@ -393,6 +394,12 @@ pub struct DynoStore {
     coalesce_linger: Duration,
     coalesce_batches: usize,
     coalesce_bytes: usize,
+
+    /// Upper bound on one `Fetch` response (#539). Seeded from
+    /// [`crate::DEFAULT_FETCH_MAX_BYTES`] and overridable per deployment via
+    /// `fetch_max_bytes`, so one replica can be run against a wider bound and
+    /// compared with the rest of the fleet without a rebuild.
+    fetch_max_bytes: u32,
 
     /// How long the high-watermark view (per-partition hint and prefix index)
     /// is served from memory before a read re-lists (#500). Defaults to
@@ -1308,6 +1315,12 @@ pub struct CoalesceTuning {
     /// The separator those components are split on (#464). See
     /// [`DynoStore::prefix_separator`].
     pub prefix_separator: Option<String>,
+
+    /// Upper bound on one `Fetch` response (#539); `None` keeps
+    /// [`crate::DEFAULT_FETCH_MAX_BYTES`]. Raising it trades broker memory —
+    /// the bound is per fetch in flight — for fewer round trips per record,
+    /// which is the only term a single-partition consumer can amortise.
+    pub fetch_max_bytes: Option<u32>,
 }
 
 /// Process-wide counter making each [`DynoStore`]'s `writer_id` unique (#59), so
@@ -3388,6 +3401,7 @@ impl DynoStore {
             coalesce_linger: Self::COALESCE_LINGER,
             coalesce_batches: Self::COALESCE_BATCHES,
             coalesce_bytes: Self::COALESCE_BYTES,
+            fetch_max_bytes: DEFAULT_FETCH_MAX_BYTES,
             watermark_hint_ttl: Self::HIGH_WATERMARK_HINT_TTL,
             prefix_depth: Self::PREFIX_DEPTH,
             prefix_separator: Self::PREFIX_SEPARATOR.to_owned(),
@@ -3478,6 +3492,7 @@ impl DynoStore {
             coalesce_linger: tuning.coalesce_linger.unwrap_or(self.coalesce_linger),
             coalesce_batches: tuning.coalesce_batches.unwrap_or(self.coalesce_batches),
             coalesce_bytes: tuning.coalesce_bytes.unwrap_or(self.coalesce_bytes),
+            fetch_max_bytes: tuning.fetch_max_bytes.unwrap_or(self.fetch_max_bytes),
             prefix_compact_min_segments: tuning
                 .prefix_compact_min_segments
                 .unwrap_or(self.prefix_compact_min_segments),
@@ -13325,6 +13340,10 @@ impl Storage for DynoStore {
 
     fn auto_create_topic_config(&self) -> AutoTopicCreate {
         self.auto_create
+    }
+
+    fn fetch_max_bytes(&self) -> u32 {
+        self.fetch_max_bytes
     }
 
     async fn incremental_alter_resource(
