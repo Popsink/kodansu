@@ -227,7 +227,8 @@ fn footer_v2_round_trips_producer_coords_and_nonce() -> Result<(), Error> {
                         offset_delta: 3,
                         flags: 0,
                     },
-                ],
+                ]
+                .into(),
             },
             // A non-idempotent sub-stream carries no producer coordinates.
             SubstreamEntry {
@@ -239,7 +240,7 @@ fn footer_v2_round_trips_producer_coords_and_nonce() -> Result<(), Error> {
                 byte_start: 42,
                 byte_len: 10,
                 max_timestamp: 1_700_000_000_500,
-                producers: vec![],
+                producers: Box::default(),
             },
         ],
     };
@@ -292,7 +293,8 @@ fn footer_v2_encoding_is_byte_identical_to_golden() -> Result<(), Error> {
                 // Nonzero on purpose: a v2 encode must not let flags reach the
                 // bytes at all.
                 flags: 0b11,
-            }],
+            }]
+            .into(),
         }],
     };
 
@@ -384,7 +386,8 @@ fn footer_v3_round_trips_producer_coords_with_flags() -> Result<(), Error> {
                     offset_delta: 5,
                     flags: 0b11,
                 },
-            ],
+            ]
+            .into(),
         }],
     };
 
@@ -439,7 +442,8 @@ fn footer_v4_round_trips_the_substream_identity() -> Result<(), Error> {
                     last_sequence: 5,
                     offset_delta: 0,
                     flags: 0,
-                }],
+                }]
+                .into(),
             },
             // Keyed by name, in the same v4 segment: a topic that predates the
             // flip, whose records are still found by the name they were written
@@ -453,7 +457,7 @@ fn footer_v4_round_trips_the_substream_identity() -> Result<(), Error> {
                 byte_start: 42,
                 byte_len: 18,
                 max_timestamp: 1_700_000_000_001,
-                producers: vec![],
+                producers: Box::default(),
             },
         ],
     };
@@ -505,7 +509,7 @@ fn a_v3_footer_carries_no_topic_id() -> Result<(), Error> {
         byte_start: 4,
         byte_len: 5,
         max_timestamp: 6,
-        producers: vec![],
+        producers: Box::default(),
     };
 
     let footer = |topic_id| SegmentFooter {
@@ -778,7 +782,8 @@ async fn control_coordinate_does_not_fold_into_producer_tail() -> Result<(), Err
                         offset_delta: 3,
                         flags: 0b11,
                     },
-                ],
+                ]
+                .into(),
             }],
         },
         0,

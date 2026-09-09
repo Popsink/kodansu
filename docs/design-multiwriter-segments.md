@@ -148,8 +148,17 @@ pcoords[]:
 - A per-flush **nonce** lives in the footer trailer (not by overloading
   `writer_epoch`) for ambiguous-PUT adoption. `writer_epoch` is written as an
   **era marker** (see Migration), and the overlap tie-break degenerates to seq.
-- Coords are **folded into a derived `ProducerTable` at ingest and dropped** — not
-  kept in the cached footer — so the in-memory index footprint stays at v1 levels.
+- Coords in the cached footer are **pruned to what a `ProducerTail` can still
+  read** (#543): per entry, per producer id, the last `IDEMPOTENT_WINDOW`
+  coordinates at that producer's highest epoch in the entry, with transaction
+  markers dropped. Not the "fold at ingest and drop everything" this design
+  originally called for — that is not a pure function of the observed footer set,
+  because a fold cannot be withdrawn when a peer retires a segment or when an
+  incremental refresh discovers one below the current max, and two pods holding
+  different histories would then classify the same retry differently. Pruning
+  per entry keeps the fold pure and still bounds the retained coordinates by the
+  window rather than by the length of the log. What the unpruned version cost is
+  in #543: ~847 MiB per replica, 37 % of `allocated`, growing with compaction.
 
 External S3-direct readers (kotatsu#82) must accept v2 before any v2 write; a v2
 segment reaching a v1 reader is a hard read failure by contract.
