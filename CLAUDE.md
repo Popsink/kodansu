@@ -29,6 +29,7 @@ just test-workspace  # cargo nextest run --workspace --all-targets --all-feature
 just test-doc        # cargo test --workspace --doc --all-features
 just clippy          # cargo clippy --workspace --all-features --all-targets -- -D warnings
 just fmt             # cargo fmt --all --check
+just comments        # non-doc comment density, and the gate on it
 just check           # cargo check --workspace --all-features --all-targets
 just coverage        # line coverage summary (needs cargo-llvm-cov)
 just coverage-html   # browsable coverage report
@@ -127,9 +128,9 @@ lake feature flags any more.
 
 ## CI Pipeline
 
-`pr.yml` is the only workflow that runs on pull requests: fmt, clippy,
-check-no-default-features, build-storage, test and coverage in parallel, summed
-up by `all-green`. `ci.yml` is disabled (upstream's, kept for reference) and
+`pr.yml` is the only workflow that runs on pull requests: fmt, comments, clippy,
+check-no-default-features, build-storage, test, azurite and coverage in
+parallel, summed up by `all-green`. `storage.yml` runs the S3 suite nightly, and
 `publish.yml` pushes `ghcr.io/popsink/tansu` on `v*` tags.
 
 There is no `check` job — `clippy` runs over the same selection and type-checks
@@ -149,6 +150,18 @@ There are no smoke tests. The upstream `smoke` job was gated on `github.actor ==
 | `tansu-sans-io/message/` | Kafka JSON protocol descriptors (upstream, ~185 files) |
 | `tansu-sans-io/build.rs` | Code generator: JSON descriptors -> Rust types |
 
+## Comments
+
+**Doc comments are encouraged; `//` inside a body is not.**
+
+- `///` and `//!` are API documentation. Write them freely — `broken_intra_doc_links = "deny"` means rustdoc here is load-bearing, not decoration. They are exempt from every count below.
+- A `//` comment inside a function body has to explain **why**. The default is no comment: if it says what the next line does, delete the comment and let the code say it, or rename something so the code says it better.
+- The comments this repository keeps are decision records — why a constant is that number, why a branch exists, what broke without it — and they cite the issue they came from (`#276`, `#461`). That citation is what distinguishes a decision record from narration, so **a `//` block citing `#\d+` is exempt from the gate**; a block citing only a KIP is not.
+
+`just comments` reports the split, per file and repo-wide, and fails past the ceiling. It counts `//` at the start of a line only — a trailing `g(); // …` is invisible to it, because 214 of the 312 lines in this tree with `//` past column 0 have it inside a string literal (`Url::parse("memory://tansu/")`), and telling the two apart means lexing Rust. Write the trailing ones as if they were counted.
+
+The ceiling is a **ratchet at the measured value**, not a budget with room in it: 2.8228% at the commit that introduced it, tight enough that a single added line of uncited narration turns the build red. Raising it is allowed and is the escape hatch — say why the real number moved. `etc/comments.awk` carries the counting model; `justfile`'s `comments` recipe carries the reasoning.
+
 ## Lint Configuration
 
-Workspace-level in `Cargo.toml`: `clippy::all = warn`, `unsafe_code = forbid`, `non_ascii_idents = forbid`, `rust_2018_idioms = deny`, `unreachable_pub = warn`, `broken_intra_doc_links = deny`. CI runs `clippy -- -D warnings` (all warnings are errors).
+Workspace-level in `Cargo.toml`: `clippy::all = warn`, `unsafe_code = forbid`, `non_ascii_idents = forbid`, `rust_2018_idioms = deny`, `unreachable_pub = warn`, `broken_intra_doc_links = deny`. CI runs `clippy -- -D warnings` (all warnings are errors). Clippy has no comment-density lint of any kind, which is why the section above is a homegrown check.

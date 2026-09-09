@@ -191,6 +191,48 @@ clippy:
 fmt:
     cargo fmt --all --check
 
+# Non-doc comment density over the Rust sources, and the gate on it (#540).
+#
+# The rule it enforces is in CLAUDE.md: `///` and `//!` are API documentation
+# and encouraged, a `//` inside a body has to say WHY, and the default is no
+# comment. `etc/comments.awk` carries the counting model and the reasoning for
+# each of its exemptions.
+#
+# The ceiling is a ratchet, not a target — the same argument as `coverage-ci`
+# below it, with one difference in how tight it is set. Coverage's floor sits
+# 3 points under the measured number because a decimal point of coverage is
+# noise. Here a tenth of a point is ~110 lines of narration, so the ceiling is
+# the measured value itself — 2.82280530%, rounded up at the last digit to the
+# 2.8229 below, which is a tenth of a line of headroom. One added line of
+# uncited narration fails; a line of rustdoc, a line of code, a trailing
+# comment, or a narration block citing an issue does not.
+#
+# So a change that legitimately adds narration has to raise this number and say
+# why the real one moved — that is the whole mechanism, not a workaround for it.
+# Never raise it to turn a red build green.
+#
+# The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
+# `pr.yml` passes in: a second copy of a threshold this tight would mean `just
+# comments` on a laptop passing while CI fails.
+#
+# `fuzz` is excluded the way every recipe above excludes it. `git ls-files` does
+# the rest for free — `target/` and the generated `tansu-sans-io` code are not
+# tracked, so neither can be counted.
+
+# Non-doc comment density per file and repo-wide, failing over ceiling%.
+comments ceiling="2.8229" top="12":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # One awk over the whole list, deliberately not `| xargs awk`: xargs would
+    # split a long list into batches and print a passing total per batch, so the
+    # gate would quietly stop covering the tree it outgrew. This form fails loudly
+    # instead (`argument list too long`) — ~10 kB of paths today against an
+    # ARG_MAX of 256 kB.
+    files=()
+    while IFS= read -r f; do files+=("$f"); done \
+      < <(git ls-files '*.rs' | grep -v '^fuzz/')
+    awk -v ceiling='{{ ceiling }}' -v top='{{ top }}' -f etc/comments.awk "${files[@]}"
+
 miri:
     cargo +nightly miri test --no-fail-fast --all-features
 
