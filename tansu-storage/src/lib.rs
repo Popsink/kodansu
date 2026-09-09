@@ -832,6 +832,15 @@ pub const DEFAULT_RETENTION_MS: i64 = 604_800_000;
 /// The Apache Kafka default `cleanup.policy`.
 pub const DEFAULT_CLEANUP_POLICY: &str = "delete";
 
+/// Upper bound on one `Fetch` response, before a deployment overrides it (#539).
+///
+/// 5 MiB is the value that has always shipped, and it is a *clamp*: a client
+/// asking for `fetch.max.bytes=16m` is silently answered with 5 MiB. #535 and
+/// #537 measured what a response over this bound costs — the bound itself was
+/// never chosen against a measurement, which is why #539 made it tunable rather
+/// than moving it.
+pub const DEFAULT_FETCH_MAX_BYTES: u32 = 5 * 1024 * 1024;
+
 /// Broker-level topic config defaults, applied by the engine when a topic is
 /// created without an explicit value.
 ///
@@ -1539,6 +1548,13 @@ pub trait Storage: Debug + Send + Sync + 'static {
         AutoTopicCreate::default()
     }
 
+    /// Upper bound on one `Fetch` response; the request's `max_bytes` is
+    /// clamped to it. Defaults to [`DEFAULT_FETCH_MAX_BYTES`]; backends
+    /// carrying a configured value override this.
+    fn fetch_max_bytes(&self) -> u32 {
+        DEFAULT_FETCH_MAX_BYTES
+    }
+
     async fn upsert_user_scram_credential(
         &self,
         user: &str,
@@ -1955,6 +1971,10 @@ where
         self.as_ref().auto_create_topic_config()
     }
 
+    fn fetch_max_bytes(&self) -> u32 {
+        self.as_ref().fetch_max_bytes()
+    }
+
     async fn upsert_user_scram_credential(
         &self,
         user: &str,
@@ -2338,6 +2358,10 @@ where
 
     fn auto_create_topic_config(&self) -> AutoTopicCreate {
         self.as_ref().auto_create_topic_config()
+    }
+
+    fn fetch_max_bytes(&self) -> u32 {
+        self.as_ref().fetch_max_bytes()
     }
 
     async fn upsert_user_scram_credential(
@@ -2959,6 +2983,15 @@ fn coalesce_tuning(storage: &Url) -> CoalesceTuning {
                     )
                     .ok()
                     .and_then(|size| usize::try_from(size).ok());
+            }
+            "fetch_max_bytes" => {
+                tuning.fetch_max_bytes = human_units::Size::from_str(value)
+                    .map(|size| size.0)
+                    .inspect_err(
+                        |err| warn!(storage = %storage, key = "fetch_max_bytes", value, ?err),
+                    )
+                    .ok()
+                    .and_then(|size| u32::try_from(size).ok());
             }
             "prefix_compact_min_segments" => {
                 tuning.prefix_compact_min_segments = value
@@ -3798,6 +3831,36 @@ mod tests {
         assert_eq!(Some(Duration::from_millis(300)), tuning.coalesce_linger);
         assert_eq!(Some(128), tuning.coalesce_batches);
         assert_eq!(Some(4 << 20), tuning.coalesce_bytes);
+        Ok(())
+    }
+
+    /// The `Fetch` response bound (#539): parsed as a human size, absent or
+    /// unparseable keeps [`DEFAULT_FETCH_MAX_BYTES`], and a value past `u32`
+    /// is refused rather than truncated — `4G` narrowed to `u32` would land on
+    /// `0` and cap every fetch at nothing.
+    #[cfg(feature = "dynostore")]
+    #[test]
+    fn fetch_max_bytes_parses() -> Result<()> {
+        assert_eq!(
+            Some(16 << 20),
+            coalesce_tuning(&Url::parse("s3://tansu/?fetch_max_bytes=16M")?).fetch_max_bytes
+        );
+
+        assert_eq!(
+            None,
+            coalesce_tuning(&Url::parse("s3://tansu/")?).fetch_max_bytes
+        );
+
+        assert_eq!(
+            None,
+            coalesce_tuning(&Url::parse("s3://tansu/?fetch_max_bytes=big")?).fetch_max_bytes
+        );
+
+        assert_eq!(
+            None,
+            coalesce_tuning(&Url::parse("s3://tansu/?fetch_max_bytes=4G")?).fetch_max_bytes
+        );
+
         Ok(())
     }
 

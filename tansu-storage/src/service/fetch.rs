@@ -859,10 +859,14 @@ where
 
             let min_bytes = u32::try_from(req.min_bytes)?;
 
-            const DEFAULT_MAX_BYTES: u32 = 5 * 1024 * 1024;
+            // A clamp, not a default: a client asking for 16 MiB is answered
+            // with this and told nothing. It was a local `const` until #539
+            // wanted one replica run against a wider bound and the rest of the
+            // fleet left alone, which a compile-time constant cannot express.
+            let cap = ctx.state().fetch_max_bytes();
 
-            let max_bytes = req.max_bytes.map_or(Ok(DEFAULT_MAX_BYTES), |max_bytes| {
-                u32::try_from(max_bytes).map(|max_bytes| max_bytes.min(DEFAULT_MAX_BYTES))
+            let max_bytes = req.max_bytes.map_or(Ok(cap), |max_bytes| {
+                u32::try_from(max_bytes).map(|max_bytes| max_bytes.min(cap))
             })?;
 
             self.fetch(

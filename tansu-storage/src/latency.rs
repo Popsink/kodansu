@@ -543,6 +543,10 @@ where
         self.storage.auto_create_topic_config()
     }
 
+    fn fetch_max_bytes(&self) -> u32 {
+        self.storage.fetch_max_bytes()
+    }
+
     async fn upsert_user_scram_credential(
         &self,
         user: &str,
