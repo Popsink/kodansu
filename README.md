@@ -508,6 +508,7 @@ just grafana-ui   # opens http://localhost:3000
 | [docs/design-multiwriter-segments.md](docs/design-multiwriter-segments.md) | Why the create-only segment sequence is the offset arbiter |
 | [docs/migration-scos.md](docs/migration-scos.md) | Operator runbook for the lease → leaseless cutover (historical) |
 | [docs/sarama.md](docs/sarama.md) | Driving the broker with the Go Sarama client |
+| [docs/copyright.md](docs/copyright.md) | Which copyright notice each file carries and why: the fork-point classification, the rewritten-in-place rule, and what CI enforces |
 | [docs/rename-kodansu.md](docs/rename-kodansu.md) | Checklist for closing the `tansu` → `kodansu` gap described below |
 | [CLAUDE.md](CLAUDE.md) | Repository layout, crate roles, build and test invocations |
 
@@ -531,8 +532,16 @@ Please [raise an issue][kodansu-issues] if you encounter a problem.
 ## Attribution and license
 
 Kodansu is a fork of [tansu][github-com-tansu-io] by Peter Morgan, and is licensed,
-like tansu, under [Apache 2.0][apache-license]. Upstream copyright headers are
-preserved throughout.
+like tansu, under [Apache 2.0][apache-license].
+
+Copyright notices are per file. Of the 272 tracked `.rs` files, the 179 derived from
+tansu keep Peter Morgan's notice, as Apache-2.0 §4(c) requires — including nine later
+ported from upstream, which are new files here but not new code. The 93 written at
+Popsink carry Popsink's notice instead. Seventeen of the inherited files have been
+rewritten in place to the point where most of what they contain today was written
+here; those carry both notices, upstream's first. Which file is in which class is
+recorded in [copyright.toml](copyright.toml) and enforced on every pull request; the
+reasoning is in [docs/copyright.md](docs/copyright.md).
 
 **On the name:** the repository is now `Popsink/kodansu`, and GitHub redirects the
 old path indefinitely. The binary, the crates and the container image are all still

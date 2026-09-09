@@ -39,9 +39,13 @@ production without producing a compile error, a failing test or a red CI job.
 - [ ] Rust module paths: `use tansu_storage::…` → `use kodansu_storage::…` across ~180 files.
 - [ ] `tansu/src/bin/tansu.rs` — the file name *is* the binary name. Rename the file,
       or add an explicit `[[bin]] name = …`.
-- [ ] `workspace.package.authors` is still `Peter Morgan <peter.morgan@tansu.io>`.
-      Decide whether to keep it as attribution (the Apache-2.0 headers already carry
-      that) or set it to Popsink. Not a link, but it is published crate metadata.
+- [x] `workspace.package.authors` — **done** (#541): set to `["Popsink SAS"]`. The
+      parenthetical here used to read "the Apache-2.0 headers already carry that",
+      which was the assumption #541 disproved: the headers carried upstream's notice
+      on every file in the tree, including the 93 written at Popsink. Upstream's
+      attribution now lives in the per-file notices, `README.md` and
+      `docs/copyright.md`; `authors` says who ships the crate. `fuzz` sets
+      `publish = false` and needs no `authors` key.
 - [ ] `.github/workflows/release.yml` runs `cargo publish --workspace` on `v*` tags.
       The `tansu-*` names on crates.io belong to upstream, so this job cannot
       currently succeed. It is `disabled_manually` today. **Decide: delete it, or

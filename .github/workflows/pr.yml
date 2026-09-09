@@ -60,6 +60,15 @@ jobs:
       - uses: extractions/setup-just@v3
       - run: just comments
 
+  # Needs no Rust toolchain: it reads the first lines of every tracked .rs file
+  # and compares them against copyright.toml. See docs/copyright.md.
+  copyright:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: extractions/setup-just@v3
+      - run: just copyright
+
   clippy:
     runs-on: ubuntu-latest-8-cores
     steps:
@@ -315,6 +324,7 @@ jobs:
     needs:
       - fmt
       - comments
+      - copyright
       - clippy
       - check-no-default-features
       - build-storage

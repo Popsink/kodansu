@@ -1,6 +1,6 @@
 set dotenv-load := true
 
-default: fmt build test clippy
+default: fmt copyright build test clippy
 
 cargo-build +args:
     cargo build {{ args }}
@@ -10,6 +10,13 @@ clean-workspace:
 
 license:
     cargo about generate about.hbs > license.html
+
+# Check every .rs file's copyright notice against copyright.toml. See docs/copyright.md.
+copyright:
+    python3 .github/scripts/check-copyright.py
+
+copyright-fix:
+    python3 .github/scripts/check-copyright.py --fix
 
 build profile="dev" features="dynostore" bin="tansu": (cargo-build "--profile" profile "--timings" "--bin" bin "--no-default-features" "--features" features)
 
