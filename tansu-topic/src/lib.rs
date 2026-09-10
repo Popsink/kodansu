@@ -28,7 +28,10 @@ mod list;
 
 pub type Result<T, E = Error> = result::Result<T, E>;
 
-#[derive(thiserror::Error, Debug)]
+/// `Clone` is why `Io` and `SerdeJson` hold an `Arc`: neither source is
+/// cloneable, and every error type in this tree is (`CLAUDE.md`). The wrapping
+/// was here and the derive was not until #556's tests asked for it.
+#[derive(Clone, thiserror::Error, Debug)]
 pub enum Error {
     Api(ErrorCode),
     Client(#[from] tansu_client::Error),

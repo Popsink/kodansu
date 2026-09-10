@@ -234,7 +234,13 @@ fmt:
 #
 # A deletion that trips this gate is the gate working off a smaller tree, not
 # narration anyone wrote, and the honest response is to re-ratchet at the new
-# measured value — which is what 2.9711 is. Check the numerator first.
+# measured value. Check the numerator first.
+#
+# It moves the other way too, and the ratchet follows: #556's `tansu-topic`
+# tests added 231 lines of code and no uncited narration, taking the real
+# number 2.97101584% -> 2.96464163%. Tightening to 2.9647 is not the same edit
+# as raising it — slack left behind a deletion is slack the next change spends
+# without saying so.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -245,7 +251,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.9711" top="12":
+comments ceiling="2.9647" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

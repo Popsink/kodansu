@@ -27,3 +27,19 @@ tokio.workspace = true
 tracing-subscriber.workspace = true
 tracing.workspace = true
 url.workspace = true
+
+[dev-dependencies]
+anyhow.workspace = true
+
+# An in-process broker to point the subcommands at. `tansu-topic` is a client
+# of the wire protocol, so the only test that says the shell still delegates is
+# one where something answers (#556). No cycle: nothing below `tansu` and
+# `tansu-cli` depends on this crate.
+# `dynostore` explicitly: the workspace declaration is `default-features =
+# false`, and every other crate re-enables it through a `[features]` section of
+# its own. This crate has none and needs the object store only here, so the
+# dev-dependency asks for it directly.
+tansu-broker = { workspace = true, features = ["dynostore"] }
+tansu-storage = { workspace = true, features = ["dynostore"] }
+
+uuid.workspace = true
