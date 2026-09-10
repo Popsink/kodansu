@@ -63,6 +63,20 @@ Throughput cross-checks already exist and are worth graphing next to it:
 > empty fetch records 5 000 ms and did no work; reading that histogram as
 > saturation is the same mistake as reading requests-in-flight.
 
+> **The bucket boundaries changed in #539.** Every histogram in `tansu-service`
+> took the OTel SDK's default ladder, whose top finite bucket is 10 000 — 10 s
+> for a duration and 10 kB for a size. 9% of production responses exceeded
+> 10 kB and shared one `+Inf` bucket, so nothing the broker publishes could
+> read its own tail: #537 moving a response from 14.7 MB to 5.36 MB was
+> invisible here.
+>
+> Durations now reach 60 s and sizes 64 MiB. This **rebases the Prometheus
+> series** — `histogram_quantile` survives it, because it reads whatever
+> `le` labels are present, but a dashboard or recording rule that names a
+> bucket (`le="10000"`) breaks, and a quantile spanning the upgrade
+> interpolates across two ladders for one scrape interval. Nothing on this page
+> names a bucket.
+
 ### A throttling fleet is not a busy fleet
 
 Client quotas (#384) would corrupt this signal if a throttle were a sleep in the

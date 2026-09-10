@@ -42,7 +42,8 @@ use tracing::{debug, error, instrument, warn};
 
 use crate::{
     BYTES_RECEIVED, BYTES_SENT, Classify, Error, REQUEST_DURATION, REQUEST_SIZE,
-    REQUESTS_IN_FLIGHT, RESPONSE_SIZE, Severity, THROTTLED_REQUESTS, THROTTLED_TIME, frame_length,
+    REQUESTS_IN_FLIGHT, RESPONSE_SIZE, RESPONSE_WRITE_DURATION, Severity, THROTTLED_REQUESTS,
+    THROTTLED_TIME, frame_length, register_runtime_gauges,
 };
 
 /// A request being served, counted for as long as this value lives (#362).
@@ -230,6 +231,12 @@ where
         ctx: Context<State>,
         req: TcpListener,
     ) -> Result<Self::Response, Self::Error> {
+        // The one place in this crate guaranteed to be inside the runtime and
+        // reached once per process: the gauges capture a `Handle`, and their
+        // callbacks run on the exporter's thread where `Handle::current()`
+        // would panic (#539).
+        register_runtime_gauges();
+
         let mut set = JoinSet::new();
 
         loop {
@@ -632,14 +639,6 @@ where
         ctx: Context<TcpContext>,
         request: Bytes,
     ) -> Result<Bytes, S::Error> {
-        // Per-API, not just per-connection (#410). `tansu_api_requests` has
-        // carried `api_key` all along and these three have not, so there was no
-        // per-API latency or size series at all — and a fleet where one API is
-        // 20% of its traffic could not say what answering it costs.
-        let mut attributes = attributes.to_vec();
-        attributes.push(KeyValue::new("api_key", frame_api_key(&request)));
-        let attributes = attributes.as_slice();
-
         REQUEST_SIZE.record(request.len() as u64, attributes);
 
         let (ctx, _) = ctx.swap_state(State::default());
@@ -690,9 +689,22 @@ where
         // where a broken pipe is `Severity::Expected`. So dropping the log loses
         // nothing and stops asserting that a departing client is a fault.
         let mut w = BufWriter::new(req);
-        w.write_all(&frame).await?;
-        BYTES_SENT.add(frame.len() as u64, &[]);
-        w.flush().await.map_err(Into::into)
+        let start = SystemTime::now();
+
+        // Not `write_all(..).await?` followed by a stamp: `?` returns, and a
+        // write that fails after seconds of backpressure is the sample worth
+        // having (#539). Both arms record, so the histogram counts what the
+        // socket cost whether or not the peer was still there.
+        let written = async {
+            w.write_all(&frame).await?;
+            BYTES_SENT.add(frame.len() as u64, &[]);
+            w.flush().await
+        }
+        .await;
+
+        RESPONSE_WRITE_DURATION.record(self.elapsed_millis(start), attributes);
+
+        written.map_err(Into::into)
     }
 
     /// Everything a request owes its caller once its first four bytes have
@@ -719,6 +731,23 @@ where
         let no_response = ctx.get::<NoResponse>().cloned();
 
         let request = self.read(req, size).await?;
+
+        // Per-API, not just per-connection (#410). `tansu_api_requests` has
+        // carried `api_key` all along and the histograms had not, so there was
+        // no per-API latency or size series at all — and a fleet where one API
+        // is 20% of its traffic could not say what answering it costs.
+        //
+        // Derived here rather than in `process`, which is where #410 put it:
+        // `write` is called with what this function holds, so
+        // `tansu_response_size` and `tansu_response_write_duration` were left
+        // labelled `cluster_id` alone (#539).
+        let attributes = {
+            let mut attributes = attributes.to_vec();
+            attributes.push(KeyValue::new("api_key", frame_api_key(&request)));
+            attributes
+        };
+        let attributes = attributes.as_slice();
+
         let response = self.process(attributes, ctx, request).await?;
 
         // `Produce` with `acks=0` is answered with silence, because that is what
@@ -883,8 +912,124 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        pin::Pin,
+        task::{Context as TaskContext, Poll},
+    };
+
+    use opentelemetry::global;
+    use opentelemetry_sdk::metrics::{
+        InMemoryMetricExporter, InMemoryMetricExporterBuilder, PeriodicReader, SdkMeterProvider,
+        Temporality,
+        data::{AggregatedMetrics, MetricData},
+    };
+    use tokio::io::AsyncWrite;
+
     use super::*;
     use tansu_sans_io::{ApiKey, ApiVersionsRequest, FetchRequest, ProduceRequest};
+
+    /// A socket that refuses every write: what a peer that has gone away looks
+    /// like from inside [`TcpBytesService::write`].
+    struct BrokenPipe;
+
+    impl AsyncWrite for BrokenPipe {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut TaskContext<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// How many data points the histogram `name` exported carrying `api_key`.
+    fn labelled_points(exporter: &InMemoryMetricExporter, name: &str, api_key: i64) -> usize {
+        exporter
+            .get_finished_metrics()
+            .expect("metrics")
+            .iter()
+            .flat_map(|resource| {
+                resource
+                    .scope_metrics()
+                    .flat_map(|scope| scope.metrics())
+                    .filter(|metric| metric.name() == name)
+                    .filter_map(|metric| match metric.data() {
+                        AggregatedMetrics::U64(MetricData::Histogram(histogram)) => Some(
+                            histogram
+                                .data_points()
+                                .filter(|point| {
+                                    point.attributes().any(|attribute| {
+                                        attribute.key.as_str() == "api_key"
+                                            && attribute.value == opentelemetry::Value::I64(api_key)
+                                    })
+                                })
+                                .count(),
+                        ),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .sum()
+    }
+
+    /// **The reason the stamp is not an `inspect`.**
+    ///
+    /// `write_all` and `flush` both return through `?`, so a stamp hung off
+    /// `inspect` records on the ok path only — and a write that fails after
+    /// seconds of backpressure is the sample #539 wants. This asserts the
+    /// failing write is timed, which is the arm an `inspect` would drop.
+    #[tokio::test]
+    async fn a_refused_write_is_still_timed() {
+        let exporter = InMemoryMetricExporterBuilder::new()
+            .with_temporality(Temporality::Delta)
+            .build();
+
+        let provider = SdkMeterProvider::builder()
+            .with_reader(
+                PeriodicReader::builder(exporter.clone())
+                    .with_interval(Duration::from_millis(20))
+                    .build(),
+            )
+            .build();
+
+        global::set_meter_provider(provider.clone());
+
+        let service: TcpBytesService<EchoBytes, ()> = TcpBytesService {
+            inner: EchoBytes,
+            _state: PhantomData,
+        };
+
+        let api_key = i64::from(ProduceRequest::KEY);
+        let attributes = [KeyValue::new("api_key", api_key)];
+
+        assert!(
+            service
+                .write(
+                    &mut BrokenPipe,
+                    Bytes::from_static(b"a response"),
+                    &attributes
+                )
+                .await
+                .is_err(),
+            "a refused write has to propagate"
+        );
+
+        provider.force_flush().expect("flush");
+
+        assert_eq!(
+            1,
+            labelled_points(&exporter, "tansu_response_write_duration", api_key),
+            "the failing write was not timed"
+        );
+    }
 
     /// A frame is labelled by the API it actually is, and anything that is not a
     /// known request is not labelled with its first two bytes (#410).
