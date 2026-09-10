@@ -44,9 +44,12 @@ use std::{
 use opentelemetry::{KeyValue, metrics::Gauge};
 use uuid::Uuid;
 
+use object_store::path::Path;
+
 use super::{
-    CachedWatermark, HeldLease, OffsetHint, OptiCon, PrefixIndex, RetiredPrefixCache,
-    SegmentReadTrace, ServedEnd, Topic, TopicIndex, TopicMetadata, TopicRouting, Watermark,
+    CachedWatermark, GroupOffsets, HeldLease, OffsetHint, OptiCon, PrefixIndex, ProducerDetail,
+    ProducerId, RetiredPrefixCache, SegmentReadTrace, ServedEnd, Topic, TopicIndex, TopicMetadata,
+    TopicRouting, Watermark,
 };
 use crate::{Error, METER, Result, Topition};
 
@@ -1134,5 +1137,89 @@ impl PrefixLocks {
     pub(super) fn read_sync(&self, prefix: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
         self.read_sync
             .write(|locks| locks.entry(prefix.to_owned()).or_default().clone())
+    }
+}
+
+/// The optimistic-concurrency handle caches keyed by a *client's* identity: a
+/// producer id, a group id.
+///
+/// # Bound
+///
+/// Neither is swept, and both are bounded by the number of producers and groups
+/// this process has served since it started — which is the same denominator
+/// `tansu_meta_producers` reports for the durable table, and for the same reason
+/// (#283, #543): a connector restart mints a new producer id, so the level is
+/// the reconnect count, not the concurrency. A handle holds a path, an etag and
+/// a cached document, so the group is small next to the topic and prefix ones —
+/// which is why it is measured here first and evicted only if the measurement
+/// says to.
+#[derive(Clone, Debug, Default)]
+pub(super) struct ClientCaches {
+    /// Per-producer optimistic-concurrency handle on `producers/{id}.json`,
+    /// holding that producer's idempotent sequence state. Sharding the sequence
+    /// CAS per producer (instead of CASing the single cluster-global `meta`
+    /// object on every idempotent batch) removes the cross-producer contention
+    /// that serialised every `acks=all`/Debezium producer on GCS (#13). The
+    /// linearizable CAS is kept, so the exact `OutOfOrderSequenceNumber` /
+    /// `DuplicateSequenceNumber` / `ProducerFenced` semantics are preserved.
+    producers: LockedMap<ProducerId, OptiCon<ProducerDetail>>,
+
+    /// Per-group optimistic-concurrency handle on `offsets.json` (#406), so the
+    /// conditional GET a commit pays is served from a memoized etag rather than a
+    /// body read on every commit.
+    group_offsets: LockedMap<String, OptiCon<GroupOffsets>>,
+}
+
+impl ClientCaches {
+    /// The handle on `producer_id`'s `producers/{id}.json`, allocating one on
+    /// first use.
+    pub(super) fn producer(
+        &self,
+        cluster: &str,
+        producer_id: ProducerId,
+    ) -> Result<OptiCon<ProducerDetail>> {
+        self.producers.write(|producers| {
+            producers
+                .entry(producer_id)
+                .or_insert_with(|| OptiCon::<ProducerDetail>::new(cluster, producer_id))
+                .to_owned()
+        })
+    }
+
+    /// The handle on a group's `offsets.json` under `prefix`, allocating one on
+    /// first use.
+    pub(super) fn group_offsets(
+        &self,
+        group_id: &str,
+        prefix: &Path,
+    ) -> Result<OptiCon<GroupOffsets>> {
+        self.group_offsets.write(|offsets| {
+            offsets
+                .entry(group_id.to_owned())
+                .or_insert_with(|| OptiCon::path(Path::from(format!("{prefix}/offsets.json"))))
+                .clone()
+        })
+    }
+
+    /// Drop a deleted group's `offsets.json` handle.
+    ///
+    /// Not for correctness: a retained handle would self-heal a stale etag
+    /// against a re-created group — the conditional PUT fails its precondition
+    /// and re-reads — but the map would otherwise grow with group churn, and #45
+    /// measured ~15k orphaned groups accumulating.
+    pub(super) fn forget_group(&self, group_id: &str) {
+        self.group_offsets.evict(|offsets| {
+            _ = offsets.remove(group_id);
+        });
+    }
+
+    /// Record what each map holds (#554).
+    pub(super) fn record_occupancy(&self) {
+        for (cache, entries) in [
+            ("producers", self.producers.len()),
+            ("group_offsets", self.group_offsets.len()),
+        ] {
+            CACHE_ENTRIES.record(entries as u64, &[KeyValue::new("cache", cache)]);
+        }
     }
 }

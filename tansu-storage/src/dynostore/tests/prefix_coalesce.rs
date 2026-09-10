@@ -3431,7 +3431,7 @@ async fn leaseless_steps_over_footerless_segment_object() -> Result<(), Error> {
 #[tokio::test]
 async fn default_compaction_target_bytes_is_modest() {
     let store = DynoStore::new(CLUSTER, NODE, InMemory::new());
-    assert_eq!(16 << 20, store.prefix_compact_target_bytes);
+    assert_eq!(16 << 20, store.tuning.prefix_compact_target_bytes);
 }
 
 /// One footer entry as an external reader coded from the doc would recover it:
