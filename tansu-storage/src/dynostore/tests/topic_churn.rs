@@ -156,8 +156,8 @@ async fn exercise(storage: &DynoStore, name: &str, id: Uuid) -> Result<()> {
 /// names: the acceptance criterion is that *no* map keeps an entry, so a test
 /// that enumerates the maps it checks stops covering the next map added — which
 /// is exactly how `topic_ids` and `routing_prefixes` went unswept for a release
-/// (#554). Adding a map to `TopicCaches` now widens these assertions by
-/// construction, and a map the eviction does not reach fails them.
+/// (#554). The inventory is the same list the occupancy gauge is recorded from,
+/// so a map left out of it is a missing metric too.
 fn cached(storage: &DynoStore) -> [(&'static str, usize); 8] {
     storage.topics.occupancy()
 }

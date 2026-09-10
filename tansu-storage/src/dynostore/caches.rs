@@ -137,10 +137,11 @@ where
 
     /// Mutate under the lock, doing nothing if it is poisoned.
     ///
-    /// For eviction, which is opportunistic by construction: it drops entries
-    /// whose authority is in the object store, so a skipped drop costs a re-read
-    /// and the next sweep retries.
-    fn evict(&self, f: impl FnOnce(&mut BTreeMap<K, V>)) {
+    /// For the memo writes and the evictions, which are opportunistic by
+    /// construction: every entry's authority is in the object store, so a
+    /// skipped write or a skipped drop costs a re-read and the next caller
+    /// retries.
+    fn try_write(&self, f: impl FnOnce(&mut BTreeMap<K, V>)) {
         if let Ok(mut locked) = self.0.lock() {
             f(&mut locked);
         }
@@ -487,7 +488,7 @@ impl TopicCaches {
 
     /// Memoize a resolved `topic-ids/{uuid}.json` pointer.
     pub(super) fn remember_topic_id(&self, id: Uuid, topic: Topic) {
-        self.ids.evict(|ids| {
+        self.ids.try_write(|ids| {
             _ = ids.insert(id, topic);
         });
     }
@@ -501,7 +502,7 @@ impl TopicCaches {
     /// [`Self::routing`] for why that is only safe while [`Self::forget`] ends
     /// it.
     pub(super) fn remember_routing(&self, topic: Topic, pinned: TopicRouting) {
-        self.routing.evict(|routing| {
+        self.routing.try_write(|routing| {
             _ = routing.insert(topic, pinned);
         });
     }
@@ -519,7 +520,7 @@ impl TopicCaches {
 
     /// Memoize a `cleanup.policy` verdict, stamped now.
     pub(super) fn remember_compacted(&self, topic: Topic, compacted: bool) {
-        self.compacted.evict(|memo| {
+        self.compacted.try_write(|memo| {
             _ = memo.insert(topic, (compacted, SystemTime::now()));
         });
     }
@@ -610,31 +611,32 @@ impl TopicCaches {
     /// lock here could put a second sequence authority on a prefix a sibling topic
     /// is still producing to.
     pub(super) fn forget(&self, topic: &str) {
-        self.metas.evict(|metas| {
+        self.metas.try_write(|metas| {
             _ = metas.remove(topic);
         });
 
-        self.routing.evict(|routing| {
+        self.routing.try_write(|routing| {
             _ = routing.remove(topic);
         });
 
-        self.compacted.evict(|compacted| {
+        self.compacted.try_write(|compacted| {
             _ = compacted.remove(topic);
         });
 
-        self.ids.evict(|ids| ids.retain(|_, name| name != topic));
+        self.ids
+            .try_write(|ids| ids.retain(|_, name| name != topic));
 
         self.watermarks
-            .evict(|watermarks| watermarks.retain(|topition, _| topition.topic() != topic));
+            .try_write(|watermarks| watermarks.retain(|topition, _| topition.topic() != topic));
 
         self.next_offsets
-            .evict(|hints| hints.retain(|topition, _| topition.topic() != topic));
+            .try_write(|hints| hints.retain(|topition, _| topition.topic() != topic));
 
         self.coalesced_watermarks
-            .evict(|cached| cached.retain(|topition, _| topition.topic() != topic));
+            .try_write(|cached| cached.retain(|topition, _| topition.topic() != topic));
 
         self.truncate_floors
-            .evict(|floors| floors.retain(|topition, _| topition.topic() != topic));
+            .try_write(|floors| floors.retain(|topition, _| topition.topic() != topic));
     }
 
     /// Drop every entry for a topic outside `live`, returning the names dropped
@@ -682,24 +684,14 @@ impl TopicCaches {
     /// instead of being papered over. Every one is a `len()`, so the gauges cost
     /// nothing even at 14.7k topics.
     pub(super) fn record_occupancy(&self) -> (usize, usize) {
-        let topics = self.metas.len();
-        let partitions = self.watermarks.len();
+        let occupancy = self.occupancy();
 
-        for (cache, entries) in [
-            ("topic_metas", topics),
-            ("topic_ids", self.ids.len()),
-            ("routing_prefixes", self.routing.len()),
-            ("compacted_topics", self.compacted.len()),
-            ("watermarks", partitions),
-            ("next_offsets", self.next_offsets.len()),
-            (
-                "coalesced_watermark_floors",
-                self.coalesced_watermarks.len(),
-            ),
-            ("truncate_floors", self.truncate_floors.len()),
-        ] {
+        for (cache, entries) in occupancy {
             CACHE_ENTRIES.record(entries as u64, &[KeyValue::new("cache", cache)]);
         }
+
+        let topics = self.metas.len();
+        let partitions = self.watermarks.len();
 
         TOPIC_CACHE_TOPICS.record(topics as u64, &[]);
         TOPIC_CACHE_PARTITIONS.record(partitions as u64, &[]);
@@ -711,7 +703,7 @@ impl TopicCaches {
     /// exercise the stale-hint read path without sleeping out the TTL.
     #[cfg(test)]
     pub(super) fn age_hints(&self, at: SystemTime) {
-        self.next_offsets.evict(|hints| {
+        self.next_offsets.try_write(|hints| {
             for hint in hints.values_mut() {
                 hint.listed_at = Some(at);
             }
@@ -723,23 +715,21 @@ impl TopicCaches {
     /// which is a different read path from a stale listing.
     #[cfg(test)]
     pub(super) fn age_hint(&self, topition: &Topition, at: SystemTime) {
-        self.next_offsets.evict(|hints| {
+        self.next_offsets.try_write(|hints| {
             if let Some(hint) = hints.get_mut(topition) {
                 hint.listed_at = hint.listed_at.map(|_| at);
             }
         });
     }
 
-    /// Every map's entry count, as
-    /// `(metas, ids, routing, compacted, watermarks, next_offsets,
-    /// coalesced_watermarks, truncate_floors)` — the whole of what this type
-    /// holds, for the tests that assert a deleted topic leaves nothing behind.
+    /// Every map's entry count, named — the whole inventory of what this type
+    /// holds.
     ///
-    /// A tuple of all eight rather than a per-map accessor: the acceptance
-    /// criterion is that *no* map keeps an entry, and a test that names the maps
-    /// it checks is a test that silently stops covering the next one added
-    /// (#554).
-    #[cfg(test)]
+    /// One list, feeding both the gauge and the tests that assert a deleted
+    /// topic leaves nothing behind. A map added to the group and not added here
+    /// is then a *missing metric* as well as an untested one, which is the
+    /// nearest thing to "cannot be forgotten" that a struct of eight differently
+    /// typed maps allows (#554).
     pub(super) fn occupancy(&self) -> [(&'static str, usize); 8] {
         [
             ("topic_metas", self.metas.len()),
@@ -780,7 +770,7 @@ fn retain_live_in<K, V, F>(
     K: Ord,
     F: for<'a> Fn(&'a K, &'a V) -> &'a str,
 {
-    cache.evict(|entries| {
+    cache.try_write(|entries| {
         entries.retain(|key, value| {
             let topic = topic_of(key, value);
 
@@ -954,14 +944,14 @@ impl PrefixCaches {
 
     /// Record an acquired or renewed compaction lease term.
     pub(super) fn hold_lease(&self, prefix: &str, held: HeldLease) {
-        self.leases.evict(|leases| {
+        self.leases.try_write(|leases| {
             _ = leases.insert(prefix.to_owned(), held);
         });
     }
 
     /// Forget a lease term this process has been fenced out of.
     pub(super) fn drop_lease(&self, prefix: &str) {
-        self.leases.evict(|leases| {
+        self.leases.try_write(|leases| {
             _ = leases.remove(prefix);
         });
     }
@@ -1208,7 +1198,7 @@ impl ClientCaches {
     /// and re-reads — but the map would otherwise grow with group churn, and #45
     /// measured ~15k orphaned groups accumulating.
     pub(super) fn forget_group(&self, group_id: &str) {
-        self.group_offsets.evict(|offsets| {
+        self.group_offsets.try_write(|offsets| {
             _ = offsets.remove(group_id);
         });
     }
