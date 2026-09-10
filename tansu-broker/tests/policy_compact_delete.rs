@@ -16,12 +16,6 @@
 // engine this fork ships. The gate was on `mod in_memory` until #552 dissolved
 // it; with the module gone it belongs to the file.
 #![cfg(feature = "dynostore")]
-// `compact_only` below is one create-produce-maintain-fetch scenario written
-// out inline, and it is long: #555's gates measure shipped code, and the
-// length here is the number of protocol exchanges the case walks. #553 turns
-// it into a row of the driver the `compact,delete` cases already use, which is
-// when the allows come out.
-#![allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -72,6 +66,16 @@ const TIMEOUT_MS: i32 = 5_000;
 /// the log's end — a truncated response and a compacted one are the same shape
 /// to [`fetched`], and only one of them is what a case is asserting.
 const MAX_BYTES: i32 = 64 * 1024;
+
+/// One record header, on every record every case produces.
+///
+/// Headers are not what any case here is about, and no case varies them: they
+/// are here so that the produce-maintain-fetch path a case walks carries one,
+/// and [`fetched`] asserts it survived. `compact_only` was the only test in
+/// the tree that put a header on the wire before #553, and it never looked at
+/// it again.
+const HEADER_KEY: &[u8] = b"x";
+const HEADER_VALUE: &[u8] = b"y";
 
 const ALPHA: &[u8] = b"alpha";
 const BETA: &[u8] = b"beta";
@@ -197,7 +201,12 @@ async fn produce_keyed(
         .record(
             Record::builder()
                 .key(Some(Bytes::from_static(key)))
-                .value(Some(Bytes::from_static(value))),
+                .value(Some(Bytes::from_static(value)))
+                .header(
+                    Header::builder()
+                        .key(Bytes::from_static(HEADER_KEY))
+                        .value(Bytes::from_static(HEADER_VALUE)),
+                ),
         )
         .build()
         .map(|batch| inflated::Frame {
@@ -351,6 +360,14 @@ async fn fetched(
         let batch = inflated::Batch::try_from(deflated)?;
 
         for record in &batch.records {
+            assert_eq!(
+                vec![Header {
+                    key: Some(Bytes::from_static(HEADER_KEY)),
+                    value: Some(Bytes::from_static(HEADER_VALUE)),
+                }],
+                record.headers,
+            );
+
             records.push((
                 record.key.clone(),
                 record.value.clone(),
@@ -379,6 +396,27 @@ fn survivors(expected: &[(&'static [u8], &'static [u8], i64)]) -> (i16, Vec<Fetc
     )
 }
 
+/// `(EARLIEST offset, LATEST offset)` for the one partition with records.
+///
+/// The three answers every case agrees on are asserted here rather than at
+/// each call: both queries succeed, `EARLIEST` carries `-1` because it is an
+/// offset lookup and not a timestamp one (#177), and `LATEST` carries a real
+/// record timestamp. What is left is the pair of numbers the cases differ on.
+///
+/// An emptied log answers `LATEST` with `-1` too, so the one case that empties
+/// a log asserts both queries itself.
+async fn log_bounds(broker: &Broker, name: &str) -> Result<(Option<i64>, Option<i64>)> {
+    let (error_code, earliest, timestamp) = list_offset(broker, name, ListOffset::Earliest).await?;
+    assert_eq!(i16::from(ErrorCode::None), error_code);
+    assert_eq!(Some(-1), timestamp);
+
+    let (error_code, latest, timestamp) = list_offset(broker, name, ListOffset::Latest).await?;
+    assert_eq!(i16::from(ErrorCode::None), error_code);
+    assert!(timestamp.is_some_and(|timestamp| timestamp > 0));
+
+    Ok((earliest, latest))
+}
+
 /// `cleanup.policy=compact,delete` at `retention`, as [`create_topic`] takes
 /// its configs.
 fn compact_delete(retention: Duration) -> [(&'static str, String); 2] {
@@ -388,442 +426,43 @@ fn compact_delete(retention: Duration) -> [(&'static str, String); 2] {
     ]
 }
 
+/// `compact` alone: the per-key pass keeps the newest value of the key and
+/// takes the two it supersedes.
+///
+/// This is the control the `compact,delete` cases are read against, and the
+/// two `ListOffsets` pairs around the pass are what it adds to them:
+/// compaction removes records without moving either end of the log. Kafka's
+/// rule is that only retention and `DeleteRecords` advance the log start, so
+/// `EARLIEST` stays at 0 over records that are no longer there, and `LATEST`
+/// stays at 3.
+///
+/// It asserted `EARLIEST == 2` while the legacy in-place compactor did the
+/// work: that rewrote the `records/` objects and advanced `watermark.low` with
+/// them, so the log start followed the surviving record. The per-key pass over
+/// segments does not, and is the conformant one, so the expectation moved
+/// rather than the engine.
 #[tokio::test]
 async fn compact_only() -> Result<()> {
     let _guard = init_tracing()?;
 
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
+    let (sc, broker, topic, topic_id) = broker_with_topic(&[(CLEANUP_POLICY, COMPACT)]).await?;
 
-    let sc = storage_container(cluster_id, broker_id).await?;
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
+    let now = SystemTime::now();
 
-    let broker = broker(sc.clone())?;
+    assert_eq!(0, produce_keyed(&broker, &topic, ALPHA, ONE, now).await?);
+    assert_eq!(1, produce_keyed(&broker, &topic, ALPHA, TWO, now).await?);
+    assert_eq!(2, produce_keyed(&broker, &topic, ALPHA, THREE, now).await?);
 
-    let topic_name = &alphanumeric_string(15)[..];
-    debug!(?topic_name);
+    assert_eq!((Some(0), Some(3)), log_bounds(&broker, &topic).await?);
 
-    let timeout = 5_000;
-    let num_partitions = 6;
-    let replication_factor = 0;
+    sc.maintain(now).await?;
 
-    let response = broker
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
-                .timeout_ms(timeout)
-                .validate_only(Some(false))
-                .topics(Some(
-                    [CreatableTopic::default()
-                        .num_partitions(num_partitions)
-                        .configs(Some(
-                            [CreatableTopicConfig::default()
-                                .name(CLEANUP_POLICY.into())
-                                .value(Some(COMPACT.into()))]
-                            .into(),
-                        ))
-                        .assignments(Some([].into()))
-                        .replication_factor(replication_factor)
-                        .name(topic_name.into())]
-                    .into(),
-                )),
-        )
-        .await?;
+    assert_eq!((Some(0), Some(3)), log_bounds(&broker, &topic).await?);
 
-    let topics = response.topics.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    assert_eq!(i16::from(ErrorCode::None), topics[0].error_code);
-
-    let topic_id = topics[0].topic_id.unwrap_or(NULL_TOPIC_ID);
-
-    let replica_id = -1;
-    let max_num_offsets = Some(6);
-    let current_leader_epoch = -1;
-    let isolation = Some(IsolationLevel::ReadUncommitted.into());
-
-    const KEY: Bytes = Bytes::from_static(b"alpha");
-
-    const ONE: Bytes = Bytes::from_static(b"one");
-
-    let frame = inflated::Batch::builder()
-        .record(
-            Record::builder().key(Some(KEY)).value(Some(ONE)).header(
-                Header::builder()
-                    .key(Bytes::from_static(b"x"))
-                    .value(Bytes::from_static(b"y")),
-            ),
-        )
-        .build()
-        .map(|batch| inflated::Frame {
-            batches: vec![batch],
-        })
-        .and_then(deflated::Frame::try_from)?;
-
-    let partition = 0;
-
-    let response = broker
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
-                .timeout_ms(timeout)
-                .acks(Ack::Leader.into())
-                .topic_data(Some(
-                    [TopicProduceData::default()
-                        .name(topic_name.into())
-                        .partition_data(Some(
-                            [PartitionProduceData::default()
-                                .index(partition)
-                                .records(Some(frame))]
-                            .into(),
-                        ))]
-                    .into(),
-                )),
-        )
-        .await
-        .inspect(|response| debug!("{response:?}"))?;
-
-    let topics = response.responses.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    assert_eq!(topic_name, topics[0].name);
-    let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
-    assert_eq!(1, partitions.len());
-    assert_eq!(partition, partitions[0].index);
-    assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
-    assert_eq!(0, partitions[0].base_offset);
-
-    const TWO: Bytes = Bytes::from_static(b"two");
-    let frame = inflated::Batch::builder()
-        .record(Record::builder().key(Some(KEY)).value(Some(TWO)))
-        .build()
-        .map(|batch| inflated::Frame {
-            batches: vec![batch],
-        })
-        .and_then(deflated::Frame::try_from)?;
-
-    let response = broker
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
-                .timeout_ms(timeout)
-                .acks(Ack::Leader.into())
-                .topic_data(Some(
-                    [TopicProduceData::default()
-                        .name(topic_name.into())
-                        .partition_data(Some(
-                            [PartitionProduceData::default()
-                                .index(partition)
-                                .records(Some(frame))]
-                            .into(),
-                        ))]
-                    .into(),
-                )),
-        )
-        .await
-        .inspect(|response| debug!("{response:?}"))?;
-
-    let topics = response.responses.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    assert_eq!(topic_name, topics[0].name);
-    let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
-    assert_eq!(1, partitions.len());
-    assert_eq!(partition, partitions[0].index);
-    assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
-    assert_eq!(1, partitions[0].base_offset);
-
-    const THREE: Bytes = Bytes::from_static(b"three");
-    let frame = inflated::Batch::builder()
-        .record(Record::builder().key(Some(KEY)).value(Some(THREE)))
-        .build()
-        .map(|batch| inflated::Frame {
-            batches: vec![batch],
-        })
-        .and_then(deflated::Frame::try_from)?;
-
-    let response = broker
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
-                .timeout_ms(timeout)
-                .acks(Ack::Leader.into())
-                .topic_data(Some(
-                    [TopicProduceData::default()
-                        .name(topic_name.into())
-                        .partition_data(Some(
-                            [PartitionProduceData::default()
-                                .index(partition)
-                                .records(Some(frame))]
-                            .into(),
-                        ))]
-                    .into(),
-                )),
-        )
-        .await
-        .inspect(|response| debug!("{response:?}"))?;
-
-    let topics = response.responses.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    assert_eq!(topic_name, topics[0].name);
-    let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
-    assert_eq!(1, partitions.len());
-    assert_eq!(partition, partitions[0].index);
-    assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
-    assert_eq!(2, partitions[0].base_offset);
-
-    debug!(phase = "pre: uncommitted earliest offset");
-    let timestamp = ListOffset::Earliest.try_into()?;
-
-    let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
-                .isolation_level(isolation)
-                .replica_id(replica_id)
-                .topics(Some(
-                    [ListOffsetsTopic::default()
-                        .name(topic_name.into())
-                        .partitions(Some(
-                            (0..num_partitions)
-                                .map(|partition_index| {
-                                    ListOffsetsPartition::default()
-                                        .partition_index(partition_index)
-                                        .max_num_offsets(max_num_offsets)
-                                        .timestamp(timestamp)
-                                        .current_leader_epoch(Some(current_leader_epoch))
-                                })
-                                .collect::<Vec<_>>(),
-                        ))]
-                    .into(),
-                )),
-        )
-        .await?;
-
-    let topics = response.topics.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    assert_eq!(topic_name, topics[0].name);
-    let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-    assert_eq!(num_partitions as usize, partitions.len());
-
-    assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
-    assert_eq!(Some(0), partitions[0].offset);
-    // EARLIEST carries no record timestamp (#177), so the wire value is the
-    // Kafka "unknown" sentinel, -1. The legacy `records/` path reported the tail
-    // object's mtime here instead — an object-store artifact, not a record
-    // timestamp, and not something Kafka answers an offset query with.
-    assert_eq!(Some(-1), partitions[0].timestamp);
-
-    for partition in partitions[1..].iter() {
-        assert_eq!(i16::from(ErrorCode::None), partition.error_code);
-        assert_eq!(Some(0), partition.offset);
-        assert_eq!(Some(-1), partition.timestamp);
-    }
-
-    debug!(phase = "pre: uncommitted latest offset");
-    let timestamp = ListOffset::Latest.try_into()?;
-
-    let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
-                .isolation_level(isolation)
-                .replica_id(replica_id)
-                .topics(Some(
-                    [ListOffsetsTopic::default()
-                        .name(topic_name.into())
-                        .partitions(Some(
-                            (0..num_partitions)
-                                .map(|partition_index| {
-                                    ListOffsetsPartition::default()
-                                        .partition_index(partition_index)
-                                        .max_num_offsets(max_num_offsets)
-                                        .timestamp(timestamp)
-                                        .current_leader_epoch(Some(current_leader_epoch))
-                                })
-                                .collect::<Vec<_>>(),
-                        ))]
-                    .into(),
-                )),
-        )
-        .await?;
-
-    let topics = response.topics.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    assert_eq!(topic_name, topics[0].name);
-    let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-    assert_eq!(num_partitions as usize, partitions.len());
-
-    assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
-    assert_eq!(Some(3), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
+    assert_eq!(
+        survivors(&[(ALPHA, THREE, 2)]),
+        fetched(&broker, &topic, topic_id, 0).await?
     );
-
-    for partition in partitions[1..].iter() {
-        assert_eq!(i16::from(ErrorCode::None), partition.error_code);
-        assert_eq!(Some(0), partition.offset);
-        assert_eq!(Some(-1), partition.timestamp);
-    }
-
-    debug!(phase = "maintenance");
-    sc.maintain(SystemTime::now()).await?;
-
-    debug!(phase = "post: uncommitted earliest offset");
-    let timestamp = ListOffset::Earliest.try_into()?;
-
-    let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
-                .isolation_level(isolation)
-                .replica_id(replica_id)
-                .topics(Some(
-                    [ListOffsetsTopic::default()
-                        .name(topic_name.into())
-                        .partitions(Some(
-                            (0..num_partitions)
-                                .map(|partition_index| {
-                                    ListOffsetsPartition::default()
-                                        .partition_index(partition_index)
-                                        .max_num_offsets(max_num_offsets)
-                                        .timestamp(timestamp)
-                                        .current_leader_epoch(Some(current_leader_epoch))
-                                })
-                                .collect::<Vec<_>>(),
-                        ))]
-                    .into(),
-                )),
-        )
-        .await?;
-
-    let topics = response.topics.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    assert_eq!(topic_name, topics[0].name);
-    let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-    assert_eq!(num_partitions as usize, partitions.len());
-
-    assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
-    // Compaction does not move the log start: it removes superseded records, it
-    // does not truncate the offset space, so EARLIEST stays at 0. Only retention
-    // and DeleteRecords advance the log start, which is Kafka's rule.
-    //
-    // This asserted 2 while the legacy in-place compactor did the work — it
-    // rewrote the `records/` objects and advanced `watermark.low` with them, so
-    // the log start followed the surviving record. The per-key pass over segments
-    // does not, and is the conformant one, so the expectation moves rather than
-    // the engine. Verified separately: the survivor keeps its original offset 2,
-    // offsets 0 and 1 remain as emptied batch headers, and the high watermark
-    // stays at 3.
-    assert_eq!(Some(0), partitions[0].offset);
-    // EARLIEST carries no record timestamp (#177): the wire value is Kafka's
-    // "unknown" sentinel, -1, not the tail object's mtime.
-    assert_eq!(Some(-1), partitions[0].timestamp);
-
-    for partition in partitions[1..].iter() {
-        assert_eq!(i16::from(ErrorCode::None), partition.error_code);
-        assert_eq!(Some(0), partition.offset);
-        assert_eq!(Some(-1), partition.timestamp);
-    }
-
-    debug!(phase = "post: uncommitted latest offset");
-    let timestamp = ListOffset::Latest.try_into()?;
-
-    let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
-                .isolation_level(isolation)
-                .replica_id(replica_id)
-                .topics(Some(
-                    [ListOffsetsTopic::default()
-                        .name(topic_name.into())
-                        .partitions(Some(
-                            (0..num_partitions)
-                                .map(|partition_index| {
-                                    ListOffsetsPartition::default()
-                                        .partition_index(partition_index)
-                                        .max_num_offsets(max_num_offsets)
-                                        .timestamp(timestamp)
-                                        .current_leader_epoch(Some(current_leader_epoch))
-                                })
-                                .collect::<Vec<_>>(),
-                        ))]
-                    .into(),
-                )),
-        )
-        .await?;
-
-    let topics = response.topics.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    assert_eq!(topic_name, topics[0].name);
-    let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-    assert_eq!(num_partitions as usize, partitions.len());
-
-    assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
-    assert_eq!(Some(3), partitions[0].offset);
-    assert!(
-        partitions[0]
-            .timestamp
-            .is_some_and(|timestamp| timestamp > 0)
-    );
-
-    for partition in partitions[1..].iter() {
-        assert_eq!(i16::from(ErrorCode::None), partition.error_code);
-        assert_eq!(Some(0), partition.offset);
-        assert_eq!(Some(-1), partition.timestamp);
-    }
-
-    let response = broker
-        .serve(
-            Context::default(),
-            FetchRequest::default()
-                .cluster_id(Some("".into()))
-                .replica_id(Some(-1))
-                .replica_state(Some(ReplicaState::default()))
-                .max_wait_ms(500)
-                .max_bytes(Some(4096))
-                .min_bytes(1)
-                .isolation_level(Some(1))
-                .session_id(Some(-1))
-                .session_epoch(Some(-1))
-                .topics(Some(vec![
-                    FetchTopic::default()
-                        .topic(Some(topic_name.into()))
-                        .topic_id(Some(topic_id))
-                        .partitions(Some(vec![
-                            FetchPartition::default()
-                                .partition(partition)
-                                .current_leader_epoch(Some(-1))
-                                .last_fetched_epoch(Some(-1))
-                                .log_start_offset(Some(0))
-                                .partition_max_bytes(4096),
-                        ])),
-                ]))
-                .forgotten_topics_data(Some([].into()))
-                .rack_id(Some("".into())),
-        )
-        .await?;
-
-    {
-        let batch = response
-            .responses
-            .and_then(|mut responses| responses.pop())
-            .and_then(|topic| topic.partitions)
-            .and_then(|mut partitions| partitions.pop())
-            .and_then(|partition_data| partition_data.records)
-            .and_then(|deflated| inflated::Frame::try_from(deflated).ok())
-            .map(|inflated| inflated.batches)
-            .and_then(|mut batches| batches.pop())
-            .unwrap_or_default();
-
-        assert_eq!(2, batch.base_offset);
-
-        assert_eq!(1, batch.records.len());
-
-        assert_eq!(Some(KEY), batch.records[0].key);
-        assert_eq!(Some(THREE), batch.records[0].value);
-        assert_eq!(0, batch.records[0].offset_delta);
-    }
 
     Ok(())
 }
@@ -866,15 +505,7 @@ async fn compact_delete_within_retention_keeps_the_latest_value() -> Result<()> 
         fetched(&broker, &topic, topic_id, 0).await?
     );
 
-    assert_eq!(
-        (i16::from(ErrorCode::None), Some(0), Some(-1)),
-        list_offset(&broker, &topic, ListOffset::Earliest).await?
-    );
-
-    let (error_code, offset, timestamp) = list_offset(&broker, &topic, ListOffset::Latest).await?;
-    assert_eq!(i16::from(ErrorCode::None), error_code);
-    assert_eq!(Some(3), offset);
-    assert!(timestamp.is_some_and(|timestamp| timestamp > 0));
+    assert_eq!((Some(0), Some(3)), log_bounds(&broker, &topic).await?);
 
     Ok(())
 }

@@ -12,13 +12,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// A golden fixture is a byte table, not a branch. #555's length gate is set
-// at the worst shipped function, and 39 of these bodies are the same fixture
-// `encode.rs` also holds; the allow comes out with #553's round-trip table.
-#![allow(clippy::too_many_lines)]
+//! Golden wire fixtures, each stated once and asserted in both directions.
+//!
+//! A fixture is a byte table captured off a real client or broker, paired with
+//! the value it decodes to. The pair is the assertion: the bytes decode to that
+//! value, and that value encodes back to those exact bytes.
+//!
+//! Until #553 the pair was split across three files. `decode.rs` held 79
+//! fixtures and asserted only the decode; `encode.rs` held 44, 43 of them
+//! byte-identical to a `decode.rs` table, and asserted only the encode;
+//! `codec.rs` held 46 more byte tables, 44 of them the same again, and asserted
+//! `encode(decode(bytes)) == bytes` without ever saying what the value in the
+//! middle was. Editing one copy and not the others left every file green while
+//! the round trip they were written for went untested. That is why the fixtures
+//! live here now, and why a one-direction fixture has to say which direction it
+//! is and why.
+//!
+//! Four shapes, in descending order of what they prove:
+//!
+//! - [`round_trip_request`] / [`round_trip_response`] — both directions. Use
+//!   these unless the fixture cannot.
+//! - [`request_encodes_to`] / [`response_encodes_to`] — the value carries a
+//!   field the version does not have, so the encoder drops it and the bytes
+//!   decode back to a *different* value.
+//! - [`re_encodes`] — bytes and back, with no value written down, for a body too
+//!   large to state as a literal.
 
 use bytes::Bytes;
 use common::init_tracing;
+use pretty_assertions::assert_eq;
 use tansu_sans_io::{
     AlterUserScramCredentialsRequest, ApiKey, Body, CreateAclsRequest, DescribeAclsRequest,
     DescribeConfigsResponse, DescribeTopicPartitionsRequest, DescribeTopicPartitionsResponse,
@@ -46,9 +68,82 @@ use tansu_sans_io::{
     offset_fetch_response::{OffsetFetchResponsePartition, OffsetFetchResponseTopic},
     record::{self, Record, deflated, inflated},
 };
-use tracing::debug;
 
 pub mod common;
+
+/// Asserts that `encoded` decodes to `decoded`, and that `decoded` encodes back
+/// to `encoded`.
+fn round_trip_request(encoded: &[u8], decoded: Frame) -> Result<()> {
+    assert_eq!(decoded, Frame::request_from_bytes(encoded)?);
+
+    let Frame { header, body, .. } = decoded;
+    assert_eq!(encoded, &Frame::request(header, body)?[..]);
+
+    Ok(())
+}
+
+/// [`round_trip_request`] for a response, which carries neither its API key nor
+/// its version on the wire and so takes both from the caller.
+fn round_trip_response(
+    encoded: &[u8],
+    decoded: Frame,
+    api_key: i16,
+    api_version: i16,
+) -> Result<()> {
+    assert_eq!(
+        decoded,
+        Frame::response_from_bytes(encoded, api_key, api_version)?
+    );
+
+    let Frame { header, body, .. } = decoded;
+    assert_eq!(
+        encoded,
+        &Frame::response(header, body, api_key, api_version)?[..]
+    );
+
+    Ok(())
+}
+
+/// Asserts the encode direction alone, for a value that does not survive the
+/// decode: it sets a field the version does not have, the encoder drops it, and
+/// what comes back is the value without it.
+fn request_encodes_to(header: Header, body: Body, encoded: &[u8]) -> Result<()> {
+    assert_eq!(encoded, &Frame::request(header, body)?[..]);
+
+    Ok(())
+}
+
+/// [`request_encodes_to`] for a response.
+fn response_encodes_to(
+    header: Header,
+    body: Body,
+    api_key: i16,
+    api_version: i16,
+    encoded: &[u8],
+) -> Result<()> {
+    assert_eq!(
+        encoded,
+        &Frame::response(header, body, api_key, api_version)?[..]
+    );
+
+    Ok(())
+}
+
+/// Asserts that `encoded` survives a decode and an encode, without saying what
+/// it decodes to.
+///
+/// This is the weakest of the three and is here for bodies whose value literal
+/// would be longer than the capture: it pins that the two directions agree, not
+/// that either of them is right.
+fn re_encodes(encoded: &[u8], api_key: i16, api_version: i16) -> Result<()> {
+    assert_eq!(
+        encoded,
+        &Frame::response_from_bytes(encoded, api_key, api_version)
+            .and_then(|frame| Frame::response(frame.header, frame.body, api_key, api_version))?[..]
+    );
+
+    Ok(())
+}
 
 #[test]
 fn sasl_handshake_request_v0_000() -> Result<()> {
@@ -61,21 +156,21 @@ fn sasl_handshake_request_v0_000() -> Result<()> {
     let actual = Frame::request_from_bytes(&v[..])?;
     assert!(actual.maximum_allocation_size()? >= v.len());
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 36,
             header: Header::Request {
                 api_key: 17,
                 api_version: 0,
                 correlation_id: 1,
-                client_id: Some("aiokafka-producer-1".into())
+                client_id: Some("aiokafka-producer-1".into()),
             },
             body: Body::SaslHandshakeRequest(
-                SaslHandshakeRequest::default().mechanism("PLAIN".into())
-            )
+                SaslHandshakeRequest::default().mechanism("PLAIN".into()),
+            ),
         },
-        actual
-    );
+    )?;
 
     Ok(())
 }
@@ -92,14 +187,15 @@ fn create_acls_request_v3_000() -> Result<()> {
     let actual = Frame::request_from_bytes(&v[..])?;
     assert!(actual.maximum_allocation_size()? >= v.len());
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 48,
             header: Header::Request {
                 api_key: 30,
                 api_version: 3,
                 correlation_id: 3,
-                client_id: Some("adminclient-1".into())
+                client_id: Some("adminclient-1".into()),
             },
             body: Body::CreateAclsRequest(
                 CreateAclsRequest::default().creations(Some(
@@ -111,12 +207,11 @@ fn create_acls_request_v3_000() -> Result<()> {
                         .host("*".into())
                         .operation(4)
                         .permission_type(3)]
-                    .into()
-                ))
-            )
+                    .into(),
+                )),
+            ),
         },
-        actual
-    );
+    )?;
 
     Ok(())
 }
@@ -137,14 +232,15 @@ fn describe_acls_request_v3_000() -> Result<()> {
         v.len()
     );
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 32,
             header: Header::Request {
                 api_key: 29,
                 api_version: 3,
                 correlation_id: 3,
-                client_id: Some("adminclient-1".into())
+                client_id: Some("adminclient-1".into()),
             },
             body: Body::DescribeAclsRequest(
                 DescribeAclsRequest::default()
@@ -154,11 +250,10 @@ fn describe_acls_request_v3_000() -> Result<()> {
                     .principal_filter(None)
                     .host_filter(None)
                     .operation(1)
-                    .permission_type(1)
-            )
+                    .permission_type(1),
+            ),
         },
-        actual
-    );
+    )?;
 
     Ok(())
 }
@@ -195,14 +290,15 @@ fn alter_scram_user_credentials_request_v0_000() -> Result<()> {
     let salt_2 = Bytes::from_static(b"1gnpu9n89skv26ktipwuvm3zt1");
     let salted_password_2 = Bytes::from_static(b"\x1e\x89^f\x14\xb4\xe1\x9b\xa9~O\xf8\xd9\x9d\xc7\xc6\x8ba\x92A<\x8e*\xd6\x8b\x8d\xa6\x9f5,\x88\xe54u\x98\xedi\xe7\xd8\xfa\xb5M\xb4\xc2\xc9g\xd0\x8eW\xd0\xa7\x07\xf0,\x97j\x8b\x8c\xb6\x90ab\xa2\x18");
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 203,
             header: Header::Request {
                 api_key: 51,
                 api_version: 0,
                 correlation_id: 3,
-                client_id: Some("adminclient-1".into())
+                client_id: Some("adminclient-1".into()),
             },
             body: Body::AlterUserScramCredentialsRequest(
                 AlterUserScramCredentialsRequest::default()
@@ -220,14 +316,13 @@ fn alter_scram_user_credentials_request_v0_000() -> Result<()> {
                                 .mechanism(1)
                                 .iterations(8192)
                                 .salt(salt_1)
-                                .salted_password(salted_password_1)
+                                .salted_password(salted_password_1),
                         ]
-                        .into()
-                    ))
-            )
+                        .into(),
+                    )),
+            ),
         },
-        actual
-    );
+    )?;
 
     Ok(())
 }
@@ -241,19 +336,19 @@ fn api_versions_request_v0_000() -> Result<()> {
         46, 49, 50, 46, 48,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 25,
             header: Header::Request {
                 api_key: 18,
                 api_version: 0,
                 correlation_id: 1,
-                client_id: Some("aiokafka-0.12.0".into())
+                client_id: Some("aiokafka-0.12.0".into()),
             },
-            body: Body::ApiVersionsRequest(ApiVersionsRequest::default())
+            body: Body::ApiVersionsRequest(ApiVersionsRequest::default()),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -268,7 +363,8 @@ fn api_versions_request_v3_000() -> Result<()> {
         97, 45, 106, 97, 118, 97, 6, 51, 46, 54, 46, 49, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 52,
             header: Header::Request {
@@ -281,10 +377,9 @@ fn api_versions_request_v3_000() -> Result<()> {
                 ApiVersionsRequest::default()
                     .client_software_name(Some("apache-kafka-java".into()))
                     .client_software_version(Some("3.6.1".into())),
-            )
+            ),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -305,7 +400,8 @@ fn api_versions_response_v1_000() -> Result<()> {
         0, 0, 0, 0, 37, 0, 0, 0, 0, 0, 0, 0, 0,
     ];
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 242,
             header: Header::Response { correlation_id: 0 },
@@ -352,13 +448,14 @@ fn api_versions_response_v1_000() -> Result<()> {
                             ApiVersion::default().api_key(36),
                             ApiVersion::default().api_key(37),
                         ]
-                        .into()
+                        .into(),
                     ))
                     .throttle_time_ms(Some(0)),
             ),
         },
-        Frame::response_from_bytes(&v[..], ApiVersionsResponse::KEY, 1)?
-    );
+        ApiVersionsResponse::KEY,
+        1,
+    )?;
 
     Ok(())
 }
@@ -387,7 +484,8 @@ fn api_versions_response_v3_000() -> Result<()> {
         101, 114, 115, 105, 111, 110, 0, 14, 0, 14, 0,
     ];
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 457,
             header: Header::Response { correlation_id: 0 },
@@ -397,14 +495,14 @@ fn api_versions_response_v3_000() -> Result<()> {
                         FinalizedFeatureKey::default()
                             .name("metadata.version".into())
                             .min_version_level(14)
-                            .max_version_level(14)
+                            .max_version_level(14),
                     ]))
                     .finalized_features_epoch(Some(76i64))
                     .supported_features(Some(vec![
                         SupportedFeatureKey::default()
                             .name("metadata.version".into())
                             .min_version(1)
-                            .max_version(14)
+                            .max_version(14),
                     ]))
                     .api_keys(Some(
                         [
@@ -464,13 +562,14 @@ fn api_versions_response_v3_000() -> Result<()> {
                             ApiVersion::default().api_key(65),
                             ApiVersion::default().api_key(66),
                         ]
-                        .into()
+                        .into(),
                     ))
-                    .throttle_time_ms(Some(0))
-            )
+                    .throttle_time_ms(Some(0)),
+            ),
         },
-        Frame::response_from_bytes(&v[..], ApiVersionsResponse::KEY, 3)?
-    );
+        ApiVersionsResponse::KEY,
+        3,
+    )?;
 
     Ok(())
 }
@@ -493,7 +592,8 @@ fn create_topics_request_v7_000() -> Result<()> {
     let timeout_ms = 30_000;
     let validate_only = Some(false);
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 73,
             header: Header::Request {
@@ -513,16 +613,15 @@ fn create_topics_request_v7_000() -> Result<()> {
                             [CreatableTopicConfig::default()
                                 .name("cleanup.policy".into())
                                 .value(Some("compact".into()))]
-                            .into()
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
                 .timeout_ms(timeout_ms)
                 .validate_only(validate_only)
                 .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -744,11 +843,7 @@ fn create_topics_response_v7_000() -> Result<()> {
             .into(),
     };
 
-    assert_eq!(
-        frame,
-        Frame::response_from_bytes(&encoded[..], api_key, api_version)
-            .inspect(|frame| debug!(?frame))?
-    );
+    round_trip_response(&encoded[..], frame, api_key, api_version)?;
 
     Ok(())
 }
@@ -765,27 +860,27 @@ fn delete_topics_request_v6_000() -> Result<()> {
         0, 0, 0, 0, 117, 48, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 52,
             header: Header::Request {
                 api_key: 20,
                 api_version: 6,
                 correlation_id: 4,
-                client_id: Some("adminclient-1".into())
+                client_id: Some("adminclient-1".into()),
             },
             body: DeleteTopicsRequest::default()
                 .topics(Some(
                     [DeleteTopicState::default()
                         .name(Some("test".into()))
                         .topic_id([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])]
-                    .into()
+                    .into(),
                 ))
                 .timeout_ms(30000)
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -801,21 +896,21 @@ fn describe_cluster_request_v1_000() -> Result<()> {
         110, 116, 45, 49, 0, 0, 1, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 27,
             header: Header::Request {
                 api_key: 60,
                 api_version: 1,
                 correlation_id: 7,
-                client_id: Some("adminclient-1".into())
+                client_id: Some("adminclient-1".into()),
             },
             body: DescribeClusterRequest::default()
                 .endpoint_type(Some(1))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -833,28 +928,28 @@ fn describe_configs_request_v4_000() -> Result<()> {
         110, 116, 45, 49, 0, 2, 2, 5, 116, 101, 115, 116, 0, 0, 0, 0, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 36,
             header: Header::Request {
                 api_key: 32,
                 api_version: 4,
                 correlation_id: 5,
-                client_id: Some("adminclient-1".into())
+                client_id: Some("adminclient-1".into()),
             },
             body: DescribeConfigsRequest::default()
                 .resources(Some(
                     [DescribeConfigsResource::default()
                         .resource_type(2)
                         .resource_name("test".into())]
-                    .into()
+                    .into(),
                 ))
                 .include_synonyms(Some(false))
                 .include_documentation(Some(false))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -872,28 +967,28 @@ fn describe_configs_request_v4_001() -> Result<()> {
         110, 116, 45, 49, 0, 2, 2, 9, 95, 115, 99, 104, 101, 109, 97, 115, 0, 0, 1, 0, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 40,
             header: Header::Request {
                 api_key: 32,
                 api_version: 4,
                 correlation_id: 3,
-                client_id: Some("adminclient-1".into())
+                client_id: Some("adminclient-1".into()),
             },
             body: DescribeConfigsRequest::default()
                 .resources(Some(
                     [DescribeConfigsResource::default()
                         .resource_type(2)
                         .resource_name("_schemas".into())]
-                    .into()
+                    .into(),
                 ))
                 .include_synonyms(Some(true))
                 .include_documentation(Some(false))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -911,32 +1006,37 @@ fn describe_configs_request_v4_002() -> Result<()> {
         110, 116, 45, 49, 0, 2, 2, 5, 116, 101, 115, 116, 0, 0, 0, 0, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 36,
             header: Header::Request {
                 api_key: 32,
                 api_version: 4,
                 correlation_id: 6,
-                client_id: Some("adminclient-1".into())
+                client_id: Some("adminclient-1".into()),
             },
             body: DescribeConfigsRequest::default()
                 .resources(Some(
                     [DescribeConfigsResource::default()
                         .resource_type(2)
                         .resource_name("test".into())]
-                    .into()
+                    .into(),
                 ))
                 .include_synonyms(Some(false))
                 .include_documentation(Some(false))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
 
+// A `DescribeConfigs` response lists every topic config, so the value literal
+// is one line per config and there are a hundred of them. Nothing here
+// branches; #555's gate measures branching code, and the two fixtures over it
+// are the only ones in this file.
+#[allow(clippy::too_many_lines)]
 #[test]
 fn describe_configs_response_v4_001() -> Result<()> {
     use tansu_sans_io::describe_configs_response::{
@@ -1064,7 +1164,8 @@ fn describe_configs_response_v4_001() -> Result<()> {
     let api_key = 32;
     let api_version = 4;
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 2330,
             header: Header::Response { correlation_id: 3 },
@@ -1085,7 +1186,7 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("compression.type".into())
                                             .value(Some("producer".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(2)),
                                 DescribeConfigsResourceResult::default()
@@ -1109,7 +1210,7 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("log.message.downconversion.enable".into())
                                             .value(Some("true".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(1)),
                                 DescribeConfigsResourceResult::default()
@@ -1121,7 +1222,7 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("min.insync.replicas".into())
                                             .value(Some("1".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(3)),
                                 DescribeConfigsResourceResult::default()
@@ -1139,7 +1240,7 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("log.local.retention.ms".into())
                                             .value(Some("-2".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(5)),
                                 DescribeConfigsResourceResult::default()
@@ -1151,7 +1252,7 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("log.cleanup.policy".into())
                                             .value(Some("delete".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(7)),
                                 DescribeConfigsResourceResult::default()
@@ -1175,7 +1276,7 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("compression.lz4.level".into())
                                             .value(Some("9".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(3)),
                                 DescribeConfigsResourceResult::default()
@@ -1191,9 +1292,9 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             DescribeConfigsSynonym::default()
                                                 .name("log.segment.bytes".into())
                                                 .value(Some("1073741824".into()))
-                                                .source(5)
+                                                .source(5),
                                         ]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(3)),
                                 DescribeConfigsResourceResult::default()
@@ -1211,7 +1312,7 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("compression.gzip.level".into())
                                             .value(Some("-1".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(3)),
                                 DescribeConfigsResourceResult::default()
@@ -1227,9 +1328,9 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             DescribeConfigsSynonym::default()
                                                 .name("log.flush.interval.messages".into())
                                                 .value(Some("9223372036854775807".into()))
-                                                .source(5)
+                                                .source(5),
                                         ]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(5)),
                                 DescribeConfigsResourceResult::default()
@@ -1241,7 +1342,7 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("compression.zstd.level".into())
                                             .value(Some("3".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(3)),
                                 DescribeConfigsResourceResult::default()
@@ -1253,7 +1354,7 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("log.message.format.version".into())
                                             .value(Some("3.0-IV1".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(2)),
                                 DescribeConfigsResourceResult::default()
@@ -1265,7 +1366,7 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("log.cleaner.max.compaction.lag.ms".into())
                                             .value(Some("9223372036854775807".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(5)),
                                 DescribeConfigsResourceResult::default()
@@ -1277,7 +1378,7 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("log.segment.delete.delay.ms".into())
                                             .value(Some("60000".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(5)),
                                 DescribeConfigsResourceResult::default()
@@ -1293,9 +1394,9 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             DescribeConfigsSynonym::default()
                                                 .name("message.max.bytes".into())
                                                 .value(Some("1048588".into()))
-                                                .source(5)
+                                                .source(5),
                                         ]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(3)),
                                 DescribeConfigsResourceResult::default()
@@ -1307,7 +1408,7 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("log.cleaner.min.compaction.lag.ms".into())
                                             .value(Some("0".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(5)),
                                 DescribeConfigsResourceResult::default()
@@ -1319,7 +1420,7 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("log.message.timestamp.type".into())
                                             .value(Some("CreateTime".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(2)),
                                 DescribeConfigsResourceResult::default()
@@ -1331,7 +1432,7 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("log.local.retention.bytes".into())
                                             .value(Some("-2".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(5)),
                                 DescribeConfigsResourceResult::default()
@@ -1343,7 +1444,7 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("log.preallocate".into())
                                             .value(Some("false".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(1)),
                                 DescribeConfigsResourceResult::default()
@@ -1355,7 +1456,7 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("log.cleaner.min.cleanable.ratio".into())
                                             .value(Some("0.5".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(6)),
                                 DescribeConfigsResourceResult::default()
@@ -1367,7 +1468,7 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("log.index.interval.bytes".into())
                                             .value(Some("4096".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(3)),
                                 DescribeConfigsResourceResult::default()
@@ -1379,7 +1480,7 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("unclean.leader.election.enable".into())
                                             .value(Some("false".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(1)),
                                 DescribeConfigsResourceResult::default()
@@ -1391,7 +1492,7 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("log.retention.bytes".into())
                                             .value(Some("-1".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(5)),
                                 DescribeConfigsResourceResult::default()
@@ -1403,7 +1504,7 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("log.cleaner.delete.retention.ms".into())
                                             .value(Some("86400000".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(5)),
                                 DescribeConfigsResourceResult::default()
@@ -1415,7 +1516,7 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("log.message.timestamp.after.max.ms".into())
                                             .value(Some("9223372036854775807".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(5)),
                                 DescribeConfigsResourceResult::default()
@@ -1427,7 +1528,7 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("log.message.timestamp.before.max.ms".into())
                                             .value(Some("9223372036854775807".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(5)),
                                 DescribeConfigsResourceResult::default()
@@ -1445,7 +1546,7 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("log.message.timestamp.difference.max.ms".into())
                                             .value(Some("9223372036854775807".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
                                     .config_type(Some(5)),
                                 DescribeConfigsResourceResult::default()
@@ -1457,22 +1558,28 @@ fn describe_configs_response_v4_001() -> Result<()> {
                                             .name("log.index.size.max.bytes".into())
                                             .value(Some("10485760".into()))
                                             .source(5)]
-                                        .into()
+                                        .into(),
                                     ))
-                                    .config_type(Some(3))
+                                    .config_type(Some(3)),
                             ]
-                            .into()
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
                 .into(),
         },
-        Frame::response_from_bytes(&v[..], api_key, api_version)?
-    );
+        api_key,
+        api_version,
+    )?;
 
     Ok(())
 }
 
+// A `DescribeConfigs` response lists every topic config, so the value literal
+// is one line per config and there are a hundred of them. Nothing here
+// branches; #555's gate measures branching code, and the two fixtures over it
+// are the only ones in this file.
+#[allow(clippy::too_many_lines)]
 #[test]
 fn describe_configs_response_v4_002() -> Result<()> {
     let _guard = init_tracing()?;
@@ -1548,7 +1655,8 @@ fn describe_configs_response_v4_002() -> Result<()> {
     let api_key = 32;
     let api_version = 4;
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 1359,
             header: Header::Response { correlation_id: 6 },
@@ -1921,16 +2029,17 @@ fn describe_configs_response_v4_002() -> Result<()> {
                                     .is_sensitive(false)
                                     .synonyms(Some([].into()))
                                     .config_type(Some(3))
-                                    .documentation(None)
+                                    .documentation(None),
                             ]
-                            .into()
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
-                .into()
+                .into(),
         },
-        Frame::response_from_bytes(&v[..], api_key, api_version)?
-    );
+        api_key,
+        api_version,
+    )?;
 
     Ok(())
 }
@@ -1945,7 +2054,8 @@ fn describe_groups_request_v1_000() -> Result<()> {
         0, 0, 0, 22, 0, 15, 0, 1, 0, 0, 0, 0, 255, 255, 0, 0, 0, 1, 0, 6, 97, 98, 99, 97, 98, 99,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 22,
             header: Header::Request {
@@ -1957,10 +2067,9 @@ fn describe_groups_request_v1_000() -> Result<()> {
             body: DescribeGroupsRequest::default()
                 .groups(Some(["abcabc".into()].into()))
                 .include_authorized_operations(None)
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -1975,7 +2084,8 @@ fn describe_groups_response_v1_000() -> Result<()> {
         0, 0, 0, 0, 0, 0, 0, 0,
     ];
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 32,
             header: Header::Response { correlation_id: 0 },
@@ -1990,12 +2100,13 @@ fn describe_groups_response_v1_000() -> Result<()> {
                         .protocol_data("".into())
                         .members(Some([].into()))
                         .authorized_operations(None)]
-                    .into()
+                    .into(),
                 ))
                 .into(),
         },
-        Frame::response_from_bytes(&v[..], DescribeGroupsResponse::KEY, 1)?
-    );
+        DescribeGroupsResponse::KEY,
+        1,
+    )?;
 
     Ok(())
 }
@@ -2012,7 +2123,8 @@ fn fetch_request_v6_000() -> Result<()> {
         1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 16, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 72,
             header: Header::Request {
@@ -2044,16 +2156,15 @@ fn fetch_request_v6_000() -> Result<()> {
                                 .log_start_offset(Some(0))
                                 .partition_max_bytes(4096)
                                 .replica_directory_id(None)]
-                            .into()
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
                 .forgotten_topics_data(None)
                 .rack_id(None)
                 .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -2075,14 +2186,15 @@ fn fetch_request_v12_000() -> Result<()> {
         0, 0, 0, 1, 1, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 162,
             header: Header::Request {
                 api_key: 1,
                 api_version: 12,
                 correlation_id: 8,
-                client_id: Some("console-consumer".into())
+                client_id: Some("console-consumer".into()),
             },
             body: FetchRequest::default()
                 .cluster_id(None)
@@ -2123,18 +2235,17 @@ fn fetch_request_v12_000() -> Result<()> {
                                     .last_fetched_epoch(Some(-1))
                                     .log_start_offset(Some(-1))
                                     .partition_max_bytes(1048576)
-                                    .replica_directory_id(None)
+                                    .replica_directory_id(None),
                             ]
-                            .into()
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
                 .forgotten_topics_data(Some([].into()))
                 .rack_id(Some("".into()))
                 .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -2176,14 +2287,15 @@ fn fetch_request_v15_000() -> Result<()> {
         255, 255, 255, 255, 0, 160, 0, 0, 0, 0, 1, 1, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 608,
             header: Header::Request {
                 api_key: 1,
                 api_version: 15,
                 correlation_id: 14,
-                client_id: Some("consumer-sub-000-Wt3ap4A-1".into())
+                client_id: Some("consumer-sub-000-Wt3ap4A-1".into()),
             },
             body: FetchRequest::default()
                 .cluster_id(None)
@@ -2200,7 +2312,7 @@ fn fetch_request_v15_000() -> Result<()> {
                         .topic(None)
                         .topic_id(Some([
                             139, 193, 249, 209, 188, 231, 73, 214, 186, 217, 20, 95, 74, 239, 160,
-                            61
+                            61,
                         ]))
                         .partitions(Some(
                             [
@@ -2331,18 +2443,17 @@ fn fetch_request_v15_000() -> Result<()> {
                                     .last_fetched_epoch(Some(-1))
                                     .log_start_offset(Some(-1))
                                     .partition_max_bytes(10485760)
-                                    .replica_directory_id(None)
+                                    .replica_directory_id(None),
                             ]
-                            .into()
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
                 .forgotten_topics_data(Some([].into()))
                 .rack_id(Some("".into()))
                 .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -2357,14 +2468,15 @@ fn fetch_request_v16_000() -> Result<()> {
         255, 255, 255, 255, 1, 1, 1, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &encoded[..],
         Frame {
             size: 52,
             header: Header::Request {
                 api_key: 1,
                 api_version: 16,
                 correlation_id: 12,
-                client_id: Some("console-consumer".into())
+                client_id: Some("console-consumer".into()),
             },
             body: FetchRequest::default()
                 .cluster_id(None)
@@ -2379,10 +2491,9 @@ fn fetch_request_v16_000() -> Result<()> {
                 .topics(Some([].into()))
                 .forgotten_topics_data(Some([].into()))
                 .rack_id(Some("".into()))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&encoded[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -2400,14 +2511,15 @@ fn fetch_request_v16_001() -> Result<()> {
         255, 255, 255, 255, 255, 0, 16, 0, 0, 0, 0, 1, 1, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &encoded[..],
         Frame {
             size: 103,
             header: Header::Request {
                 api_key: 1,
                 api_version: 16,
                 correlation_id: 8,
-                client_id: Some("console-consumer".into())
+                client_id: Some("console-consumer".into()),
             },
             body: FetchRequest::default()
                 .cluster_id(None)
@@ -2423,7 +2535,7 @@ fn fetch_request_v16_001() -> Result<()> {
                     [FetchTopic::default()
                         .topic(None)
                         .topic_id(Some([
-                            246, 177, 3, 16, 190, 12, 74, 195, 190, 197, 130, 25, 106, 235, 221, 30
+                            246, 177, 3, 16, 190, 12, 74, 195, 190, 197, 130, 25, 106, 235, 221, 30,
                         ]))
                         .partitions(Some(
                             [FetchPartition::default()
@@ -2434,16 +2546,15 @@ fn fetch_request_v16_001() -> Result<()> {
                                 .log_start_offset(Some(-1))
                                 .partition_max_bytes(1048576)
                                 .replica_directory_id(None)]
-                            .into()
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
                 .forgotten_topics_data(Some([].into()))
                 .rack_id(Some("".into()))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&encoded[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -2467,7 +2578,8 @@ fn fetch_response_v12_000() -> Result<()> {
         255, 255, 255, 255, 1, 255, 255, 255, 255, 1, 0, 0, 0,
     ];
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 135,
             header: Header::Response { correlation_id: 8 },
@@ -2516,17 +2628,18 @@ fn fetch_response_v12_000() -> Result<()> {
                                     .snapshot_id(None)
                                     .aborted_transactions(Some([].into()))
                                     .preferred_read_replica(Some(-1))
-                                    .records(None)
+                                    .records(None),
                             ]
-                            .into()
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
                 .node_endpoints(None)
-                .into()
+                .into(),
         },
-        Frame::response_from_bytes(&v[..], api_key, api_version)?
-    );
+        api_key,
+        api_version,
+    )?;
 
     Ok(())
 }
@@ -2552,7 +2665,8 @@ fn fetch_response_v12_001() -> Result<()> {
         0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 1, 0, 0, 0,
     ];
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 284,
             header: Header::Response { correlation_id: 8 },
@@ -2611,14 +2725,14 @@ fn fetch_response_v12_001() -> Result<()> {
                                                         timestamp_delta: 0,
                                                         offset_delta: 0,
                                                         key: Some(Bytes::from_static(&[
-                                                            97, 98, 99
+                                                            97, 98, 99,
                                                         ])),
                                                         value: Some(Bytes::from_static(&[
-                                                            112, 113, 114
+                                                            112, 113, 114,
                                                         ])),
-                                                        headers: [].into()
+                                                        headers: [].into(),
                                                     }]
-                                                    .into()
+                                                    .into(),
                                                 },
                                                 inflated::Batch {
                                                     base_offset: 1,
@@ -2639,19 +2753,19 @@ fn fetch_response_v12_001() -> Result<()> {
                                                         timestamp_delta: 0,
                                                         offset_delta: 0,
                                                         key: Some(Bytes::from_static(&[
-                                                            97, 98, 99
+                                                            97, 98, 99,
                                                         ])),
                                                         value: Some(Bytes::from_static(&[
-                                                            112, 113, 114
+                                                            112, 113, 114,
                                                         ])),
-                                                        headers: [].into()
+                                                        headers: [].into(),
                                                     }]
-                                                    .into()
-                                                }
+                                                    .into(),
+                                                },
                                             ]
-                                            .into()
+                                            .into(),
                                         }
-                                        .try_into()?
+                                        .try_into()?,
                                     )),
                                 PartitionData::default()
                                     .partition_index(2)
@@ -2664,17 +2778,18 @@ fn fetch_response_v12_001() -> Result<()> {
                                     .snapshot_id(None)
                                     .aborted_transactions(None)
                                     .preferred_read_replica(Some(-1))
-                                    .records(None)
+                                    .records(None),
                             ]
-                            .into()
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
                 .node_endpoints(None)
-                .into()
+                .into(),
         },
-        Frame::response_from_bytes(&v[..], api_key, api_version)?
-    );
+        api_key,
+        api_version,
+    )?;
 
     Ok(())
 }
@@ -2703,7 +2818,8 @@ fn fetch_response_v12_002() -> Result<()> {
         255, 255, 1, 255, 255, 255, 255, 1, 0, 0, 0,
     ];
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 320,
             header: Header::Response { correlation_id: 8 },
@@ -2751,7 +2867,7 @@ fn fetch_response_v12_002() -> Result<()> {
                                                         offset_delta: 0,
                                                         key: Some(Bytes::from_static(&[107, 49])),
                                                         value: Some(Bytes::from_static(&[118, 49])),
-                                                        headers: [].into()
+                                                        headers: [].into(),
                                                     },
                                                     Record {
                                                         length: 10,
@@ -2760,7 +2876,7 @@ fn fetch_response_v12_002() -> Result<()> {
                                                         offset_delta: 1,
                                                         key: Some(Bytes::from_static(&[107, 50])),
                                                         value: Some(Bytes::from_static(&[118, 50])),
-                                                        headers: [].into()
+                                                        headers: [].into(),
                                                     },
                                                     Record {
                                                         length: 10,
@@ -2769,7 +2885,7 @@ fn fetch_response_v12_002() -> Result<()> {
                                                         offset_delta: 2,
                                                         key: Some(Bytes::from_static(&[107, 49])),
                                                         value: Some(Bytes::from_static(&[118, 51])),
-                                                        headers: [].into()
+                                                        headers: [].into(),
                                                     },
                                                     Record {
                                                         length: 10,
@@ -2778,7 +2894,7 @@ fn fetch_response_v12_002() -> Result<()> {
                                                         offset_delta: 3,
                                                         key: Some(Bytes::from_static(&[107, 49])),
                                                         value: Some(Bytes::from_static(&[118, 52])),
-                                                        headers: [].into()
+                                                        headers: [].into(),
                                                     },
                                                     Record {
                                                         length: 10,
@@ -2787,7 +2903,7 @@ fn fetch_response_v12_002() -> Result<()> {
                                                         offset_delta: 4,
                                                         key: Some(Bytes::from_static(&[107, 51])),
                                                         value: Some(Bytes::from_static(&[118, 53])),
-                                                        headers: [].into()
+                                                        headers: [].into(),
                                                     },
                                                     Record {
                                                         length: 10,
@@ -2796,7 +2912,7 @@ fn fetch_response_v12_002() -> Result<()> {
                                                         offset_delta: 5,
                                                         key: Some(Bytes::from_static(&[107, 50])),
                                                         value: Some(Bytes::from_static(&[118, 54])),
-                                                        headers: [].into()
+                                                        headers: [].into(),
                                                     },
                                                     Record {
                                                         length: 10,
@@ -2805,7 +2921,7 @@ fn fetch_response_v12_002() -> Result<()> {
                                                         offset_delta: 6,
                                                         key: Some(Bytes::from_static(&[107, 52])),
                                                         value: Some(Bytes::from_static(&[118, 55])),
-                                                        headers: [].into()
+                                                        headers: [].into(),
                                                     },
                                                     Record {
                                                         length: 10,
@@ -2814,7 +2930,7 @@ fn fetch_response_v12_002() -> Result<()> {
                                                         offset_delta: 7,
                                                         key: Some(Bytes::from_static(&[107, 53])),
                                                         value: Some(Bytes::from_static(&[118, 56])),
-                                                        headers: [].into()
+                                                        headers: [].into(),
                                                     },
                                                     Record {
                                                         length: 10,
@@ -2823,7 +2939,7 @@ fn fetch_response_v12_002() -> Result<()> {
                                                         offset_delta: 8,
                                                         key: Some(Bytes::from_static(&[107, 53])),
                                                         value: Some(Bytes::from_static(&[118, 57])),
-                                                        headers: [].into()
+                                                        headers: [].into(),
                                                     },
                                                     Record {
                                                         length: 11,
@@ -2832,9 +2948,9 @@ fn fetch_response_v12_002() -> Result<()> {
                                                         offset_delta: 9,
                                                         key: Some(Bytes::from_static(&[107, 50])),
                                                         value: Some(Bytes::from_static(&[
-                                                            118, 49, 48
+                                                            118, 49, 48,
                                                         ])),
-                                                        headers: [].into()
+                                                        headers: [].into(),
                                                     },
                                                     Record {
                                                         length: 11,
@@ -2843,16 +2959,16 @@ fn fetch_response_v12_002() -> Result<()> {
                                                         offset_delta: 10,
                                                         key: Some(Bytes::from_static(&[107, 54])),
                                                         value: Some(Bytes::from_static(&[
-                                                            118, 49, 49
+                                                            118, 49, 49,
                                                         ])),
-                                                        headers: [].into()
-                                                    }
+                                                        headers: [].into(),
+                                                    },
                                                 ]
-                                                .into()
+                                                .into(),
                                             }]
-                                            .into()
+                                            .into(),
                                         }
-                                        .try_into()?
+                                        .try_into()?,
                                     )),
                                 PartitionData::default()
                                     .partition_index(1)
@@ -2877,17 +2993,18 @@ fn fetch_response_v12_002() -> Result<()> {
                                     .snapshot_id(None)
                                     .aborted_transactions(Some([].into()))
                                     .preferred_read_replica(Some(-1))
-                                    .records(None)
+                                    .records(None),
                             ]
-                            .into()
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
                 .node_endpoints(None)
-                .into()
+                .into(),
         },
-        Frame::response_from_bytes(&v[..], api_key, api_version)?
-    );
+        api_key,
+        api_version,
+    )?;
 
     Ok(())
 }
@@ -2910,7 +3027,8 @@ fn fetch_response_v16_001() -> Result<()> {
         13, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 1, 0, 1, 1,
     ];
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 189,
             header: Header::Response { correlation_id: 8 },
@@ -2922,7 +3040,7 @@ fn fetch_response_v16_001() -> Result<()> {
                     [FetchableTopicResponse::default()
                         .topic(None)
                         .topic_id(Some([
-                            28, 205, 172, 195, 142, 19, 71, 71, 182, 128, 13, 18, 65, 142, 210, 222
+                            28, 205, 172, 195, 142, 19, 71, 71, 182, 128, 13, 18, 65, 142, 210, 222,
                         ]))
                         .partitions(Some(
                             [PartitionData::default()
@@ -2932,10 +3050,10 @@ fn fetch_response_v16_001() -> Result<()> {
                                 .last_stable_offset(Some(1))
                                 .log_start_offset(Some(-1))
                                 .diverging_epoch(Some(
-                                    EpochEndOffset::default().epoch(-1).end_offset(-1)
+                                    EpochEndOffset::default().epoch(-1).end_offset(-1),
                                 ))
                                 .current_leader(Some(
-                                    LeaderIdAndEpoch::default().leader_id(0).leader_epoch(0)
+                                    LeaderIdAndEpoch::default().leader_id(0).leader_epoch(0),
                                 ))
                                 .snapshot_id(Some(SnapshotId::default().end_offset(-1).epoch(-1)))
                                 .aborted_transactions(Some([].into()))
@@ -2962,25 +3080,26 @@ fn fetch_response_v16_001() -> Result<()> {
                                                 offset_delta: 0,
                                                 key: None,
                                                 value: Some(Bytes::from_static(&[
-                                                    112, 111, 105, 117, 121
+                                                    112, 111, 105, 117, 121,
                                                 ])),
-                                                headers: [].into()
+                                                headers: [].into(),
                                             }]
-                                            .into()
+                                            .into(),
                                         }]
-                                        .into()
+                                        .into(),
                                     }
-                                    .try_into()?
+                                    .try_into()?,
                                 ))]
-                            .into()
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
                 .node_endpoints(Some([].into()))
-                .into()
+                .into(),
         },
-        Frame::response_from_bytes(&v[..], api_key, api_version)?
-    );
+        api_key,
+        api_version,
+    )?;
 
     Ok(())
 }
@@ -3003,7 +3122,8 @@ fn fetch_response_v16_002() -> Result<()> {
         13, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0,
     ];
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 186,
             header: Header::Response { correlation_id: 8 },
@@ -3015,7 +3135,7 @@ fn fetch_response_v16_002() -> Result<()> {
                     [FetchableTopicResponse::default()
                         .topic(None)
                         .topic_id(Some([
-                            28, 205, 172, 195, 142, 19, 71, 71, 182, 128, 13, 18, 65, 142, 210, 222
+                            28, 205, 172, 195, 142, 19, 71, 71, 182, 128, 13, 18, 65, 142, 210, 222,
                         ]))
                         .partitions(Some(
                             [PartitionData::default()
@@ -3025,10 +3145,10 @@ fn fetch_response_v16_002() -> Result<()> {
                                 .last_stable_offset(Some(1))
                                 .log_start_offset(Some(-1))
                                 .diverging_epoch(Some(
-                                    EpochEndOffset::default().epoch(-1).end_offset(-1)
+                                    EpochEndOffset::default().epoch(-1).end_offset(-1),
                                 ))
                                 .current_leader(Some(
-                                    LeaderIdAndEpoch::default().leader_id(0).leader_epoch(0)
+                                    LeaderIdAndEpoch::default().leader_id(0).leader_epoch(0),
                                 ))
                                 .snapshot_id(Some(SnapshotId::default().end_offset(-1).epoch(-1)))
                                 .aborted_transactions(Some([].into()))
@@ -3055,25 +3175,26 @@ fn fetch_response_v16_002() -> Result<()> {
                                                 offset_delta: 0,
                                                 key: None,
                                                 value: Some(Bytes::from_static(&[
-                                                    112, 111, 105, 117, 121
+                                                    112, 111, 105, 117, 121,
                                                 ])),
-                                                headers: [].into()
+                                                headers: [].into(),
                                             }]
-                                            .into()
+                                            .into(),
                                         }]
-                                        .into()
+                                        .into(),
                                     }
-                                    .try_into()?
+                                    .try_into()?,
                                 ))]
-                            .into()
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
                 .node_endpoints(None)
-                .into()
+                .into(),
         },
-        Frame::response_from_bytes(&v[..], api_key, api_version)?
-    );
+        api_key,
+        api_version,
+    )?;
 
     Ok(())
 }
@@ -3086,7 +3207,8 @@ fn find_coordinator_request_v1_000() -> Result<()> {
         0, 0, 0, 19, 0, 10, 0, 1, 0, 0, 0, 0, 255, 255, 0, 6, 97, 98, 99, 100, 101, 102, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 19,
             header: Header::Request {
@@ -3099,10 +3221,9 @@ fn find_coordinator_request_v1_000() -> Result<()> {
                 .key(Some("abcdef".into()))
                 .key_type(Some(0))
                 .coordinator_keys(None)
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -3117,7 +3238,8 @@ fn find_coordinator_response_v1_000() -> Result<()> {
         111, 109, 112, 117, 116, 101, 46, 105, 110, 116, 101, 114, 110, 97, 108, 0, 0, 35, 132,
     ];
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 62,
             header: Header::Response { correlation_id: 0 },
@@ -3129,10 +3251,11 @@ fn find_coordinator_response_v1_000() -> Result<()> {
                 .host(Some("ip-10-2-91-66.eu-west-1.compute.internal".into()))
                 .port(Some(9092))
                 .coordinators(None)
-                .into()
+                .into(),
         },
-        Frame::response_from_bytes(&v[..], FindCoordinatorResponse::KEY, 1)?
-    );
+        FindCoordinatorResponse::KEY,
+        1,
+    )?;
 
     Ok(())
 }
@@ -3146,24 +3269,24 @@ fn find_coordinator_request_v1_001() -> Result<()> {
         46, 49, 50, 46, 48, 0, 8, 109, 121, 45, 103, 114, 111, 117, 112, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 36,
             header: Header::Request {
                 api_key: 10,
                 api_version: 1,
                 correlation_id: 2,
-                client_id: Some("aiokafka-0.12.0".into())
+                client_id: Some("aiokafka-0.12.0".into()),
             },
             body: Body::FindCoordinatorRequest(
                 FindCoordinatorRequest::default()
                     .key(Some("my-group".into()))
                     .key_type(Some(0))
-                    .coordinator_keys(None)
-            )
+                    .coordinator_keys(None),
+            ),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -3177,7 +3300,8 @@ fn find_coordinator_response_v1_001() -> Result<()> {
         111, 99, 97, 108, 104, 111, 115, 116, 0, 0, 35, 132,
     ];
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 35,
             header: Header::Response { correlation_id: 2 },
@@ -3189,11 +3313,12 @@ fn find_coordinator_response_v1_001() -> Result<()> {
                     .node_id(Some(111))
                     .host(Some("localhost".into()))
                     .port(Some(9092))
-                    .coordinators(None)
-            )
+                    .coordinators(None),
+            ),
         },
-        Frame::response_from_bytes(&v[..], FindCoordinatorResponse::KEY, 1)?
-    );
+        FindCoordinatorResponse::KEY,
+        1,
+    )?;
 
     Ok(())
 }
@@ -3208,23 +3333,23 @@ fn find_coordinator_request_v2_000() -> Result<()> {
         117, 112, 95, 105, 100, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 45,
             header: Header::Request {
                 api_key: 10,
                 api_version: 2,
                 correlation_id: 3,
-                client_id: Some("rdkafka".into())
+                client_id: Some("rdkafka".into()),
             },
             body: FindCoordinatorRequest::default()
                 .key(Some("example_consumer_group_id".into()))
                 .key_type(Some(0))
                 .coordinator_keys(None)
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -3239,23 +3364,23 @@ fn find_coordinator_request_v4_000() -> Result<()> {
         109, 101, 114, 45, 103, 114, 111, 117, 112, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 50,
             header: Header::Request {
                 api_key: 10,
                 api_version: 4,
                 correlation_id: 0,
-                client_id: Some("console-consumer".into())
+                client_id: Some("console-consumer".into()),
             },
             body: FindCoordinatorRequest::default()
                 .key(None)
                 .key_type(Some(0))
                 .coordinator_keys(Some(["test-consumer-group".into()].into()))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -3270,24 +3395,24 @@ fn heartbeat_request_v4_000() -> Result<()> {
         109, 101, 114, 45, 103, 114, 111, 117, 112, 0, 0, 0, 0, 5, 49, 48, 48, 48, 0, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 58,
             header: Header::Request {
                 api_key: 12,
                 api_version: 4,
                 correlation_id: 10288,
-                client_id: Some("console-consumer".into())
+                client_id: Some("console-consumer".into()),
             },
             body: HeartbeatRequest::default()
                 .group_id("test-consumer-group".into())
                 .generation_id(0)
                 .member_id("1000".into())
                 .group_instance_id(None)
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -3302,7 +3427,8 @@ fn init_producer_id_request_v4_000() -> Result<()> {
         255, 255, 255, 255, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 43,
             header: Header::Request {
@@ -3316,10 +3442,9 @@ fn init_producer_id_request_v4_000() -> Result<()> {
                 .transaction_timeout_ms(2147483647)
                 .producer_id(Some(-1))
                 .producer_epoch(Some(-1))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -3346,14 +3471,15 @@ fn join_group_request_v5_000() -> Result<()> {
     let roundrobin_metadata =
         Bytes::from_static(b"\0\x03\0\0\0\x01\0\tbenchmark\0\0\0\0\0\0\0\0\xff\xff\xff\xff\0\0");
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 159,
             header: Header::Request {
                 api_key: 11,
                 api_version: 5,
                 correlation_id: 3,
-                client_id: Some("rdkafka".into())
+                client_id: Some("rdkafka".into()),
             },
             body: JoinGroupRequest::default()
                 .group_id("example_consumer_group_id".into())
@@ -3369,15 +3495,14 @@ fn join_group_request_v5_000() -> Result<()> {
                             .metadata(range_metadata),
                         JoinGroupRequestProtocol::default()
                             .name("roundrobin".into())
-                            .metadata(roundrobin_metadata)
+                            .metadata(roundrobin_metadata),
                     ]
-                    .into()
+                    .into(),
                 ))
                 .reason(None)
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -3405,7 +3530,8 @@ fn join_group_response_v5_000() -> Result<()> {
     let metadata =
         Bytes::from_static(b"\0\x03\0\0\0\x01\0\tbenchmark\0\0\0\0\0\0\0\0\xff\xff\xff\xff\0\0");
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 200,
             header: Header::Response { correlation_id: 4 },
@@ -3423,12 +3549,13 @@ fn join_group_response_v5_000() -> Result<()> {
                         .member_id("rdkafka-499e5770-375e-4990-bf84-a39634e3bfe4".into())
                         .group_instance_id(None)
                         .metadata(metadata)]
-                    .into()
+                    .into(),
                 ))
-                .into()
+                .into(),
         },
-        Frame::response_from_bytes(&v[..], api_key, api_version)?
-    );
+        api_key,
+        api_version,
+    )?;
 
     Ok(())
 }
@@ -3449,14 +3576,15 @@ fn join_group_request_v5_001() -> Result<()> {
 
     let metadata = Bytes::from_static(b"\0\0\0\0\0\x01\0\x08customer\0\0\0\0");
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 97,
             header: Header::Request {
                 api_key: 11,
                 api_version: 5,
                 correlation_id: 2,
-                client_id: Some("aiokafka-0.12.0".into())
+                client_id: Some("aiokafka-0.12.0".into()),
             },
             body: Body::JoinGroupRequest(
                 JoinGroupRequest::default()
@@ -3470,13 +3598,12 @@ fn join_group_request_v5_001() -> Result<()> {
                         [JoinGroupRequestProtocol::default()
                             .name("roundrobin".into())
                             .metadata(metadata)]
-                        .into()
+                        .into(),
                     ))
-                    .reason(None)
-            )
+                    .reason(None),
+            ),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -3498,7 +3625,8 @@ fn join_group_request_v9_000() -> Result<()> {
         255, 255, 255, 255, 255, 255, 0, 1, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 154,
             header: Header::Request {
@@ -3527,8 +3655,7 @@ fn join_group_request_v9_000() -> Result<()> {
                 .reason(Some("".into()))
                     .into()
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -3547,14 +3674,15 @@ fn leave_group_request_v5_000() -> Result<()> {
         108, 111, 115, 101, 100, 0, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 85,
             header: Header::Request {
                 api_key: 13,
                 api_version: 5,
                 correlation_id: 11,
-                client_id: Some("console-consumer".into())
+                client_id: Some("console-consumer".into()),
             },
             body: LeaveGroupRequest::default()
                 .group_id("test-consumer-group".into())
@@ -3564,12 +3692,11 @@ fn leave_group_request_v5_000() -> Result<()> {
                         .member_id("1000".into())
                         .group_instance_id(None)
                         .reason(Some("the consumer is being closed".into()))]
-                    .into()
+                    .into(),
                 ))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -3583,7 +3710,8 @@ fn list_groups_request_v4_000() -> Result<()> {
         110, 116, 45, 49, 0, 1, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 26,
             header: Header::Request {
@@ -3595,10 +3723,9 @@ fn list_groups_request_v4_000() -> Result<()> {
             body: ListGroupsRequest::default()
                 .states_filter(Some([].into()))
                 .types_filter(None)
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -3617,7 +3744,8 @@ fn list_offsets_response_v0_000() -> Result<()> {
         252, 0, 0, 0, 0, 0, 17, 198, 100, 0, 0, 0, 0, 0, 0, 0, 0,
     ];
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 67,
             header: Header::Response { correlation_id: 0 },
@@ -3634,14 +3762,15 @@ fn list_offsets_response_v0_000() -> Result<()> {
                                 .timestamp(None)
                                 .offset(None)
                                 .leader_epoch(None)]
-                            .into()
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
-                .into()
+                .into(),
         },
-        Frame::response_from_bytes(&v[..], ListOffsetsResponse::KEY, 0)?
-    );
+        ListOffsetsResponse::KEY,
+        0,
+    )?;
 
     Ok(())
 }
@@ -3658,14 +3787,15 @@ fn list_partition_reassignments_request_v0_000() -> Result<()> {
         0, 0, 2, 0, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 49,
             header: Header::Request {
                 api_key: 46,
                 api_version: 0,
                 correlation_id: 7,
-                client_id: Some("adminclient-1".into())
+                client_id: Some("adminclient-1".into()),
             },
             body: ListPartitionReassignmentsRequest::default()
                 .timeout_ms(30_000)
@@ -3673,17 +3803,15 @@ fn list_partition_reassignments_request_v0_000() -> Result<()> {
                     [ListPartitionReassignmentsTopics::default()
                         .name("test".into())
                         .partition_indexes(Some([1, 0, 2].into()))]
-                    .into()
+                    .into(),
                 ))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
 
-#[ignore]
 #[test]
 fn list_transactions_request_v1_000() -> Result<()> {
     let _guard = init_tracing()?;
@@ -3693,23 +3821,23 @@ fn list_transactions_request_v1_000() -> Result<()> {
         110, 116, 45, 49, 0, 1, 1, 255, 255, 255, 255, 255, 255, 255, 255, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 35,
             header: Header::Request {
                 api_key: 66,
                 api_version: 1,
                 correlation_id: 4,
-                client_id: Some("adminclient-1".into())
+                client_id: Some("adminclient-1".into()),
             },
             body: ListTransactionsRequest::default()
                 .state_filters(Some([].into()))
                 .producer_id_filters(Some([].into()))
                 .duration_filter(Some(-1))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -3728,7 +3856,8 @@ fn list_transactions_response_v1_000() -> Result<()> {
         67, 111, 109, 109, 105, 116, 0, 0,
     ];
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 70,
             header: Header::Response { correlation_id: 4 },
@@ -3741,12 +3870,13 @@ fn list_transactions_response_v1_000() -> Result<()> {
                         .transactional_id("librdkafka_transactions_example".into())
                         .producer_id(0)
                         .transaction_state("CompleteCommit".into())]
-                    .into()
+                    .into(),
                 ))
-                .into()
+                .into(),
         },
-        Frame::response_from_bytes(&v[..], api_key, api_version)?
-    );
+        api_key,
+        api_version,
+    )?;
 
     Ok(())
 }
@@ -3762,29 +3892,29 @@ fn metadata_request_v1_000() -> Result<()> {
         101, 110, 99, 104, 109, 97, 114, 107,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 30,
             header: Header::Request {
                 api_key: 3,
                 api_version: 1,
                 correlation_id: 1,
-                client_id: Some("samsa".into())
+                client_id: Some("samsa".into()),
             },
             body: MetadataRequest::default()
                 .topics(Some(
                     [MetadataRequestTopic::default()
                         .topic_id(None)
                         .name(Some("benchmark".into()))]
-                    .into()
+                    .into(),
                 ))
                 .allow_auto_topic_creation(None)
                 .include_cluster_authorized_operations(None)
                 .include_topic_authorized_operations(None)
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -3808,7 +3938,8 @@ fn metadata_response_v1_000() -> Result<()> {
         0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1,
     ];
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 237,
             header: Header::Response { correlation_id: 1 },
@@ -3820,7 +3951,7 @@ fn metadata_response_v1_000() -> Result<()> {
                         .host("localhost".into())
                         .port(9092)
                         .rack(None)]
-                    .into()
+                    .into(),
                 ))
                 .cluster_id(None)
                 .controller_id(Some(1))
@@ -3887,18 +4018,19 @@ fn metadata_response_v1_000() -> Result<()> {
                                     .leader_epoch(None)
                                     .replica_nodes(Some([1].into()))
                                     .isr_nodes(Some([1].into()))
-                                    .offline_replicas(None)
+                                    .offline_replicas(None),
                             ]
-                            .into()
+                            .into(),
                         ))
                         .topic_authorized_operations(None)]
-                    .into()
+                    .into(),
                 ))
                 .cluster_authorized_operations(None)
-                .into()
+                .into(),
         },
-        Frame::response_from_bytes(&v[..], api_key, api_version)?
-    );
+        api_key,
+        api_version,
+    )?;
 
     Ok(())
 }
@@ -3914,14 +4046,15 @@ fn metadata_request_v1_001() -> Result<()> {
         46, 49, 50, 46, 48, 0, 0, 0, 1, 0, 8, 99, 117, 115, 116, 111, 109, 101, 114,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 39,
             header: Header::Request {
                 api_key: 3,
                 api_version: 1,
                 correlation_id: 3,
-                client_id: Some("aiokafka-0.12.0".into())
+                client_id: Some("aiokafka-0.12.0".into()),
             },
             body: Body::MetadataRequest(
                 MetadataRequest::default()
@@ -3929,15 +4062,14 @@ fn metadata_request_v1_001() -> Result<()> {
                         [MetadataRequestTopic::default()
                             .topic_id(None)
                             .name(Some("customer".into()))]
-                        .into()
+                        .into(),
                     ))
                     .allow_auto_topic_creation(None)
                     .include_cluster_authorized_operations(None)
-                    .include_topic_authorized_operations(None)
-            )
+                    .include_topic_authorized_operations(None),
+            ),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -3958,7 +4090,8 @@ fn metadata_response_v1_001() -> Result<()> {
         1, 0, 0, 0, 111,
     ];
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 132,
             header: Header::Response { correlation_id: 3 },
@@ -3971,7 +4104,7 @@ fn metadata_response_v1_001() -> Result<()> {
                             .host("localhost".into())
                             .port(9092)
                             .rack(None)]
-                        .into()
+                        .into(),
                     ))
                     .cluster_id(None)
                     .controller_id(Some(111))
@@ -4006,18 +4139,19 @@ fn metadata_response_v1_001() -> Result<()> {
                                         .leader_epoch(None)
                                         .replica_nodes(Some([111].into()))
                                         .isr_nodes(Some([111].into()))
-                                        .offline_replicas(None)
+                                        .offline_replicas(None),
                                 ]
-                                .into()
+                                .into(),
                             ))
                             .topic_authorized_operations(None)]
-                        .into()
+                        .into(),
                     ))
-                    .cluster_authorized_operations(None)
-            )
+                    .cluster_authorized_operations(None),
+            ),
         },
-        Frame::response_from_bytes(&v[..], api_key, api_version)?
-    );
+        api_key,
+        api_version,
+    )?;
 
     Ok(())
 }
@@ -4033,14 +4167,15 @@ fn metadata_request_v1_002() -> Result<()> {
         46, 49, 50, 46, 48, 0, 0, 0, 1, 0, 8, 99, 117, 115, 116, 111, 109, 101, 114,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 39,
             header: Header::Request {
                 api_key: 3,
                 api_version: 1,
                 correlation_id: 3,
-                client_id: Some("aiokafka-0.12.0".into())
+                client_id: Some("aiokafka-0.12.0".into()),
             },
             body: Body::MetadataRequest(
                 MetadataRequest::default()
@@ -4048,15 +4183,14 @@ fn metadata_request_v1_002() -> Result<()> {
                         [MetadataRequestTopic::default()
                             .topic_id(None)
                             .name(Some("customer".into()))]
-                        .into()
+                        .into(),
                     ))
                     .allow_auto_topic_creation(None)
                     .include_cluster_authorized_operations(None)
-                    .include_topic_authorized_operations(None)
-            )
+                    .include_topic_authorized_operations(None),
+            ),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -4079,7 +4213,8 @@ fn metadata_response_v1_002() -> Result<()> {
     let api_key = 3;
     let api_version = 1;
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 132,
             header: Header::Response { correlation_id: 3 },
@@ -4092,7 +4227,7 @@ fn metadata_response_v1_002() -> Result<()> {
                             .host("localhost".into())
                             .port(9092)
                             .rack(None)]
-                        .into()
+                        .into(),
                     ))
                     .cluster_id(None)
                     .controller_id(Some(111))
@@ -4127,18 +4262,19 @@ fn metadata_response_v1_002() -> Result<()> {
                                         .leader_epoch(None)
                                         .replica_nodes(Some([111].into()))
                                         .isr_nodes(Some([111].into()))
-                                        .offline_replicas(None)
+                                        .offline_replicas(None),
                                 ]
-                                .into()
+                                .into(),
                             ))
                             .topic_authorized_operations(None)]
-                        .into()
+                        .into(),
                     ))
-                    .cluster_authorized_operations(None)
-            )
+                    .cluster_authorized_operations(None),
+            ),
         },
-        Frame::response_from_bytes(&v[..], api_key, api_version)?
-    );
+        api_key,
+        api_version,
+    )?;
 
     Ok(())
 }
@@ -4151,24 +4287,24 @@ fn metadata_request_v7_000() -> Result<()> {
         0, 0, 0, 21, 0, 3, 0, 7, 0, 0, 0, 0, 0, 6, 115, 97, 114, 97, 109, 97, 255, 255, 255, 255, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 21,
             header: Header::Request {
                 api_key: 3,
                 api_version: 7,
                 correlation_id: 0,
-                client_id: Some("sarama".into())
+                client_id: Some("sarama".into()),
             },
             body: MetadataRequest::default()
                 .topics(None)
                 .allow_auto_topic_creation(Some(false))
                 .include_cluster_authorized_operations(None)
                 .include_topic_authorized_operations(None)
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -4193,7 +4329,8 @@ fn metadata_response_v7_000() -> Result<()> {
     let api_key = 3;
     let api_version = 7;
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 180,
             header: Header::Response { correlation_id: 0 },
@@ -4205,7 +4342,7 @@ fn metadata_response_v7_000() -> Result<()> {
                         .host("localhost".into())
                         .port(9092)
                         .rack(None)]
-                    .into()
+                    .into(),
                 ))
                 .cluster_id(Some("5L6g3nShT-eMCtK--X86sw".into()))
                 .controller_id(Some(1))
@@ -4240,18 +4377,19 @@ fn metadata_response_v7_000() -> Result<()> {
                                     .leader_epoch(Some(0))
                                     .replica_nodes(Some([1].into()))
                                     .isr_nodes(Some([1].into()))
-                                    .offline_replicas(Some([].into()))
+                                    .offline_replicas(Some([].into())),
                             ]
-                            .into()
+                            .into(),
                         ))
                         .topic_authorized_operations(None)]
-                    .into()
+                    .into(),
                 ))
                 .cluster_authorized_operations(None)
-                .into()
+                .into(),
         },
-        Frame::response_from_bytes(&v[..], api_key, api_version)?
-    );
+        api_key,
+        api_version,
+    )?;
 
     Ok(())
 }
@@ -4268,7 +4406,8 @@ fn metadata_request_v12_000() -> Result<()> {
         116, 101, 115, 116, 0, 1, 0, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 53,
             header: Header::Request {
@@ -4282,15 +4421,14 @@ fn metadata_request_v12_000() -> Result<()> {
                     [MetadataRequestTopic::default()
                         .topic_id(Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
                         .name(Some("test".into()))]
-                    .into()
+                    .into(),
                 ))
                 .allow_auto_topic_creation(Some(true))
                 .include_cluster_authorized_operations(None)
                 .include_topic_authorized_operations(Some(false))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -4311,7 +4449,8 @@ fn metadata_response_v12_000() -> Result<()> {
     let api_key = 3;
     let api_version = 12;
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 92,
             header: Header::Response { correlation_id: 5 },
@@ -4322,7 +4461,7 @@ fn metadata_response_v12_000() -> Result<()> {
                         .node_id(0)
                         .host("kafka-server".into())
                         .port(9092)
-                        .rack(None)
+                        .rack(None),
                 ]))
                 .cluster_id(Some("RvQwrYegSUCkIPkaiAZQlQ".into()))
                 .controller_id(Some(0))
@@ -4333,13 +4472,14 @@ fn metadata_response_v12_000() -> Result<()> {
                         .topic_id(Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
                         .is_internal(Some(false))
                         .partitions(Some(vec![]))
-                        .topic_authorized_operations(Some(-2147483648))
+                        .topic_authorized_operations(Some(-2147483648)),
                 ]))
                 .cluster_authorized_operations(None)
-                .into()
+                .into(),
         },
-        Frame::response_from_bytes(&v[..], api_key, api_version)?
-    );
+        api_key,
+        api_version,
+    )?;
 
     Ok(())
 }
@@ -4353,7 +4493,8 @@ fn metadata_request_v12_001() -> Result<()> {
         114, 111, 100, 117, 99, 101, 114, 0, 1, 1, 0, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 31,
             header: Header::Request {
@@ -4367,10 +4508,9 @@ fn metadata_request_v12_001() -> Result<()> {
                 .allow_auto_topic_creation(Some(true))
                 .include_cluster_authorized_operations(None)
                 .include_topic_authorized_operations(Some(false))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -4385,29 +4525,29 @@ fn metadata_request_v12_002() -> Result<()> {
         0, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 49,
             header: Header::Request {
                 api_key: 3,
                 api_version: 12,
                 correlation_id: 2,
-                client_id: Some("rdkafka".into())
+                client_id: Some("rdkafka".into()),
             },
             body: MetadataRequest::default()
                 .topics(Some(
                     [MetadataRequestTopic::default()
                         .topic_id(Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
                         .name(Some("benchmark".into()))]
-                    .into()
+                    .into(),
                 ))
                 .allow_auto_topic_creation(Some(true))
                 .include_cluster_authorized_operations(None)
                 .include_topic_authorized_operations(Some(false))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -4433,7 +4573,8 @@ fn metadata_response_v12_002() -> Result<()> {
     let api_key = 3;
     let api_version = 12;
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 276,
             header: Header::Response { correlation_id: 2 },
@@ -4445,7 +4586,7 @@ fn metadata_response_v12_002() -> Result<()> {
                         .host("localhost".into())
                         .port(9092)
                         .rack(None)]
-                    .into()
+                    .into(),
                 ))
                 .cluster_id(Some("5L6g3nShT-eMCtK--X86sw".into()))
                 .controller_id(Some(1))
@@ -4455,7 +4596,7 @@ fn metadata_response_v12_002() -> Result<()> {
                         .name(Some("benchmark".into()))
                         .topic_id(Some([
                             177, 248, 14, 236, 65, 78, 72, 57, 179, 196, 215, 75, 145, 238, 120,
-                            241
+                            241,
                         ]))
                         .is_internal(Some(false))
                         .partitions(Some(
@@ -4515,18 +4656,19 @@ fn metadata_response_v12_002() -> Result<()> {
                                     .leader_epoch(Some(0))
                                     .replica_nodes(Some([1].into()))
                                     .isr_nodes(Some([1].into()))
-                                    .offline_replicas(Some([].into()))
+                                    .offline_replicas(Some([].into())),
                             ]
-                            .into()
+                            .into(),
                         ))
                         .topic_authorized_operations(Some(-2147483648))]
-                    .into()
+                    .into(),
                 ))
                 .cluster_authorized_operations(None)
-                .into()
+                .into(),
         },
-        Frame::response_from_bytes(&v[..], api_key, api_version)?
-    );
+        api_key,
+        api_version,
+    )?;
 
     Ok(())
 }
@@ -4543,7 +4685,8 @@ fn offset_fetch_request_v3_000() -> Result<()> {
         116, 49, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 2,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 65,
             header: Header::Request {
@@ -4561,16 +4704,15 @@ fn offset_fetch_request_v3_000() -> Result<()> {
                             .partition_indexes(Some([3, 4, 5].into())),
                         OffsetFetchRequestTopic::default()
                             .name("test1".into())
-                            .partition_indexes(Some([0, 1, 2].into()))
+                            .partition_indexes(Some([0, 1, 2].into())),
                     ]
-                    .into()
+                    .into(),
                 ))
                 .groups(None)
                 .require_stable(None)
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -4588,7 +4730,8 @@ fn offset_fetch_request_v7_000() -> Result<()> {
         0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0, 6, 0, 1, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 87,
             header: Header::Request {
@@ -4603,14 +4746,13 @@ fn offset_fetch_request_v7_000() -> Result<()> {
                     [OffsetFetchRequestTopic::default()
                         .name("benchmark".into())
                         .partition_indexes(Some((0..7).collect()))]
-                    .into()
+                    .into(),
                 ))
                 .groups(None)
                 .require_stable(Some(true))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -4633,7 +4775,8 @@ fn offset_fetch_response_v7_000() -> Result<()> {
     let api_key = 9;
     let api_version = 7;
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 165,
             header: Header::Response { correlation_id: 8 },
@@ -4655,14 +4798,15 @@ fn offset_fetch_response_v7_000() -> Result<()> {
                                         .metadata(Some("".into()))
                                         .error_code(ErrorCode::None.into())
                                 })
-                                .collect()
+                                .collect(),
                         ))]
-                    .into()
+                    .into(),
                 ))
-                .into()
+                .into(),
         },
-        Frame::response_from_bytes(&v[..], api_key, api_version)?
-    );
+        api_key,
+        api_version,
+    )?;
 
     Ok(())
 }
@@ -4680,14 +4824,15 @@ fn offset_fetch_request_v9_000() -> Result<()> {
         116, 4, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 1, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 76,
             header: Header::Request {
                 api_key: 9,
                 api_version: 9,
                 correlation_id: 7,
-                client_id: Some("console-consumer".into())
+                client_id: Some("console-consumer".into()),
             },
             body: OffsetFetchRequest::default()
                 .group_id(None)
@@ -4701,15 +4846,14 @@ fn offset_fetch_request_v9_000() -> Result<()> {
                             [OffsetFetchRequestTopics::default()
                                 .name("test".into())
                                 .partition_indexes(Some([1, 0, 2].into()))]
-                            .into()
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
                 .require_stable(Some(true))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -4731,14 +4875,15 @@ fn offset_commit_request_v9_000() -> Result<()> {
         0, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 120,
             header: Header::Request {
                 api_key: 8,
                 api_version: 9,
                 correlation_id: 10,
-                client_id: Some("console-consumer".into())
+                client_id: Some("console-consumer".into()),
             },
             body: OffsetCommitRequest::default()
                 .group_id("test-consumer-group".into())
@@ -4768,16 +4913,15 @@ fn offset_commit_request_v9_000() -> Result<()> {
                                     .committed_offset(0)
                                     .committed_leader_epoch(Some(0))
                                     .commit_timestamp(None)
-                                    .committed_metadata(Some("".into()))
+                                    .committed_metadata(Some("".into())),
                             ]
-                            .into()
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -4793,7 +4937,8 @@ fn offset_for_leader_request_v0_000() -> Result<()> {
         97, 98, 99, 97, 98, 0, 0, 0, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 31,
             header: Header::Request {
@@ -4808,16 +4953,37 @@ fn offset_for_leader_request_v0_000() -> Result<()> {
                     [OffsetForLeaderTopic::default()
                         .topic("abcabcabcab".into())
                         .partitions(Some([].into()))]
-                    .into()
+                    .into(),
                 ))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
 
+const LOREM: Bytes = Bytes::from_static(
+    b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do \
+eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad \
+minim veniam, quis nostrud exercitation ullamco laboris nisi ut \
+aliquip ex ea commodo consequat. Duis aute irure dolor in \
+reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla \
+pariatur. Excepteur sint occaecat cupidatat non proident, sunt in \
+culpa qui officia deserunt mollit anim id est laborum.",
+);
+
+/// A v0 `ProduceRequest`, captured off sarama, which does not decode.
+///
+/// Ignored since it was written, with no reason given; #553 ran it. v0 carries
+/// the pre-KIP-98 MessageSet rather than a v2 record batch, and the decoder
+/// answers a `magic: 0` batch with `record_count: 0` and no record data — the
+/// envelope decodes, the messages inside it are dropped. The value written
+/// beside these bytes is not even a decode of them: it is a v3 capture off
+/// samsa of a different topic, so the fixture would not have passed had the
+/// MessageSet decoded either.
+///
+/// Kept for the capture. The bytes are the only v0 produce in the tree, and
+/// they are what a fix would be written against.
 #[ignore]
 #[test]
 fn produce_request_v0_000() -> Result<()> {
@@ -4835,14 +5001,15 @@ fn produce_request_v0_000() -> Result<()> {
         20, 14,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 196,
             header: Header::Request {
                 api_key: 0,
                 api_version: 3,
                 correlation_id: 1,
-                client_id: Some("samsa".into())
+                client_id: Some("samsa".into()),
             },
             body: ProduceRequest::default()
                 .transactional_id(None)
@@ -4875,7 +5042,7 @@ fn produce_request_v0_000() -> Result<()> {
                                                 offset_delta: 0,
                                                 key: Some(Bytes::from_static(b"")),
                                                 value: Some(Bytes::from_static(b"0123456789")),
-                                                headers: [].into()
+                                                headers: [].into(),
                                             },
                                             Record {
                                                 length: 16,
@@ -4884,7 +5051,7 @@ fn produce_request_v0_000() -> Result<()> {
                                                 offset_delta: 1,
                                                 key: Some(Bytes::from_static(b"")),
                                                 value: Some(Bytes::from_static(b"0123456789")),
-                                                headers: [].into()
+                                                headers: [].into(),
                                             },
                                             Record {
                                                 length: 16,
@@ -4893,7 +5060,7 @@ fn produce_request_v0_000() -> Result<()> {
                                                 offset_delta: 2,
                                                 key: Some(Bytes::from_static(b"")),
                                                 value: Some(Bytes::from_static(b"0123456789")),
-                                                headers: [].into()
+                                                headers: [].into(),
                                             },
                                             Record {
                                                 length: 16,
@@ -4902,7 +5069,7 @@ fn produce_request_v0_000() -> Result<()> {
                                                 offset_delta: 3,
                                                 key: Some(Bytes::from_static(b"")),
                                                 value: Some(Bytes::from_static(b"0123456789")),
-                                                headers: [].into()
+                                                headers: [].into(),
                                             },
                                             Record {
                                                 length: 16,
@@ -4911,23 +5078,22 @@ fn produce_request_v0_000() -> Result<()> {
                                                 offset_delta: 4,
                                                 key: Some(Bytes::from_static(b"")),
                                                 value: Some(Bytes::from_static(b"0123456789")),
-                                                headers: [].into()
-                                            }
+                                                headers: [].into(),
+                                            },
                                         ]
-                                        .into()
+                                        .into(),
                                     }]
-                                    .into()
+                                    .into(),
                                 }
-                                .try_into()?
+                                .try_into()?,
                             ))]
-                            .into()
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -4950,14 +5116,15 @@ fn produce_request_v3_000() -> Result<()> {
         53, 54, 55, 56, 57, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 196,
             header: Header::Request {
                 api_key: 0,
                 api_version: 3,
                 correlation_id: 1,
-                client_id: Some("samsa".into())
+                client_id: Some("samsa".into()),
             },
             body: ProduceRequest::default()
                 .transactional_id(None)
@@ -4990,7 +5157,7 @@ fn produce_request_v3_000() -> Result<()> {
                                                 offset_delta: 0,
                                                 key: Some(Bytes::from_static(b"")),
                                                 value: Some(Bytes::from_static(b"0123456789")),
-                                                headers: [].into()
+                                                headers: [].into(),
                                             },
                                             Record {
                                                 length: 16,
@@ -4999,7 +5166,7 @@ fn produce_request_v3_000() -> Result<()> {
                                                 offset_delta: 1,
                                                 key: Some(Bytes::from_static(b"")),
                                                 value: Some(Bytes::from_static(b"0123456789")),
-                                                headers: [].into()
+                                                headers: [].into(),
                                             },
                                             Record {
                                                 length: 16,
@@ -5008,7 +5175,7 @@ fn produce_request_v3_000() -> Result<()> {
                                                 offset_delta: 2,
                                                 key: Some(Bytes::from_static(b"")),
                                                 value: Some(Bytes::from_static(b"0123456789")),
-                                                headers: [].into()
+                                                headers: [].into(),
                                             },
                                             Record {
                                                 length: 16,
@@ -5017,7 +5184,7 @@ fn produce_request_v3_000() -> Result<()> {
                                                 offset_delta: 3,
                                                 key: Some(Bytes::from_static(b"")),
                                                 value: Some(Bytes::from_static(b"0123456789")),
-                                                headers: [].into()
+                                                headers: [].into(),
                                             },
                                             Record {
                                                 length: 16,
@@ -5026,23 +5193,22 @@ fn produce_request_v3_000() -> Result<()> {
                                                 offset_delta: 4,
                                                 key: Some(Bytes::from_static(b"")),
                                                 value: Some(Bytes::from_static(b"0123456789")),
-                                                headers: [].into()
-                                            }
+                                                headers: [].into(),
+                                            },
                                         ]
-                                        .into()
+                                        .into(),
                                     }]
-                                    .into()
+                                    .into(),
                                 }
-                                .try_into()?
+                                .try_into()?,
                             ))]
-                            .into()
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -5064,14 +5230,15 @@ fn produce_request_v7_000() -> Result<()> {
         108, 117, 101,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 158,
             header: Header::Request {
                 api_key: 0,
                 api_version: 7,
                 correlation_id: 3,
-                client_id: Some("rdkafka".into())
+                client_id: Some("rdkafka".into()),
             },
             body: ProduceRequest::default()
                 .transactional_id(None)
@@ -5105,24 +5272,23 @@ fn produce_request_v7_000() -> Result<()> {
                                             value: Some(Bytes::from_static(b"Message 0")),
                                             headers: [record::Header {
                                                 key: Some(Bytes::from_static(b"header_key")),
-                                                value: Some(Bytes::from_static(b"header_value"))
+                                                value: Some(Bytes::from_static(b"header_value")),
                                             }]
-                                            .into()
+                                            .into(),
                                         }]
-                                        .into()
+                                        .into(),
                                     }]
-                                    .into()
+                                    .into(),
                                 }
-                                .try_into()?
+                                .try_into()?,
                             ))]
-                            .into()
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -5142,7 +5308,8 @@ fn produce_request_v9_000() -> Result<()> {
         0, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 120,
             header: Header::Request {
@@ -5181,22 +5348,21 @@ fn produce_request_v9_000() -> Result<()> {
                                             offset_delta: 0,
                                             key: None,
                                             value: Some(Bytes::from_static(&[100, 101, 102])),
-                                            headers: [].into()
+                                            headers: [].into(),
                                         }]
-                                        .into()
+                                        .into(),
                                     }]
                                     .into(),
                                 }
-                                .try_into()?
-                            )),]
-                            .into()
+                                .try_into()?,
+                            ))]
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -5220,14 +5386,15 @@ fn produce_request_v9_001() -> Result<()> {
         6, 118, 49, 48, 0, 22, 0, 0, 20, 4, 107, 54, 6, 118, 49, 49, 0, 0, 0, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 234,
             header: Header::Request {
                 api_key: 0,
                 api_version: 9,
                 correlation_id: 6,
-                client_id: Some("console-producer".into())
+                client_id: Some("console-producer".into()),
             },
             body: ProduceRequest::default()
                 .transactional_id(None)
@@ -5260,7 +5427,7 @@ fn produce_request_v9_001() -> Result<()> {
                                                 offset_delta: 0,
                                                 key: Some(Bytes::from_static(&[107, 49])),
                                                 value: Some(Bytes::from_static(&[118, 49])),
-                                                headers: [].into()
+                                                headers: [].into(),
                                             },
                                             Record {
                                                 length: 10,
@@ -5269,7 +5436,7 @@ fn produce_request_v9_001() -> Result<()> {
                                                 offset_delta: 1,
                                                 key: Some(Bytes::from_static(&[107, 50])),
                                                 value: Some(Bytes::from_static(&[118, 50])),
-                                                headers: [].into()
+                                                headers: [].into(),
                                             },
                                             Record {
                                                 length: 10,
@@ -5278,7 +5445,7 @@ fn produce_request_v9_001() -> Result<()> {
                                                 offset_delta: 2,
                                                 key: Some(Bytes::from_static(&[107, 49])),
                                                 value: Some(Bytes::from_static(&[118, 51])),
-                                                headers: [].into()
+                                                headers: [].into(),
                                             },
                                             Record {
                                                 length: 10,
@@ -5287,7 +5454,7 @@ fn produce_request_v9_001() -> Result<()> {
                                                 offset_delta: 3,
                                                 key: Some(Bytes::from_static(&[107, 49])),
                                                 value: Some(Bytes::from_static(&[118, 52])),
-                                                headers: [].into()
+                                                headers: [].into(),
                                             },
                                             Record {
                                                 length: 10,
@@ -5296,7 +5463,7 @@ fn produce_request_v9_001() -> Result<()> {
                                                 offset_delta: 4,
                                                 key: Some(Bytes::from_static(&[107, 51])),
                                                 value: Some(Bytes::from_static(&[118, 53])),
-                                                headers: [].into()
+                                                headers: [].into(),
                                             },
                                             Record {
                                                 length: 10,
@@ -5305,7 +5472,7 @@ fn produce_request_v9_001() -> Result<()> {
                                                 offset_delta: 5,
                                                 key: Some(Bytes::from_static(&[107, 50])),
                                                 value: Some(Bytes::from_static(&[118, 54])),
-                                                headers: [].into()
+                                                headers: [].into(),
                                             },
                                             Record {
                                                 length: 10,
@@ -5314,7 +5481,7 @@ fn produce_request_v9_001() -> Result<()> {
                                                 offset_delta: 6,
                                                 key: Some(Bytes::from_static(&[107, 52])),
                                                 value: Some(Bytes::from_static(&[118, 55])),
-                                                headers: [].into()
+                                                headers: [].into(),
                                             },
                                             Record {
                                                 length: 10,
@@ -5323,7 +5490,7 @@ fn produce_request_v9_001() -> Result<()> {
                                                 offset_delta: 7,
                                                 key: Some(Bytes::from_static(&[107, 53])),
                                                 value: Some(Bytes::from_static(&[118, 56])),
-                                                headers: [].into()
+                                                headers: [].into(),
                                             },
                                             Record {
                                                 length: 10,
@@ -5332,7 +5499,7 @@ fn produce_request_v9_001() -> Result<()> {
                                                 offset_delta: 8,
                                                 key: Some(Bytes::from_static(&[107, 53])),
                                                 value: Some(Bytes::from_static(&[118, 57])),
-                                                headers: [].into()
+                                                headers: [].into(),
                                             },
                                             Record {
                                                 length: 11,
@@ -5341,7 +5508,7 @@ fn produce_request_v9_001() -> Result<()> {
                                                 offset_delta: 9,
                                                 key: Some(Bytes::from_static(&[107, 50])),
                                                 value: Some(Bytes::from_static(&[118, 49, 48])),
-                                                headers: [].into()
+                                                headers: [].into(),
                                             },
                                             Record {
                                                 length: 11,
@@ -5350,23 +5517,22 @@ fn produce_request_v9_001() -> Result<()> {
                                                 offset_delta: 10,
                                                 key: Some(Bytes::from_static(&[107, 54])),
                                                 value: Some(Bytes::from_static(&[118, 49, 49])),
-                                                headers: [].into()
-                                            }
+                                                headers: [].into(),
+                                            },
                                         ]
-                                        .into()
+                                        .into(),
                                     }]
-                                    .into()
+                                    .into(),
                                 }
-                                .try_into()?
+                                .try_into()?,
                             ))]
-                            .into()
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -5387,14 +5553,15 @@ fn produce_request_v10_000() -> Result<()> {
         107, 108, 4, 104, 51, 6, 117, 105, 111, 0, 0, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 149,
             header: Header::Request {
                 api_key: 0,
                 api_version: 10,
                 correlation_id: 7,
-                client_id: Some("console-producer".into())
+                client_id: Some("console-producer".into()),
             },
             body: ProduceRequest::default()
                 .transactional_id(None)
@@ -5425,47 +5592,46 @@ fn produce_request_v10_000() -> Result<()> {
                                             timestamp_delta: 0,
                                             offset_delta: 0,
                                             key: Some(Bytes::from_static(&[
-                                                113, 119, 101, 114, 116, 121
+                                                113, 119, 101, 114, 116, 121,
                                             ])),
                                             value: Some(Bytes::from_static(&[
-                                                112, 111, 105, 117, 121
+                                                112, 111, 105, 117, 121,
                                             ])),
                                             headers: [
                                                 record::Header {
                                                     key: Some(Bytes::from_static(&[104, 49])),
                                                     value: Some(Bytes::from_static(&[
-                                                        112, 113, 114
-                                                    ]))
+                                                        112, 113, 114,
+                                                    ])),
                                                 },
                                                 record::Header {
                                                     key: Some(Bytes::from_static(&[104, 50])),
                                                     value: Some(Bytes::from_static(&[
-                                                        106, 107, 108
-                                                    ]))
+                                                        106, 107, 108,
+                                                    ])),
                                                 },
                                                 record::Header {
                                                     key: Some(Bytes::from_static(&[104, 51])),
                                                     value: Some(Bytes::from_static(&[
-                                                        117, 105, 111
-                                                    ]))
-                                                }
+                                                        117, 105, 111,
+                                                    ])),
+                                                },
                                             ]
-                                            .into()
+                                            .into(),
                                         }]
-                                        .into()
+                                        .into(),
                                     }]
-                                    .into()
+                                    .into(),
                                 }
-                                .try_into()?
+                                .try_into()?,
                             ))]
-                            .into()
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -5496,14 +5662,15 @@ fn produce_request_v10_001() -> Result<()> {
         0, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 340,
             header: Header::Request {
                 api_key: 0,
                 api_version: 10,
                 correlation_id: 6,
-                client_id: Some("console-producer".into())
+                client_id: Some("console-producer".into()),
             },
             body: ProduceRequest::default()
                 .transactional_id(None)
@@ -5535,32 +5702,32 @@ fn produce_request_v10_001() -> Result<()> {
                                                 timestamp_delta: 0,
                                                 offset_delta: 0,
                                                 key: Some(Bytes::from_static(&[
-                                                    113, 119, 101, 114, 116, 121
+                                                    113, 119, 101, 114, 116, 121,
                                                 ])),
                                                 value: Some(Bytes::from_static(&[
-                                                    112, 111, 105, 117, 121
+                                                    112, 111, 105, 117, 121,
                                                 ])),
                                                 headers: [
                                                     record::Header {
                                                         key: Some(Bytes::from_static(&[104, 49])),
                                                         value: Some(Bytes::from_static(&[
-                                                            112, 113, 114
-                                                        ]))
+                                                            112, 113, 114,
+                                                        ])),
                                                     },
                                                     record::Header {
                                                         key: Some(Bytes::from_static(&[104, 50])),
                                                         value: Some(Bytes::from_static(&[
-                                                            106, 107, 108
-                                                        ]))
+                                                            106, 107, 108,
+                                                        ])),
                                                     },
                                                     record::Header {
                                                         key: Some(Bytes::from_static(&[104, 51])),
                                                         value: Some(Bytes::from_static(&[
-                                                            117, 105, 111
-                                                        ]))
-                                                    }
+                                                            117, 105, 111,
+                                                        ])),
+                                                    },
                                                 ]
-                                                .into()
+                                                .into(),
                                             },
                                             Record {
                                                 length: 38,
@@ -5568,32 +5735,32 @@ fn produce_request_v10_001() -> Result<()> {
                                                 timestamp_delta: 8,
                                                 offset_delta: 1,
                                                 key: Some(Bytes::from_static(&[
-                                                    97, 115, 100, 102, 103, 104
+                                                    97, 115, 100, 102, 103, 104,
                                                 ])),
                                                 value: Some(Bytes::from_static(&[
-                                                    108, 107, 106, 104, 103
+                                                    108, 107, 106, 104, 103,
                                                 ])),
                                                 headers: [
                                                     record::Header {
                                                         key: Some(Bytes::from_static(&[104, 49])),
                                                         value: Some(Bytes::from_static(&[
-                                                            114, 116, 121
-                                                        ]))
+                                                            114, 116, 121,
+                                                        ])),
                                                     },
                                                     record::Header {
                                                         key: Some(Bytes::from_static(&[104, 50])),
                                                         value: Some(Bytes::from_static(&[
-                                                            100, 102, 103
-                                                        ]))
+                                                            100, 102, 103,
+                                                        ])),
                                                     },
                                                     record::Header {
                                                         key: Some(Bytes::from_static(&[104, 51])),
                                                         value: Some(Bytes::from_static(&[
-                                                            108, 107, 106
-                                                        ]))
-                                                    }
+                                                            108, 107, 106,
+                                                        ])),
+                                                    },
                                                 ]
-                                                .into()
+                                                .into(),
                                             },
                                             Record {
                                                 length: 38,
@@ -5601,32 +5768,32 @@ fn produce_request_v10_001() -> Result<()> {
                                                 timestamp_delta: 8,
                                                 offset_delta: 2,
                                                 key: Some(Bytes::from_static(&[
-                                                    106, 107, 108, 106, 107, 108
+                                                    106, 107, 108, 106, 107, 108,
                                                 ])),
                                                 value: Some(Bytes::from_static(&[
-                                                    105, 117, 105, 117, 105
+                                                    105, 117, 105, 117, 105,
                                                 ])),
                                                 headers: [
                                                     record::Header {
                                                         key: Some(Bytes::from_static(&[104, 49])),
                                                         value: Some(Bytes::from_static(&[
-                                                            122, 120, 99
-                                                        ]))
+                                                            122, 120, 99,
+                                                        ])),
                                                     },
                                                     record::Header {
                                                         key: Some(Bytes::from_static(&[104, 50])),
                                                         value: Some(Bytes::from_static(&[
-                                                            99, 118, 98
-                                                        ]))
+                                                            99, 118, 98,
+                                                        ])),
                                                     },
                                                     record::Header {
                                                         key: Some(Bytes::from_static(&[104, 51])),
                                                         value: Some(Bytes::from_static(&[
-                                                            109, 110, 98
-                                                        ]))
-                                                    }
+                                                            109, 110, 98,
+                                                        ])),
+                                                    },
                                                 ]
-                                                .into()
+                                                .into(),
                                             },
                                             Record {
                                                 length: 42,
@@ -5634,32 +5801,32 @@ fn produce_request_v10_001() -> Result<()> {
                                                 timestamp_delta: 8,
                                                 offset_delta: 3,
                                                 key: Some(Bytes::from_static(&[
-                                                    113, 119, 101, 114, 116, 121
+                                                    113, 119, 101, 114, 116, 121,
                                                 ])),
                                                 value: Some(Bytes::from_static(&[
-                                                    121, 116, 114, 114, 114, 119, 113, 101, 101
+                                                    121, 116, 114, 114, 114, 119, 113, 101, 101,
                                                 ])),
                                                 headers: [
                                                     record::Header {
                                                         key: Some(Bytes::from_static(&[104, 49])),
                                                         value: Some(Bytes::from_static(&[
-                                                            101, 114, 105
-                                                        ]))
+                                                            101, 114, 105,
+                                                        ])),
                                                     },
                                                     record::Header {
                                                         key: Some(Bytes::from_static(&[104, 50])),
                                                         value: Some(Bytes::from_static(&[
-                                                            101, 105, 117
-                                                        ]))
+                                                            101, 105, 117,
+                                                        ])),
                                                     },
                                                     record::Header {
                                                         key: Some(Bytes::from_static(&[104, 51])),
                                                         value: Some(Bytes::from_static(&[
-                                                            112, 112, 111
-                                                        ]))
-                                                    }
+                                                            112, 112, 111,
+                                                        ])),
+                                                    },
                                                 ]
-                                                .into()
+                                                .into(),
                                             },
                                             Record {
                                                 length: 67,
@@ -5667,64 +5834,53 @@ fn produce_request_v10_001() -> Result<()> {
                                                 timestamp_delta: 8,
                                                 offset_delta: 4,
                                                 key: Some(Bytes::from_static(&[
-                                                    113, 119, 114, 114, 114, 116, 105, 105, 112
+                                                    113, 119, 114, 114, 114, 116, 105, 105, 112,
                                                 ])),
                                                 value: Some(Bytes::from_static(&[
                                                     106, 107, 108, 106, 107, 108, 106, 107, 108,
                                                     107, 106, 107, 106, 107, 108, 107, 106, 108,
                                                     106, 108, 107, 106, 108, 106, 107, 108, 106,
-                                                    108, 107, 106, 106
+                                                    108, 107, 106, 106,
                                                 ])),
                                                 headers: [
                                                     record::Header {
                                                         key: Some(Bytes::from_static(&[104, 49])),
                                                         value: Some(Bytes::from_static(&[
-                                                            105, 105, 111
-                                                        ]))
+                                                            105, 105, 111,
+                                                        ])),
                                                     },
                                                     record::Header {
                                                         key: Some(Bytes::from_static(&[104, 50])),
                                                         value: Some(Bytes::from_static(&[
-                                                            101, 114, 116
-                                                        ]))
+                                                            101, 114, 116,
+                                                        ])),
                                                     },
                                                     record::Header {
                                                         key: Some(Bytes::from_static(&[104, 51])),
                                                         value: Some(Bytes::from_static(&[
-                                                            113, 119, 101
-                                                        ]))
-                                                    }
+                                                            113, 119, 101,
+                                                        ])),
+                                                    },
                                                 ]
-                                                .into()
-                                            }
+                                                .into(),
+                                            },
                                         ]
-                                        .into()
+                                        .into(),
                                     }]
-                                    .into()
+                                    .into(),
                                 }
-                                .try_into()?
+                                .try_into()?,
                             ))]
-                            .into()
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
-
-const LOREM: Bytes = Bytes::from_static(
-    b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do \
-eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad \
-minim veniam, quis nostrud exercitation ullamco laboris nisi ut \
-aliquip ex ea commodo consequat. Duis aute irure dolor in \
-reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla \
-pariatur. Excepteur sint occaecat cupidatat non proident, sunt in \
-culpa qui officia deserunt mollit anim id est laborum.",
-);
 
 #[test]
 fn produce_request_v10_002() -> Result<()> {
@@ -5787,14 +5943,15 @@ sunt\x01uXculpa qui officia deser\x01\x1e\x1cmollit a!!<id est laborum.\0");
         record_data,
     };
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 571,
             header: Header::Request {
                 api_key: 0,
                 api_version: 10,
                 correlation_id: 5,
-                client_id: Some("console-producer".into())
+                client_id: Some("console-producer".into()),
             },
             body: ProduceRequest::default()
                 .transactional_id(None)
@@ -5806,17 +5963,16 @@ sunt\x01uXculpa qui officia deser\x01\x1e\x1cmollit a!!<id est laborum.\0");
                         .partition_data(Some(
                             [PartitionProduceData::default().index(2).records(Some(
                                 deflated::Frame {
-                                    batches: [deflated_batch.clone()].into()
-                                }
+                                    batches: [deflated_batch.clone()].into(),
+                                },
                             ))]
-                            .into()
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     assert_eq!(
         inflated::Batch {
@@ -5914,14 +6070,15 @@ sun\x05uXculpa qui officia deser\x01\x1e\x0cmoll!\x93!!<id est laborum.\0",
         record_data,
     };
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 534,
             header: Header::Request {
                 api_key: 0,
                 api_version: 10,
                 correlation_id: 3,
-                client_id: Some("rdkafka".into())
+                client_id: Some("rdkafka".into()),
             },
             body: ProduceRequest::default()
                 .transactional_id(None)
@@ -5933,17 +6090,16 @@ sun\x05uXculpa qui officia deser\x01\x1e\x0cmoll!\x93!!<id est laborum.\0",
                         .partition_data(Some(
                             [PartitionProduceData::default().index(0).records(Some(
                                 deflated::Frame {
-                                    batches: [deflated_batch.clone()].into()
-                                }
+                                    batches: [deflated_batch.clone()].into(),
+                                },
                             ))]
-                            .into()
+                            .into(),
                         ))]
-                    .into()
+                    .into(),
                 ))
-                .into()
+                .into(),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     assert_eq!(
         inflated::Batch {
@@ -5988,7 +6144,8 @@ fn produce_response_v9_000() -> Result<()> {
         0, 0, 0,
     ];
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 51,
             header: Header::Response { correlation_id: 6 },
@@ -6007,15 +6164,16 @@ fn produce_response_v9_000() -> Result<()> {
                                 .record_errors(Some([].into()))
                                 .error_message(None)
                                 .current_leader(None)]
-                            .into()
-                        )),]
-                    .into()
+                            .into(),
+                        ))]
+                    .into(),
                 ))
                 .throttle_time_ms(Some(0))
-                .into()
+                .into(),
         },
-        Frame::response_from_bytes(&v[..], ProduceResponse::KEY, 9)?
-    );
+        ProduceResponse::KEY,
+        9,
+    )?;
 
     Ok(())
 }
@@ -6035,7 +6193,8 @@ pub fn sync_group_request_v5_000() -> Result<()> {
         255, 255, 255, 0, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 113,
             header: Header::Request {
@@ -6060,8 +6219,7 @@ pub fn sync_group_request_v5_000() -> Result<()> {
                 )
             ).into()
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -6077,24 +6235,24 @@ fn describe_topic_partitions_request_v0_000() -> Result<()> {
         110, 116, 45, 49, 0, 2, 5, 116, 101, 115, 116, 0, 0, 0, 7, 208, 255, 0,
     ];
 
-    assert_eq!(
+    round_trip_request(
+        &v[..],
         Frame {
             size: 37,
             header: Header::Request {
                 api_key: 75,
                 api_version: 0,
                 correlation_id: 5,
-                client_id: Some("adminclient-1".into())
+                client_id: Some("adminclient-1".into()),
             },
             body: Body::DescribeTopicPartitionsRequest(
                 DescribeTopicPartitionsRequest::default()
                     .topics(Some([TopicRequest::default().name("test".into())].into()))
                     .response_partition_limit(2000)
-                    .cursor(None)
-            )
+                    .cursor(None),
+            ),
         },
-        Frame::request_from_bytes(&v[..])?
-    );
+    )?;
 
     Ok(())
 }
@@ -6118,7 +6276,8 @@ fn describe_topic_partitions_response_v0_000() -> Result<()> {
     let api_key = 75;
     let api_version = 0;
 
-    assert_eq!(
+    round_trip_response(
+        &v[..],
         Frame {
             size: 126,
             header: Header::Response { correlation_id: 5 },
@@ -6131,7 +6290,7 @@ fn describe_topic_partitions_response_v0_000() -> Result<()> {
                             .name(Some("test".into()))
                             .topic_id([
                                 113, 142, 248, 9, 90, 152, 68, 142, 161, 218, 25, 210, 166, 234,
-                                204, 62
+                                204, 62,
                             ])
                             .is_internal(false)
                             .partitions(Some(
@@ -6165,18 +6324,426 @@ fn describe_topic_partitions_response_v0_000() -> Result<()> {
                                         .isr_nodes(Some([1].into()))
                                         .eligible_leader_replicas(Some([].into()))
                                         .last_known_elr(Some([].into()))
-                                        .offline_replicas(Some([].into()))
+                                        .offline_replicas(Some([].into())),
                                 ]
-                                .into()
+                                .into(),
                             ))
                             .topic_authorized_operations(3576)]
-                        .into()
+                        .into(),
                     ))
-                    .next_cursor(None)
-            )
+                    .next_cursor(None),
+            ),
         },
-        Frame::response_from_bytes(&v[..], api_key, api_version)?
-    );
+        api_key,
+        api_version,
+    )?;
 
     Ok(())
+}
+
+/// A `MetadataResponse` value carrying a topic id, encoded at v7, which has no
+/// field to put it in.
+///
+/// `TopicId` is `10+`, so the encoder drops it and these are the same bytes
+/// [`metadata_response_v7_000`] round trips — decoding them gives that
+/// fixture's value, with `topic_id: None`, and not this one. Encode only for
+/// that reason.
+#[test]
+fn metadata_response_v7_drops_topic_id() -> Result<()> {
+    use tansu_sans_io::metadata_response::{
+        MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic,
+    };
+
+    let _guard = init_tracing()?;
+
+    let header = Header::Response { correlation_id: 0 };
+
+    let body = MetadataResponse::default()
+        .throttle_time_ms(Some(0))
+        .brokers(Some(
+            [MetadataResponseBroker::default()
+                .node_id(1)
+                .host("localhost".into())
+                .port(9092)
+                .rack(None)]
+            .into(),
+        ))
+        .cluster_id(Some("5L6g3nShT-eMCtK--X86sw".into()))
+        .controller_id(Some(1))
+        .topics(Some(
+            [MetadataResponseTopic::default()
+                .error_code(0)
+                .name(Some("test".into()))
+                .topic_id(Some([
+                    118, 154, 146, 249, 19, 231, 73, 33, 136, 41, 108, 64, 151, 75, 30, 65,
+                ]))
+                .is_internal(Some(false))
+                .partitions(Some(
+                    [
+                        MetadataResponsePartition::default()
+                            .error_code(0)
+                            .partition_index(1)
+                            .leader_id(1)
+                            .leader_epoch(Some(0))
+                            .replica_nodes(Some([1].into()))
+                            .isr_nodes(Some([1].into()))
+                            .offline_replicas(Some([].into())),
+                        MetadataResponsePartition::default()
+                            .error_code(0)
+                            .partition_index(2)
+                            .leader_id(1)
+                            .leader_epoch(Some(0))
+                            .replica_nodes(Some([1].into()))
+                            .isr_nodes(Some([1].into()))
+                            .offline_replicas(Some([].into())),
+                        MetadataResponsePartition::default()
+                            .error_code(0)
+                            .partition_index(0)
+                            .leader_id(1)
+                            .leader_epoch(Some(0))
+                            .replica_nodes(Some([1].into()))
+                            .isr_nodes(Some([1].into()))
+                            .offline_replicas(Some([].into())),
+                    ]
+                    .into(),
+                ))
+                .topic_authorized_operations(None)]
+            .into(),
+        ))
+        .cluster_authorized_operations(None)
+        .into();
+
+    let api_key = 3;
+    let api_version = 7;
+
+    response_encodes_to(
+        header,
+        body,
+        api_key,
+        api_version,
+        &[
+            0, 0, 0, 180, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 9, 108, 111, 99, 97,
+            108, 104, 111, 115, 116, 0, 0, 35, 132, 255, 255, 0, 22, 53, 76, 54, 103, 51, 110, 83,
+            104, 84, 45, 101, 77, 67, 116, 75, 45, 45, 88, 56, 54, 115, 119, 0, 0, 0, 1, 0, 0, 0,
+            1, 0, 0, 0, 4, 116, 101, 115, 116, 0, 0, 0, 0, 3, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0,
+            0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0,
+            0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0,
+            0, 0, 0,
+        ],
+    )
+}
+
+/// A `MetadataResponse` value carrying `cluster_authorized_operations`, encoded
+/// at v12, which has no field to put it in.
+///
+/// The field is `8-10` — v11 deprecated it in favour of `DescribeCluster`
+/// (KIP-700) — so the encoder drops it and these are the same bytes
+/// [`metadata_response_v12_000`] round trips. Encode only for that reason.
+#[test]
+fn metadata_response_v12_drops_cluster_authorized_operations() -> Result<()> {
+    use tansu_sans_io::metadata_response::{MetadataResponseBroker, MetadataResponseTopic};
+
+    let _guard = init_tracing()?;
+
+    let header = Header::Response { correlation_id: 5 };
+
+    let body = MetadataResponse::default()
+        .throttle_time_ms(Some(0))
+        .brokers(Some(vec![
+            MetadataResponseBroker::default()
+                .node_id(0)
+                .host("kafka-server".into())
+                .port(9092)
+                .rack(None),
+        ]))
+        .cluster_id(Some("RvQwrYegSUCkIPkaiAZQlQ".into()))
+        .controller_id(Some(0))
+        .topics(Some(vec![
+            MetadataResponseTopic::default()
+                .error_code(3)
+                .name(Some("test".into()))
+                .topic_id(Some([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]))
+                .is_internal(Some(false))
+                .partitions(Some(vec![]))
+                .topic_authorized_operations(Some(-2147483648)),
+        ]))
+        .cluster_authorized_operations(Some(-1))
+        .into();
+
+    let api_key = 3;
+    let api_version = 12;
+
+    response_encodes_to(
+        header,
+        body,
+        api_key,
+        api_version,
+        &[
+            0, 0, 0, 92, 0, 0, 0, 5, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 13, 107, 97, 102, 107, 97, 45,
+            115, 101, 114, 118, 101, 114, 0, 0, 35, 132, 0, 0, 23, 82, 118, 81, 119, 114, 89, 101,
+            103, 83, 85, 67, 107, 73, 80, 107, 97, 105, 65, 90, 81, 108, 81, 0, 0, 0, 0, 2, 0, 3,
+            5, 116, 101, 115, 116, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 128, 0, 0,
+            0, 0, 0,
+        ],
+    )
+}
+
+/// A `MetadataRequest` value carrying `include_cluster_authorized_operations`,
+/// encoded at v12, which has no field to put it in.
+///
+/// The field is `8-10`, so the encoder drops it and these are the same bytes
+/// [`metadata_request_v12_001`] round trips. Encode only for that reason.
+#[test]
+fn metadata_request_v12_drops_include_cluster_authorized_operations() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let header = Header::Request {
+        api_key: 3,
+        api_version: 12,
+        correlation_id: 1,
+        client_id: Some("console-producer".into()),
+    };
+
+    let body = MetadataRequest::default()
+        .topics(Some([].into()))
+        .allow_auto_topic_creation(Some(true))
+        .include_cluster_authorized_operations(Some(false))
+        .include_topic_authorized_operations(Some(false))
+        .into();
+
+    request_encodes_to(
+        header,
+        body,
+        &[
+            0, 0, 0, 31, 0, 3, 0, 12, 0, 0, 0, 1, 0, 16, 99, 111, 110, 115, 111, 108, 101, 45, 112,
+            114, 111, 100, 117, 99, 101, 114, 0, 1, 1, 0, 0,
+        ],
+    )
+}
+
+#[test]
+fn find_coordinator_response_v2_000() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let v = [
+        0, 0, 0, 31, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 255, 255, 0, 0, 16, 247, 0, 9, 49, 50, 55, 46,
+        48, 46, 48, 46, 49, 0, 0, 35, 132,
+    ];
+
+    round_trip_response(
+        &v[..],
+        Frame {
+            size: 31,
+            header: Header::Response { correlation_id: 3 },
+            body: FindCoordinatorResponse::default()
+                .throttle_time_ms(Some(0))
+                .error_code(Some(0))
+                .error_message(None)
+                .node_id(Some(4343))
+                .host(Some("127.0.0.1".into()))
+                .port(Some(9092))
+                .coordinators(None)
+                .into(),
+        },
+        FindCoordinatorResponse::KEY,
+        2,
+    )
+}
+
+#[test]
+fn describe_configs_response_v4_003() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let v = [
+        0, 0, 0, 61, 0, 0, 0, 7, 0, 0, 0, 0, 0, 2, 0, 0, 10, 78, 111, 32, 101, 114, 114, 111, 114,
+        46, 2, 5, 116, 101, 115, 116, 2, 15, 99, 108, 101, 97, 110, 117, 112, 46, 112, 111, 108,
+        105, 99, 121, 8, 99, 111, 109, 112, 97, 99, 116, 0, 5, 0, 1, 2, 1, 0, 0, 0,
+    ];
+
+    round_trip_response(
+        &v[..],
+        Frame {
+            size: 61,
+            header: Header::Response { correlation_id: 7 },
+            body: DescribeConfigsResponse::default()
+                .throttle_time_ms(0)
+                .results(Some(
+                    [DescribeConfigsResult::default()
+                        .error_code(0)
+                        .error_message(Some("No error.".into()))
+                        .resource_type(2)
+                        .resource_name("test".into())
+                        .configs(Some(
+                            [DescribeConfigsResourceResult::default()
+                                .name("cleanup.policy".into())
+                                .value(Some("compact".into()))
+                                .read_only(false)
+                                .is_default(None)
+                                .config_source(Some(5))
+                                .is_sensitive(false)
+                                .synonyms(Some([].into()))
+                                .config_type(Some(2))
+                                .documentation(Some("".into()))]
+                            .into(),
+                        ))]
+                    .into(),
+                ))
+                .into(),
+        },
+        DescribeConfigsResponse::KEY,
+        4,
+    )
+}
+
+/// A `FetchResponse` whose partition holds a 1 024-byte record body.
+///
+/// Bytes and back with no value written down: the literal for a body that size
+/// would be longer than the capture and would say nothing the capture does not.
+/// This pins that the two directions agree on it, which is weaker than the
+/// fixtures above and is the only one of its kind here.
+///
+/// Decoded at v16, not the v17 in the name: that is how the capture arrived and
+/// how it has always been read. `FetchResponse.json` is `validVersions 0-17`
+/// and its own comment says v17 changes nothing in the response (KIP-853), so
+/// the two versions decode through the same arms.
+#[test]
+fn fetch_response_v17_body_1024() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let v = [
+        0, 0, 8, 229, 0, 0, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 1, 157, 33, 16, 189, 7, 114,
+        34, 140, 225, 73, 98, 44, 169, 175, 30, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 255, 255, 255, 255, 1, 0, 0, 0, 0, 1, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 255, 255, 255, 255,
+        1, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0,
+        0, 0, 1, 255, 255, 255, 255, 208, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 67, 255, 255, 255,
+        255, 2, 244, 74, 144, 98, 0, 0, 0, 0, 0, 1, 0, 0, 1, 157, 33, 16, 224, 139, 0, 0, 1, 157,
+        33, 16, 224, 167, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 142, 16, 0, 0, 0,
+        1, 128, 16, 89, 81, 72, 72, 78, 69, 66, 83, 69, 80, 68, 78, 83, 69, 73, 70, 71, 65, 77, 83,
+        85, 74, 88, 75, 79, 76, 84, 88, 83, 80, 76, 71, 72, 68, 73, 79, 89, 90, 74, 70, 78, 73, 68,
+        83, 80, 87, 72, 90, 77, 75, 86, 74, 65, 88, 68, 66, 90, 70, 67, 79, 88, 89, 75, 89, 82, 74,
+        79, 71, 89, 75, 68, 69, 83, 83, 74, 77, 79, 73, 73, 79, 87, 86, 75, 89, 85, 65, 86, 87, 74,
+        76, 88, 83, 69, 80, 80, 70, 69, 73, 76, 86, 66, 65, 83, 72, 67, 71, 82, 72, 83, 89, 71, 73,
+        70, 83, 89, 76, 86, 71, 82, 88, 67, 68, 86, 65, 66, 87, 87, 84, 82, 81, 90, 84, 77, 77, 80,
+        66, 65, 88, 71, 72, 69, 80, 72, 84, 65, 83, 83, 79, 82, 89, 75, 71, 86, 80, 70, 71, 81, 89,
+        74, 75, 73, 78, 83, 90, 85, 74, 76, 88, 81, 85, 85, 68, 86, 65, 76, 85, 83, 66, 70, 82, 83,
+        88, 78, 81, 72, 83, 68, 70, 68, 66, 65, 75, 81, 90, 90, 78, 84, 89, 88, 70, 72, 89, 71, 68,
+        80, 89, 71, 78, 82, 69, 84, 89, 65, 88, 73, 88, 88, 89, 81, 75, 77, 75, 85, 82, 68, 83, 74,
+        89, 73, 90, 78, 69, 68, 65, 72, 86, 73, 86, 72, 67, 74, 65, 80, 71, 79, 66, 81, 76, 72, 85,
+        90, 84, 75, 73, 87, 84, 86, 70, 69, 72, 86, 89, 80, 78, 71, 72, 73, 68, 83, 69, 82, 77, 65,
+        82, 70, 88, 67, 80, 89, 70, 69, 80, 81, 77, 70, 68, 79, 84, 68, 80, 87, 78, 75, 77, 89, 82,
+        77, 70, 73, 65, 66, 73, 81, 65, 87, 87, 79, 73, 70, 73, 65, 75, 78, 89, 70, 69, 80, 84, 80,
+        77, 73, 88, 80, 81, 65, 88, 70, 69, 73, 75, 85, 70, 70, 88, 73, 68, 72, 73, 76, 66, 80, 67,
+        66, 84, 72, 87, 68, 82, 77, 65, 76, 72, 70, 78, 68, 67, 82, 72, 65, 89, 86, 76, 76, 77, 82,
+        67, 75, 74, 73, 80, 78, 80, 75, 71, 87, 67, 73, 87, 81, 67, 72, 78, 72, 83, 70, 83, 67, 84,
+        89, 83, 65, 75, 83, 76, 86, 90, 67, 67, 65, 73, 69, 81, 80, 76, 74, 88, 89, 85, 79, 69, 65,
+        88, 80, 82, 65, 90, 74, 84, 79, 82, 66, 77, 80, 88, 69, 72, 70, 88, 87, 87, 68, 67, 76, 89,
+        75, 71, 79, 77, 83, 78, 87, 81, 82, 76, 75, 75, 83, 67, 81, 84, 71, 83, 85, 76, 76, 71, 70,
+        75, 73, 77, 77, 68, 71, 85, 65, 68, 86, 88, 71, 76, 77, 88, 81, 84, 85, 83, 76, 73, 76, 89,
+        74, 89, 89, 83, 72, 72, 76, 74, 90, 68, 73, 69, 83, 68, 80, 74, 88, 83, 67, 84, 65, 68, 90,
+        70, 71, 73, 68, 74, 83, 68, 69, 75, 68, 79, 76, 86, 87, 73, 71, 79, 84, 68, 65, 87, 75, 87,
+        79, 78, 83, 77, 89, 85, 70, 68, 84, 72, 90, 77, 78, 65, 85, 85, 89, 73, 66, 65, 71, 73, 87,
+        73, 73, 84, 76, 82, 85, 83, 81, 73, 90, 90, 83, 76, 72, 83, 77, 69, 77, 75, 82, 66, 84, 84,
+        77, 88, 84, 90, 72, 86, 76, 83, 68, 82, 83, 65, 81, 84, 67, 74, 88, 71, 70, 72, 69, 79, 89,
+        79, 87, 89, 79, 65, 86, 67, 87, 70, 67, 73, 79, 75, 65, 68, 78, 87, 77, 88, 83, 86, 74, 68,
+        81, 67, 74, 71, 68, 76, 65, 80, 90, 74, 89, 71, 69, 82, 86, 85, 83, 71, 74, 75, 74, 78, 71,
+        68, 65, 78, 82, 76, 67, 85, 88, 90, 69, 88, 78, 67, 80, 79, 89, 69, 75, 83, 84, 78, 73, 76,
+        89, 74, 76, 72, 77, 79, 77, 74, 77, 65, 89, 65, 74, 76, 90, 90, 87, 73, 75, 84, 90, 85, 87,
+        83, 70, 76, 69, 87, 83, 76, 75, 68, 77, 75, 74, 70, 67, 75, 76, 72, 83, 78, 69, 78, 71, 74,
+        84, 74, 67, 85, 74, 66, 89, 77, 65, 75, 70, 81, 76, 65, 67, 74, 70, 68, 65, 72, 81, 74, 85,
+        79, 86, 73, 88, 83, 83, 83, 65, 78, 80, 84, 68, 77, 73, 78, 69, 80, 72, 70, 72, 68, 82, 79,
+        89, 76, 87, 67, 84, 81, 68, 74, 85, 68, 85, 77, 75, 77, 82, 80, 75, 90, 73, 77, 90, 71, 80,
+        77, 77, 90, 72, 86, 73, 69, 68, 85, 72, 85, 68, 90, 83, 85, 90, 81, 65, 69, 85, 84, 75, 74,
+        72, 86, 72, 74, 85, 73, 77, 74, 86, 77, 85, 70, 82, 81, 75, 65, 86, 72, 87, 70, 85, 67, 69,
+        84, 83, 80, 65, 68, 78, 86, 78, 68, 65, 71, 65, 68, 86, 68, 87, 69, 70, 69, 73, 78, 87, 88,
+        78, 81, 68, 71, 83, 66, 82, 86, 70, 73, 87, 86, 70, 90, 70, 89, 85, 75, 74, 68, 75, 82, 90,
+        78, 67, 77, 70, 81, 84, 86, 73, 79, 81, 69, 89, 76, 76, 90, 70, 74, 88, 90, 74, 84, 86, 79,
+        87, 89, 86, 73, 73, 81, 79, 66, 88, 75, 90, 90, 82, 65, 86, 86, 70, 89, 68, 74, 83, 74, 88,
+        82, 75, 66, 83, 72, 69, 88, 87, 72, 66, 88, 71, 80, 88, 67, 89, 80, 66, 81, 77, 85, 81, 80,
+        67, 74, 69, 69, 82, 77, 67, 72, 86, 89, 66, 65, 68, 81, 67, 90, 85, 73, 87, 90, 65, 71, 88,
+        86, 72, 87, 74, 75, 84, 70, 79, 69, 85, 67, 68, 76, 76, 77, 76, 72, 86, 84, 85, 88, 82, 82,
+        67, 67, 84, 69, 79, 69, 86, 90, 82, 65, 65, 67, 83, 82, 71, 74, 77, 80, 89, 84, 81, 65, 87,
+        78, 86, 80, 88, 67, 81, 79, 84, 72, 65, 68, 81, 89, 79, 72, 0, 142, 16, 0, 56, 2, 1, 128,
+        16, 89, 75, 66, 81, 89, 65, 72, 86, 65, 85, 83, 79, 77, 90, 70, 82, 81, 90, 84, 84, 76, 78,
+        87, 80, 90, 87, 81, 84, 80, 81, 68, 67, 77, 78, 70, 67, 87, 65, 71, 88, 89, 75, 79, 78, 72,
+        88, 65, 66, 72, 66, 68, 86, 73, 81, 71, 67, 70, 68, 67, 78, 87, 83, 68, 84, 89, 73, 87, 78,
+        70, 67, 71, 77, 79, 84, 74, 71, 78, 89, 70, 80, 78, 88, 76, 71, 71, 80, 86, 88, 76, 76, 72,
+        72, 70, 79, 71, 73, 76, 76, 67, 84, 86, 74, 69, 80, 75, 68, 78, 69, 76, 67, 66, 89, 80, 66,
+        66, 75, 89, 82, 81, 83, 90, 76, 81, 82, 66, 76, 88, 67, 76, 73, 86, 70, 66, 81, 84, 79, 68,
+        65, 87, 87, 67, 88, 67, 83, 84, 87, 67, 68, 68, 65, 84, 72, 83, 77, 82, 86, 89, 77, 74, 82,
+        70, 71, 66, 80, 68, 69, 69, 67, 89, 80, 78, 89, 70, 86, 90, 73, 67, 88, 71, 86, 87, 81, 73,
+        68, 77, 73, 74, 79, 83, 80, 68, 81, 71, 78, 79, 72, 75, 87, 84, 86, 82, 72, 74, 71, 80, 78,
+        72, 89, 82, 82, 74, 74, 73, 70, 65, 87, 86, 89, 77, 89, 70, 69, 80, 82, 88, 73, 70, 88, 82,
+        74, 69, 73, 90, 74, 79, 65, 74, 86, 65, 76, 79, 70, 88, 84, 83, 73, 86, 78, 90, 86, 80, 85,
+        72, 74, 70, 71, 89, 66, 65, 65, 66, 88, 88, 75, 89, 77, 89, 86, 69, 69, 75, 82, 79, 80, 79,
+        81, 88, 78, 86, 84, 90, 90, 86, 72, 65, 65, 87, 82, 87, 77, 90, 89, 65, 76, 67, 87, 65, 65,
+        74, 80, 81, 84, 71, 73, 73, 76, 67, 66, 89, 85, 65, 85, 81, 84, 74, 80, 84, 77, 67, 83, 71,
+        75, 81, 74, 72, 74, 81, 81, 70, 65, 66, 72, 81, 80, 77, 90, 79, 81, 73, 86, 83, 74, 71, 67,
+        86, 90, 77, 82, 77, 70, 73, 76, 89, 83, 67, 66, 69, 65, 76, 71, 67, 72, 81, 90, 65, 77, 80,
+        77, 87, 68, 77, 65, 66, 86, 71, 71, 88, 86, 73, 76, 84, 88, 68, 79, 67, 75, 78, 88, 81, 65,
+        67, 77, 76, 72, 69, 84, 88, 88, 70, 70, 65, 89, 76, 80, 68, 86, 75, 87, 86, 85, 72, 86, 90,
+        81, 76, 90, 74, 85, 85, 72, 71, 90, 76, 71, 84, 74, 81, 68, 89, 77, 69, 66, 88, 87, 66, 77,
+        69, 84, 81, 65, 72, 87, 86, 75, 73, 84, 78, 68, 78, 84, 74, 89, 77, 87, 90, 72, 73, 73, 76,
+        80, 81, 84, 88, 90, 70, 72, 87, 79, 65, 88, 86, 73, 72, 82, 69, 86, 90, 79, 69, 88, 83, 89,
+        77, 79, 85, 89, 83, 69, 78, 87, 87, 76, 66, 73, 83, 89, 65, 80, 85, 77, 68, 70, 84, 72, 71,
+        81, 69, 73, 87, 67, 76, 74, 72, 90, 90, 69, 79, 89, 87, 88, 84, 85, 87, 79, 88, 69, 65, 87,
+        82, 76, 73, 89, 74, 83, 71, 74, 69, 66, 85, 78, 75, 73, 67, 71, 81, 80, 90, 76, 78, 69, 87,
+        66, 90, 83, 88, 68, 78, 88, 69, 82, 89, 82, 88, 65, 81, 75, 78, 66, 79, 81, 78, 75, 84, 89,
+        84, 86, 86, 89, 68, 76, 69, 80, 68, 83, 76, 78, 74, 80, 76, 80, 90, 88, 74, 89, 82, 74, 72,
+        69, 86, 85, 67, 74, 71, 74, 87, 88, 72, 85, 87, 89, 82, 70, 66, 81, 84, 81, 89, 90, 65, 78,
+        66, 73, 72, 78, 80, 74, 67, 87, 75, 75, 87, 83, 67, 79, 79, 83, 73, 65, 78, 75, 65, 89, 84,
+        72, 65, 66, 69, 84, 74, 79, 75, 84, 69, 81, 86, 81, 71, 83, 86, 76, 78, 72, 79, 85, 90, 85,
+        70, 77, 71, 86, 71, 88, 82, 70, 90, 87, 82, 84, 69, 84, 87, 90, 74, 87, 72, 75, 67, 70, 84,
+        66, 81, 68, 89, 79, 83, 70, 72, 76, 67, 77, 72, 87, 82, 67, 71, 69, 72, 85, 77, 81, 80, 90,
+        80, 84, 86, 87, 67, 75, 73, 69, 88, 68, 71, 75, 66, 68, 86, 72, 84, 69, 86, 90, 86, 70, 83,
+        77, 65, 87, 81, 76, 71, 67, 76, 74, 71, 71, 87, 68, 72, 76, 79, 71, 84, 65, 79, 90, 85, 85,
+        88, 75, 65, 66, 89, 84, 87, 80, 73, 72, 69, 85, 79, 76, 66, 85, 66, 71, 73, 78, 71, 82, 86,
+        89, 80, 72, 80, 77, 88, 69, 69, 78, 79, 87, 68, 72, 66, 69, 81, 84, 77, 68, 71, 84, 66, 66,
+        85, 77, 71, 80, 82, 73, 75, 66, 80, 84, 66, 68, 68, 89, 77, 67, 90, 71, 83, 66, 69, 90, 84,
+        79, 81, 90, 85, 74, 72, 80, 74, 78, 87, 89, 84, 90, 82, 88, 70, 82, 75, 80, 71, 80, 76, 78,
+        78, 87, 79, 69, 78, 72, 67, 81, 69, 73, 76, 80, 77, 68, 89, 88, 76, 79, 78, 79, 79, 87, 76,
+        69, 74, 75, 72, 65, 74, 66, 79, 82, 89, 70, 90, 80, 83, 89, 82, 89, 84, 70, 72, 88, 77, 83,
+        82, 70, 88, 81, 65, 82, 76, 76, 82, 70, 84, 84, 72, 84, 89, 88, 89, 72, 81, 87, 83, 82, 65,
+        73, 78, 81, 70, 83, 80, 81, 73, 83, 87, 82, 71, 73, 70, 76, 69, 82, 85, 84, 67, 88, 77, 80,
+        79, 75, 76, 85, 75, 74, 66, 77, 68, 85, 86, 69, 75, 85, 69, 69, 72, 67, 80, 82, 86, 75, 84,
+        71, 86, 65, 87, 70, 80, 82, 76, 81, 83, 86, 83, 78, 71, 89, 81, 75, 75, 87, 84, 80, 67, 65,
+        69, 65, 77, 78, 74, 75, 72, 66, 68, 77, 85, 81, 66, 78, 77, 75, 75, 73, 76, 89, 73, 82, 79,
+        66, 77, 72, 85, 86, 89, 69, 69, 87, 67, 68, 79, 71, 0, 0, 0, 1, 0, 1, 1,
+    ];
+
+    re_encodes(&v[..], FetchResponse::KEY, 16)
+}
+
+/// A `ListGroupsRequest` value carrying a types filter, encoded at v4, which
+/// has no field to put it in.
+///
+/// `TypesFilter` is `5+` (KIP-848), so the encoder drops it and these are the
+/// same bytes [`list_groups_request_v4_000`] round trips — decoding them gives
+/// that fixture's value, with `types_filter: None`. Encode only for that
+/// reason.
+#[test]
+fn list_groups_request_v4_drops_types_filter() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let header = Header::Request {
+        api_key: 16,
+        api_version: 4,
+        correlation_id: 84,
+        client_id: Some("adminclient-1".into()),
+    };
+
+    let body = ListGroupsRequest::default()
+        .states_filter(Some([].into()))
+        .types_filter(Some([].into()))
+        .into();
+
+    request_encodes_to(
+        header,
+        body,
+        &[
+            0, 0, 0, 26, 0, 16, 0, 4, 0, 0, 0, 84, 0, 13, 97, 100, 109, 105, 110, 99, 108, 105,
+            101, 110, 116, 45, 49, 0, 1, 0,
+        ],
+    )
 }

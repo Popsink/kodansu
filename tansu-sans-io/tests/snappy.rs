@@ -12,9 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// A golden fixture is a byte table, not a branch. #555's length gate is set
-// at the worst shipped function, and these bodies are the literals #553 will
-// state once instead of twice; the allow comes out when they do.
+// A golden fixture is a byte table, not a branch, and all three bodies here are
+// one: #555's length gate is set at the worst shipped function. The three
+// captures overlap heavily — the same producer's records at three counts, so
+// the 100 and 500 tables share a run of 1601 bytes and the 500 and 1000 tables
+// one of 8001 — but the overlap is inside the byte tables, which is where the
+// fixture is, so #553 had nothing to state once here.
 #![allow(clippy::too_many_lines)]
 
 use tansu_sans_io::{Frame, ProduceRequest, Result, record::inflated};

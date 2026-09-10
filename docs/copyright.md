@@ -17,13 +17,14 @@ byte. Only the notice lines above it differ.
 
 | class | count | notice |
 |---|---|---|
-| inherited from tansu | 160 | Peter Morgan's line, unchanged |
+| inherited from tansu | 158 | Peter Morgan's line, unchanged |
 | inherited, rewritten in place here | 17 | Peter Morgan's line, then Popsink's |
-| written at Popsink | 95 | Popsink's line alone |
+| written at Popsink | 98 | Popsink's line alone |
 
-The first two rows are the 177 files `copyright.toml` calls `inherited`; the middle
-row is the subset it also calls `joint`. 160 + 17 + 95 = 272, every tracked `.rs`
-file.
+The first two rows are the 175 files `copyright.toml` calls `inherited`; the middle
+row is the subset it also calls `joint`. 158 + 17 + 98 = 273, every tracked `.rs`
+file. `just copyright` prints the total it checked, which is how to tell whether
+this table has drifted.
 
 Popsink's line is `// Copyright ⓒ 2026 Popsink SAS`. It claims 2026 and no earlier
 year: the fork point is 2026-05-16 and all 469 commits since are dated 2026, so
@@ -99,12 +100,15 @@ git log --diff-filter=A -1 --format=%an -- <file>
 which splits the 102 additions into 92 Alexandre Colella, 1 Pierre-Yves Péton, and
 the 9 Peter Morgan above.
 
-**No Popsink-added file is upstream code that was split out.** Worth checking,
-because a file created by moving a module out of an upstream file is inherited code
-under a new name, and the command above would call it ours. It does not happen here:
-comparing each added file's distinctive lines (over 40 characters, header stripped)
-against every line in the tree at the fork point, the highest overlap is 26%, and
-those matches are all `ObjectStore` trait-impl boilerplate.
+**One Popsink-added file is upstream code under a new name.** Worth checking for,
+because a file made by moving code out of an upstream file is inherited code under
+a new name, and the command above would call it ours. It happened once:
+`tansu-sans-io/tests/golden.rs` is #553's merge of upstream's `decode.rs`,
+`encode.rs` and `codec.rs`, so almost all of it is upstream's and it is listed
+`inherited`. Nothing else: comparing each added file's distinctive lines (over 40
+characters, header stripped) against every line in the tree at the fork point, the
+highest overlap is 26%, and those matches are all `ObjectStore` trait-impl
+boilerplate.
 
 ## Rewritten in place
 
