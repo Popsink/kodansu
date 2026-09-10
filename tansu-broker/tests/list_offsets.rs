@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// One body walks every `ListOffset` variant against a produced log, so its
+// length and its branch count are the size of the matrix it covers, not
+// complexity #555 can ask anyone to remove.
+#![allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;

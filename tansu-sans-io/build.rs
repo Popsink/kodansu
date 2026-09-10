@@ -199,7 +199,6 @@ fn tag_kind(
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn body_enum(messages: &[Message], include_tag: bool) -> TokenStream {
     let variants = messages.iter().map(|message| {
         let name = message.type_name();
@@ -228,8 +227,12 @@ fn body_enum(messages: &[Message], include_tag: bool) -> TokenStream {
                 }
             });
 
+            // One match arm per API key per version, ~800 lines of it. The
+            // length is the protocol's, not anyone's to shorten, so the
+            // generator states the allow rather than #555 moving its gate.
             quote! {
                 impl From<mezzanine::Body> for Body {
+                    #[allow(clippy::too_many_lines)]
                     fn from(value: mezzanine::Body) -> Self {
                         match value {
                             #(#conversions),*
@@ -271,8 +274,12 @@ fn body_enum(messages: &[Message], include_tag: bool) -> TokenStream {
                 }
             });
 
+            // One match arm per API key per version, ~800 lines of it. The
+            // length is the protocol's, not anyone's to shorten, so the
+            // generator states the allow rather than #555 moving its gate.
             quote! {
                 impl From<crate::Body> for Body {
+                    #[allow(clippy::too_many_lines)]
                     fn from(value: crate::Body) -> Self {
                         match value {
                             #(#conversions),*
@@ -444,7 +451,6 @@ fn root_message_struct(message: &Message, include_tag: bool) -> TokenStream {
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn message_struct(
     module: &syn::Path,
     parent: Option<&Field>,
@@ -827,7 +833,6 @@ fn maximum_allocation_size(name: &Type, fields: &[Field], include_tag: bool) -> 
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn common_struct(
     parent: Option<&Field>,
     module: &syn::Path,

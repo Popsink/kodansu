@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// A rebalance test is a scripted sequence of protocol exchanges, each with
+// its own assertion: the branch count #555's nursery gate sees is the length
+// of the script.
+#![allow(clippy::cognitive_complexity)]
+
 use bytes::Bytes;
 use common::{
     CLIENT_ID, COOPERATIVE_STICKY, PROTOCOL_TYPE, RANGE, StorageType, alphanumeric_string,

@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// A golden fixture is a byte table, not a branch. #555's length gate is set
+// at the worst shipped function, and these bodies are the literals #553 will
+// state once instead of twice; the allow comes out when they do.
+#![allow(clippy::too_many_lines)]
+
 use tansu_sans_io::{Frame, ProduceRequest, Result, record::inflated};
 
 use crate::common::init_tracing;

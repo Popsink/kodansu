@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// A transaction test is a scripted sequence of protocol exchanges, each with
+// its own assertion: the branch count #555's nursery gate sees is the length
+// of the script.
+#![allow(clippy::cognitive_complexity)]
+
 use std::{collections::BTreeMap, slice, time::Duration};
 
 use bytes::Bytes;
