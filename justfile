@@ -224,16 +224,17 @@ fmt:
 # Never raise it to turn a red build green.
 #
 # The ratio is non-doc over (non-doc + code), so **deleting code raises it**.
-# That is not a corner case, it is the common one, three deletions running.
-# #549 deleted 2341 lines of comment-free unrun bin from
-# `tansu-sans-io/src/bin/` and moved the real number
-# 2.80887531% -> 2.86782372%; #552 then deleted 1989 lines of `#[ignore]`d test
-# body with the numerator untouched at 3199 (-> 2.91581595%), and dissolving the
-# multi-backend harness took another 843 lines while the numerator *fell* to
-# 3192 (-> 2.93223344%). A deletion that trips this gate is the gate working off
-# a smaller tree, not narration anyone wrote, and the honest response is to
-# re-ratchet at the new measured value — which is what 2.9323 is. Check the
-# numerator before assuming otherwise: three times now it has not risen.
+# That is not a corner case, it is the common one, four deletions running, and
+# the numerator has not risen once across them:
+#
+#   #549  -2341 lines, unrun bin        3199 -> 3199   2.80887531 -> 2.86782372
+#   #552  -1989 lines, skipped tests    3199 -> 3199   2.86782372 -> 2.91581595
+#   #552   -843 lines, the harness      3199 -> 3192   2.91581595 -> 2.93223344
+#   #551  -1695 lines, five delegations 3192 -> 3192   2.93223344 -> 2.97101584
+#
+# A deletion that trips this gate is the gate working off a smaller tree, not
+# narration anyone wrote, and the honest response is to re-ratchet at the new
+# measured value — which is what 2.9711 is. Check the numerator first.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -244,7 +245,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.9323" top="12":
+comments ceiling="2.9711" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
