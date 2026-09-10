@@ -2365,7 +2365,7 @@ fn coalesce_tuning(storage: &Url) -> CoalesceTuning {
             }
             // The one key here that changes what is *written* rather than how
             // often (#442), and the only one whose effect does not reverse when
-            // it is unset again — see `DynoStore::segment_format_version`. An
+            // it is unset again — see the engine's `segment_format_version`. An
             // unparseable or unknown version is ignored with a warning like
             // every other key, which leaves the writer at its default: a typo
             // must not be able to stamp segments with a version no reader knows.

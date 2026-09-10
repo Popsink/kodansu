@@ -1022,17 +1022,10 @@ async fn coalesced_stale_hint_list_offsets_is_per_prefix_not_per_partition() -> 
     // per-partition GET.
     let age = |storage: &DynoStore| {
         let past = SystemTime::now() - Duration::from_secs(60);
-        for hint in storage
-            .next_offsets
-            .lock()
-            .expect("next_offsets lock")
-            .values_mut()
-        {
-            hint.listed_at = Some(past);
-        }
+        storage.topics.age_hints(past);
         for entry in storage
-            .prefix_index
-            .lock()
+            .prefixes
+            .index()
             .expect("prefix_index lock")
             .values_mut()
         {
@@ -1142,17 +1135,10 @@ async fn coalesced_latest_survives_peer_expiry_via_floor_certification() -> Resu
     assert_eq!(4, storage.high_watermark(&tp).await?);
     let age = |storage: &DynoStore| {
         let past = SystemTime::now() - Duration::from_secs(60);
-        for hint in storage
-            .next_offsets
-            .lock()
-            .expect("next_offsets lock")
-            .values_mut()
-        {
-            hint.listed_at = Some(past);
-        }
+        storage.topics.age_hints(past);
         for entry in storage
-            .prefix_index
-            .lock()
+            .prefixes
+            .index()
             .expect("prefix_index lock")
             .values_mut()
         {
@@ -1256,17 +1242,10 @@ async fn segmentless_substream_stale_hint_latest_costs_no_per_partition_get() ->
     // memoized, which is the state a production poll arrives in once per window.
     let age = |storage: &DynoStore| {
         let past = SystemTime::now() - Duration::from_secs(60);
-        for hint in storage
-            .next_offsets
-            .lock()
-            .expect("next_offsets lock")
-            .values_mut()
-        {
-            hint.listed_at = Some(past);
-        }
+        storage.topics.age_hints(past);
         for entry in storage
-            .prefix_index
-            .lock()
+            .prefixes
+            .index()
             .expect("prefix_index lock")
             .values_mut()
         {

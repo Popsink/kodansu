@@ -635,7 +635,7 @@ async fn probe_seed(seed: u64) -> Result<()> {
     // Snapshot the whole cached index: (seq, footer, last_modified) — a stale
     // peer replica's view of the prefix.
     let stale: Vec<(u64, SegmentFooter, i64)> = {
-        let index = store.prefix_index.lock().unwrap();
+        let index = store.prefixes.index().unwrap();
         index
             .get(PREFIX)
             .map(|entry| {
@@ -655,7 +655,7 @@ async fn probe_seed(seed: u64) -> Result<()> {
         _ = store.drain_compact_prefix(PREFIX).await;
 
         let live: BTreeSet<u64> = {
-            let index = store.prefix_index.lock().unwrap();
+            let index = store.prefixes.index().unwrap();
             index
                 .get(PREFIX)
                 .map(|entry| entry.segments.keys().copied().collect())

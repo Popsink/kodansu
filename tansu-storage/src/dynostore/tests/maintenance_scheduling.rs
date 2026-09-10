@@ -157,8 +157,8 @@ fn stale_footer(base: i64, count: i64) -> SegmentFooter {
 /// The sequences this process has indexed for `PREFIX`.
 fn indexed(store: &DynoStore) -> Vec<u64> {
     store
-        .prefix_index
-        .lock()
+        .prefixes
+        .index()
         .expect("prefix index")
         .get(PREFIX)
         .map(|entry| entry.segments.keys().copied().collect())
