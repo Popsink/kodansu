@@ -80,7 +80,7 @@ rather than the write.
 ```shell
 just coverage          # summary in the terminal
 just coverage-html     # browsable report, opens in a browser
-just coverage-ci 70    # what CI runs: lcov + HTML + summary, floored at 70%
+just coverage-ci 82    # what CI runs: lcov + HTML + summary, floored at 82%
 ```
 
 All three need `cargo-llvm-cov` and the `llvm-tools-preview` component:
@@ -103,6 +103,24 @@ deletes the tests covering the code it touches is exactly what the floor is for.
 Coverage is measured without `--all-targets`, unlike `test-workspace`. With it,
 cargo builds the benchmark and example targets too and llvm-cov counts their
 lines as uncovered source — a number that moves when you add a benchmark.
+
+That excludes `[[bench]]` and `[[example]]`, and nothing else: `[[bin]]` targets
+are in cargo's default target set, so an unrun binary still lands in the
+denominator at 0%. #549 was that hole. `tansu-sans-io/src/bin/bench.rs` was an
+auto-discovered bin — the crate declares no `[[bin]]`, cargo picked the file up
+from `src/bin/` by convention — that nothing built on purpose, ran or referenced,
+and its 1955 uncovered lines were 5.5% of the workspace denominator and 26.6% of
+all uncovered lines. Deleting it moved the real number from 79.44% to 84.06% and
+`tansu-sans-io` from 61% to 77%, which is why that crate used to read as the
+worst-covered one in the tree and was not. A new `src/bin/*.rs` re-opens it, so
+add one only if something runs it.
+
+The number is not reproducible to the digit. Measured three times over the one
+tree, the denominator held at 33 776 lines and the uncovered count came out 5383
+on darwin, then 5375 and 5383 on two runs of the `coverage` job — ~8 lines, 0.03
+points, of run-to-run jitter *within* a platform. That is why the floor sits two
+points under rather than at the measured value, the way `comments`' ceiling
+does: a floor at the measurement would go red on a re-run of a green commit.
 
 Doc tests are not counted. `cargo llvm-cov` can only instrument them on nightly,
 and this workspace is pinned to a stable toolchain.

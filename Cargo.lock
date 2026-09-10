@@ -3823,7 +3823,6 @@ name = "tansu-sans-io"
 version = "1.0.0-alpha.18"
 dependencies = [
  "bytes",
- "clap",
  "convert_case",
  "crc-fast",
  "criterion",
