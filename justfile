@@ -135,6 +135,10 @@ test-storage-minio: s3-up
 #
 # `--all-targets` is dropped because it makes cargo build the benchmark and
 # example targets too, and llvm-cov then counts their lines as uncovered source.
+# Note what that does *not* buy: `[[bin]]` targets are in cargo's default set, so
+# dropping `--all-targets` leaves them in. #549 was exactly that hole — an
+# auto-discovered `tansu-sans-io/src/bin/bench.rs` nothing ran, 1955 uncovered
+# lines, 5.5% of the denominator. A new `src/bin/*.rs` re-opens it.
 # `--exclude fuzz` is here for the same reason as in `test-workspace`: the crate
 # needs a C++ libfuzzer toolchain that is not always present.
 coverage-scope := "--workspace --all-features --no-fail-fast --exclude fuzz"
@@ -206,17 +210,26 @@ fmt:
 # each of its exemptions.
 #
 # The ceiling is a ratchet, not a target — the same argument as `coverage-ci`
-# below it, with one difference in how tight it is set. Coverage's floor sits
-# 3 points under the measured number because a decimal point of coverage is
-# noise. Here a tenth of a point is ~110 lines of narration, so the ceiling is
-# the measured value itself — 2.82280530%, rounded up at the last digit to the
-# 2.8229 below, which is a tenth of a line of headroom. One added line of
-# uncited narration fails; a line of rustdoc, a line of code, a trailing
+# below it, with one difference in how tight it is set. Coverage's floor sits a
+# couple of points under the measured number because that measurement jitters by
+# ~8 lines run to run (#549 measured it three times over one tree). This one does
+# not jitter at all, and a tenth of a point here is ~110 lines of narration, so
+# the ceiling is the measured value itself — 2.86782372%, rounded up at the last
+# digit to the 2.8679 below, which is a tenth of a line of headroom. One added
+# line of uncited narration fails; a line of rustdoc, a line of code, a trailing
 # comment, or a narration block citing an issue does not.
 #
 # So a change that legitimately adds narration has to raise this number and say
 # why the real one moved — that is the whole mechanism, not a workaround for it.
 # Never raise it to turn a red build green.
+#
+# The ratio is non-doc over (non-doc + code), so **deleting code raises it**.
+# That is not a corner case: #549 deleted 2341 lines of comment-free unrun bin
+# from `tansu-sans-io/src/bin/` and moved the real number 2.80887531% ->
+# 2.86782372% with the numerator untouched at 3199. A deletion that trips this
+# gate is the gate working off a smaller tree, not narration anyone wrote, and
+# the honest response is to re-ratchet at the new measured value — which is what
+# 2.8679 is. Check the numerator before assuming otherwise.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -227,7 +240,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.8229" top="12":
+comments ceiling="2.8679" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

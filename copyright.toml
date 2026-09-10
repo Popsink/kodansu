@@ -109,8 +109,6 @@ inherited = [
     "tansu-sans-io/benches/decode_bench.rs",
     "tansu-sans-io/build.rs",
     "tansu-sans-io/src/acl.rs",
-    "tansu-sans-io/src/bin/bench.rs",
-    "tansu-sans-io/src/bin/bench_produce_v11.rs",
     "tansu-sans-io/src/consumer.rs",
     "tansu-sans-io/src/consumer/assignor.rs",
     "tansu-sans-io/src/consumer/assignor/cooperative_sticky.rs",

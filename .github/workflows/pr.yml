@@ -197,12 +197,23 @@ jobs:
           cache: false
       - uses: taiki-e/install-action@nextest
       - uses: taiki-e/install-action@cargo-llvm-cov
-      # The floor is a ratchet, and 70 is deliberately under the 73.21% measured
-      # at the time it was set: it is there to catch a change that deletes the
-      # tests covering the code it touches, not to police a decimal point. Raise
-      # it when the real number moves up; never lower it to turn a red build
-      # green, which is the one edit that makes this job decorative.
-      - run: just coverage-ci 70
+      # The floor is a ratchet, and 82 is deliberately under the ~84.06% measured
+      # when #549 deleted the unrun `tansu-sans-io` bin that had been 5.5% of the
+      # denominator: it is there to catch a change that deletes the tests
+      # covering the code it touches, not to police a decimal point.
+      #
+      # Two points is more slack than `comments` gets below, and the reason is
+      # that this number is not reproducible to the digit the way that one is.
+      # #549 measured it three times over one tree — 5383 uncovered lines on
+      # darwin, then 5375 and 5383 on two runs of this job — so the denominator
+      # is stable at 33776 and the numerator moves by ~8 lines, 0.03 points, run
+      # to run within a single platform. A floor at the measured value would go
+      # red on a re-run of a green commit. The rest of the margin is for
+      # legitimate churn in what the suite covers.
+      #
+      # Raise it when the real number moves up; never lower it to turn a red
+      # build green, which is the one edit that makes this job decorative.
+      - run: just coverage-ci 82
       - name: Coverage summary
         if: always()
         run: |

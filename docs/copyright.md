@@ -17,12 +17,12 @@ byte. Only the notice lines above it differ.
 
 | class | count | notice |
 |---|---|---|
-| inherited from tansu | 162 | Peter Morgan's line, unchanged |
+| inherited from tansu | 160 | Peter Morgan's line, unchanged |
 | inherited, rewritten in place here | 17 | Peter Morgan's line, then Popsink's |
-| written at Popsink | 93 | Popsink's line alone |
+| written at Popsink | 95 | Popsink's line alone |
 
-The first two rows are the 179 files `copyright.toml` calls `inherited`; the middle
-row is the subset it also calls `joint`. 162 + 17 + 93 = 272, every tracked `.rs`
+The first two rows are the 177 files `copyright.toml` calls `inherited`; the middle
+row is the subset it also calls `joint`. 160 + 17 + 95 = 272, every tracked `.rs`
 file.
 
 Popsink's line is `// Copyright ⓒ 2026 Popsink SAS`. It claims 2026 and no earlier
