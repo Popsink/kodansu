@@ -114,7 +114,7 @@ type SegmentExpirySnapshot = (u64, i64, Vec<(Substream, String, i32, i64)>);
 
 /// This process's view of the cluster's retired-prefix markers (#532): prefix ->
 /// (the etag it was last read at, the marker), so a refresh GETs only what
-/// changed. See [`DynoStore::retired_prefixes`].
+/// changed. See [`PrefixCaches`].
 type RetiredPrefixCache = BTreeMap<String, (Option<String>, RetiredPrefix)>;
 
 #[derive(Clone, Debug)]
@@ -557,7 +557,7 @@ static PREFIX_TAIL_PROBES: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// unbroken offset interval per sub-stream. Normally it does: the segments
 /// of a prefix tile the offset axis with no gaps, so any run of them is
 /// contiguous whatever order it was selected in. Quarantining a segment
-/// (see [`DynoStore::quarantined_segments`]) punches a hole in that tiling, and
+/// (see [`PrefixCaches`]) punches a hole in that tiling, and
 /// merging *across* the hole would slide every record above it down into
 /// the gap — silent offset corruption, which is far worse than the stalled
 /// drain being fixed.
@@ -746,7 +746,7 @@ impl IndexedTopic {
 /// behind (#246): the successor's log starts at the predecessor's end.
 ///
 /// By **topic id** for a topic created under the v4 writer regime
-/// ([`DynoStore::segment_format_version`]). A recreation is a different uuid, so
+/// ([`Tuning::segment_format_version`]). A recreation is a different uuid, so
 /// it is a different sub-stream, its predecessor's slices are unreachable by
 /// construction rather than hidden by a floor, and its log starts where an empty
 /// log starts. The pinned identity is `topic-routing/{name}.json`'s
@@ -996,15 +996,15 @@ pub struct CoalesceTuning {
     /// duplicates, never loss.
     pub watermark_hint_ttl: Option<Duration>,
     /// The segment footer version this deployment writes (#442). See
-    /// [`DynoStore::segment_format_version`] — including why raising it is a
+    /// [`Tuning::segment_format_version`] — including why raising it is a
     /// one-way move.
     pub segment_format_version: Option<u16>,
     /// Leading components of a topic name that form its coalescing prefix
     /// (#464); `0` gives every topic its own prefix. See
-    /// [`DynoStore::prefix_depth`] — this one is sealed per cluster, not tuned.
+    /// [`Tuning::prefix_depth`] — this one is sealed per cluster, not tuned.
     pub prefix_depth: Option<usize>,
     /// The separator those components are split on (#464). See
-    /// [`DynoStore::prefix_separator`].
+    /// [`Tuning::prefix_separator`].
     pub prefix_separator: Option<String>,
 
     /// Upper bound on one `Fetch` response (#539); `None` keeps
@@ -1032,7 +1032,7 @@ static SEGMENT_FLUSHES: LazyLock<Counter<u64>> = LazyLock::new(|| {
 /// Expected to be **flat zero**. A non-zero value means compaction met a run it
 /// could not merge without losing records and declined. Since #399 that costs
 /// one refusal per newly met seam per process, not a permanent stall: the break
-/// is memoized ([`DynoStore::compact_seams`]) and later runs are selected around
+/// is memoized ([`PrefixCaches`]) and later runs are selected around
 /// it, so the segments on either side still merge. A *sustained* rate here
 /// therefore means seams are being newly discovered — run `tansu audit` on the
 /// bucket to see whether records are still being lost, or the fleet is merely
@@ -2019,10 +2019,10 @@ const SEGMENT_FORMAT_VERSION_V3: u16 = 3;
 ///
 /// What is different is that the gate is a flag rather than a release. Nothing
 /// emits v4 until a deployment sets `segment_format=4`
-/// ([`DynoStore::segment_format_version`]), so the ordering is: roll the binary
+/// ([`Tuning::segment_format_version`]), so the ordering is: roll the binary
 /// everywhere (every reader now accepts v4, nothing writes it), *then* flip.
 /// The flip is one-way in practice — see the warning on
-/// [`DynoStore::segment_format_version`].
+/// [`Tuning::segment_format_version`].
 pub(crate) const SEGMENT_FORMAT_VERSION_V4: u16 = 4;
 
 /// The footer versions a deployment may be configured to **write** (#442).
@@ -2608,7 +2608,7 @@ type ProducerId = i64;
 type Sequence = i32;
 type Topic = String;
 
-/// Per-partition next-offset hint (see [`DynoStore::next_offsets`]).
+/// Per-partition next-offset hint (see [`TopicCaches`]).
 ///
 /// `next` is the cached next offset to assign (== the high watermark) and is the
 /// authority for offset *assignment* only as a starting candidate — the true
@@ -3035,7 +3035,7 @@ struct TopicIdRef {
     name: Topic,
 }
 
-/// In-memory topic index (see [`DynoStore::topic_index`]). `entries` maps a
+/// In-memory topic index (see [`TopicCaches`]). `entries` maps a
 /// topic name to its last-seen object etag and decoded metadata, used to skip
 /// re-GETting unchanged objects on refresh; `snapshot` is the shared, ready-to-
 /// serve list reused by every list-all caller between refreshes.
@@ -3302,7 +3302,7 @@ impl DynoStore {
     ///
     /// Built per call rather than memoized like [`Self::topic_meta`]: it is
     /// written once per topic deletion and read through the etag-delta cache
-    /// ([`Self::retired_prefixes`]), so a permanent per-prefix handle would hold
+    /// ([`PrefixCaches`]), so a permanent per-prefix handle would hold
     /// a second copy of the value for no read it serves. A fresh handle has no
     /// cached version, so its first `with_mut` attempts a create and falls back
     /// to a conditional update on conflict — exactly the merge a second topic
@@ -3538,7 +3538,7 @@ impl DynoStore {
     /// for the tick instead of ballooning maintainer memory.
     const PREFIX_COMPACT_SEEN_KEYS: usize = 1_000_000;
 
-    /// Cap on [`Self::quarantined_segments`] per prefix (#398).
+    /// Cap on [`PrefixCaches`]'s quarantine per prefix (#398).
     ///
     /// The set is one `u64` per known-bad object and production holds ~900 of
     /// them across the fleet, so this is far above the incidence it exists for.
@@ -3953,7 +3953,7 @@ impl DynoStore {
 
     /// The truncation floor (#176) for `topition` from in-process caches only
     /// — the OptiCon watermark cache first (it is refreshed by the cold/slow
-    /// watermark reads), else the [`Self::truncate_floors`] memo — **without
+    /// watermark reads), else the [`TopicCaches`] truncation memo — **without
     /// any object-store request**. `None` when neither holds the partition.
     /// Callers on request-free paths treat `None` as "no floor known": for
     /// read-uncommitted `offset_stage_at` that degrades to the pre-truncation
@@ -4035,7 +4035,7 @@ impl DynoStore {
         Ok(floor)
     }
 
-    /// Max-fold `floor` into the [`Self::truncate_floors`] memo (the floor is
+    /// Max-fold `floor` into the [`TopicCaches`] truncation memo (the floor is
     /// monotonic, so a racing older resolution can never regress it).
     fn memo_truncate_floor(&self, topition: &Topition, floor: i64) -> Result<()> {
         self.topics.memo_truncate_floor(topition, floor)
@@ -4186,7 +4186,7 @@ impl DynoStore {
     /// The cached `watermark.high` floor (and its #290 served-end
     /// certification, if any) for a prefix-coalesced sub-stream, valid only
     /// when it was read under the still-current certified seq `floor` (see
-    /// [`Self::coalesced_watermark_floors`]). `None` means the caller must pay
+    /// [`TopicCaches`]). `None` means the caller must pay
     /// the `watermark.json` GET (once — the slow path caches it via
     /// [`Self::cache_coalesced_watermark`]).
     fn cached_coalesced_watermark(
@@ -5771,7 +5771,7 @@ impl DynoStore {
     }
 
     /// The per-prefix single-flight lock for the real index refresh and the
-    /// certified seq-floor sync (see [`Self::prefix_read_sync_locks`]).
+    /// certified seq-floor sync (see [`PrefixLocks`]).
     fn prefix_read_sync_lock(&self, prefix: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
         self.prefix_locks.read_sync(prefix)
     }
@@ -7340,7 +7340,7 @@ impl DynoStore {
         }))
     }
 
-    /// The per-prefix flush serialization lock (see [`Self::prefix_flush_locks`]).
+    /// The per-prefix flush serialization lock (see [`PrefixLocks`]).
     fn prefix_flush_lock(&self, prefix: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
         self.prefix_locks.flush(prefix)
     }
@@ -9730,7 +9730,7 @@ impl DynoStore {
         Ok(())
     }
 
-    /// The seams of `prefix` (#399) — see [`Self::compact_seams`]. Snapshotted
+    /// The seams of `prefix` (#399) — see [`PrefixCaches`]. Snapshotted
     /// for the same reason [`Self::quarantined_segments_of`] is.
     fn compact_seams_of(&self, prefix: &str) -> Result<BTreeSet<u64>> {
         self.prefixes.seams_of(prefix)
@@ -11526,7 +11526,7 @@ impl DynoStore {
     ///
     /// ## Cost
     ///
-    /// Once per prefix per process ([`Self::served_end_reconciled`]) — a forced
+    /// Once per prefix per process ([`PrefixCaches`]) — a forced
     /// listing plus one conditional watermark GET per sub-stream, which answers
     /// 304 while the watermark is unchanged. Right as a one-shot after a deploy,
     /// wasteful every tick. A restart re-arms it, which is the correct default:
@@ -12265,7 +12265,7 @@ impl DynoStore {
     /// conflict-correction re-encode.
     ///
     /// `version` is stamped unconditionally and comes from the writer regime
-    /// ([`DynoStore::segment_format_version`]), never from the segment's
+    /// ([`Tuning::segment_format_version`]), never from the segment's
     /// content — a v4 segment whose sub-streams are all name-keyed is still v4,
     /// and its entries carry the nil uuid. What *is* content is the identity of
     /// each sub-stream (#442), which the caller decides and passes in: a v3

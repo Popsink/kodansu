@@ -175,7 +175,7 @@ where
 /// Each map is bounded by the cluster's live topic count (the partition-keyed
 /// ones by its live partition count), and the thing that enforces the bound is
 /// [`Self::retain_live`] on every maintenance tick, not a size or age policy.
-/// That distinction is load-bearing for [`Self::next_offsets`]: it is offset
+/// That distinction is load-bearing for the next-offset hints: it is offset
 /// *assignment* state for a live topic, so evicting it under memory pressure
 /// would be a correctness bug rather than a cache miss. Absence from a bucket
 /// listing is the only admissible eviction criterion here, which is why the
@@ -793,7 +793,7 @@ fn retain_live_in<K, V, F>(
 /// prefixes. It is **not** bounded by a sweep, unlike [`TopicCaches`], and the
 /// reason is a real constraint rather than an omission: a prefix is shared
 /// between topics and no caller can tell whether a deleted topic was its last
-/// member without a scan, so evicting [`Self::segment_seqs`] or a flush lock for
+/// member without a scan, so evicting a prefix's next-sequence hint or a flush lock for
 /// a prefix a sibling topic is still producing to would put a second sequence
 /// authority on it — the #78 class. The growth that is left is one entry set per
 /// *compacted* topic, which routes to its own dedicated prefix (#175);
