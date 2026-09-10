@@ -81,15 +81,7 @@ async fn latest(storage: &DynoStore, topition: &Topition) -> Result<Option<i64>>
 fn age_watermark_view(storage: &DynoStore, topition: &Topition, age: Duration) -> Result<()> {
     let then = SystemTime::now() - age;
 
-    storage
-        .next_offsets
-        .lock()
-        .map_err(Into::<Error>::into)
-        .map(|mut locked| {
-            if let Some(hint) = locked.get_mut(topition) {
-                hint.listed_at = hint.listed_at.map(|_| then);
-            }
-        })?;
+    storage.topics.age_hint(topition, then);
 
     storage
         .prefix_index

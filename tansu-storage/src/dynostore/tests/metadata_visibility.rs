@@ -107,7 +107,7 @@ async fn the_index_says_why_a_lookup_fell_through() -> Result<(), Error> {
     // No usable index: the case the fallback exists for (#28/#29), and the one
     // that must keep reading the object. Aged rather than waited out, so the test
     // does not sleep through the TTL.
-    store.topic_index.lock()?.refreshed_at = None;
+    store.topics.invalidate_index();
 
     assert_eq!(
         "stale",

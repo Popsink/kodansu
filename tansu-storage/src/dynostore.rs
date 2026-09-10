@@ -29,6 +29,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use caches::TopicCaches;
 use futures::{
     StreamExt,
     stream::{BoxStream, TryStreamExt},
@@ -76,6 +77,7 @@ use tracing::{debug, error, info, instrument, warn};
 use url::Url;
 use uuid::Uuid;
 
+mod caches;
 mod metadata;
 mod opticon;
 
@@ -119,47 +121,14 @@ pub struct DynoStore {
     cluster: String,
     node: i32,
     advertised_listener: Url,
-    watermarks: Arc<Mutex<BTreeMap<Topition, OptiCon<Watermark>>>>,
     meta: OptiCon<Meta>,
 
-    /// Per-topic optimistic-concurrency handle on
-    /// `topic-metadata/{name}.json`, the authoritative record of a topic's id
-    /// and config. Decomposing topic metadata out of the cluster-global
-    /// `meta.json` removes the create-time CAS contention on that monolith and,
-    /// crucially, makes a freshly created topic immediately visible to every
-    /// replica: a replica that has never read the topic holds no cached etag,
-    /// so the conditional GET cannot be short-circuited to a stale
-    /// `NotModified` (the cross-replica create-then-produce race, #28).
-    topic_metas: Arc<Mutex<BTreeMap<Topic, OptiCon<TopicMetadata>>>>,
-
-    /// In-memory, etag-delta-refreshed index of all topics, serving the list-all
-    /// metadata path and the cleanup policies from memory. Without it, list-all
-    /// swept every per-topic object (a GET each) on every request — the #29
-    /// regression that OOM-crash-looped prod under metadata load. A refresh
-    /// LISTs the `topic-metadata/` prefix once and GETs only the objects whose
-    /// etag changed, so it scales to tens of thousands of topics.
-    topic_index: Arc<Mutex<TopicIndex>>,
-
-    /// Single-flight guard: only one task refreshes [`Self::topic_index`] at a
-    /// time; concurrent list-all callers await it rather than each re-listing.
-    topic_index_refresh: Arc<tokio::sync::Mutex<()>>,
-
-    /// Cache of the `topic-ids/{uuid}.json` pointer (topic-id -> name), immutable
-    /// for a topic's lifetime, so a by-id lookup avoids an uncached object GET;
-    /// invalidated on delete.
-    topic_ids: Arc<Mutex<BTreeMap<Uuid, Topic>>>,
-
-    /// Cache of the pinned routing prefix (`topic-routing/{name}.json`), the
-    /// prefix a topic's records coalesce under (#236).
-    ///
-    /// Held **without a TTL**, for the same reason [`Self::topic_ids`] is: the
-    /// pinned value is immutable for a topic's lifetime, so there is no staleness
-    /// argument to make. That is the whole point of pinning it. Before, routing
-    /// was re-derived from `cleanup.policy` — mutable config — so the value could
-    /// only be memoized for seconds, and the per-topic conditional GET that
-    /// refreshed it was 57% of the fleet's 304 plane (~$38/day). Invalidated on
-    /// delete, exactly like the id pointer.
-    routing_prefixes: Arc<Mutex<BTreeMap<Topic, TopicRouting>>>,
+    /// Every process-local cache whose lifetime is a topic's (#554): the
+    /// per-topic and per-partition handles, hints and memos, the id and routing
+    /// pointers, and the list-all topic index. Grouped so that "this topic is
+    /// gone" has one answer ([`TopicCaches::forget`]) rather than one per
+    /// invalidation site — see [`caches`] for the map that answer used to miss.
+    topics: TopicCaches,
 
     /// Broker auto-topic-creation policy (Kafka `auto.create.topics.enable` /
     /// `num.partitions` / `default.replication.factor`), consulted by the
@@ -173,30 +142,6 @@ pub struct DynoStore {
     /// auto-create path silently dropped it (#225).
     topic_defaults: TopicDefaults,
 
-    /// Per-partition cache of the next offset to assign (== the high watermark).
-    ///
-    /// This is a *hint*, not the authority: the authority is the set of
-    /// immutable, create-only batch objects whose names encode their base
-    /// offset. The hint lets the common produce path skip a tail listing, and
-    /// is reconciled against the listing on a `Create` conflict or a cold read
-    /// (see [`DynoStore::refresh_high`]). Keeping offset assignment off a single
-    /// mutable `watermark` object is what takes the produce hot path off the
-    /// GCS per-object update-rate cap (#13).
-    next_offsets: Arc<Mutex<BTreeMap<Topition, OffsetHint>>>,
-
-    /// Per-partition cache of the persisted `watermark.high` floor for
-    /// prefix-coalesced sub-streams, paired with the certified seq floor under
-    /// which it was read: `topition -> (watermark.high, certified floor)`. An
-    /// entry is valid only while [`Self::certified_seq_floor`] still returns
-    /// the same floor — for coalesced sub-streams `watermark.high` only ever
-    /// advances in an operation that then raises that floor (see
-    /// `certified_seq_floor`), so an unchanged floor certifies the cached
-    /// value. This is what takes the stale-hint LATEST path
-    /// ([`Self::coalesced_high_from_index`]) off the per-partition
-    /// `watermark.json` conditional GET: a wide `endOffsets(assignment)` costs
-    /// O(prefixes), not O(partitions), in object-store round-trips.
-    coalesced_watermark_floors: Arc<Mutex<BTreeMap<Topition, CachedWatermark>>>,
-
     /// Prefixes this process has already run the served-end reconciliation over
     /// (#290). See [`DynoStore::certify_prefix_served_ends`].
     ///
@@ -206,19 +151,6 @@ pub struct DynoStore {
     /// it, which is the right default — a fresh process is exactly when a prefix
     /// may have picked up a gap under a binary that did not certify.
     served_end_reconciled: Arc<Mutex<BTreeSet<String>>>,
-
-    /// Per-partition memo of the resolved truncation floor (#176), including
-    /// the **absence** of one (memoized as `0`). Read paths that do not pass
-    /// through the watermark slow path (EARLIEST on a fresh process, the
-    /// fetch clamp) resolve the floor via [`Self::truncate_floor`], which
-    /// pays at most one `watermark.json` GET per process per partition and
-    /// then serves from here — never a per-call 404 on floor-less partitions
-    /// (the #161 pathology). Entries are max-folded (the floor is monotonic)
-    /// and evicted on `create_topic` so a re-created topic does not inherit
-    /// a dead incarnation's floor. The OptiCon watermark cache, when
-    /// populated, takes precedence over this memo: it is refreshed by the
-    /// cold/slow watermark reads, while the memo is not.
-    truncate_floors: Arc<Mutex<BTreeMap<Topition, i64>>>,
 
     /// Per-prefix single-flight for the stale-index refresh and the certified
     /// seq-floor sync. A wide ListOffsets resolves its partitions concurrently
@@ -363,14 +295,6 @@ pub struct DynoStore {
     /// tie-break in [`Self::valid_substream_segments`] and erase acked data. This
     /// caches it so the seeding object is read once per process per prefix.
     era_epochs: Arc<Mutex<BTreeMap<String, i64>>>,
-
-    /// Per-topic memo of whether `cleanup.policy` is `compact`, with a check
-    /// time (#113). `produce` consults this on every batch to decide the
-    /// coalesce route; the topic config changes only on `AlterConfigs` (rare), so
-    /// a short TTL keeps the produce hot path off a per-batch conditional GET of
-    /// `topic-metadata/<name>.json` while still picking up a policy change within
-    /// the window.
-    compacted_topics: Arc<Mutex<BTreeMap<String, (bool, SystemTime)>>>,
 
     /// This writer's identity, recorded in the lease `holder` field (#59) for
     /// observability. Unique per process instance so two brokers (or two test
@@ -2185,60 +2109,6 @@ static SEGMENT_VANISHED_BEFORE_READ: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
-/// Topics this process holds a metadata handle for, after a maintenance sweep
-/// (#283).
-///
-/// The level, not a count of evictions: the failure being watched is monotonic
-/// growth, so what says the fix is working is that this tracks the cluster's live
-/// topic count instead of climbing past it. Divergence is the signal that
-/// something populates a per-topic map by a path the sweep does not reach.
-static TOPIC_CACHE_TOPICS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
-    METER
-        .u64_gauge("tansu_topic_cache_topics")
-        .with_description("topics held in this process's topic-metadata cache")
-        .build()
-});
-
-/// Partitions this process holds a watermark handle for, after a maintenance
-/// sweep (#283) — the partition-scale companion to [`TOPIC_CACHE_TOPICS`], and
-/// the larger of the two by the partition count, so it is the one that shows up
-/// first in RSS.
-static TOPIC_CACHE_PARTITIONS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
-    METER
-        .u64_gauge("tansu_topic_cache_partitions")
-        .with_description("partitions held in this process's watermark cache")
-        .build()
-});
-
-/// The topic names a per-topic cache holds entries for that are **not** in
-/// `live` (#283), where `topic_of` projects the map's key onto its topic name —
-/// identity for the name-keyed caches, [`Topition::topic`] for the
-/// partition-keyed ones.
-///
-/// Generic so the six maps, whose keys and values are all different types, are
-/// swept by one rule rather than by six copies of it. A poisoned lock yields
-/// nothing: the sweep is opportunistic, and the next tick retries.
-fn dead_keys<K, V, F>(
-    cache: &Arc<Mutex<BTreeMap<K, V>>>,
-    topic_of: F,
-    live: &BTreeSet<Topic>,
-) -> BTreeSet<Topic>
-where
-    F: Fn(&K) -> &str,
-{
-    cache.lock().map_or_else(
-        |_| BTreeSet::new(),
-        |cache| {
-            cache
-                .keys()
-                .map(topic_of)
-                .filter(|topic| !live.contains(*topic))
-                .map(ToOwned::to_owned)
-                .collect()
-        },
-    )
-}
-
 /// Entries in the cluster-global `meta.json` producer table (#283).
 ///
 /// Nothing prunes this table, and every `InitProducerId` appends to it — so every
@@ -3548,11 +3418,7 @@ impl DynoStore {
             cluster: cluster.into(),
             node,
             advertised_listener: Url::parse("tcp://127.0.0.1/").unwrap(),
-            watermarks: Arc::new(Mutex::new(BTreeMap::new())),
-            next_offsets: Arc::new(Mutex::new(BTreeMap::new())),
-            coalesced_watermark_floors: Arc::new(Mutex::new(BTreeMap::new())),
             served_end_reconciled: Arc::new(Mutex::new(BTreeSet::new())),
-            truncate_floors: Arc::new(Mutex::new(BTreeMap::new())),
             prefix_read_sync_locks: Arc::new(Mutex::new(BTreeMap::new())),
             producers: Arc::new(Mutex::new(BTreeMap::new())),
             oldest_retained_prefix: Arc::new(Mutex::new(BTreeMap::new())),
@@ -3568,7 +3434,6 @@ impl DynoStore {
             compact_seams: Arc::new(Mutex::new(BTreeMap::new())),
             compaction_leases: Arc::new(Mutex::new(BTreeMap::new())),
             era_epochs: Arc::new(Mutex::new(BTreeMap::new())),
-            compacted_topics: Arc::new(Mutex::new(BTreeMap::new())),
             // Per-process random component so two ReplicaSet pods are actually
             // distinguishable (#126): `node` is always 111 and `WRITER_INSTANCE`
             // is a per-process counter, so without entropy every pod's first
@@ -3596,11 +3461,7 @@ impl DynoStore {
             maintenance_recency: Self::MAINTENANCE_RECENCY,
             flush_max_elapsed: Self::FLUSH_MAX_ELAPSED,
             maintenance_seed: rng().random::<u64>(),
-            topic_metas: Arc::new(Mutex::new(BTreeMap::new())),
-            topic_index: Arc::new(Mutex::new(TopicIndex::default())),
-            topic_index_refresh: Arc::new(tokio::sync::Mutex::new(())),
-            topic_ids: Arc::new(Mutex::new(BTreeMap::new())),
-            routing_prefixes: Arc::new(Mutex::new(BTreeMap::new())),
+            topics: TopicCaches::default(),
             auto_create: AutoTopicCreate::default(),
             topic_defaults: TopicDefaults::default(),
             meta: OptiCon::<Meta>::new(cluster),
@@ -3706,15 +3567,7 @@ impl DynoStore {
 
     /// Optimistic-concurrency handle on a topic's `topic-metadata/{name}.json`.
     fn topic_meta(&self, name: &str) -> Result<OptiCon<TopicMetadata>> {
-        self.topic_metas
-            .lock()
-            .map(|mut locked| {
-                locked
-                    .entry(name.to_owned())
-                    .or_insert_with(|| OptiCon::<TopicMetadata>::new(self.cluster.as_str(), name))
-                    .to_owned()
-            })
-            .map_err(Into::into)
+        self.topics.meta(self.cluster.as_str(), name)
     }
 
     fn topic_id_path(&self, id: &Uuid) -> Path {
@@ -3807,30 +3660,19 @@ impl DynoStore {
     /// `topic-ids/{uuid}.json` pointer (result cached). The mapping is immutable
     /// for a topic's lifetime, so the cache is safe until delete.
     async fn topic_name_by_id(&self, id: &Uuid) -> Result<Option<Topic>> {
-        if let Ok(cache) = self.topic_ids.lock()
-            && let Some(name) = cache.get(id)
-        {
-            return Ok(Some(name.clone()));
+        if let Some(name) = self.topics.topic_id(id) {
+            return Ok(Some(name));
         }
 
         match self.object_store.get(&self.topic_id_path(id)).await {
             Ok(get_result) => {
                 let encoded = get_result.bytes().await?;
                 let name = serde_json::from_slice::<TopicIdRef>(&encoded)?.name;
-                if let Ok(mut cache) = self.topic_ids.lock() {
-                    _ = cache.insert(*id, name.clone());
-                }
+                self.topics.remember_topic_id(*id, name.clone());
                 Ok(Some(name))
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(otherwise) => Err(otherwise.into()),
-        }
-    }
-
-    /// Drop a cached topic-id -> name mapping (on delete).
-    fn invalidate_topic_id(&self, id: &Uuid) {
-        if let Ok(mut cache) = self.topic_ids.lock() {
-            _ = cache.remove(id);
         }
     }
 
@@ -4051,7 +3893,7 @@ impl DynoStore {
         }
 
         // Stale or empty: one task refreshes, the rest await and reuse it.
-        let _guard = self.topic_index_refresh.lock().await;
+        let _guard = self.topics.index_refresh().lock().await;
         if let Some(snapshot) = self.fresh_topic_index()? {
             return Ok(snapshot);
         }
@@ -4060,13 +3902,7 @@ impl DynoStore {
 
     /// The cached snapshot iff it was refreshed within [`Self::TOPIC_INDEX_TTL`].
     fn fresh_topic_index(&self) -> Result<Option<Arc<Vec<TopicMetadata>>>> {
-        let index = self.topic_index.lock()?;
-        let fresh = index.refreshed_at.is_some_and(|at| {
-            SystemTime::now()
-                .duration_since(at)
-                .is_ok_and(|elapsed| elapsed < Self::TOPIC_INDEX_TTL)
-        });
-        Ok(fresh.then(|| index.snapshot.clone()))
+        self.topics.fresh_index(Self::TOPIC_INDEX_TTL)
     }
 
     /// Rebuild the index: LIST the prefix once, reuse cached entries whose etag
@@ -4078,8 +3914,7 @@ impl DynoStore {
         let mut entries: BTreeMap<Topic, (Option<String>, TopicMetadata)> = BTreeMap::new();
         let mut stale = Vec::new();
 
-        {
-            let index = self.topic_index.lock()?;
+        self.topics.with_index(|index| {
             for object in &listed.objects {
                 let Some(name) = object
                     .location
@@ -4100,7 +3935,7 @@ impl DynoStore {
                     )),
                 }
             }
-        }
+        })?;
 
         // GET only the new/changed objects (no lock held), with a bounded
         // fan-out. The cold build — every topic stale on the first refresh —
@@ -4139,12 +3974,7 @@ impl DynoStore {
                 .collect::<Vec<_>>(),
         );
 
-        {
-            let mut index = self.topic_index.lock()?;
-            index.entries = entries;
-            index.snapshot = snapshot.clone();
-            index.refreshed_at = Some(SystemTime::now());
-        }
+        self.topics.replace_index(entries, snapshot.clone())?;
 
         Ok(snapshot)
     }
@@ -4152,9 +3982,7 @@ impl DynoStore {
     /// Force the next [`Self::topics_index`] to refresh (after a local create or
     /// delete), so the change is reflected without waiting out the TTL.
     fn invalidate_topic_index(&self) {
-        if let Ok(mut index) = self.topic_index.lock() {
-            index.refreshed_at = None;
-        }
+        self.topics.invalidate_index();
     }
 
     /// Best-effort warm-up of the topic index at boot, run from
@@ -4319,13 +4147,13 @@ impl DynoStore {
             },
         };
 
-        Ok(self
-            .topic_index
-            .lock()?
-            .entries
-            .get(name.as_str())
-            .map(|(_, metadata)| IndexedTopic::Hit(metadata.clone()))
-            .unwrap_or(IndexedTopic::FreshMiss))
+        self.topics.with_index(|index| {
+            index
+                .entries
+                .get(name.as_str())
+                .map(|(_, metadata)| IndexedTopic::Hit(metadata.clone()))
+                .unwrap_or(IndexedTopic::FreshMiss)
+        })
     }
 
     /// A topic's metadata for a path that only *describes* it: served from the
@@ -4418,15 +4246,7 @@ impl DynoStore {
     }
 
     fn watermark(&self, topition: &Topition) -> Result<OptiCon<Watermark>> {
-        self.watermarks
-            .lock()
-            .map(|mut locked| {
-                locked
-                    .entry(topition.to_owned())
-                    .or_insert_with(|| OptiCon::<Watermark>::new(self.cluster.as_str(), topition))
-                    .to_owned()
-            })
-            .map_err(Into::into)
+        self.topics.watermark(self.cluster.as_str(), topition)
     }
 
     /// The truncation floor (#176) for `topition` from in-process caches only
@@ -4439,28 +4259,13 @@ impl DynoStore {
     /// loop the direction is mandatory — an unknown floor must defer reclaim,
     /// never force it.
     fn cached_truncate(&self, topition: &Topition) -> Result<Option<i64>> {
-        // Deliberately non-inserting (unlike `self.watermark(...)`) so the
-        // expiry loop's sweep over every footer entry does not populate an
-        // OptiCon handle per sub-stream it will never serve.
-        let from_watermark = self
-            .watermarks
-            .lock()
-            .map(|locked| {
-                locked
-                    .get(topition)
-                    .and_then(|watermark| watermark.cached())
-                    .map(|watermark| watermark.truncate.unwrap_or(0))
-            })
-            .map_err(Into::<Error>::into)?;
+        let from_watermark = self.topics.watermark_truncate(topition)?;
 
         if from_watermark.is_some() {
             return Ok(from_watermark);
         }
 
-        self.truncate_floors
-            .lock()
-            .map(|locked| locked.get(topition).copied())
-            .map_err(Into::into)
+        self.topics.truncate_floor(topition)
     }
 
     /// The truncation floor (#176) for `topition`: the offset below which
@@ -4531,13 +4336,7 @@ impl DynoStore {
     /// Max-fold `floor` into the [`Self::truncate_floors`] memo (the floor is
     /// monotonic, so a racing older resolution can never regress it).
     fn memo_truncate_floor(&self, topition: &Topition, floor: i64) -> Result<()> {
-        self.truncate_floors
-            .lock()
-            .map(|mut locked| {
-                let entry = locked.entry(topition.to_owned()).or_insert(floor);
-                *entry = (*entry).max(floor);
-            })
-            .map_err(Into::into)
+        self.topics.memo_truncate_floor(topition, floor)
     }
 
     /// The log start offset for `topition` (#161).
@@ -4623,10 +4422,7 @@ impl DynoStore {
     /// offset assignment (produce) and as a listing floor, where any known lower
     /// bound is safe (a `Create` conflict / tail listing reconciles it).
     fn cached_high(&self, topition: &Topition) -> Result<Option<i64>> {
-        self.next_offsets
-            .lock()
-            .map(|locked| locked.get(topition).map(|hint| hint.next))
-            .map_err(Into::into)
+        self.topics.high(topition)
     }
 
     /// The cached next-offset hint for `topition` iff it was last reconciled
@@ -4636,19 +4432,7 @@ impl DynoStore {
     /// on another replica. Serving from a fresh hint is what takes the consumer
     /// Fetch hot path off the per-poll `ListObjectsV2` request (#40).
     fn cached_high_fresh(&self, topition: &Topition) -> Result<Option<i64>> {
-        self.next_offsets
-            .lock()
-            .map(|locked| {
-                locked.get(topition).and_then(|hint| {
-                    let fresh = hint.listed_at.is_some_and(|at| {
-                        SystemTime::now()
-                            .duration_since(at)
-                            .is_ok_and(|elapsed| elapsed < self.watermark_hint_ttl)
-                    });
-                    fresh.then_some(hint.next)
-                })
-            })
-            .map_err(Into::into)
+        self.topics.high_fresh(topition, self.watermark_hint_ttl)
     }
 
     /// Advance the cached next-offset hint for `topition` after a local produce.
@@ -4658,13 +4442,7 @@ impl DynoStore {
     /// replica's writes, so the TTL clock that forces cross-replica reconciliation
     /// keeps running.
     fn set_high(&self, topition: &Topition, high: i64) -> Result<()> {
-        self.next_offsets
-            .lock()
-            .map(|mut locked| {
-                let entry = locked.entry(topition.to_owned()).or_default();
-                entry.next = entry.next.max(high);
-            })
-            .map_err(Into::into)
+        self.topics.set_high(topition, high)
     }
 
     /// Advance the hint after an authoritative tail *listing* and mark it fresh.
@@ -4679,14 +4457,7 @@ impl DynoStore {
     /// cross-pod visibility staleness compound toward ~2×TTL — the index could be
     /// a TTL stale and then be treated as fresh for another full TTL (#91).
     fn mark_listed(&self, topition: &Topition, high: i64, as_of: SystemTime) -> Result<()> {
-        self.next_offsets
-            .lock()
-            .map(|mut locked| {
-                let entry = locked.entry(topition.to_owned()).or_default();
-                entry.next = entry.next.max(high);
-                entry.listed_at = Some(as_of);
-            })
-            .map_err(Into::into)
+        self.topics.mark_listed(topition, high, as_of)
     }
 
     /// The persisted `watermark.high`: a durable lower bound on the tail offset,
@@ -4729,14 +4500,7 @@ impl DynoStore {
         topition: &Topition,
         floor: u64,
     ) -> Result<Option<(i64, Option<ServedEnd>)>> {
-        self.coalesced_watermark_floors
-            .lock()
-            .map(|locked| {
-                locked.get(topition).and_then(|cached| {
-                    (cached.seq_floor == floor).then_some((cached.high, cached.served))
-                })
-            })
-            .map_err(Into::into)
+        self.topics.coalesced_watermark(topition, floor)
     }
 
     /// Cache `high` and `served` (a just-read `watermark.json`) for `topition`
@@ -4751,19 +4515,8 @@ impl DynoStore {
         served: Option<ServedEnd>,
         floor: u64,
     ) -> Result<()> {
-        self.coalesced_watermark_floors
-            .lock()
-            .map(|mut locked| {
-                _ = locked.insert(
-                    topition.to_owned(),
-                    CachedWatermark {
-                        high,
-                        served,
-                        seq_floor: floor,
-                    },
-                );
-            })
-            .map_err(Into::into)
+        self.topics
+            .cache_coalesced_watermark(topition, high, served, floor)
     }
 
     /// The stale-hint high watermark of a prefix-coalesced sub-stream served
@@ -5112,13 +4865,7 @@ impl DynoStore {
     async fn routing_of(&self, topition: &Topition) -> Result<TopicRouting> {
         let topic = topition.topic();
 
-        if let Some(pinned) = self
-            .routing_prefixes
-            .lock()
-            .map_err(Into::<Error>::into)?
-            .get(topic)
-            .cloned()
-        {
+        if let Some(pinned) = self.topics.routing(topic)? {
             return Ok(pinned);
         }
 
@@ -5160,10 +4907,8 @@ impl DynoStore {
             }
         };
 
-        _ = self
-            .routing_prefixes
-            .lock()
-            .map(|mut locked| locked.insert(topic.to_owned(), pinned.clone()));
+        self.topics
+            .remember_routing(topic.to_owned(), pinned.clone());
 
         Ok(pinned)
     }
@@ -5269,13 +5014,7 @@ impl DynoStore {
     /// and answers `Name` for a name that has no pin at all, which is what a
     /// deleted topic's name looks like.
     async fn current_substream_of(&self, topic: &str) -> Result<Substream> {
-        if let Some(pinned) = self
-            .routing_prefixes
-            .lock()
-            .map_err(Into::<Error>::into)?
-            .get(topic)
-            .cloned()
-        {
+        if let Some(pinned) = self.topics.routing(topic)? {
             return Ok(pinned.substream(topic));
         }
 
@@ -5304,89 +5043,10 @@ impl DynoStore {
         }
     }
 
-    /// Drop a cached pinned prefix (on delete), so a topic re-created under the
-    /// same name cannot inherit a dead incarnation's routing.
-    fn invalidate_routing_prefix(&self, topic: &str) {
-        if let Ok(mut cache) = self.routing_prefixes.lock() {
-            _ = cache.remove(topic);
-        }
-    }
-
-    /// Drop every remaining process-local cache entry keyed by `topic` or by one
-    /// of its topitions (#283).
-    ///
-    /// Called for a topic whose metadata object is gone — by `delete_topic` for
-    /// the one it just deleted, and by [`Self::evict_deleted_topic_caches`] for one
-    /// a peer replica deleted.
-    ///
-    /// `delete_topic` used to invalidate three caches — the id pointer, the
-    /// routing pin and the topic index — and leave six behind. Those six kept
-    /// their entries until a same-named `create_topic` cleared them or the
-    /// process restarted, so under create/delete churn with **fresh** names
-    /// nothing ever cleared them: the growth was monotonic for the life of the
-    /// pod. `topic_metas` and `watermarks` each hold a cached JSON value per
-    /// entry, which makes it real memory rather than a few bytes of key.
-    ///
-    /// Every one of these is a cache or a hint whose authority is in the object
-    /// store, so dropping an entry can only cost a re-read:
-    ///
-    /// - `topic_metas` — the per-topic `OptiCon`. Dropping it is also what makes a
-    ///   same-named successor behave like a topic this replica has never read,
-    ///   which is the state #28 needs for a fresh create to be immediately visible
-    ///   (a retained handle holds a cached etag that can short-circuit the
-    ///   conditional GET to a stale `NotModified`).
-    /// - `next_offsets` — a hint, reconciled against the segment listing on a
-    ///   cold read or a create conflict. Reached **only** because the topic is
-    ///   gone: this is offset-authority state for a live topic, so a size- or
-    ///   age-triggered eviction here would be a correctness bug, not a cache miss.
-    /// - `coalesced_watermark_floors` — certified by [`Self::certified_seq_floor`],
-    ///   which is unrelated to topic lifecycle, so nothing else would ever
-    ///   invalidate a floor cached for the deleted incarnation.
-    /// - `truncate_floors` / `watermarks` — re-read from the `watermark.json` that
-    ///   `delete_topic` rewrites as the truncation tombstone (#246). The floor that
-    ///   hides the topic's slices inside shared segments lives in that object, not
-    ///   in these maps, so dropping the memo cannot resurrect anything: the next
-    ///   reader re-reads the same floor.
-    /// - `compacted_topics` — a TTL'd memo of `cleanup.policy`.
-    ///
-    /// Prefix-keyed state is deliberately untouched. A prefix is shared between
-    /// topics (`a.b.c` and `a.b.c.d` route to the same one), and neither caller can
-    /// tell whether the deleted topic was its last member without a scan — so
-    /// evicting `segment_seqs` or a flush lock here could put a second sequence
-    /// authority on a prefix a sibling topic is still producing to. A compacted
-    /// topic's prefix *is* per-topic (#175), so that state does still grow with
-    /// compacted-topic churn; establishing exclusivity cheaply is a separate
-    /// change.
-    fn invalidate_topic_caches(&self, topic: &str) {
-        if let Ok(mut cache) = self.topic_metas.lock() {
-            _ = cache.remove(topic);
-        }
-
-        if let Ok(mut cache) = self.compacted_topics.lock() {
-            _ = cache.remove(topic);
-        }
-
-        if let Ok(mut cache) = self.watermarks.lock() {
-            cache.retain(|topition, _| topition.topic() != topic);
-        }
-
-        if let Ok(mut cache) = self.next_offsets.lock() {
-            cache.retain(|topition, _| topition.topic() != topic);
-        }
-
-        if let Ok(mut cache) = self.coalesced_watermark_floors.lock() {
-            cache.retain(|topition, _| topition.topic() != topic);
-        }
-
-        if let Ok(mut cache) = self.truncate_floors.lock() {
-            cache.retain(|topition, _| topition.topic() != topic);
-        }
-    }
-
-    /// Drop the per-topic caches of every topic that no longer exists,
+    /// Drop the process-local caches of every topic that no longer exists,
     /// returning how many topics were evicted (#283).
     ///
-    /// [`Self::invalidate_topic_caches`] fixes only the replica that served the
+    /// [`TopicCaches::forget`] fixes only the replica that served the
     /// `DeleteTopics`. Eviction is process-local and a stateless fleet puts every
     /// topic through every replica, so on a ten-pod deployment nine pods keep
     /// their entries for a deleted topic — the growth is still monotonic, just at
@@ -5405,13 +5065,13 @@ impl DynoStore {
     /// topics" would drop the whole fleet's caches at once. An empty listing that
     /// succeeded is a cluster with no topics, and evicting is then correct.
     ///
-    /// This is the one trigger that touches [`Self::next_offsets`] without a local
-    /// delete, so it is worth being explicit that it is not the size-triggered
-    /// eviction that map must never have: the criterion is the topic's *absence
-    /// from the bucket*, never memory pressure or age, so a live topic cannot be
-    /// selected however hot or cold its partitions are. The only way to reach a
-    /// live topic here is a listing that omits an object that exists, which is not
-    /// a state either object store produces.
+    /// This is the one trigger that drops an offset hint without a local delete,
+    /// so it is worth being explicit that it is not the size-triggered eviction
+    /// that map must never have: the criterion is the topic's *absence from the
+    /// bucket*, never memory pressure or age, so a live topic cannot be selected
+    /// however hot or cold its partitions are. The only way to reach a live topic
+    /// here is a listing that omits an object that exists, which is not a state
+    /// either object store produces.
     async fn evict_deleted_topic_caches(&self) -> Result<usize> {
         // Force the listing: a snapshot up to `TOPIC_INDEX_TTL` old is fine for
         // answering Metadata and is not fine for deciding what to forget.
@@ -5424,35 +5084,8 @@ impl DynoStore {
             .map(|metadata| metadata.topic.name.clone())
             .collect::<BTreeSet<_>>();
 
-        // Whose entries to drop, decided once across every map, so the six
-        // cannot end up disagreeing about which topics are gone.
-        let mut evicted = BTreeSet::new();
-
-        evicted.extend(dead_keys(&self.topic_metas, |topic| topic, &live));
-        evicted.extend(dead_keys(&self.compacted_topics, |topic| topic, &live));
-        evicted.extend(dead_keys(&self.watermarks, Topition::topic, &live));
-        evicted.extend(dead_keys(&self.next_offsets, Topition::topic, &live));
-        evicted.extend(dead_keys(
-            &self.coalesced_watermark_floors,
-            Topition::topic,
-            &live,
-        ));
-        evicted.extend(dead_keys(&self.truncate_floors, Topition::topic, &live));
-
-        for topic in &evicted {
-            self.invalidate_topic_caches(topic);
-        }
-
-        // Read from the maps after the eviction rather than derived from `live`:
-        // these must report what is actually held, so a map populated by a path
-        // this sweep does not reach shows up as divergence from the cluster's topic
-        // count instead of being papered over. Both are a `len()`, so the gauges
-        // cost nothing even at 14.7k topics.
-        let topics = self.topic_metas.lock().map_or(0, |cache| cache.len());
-        let partitions = self.watermarks.lock().map_or(0, |cache| cache.len());
-
-        TOPIC_CACHE_TOPICS.record(topics as u64, &[]);
-        TOPIC_CACHE_PARTITIONS.record(partitions as u64, &[]);
+        let evicted = self.topics.retain_live(&live);
+        let (topics, partitions) = self.topics.record_occupancy();
 
         if !evicted.is_empty() {
             debug!(
@@ -7852,15 +7485,9 @@ impl DynoStore {
     /// per-batch conditional GET of the `topic-metadata/<name>.json` object. A
     /// policy change is observed within the TTL.
     async fn topic_is_compacted(&self, topic: &str) -> Result<bool> {
-        if let Some((compacted, checked_at)) = self
-            .compacted_topics
-            .lock()
-            .map_err(Into::<Error>::into)?
-            .get(topic)
-            .copied()
-            && checked_at
-                .elapsed()
-                .is_ok_and(|elapsed| elapsed < Self::HIGH_WATERMARK_HINT_TTL)
+        if let Some(compacted) = self
+            .topics
+            .compacted(topic, Self::HIGH_WATERMARK_HINT_TTL)?
         {
             return Ok(compacted);
         }
@@ -7881,9 +7508,7 @@ impl DynoStore {
                         .is_some_and(|value| value.contains("compact"))
             });
 
-        _ = self.compacted_topics.lock().map(|mut cache| {
-            _ = cache.insert(topic.to_owned(), (compacted, SystemTime::now()));
-        });
+        self.topics.remember_compacted(topic.to_owned(), compacted);
 
         Ok(compacted)
     }
@@ -10269,7 +9894,7 @@ impl DynoStore {
                 self.watermark(&Topition::new(topic.clone(), *partition))?
                     .remove(&self.object_store)
                     .await?;
-                self.invalidate_topic_caches(topic);
+                self.topics.forget(topic);
 
                 continue;
             }
@@ -10346,16 +9971,12 @@ impl DynoStore {
         // locally without waiting out the hint TTL (#290). Peers converge on
         // their own: the seq-floor raise invalidates their cached watermark
         // floors, so their next read pays the one GET and sees the pair.
-        self.next_offsets.lock().map(|mut locked| {
-            for (_, topic, partition) in &affected {
-                _ = locked.remove(&Topition::new(topic.clone(), *partition));
-            }
-        })?;
-        self.coalesced_watermark_floors.lock().map(|mut locked| {
-            for (_, topic, partition) in &affected {
-                _ = locked.remove(&Topition::new(topic.clone(), *partition));
-            }
-        })?;
+        self.topics.forget_hints(
+            &affected
+                .iter()
+                .map(|(_, topic, partition)| Topition::new(topic.clone(), *partition))
+                .collect::<Vec<_>>(),
+        )?;
 
         Ok(deleted)
     }
@@ -12460,16 +12081,7 @@ impl DynoStore {
         // reads exclusively from that cache (it pays no object request). The gap
         // would stay unanswerable on this replica until the hint aged out. Peers
         // converge on their own conditional GET.
-        self.next_offsets.lock().map(|mut locked| {
-            for tp in &certified {
-                _ = locked.remove(tp);
-            }
-        })?;
-        self.coalesced_watermark_floors.lock().map(|mut locked| {
-            for tp in &certified {
-                _ = locked.remove(tp);
-            }
-        })?;
+        self.topics.forget_hints(&certified)?;
 
         Ok(certified.len() as u64)
     }
@@ -13734,20 +13346,13 @@ impl Storage for DynoStore {
             )
             .await?;
 
-        _ = self
-            .routing_prefixes
-            .lock()
-            .map(|mut locked| locked.insert(topic.name.clone(), pinned.clone()));
+        self.topics
+            .remember_routing(topic.name.clone(), pinned.clone());
 
         for partition in 0..topic.num_partitions {
             let topition = Topition::new(topic.name.as_str(), partition);
 
-            let watermark = self.watermarks.lock().map(|mut locked| {
-                locked
-                    .entry(topition.to_owned())
-                    .or_insert(OptiCon::<Watermark>::new(self.cluster.as_str(), &topition))
-                    .to_owned()
-            })?;
+            let watermark = self.watermark(&topition)?;
 
             // Drop any stale next-offset hint (e.g. a topic of the same
             // name was previously deleted) so the fresh, empty partition
@@ -13760,18 +13365,7 @@ impl Storage for DynoStore {
             // reason since #246: not to forget the predecessor's floor but to
             // re-read it from the watermark object, which now carries the
             // deleted log end rather than a dead incarnation's stale value.
-            _ = self
-                .next_offsets
-                .lock()
-                .map(|mut locked| locked.remove(&topition))?;
-            _ = self
-                .coalesced_watermark_floors
-                .lock()
-                .map(|mut locked| locked.remove(&topition))?;
-            _ = self
-                .truncate_floors
-                .lock()
-                .map(|mut locked| locked.remove(&topition))?;
+            self.topics.forget_partition(&topition)?;
 
             // Preserve `truncate` (#246).
             //
@@ -14092,14 +13686,11 @@ impl Storage for DynoStore {
                 .remove(&self.object_store)
                 .await?;
 
-            self.invalidate_topic_id(&metadata.id);
-            self.invalidate_routing_prefix(metadata.topic.name.as_str());
+            // Every process-local cache keyed by this topic, in one call (#554).
+            // After the tombstone write above, so the watermark handle this drops
+            // is not one a later step still needs.
+            self.topics.forget(metadata.topic.name.as_str());
             self.invalidate_topic_index();
-
-            // The other six per-topic caches (#283). After the tombstone write
-            // above, so the watermark handle this drops is not one a later step
-            // still needs.
-            self.invalidate_topic_caches(metadata.topic.name.as_str());
 
             for path in [
                 self.topic_id_path(&metadata.id),
