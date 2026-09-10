@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// One `bench_function` per protocol fixture, each carrying its own byte
+// literal: length here is the fixture, not the benchmark (#555).
+#![allow(clippy::too_many_lines)]
+
 use std::hint::black_box;
 
 use criterion::{Criterion, criterion_group, criterion_main};

@@ -125,6 +125,52 @@ does: a floor at the measurement would go red on a re-run of a green commit.
 Doc tests are not counted. `cargo llvm-cov` can only instrument them on nightly,
 and this workspace is pinned to a stable toolchain.
 
+## Function length and branch count
+
+Two clippy lints gate the size of a function, both turned on in #555 and both
+configured in `clippy.toml`:
+
+| lint | clippy group | default | here |
+|---|---|---|---|
+| `too_many_lines` | pedantic | 100 | **350** |
+| `cognitive_complexity` | nursery | 25 | **34** |
+
+Neither is in `clippy::all`, so neither ran until #555 — which is how ten
+`DynoStore` methods reached 200-424 source lines with not one `#[allow]`
+between them, and why `#[allow(clippy::too_many_lines)]` appeared ten times in
+the tree suppressing a lint that was off. Those ten are gone; a suppression
+that suppresses nothing reads as a gate and is not one.
+
+Both numbers are a **ratchet set at the measured worst shipped function**, the
+same construction as `comments`' ceiling and `coverage-ci`'s floor: green on
+the commit that set them, red on the next function to cross either. 350 is
+`ErrorCode`'s `Display` in `tansu-sans-io/src/lib.rs`, one arm per error code.
+34 is `expire_prefix_segments` in `tansu-storage/src/dynostore.rs`. Lower both
+as #550's follow-ups land; raising either is the escape hatch, on the same
+terms as the other two — say why the real number moved.
+
+Unlike the other two ratchets there is no jitter to leave room for, so these
+sit *at* the measurement rather than under it.
+
+Clippy counts body lines after comments and blank lines are dropped, so it
+reads lower than `wc -l` over the same span: #550's table says 424 for
+`compact_prefix_segments` where clippy says 228. Quote the clippy number when
+moving the threshold, or the two disagree by a factor of two.
+
+The threshold is deliberately set on **shipped** code. Test and bench targets
+are an order of magnitude over it — a 1536-line body in
+`tansu-sans-io/tests/snappy.rs`, five 550-line near-copies in
+`tansu-broker/tests/policy_compact_delete.rs` — because a golden fixture is a
+byte table and a protocol test is a script, neither of which shortens. Those
+files carry a file-level `#![allow]` citing #553, the issue that will delete
+the bodies; the allow comes out with them. Widening the threshold to swallow a
+fixture table instead would have set it at 1536 and gated nothing.
+
+The generated protocol code is the other exemption. `tansu-sans-io/build.rs`
+emits two `From<Body>` impls of ~800 lines, one match arm per API key per
+version, and the generator states the `#[allow]` itself: an attribute on the
+`include!` does not reach the items it expands to.
+
 ## Conditional put
 
 Everything that makes the broker stateless is a conditional put: offset

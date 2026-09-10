@@ -12,6 +12,8 @@ version.workspace = true
 
 [lints.clippy]
 all = "warn"
+cognitive_complexity = "warn"
+too_many_lines = "warn"
 
 [lints.rust]
 deprecated_in_future = "warn"

@@ -165,3 +165,5 @@ The ceiling is a **ratchet at the measured value**, not a budget with room in it
 ## Lint Configuration
 
 Workspace-level in `Cargo.toml`: `clippy::all = warn`, `unsafe_code = forbid`, `non_ascii_idents = forbid`, `rust_2018_idioms = deny`, `unreachable_pub = warn`, `broken_intra_doc_links = deny`. CI runs `clippy -- -D warnings` (all warnings are errors). Clippy has no comment-density lint of any kind, which is why the section above is a homegrown check.
+
+Two lints outside `clippy::all` are on and thresholded in `clippy.toml` (#555): `too_many_lines` at **350** and `cognitive_complexity` at **34**. Both are ratchets set at the measured worst shipped function, on the same terms as the comment ceiling — lower them as functions shrink, and if you raise one, say why the real number moved. Clippy counts body lines with comments and blanks dropped, so its number is well under `wc -l` for the same function. Test and bench targets, and the generated protocol code, are exempted at the file or item level with a citation rather than by widening the threshold; `docs/testing.md` says why.

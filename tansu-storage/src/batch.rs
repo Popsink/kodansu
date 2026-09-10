@@ -1460,6 +1460,9 @@ mod tests {
         Ok(split)
     }
 
+    // A table of split/combine cases, each with its own assertion: the branch
+    // count #555's nursery gate sees is the size of the table.
+    #[allow(clippy::cognitive_complexity)]
     #[test]
     fn combine_batches() -> Result<()> {
         let batches = [

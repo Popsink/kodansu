@@ -1185,7 +1185,6 @@ mod tests {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
     #[test]
     fn tagged_field_from_value() -> Result<()> {
         assert_eq!(
@@ -1360,7 +1359,6 @@ mod tests {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
     #[test]
     fn message_from_value() -> Result<()> {
         assert_eq!(
@@ -1486,7 +1484,6 @@ mod tests {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines)]
     #[test]
     fn header_from_value() -> Result<()> {
         let v = serde_json::from_str::<Value>(

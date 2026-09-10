@@ -842,7 +842,6 @@ impl TryFrom<i16> for ErrorCode {
 impl TryFrom<&i16> for ErrorCode {
     type Error = Error;
 
-    #[allow(clippy::too_many_lines)]
     fn try_from(value: &i16) -> Result<Self, Self::Error> {
         match value {
             -1 => Ok(Self::UnknownServerError),
@@ -978,7 +977,6 @@ impl From<ErrorCode> for i16 {
 }
 
 impl From<&ErrorCode> for i16 {
-    #[allow(clippy::too_many_lines)]
     fn from(value: &ErrorCode) -> Self {
         match value {
             ErrorCode::UnknownServerError => -1,
@@ -1107,7 +1105,6 @@ impl From<&ErrorCode> for i16 {
 }
 
 impl Display for ErrorCode {
-    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             ErrorCode::UnknownServerError => f.write_str(

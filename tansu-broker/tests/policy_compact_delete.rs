@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Five near-copies of one create-produce-maintain-fetch scenario, which is
+// #553's second target. #555's gates measure shipped code; here they would
+// only be restating the duplication. Both allows come out when the five
+// bodies become data behind one driver.
+#![allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;

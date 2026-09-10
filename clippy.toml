@@ -1,0 +1,25 @@
+# Two lints clippy will not turn on by itself. `too_many_lines` is pedantic and
+# `cognitive_complexity` is nursery, so neither is in `clippy::all` and neither
+# ran here until #555 — which is how ten `DynoStore` methods reached 200-424
+# source lines with not one `#[allow]` between them.
+#
+# Both numbers are a ratchet set at the measured worst *shipped* function, the
+# same construction as the comment ceiling in `justfile` (#540): the tree is
+# green on the commit that adds them, and the next function to cross either one
+# turns the build red. They are not budgets and there is no room in them.
+#
+# 350 is `ErrorCode`'s `Display` in `tansu-sans-io/src/lib.rs`, a match arm per
+# error code. 34 is `expire_prefix_segments` in `tansu-storage/src/dynostore.rs`.
+# Clippy counts body lines after comments and blanks are dropped, so it reads
+# lower than `wc -l` on the same function: #550's table says 424 for
+# `compact_prefix_segments` where clippy says 228.
+#
+# Test and bench targets exceed both by a wide margin and carry a file-level
+# `#![allow]` citing the issue that will delete the offending bodies, rather
+# than moving these numbers to accommodate a fixture table.
+#
+# Lower both as #550's follow-ups land. Raising either is allowed and is the
+# escape hatch, on the same terms as the comment ceiling: say why the real
+# number moved.
+too-many-lines-threshold = 350
+cognitive-complexity-threshold = 34

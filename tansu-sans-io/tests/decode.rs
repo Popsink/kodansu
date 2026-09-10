@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// A golden fixture is a byte table, not a branch. #555's length gate is set
+// at the worst shipped function, and 39 of these bodies are the same fixture
+// `encode.rs` also holds; the allow comes out with #553's round-trip table.
+#![allow(clippy::too_many_lines)]
+
 use bytes::Bytes;
 use common::init_tracing;
 use tansu_sans_io::{
