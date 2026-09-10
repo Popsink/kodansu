@@ -80,7 +80,7 @@ rather than the write.
 ```shell
 just coverage          # summary in the terminal
 just coverage-html     # browsable report, opens in a browser
-just coverage-ci 85    # what CI runs: lcov + HTML + summary, floored at 85%
+just coverage-ci 88    # what CI runs: lcov + HTML + summary, floored at 88%
 ```
 
 All three need `cargo-llvm-cov` and the `llvm-tools-preview` component:
@@ -95,10 +95,21 @@ attaches `lcov.info` plus the HTML report as the `coverage` artifact. It also
 uploads to Codecov, but only if a `CODECOV_TOKEN` secret exists — the artifact is
 the fallback and needs no third-party account.
 
-The measured value is **87.22%** at the commit that took `tansu-cli` from 29% to
-96% (#556's third milestone), up from 85.29% when `tansu-topic` reached 100% and
+The measured value is **90.65%** at the commit that took the four wire codecs in
+`tansu-sans-io` from 35-69% to 90-98% (#556's fourth milestone), up from 87.22%
+when `tansu-cli` went from 29% to 96%, 85.29% when `tansu-topic` reached 100% and
 84.06% when #549 closed the orphan-bin hole. The floor below tracks it two points
 back.
+
+What those codecs still do not cover is worth naming, because most of it is not a
+gap a test closes. The residual in `de.rs` and `ser.rs` is mostly the version
+machinery — arms that need a particular API key, at a particular version, on a
+field with a particular nullability, and so are reachable only through a frame
+that has one. The rest divides into two kinds of line that no assertion improves:
+`debug!` arguments, which are not evaluated at all unless the test installs a
+subscriber at debug level, and the `expecting()` impls, which `serde` calls only
+to build a type-error message that these codecs never produce, because their
+visitors are only ever handed a sequence.
 
 Two files in that crate are deliberately left uncovered rather than excluded from
 the denominator: `Cli::main`, which reads the real argv, and `broker::Arg::main`,

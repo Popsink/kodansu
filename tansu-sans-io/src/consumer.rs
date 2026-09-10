@@ -102,12 +102,28 @@ impl ConsumerAssignor for Assignor {
     }
 }
 
-#[derive(Clone, Default, Deserialize, Eq, Hash, Debug, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Default, Deserialize, Eq, Hash, Debug, Ord, PartialEq, PartialOrd)]
 #[serde(try_from = "codec::MemberMetadata")]
-#[serde(into = "codec::MemberMetadata")]
 pub struct MemberMetadata {
     pub version: i16,
     pub subscription: ConsumerProtocolSubscription,
+}
+
+/// Written through [`codec::MemberMetadata`], which is where the version
+/// becomes a layout.
+///
+/// This is by hand rather than `#[serde(into = ...)]` because that attribute
+/// takes an infallible conversion and a version outside the range this fork
+/// encodes has to be an error (#556).
+impl Serialize for MemberMetadata {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        codec::MemberMetadata::try_from(self.clone())
+            .map_err(serde::ser::Error::custom)
+            .and_then(|encoded| encoded.serialize(serializer))
+    }
 }
 
 impl fmt::Display for MemberMetadata {

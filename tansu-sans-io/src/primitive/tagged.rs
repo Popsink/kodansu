@@ -307,100 +307,163 @@ impl<'de> Deserialize<'de> for TagBuffer {
 #[cfg(test)]
 mod tests {
     use super::{de::Decoder, ser::Encoder, *};
+    use crate::{Error, de, ser};
+    use bytes::BytesMut;
 
-    #[ignore]
+    /// A tag buffer as it appears in a frame: written by the protocol
+    /// serializer and read back by the protocol deserializer.
+    ///
+    /// That pairing is the point. A [`TagBuffer`] states its own field count as
+    /// its first element, so it needs a `deserialize_seq` that hands the
+    /// visitor an *unbounded* sequence — which the protocol decoder does and
+    /// the tag-value decoder in [`de`](super::de) does not, since there a
+    /// sequence is a compact array whose length the codec consumes itself.
+    /// Until #556 these four fixtures were `#[ignore]`d and paired with the
+    /// wrong one of the two, having also encoded and decoded through a single
+    /// `Cursor` without rewinding it, so all four failed on the first byte they
+    /// read.
+    fn round_trip(expected: &TagBuffer) -> Result<()> {
+        let mut encoder = ser::Encoder::new(BytesMut::new());
+        expected.serialize(&mut encoder)?;
+        let encoded = BytesMut::from(encoder);
+
+        assert_eq!(encoded.len(), expected.size_in_bytes()?);
+
+        let mut reader = Cursor::new(&encoded[..]);
+        let mut decoder = de::Decoder::new(&mut reader);
+
+        assert_eq!(*expected, TagBuffer::deserialize(&mut decoder)?);
+
+        Ok(())
+    }
+
     #[test]
-    fn empty() -> Result<()> {
+    fn an_empty_tag_buffer_is_a_single_zero_byte() -> Result<()> {
         let expected = TagBuffer::builder().build();
 
-        let mut encoded = vec![];
-        let mut c = Cursor::new(&mut encoded);
-        let mut encoder = Encoder::new(&mut c);
+        assert_eq!(TagBuffer::empty(), expected);
+        assert!(expected.is_empty());
+        assert_eq!(1, expected.size_in_bytes()?);
 
-        expected.serialize(&mut encoder)?;
-
-        let mut decoder = Decoder::new(&mut c);
-        let actual = TagBuffer::deserialize(&mut decoder)?;
-
-        assert_eq!(expected, actual);
-
-        Ok(())
+        round_trip(&expected)
     }
 
-    #[ignore]
     #[test]
-    fn buffer_of1() -> Result<()> {
+    fn a_tag_field_is_its_tag_its_length_and_its_payload() -> Result<()> {
         let expected = TagBuffer::builder().tag(55, b"pqr".into()).build();
 
-        let mut encoded = vec![];
-        let mut c = Cursor::new(&mut encoded);
-        let mut encoder = Encoder::new(&mut c);
-
+        let mut encoder = ser::Encoder::new(BytesMut::new());
         expected.serialize(&mut encoder)?;
 
-        let mut decoder = Decoder::new(&mut c);
-        let actual = TagBuffer::deserialize(&mut decoder)?;
+        assert_eq!(
+            vec![1, 55, 3, b'p', b'q', b'r'],
+            Vec::from(&BytesMut::from(encoder)[..])
+        );
 
-        assert_eq!(expected, actual);
+        assert_eq!(TagField::from((55, b"pqr".to_vec())), expected[0]);
 
-        Ok(())
+        round_trip(&expected)
     }
 
-    #[ignore]
     #[test]
-    fn buffer_of2() -> Result<()> {
-        let expected = TagBuffer::builder()
-            .tag(66, vec![5, 4, 3, 2, 1])
-            .tag(88, b"abc".into())
-            .build();
-
-        let mut encoded = vec![];
-        let mut c = Cursor::new(&mut encoded);
-        let mut encoder = Encoder::new(&mut c);
-
-        expected.serialize(&mut encoder)?;
-
-        let mut decoder = Decoder::new(&mut c);
-        let actual = TagBuffer::deserialize(&mut decoder)?;
-
-        assert_eq!(expected, actual);
-
-        Ok(())
+    fn a_tag_buffer_of_two_fields_round_trips() -> Result<()> {
+        round_trip(
+            &TagBuffer::builder()
+                .tag(66, vec![5, 4, 3, 2, 1])
+                .tag(88, b"abc".into())
+                .build(),
+        )
     }
 
-    #[ignore]
+    /// The tag buffer of a real `ApiVersionsResponse` v3, as a broker sends it.
     #[test]
     fn api_versions_response_v3_000() -> Result<()> {
-        let expected = TagBuffer::builder()
-            .tag(
-                0,
-                vec![
-                    2, 17, 109, 101, 116, 97, 100, 97, 116, 97, 46, 118, 101, 114, 115, 105, 111,
-                    110, 0, 1, 0, 14, 0,
-                ],
-            )
-            .tag(1, vec![0, 0, 0, 0, 0, 0, 0, 76])
-            .tag(
-                2,
-                vec![
-                    2, 17, 109, 101, 116, 97, 100, 97, 116, 97, 46, 118, 101, 114, 115, 105, 111,
-                    110, 0, 14, 0, 14, 0,
-                ],
-            )
-            .build();
+        round_trip(
+            &TagBuffer::builder()
+                .tag(
+                    0,
+                    vec![
+                        2, 17, 109, 101, 116, 97, 100, 97, 116, 97, 46, 118, 101, 114, 115, 105,
+                        111, 110, 0, 1, 0, 14, 0,
+                    ],
+                )
+                .tag(1, vec![0, 0, 0, 0, 0, 0, 0, 76])
+                .tag(
+                    2,
+                    vec![
+                        2, 17, 109, 101, 116, 97, 100, 97, 116, 97, 46, 118, 101, 114, 115, 105,
+                        111, 110, 0, 14, 0, 14, 0,
+                    ],
+                )
+                .build(),
+        )
+    }
 
-        let mut encoded = vec![];
-        let mut c = Cursor::new(&mut encoded);
-        let mut encoder = Encoder::new(&mut c);
+    /// A tag's value is encoded by [`TagBuffer::encode`] and read back by tag.
+    ///
+    /// This is the pair every caller of tagged fields uses. Note what `decode`
+    /// answers for a tag that is not there: `Ok(None)`, the same as a tag
+    /// carrying a null — the buffer carries no schema, so "absent" and "present
+    /// and null" are the same answer.
+    #[test]
+    fn a_tag_is_encoded_by_tag_and_read_back_by_tag() -> Result<()> {
+        let buffer = TagBuffer::encode(&[(0u32, "a-cluster".to_owned())])?;
 
-        expected.serialize(&mut encoder)?;
+        assert_eq!(Some("a-cluster".to_owned()), buffer.decode::<String>(&0)?);
+        assert_eq!(None, buffer.decode::<String>(&1)?);
 
-        let mut decoder = Decoder::new(&mut c);
-        let actual = TagBuffer::deserialize(&mut decoder)?;
-
-        assert_eq!(expected, actual);
+        assert_eq!(
+            TagField::encode(0, &"a-cluster".to_owned())?,
+            buffer.first().cloned().expect("one tag")
+        );
 
         Ok(())
+    }
+
+    /// More than 128 tagged fields in one buffer is refused.
+    ///
+    /// The bound is a decision this fork inherited rather than a protocol
+    /// limit: nothing in the Kafka messages says 128. What it buys is that the
+    /// count — an unsigned varint a peer chose, so up to four billion — cannot
+    /// be turned into a four-billion-element `Vec::with_capacity` by a frame
+    /// that then supplies two bytes.
+    #[test]
+    fn more_than_128_tagged_fields_is_refused() {
+        let mut reader = Cursor::new(vec![0x81, 0x01]);
+        let mut decoder = de::Decoder::new(&mut reader);
+
+        let error = TagBuffer::deserialize(&mut decoder).expect_err("129 tagged fields");
+
+        assert!(
+            matches!(&error, Error::Message(message)
+                if message.contains("maximum tagged fields exceeded 129")),
+            "expected the field-count bound, got {error:?}"
+        );
+    }
+
+    /// A tag whose payload is longer than 128 bytes is refused too — by the
+    /// same constant, which is the defect.
+    ///
+    /// `MAXIMUM_TAGGED_FIELDS` bounds two unrelated things: how many fields a
+    /// buffer may carry, and how long any one of them may be. The second is
+    /// wrong. A tagged field's payload is an arbitrary encoded value, and the
+    /// `ApiVersionsResponse` fixture above already carries a 23-byte one, so a
+    /// broker advertising a handful more features sends a frame this decoder
+    /// refuses. Asserted here as the behaviour that ships, not as the behaviour
+    /// that is wanted: raising the payload bound changes what frames this fork
+    /// accepts, which is its own change and not a test's to make (#556).
+    #[test]
+    fn a_tag_payload_longer_than_128_bytes_is_refused_by_the_same_constant() {
+        let mut reader = Cursor::new(vec![1, 0, 0x81, 0x01]);
+        let mut decoder = de::Decoder::new(&mut reader);
+
+        let error = TagBuffer::deserialize(&mut decoder).expect_err("a 129-byte payload");
+
+        assert!(
+            matches!(&error, Error::Message(message)
+                if message.contains("maximum tagged fields exceeded 129")),
+            "expected the payload-length bound, got {error:?}"
+        );
     }
 
     #[test]
