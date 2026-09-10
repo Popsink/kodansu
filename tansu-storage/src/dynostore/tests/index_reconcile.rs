@@ -156,8 +156,8 @@ async fn fetch_from(store: &DynoStore, tp: &Topition, offset: i64) -> Result<Vec
 /// The sequences this process has indexed for `PREFIX`.
 fn indexed(store: &DynoStore) -> Vec<u64> {
     store
-        .prefix_index
-        .lock()
+        .prefixes
+        .index()
         .expect("prefix index")
         .get(PREFIX)
         .map(|entry| entry.segments.keys().copied().collect())
@@ -168,8 +168,8 @@ fn indexed(store: &DynoStore) -> Vec<u64> {
 /// index's other monotonic set.
 fn opaque(store: &DynoStore) -> Vec<u64> {
     store
-        .prefix_index
-        .lock()
+        .prefixes
+        .index()
         .expect("prefix index")
         .get(PREFIX)
         .map(|entry| entry.opaque.iter().copied().collect())
@@ -181,8 +181,8 @@ fn opaque(store: &DynoStore) -> Vec<u64> {
 /// coming due is expressed.
 fn the_window_lapses(store: &DynoStore) {
     if let Some(entry) = store
-        .prefix_index
-        .lock()
+        .prefixes
+        .index()
         .expect("prefix index")
         .get_mut(PREFIX)
     {
@@ -196,8 +196,8 @@ fn the_window_lapses(store: &DynoStore) {
 /// `index_invalidate` cannot stand in for this: a 404 lapses both clocks.
 fn the_ttl_lapses(store: &DynoStore) {
     if let Some(entry) = store
-        .prefix_index
-        .lock()
+        .prefixes
+        .index()
         .expect("prefix index")
         .get_mut(PREFIX)
     {

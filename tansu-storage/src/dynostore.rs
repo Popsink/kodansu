@@ -29,7 +29,7 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use caches::TopicCaches;
+use caches::{PrefixCaches, PrefixLocks, TopicCaches};
 use futures::{
     StreamExt,
     stream::{BoxStream, TryStreamExt},
@@ -130,6 +130,16 @@ pub struct DynoStore {
     /// invalidation site — see [`caches`] for the map that answer used to miss.
     topics: TopicCaches,
 
+    /// Every process-local cache keyed by a coalescing prefix (#554): the footer
+    /// index and the hints, memos and skip lists that ride alongside it. See
+    /// [`PrefixCaches`] for why this group is bounded by the prefix count rather
+    /// than by a sweep.
+    prefixes: PrefixCaches,
+
+    /// The two per-prefix single-flight locks (#554), which are not caches — see
+    /// [`PrefixLocks`].
+    prefix_locks: PrefixLocks,
+
     /// Broker auto-topic-creation policy (Kafka `auto.create.topics.enable` /
     /// `num.partitions` / `default.replication.factor`), consulted by the
     /// Metadata handler.
@@ -142,26 +152,6 @@ pub struct DynoStore {
     /// auto-create path silently dropped it (#225).
     topic_defaults: TopicDefaults,
 
-    /// Prefixes this process has already run the served-end reconciliation over
-    /// (#290). See [`DynoStore::certify_prefix_served_ends`].
-    ///
-    /// Once per prefix per process, not once per tick: the pass costs a forced
-    /// listing plus one conditional watermark GET per sub-stream, which is fine
-    /// as a one-shot after a deploy and wasteful every tick. A restart re-arms
-    /// it, which is the right default — a fresh process is exactly when a prefix
-    /// may have picked up a gap under a binary that did not certify.
-    served_end_reconciled: Arc<Mutex<BTreeSet<String>>>,
-
-    /// Per-prefix single-flight for the stale-index refresh and the certified
-    /// seq-floor sync. A wide ListOffsets resolves its partitions concurrently
-    /// (32-way), so without this every stale same-prefix partition in flight
-    /// would issue its own duplicate `segments/` LIST and `seq-floor.json`
-    /// GET — re-inflating the per-prefix amortized cost back toward
-    /// per-partition. Losers of the race re-check under the lock and are
-    /// served by the winner's work. Fresh (TTL-served) reads never touch this
-    /// lock.
-    prefix_read_sync_locks: Arc<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>>,
-
     /// Per-producer optimistic-concurrency handle on `producers/{id}.json`,
     /// holding that producer's idempotent sequence state. Sharding the sequence
     /// CAS per producer (instead of CASing the single cluster-global `meta`
@@ -170,20 +160,6 @@ pub struct DynoStore {
     /// linearizable CAS is kept, so the exact `OutOfOrderSequenceNumber` /
     /// `DuplicateSequenceNumber` / `ProducerFenced` semantics are preserved.
     producers: Arc<Mutex<BTreeMap<ProducerId, OptiCon<ProducerDetail>>>>,
-
-    /// Per-*prefix* analogue of [`Self::oldest_retained`] for whole-segment
-    /// retention (#61): the oldest surviving segment's age (ms) observed at the
-    /// last scan, letting the maintenance loop skip the `segments/` LIST of a
-    /// prefix whose oldest segment is still within retention. Same lower-bound
-    /// soundness as the per-partition hint. In-memory only.
-    oldest_retained_prefix: Arc<Mutex<BTreeMap<String, i64>>>,
-
-    /// Etag-delta cache of the cluster's retired-prefix markers (#532): prefix
-    /// -> (last-seen etag, marker). A marker changes only when another topic on
-    /// the same prefix is deleted, so refreshing it costs the LIST and nothing
-    /// else — which is what lets both maintenance universes (the claim and the
-    /// retention thresholds) read the set in one tick. In-memory only.
-    retired_prefixes: Arc<Mutex<RetiredPrefixCache>>,
 
     /// Per-prefix coalescing buffer (#57) — the only produce buffer since #177.
     /// Keyed by prefix, so one buffer accumulates `PrefixPending` batches across
@@ -197,104 +173,10 @@ pub struct DynoStore {
 
     prefix_coalesce_buffers: Arc<Mutex<BTreeMap<String, PrefixCoalesceBuffer>>>,
 
-    /// Per-prefix next segment sequence hint (#57). The segment object name
-    /// `prefixes/{prefix}/segments/{seq:020}.seg` is monotonic and create-only,
-    /// so — exactly as the `{offset}.batch` name is the offset authority for the
-    /// legacy layout — the segment sequence is the ordering authority for the
-    /// coalesced layout. A `Create` conflict resyncs the hint from the tail of
-    /// the segment listing (single-writer per prefix, #59, makes conflicts a
-    /// failover edge case rather than the steady state).
-    segment_seqs: Arc<Mutex<BTreeMap<String, u64>>>,
-
-    /// Per-prefix async flush lock: serializes `flush_prefix_coalesced` for a
-    /// given prefix so a window's `cached_high` read → segment PUT → `set_high`
-    /// is atomic. Without it two overlapping flushes (a threshold flush and a
-    /// linger-timer flush) could both read the same base offset before either
-    /// advanced the hint, writing two segments at the same offsets. The segment
-    /// `Create` only guards the *sequence* name, not offsets, so this lock — not
-    /// the create-race — is the per-prefix offset authority.
-    prefix_flush_locks: Arc<Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>>,
-
-    /// Per-prefix in-memory segment-footer index (read-path #60 review fix). See
-    /// [`PrefixIndex`]: caches immutable footers so fetch/high-watermark/earliest/
-    /// retention resolve without a per-call `segments/` LIST or per-segment footer
-    /// GET.
-    prefix_index: Arc<Mutex<BTreeMap<String, PrefixIndex>>>,
-
-    /// Measurement-only trace of which segment objects this pod has recently read
-    /// record bytes from, and over which byte ranges (#117). Not a cache — it
-    /// holds no data and nothing reads through it; it exists to answer the one
-    /// question that decides #117's design: when a segment object is read more
-    /// than once on a pod, is it the *same* range (what a `(prefix, seq, range)`
-    /// block cache would serve) or a *different* one (co-prefix sub-streams
-    /// reading disjoint slices of the same object, which only a whole-object cache
-    /// would serve)? See [`SegmentReadTrace`].
-    segment_reads: Arc<Mutex<BTreeMap<(String, u64), SegmentReadTrace>>>,
-
     /// Per-group optimistic-concurrency handle on `offsets.json` (#406), so the
     /// conditional GET a commit pays is served from a memoized etag rather than a
     /// body read on every commit.
     group_offsets: Arc<Mutex<BTreeMap<String, OptiCon<GroupOffsets>>>>,
-
-    /// Segments a compaction pass has proved undecodable, per prefix (#398).
-    ///
-    /// A region that arrives whole and holds no frame is damage no code path in
-    /// this process can undo: `CorruptSegment` is deliberately fatal to the
-    /// compaction run (#388), so without this the run selection picks the same
-    /// object every tick — it selects the *oldest* mergeable segments, and a
-    /// damaged one is old — and the prefix's drain dies on byte 0 of it forever.
-    /// Observed in production for 17 hours at ~2 errors/hour, which is #274's
-    /// "one error aborts the prefix's pass" one error variant later.
-    ///
-    /// In memory and per process on purpose: it is a *skip list*, not a verdict
-    /// about the object. A restart re-reads the segment once and re-quarantines
-    /// it if it is still bad, which is exactly the behaviour wanted the day a
-    /// repair path lands — nothing durable has to be un-said.
-    ///
-    /// A quarantined sequence bounds a merge run rather than being filtered out
-    /// of it: the merged segment carries the base offset of its first region and
-    /// concatenates the rest, so merging *across* a hole would shift every
-    /// following record's offset down into it. Bounded by
-    /// [`Self::PREFIX_QUARANTINE_CAP`] per prefix, and pruned against the index
-    /// as segments retire.
-    quarantined_segments: Arc<Mutex<BTreeMap<String, BTreeSet<u64>>>>,
-
-    /// Sequences at which a merge run's offset tiling is known to break (#399):
-    /// a **seam**. Run selection will not extend a run across one, exactly as it
-    /// will not extend across a quarantined sequence — but where a quarantined
-    /// segment is excluded outright, a seam segment is healthy and may *start*
-    /// the next run.
-    ///
-    /// This exists because the tiling check discovers a gap only after the run's
-    /// objects are fetched and decoded, and #461's holes are permanent: the
-    /// records between two segments are gone, so a run straddling one can
-    /// **never** become mergeable. Without the memo, selection — which always
-    /// picks the oldest eligible run — rebuilt the same straddling run every
-    /// tick, paid its reads, and refused: zero compaction forever on exactly the
-    /// damaged prefixes, including the segments *above* the hole. Measured on
-    /// the production fleet the day this landed: 21 054 segments created per
-    /// hour against 142 merged away, with 40/40 sampled refusals being a hole.
-    ///
-    /// In memory and per process for the same reason the quarantine is: it is a
-    /// *skip list*, not a verdict about the objects. A restart re-meets each
-    /// seam once — one refused run — and re-learns it. Bounded by
-    /// [`Self::PREFIX_QUARANTINE_CAP`] per prefix, and pruned against the index
-    /// as segments retire.
-    compact_seams: Arc<Mutex<BTreeMap<String, BTreeSet<u64>>>>,
-
-    /// Per-prefix compaction leases this process holds (#66) — the maintenance
-    /// side of the single-writer fence. The produce lease is gone with #177;
-    /// this is the only remaining lease.
-    compaction_leases: Arc<Mutex<BTreeMap<String, HeldLease>>>,
-
-    /// Per-prefix leaseless *era* epoch (#92), the durable side being
-    /// `prefixes/{prefix}/era.json`. Seeded on the first leaseless flush of a
-    /// prefix as `max(lease.json epoch, max footer epoch) + 1` (never 0) and
-    /// stamped as a constant `writer_epoch` into every leaseless segment, so a
-    /// straggler from the pre-cutover lease era can never win the overlap
-    /// tie-break in [`Self::valid_substream_segments`] and erase acked data. This
-    /// caches it so the seeding object is read once per process per prefix.
-    era_epochs: Arc<Mutex<BTreeMap<String, i64>>>,
 
     /// This writer's identity, recorded in the lease `holder` field (#59) for
     /// observability. Unique per process instance so two brokers (or two test
@@ -3418,22 +3300,10 @@ impl DynoStore {
             cluster: cluster.into(),
             node,
             advertised_listener: Url::parse("tcp://127.0.0.1/").unwrap(),
-            served_end_reconciled: Arc::new(Mutex::new(BTreeSet::new())),
-            prefix_read_sync_locks: Arc::new(Mutex::new(BTreeMap::new())),
             producers: Arc::new(Mutex::new(BTreeMap::new())),
-            oldest_retained_prefix: Arc::new(Mutex::new(BTreeMap::new())),
-            retired_prefixes: Arc::new(Mutex::new(RetiredPrefixCache::new())),
             message_max_bytes: Self::MESSAGE_MAX_BYTES,
             prefix_coalesce_buffers: Arc::new(Mutex::new(BTreeMap::new())),
-            segment_seqs: Arc::new(Mutex::new(BTreeMap::new())),
-            prefix_flush_locks: Arc::new(Mutex::new(BTreeMap::new())),
-            prefix_index: Arc::new(Mutex::new(BTreeMap::new())),
-            segment_reads: Arc::new(Mutex::new(BTreeMap::new())),
             group_offsets: Arc::new(Mutex::new(BTreeMap::new())),
-            quarantined_segments: Arc::new(Mutex::new(BTreeMap::new())),
-            compact_seams: Arc::new(Mutex::new(BTreeMap::new())),
-            compaction_leases: Arc::new(Mutex::new(BTreeMap::new())),
-            era_epochs: Arc::new(Mutex::new(BTreeMap::new())),
             // Per-process random component so two ReplicaSet pods are actually
             // distinguishable (#126): `node` is always 111 and `WRITER_INSTANCE`
             // is a per-process counter, so without entropy every pod's first
@@ -3462,6 +3332,8 @@ impl DynoStore {
             flush_max_elapsed: Self::FLUSH_MAX_ELAPSED,
             maintenance_seed: rng().random::<u64>(),
             topics: TopicCaches::default(),
+            prefixes: PrefixCaches::default(),
+            prefix_locks: PrefixLocks::default(),
             auto_create: AutoTopicCreate::default(),
             topic_defaults: TopicDefaults::default(),
             meta: OptiCon::<Meta>::new(cluster),
@@ -5205,22 +5077,13 @@ impl DynoStore {
 
     /// The cached next segment sequence for `prefix`, if known to this process.
     fn cached_seq(&self, prefix: &str) -> Result<Option<u64>> {
-        self.segment_seqs
-            .lock()
-            .map(|locked| locked.get(prefix).copied())
-            .map_err(Into::into)
+        self.prefixes.seq(prefix)
     }
 
     /// Advance the cached next-segment-sequence hint. Monotonic, like
     /// [`Self::set_high`]: a sequence is never reused.
     fn set_seq(&self, prefix: &str, next: u64) -> Result<()> {
-        self.segment_seqs
-            .lock()
-            .map(|mut locked| {
-                let entry = locked.entry(prefix.to_owned()).or_default();
-                *entry = (*entry).max(next);
-            })
-            .map_err(Into::into)
+        self.prefixes.set_seq(prefix, next)
     }
 
     /// The coalesce linger with per-flush random jitter (±20%, within the #91
@@ -5301,9 +5164,8 @@ impl DynoStore {
         }
 
         let generation = self
-            .prefix_index
-            .lock()
-            .map_err(Into::<Error>::into)?
+            .prefixes
+            .index()?
             .get(prefix)
             .map(|entry| entry.generation)
             .unwrap_or_default();
@@ -5311,7 +5173,7 @@ impl DynoStore {
         let floor = self.read_seq_floor(prefix).await?;
 
         {
-            let mut index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            let mut index = self.prefixes.index()?;
             let entry = index.entry(prefix.to_owned()).or_default();
             // A prune can bump the generation without taking the single-flight
             // lock, so commit only if no such loss happened during the GET — a
@@ -5331,20 +5193,17 @@ impl DynoStore {
     ///
     /// Called by [`Self::raise_seq_floor`] the moment the persisted floor moves.
     fn invalidate_certified_seq_floor(&self, prefix: &str) -> Result<()> {
-        self.prefix_index
-            .lock()
-            .map_err(Into::into)
-            .map(|mut index| {
-                if let Some(entry) = index.get_mut(prefix) {
-                    entry.seq_floor = None;
-                }
-            })
+        self.prefixes.index().map(|mut index| {
+            if let Some(entry) = index.get_mut(prefix) {
+                entry.seq_floor = None;
+            }
+        })
     }
 
     /// The certified seq floor for `prefix` iff one is cached for the current
     /// index generation (see [`Self::certified_seq_floor`]).
     fn cached_certified_seq_floor(&self, prefix: &str) -> Result<Option<u64>> {
-        let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+        let index = self.prefixes.index()?;
         Ok(index.get(prefix).and_then(|entry| {
             entry
                 .seq_floor
@@ -5456,9 +5315,8 @@ impl DynoStore {
     /// reflects every live pre-cutover segment.
     fn max_footer_epoch(&self, prefix: &str) -> Result<i64> {
         Ok(self
-            .prefix_index
-            .lock()
-            .map_err(Into::<Error>::into)?
+            .prefixes
+            .index()?
             .get(prefix)
             .map(|index| {
                 index
@@ -5480,13 +5338,7 @@ impl DynoStore {
     /// on the leaseless flush path *after* the forced index refresh, so
     /// `max_footer_epoch` sees every folded segment.
     async fn seed_era_epoch(&self, prefix: &str) -> Result<i64> {
-        if let Some(era) = self
-            .era_epochs
-            .lock()
-            .map_err(Into::<Error>::into)?
-            .get(prefix)
-            .copied()
-        {
+        if let Some(era) = self.prefixes.era(prefix)? {
             return Ok(era);
         }
 
@@ -5541,13 +5393,7 @@ impl DynoStore {
     /// Cache a resolved era epoch (monotonic, like the other hints — the durable
     /// object is immutable, so the value can only ever be the same one).
     fn cache_era(&self, prefix: &str, era: i64) -> Result<()> {
-        self.era_epochs
-            .lock()
-            .map(|mut cache| {
-                let entry = cache.entry(prefix.to_owned()).or_default();
-                *entry = (*entry).max(era);
-            })
-            .map_err(Into::into)
+        self.prefixes.cache_era(prefix, era)
     }
 
     /// Roll `prefix` back to the lease regime (#92): rewrite `lease.json` with an
@@ -5689,9 +5535,8 @@ impl DynoStore {
     /// only ever re-read what the probe had just read under the same generation.
     async fn tail_next_seq_folded(&self, prefix: &str) -> Result<u64> {
         let listed_max = self
-            .prefix_index
-            .lock()
-            .map_err(Into::<Error>::into)?
+            .prefixes
+            .index()?
             .get(prefix)
             .and_then(PrefixIndex::resolved_max);
         let floor = self.certified_seq_floor(prefix).await?;
@@ -6050,7 +5895,7 @@ impl DynoStore {
             return false;
         };
 
-        let Ok(mut index) = self.prefix_index.lock() else {
+        let Some(mut index) = self.prefixes.try_index() else {
             return false;
         };
 
@@ -6071,7 +5916,7 @@ impl DynoStore {
     /// what to list: whether it is within its freshness TTL, the
     /// incremental-listing watermark, and whether the downward pass is due.
     fn prefix_index_freshness(&self, prefix: &str) -> Result<IndexFreshness> {
-        let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+        let index = self.prefixes.index()?;
         Ok(match index.get(prefix) {
             Some(entry) => {
                 let now = SystemTime::now();
@@ -6102,10 +5947,7 @@ impl DynoStore {
     /// The per-prefix single-flight lock for the real index refresh and the
     /// certified seq-floor sync (see [`Self::prefix_read_sync_locks`]).
     fn prefix_read_sync_lock(&self, prefix: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
-        self.prefix_read_sync_locks
-            .lock()
-            .map_err(Into::into)
-            .map(|mut locks| locks.entry(prefix.to_owned()).or_default().clone())
+        self.prefix_locks.read_sync(prefix)
     }
 
     /// Follow a prefix's segment tail with ranged GETs instead of a
@@ -6216,7 +6058,7 @@ impl DynoStore {
                     // only *add* segments, never reflect a peer's deletion, so the
                     // index generation — and with it the certified seq floor that
                     // keeps the LATEST fast path off `watermark.json` — stays valid.
-                    if let Ok(mut index) = self.prefix_index.lock() {
+                    if let Some(mut index) = self.prefixes.try_index() {
                         index.entry(prefix.to_owned()).or_default().refreshed_at =
                             Some(SystemTime::now());
                     }
@@ -6234,7 +6076,7 @@ impl DynoStore {
             // prefix; anything else is the LIST path's business.
             match Self::decode_segment_footer(&bytes) {
                 Ok(Some(footer)) => {
-                    if let Ok(mut index) = self.prefix_index.lock() {
+                    if let Some(mut index) = self.prefixes.try_index() {
                         index.entry(prefix.to_owned()).or_default().insert_segment(
                             seq,
                             CachedSegment {
@@ -6273,9 +6115,8 @@ impl DynoStore {
     /// holds the per-prefix single-flight lock that method takes.
     async fn probe_seq_floor(&self, prefix: &str) -> Result<u64> {
         let generation = self
-            .prefix_index
-            .lock()
-            .map_err(Into::<Error>::into)?
+            .prefixes
+            .index()?
             .get(prefix)
             .map(|entry| entry.generation)
             .unwrap_or_default();
@@ -6283,7 +6124,7 @@ impl DynoStore {
         let floor = self.read_seq_floor(prefix).await?;
 
         {
-            let mut index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            let mut index = self.prefixes.index()?;
             let entry = index.entry(prefix.to_owned()).or_default();
             if entry.generation == generation {
                 entry.seq_floor = Some((floor, generation));
@@ -6440,9 +6281,8 @@ impl DynoStore {
         // re-GETting a footer that will not decode again costs a request per
         // refresh (per flush, on the forced path) and never makes progress.
         let cached: BTreeSet<u64> = self
-            .prefix_index
-            .lock()
-            .map_err(Into::<Error>::into)?
+            .prefixes
+            .index()?
             .get(prefix)
             .map(|entry| {
                 entry
@@ -6481,7 +6321,7 @@ impl DynoStore {
 
         while let Some(result) = footers.next().await {
             let (seq, last_modified_ms, footer) = result?;
-            let mut index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            let mut index = self.prefixes.index()?;
             let entry = index.entry(prefix.to_owned()).or_default();
             match footer {
                 FooterOutcome::Decoded(footer) => {
@@ -6535,7 +6375,7 @@ impl DynoStore {
         // certified seq floor must be re-read at least as recently as this
         // listing before the LATEST fast path may trust the index again.
         {
-            let mut index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            let mut index = self.prefixes.index()?;
             let entry = index.entry(prefix.to_owned()).or_default();
             entry.refreshed_at = Some(SystemTime::now());
             entry.generation += 1;
@@ -6641,20 +6481,17 @@ impl DynoStore {
         footer: SegmentFooter,
         last_modified_ms: i64,
     ) -> Result<()> {
-        self.prefix_index
-            .lock()
-            .map_err(Into::into)
-            .map(|mut index| {
-                let entry = index.entry(prefix.to_owned()).or_default();
-                entry.insert_segment(
-                    seq,
-                    CachedSegment {
-                        footer,
-                        last_modified_ms,
-                    },
-                );
-                entry.refreshed_at = Some(SystemTime::now());
-            })
+        self.prefixes.index().map(|mut index| {
+            let entry = index.entry(prefix.to_owned()).or_default();
+            entry.insert_segment(
+                seq,
+                CachedSegment {
+                    footer,
+                    last_modified_ms,
+                },
+            );
+            entry.refreshed_at = Some(SystemTime::now());
+        })
     }
 
     /// When the cached prefix index for `prefix` was last reconciled by a
@@ -6664,9 +6501,8 @@ impl DynoStore {
     /// be up to one TTL old, so stamping `mark_listed` with `now` let cross-pod
     /// staleness compound toward ~2×TTL.
     fn prefix_index_refreshed_at(&self, prefix: &str) -> Option<SystemTime> {
-        self.prefix_index
-            .lock()
-            .ok()
+        self.prefixes
+            .try_index()
             .and_then(|index| index.get(prefix).and_then(|entry| entry.refreshed_at))
     }
 
@@ -6688,15 +6524,12 @@ impl DynoStore {
     /// authoritative for the whole prefix at that instant — means something was
     /// retired since: new evidence, not the same evidence again.
     fn index_invalidate(&self, prefix: &str) -> Result<()> {
-        self.prefix_index
-            .lock()
-            .map_err(Into::into)
-            .map(|mut index| {
-                if let Some(entry) = index.get_mut(prefix) {
-                    entry.refreshed_at = None;
-                    entry.reconciled_at = None;
-                }
-            })
+        self.prefixes.index().map(|mut index| {
+            if let Some(entry) = index.get_mut(prefix) {
+                entry.refreshed_at = None;
+                entry.reconciled_at = None;
+            }
+        })
     }
 
     /// Drop expired sequences from the index after a retention delete (#61).
@@ -6705,20 +6538,17 @@ impl DynoStore {
     /// the LATEST fast path may trust the index again (see
     /// [`Self::certified_seq_floor`]).
     fn index_prune(&self, prefix: &str, seqs: &[u64]) -> Result<()> {
-        self.prefix_index
-            .lock()
-            .map_err(Into::into)
-            .map(|mut index| {
-                if let Some(entry) = index.get_mut(prefix) {
-                    // Through `retain_segments`, not a `remove_segment` loop:
-                    // `retire_segments` prunes a whole retirement batch here, and
-                    // withdrawing one segment at a time from the derived map is
-                    // quadratic in a sub-stream's segment count (#492).
-                    let pruned: BTreeSet<u64> = seqs.iter().copied().collect();
-                    _ = entry.retain_segments(|seq| !pruned.contains(&seq));
-                    entry.generation += 1;
-                }
-            })
+        self.prefixes.index().map(|mut index| {
+            if let Some(entry) = index.get_mut(prefix) {
+                // Through `retain_segments`, not a `remove_segment` loop:
+                // `retire_segments` prunes a whole retirement batch here, and
+                // withdrawing one segment at a time from the derived map is
+                // quadratic in a sub-stream's segment count (#492).
+                let pruned: BTreeSet<u64> = seqs.iter().copied().collect();
+                _ = entry.retain_segments(|seq| !pruned.contains(&seq));
+                entry.generation += 1;
+            }
+        })
     }
 
     /// GET each of `seqs` whole, or `None` when any of them had already been
@@ -6939,9 +6769,8 @@ impl DynoStore {
         // Through `substream_entries` (#492), so the lock is held for this
         // sub-stream's own segments rather than for a scan of the whole prefix.
         let mut segs: Vec<(i64, u64, SubstreamEntry)> = self
-            .prefix_index
-            .lock()
-            .map_err(Into::<Error>::into)?
+            .prefixes
+            .index()?
             .get(prefix)
             .map(|index| {
                 index
@@ -7055,7 +6884,7 @@ impl DynoStore {
         SEGMENT_DATA_GETS.add(1, &[]);
         SEGMENT_DATA_BYTES.add(byte_len, &[]);
 
-        let Ok(mut traces) = self.segment_reads.lock() else {
+        let Some(mut traces) = self.prefixes.traces() else {
             return;
         };
 
@@ -7687,10 +7516,7 @@ impl DynoStore {
 
     /// The per-prefix flush serialization lock (see [`Self::prefix_flush_locks`]).
     fn prefix_flush_lock(&self, prefix: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
-        self.prefix_flush_locks
-            .lock()
-            .map_err(Into::into)
-            .map(|mut locks| locks.entry(prefix.to_owned()).or_default().clone())
+        self.prefix_locks.flush(prefix)
     }
 
     /// The durable single-writer lease object for a connector prefix (#59).
@@ -7725,8 +7551,7 @@ impl DynoStore {
     /// can compact without holding (or fencing) the produce lease.
     async fn acquire_compaction_lease(&self, prefix: &str) -> Result<i64> {
         let location = self.compaction_lease_location(prefix);
-        self.acquire_or_renew_lease_at(prefix, &location, &self.compaction_leases)
-            .await
+        self.acquire_or_renew_lease_at(prefix, &location).await
     }
 
     /// Generic lease acquire/renew against `location`, caching the held term in
@@ -7734,17 +7559,12 @@ impl DynoStore {
     /// lease or a lost CAS yields `NotLeaderOrFollower`. A held term is reused
     /// with no write while more than a third of it remains, keeping the object's
     /// mutation rate well under GCS's ~1/s cap (#13).
-    async fn acquire_or_renew_lease_at(
-        &self,
-        key: &str,
-        location: &Path,
-        cache: &Arc<Mutex<BTreeMap<String, HeldLease>>>,
-    ) -> Result<i64> {
+    async fn acquire_or_renew_lease_at(&self, key: &str, location: &Path) -> Result<i64> {
         let now = SystemTime::now();
         let margin = self.prefix_lease_ttl / 3;
 
         // Fast path: comfortably within our term — no object mutation.
-        if let Some(held) = cache.lock().map_err(Into::<Error>::into)?.get(key)
+        if let Some(held) = self.prefixes.held_lease(key)?
             && held.expires_at > now + margin
         {
             return Ok(held.epoch);
@@ -7766,11 +7586,7 @@ impl DynoStore {
 
         // "Ours" iff the object's etag matches the one we last wrote — then this
         // is a renewal, not a takeover of a foreign live lease.
-        let our_version = cache
-            .lock()
-            .map_err(Into::<Error>::into)?
-            .get(key)
-            .and_then(|held| held.version.clone());
+        let our_version = self.prefixes.held_lease(key)?.and_then(|held| held.version);
         let ours = matches!((&version, &our_version), (Some(v), Some(o)) if v.e_tag == o.e_tag);
         let expired = current
             .as_ref()
@@ -7782,7 +7598,7 @@ impl DynoStore {
             if let Some(lease) = &current {
                 debug!(key, holder = %lease.holder, epoch = lease.epoch, "lease held elsewhere");
             }
-            _ = cache.lock().map(|mut leases| leases.remove(key));
+            self.prefixes.drop_lease(key);
             LEASE_FENCED.add(1, &[]);
             return Err(Error::Api(ErrorCode::NotLeaderOrFollower));
         }
@@ -7822,16 +7638,14 @@ impl DynoStore {
                     e_tag: result.e_tag,
                     version: result.version,
                 });
-                _ = cache.lock().map(|mut leases| {
-                    _ = leases.insert(
-                        key.to_owned(),
-                        HeldLease {
-                            epoch,
-                            expires_at: now + self.prefix_lease_ttl,
-                            version,
-                        },
-                    );
-                });
+                self.prefixes.hold_lease(
+                    key,
+                    HeldLease {
+                        epoch,
+                        expires_at: now + self.prefix_lease_ttl,
+                        version,
+                    },
+                );
                 LEASE_ACQUIRES.add(1, &[]);
                 debug!(key, epoch, "lease acquired/renewed");
                 Ok(epoch)
@@ -7843,7 +7657,7 @@ impl DynoStore {
                 | object_store::Error::AlreadyExists { .. },
             ) => {
                 debug!(key, "lease CAS lost — fenced");
-                _ = cache.lock().map(|mut leases| leases.remove(key));
+                self.prefixes.drop_lease(key);
                 LEASE_FENCED.add(1, &[]);
                 Err(Error::Api(ErrorCode::NotLeaderOrFollower))
             }
@@ -9553,25 +9367,12 @@ impl DynoStore {
     /// away, and the value is the plateau signal — a caller that skips on it has
     /// the one number [`OLDEST_RETAINED`] wants and could not report it.
     fn prefix_oldest_retained(&self, prefix: &str) -> Result<Option<i64>> {
-        self.oldest_retained_prefix
-            .lock()
-            .map_err(Into::into)
-            .map(|locked| locked.get(prefix).copied())
+        self.prefixes.oldest_retained(prefix)
     }
 
     /// Update the per-prefix oldest-retained hint after a segment scan (#61).
     fn record_prefix_oldest_retained(&self, prefix: &str, oldest_ms: Option<i64>) -> Result<()> {
-        self.oldest_retained_prefix
-            .lock()
-            .map_err(Into::into)
-            .map(|mut locked| match oldest_ms {
-                Some(ms) => {
-                    _ = locked.insert(prefix.to_owned(), ms);
-                }
-                None => {
-                    _ = locked.remove(prefix);
-                }
-            })
+        self.prefixes.record_oldest_retained(prefix, oldest_ms)
     }
 
     /// Delete every segment under `prefix` whose records are all older than
@@ -9600,7 +9401,7 @@ impl DynoStore {
         // `truncate_floors` locks, and nesting those under `prefix_index`
         // would set up a lock-order hazard for no benefit.
         let segments_snapshot: Vec<SegmentExpirySnapshot> = {
-            let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            let index = self.prefixes.index()?;
 
             index
                 .get(prefix)
@@ -9930,7 +9731,7 @@ impl DynoStore {
         // segments back routinely), and the fleet's worst prefix carries 25 779
         // segments. This is O(expired), not O(prefix).
         let expired_bytes: u64 = {
-            let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            let index = self.prefixes.index()?;
 
             index
                 .get(prefix)
@@ -10016,13 +9817,7 @@ impl DynoStore {
     /// concurrently. The set is small by construction
     /// ([`Self::PREFIX_QUARANTINE_CAP`]).
     fn quarantined_segments_of(&self, prefix: &str) -> Result<BTreeSet<u64>> {
-        Ok(self
-            .quarantined_segments
-            .lock()
-            .map_err(Into::<Error>::into)?
-            .get(prefix)
-            .cloned()
-            .unwrap_or_default())
+        self.prefixes.quarantined_of(prefix)
     }
 
     /// Exclude `region`'s segment from this prefix's future compaction runs
@@ -10035,10 +9830,7 @@ impl DynoStore {
     /// cannot reach and retrying the drain would spin.
     fn quarantine_segment(&self, region: &CorruptRegion) -> Result<bool> {
         let held = {
-            let mut quarantined = self
-                .quarantined_segments
-                .lock()
-                .map_err(Into::<Error>::into)?;
+            let mut quarantined = self.prefixes.quarantined()?;
             let seqs = quarantined.entry(region.prefix.clone()).or_default();
 
             if !seqs.contains(&region.seq) && seqs.len() >= Self::PREFIX_QUARANTINE_CAP {
@@ -10084,10 +9876,7 @@ impl DynoStore {
     /// cleared.
     fn prune_quarantine(&self, prefix: &str, live: &BTreeSet<u64>) -> Result<()> {
         let held = {
-            let mut quarantined = self
-                .quarantined_segments
-                .lock()
-                .map_err(Into::<Error>::into)?;
+            let mut quarantined = self.prefixes.quarantined()?;
 
             let Some(seqs) = quarantined.get_mut(prefix) else {
                 return Ok(());
@@ -10111,13 +9900,7 @@ impl DynoStore {
     /// The seams of `prefix` (#399) — see [`Self::compact_seams`]. Snapshotted
     /// for the same reason [`Self::quarantined_segments_of`] is.
     fn compact_seams_of(&self, prefix: &str) -> Result<BTreeSet<u64>> {
-        Ok(self
-            .compact_seams
-            .lock()
-            .map_err(Into::<Error>::into)?
-            .get(prefix)
-            .cloned()
-            .unwrap_or_default())
+        self.prefixes.seams_of(prefix)
     }
 
     /// Record `seams` as run boundaries for `prefix` (#399), answering whether
@@ -10132,7 +9915,7 @@ impl DynoStore {
         let mut learned = false;
 
         {
-            let mut memo = self.compact_seams.lock().map_err(Into::<Error>::into)?;
+            let mut memo = self.prefixes.seams()?;
             let held = memo.entry(prefix.to_owned()).or_default();
 
             for seam in seams {
@@ -10165,7 +9948,7 @@ impl DynoStore {
     /// reason: a sequence is never reused (#77), so a seam whose segment is gone
     /// bounds nothing and is dead weight.
     fn prune_compact_seams(&self, prefix: &str, live: &BTreeSet<u64>) -> Result<()> {
-        let mut memo = self.compact_seams.lock().map_err(Into::<Error>::into)?;
+        let mut memo = self.prefixes.seams()?;
 
         let Some(seams) = memo.get_mut(prefix) else {
             return Ok(());
@@ -10204,7 +9987,7 @@ impl DynoStore {
         // Snapshot (seq, epoch, last_modified, region bytes) for every cached
         // segment, ascending by seq (== ascending offset for a sub-stream).
         let mut segs: Vec<(u64, i64, i64, usize)> = {
-            let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            let index = self.prefixes.index()?;
             index
                 .get(prefix)
                 .map(|entry| {
@@ -10263,7 +10046,7 @@ impl DynoStore {
             if quarantined.is_empty() && seams.is_empty() {
                 BTreeMap::new()
             } else {
-                let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+                let index = self.prefixes.index()?;
                 index
                     .get(prefix)
                     .map(|entry| {
@@ -10373,7 +10156,7 @@ impl DynoStore {
 
         // Snapshot the run's footers; GET each run segment once.
         let footers: BTreeMap<u64, SegmentFooter> = {
-            let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            let index = self.prefixes.index()?;
             let entry = index.get(prefix);
             run.iter()
                 .filter_map(|seq| {
@@ -10635,7 +10418,7 @@ impl DynoStore {
         let mut segments_meta: BTreeMap<u64, (i64, i64)> = BTreeMap::new();
         let mut substream_keys: BTreeSet<(Substream, String, i32)> = BTreeSet::new();
         {
-            let index = self.prefix_index.lock().map_err(Into::<Error>::into)?;
+            let index = self.prefixes.index()?;
             if let Some(entry) = index.get(prefix) {
                 for (seq, cached) in &entry.segments {
                     if quarantined.contains(seq) {
@@ -10899,13 +10682,7 @@ impl DynoStore {
     /// Recency `0` disables the skip → every maintainer claims every prefix
     /// (single-maintainer behaviour).
     async fn claim_maintenance_prefixes(&self, now_ms: i64) -> Result<BTreeSet<String>> {
-        let mut universe: BTreeSet<String> = self
-            .prefix_index
-            .lock()
-            .map_err(Into::<Error>::into)?
-            .keys()
-            .cloned()
-            .collect();
+        let mut universe: BTreeSet<String> = self.prefixes.index()?.keys().cloned().collect();
         for metadata in self.topics_index().await?.iter() {
             let compact = metadata
                 .topic
@@ -10983,13 +10760,7 @@ impl DynoStore {
         // the in-memory index: a dedicated maintenance worker never produces or
         // fetches, so its index is empty — it must discover prefixes from the
         // topics (as retention does). Union with any locally-indexed prefixes.
-        let mut prefix_set: BTreeSet<String> = self
-            .prefix_index
-            .lock()
-            .map_err(Into::<Error>::into)?
-            .keys()
-            .cloned()
-            .collect();
+        let mut prefix_set: BTreeSet<String> = self.prefixes.index()?.keys().cloned().collect();
         for metadata in self.topics_index().await?.iter() {
             let compact = metadata
                 .topic
@@ -11180,7 +10951,7 @@ impl DynoStore {
         // This is the index's size, not the bucket's (#399): what is really under
         // the prefix is `tansu_prefix_segments_live`, recorded from the listing
         // that reconciled this index rather than from the index it produced.
-        let live: Option<BTreeSet<u64>> = self.prefix_index.lock().ok().and_then(|index| {
+        let live: Option<BTreeSet<u64>> = self.prefixes.try_index().and_then(|index| {
             index.get(prefix).map(|entry| {
                 PREFIX_INDEX_ENTRIES.record(
                     entry.segments.len() as u64,
@@ -11317,9 +11088,8 @@ impl DynoStore {
         // already has cached, no extra request). A prefix this maintainer has
         // never indexed sorts last — it has no known backlog.
         let live_counts: BTreeMap<String, usize> = self
-            .prefix_index
-            .lock()
-            .map_err(Into::<Error>::into)?
+            .prefixes
+            .index()?
             .iter()
             .map(|(prefix, entry)| (prefix.clone(), entry.segments.len()))
             .collect();
@@ -11499,7 +11269,7 @@ impl DynoStore {
     /// `compact_prefix_segments` selects a run under, so a prefix that cannot
     /// yield a run is never swept for one.
     fn backlogged_prefixes(&self, compactable: &BTreeSet<String>) -> Vec<String> {
-        let Ok(index) = self.prefix_index.lock() else {
+        let Some(index) = self.prefixes.try_index() else {
             return Vec::new();
         };
 
@@ -11584,7 +11354,7 @@ impl DynoStore {
         let mut named: BTreeSet<String> = BTreeSet::new();
 
         {
-            let cached = self.retired_prefixes.lock()?;
+            let cached = self.prefixes.retired()?;
 
             for object in &listed.objects {
                 let Some(prefix) = object
@@ -11620,7 +11390,7 @@ impl DynoStore {
             .await?;
 
         let markers = {
-            let mut cached = self.retired_prefixes.lock()?;
+            let mut cached = self.prefixes.retired()?;
 
             cached.retain(|prefix, _| named.contains(prefix));
             for (prefix, entry) in fetched {
@@ -11683,9 +11453,8 @@ impl DynoStore {
     /// topic routed there, which supplies its own.
     async fn drop_retired_prefix_if_drained(&self, prefix: &str) -> Result<bool> {
         let drained = self
-            .prefix_index
-            .lock()
-            .map_err(Into::<Error>::into)?
+            .prefixes
+            .index()?
             .get(prefix)
             .is_some_and(|entry| entry.segments.is_empty());
 
@@ -11697,9 +11466,7 @@ impl DynoStore {
             .remove(&self.object_store)
             .await?;
 
-        self.retired_prefixes.lock().map(|mut cached| {
-            _ = cached.remove(prefix);
-        })?;
+        self.prefixes.forget_retired_marker(prefix);
 
         debug!(prefix, "dropped a drained prefix's retired marker");
 
@@ -11928,12 +11695,7 @@ impl DynoStore {
     /// a fresh process is exactly when a prefix may have picked up a gap under a
     /// binary that did not certify.
     async fn certify_prefix_served_ends(&self, prefix: &str) -> Result<u64> {
-        if self
-            .served_end_reconciled
-            .lock()
-            .map_err(Into::<Error>::into)?
-            .contains(prefix)
-        {
+        if self.prefixes.served_end_reconciled(prefix)? {
             return Ok(0);
         }
 
@@ -11948,18 +11710,13 @@ impl DynoStore {
         // Marked before the work, not after: a prefix whose reconciliation fails
         // must not retry every tick for the life of the process. The next restart
         // re-arms it, and #338's counter still reports the state meanwhile.
-        _ = self
-            .served_end_reconciled
-            .lock()
-            .map_err(Into::<Error>::into)?
-            .insert(prefix.to_owned());
+        self.prefixes.mark_served_end_reconciled(prefix)?;
 
         self.refresh_prefix_index_forced(prefix).await?;
 
         let substreams: BTreeSet<(Substream, String, i32)> =
-            self.prefix_index
-                .lock()
-                .map_err(Into::<Error>::into)?
+            self.prefixes
+                .index()?
                 .get(prefix)
                 .map(|index| {
                     index
@@ -12387,9 +12144,8 @@ impl DynoStore {
         // because whole-segment retention (#61) decides expiry on it and a `0`
         // here would read as "ancient" and delete a live segment.
         let last_modified_ms = self
-            .prefix_index
-            .lock()
-            .map_err(Into::<Error>::into)?
+            .prefixes
+            .index()?
             .get(prefix)
             .and_then(|index| index.segments.get(&seq))
             .map(|cached| cached.last_modified_ms)
@@ -16436,6 +16192,11 @@ impl Storage for DynoStore {
             .await
             .inspect_err(|err| warn!(?err, "could not evict deleted-topic caches"))
             .unwrap_or_default();
+
+        // Per-cache occupancy (#554), on the same tick and for the same reason as
+        // the topic-cache gauges above: the resident-memory work (#476, #543)
+        // keeps landing on these maps and could not name which one.
+        self.prefixes.record_occupancy();
 
         // Measurement only (#283): a failure here must not cost this replica its
         // retention and compaction, which is why it is not `?`.

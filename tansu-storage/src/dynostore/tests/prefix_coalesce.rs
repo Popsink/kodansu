@@ -2771,8 +2771,8 @@ async fn prefix_index_cold_build_commits_incrementally() -> Result<(), Error> {
 
     let cached = |store: &DynoStore| {
         store
-            .prefix_index
-            .lock()
+            .prefixes
+            .index()
             .unwrap()
             .get(PREFIX)
             .map(|entry| entry.segments.len())
@@ -3980,7 +3980,7 @@ async fn co_prefix_consumers_read_disjoint_ranges_of_one_segment() -> Result<(),
     assert!(!fetch_from(&store, &a, 0).await?.is_empty());
     assert!(!fetch_from(&store, &b, 0).await?.is_empty());
 
-    let traces = store.segment_reads.lock().expect("segment_reads").clone();
+    let traces = store.prefixes.traces().expect("segment_reads").clone();
     let trace = traces
         .get(&(PREFIX.to_owned(), 0))
         .expect("both consumers read segment 0");
@@ -4019,7 +4019,7 @@ async fn re_reading_one_substream_repeats_the_same_range() -> Result<(), Error> 
     assert!(!fetch_from(&store, &tp, 0).await?.is_empty());
     assert!(!fetch_from(&store, &tp, 0).await?.is_empty());
 
-    let traces = store.segment_reads.lock().expect("segment_reads").clone();
+    let traces = store.prefixes.traces().expect("segment_reads").clone();
     let trace = traces
         .get(&(PREFIX.to_owned(), 0))
         .expect("the sub-stream was read");
@@ -4045,7 +4045,7 @@ async fn segment_read_trace_stays_bounded() {
         store.note_segment_data_read(PREFIX, seq, 0, 64);
     }
 
-    let traced = store.segment_reads.lock().expect("segment_reads").len();
+    let traced = store.prefixes.traces().expect("segment_reads").len();
     assert!(traced <= 1_024, "trace grew to {traced} objects");
 }
 
@@ -4200,8 +4200,8 @@ async fn tail_probe_follows_a_peer_without_listing() -> Result<(), Error> {
     assert_eq!(
         Some(1),
         reader
-            .prefix_index
-            .lock()
+            .prefixes
+            .index()
             .expect("prefix_index")
             .get(PREFIX)
             .and_then(|index| index.segments.keys().next_back().copied()),

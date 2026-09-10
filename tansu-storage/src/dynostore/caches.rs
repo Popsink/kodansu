@@ -37,7 +37,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, LazyLock, Mutex, MutexGuard},
     time::{Duration, SystemTime},
 };
 
@@ -45,8 +45,8 @@ use opentelemetry::{KeyValue, metrics::Gauge};
 use uuid::Uuid;
 
 use super::{
-    CachedWatermark, OffsetHint, OptiCon, ServedEnd, Topic, TopicIndex, TopicMetadata,
-    TopicRouting, Watermark,
+    CachedWatermark, HeldLease, OffsetHint, OptiCon, PrefixIndex, RetiredPrefixCache,
+    SegmentReadTrace, ServedEnd, Topic, TopicIndex, TopicMetadata, TopicRouting, Watermark,
 };
 use crate::{Error, METER, Result, Topition};
 
@@ -141,6 +141,18 @@ where
         if let Ok(mut locked) = self.0.lock() {
             f(&mut locked);
         }
+    }
+
+    /// The map under its lock, for the readers that decide something and return
+    /// out of the middle of the decision — where a closure would be a rewrite of
+    /// the caller rather than a move of the map.
+    fn guard(&self) -> Result<MutexGuard<'_, BTreeMap<K, V>>> {
+        self.0.lock().map_err(Into::into)
+    }
+
+    /// The map under its lock, or `None` if it is poisoned.
+    fn try_guard(&self) -> Option<MutexGuard<'_, BTreeMap<K, V>>> {
+        self.0.lock().ok()
     }
 
     /// How many entries are held, or `0` from a poisoned lock — a gauge must not
@@ -775,4 +787,352 @@ fn retain_live_in<K, V, F>(
             }
         });
     });
+}
+
+/// Every cache keyed by a coalescing prefix: the footer index and the hints,
+/// memos and skip lists that ride alongside it.
+///
+/// # Bound
+///
+/// Bounded by the prefixes this process has touched, which is the cluster's
+/// connector count in the shipped shape — `org.env.conn` out of
+/// `org.env.conn.<schema>.<table>`, so thousands of topics share tens of
+/// prefixes. It is **not** bounded by a sweep, unlike [`TopicCaches`], and the
+/// reason is a real constraint rather than an omission: a prefix is shared
+/// between topics and no caller can tell whether a deleted topic was its last
+/// member without a scan, so evicting [`Self::segment_seqs`] or a flush lock for
+/// a prefix a sibling topic is still producing to would put a second sequence
+/// authority on it — the #78 class. The growth that is left is one entry set per
+/// *compacted* topic, which routes to its own dedicated prefix (#175);
+/// establishing that exclusivity cheaply is what an automated sweep here needs
+/// first.
+///
+/// There is therefore no `forget(prefix)` here, and its absence is the finding
+/// rather than an omission: the per-map owners (`index_prune`,
+/// `prune_quarantine`, `prune_compact_seams`, `invalidate_certified_seq_floor`)
+/// are each keyed by *sequence*, which is a fact about objects that have been
+/// deleted, and that is the only eviction criterion this group can prove. The
+/// one exception is [`Self::forget_retired_marker`], which is one map wide.
+#[derive(Clone, Debug, Default)]
+pub(super) struct PrefixCaches {
+    /// Per-prefix in-memory segment-footer index (read-path #60 review fix). See
+    /// [`PrefixIndex`]: caches immutable footers so
+    /// fetch/high-watermark/earliest/retention resolve without a per-call
+    /// `segments/` LIST or per-segment footer GET.
+    index: LockedMap<String, PrefixIndex>,
+
+    /// Per-prefix next segment sequence hint (#57). The segment object name
+    /// `prefixes/{prefix}/segments/{seq:020}.seg` is monotonic and create-only,
+    /// so — exactly as the `{offset}.batch` name is the offset authority for the
+    /// legacy layout — the segment sequence is the ordering authority for the
+    /// coalesced layout. A `Create` conflict resyncs the hint from the tail of
+    /// the segment listing (single-writer per prefix, #59, makes conflicts a
+    /// failover edge case rather than the steady state).
+    segment_seqs: LockedMap<String, u64>,
+
+    /// Per-*prefix* analogue of the per-partition oldest-retained hint for
+    /// whole-segment retention (#61): the oldest surviving segment's age (ms)
+    /// observed at the last scan, letting the maintenance loop skip the
+    /// `segments/` LIST of a prefix whose oldest segment is still within
+    /// retention. Same lower-bound soundness as the per-partition hint.
+    oldest_retained: LockedMap<String, i64>,
+
+    /// Etag-delta cache of the cluster's retired-prefix markers (#532): prefix ->
+    /// (last-seen etag, marker). A marker changes only when another topic on the
+    /// same prefix is deleted, so refreshing it costs the LIST and nothing else —
+    /// which is what lets both maintenance universes (the claim and the retention
+    /// thresholds) read the set in one tick.
+    retired: Arc<Mutex<RetiredPrefixCache>>,
+
+    /// Segments a compaction pass has proved undecodable, per prefix (#398).
+    ///
+    /// A region that arrives whole and holds no frame is damage no code path in
+    /// this process can undo: `CorruptSegment` is deliberately fatal to the
+    /// compaction run (#388), so without this the run selection picks the same
+    /// object every tick — it selects the *oldest* mergeable segments, and a
+    /// damaged one is old — and the prefix's drain dies on byte 0 of it forever.
+    ///
+    /// In memory and per process on purpose: it is a *skip list*, not a verdict
+    /// about the object. A restart re-reads the segment once and re-quarantines
+    /// it if it is still bad, which is exactly the behaviour wanted the day a
+    /// repair path lands — nothing durable has to be un-said. Bounded per prefix
+    /// by `PREFIX_QUARANTINE_CAP`, and pruned against the index as segments
+    /// retire.
+    quarantined: LockedMap<String, BTreeSet<u64>>,
+
+    /// Sequences at which a merge run's offset tiling is known to break (#399): a
+    /// **seam**. Run selection will not extend a run across one, exactly as it
+    /// will not extend across a quarantined sequence — but where a quarantined
+    /// segment is excluded outright, a seam segment is healthy and may *start*
+    /// the next run. Bounded and pruned exactly as [`Self::quarantined`] is.
+    seams: LockedMap<String, BTreeSet<u64>>,
+
+    /// Per-prefix compaction leases this process holds (#66) — the maintenance
+    /// side of the single-writer fence. The produce lease is gone with #177; this
+    /// is the only remaining lease.
+    leases: LockedMap<String, HeldLease>,
+
+    /// Per-prefix leaseless *era* epoch (#92), the durable side being
+    /// `prefixes/{prefix}/era.json`. Seeded on the first leaseless flush of a
+    /// prefix as `max(lease.json epoch, max footer epoch) + 1` (never 0) and
+    /// stamped as a constant `writer_epoch` into every leaseless segment, so a
+    /// straggler from the pre-cutover lease era can never win the overlap
+    /// tie-break and erase acked data. This caches it so the seeding object is
+    /// read once per process per prefix.
+    era_epochs: LockedMap<String, i64>,
+
+    /// Prefixes this process has already run the served-end reconciliation over
+    /// (#290).
+    ///
+    /// Once per prefix per process, not once per tick: the pass costs a forced
+    /// listing plus one conditional watermark GET per sub-stream, which is fine
+    /// as a one-shot after a deploy and wasteful every tick. A restart re-arms
+    /// it, which is the right default — a fresh process is exactly when a prefix
+    /// may have picked up a gap under a binary that did not certify.
+    served_end_reconciled: Arc<Mutex<BTreeSet<String>>>,
+
+    /// Measurement-only trace of which segment objects this pod has recently read
+    /// record bytes from, and over which byte ranges (#117). Not a cache — it
+    /// holds no data and nothing reads through it; it exists to answer the one
+    /// question that decides #117's design: when a segment object is read more
+    /// than once on a pod, is it the *same* range (what a `(prefix, seq, range)`
+    /// block cache would serve) or a *different* one (co-prefix sub-streams
+    /// reading disjoint slices of the same object, which only a whole-object
+    /// cache would serve)?
+    segment_reads: LockedMap<(String, u64), SegmentReadTrace>,
+}
+
+impl PrefixCaches {
+    /// The footer index, under its lock.
+    ///
+    /// A guard rather than a closure: nearly every reader of this map decides
+    /// something and returns out of the middle of the decision, and rewriting
+    /// those into closures would be a rewrite of the fetch and compaction paths
+    /// for no gain. What the group owns is the map's *existence* — nothing
+    /// outside this module can hold a second handle on it, and the occupancy
+    /// gauge is derived here.
+    pub(super) fn index(&self) -> Result<MutexGuard<'_, BTreeMap<String, PrefixIndex>>> {
+        self.index.guard()
+    }
+
+    /// The footer index if its lock is not poisoned, for the paths that degrade
+    /// (a metric, a best-effort prune) rather than fail.
+    pub(super) fn try_index(&self) -> Option<MutexGuard<'_, BTreeMap<String, PrefixIndex>>> {
+        self.index.try_guard()
+    }
+
+    /// The quarantine skip list, under its lock.
+    pub(super) fn quarantined(&self) -> Result<MutexGuard<'_, BTreeMap<String, BTreeSet<u64>>>> {
+        self.quarantined.guard()
+    }
+
+    /// The seam memo, under its lock.
+    pub(super) fn seams(&self) -> Result<MutexGuard<'_, BTreeMap<String, BTreeSet<u64>>>> {
+        self.seams.guard()
+    }
+
+    /// The retired-prefix marker cache, under its lock.
+    pub(super) fn retired(&self) -> Result<MutexGuard<'_, RetiredPrefixCache>> {
+        self.retired.lock().map_err(Into::into)
+    }
+
+    /// The segment-read traces, if the lock is not poisoned. Measurement only, so
+    /// a poisoned lock degrades the numbers and never the read.
+    pub(super) fn traces(
+        &self,
+    ) -> Option<MutexGuard<'_, BTreeMap<(String, u64), SegmentReadTrace>>> {
+        self.segment_reads.try_guard()
+    }
+
+    /// The compaction lease term this process holds for `prefix`, if any.
+    pub(super) fn held_lease(&self, prefix: &str) -> Result<Option<HeldLease>> {
+        self.leases.read(|leases| leases.get(prefix).cloned())
+    }
+
+    /// Record an acquired or renewed compaction lease term.
+    pub(super) fn hold_lease(&self, prefix: &str, held: HeldLease) {
+        self.leases.evict(|leases| {
+            _ = leases.insert(prefix.to_owned(), held);
+        });
+    }
+
+    /// Forget a lease term this process has been fenced out of.
+    pub(super) fn drop_lease(&self, prefix: &str) {
+        self.leases.evict(|leases| {
+            _ = leases.remove(prefix);
+        });
+    }
+
+    /// The seams recorded for `prefix` (#399), snapshotted so the caller's walk
+    /// does not hold the lock.
+    pub(super) fn seams_of(&self, prefix: &str) -> Result<BTreeSet<u64>> {
+        self.seams
+            .read(|seams| seams.get(prefix).cloned().unwrap_or_default())
+    }
+
+    /// The quarantined sequences for `prefix` (#398), snapshotted for the same
+    /// reason [`Self::seams_of`] is.
+    pub(super) fn quarantined_of(&self, prefix: &str) -> Result<BTreeSet<u64>> {
+        self.quarantined
+            .read(|quarantined| quarantined.get(prefix).cloned().unwrap_or_default())
+    }
+
+    /// The cached next segment sequence for `prefix`, if known to this process.
+    pub(super) fn seq(&self, prefix: &str) -> Result<Option<u64>> {
+        self.segment_seqs.read(|seqs| seqs.get(prefix).copied())
+    }
+
+    /// Advance the cached next-segment-sequence hint. Monotonic, like the
+    /// next-offset hint: a sequence is never reused (#77).
+    pub(super) fn set_seq(&self, prefix: &str, next: u64) -> Result<()> {
+        self.segment_seqs.write(|seqs| {
+            let entry = seqs.entry(prefix.to_owned()).or_default();
+            *entry = (*entry).max(next);
+        })
+    }
+
+    /// The cached leaseless era epoch for `prefix` (#92).
+    pub(super) fn era(&self, prefix: &str) -> Result<Option<i64>> {
+        self.era_epochs.read(|eras| eras.get(prefix).copied())
+    }
+
+    /// Cache a resolved era epoch (monotonic, like the other hints — the durable
+    /// object is immutable, so the value can only ever be the same one).
+    pub(super) fn cache_era(&self, prefix: &str, era: i64) -> Result<()> {
+        self.era_epochs.write(|eras| {
+            let entry = eras.entry(prefix.to_owned()).or_default();
+            *entry = (*entry).max(era);
+        })
+    }
+
+    /// The per-prefix oldest-retained hint (#61/#544).
+    pub(super) fn oldest_retained(&self, prefix: &str) -> Result<Option<i64>> {
+        self.oldest_retained
+            .read(|oldest| oldest.get(prefix).copied())
+    }
+
+    /// Update the per-prefix oldest-retained hint after a segment scan (#61).
+    pub(super) fn record_oldest_retained(
+        &self,
+        prefix: &str,
+        oldest_ms: Option<i64>,
+    ) -> Result<()> {
+        self.oldest_retained.write(|oldest| match oldest_ms {
+            Some(ms) => {
+                _ = oldest.insert(prefix.to_owned(), ms);
+            }
+            None => {
+                _ = oldest.remove(prefix);
+            }
+        })
+    }
+
+    /// Whether this process has already reconciled `prefix`'s served ends (#290).
+    pub(super) fn served_end_reconciled(&self, prefix: &str) -> Result<bool> {
+        self.served_end_reconciled
+            .lock()
+            .map(|reconciled| reconciled.contains(prefix))
+            .map_err(Into::into)
+    }
+
+    /// Mark `prefix` reconciled. Called *before* the work, not after: a prefix
+    /// whose reconciliation fails must not retry every tick for the life of the
+    /// process, and the next restart re-arms it.
+    pub(super) fn mark_served_end_reconciled(&self, prefix: &str) -> Result<()> {
+        self.served_end_reconciled
+            .lock()
+            .map(|mut reconciled| {
+                _ = reconciled.insert(prefix.to_owned());
+            })
+            .map_err(Into::into)
+    }
+
+    /// Drop `prefix`'s retired marker from the etag-delta cache once the durable
+    /// marker object is gone (#532).
+    ///
+    /// This is the *only* whole-key eviction this group has, and it is one map
+    /// wide on purpose. The rest are not evicted per prefix at all — see this
+    /// type's bound: the caller here has proved the marker object is deleted,
+    /// which is not the same as proving the prefix is dead. "Drained" is judged
+    /// from an index entry holding no segments, and the comment on that judgement
+    /// says why it is deliberately a lower bound: a live topic can still be routed
+    /// to the prefix and supply its own threshold. Widening this to
+    /// `segment_seqs` would drop the next-sequence hint of a prefix that topic is
+    /// producing to.
+    pub(super) fn forget_retired_marker(&self, prefix: &str) {
+        if let Ok(mut cached) = self.retired.lock() {
+            _ = cached.remove(prefix);
+        }
+    }
+
+    /// Record what each map holds (#554), so the resident-memory investigations
+    /// (#476, #543) can attribute a prefix-keyed map by name instead of inferring
+    /// it from RSS.
+    ///
+    /// The compaction leases are deliberately absent: a lease this process holds
+    /// is not a cache, it is a claim, and `tansu_maintenance_prefixes` already
+    /// reports the claim rate.
+    pub(super) fn record_occupancy(&self) {
+        for (cache, entries) in [
+            ("prefix_index", self.index.len()),
+            ("segment_seqs", self.segment_seqs.len()),
+            ("oldest_retained_prefix", self.oldest_retained.len()),
+            (
+                "retired_prefixes",
+                self.retired.lock().map_or(0, |cached| cached.len()),
+            ),
+            ("quarantined_segments", self.quarantined.len()),
+            ("compact_seams", self.seams.len()),
+            ("era_epochs", self.era_epochs.len()),
+            (
+                "served_end_reconciled",
+                self.served_end_reconciled
+                    .lock()
+                    .map_or(0, |reconciled| reconciled.len()),
+            ),
+            ("segment_reads", self.segment_reads.len()),
+        ] {
+            CACHE_ENTRIES.record(entries as u64, &[KeyValue::new("cache", cache)]);
+        }
+    }
+}
+
+/// The two per-prefix single-flight locks, which are not caches: they hold no
+/// value and nothing is ever served from them (#554). Typed as what they are so
+/// that a sweep written for the caches cannot be pointed at them by mistake —
+/// dropping a live flush lock is how two writers end up assigning the same
+/// offsets.
+#[derive(Clone, Debug, Default)]
+pub(super) struct PrefixLocks {
+    /// Per-prefix async flush lock: serializes `flush_prefix_coalesced` for a
+    /// given prefix so a window's `cached_high` read -> segment PUT -> `set_high`
+    /// is atomic. Without it two overlapping flushes (a threshold flush and a
+    /// linger-timer flush) could both read the same base offset before either
+    /// advanced the hint, writing two segments at the same offsets. The segment
+    /// `Create` only guards the *sequence* name, not offsets, so this lock — not
+    /// the create-race — is the per-prefix offset authority.
+    flush: LockedMap<String, Arc<tokio::sync::Mutex<()>>>,
+
+    /// Per-prefix single-flight for the stale-index refresh and the certified
+    /// seq-floor sync. A wide ListOffsets resolves its partitions concurrently
+    /// (32-way), so without this every stale same-prefix partition in flight
+    /// would issue its own duplicate `segments/` LIST and `seq-floor.json` GET —
+    /// re-inflating the per-prefix amortized cost back toward per-partition.
+    /// Losers of the race re-check under the lock and are served by the winner's
+    /// work. Fresh (TTL-served) reads never touch this lock.
+    read_sync: LockedMap<String, Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl PrefixLocks {
+    /// The flush serialization lock for `prefix`, creating it on first use.
+    pub(super) fn flush(&self, prefix: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
+        self.flush
+            .write(|locks| locks.entry(prefix.to_owned()).or_default().clone())
+    }
+
+    /// The refresh single-flight lock for `prefix`, creating it on first use.
+    pub(super) fn read_sync(&self, prefix: &str) -> Result<Arc<tokio::sync::Mutex<()>>> {
+        self.read_sync
+            .write(|locks| locks.entry(prefix.to_owned()).or_default().clone())
+    }
 }

@@ -1024,8 +1024,8 @@ async fn coalesced_stale_hint_list_offsets_is_per_prefix_not_per_partition() -> 
         let past = SystemTime::now() - Duration::from_secs(60);
         storage.topics.age_hints(past);
         for entry in storage
-            .prefix_index
-            .lock()
+            .prefixes
+            .index()
             .expect("prefix_index lock")
             .values_mut()
         {
@@ -1137,8 +1137,8 @@ async fn coalesced_latest_survives_peer_expiry_via_floor_certification() -> Resu
         let past = SystemTime::now() - Duration::from_secs(60);
         storage.topics.age_hints(past);
         for entry in storage
-            .prefix_index
-            .lock()
+            .prefixes
+            .index()
             .expect("prefix_index lock")
             .values_mut()
         {
@@ -1244,8 +1244,8 @@ async fn segmentless_substream_stale_hint_latest_costs_no_per_partition_get() ->
         let past = SystemTime::now() - Duration::from_secs(60);
         storage.topics.age_hints(past);
         for entry in storage
-            .prefix_index
-            .lock()
+            .prefixes
+            .index()
             .expect("prefix_index lock")
             .values_mut()
         {

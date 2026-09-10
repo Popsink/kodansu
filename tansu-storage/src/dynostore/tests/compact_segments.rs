@@ -988,7 +988,7 @@ async fn compaction_prunes_a_vanished_segment_instead_of_failing() -> Result<(),
     _ = store.compact_prefix_per_key(topic).await?;
 
     let seq = {
-        let index = store.prefix_index.lock().expect("poison");
+        let index = store.prefixes.index().expect("poison");
         *index
             .get(topic)
             .expect("the prefix is indexed")
@@ -1010,7 +1010,7 @@ async fn compaction_prunes_a_vanished_segment_instead_of_failing() -> Result<(),
         .inspect_err(|err| panic!("a vanished segment must not fail the pass: {err:?}"))?;
 
     let pruned = {
-        let index = store.prefix_index.lock().expect("poison");
+        let index = store.prefixes.index().expect("poison");
         index
             .get(topic)
             .is_none_or(|entry| !entry.segments.contains_key(&seq))
