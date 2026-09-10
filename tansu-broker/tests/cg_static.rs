@@ -34,7 +34,7 @@ where
 {
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
-    let mut controller = Controller::with_storage(sc)?;
+    let mut controller = Controller::with_storage(sc)?.with_now(common::paused_clock);
 
     let session_timeout_ms = 45_000;
     let rebalance_timeout_ms = Some(300_000);
@@ -201,8 +201,7 @@ mod in_memory {
         .await
     }
 
-    #[ignore]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn join_with_empty_member_id() -> Result<()> {
         let _guard = common::init_tracing()?;
 
@@ -217,8 +216,7 @@ mod in_memory {
         .await
     }
 
-    #[ignore]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn rejoin_with_empty_member_id() -> Result<()> {
         let _guard = common::init_tracing()?;
 

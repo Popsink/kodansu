@@ -224,12 +224,15 @@ fmt:
 # Never raise it to turn a red build green.
 #
 # The ratio is non-doc over (non-doc + code), so **deleting code raises it**.
-# That is not a corner case: #549 deleted 2341 lines of comment-free unrun bin
-# from `tansu-sans-io/src/bin/` and moved the real number 2.80887531% ->
-# 2.86782372% with the numerator untouched at 3199. A deletion that trips this
-# gate is the gate working off a smaller tree, not narration anyone wrote, and
-# the honest response is to re-ratchet at the new measured value — which is what
-# 2.8679 is. Check the numerator before assuming otherwise.
+# That is not a corner case, it is the common one: it has now happened twice in
+# a row with the numerator untouched at 3199. #549 deleted 2341 lines of
+# comment-free unrun bin from `tansu-sans-io/src/bin/` and moved the real number
+# 2.80887531% -> 2.86782372%; #552 then deleted 1989 lines of test body that had
+# been `#[ignore]`d since the SQL backends left, and moved it again to
+# 2.91581595%. A deletion that trips this gate is the gate working off a smaller
+# tree, not narration anyone wrote, and the honest response is to re-ratchet at
+# the new measured value — which is what 2.9159 is. Check the numerator before
+# assuming otherwise: twice now it has not moved at all.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -240,7 +243,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.8679" top="12":
+comments ceiling="2.9159" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
