@@ -43,12 +43,13 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    AclBinding, AclFilter, Acls, AssignmentDoc, AssignmentOutcome, BrokerRegistrationRequest,
-    CommittedOffset, Error, GenerationDoc, GroupDetailResponse, ListOffsetResponse, MemberDoc,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    QuotaAlteration, QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas, Result,
-    ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, UpdateError, Version,
+    AclBinding, AclFilter, Acls, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
+    BrokerRegistrationRequest, CommittedOffset, DEFAULT_FETCH_MAX_BYTES, Error, GenerationDoc,
+    GroupDetailResponse, ListOffsetResponse, MemberDoc, MetadataResponse, NamedGroupDetail,
+    OffsetCommitRequest, OffsetStage, ProducerIdResponse, QuotaAlteration, QuotaEntity,
+    QuotaFilterComponent, QuotaLimits, Quotas, Result, ScramCredential, Storage, TopicId, Topition,
+    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
+    Version,
 };
 
 /// A stored document with the version identifying it, as the object store
@@ -207,6 +208,26 @@ impl Storage for Engine {
     #[instrument(skip_all)]
     async fn offset_stage(&self, _topition: &Topition) -> Result<OffsetStage> {
         Ok(OffsetStage::default())
+    }
+
+    /// The three below are stated rather than inherited: #551 removed their
+    /// trait defaults, because a default is a method a wrapper can forget
+    /// without the compiler noticing (#273). The engine that stores nothing
+    /// takes the same answers the defaults gave, and now says so.
+    fn auto_create_topic_config(&self) -> AutoTopicCreate {
+        AutoTopicCreate::default()
+    }
+
+    fn fetch_max_bytes(&self) -> u32 {
+        DEFAULT_FETCH_MAX_BYTES
+    }
+
+    async fn offset_stage_at(
+        &self,
+        topition: &Topition,
+        _isolation: IsolationLevel,
+    ) -> Result<OffsetStage> {
+        self.offset_stage(topition).await
     }
 
     #[instrument(skip_all)]

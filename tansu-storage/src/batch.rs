@@ -46,6 +46,7 @@ use tracing::{debug, instrument, warn};
 use url::Url;
 use uuid::Uuid;
 
+use crate::delegate::storage_methods;
 use crate::{
     AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
     BrokerRegistrationRequest, CommittedOffset, Error, GenerationDoc, ListOffsetResponse, METER,
@@ -293,60 +294,31 @@ where
     }
 }
 
-#[async_trait]
-impl<G> Storage for ProduceRequestBatcher<G>
+/// The batching produce, and the reason it is an inherent method.
+///
+/// `#[instrument]` cannot be generated — a `macro_rules!` does not expand into
+/// attribute position — so the `produce` generated below forwards here and the
+/// span sits on this frame (#551).
+impl<G> ProduceRequestBatcher<G>
 where
     G: Storage + Clone,
 {
-    async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()> {
-        self.storage.register_broker(broker_registration).await
-    }
-
-    async fn create_topic(&self, topic: CreatableTopic, validate_only: bool) -> Result<Uuid> {
-        self.storage.create_topic(topic, validate_only).await
-    }
-
-    async fn incremental_alter_resource(
-        &self,
-        resource: AlterConfigsResource,
-    ) -> Result<AlterConfigsResourceResponse> {
-        self.storage.incremental_alter_resource(resource).await
-    }
-
-    async fn delete_records(
-        &self,
-        topics: &[DeleteRecordsTopic],
-    ) -> Result<Vec<DeleteRecordsTopicResult>> {
-        self.storage.delete_records(topics).await
-    }
-
-    async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
-        self.storage.delete_topic(topic).await
-    }
-
-    async fn brokers(&self) -> Result<Vec<DescribeClusterBroker>> {
-        self.storage.brokers().await
-    }
-
     #[instrument(skip_all, fields(transaction_id, topic = topition.topic, partition = topition.partition))]
-    async fn produce(
+    async fn batched_produce(
         &self,
         transaction_id: Option<&str>,
         topition: &Topition,
-        deflated: deflated::Batch,
+        batch: deflated::Batch,
     ) -> Result<i64> {
         let Some(maximum_delay) = self.maximum_delay else {
-            return self
-                .storage
-                .produce(transaction_id, topition, deflated)
-                .await;
+            return self.storage.produce(transaction_id, topition, batch).await;
         };
 
         let start = SystemTime::now();
 
         let attributes = [KeyValue::new("topic", topition.topic.clone())];
 
-        let producer_id = deflated.producer_id;
+        let producer_id = batch.producer_id;
 
         let topition_producer_id = TopitionProducerId {
             topition: topition.to_owned(),
@@ -360,7 +332,7 @@ where
 
             queue.push(BatchRequest {
                 id: ticket.id,
-                batch: deflated,
+                batch,
             });
 
             PRODUCE_REQUEST_QUEUED_COUNTER.add(1, &attributes);
@@ -431,362 +403,53 @@ where
             }
         }
     }
-
-    async fn fetch(
-        &self,
-        topition: &'_ Topition,
-        offset: i64,
-        min_bytes: u32,
-        max_bytes: u32,
-        isolation: IsolationLevel,
-        max_wait: Duration,
-    ) -> Result<Vec<deflated::Batch>> {
-        self.storage
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
-            .await
-    }
-
-    async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
-        self.storage.offset_stage(topition).await
-    }
-
-    /// Delegated explicitly (#273). This has a default body on `Storage`, and
-    /// this wrapper is applied **unconditionally** in the `s3` and `gs` builder
-    /// arms — so the default silently absorbed it in every object-store
-    /// deployment: `offset_stage_at` fell back to `offset_stage` and its
-    /// `meta.json` read, defeating #109. It shipped and it never ran. The
-    /// legacy `read_group` was the other half of that, and went with the object
-    /// it read (#359).
-    ///
-    /// The `memory://` arm is not wrapped, which is why the suite could not see
-    /// it: in-memory tests exercised the optimised paths that production never
-    /// reached.
-    async fn offset_stage_at(
-        &self,
-        topition: &Topition,
-        isolation: IsolationLevel,
-    ) -> Result<OffsetStage> {
-        self.storage.offset_stage_at(topition, isolation).await
-    }
-
-    async fn write_group_member(
-        &self,
-        group_id: &str,
-        member_id: &str,
-        member: MemberDoc,
-        version: Option<Version>,
-    ) -> Result<Version, UpdateError<MemberDoc>> {
-        self.storage
-            .write_group_member(group_id, member_id, member, version)
-            .await
-    }
-
-    async fn read_group_member(
-        &self,
-        group_id: &str,
-        member_id: &str,
-    ) -> Result<Option<(MemberDoc, Version)>> {
-        self.storage.read_group_member(group_id, member_id).await
-    }
-
-    async fn delete_group_member(&self, group_id: &str, member_id: &str) -> Result<()> {
-        self.storage.delete_group_member(group_id, member_id).await
-    }
-
-    async fn list_group_members(
-        &self,
-        group_id: &str,
-    ) -> Result<BTreeMap<String, (MemberDoc, Version)>> {
-        self.storage.list_group_members(group_id).await
-    }
-
-    async fn list_group_member_stamps(&self, group_id: &str) -> Result<BTreeMap<String, i64>> {
-        self.storage.list_group_member_stamps(group_id).await
-    }
-
-    async fn create_acls(&self, bindings: &[AclBinding]) -> Result<Vec<ErrorCode>> {
-        self.storage.create_acls(bindings).await
-    }
-
-    async fn describe_acls(&self, filter: &AclFilter) -> Result<Vec<AclBinding>> {
-        self.storage.describe_acls(filter).await
-    }
-
-    async fn delete_acls(&self, filters: &[AclFilter]) -> Result<Vec<Vec<AclBinding>>> {
-        self.storage.delete_acls(filters).await
-    }
-
-    async fn assert_group_schema(&self) -> Result<()> {
-        self.storage.assert_group_schema().await
-    }
-
-    async fn read_group_generation(
-        &self,
-        group_id: &str,
-    ) -> Result<Option<(GenerationDoc, Version)>> {
-        self.storage.read_group_generation(group_id).await
-    }
-
-    async fn update_group_generation(
-        &self,
-        group_id: &str,
-        generation: GenerationDoc,
-        version: Option<Version>,
-    ) -> Result<Version, UpdateError<GenerationDoc>> {
-        self.storage
-            .update_group_generation(group_id, generation, version)
-            .await
-    }
-
-    async fn create_group_assignment(
-        &self,
-        group_id: &str,
-        generation_id: i32,
-        assignment: AssignmentDoc,
-    ) -> Result<AssignmentOutcome> {
-        self.storage
-            .create_group_assignment(group_id, generation_id, assignment)
-            .await
-    }
-
-    async fn read_group_assignment(
-        &self,
-        group_id: &str,
-        generation_id: i32,
-    ) -> Result<Option<AssignmentDoc>> {
-        self.storage
-            .read_group_assignment(group_id, generation_id)
-            .await
-    }
-
-    async fn delete_group_assignments_before(
-        &self,
-        group_id: &str,
-        generation_id: i32,
-    ) -> Result<u64> {
-        self.storage
-            .delete_group_assignments_before(group_id, generation_id)
-            .await
-    }
-
-    async fn list_offsets(
-        &self,
-        isolation_level: IsolationLevel,
-        offsets: &[(Topition, ListOffset)],
-    ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
-        self.storage.list_offsets(isolation_level, offsets).await
-    }
-
-    async fn offset_commit(
-        &self,
-        group_id: &str,
-        retention_time_ms: Option<Duration>,
-        offsets: &[(Topition, OffsetCommitRequest)],
-    ) -> Result<Vec<(Topition, ErrorCode)>> {
-        self.storage
-            .offset_commit(group_id, retention_time_ms, offsets)
-            .await
-    }
-
-    async fn offset_fetch(
-        &self,
-        group_id: Option<&str>,
-        topics: &[Topition],
-        require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
-        self.storage
-            .offset_fetch(group_id, topics, require_stable)
-            .await
-    }
-
-    async fn committed_offset_topitions(
-        &self,
-        group_id: &str,
-    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
-        self.storage.committed_offset_topitions(group_id).await
-    }
-
-    async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
-        self.storage.metadata(topics).await
-    }
-
-    fn auto_create_topic_config(&self) -> AutoTopicCreate {
-        self.storage.auto_create_topic_config()
-    }
-
-    fn fetch_max_bytes(&self) -> u32 {
-        self.storage.fetch_max_bytes()
-    }
-
-    async fn upsert_user_scram_credential(
-        &self,
-        user: &str,
-        mechanism: ScramMechanism,
-        credential: ScramCredential,
-    ) -> Result<()> {
-        self.storage
-            .upsert_user_scram_credential(user, mechanism, credential)
-            .await
-    }
-
-    async fn delete_user_scram_credential(
-        &self,
-        user: &str,
-        mechanism: ScramMechanism,
-    ) -> Result<()> {
-        self.storage
-            .delete_user_scram_credential(user, mechanism)
-            .await
-    }
-
-    async fn user_scram_credential(
-        &self,
-        user: &str,
-        mechanism: ScramMechanism,
-    ) -> Result<Option<ScramCredential>> {
-        self.storage.user_scram_credential(user, mechanism).await
-    }
-
-    async fn describe_config(
-        &self,
-        name: &str,
-        resource: ConfigResource,
-        keys: Option<&[String]>,
-    ) -> Result<DescribeConfigsResult> {
-        self.storage.describe_config(name, resource, keys).await
-    }
-
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-        self.storage.list_groups(states_filter).await
-    }
-
-    async fn delete_groups(
-        &self,
-        group_ids: Option<&[String]>,
-    ) -> Result<Vec<DeletableGroupResult>> {
-        self.storage.delete_groups(group_ids).await
-    }
-
-    async fn describe_groups(
-        &self,
-        group_ids: Option<&[String]>,
-        include_authorized_operations: bool,
-    ) -> Result<Vec<NamedGroupDetail>> {
-        self.storage
-            .describe_groups(group_ids, include_authorized_operations)
-            .await
-    }
-
-    async fn describe_topic_partitions(
-        &self,
-        topics: Option<&[TopicId]>,
-        partition_limit: i32,
-        cursor: Option<Topition>,
-    ) -> Result<Vec<DescribeTopicPartitionsResponseTopic>> {
-        self.storage
-            .describe_topic_partitions(topics, partition_limit, cursor)
-            .await
-    }
-
-    async fn init_producer(
-        &self,
-        transaction_id: Option<&str>,
-        transaction_timeout_ms: i32,
-        producer_id: Option<i64>,
-        producer_epoch: Option<i16>,
-    ) -> Result<ProducerIdResponse> {
-        self.storage
-            .init_producer(
-                transaction_id,
-                transaction_timeout_ms,
-                producer_id,
-                producer_epoch,
-            )
-            .await
-    }
-
-    async fn txn_add_offsets(
-        &self,
-        transaction_id: &str,
-        producer_id: i64,
-        producer_epoch: i16,
-        group_id: &str,
-    ) -> Result<ErrorCode> {
-        self.storage
-            .txn_add_offsets(transaction_id, producer_id, producer_epoch, group_id)
-            .await
-    }
-
-    async fn txn_add_partitions(
-        &self,
-        partitions: TxnAddPartitionsRequest,
-    ) -> Result<TxnAddPartitionsResponse> {
-        self.storage.txn_add_partitions(partitions).await
-    }
-
-    async fn txn_offset_commit(
-        &self,
-        offsets: TxnOffsetCommitRequest,
-    ) -> Result<Vec<TxnOffsetCommitResponseTopic>> {
-        self.storage.txn_offset_commit(offsets).await
-    }
-
-    async fn txn_end(
-        &self,
-        transaction_id: &str,
-        producer_id: i64,
-        producer_epoch: i16,
-        committed: bool,
-    ) -> Result<ErrorCode> {
-        self.storage
-            .txn_end(transaction_id, producer_id, producer_epoch, committed)
-            .await
-    }
-
-    async fn maintain(&self, now: SystemTime) -> Result<()> {
-        self.storage.maintain(now).await
-    }
-
-    async fn cluster_id(&self) -> Result<String> {
-        self.storage.cluster_id().await
-    }
-
-    async fn node(&self) -> Result<i32> {
-        self.storage.node().await
-    }
-
-    async fn advertised_listener(&self) -> Result<Url> {
-        self.storage.advertised_listener().await
-    }
-
-    async fn alter_client_quotas(
-        &self,
-        alterations: &[QuotaAlteration],
-        validate_only: bool,
-    ) -> Result<Vec<ErrorCode>> {
-        self.storage
-            .alter_client_quotas(alterations, validate_only)
-            .await
-    }
-
-    async fn describe_client_quotas(
-        &self,
-        components: &[QuotaFilterComponent],
-        strict: bool,
-    ) -> Result<Vec<(QuotaEntity, QuotaLimits)>> {
-        self.storage
-            .describe_client_quotas(components, strict)
-            .await
-    }
-
-    async fn client_quotas(&self) -> Result<Quotas> {
-        self.storage.client_quotas().await
-    }
-
-    async fn ping(&self) -> Result<()> {
-        self.storage.ping().await
-    }
 }
+
+/// One body per method: `produce` batches, the other fifty-one forward.
+///
+/// Invoked in expression position, which `#[async_trait]` can see through —
+/// an item-position call inside the `impl` would still be unexpanded when
+/// `async_trait` rewrites it (#551).
+macro_rules! batcher_body {
+    ($s:ident, produce, ($($arg:ident),*)) => {{
+        $s.batched_produce($($arg),*).await
+    }};
+
+    ($s:ident, $name:ident, ($($arg:ident),*)) => {{
+        $s.storage.$name($($arg),*).await
+    }};
+}
+
+/// `Storage` for the produce batcher, generated from
+/// [`storage_methods`](crate::delegate::storage_methods).
+///
+/// Fifty-one of the fifty-two are `self.storage.m(args).await`, written out by
+/// hand until #551.
+macro_rules! batcher_delegation {
+    (
+        $(fn $name:ident(&$s:ident $(, $arg:ident : $ty:ty)* $(,)?) -> $ret:ty;)*
+        $(sync fn $sname:ident(&$ss:ident $(, $sarg:ident : $sty:ty)* $(,)?) -> $sret:ty;)*
+    ) => {
+        #[async_trait]
+        impl<G> Storage for ProduceRequestBatcher<G>
+        where
+            G: Storage + Clone,
+        {
+            $(
+                async fn $name(&$s $(, $arg: $ty)*) -> $ret {
+                    batcher_body!($s, $name, ($($arg),*))
+                }
+            )*
+            $(
+                fn $sname(&$ss $(, $sarg: $sty)*) -> $sret {
+                    $ss.storage.$sname($($sarg),*)
+                }
+            )*
+        }
+    };
+}
+
+storage_methods!(batcher_delegation);
 
 #[instrument(skip_all)]
 fn combine(batches: Vec<deflated::Batch>) -> Result<Option<deflated::Batch>> {
@@ -884,349 +547,53 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl Storage for FlightRecorder {
-        async fn register_broker(
-            &self,
-            _broker_registration: BrokerRegistrationRequest,
-        ) -> Result<()> {
-            unimplemented!()
-        }
-
-        async fn brokers(&self) -> Result<Vec<DescribeClusterBroker>> {
-            unimplemented!()
-        }
-
-        async fn create_topic(&self, _topic: CreatableTopic, _validate_only: bool) -> Result<Uuid> {
-            unimplemented!()
-        }
-
-        async fn delete_records(
-            &self,
-            _topics: &[DeleteRecordsTopic],
-        ) -> Result<Vec<DeleteRecordsTopicResult>> {
-            unimplemented!()
-        }
-
-        async fn delete_topic(&self, _topic: &TopicId) -> Result<ErrorCode> {
-            unimplemented!()
-        }
-
-        async fn incremental_alter_resource(
-            &self,
-            _resource: AlterConfigsResource,
-        ) -> Result<AlterConfigsResourceResponse> {
-            unimplemented!()
-        }
-
-        async fn produce(
-            &self,
-            _transaction_id: Option<&str>,
-            topition: &Topition,
-            deflated: deflated::Batch,
-        ) -> Result<i64> {
-            self.produced
+    /// A stub: `produce` records, everything else is unreachable in these
+    /// tests and says so.
+    ///
+    /// 346 lines of `unimplemented!()` until #551. `unused_variables` is
+    /// allowed for the whole impl rather than `_`-prefixing fifty parameter
+    /// names, because the names come from the shared signature list and the
+    /// list has one reader that does use them.
+    macro_rules! recorder_body {
+        ($s:ident, produce, ($transaction_id:ident, $topition:ident, $batch:ident)) => {{
+            $s.produced
                 .lock()
                 .map(|mut produced| {
                     _ = produced
-                        .entry(topition.to_owned())
+                        .entry($topition.to_owned())
                         .or_default()
-                        .push(deflated);
-
+                        .push($batch);
                     0
                 })
                 .map_err(Into::into)
-        }
+        }};
 
-        async fn fetch(
-            &self,
-            _topition: &Topition,
-            _offset: i64,
-            _min_bytes: u32,
-            _max_bytes: u32,
-            _isolation_level: IsolationLevel,
-            _max_wait: Duration,
-        ) -> Result<Vec<deflated::Batch>> {
-            unimplemented!()
-        }
-
-        async fn offset_stage(&self, _topition: &Topition) -> Result<OffsetStage> {
-            unimplemented!()
-        }
-
-        async fn offset_commit(
-            &self,
-            _group: &str,
-            _retention: Option<Duration>,
-            _offsets: &[(Topition, OffsetCommitRequest)],
-        ) -> Result<Vec<(Topition, ErrorCode)>> {
-            unimplemented!()
-        }
-
-        async fn committed_offset_topitions(
-            &self,
-            _group_id: &str,
-        ) -> Result<BTreeMap<Topition, CommittedOffset>> {
-            unimplemented!()
-        }
-
-        async fn offset_fetch(
-            &self,
-            _group_id: Option<&str>,
-            _topics: &[Topition],
-            _require_stable: Option<bool>,
-        ) -> Result<BTreeMap<Topition, CommittedOffset>> {
-            unimplemented!()
-        }
-
-        async fn list_offsets(
-            &self,
-            _isolation_level: IsolationLevel,
-            _offsets: &[(Topition, ListOffset)],
-        ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
-            unimplemented!()
-        }
-
-        async fn metadata(&self, _topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
-            unimplemented!()
-        }
-
-        async fn describe_config(
-            &self,
-            _name: &str,
-            _resource: ConfigResource,
-            _keys: Option<&[String]>,
-        ) -> Result<DescribeConfigsResult> {
-            unimplemented!()
-        }
-
-        async fn describe_topic_partitions(
-            &self,
-            _topics: Option<&[TopicId]>,
-            _partition_limit: i32,
-            _cursor: Option<Topition>,
-        ) -> Result<Vec<DescribeTopicPartitionsResponseTopic>> {
-            unimplemented!()
-        }
-
-        async fn list_groups(&self, _states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-            unimplemented!()
-        }
-
-        async fn delete_groups(
-            &self,
-            _group_ids: Option<&[String]>,
-        ) -> Result<Vec<DeletableGroupResult>> {
-            unimplemented!()
-        }
-
-        async fn describe_groups(
-            &self,
-            _group_ids: Option<&[String]>,
-            _include_authorized_operations: bool,
-        ) -> Result<Vec<NamedGroupDetail>> {
-            unimplemented!()
-        }
-
-        async fn write_group_member(
-            &self,
-            _group_id: &str,
-            _member_id: &str,
-            _member: MemberDoc,
-            _version: Option<Version>,
-        ) -> Result<Version, UpdateError<MemberDoc>> {
-            unimplemented!()
-        }
-
-        async fn read_group_member(
-            &self,
-            _group_id: &str,
-            _member_id: &str,
-        ) -> Result<Option<(MemberDoc, Version)>> {
-            unimplemented!()
-        }
-
-        async fn delete_group_member(&self, _group_id: &str, _member_id: &str) -> Result<()> {
-            unimplemented!()
-        }
-
-        async fn list_group_members(
-            &self,
-            _group_id: &str,
-        ) -> Result<BTreeMap<String, (MemberDoc, Version)>> {
-            unimplemented!()
-        }
-
-        async fn list_group_member_stamps(&self, _group_id: &str) -> Result<BTreeMap<String, i64>> {
-            unimplemented!()
-        }
-
-        async fn create_acls(&self, _bindings: &[AclBinding]) -> Result<Vec<ErrorCode>> {
-            unimplemented!()
-        }
-
-        async fn describe_acls(&self, _filter: &AclFilter) -> Result<Vec<AclBinding>> {
-            unimplemented!()
-        }
-
-        async fn delete_acls(&self, _filters: &[AclFilter]) -> Result<Vec<Vec<AclBinding>>> {
-            unimplemented!()
-        }
-
-        async fn assert_group_schema(&self) -> Result<()> {
-            unimplemented!()
-        }
-
-        async fn read_group_generation(
-            &self,
-            _group_id: &str,
-        ) -> Result<Option<(GenerationDoc, Version)>> {
-            unimplemented!()
-        }
-
-        async fn update_group_generation(
-            &self,
-            _group_id: &str,
-            _generation: GenerationDoc,
-            _version: Option<Version>,
-        ) -> Result<Version, UpdateError<GenerationDoc>> {
-            unimplemented!()
-        }
-
-        async fn create_group_assignment(
-            &self,
-            _group_id: &str,
-            _generation_id: i32,
-            _assignment: AssignmentDoc,
-        ) -> Result<AssignmentOutcome> {
-            unimplemented!()
-        }
-
-        async fn read_group_assignment(
-            &self,
-            _group_id: &str,
-            _generation_id: i32,
-        ) -> Result<Option<AssignmentDoc>> {
-            unimplemented!()
-        }
-
-        async fn delete_group_assignments_before(
-            &self,
-            _group_id: &str,
-            _generation_id: i32,
-        ) -> Result<u64> {
-            unimplemented!()
-        }
-
-        async fn init_producer(
-            &self,
-            _transaction_id: Option<&str>,
-            _transaction_timeout_ms: i32,
-            _producer_id: Option<i64>,
-            _producer_epoch: Option<i16>,
-        ) -> Result<ProducerIdResponse> {
-            unimplemented!()
-        }
-
-        async fn txn_add_offsets(
-            &self,
-            _transaction_id: &str,
-            _producer_id: i64,
-            _producer_epoch: i16,
-            _group_id: &str,
-        ) -> Result<ErrorCode> {
-            unimplemented!()
-        }
-
-        async fn txn_add_partitions(
-            &self,
-            _partitions: TxnAddPartitionsRequest,
-        ) -> Result<TxnAddPartitionsResponse> {
-            unimplemented!()
-        }
-
-        async fn txn_offset_commit(
-            &self,
-            _offsets: TxnOffsetCommitRequest,
-        ) -> Result<Vec<TxnOffsetCommitResponseTopic>> {
-            unimplemented!()
-        }
-
-        async fn txn_end(
-            &self,
-            _transaction_id: &str,
-            _producer_id: i64,
-            _producer_epoch: i16,
-            _committed: bool,
-        ) -> Result<ErrorCode> {
-            unimplemented!()
-        }
-
-        async fn maintain(&self, _now: SystemTime) -> Result<()> {
-            unimplemented!()
-        }
-
-        async fn cluster_id(&self) -> Result<String> {
-            unimplemented!()
-        }
-
-        async fn node(&self) -> Result<i32> {
-            unimplemented!()
-        }
-
-        async fn advertised_listener(&self) -> Result<Url> {
-            unimplemented!()
-        }
-
-        async fn ping(&self) -> Result<()> {
-            unimplemented!()
-        }
-
-        async fn delete_user_scram_credential(
-            &self,
-            _user: &str,
-            _mechanism: ScramMechanism,
-        ) -> Result<()> {
-            unimplemented!()
-        }
-
-        async fn upsert_user_scram_credential(
-            &self,
-            _user: &str,
-            _mechanism: ScramMechanism,
-            _credential: ScramCredential,
-        ) -> Result<()> {
-            unimplemented!()
-        }
-
-        async fn user_scram_credential(
-            &self,
-            _user: &str,
-            _mechanism: ScramMechanism,
-        ) -> Result<Option<ScramCredential>> {
-            unimplemented!()
-        }
-
-        async fn alter_client_quotas(
-            &self,
-            _alterations: &[QuotaAlteration],
-            _validate_only: bool,
-        ) -> Result<Vec<ErrorCode>> {
-            unimplemented!()
-        }
-
-        async fn describe_client_quotas(
-            &self,
-            _components: &[QuotaFilterComponent],
-            _strict: bool,
-        ) -> Result<Vec<(QuotaEntity, QuotaLimits)>> {
-            unimplemented!()
-        }
-
-        async fn client_quotas(&self) -> Result<Quotas> {
-            unimplemented!()
-        }
+        ($s:ident, $name:ident, ($($arg:ident),*)) => {{ unimplemented!() }};
     }
+
+    macro_rules! recorder_delegation {
+        (
+            $(fn $name:ident(&$s:ident $(, $arg:ident : $ty:ty)* $(,)?) -> $ret:ty;)*
+            $(sync fn $sname:ident(&$ss:ident $(, $sarg:ident : $sty:ty)* $(,)?) -> $sret:ty;)*
+        ) => {
+            #[async_trait]
+            #[allow(unused_variables)]
+            impl Storage for FlightRecorder {
+                $(
+                    async fn $name(&$s $(, $arg: $ty)*) -> $ret {
+                        recorder_body!($s, $name, ($($arg),*))
+                    }
+                )*
+                $(
+                    fn $sname(&$ss $(, $sarg: $sty)*) -> $sret {
+                        unimplemented!()
+                    }
+                )*
+            }
+        };
+    }
+
+    storage_methods!(recorder_delegation);
 
     fn into_batch(
         attributes: i16,

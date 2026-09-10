@@ -46,12 +46,12 @@ use tansu_sans_io::{
 };
 use tansu_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
 use tansu_storage::{
-    AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, BrokerRegistrationRequest,
-    CommittedOffset, GenerationDoc, ListOffsetResponse, MemberDoc, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, QuotaAlteration,
-    QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas, ScramCredential, Storage, TopicId,
-    Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    UpdateError, Version,
+    AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
+    BrokerRegistrationRequest, CommittedOffset, GenerationDoc, ListOffsetResponse, MemberDoc,
+    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
+    QuotaAlteration, QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas, ScramCredential,
+    Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, UpdateError, Version,
 };
 use tracing::{debug, instrument};
 use url::Url;
@@ -844,6 +844,27 @@ impl Storage for Engine {
 
     #[instrument(skip_all)]
     async fn offset_stage(&self, _topition: &Topition) -> tansu_storage::Result<OffsetStage> {
+        unimplemented!()
+    }
+
+    // These three had trait defaults until #551, so this stub inherited them
+    // rather than refusing like every other method it does not serve — the
+    // #273 shape, in a test double. An authentication test reaches none of
+    // them; `unimplemented!()` says so.
+    #[instrument(skip_all)]
+    async fn offset_stage_at(
+        &self,
+        _topition: &Topition,
+        _isolation: IsolationLevel,
+    ) -> tansu_storage::Result<OffsetStage> {
+        unimplemented!()
+    }
+
+    fn auto_create_topic_config(&self) -> AutoTopicCreate {
+        unimplemented!()
+    }
+
+    fn fetch_max_bytes(&self) -> u32 {
         unimplemented!()
     }
 

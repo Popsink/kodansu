@@ -151,8 +151,11 @@ pub use audit::{Audit, AuditReport, Bracket, Gap, PartitionAudit, SegmentFault, 
 
 mod acl;
 mod authorizer;
+
+use crate::delegate::storage_methods;
 mod backend;
 mod batch;
+mod delegate;
 mod enforcer;
 mod group;
 mod latency;
@@ -1498,16 +1501,19 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// fetch hot path off that single hot key — which at consumer-fan-out scale
     /// is both an S3 request ceiling (503 SlowDown) and ~2 extra round-trips per
     /// fetch (#109). Read-committed falls through to the full, transaction-aware
-    /// [`Self::offset_stage`]. The default delegates for backends that do not
-    /// distinguish the two.
+    /// [`Self::offset_stage`].
+    ///
+    /// This had a default body delegating to [`Self::offset_stage`], for
+    /// backends that do not distinguish the two. That default is what made
+    /// #273 possible — two wrappers never stated the method and silently
+    /// inherited it, which left #109 inert in every deployment — so #551
+    /// removed it. A backend that does not distinguish them says so by writing
+    /// the one-line delegation itself.
     async fn offset_stage_at(
         &self,
         topition: &Topition,
         isolation: IsolationLevel,
-    ) -> Result<OffsetStage> {
-        let _ = isolation;
-        self.offset_stage(topition).await
-    }
+    ) -> Result<OffsetStage>;
 
     /// Query the offsets for one or more topic partitions.
     async fn list_offsets(
@@ -1541,19 +1547,21 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// Query broker and topic metadata.
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse>;
 
-    /// The broker's auto-topic-creation policy. Defaults to enabled with a
-    /// single partition and replication factor of one; backends carrying a
-    /// configured value override this.
-    fn auto_create_topic_config(&self) -> AutoTopicCreate {
-        AutoTopicCreate::default()
-    }
+    /// The broker's auto-topic-creation policy.
+    ///
+    /// Had a default of [`AutoTopicCreate::default`] until #551, alongside
+    /// [`Self::fetch_max_bytes`] below. Both are read *through* the wrapper
+    /// stack, so a wrapper that inherits the default answers for a backend
+    /// that was configured otherwise — the #273 shape, and the one place it
+    /// would have cost most, because `fetch_max_bytes` is #547's
+    /// per-deployment clamp. Every wrapper forwarded both by hand and none had
+    /// to; now none can forget.
+    fn auto_create_topic_config(&self) -> AutoTopicCreate;
 
     /// Upper bound on one `Fetch` response; the request's `max_bytes` is
-    /// clamped to it. Defaults to [`DEFAULT_FETCH_MAX_BYTES`]; backends
-    /// carrying a configured value override this.
-    fn fetch_max_bytes(&self) -> u32 {
-        DEFAULT_FETCH_MAX_BYTES
-    }
+    /// clamped to it. A backend with no configured value answers
+    /// [`DEFAULT_FETCH_MAX_BYTES`].
+    fn fetch_max_bytes(&self) -> u32;
 
     async fn upsert_user_scram_credential(
         &self,
@@ -1839,9 +1847,13 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ) -> Result<ErrorCode>;
 
     /// Run periodic maintenance on this storage.
-    async fn maintain(&self, _now: SystemTime) -> Result<()> {
-        Ok(())
-    }
+    ///
+    /// This had a default body of `Ok(())`, for backends with nothing to do
+    /// periodically. Removed with `offset_stage_at`'s and for the same reason
+    /// (#273, #551): a defaulted method is one a wrapper can forget without
+    /// the compiler noticing. A backend with no maintenance writes the
+    /// `Ok(())`.
+    async fn maintain(&self, now: SystemTime) -> Result<()>;
 
     async fn cluster_id(&self) -> Result<String>;
 
@@ -1856,783 +1868,63 @@ pub trait Storage: Debug + Send + Sync + 'static {
 // trait is "object-safe" or not.
 fn _assert_trait_object(_s: &dyn Storage) {}
 
-#[async_trait]
-impl<T> Storage for Arc<T>
-where
-    T: Storage + ?Sized,
-{
-    async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()> {
-        self.as_ref().register_broker(broker_registration).await
-    }
-
-    async fn create_topic(&self, topic: CreatableTopic, validate_only: bool) -> Result<Uuid> {
-        self.as_ref().create_topic(topic, validate_only).await
-    }
-
-    async fn incremental_alter_resource(
-        &self,
-        resource: AlterConfigsResource,
-    ) -> Result<AlterConfigsResourceResponse> {
-        self.as_ref().incremental_alter_resource(resource).await
-    }
-
-    async fn delete_records(
-        &self,
-        topics: &[DeleteRecordsTopic],
-    ) -> Result<Vec<DeleteRecordsTopicResult>> {
-        self.as_ref().delete_records(topics).await
-    }
-
-    async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
-        self.as_ref().delete_topic(topic).await
-    }
-
-    async fn brokers(&self) -> Result<Vec<DescribeClusterBroker>> {
-        self.as_ref().brokers().await
-    }
-
-    async fn produce(
-        &self,
-        transaction_id: Option<&str>,
-        topition: &Topition,
-        batch: deflated::Batch,
-    ) -> Result<i64> {
-        self.as_ref().produce(transaction_id, topition, batch).await
-    }
-
-    async fn fetch(
-        &self,
-        topition: &'_ Topition,
-        offset: i64,
-        min_bytes: u32,
-        max_bytes: u32,
-        isolation: IsolationLevel,
-        max_wait: Duration,
-    ) -> Result<Vec<deflated::Batch>> {
-        self.as_ref()
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
-            .await
-    }
-
-    async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
-        self.as_ref().offset_stage(topition).await
-    }
-
-    async fn offset_stage_at(
-        &self,
-        topition: &Topition,
-        isolation: IsolationLevel,
-    ) -> Result<OffsetStage> {
-        self.as_ref().offset_stage_at(topition, isolation).await
-    }
-
-    async fn list_offsets(
-        &self,
-        isolation_level: IsolationLevel,
-        offsets: &[(Topition, ListOffset)],
-    ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
-        self.as_ref().list_offsets(isolation_level, offsets).await
-    }
-
-    async fn offset_commit(
-        &self,
-        group_id: &str,
-        retention_time_ms: Option<Duration>,
-        offsets: &[(Topition, OffsetCommitRequest)],
-    ) -> Result<Vec<(Topition, ErrorCode)>> {
-        self.as_ref()
-            .offset_commit(group_id, retention_time_ms, offsets)
-            .await
-    }
-
-    async fn offset_fetch(
-        &self,
-        group_id: Option<&str>,
-        topics: &[Topition],
-        require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
-        self.as_ref()
-            .offset_fetch(group_id, topics, require_stable)
-            .await
-    }
-
-    async fn committed_offset_topitions(
-        &self,
-        group_id: &str,
-    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
-        self.as_ref().committed_offset_topitions(group_id).await
-    }
-
-    async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
-        self.as_ref().metadata(topics).await
-    }
-
-    fn auto_create_topic_config(&self) -> AutoTopicCreate {
-        self.as_ref().auto_create_topic_config()
-    }
-
-    fn fetch_max_bytes(&self) -> u32 {
-        self.as_ref().fetch_max_bytes()
-    }
-
-    async fn upsert_user_scram_credential(
-        &self,
-        user: &str,
-        mechanism: ScramMechanism,
-        credential: ScramCredential,
-    ) -> Result<()> {
-        self.as_ref()
-            .upsert_user_scram_credential(user, mechanism, credential)
-            .await
-    }
-
-    async fn delete_user_scram_credential(
-        &self,
-        user: &str,
-        mechanism: ScramMechanism,
-    ) -> Result<()> {
-        self.as_ref()
-            .delete_user_scram_credential(user, mechanism)
-            .await
-    }
-
-    async fn user_scram_credential(
-        &self,
-        user: &str,
-        mechanism: ScramMechanism,
-    ) -> Result<Option<ScramCredential>> {
-        self.as_ref().user_scram_credential(user, mechanism).await
-    }
-
-    async fn describe_config(
-        &self,
-        name: &str,
-        resource: ConfigResource,
-        keys: Option<&[String]>,
-    ) -> Result<DescribeConfigsResult> {
-        self.as_ref().describe_config(name, resource, keys).await
-    }
-
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-        self.as_ref().list_groups(states_filter).await
-    }
-
-    async fn delete_groups(
-        &self,
-        group_ids: Option<&[String]>,
-    ) -> Result<Vec<DeletableGroupResult>> {
-        self.as_ref().delete_groups(group_ids).await
-    }
-
-    async fn describe_groups(
-        &self,
-        group_ids: Option<&[String]>,
-        include_authorized_operations: bool,
-    ) -> Result<Vec<NamedGroupDetail>> {
-        self.as_ref()
-            .describe_groups(group_ids, include_authorized_operations)
-            .await
-    }
-
-    async fn describe_topic_partitions(
-        &self,
-        topics: Option<&[TopicId]>,
-        partition_limit: i32,
-        cursor: Option<Topition>,
-    ) -> Result<Vec<DescribeTopicPartitionsResponseTopic>> {
-        self.as_ref()
-            .describe_topic_partitions(topics, partition_limit, cursor)
-            .await
-    }
-
-    async fn write_group_member(
-        &self,
-        group_id: &str,
-        member_id: &str,
-        member: MemberDoc,
-        version: Option<Version>,
-    ) -> Result<Version, UpdateError<MemberDoc>> {
-        self.as_ref()
-            .write_group_member(group_id, member_id, member, version)
-            .await
-    }
-
-    async fn read_group_member(
-        &self,
-        group_id: &str,
-        member_id: &str,
-    ) -> Result<Option<(MemberDoc, Version)>> {
-        self.as_ref().read_group_member(group_id, member_id).await
-    }
-
-    async fn delete_group_member(&self, group_id: &str, member_id: &str) -> Result<()> {
-        self.as_ref().delete_group_member(group_id, member_id).await
-    }
-
-    async fn list_group_members(
-        &self,
-        group_id: &str,
-    ) -> Result<BTreeMap<String, (MemberDoc, Version)>> {
-        self.as_ref().list_group_members(group_id).await
-    }
-
-    async fn list_group_member_stamps(&self, group_id: &str) -> Result<BTreeMap<String, i64>> {
-        self.as_ref().list_group_member_stamps(group_id).await
-    }
-
-    async fn read_group_generation(
-        &self,
-        group_id: &str,
-    ) -> Result<Option<(GenerationDoc, Version)>> {
-        self.as_ref().read_group_generation(group_id).await
-    }
-
-    async fn update_group_generation(
-        &self,
-        group_id: &str,
-        generation: GenerationDoc,
-        version: Option<Version>,
-    ) -> Result<Version, UpdateError<GenerationDoc>> {
-        self.as_ref()
-            .update_group_generation(group_id, generation, version)
-            .await
-    }
-
-    async fn create_group_assignment(
-        &self,
-        group_id: &str,
-        generation_id: i32,
-        assignment: AssignmentDoc,
-    ) -> Result<AssignmentOutcome> {
-        self.as_ref()
-            .create_group_assignment(group_id, generation_id, assignment)
-            .await
-    }
-
-    async fn read_group_assignment(
-        &self,
-        group_id: &str,
-        generation_id: i32,
-    ) -> Result<Option<AssignmentDoc>> {
-        self.as_ref()
-            .read_group_assignment(group_id, generation_id)
-            .await
-    }
-
-    async fn delete_group_assignments_before(
-        &self,
-        group_id: &str,
-        generation_id: i32,
-    ) -> Result<u64> {
-        self.as_ref()
-            .delete_group_assignments_before(group_id, generation_id)
-            .await
-    }
-
-    async fn create_acls(&self, bindings: &[AclBinding]) -> Result<Vec<ErrorCode>> {
-        self.as_ref().create_acls(bindings).await
-    }
-
-    async fn describe_acls(&self, filter: &AclFilter) -> Result<Vec<AclBinding>> {
-        self.as_ref().describe_acls(filter).await
-    }
-
-    async fn delete_acls(&self, filters: &[AclFilter]) -> Result<Vec<Vec<AclBinding>>> {
-        self.as_ref().delete_acls(filters).await
-    }
-
-    async fn alter_client_quotas(
-        &self,
-        alterations: &[QuotaAlteration],
-        validate_only: bool,
-    ) -> Result<Vec<ErrorCode>> {
-        self.as_ref()
-            .alter_client_quotas(alterations, validate_only)
-            .await
-    }
-
-    async fn describe_client_quotas(
-        &self,
-        components: &[QuotaFilterComponent],
-        strict: bool,
-    ) -> Result<Vec<(QuotaEntity, QuotaLimits)>> {
-        self.as_ref()
-            .describe_client_quotas(components, strict)
-            .await
-    }
-
-    async fn client_quotas(&self) -> Result<Quotas> {
-        self.as_ref().client_quotas().await
-    }
-
-    async fn assert_group_schema(&self) -> Result<()> {
-        self.as_ref().assert_group_schema().await
-    }
-
-    async fn init_producer(
-        &self,
-        transaction_id: Option<&str>,
-        transaction_timeout_ms: i32,
-        producer_id: Option<i64>,
-        producer_epoch: Option<i16>,
-    ) -> Result<ProducerIdResponse> {
-        self.as_ref()
-            .init_producer(
-                transaction_id,
-                transaction_timeout_ms,
-                producer_id,
-                producer_epoch,
-            )
-            .await
-    }
-
-    async fn txn_add_offsets(
-        &self,
-        transaction_id: &str,
-        producer_id: i64,
-        producer_epoch: i16,
-        group_id: &str,
-    ) -> Result<ErrorCode> {
-        self.as_ref()
-            .txn_add_offsets(transaction_id, producer_id, producer_epoch, group_id)
-            .await
-    }
-
-    async fn txn_add_partitions(
-        &self,
-        partitions: TxnAddPartitionsRequest,
-    ) -> Result<TxnAddPartitionsResponse> {
-        self.as_ref().txn_add_partitions(partitions).await
-    }
-
-    async fn txn_offset_commit(
-        &self,
-        offsets: TxnOffsetCommitRequest,
-    ) -> Result<Vec<TxnOffsetCommitResponseTopic>> {
-        self.as_ref().txn_offset_commit(offsets).await
-    }
-
-    async fn txn_end(
-        &self,
-        transaction_id: &str,
-        producer_id: i64,
-        producer_epoch: i16,
-        committed: bool,
-    ) -> Result<ErrorCode> {
-        self.as_ref()
-            .txn_end(transaction_id, producer_id, producer_epoch, committed)
-            .await
-    }
-
-    async fn maintain(&self, now: SystemTime) -> Result<()> {
-        self.as_ref().maintain(now).await
-    }
-
-    async fn cluster_id(&self) -> Result<String> {
-        self.as_ref().cluster_id().await
-    }
-
-    async fn node(&self) -> Result<i32> {
-        self.as_ref().node().await
-    }
-
-    async fn advertised_listener(&self) -> Result<Url> {
-        self.as_ref().advertised_listener().await
-    }
-
-    async fn ping(&self) -> Result<()> {
-        self.as_ref().ping().await
-    }
+/// `Storage` for `Arc<T>` and `Box<T>`, generated from
+/// [`storage_methods`](crate::delegate::storage_methods).
+///
+/// Fifty methods each, every body `self.as_ref().m(args).await`, written out
+/// by hand until #551. The two expanders are separate macros rather than one
+/// parameterised by the type, because `#[async_trait]` has to be attached to a
+/// complete `impl` in a single expansion — see `delegate.rs`.
+macro_rules! arc_delegation {
+    (
+        $(fn $name:ident(&$s:ident $(, $arg:ident : $ty:ty)* $(,)?) -> $ret:ty;)*
+        $(sync fn $sname:ident(&$ss:ident $(, $sarg:ident : $sty:ty)* $(,)?) -> $sret:ty;)*
+    ) => {
+        #[async_trait]
+        impl<T> Storage for Arc<T>
+        where
+            T: Storage + ?Sized,
+        {
+            $(
+                async fn $name(&$s $(, $arg: $ty)*) -> $ret {
+                    $s.as_ref().$name($($arg),*).await
+                }
+            )*
+            $(
+                fn $sname(&$ss $(, $sarg: $sty)*) -> $sret {
+                    $ss.as_ref().$sname($($sarg),*)
+                }
+            )*
+        }
+    };
 }
 
-#[async_trait]
-impl<T> Storage for Box<T>
-where
-    T: Storage + ?Sized,
-{
-    async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()> {
-        self.as_ref().register_broker(broker_registration).await
-    }
-
-    async fn create_topic(&self, topic: CreatableTopic, validate_only: bool) -> Result<Uuid> {
-        self.as_ref().create_topic(topic, validate_only).await
-    }
-
-    async fn incremental_alter_resource(
-        &self,
-        resource: AlterConfigsResource,
-    ) -> Result<AlterConfigsResourceResponse> {
-        self.as_ref().incremental_alter_resource(resource).await
-    }
-
-    async fn delete_records(
-        &self,
-        topics: &[DeleteRecordsTopic],
-    ) -> Result<Vec<DeleteRecordsTopicResult>> {
-        self.as_ref().delete_records(topics).await
-    }
-
-    async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
-        self.as_ref().delete_topic(topic).await
-    }
-
-    async fn brokers(&self) -> Result<Vec<DescribeClusterBroker>> {
-        self.as_ref().brokers().await
-    }
-
-    async fn produce(
-        &self,
-        transaction_id: Option<&str>,
-        topition: &Topition,
-        batch: deflated::Batch,
-    ) -> Result<i64> {
-        self.as_ref().produce(transaction_id, topition, batch).await
-    }
-
-    async fn fetch(
-        &self,
-        topition: &'_ Topition,
-        offset: i64,
-        min_bytes: u32,
-        max_bytes: u32,
-        isolation: IsolationLevel,
-        max_wait: Duration,
-    ) -> Result<Vec<deflated::Batch>> {
-        self.as_ref()
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
-            .await
-    }
-
-    async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
-        self.as_ref().offset_stage(topition).await
-    }
-
-    async fn offset_stage_at(
-        &self,
-        topition: &Topition,
-        isolation: IsolationLevel,
-    ) -> Result<OffsetStage> {
-        self.as_ref().offset_stage_at(topition, isolation).await
-    }
-
-    async fn list_offsets(
-        &self,
-        isolation_level: IsolationLevel,
-        offsets: &[(Topition, ListOffset)],
-    ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
-        self.as_ref().list_offsets(isolation_level, offsets).await
-    }
-
-    async fn offset_commit(
-        &self,
-        group_id: &str,
-        retention_time_ms: Option<Duration>,
-        offsets: &[(Topition, OffsetCommitRequest)],
-    ) -> Result<Vec<(Topition, ErrorCode)>> {
-        self.as_ref()
-            .offset_commit(group_id, retention_time_ms, offsets)
-            .await
-    }
-
-    async fn offset_fetch(
-        &self,
-        group_id: Option<&str>,
-        topics: &[Topition],
-        require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
-        self.as_ref()
-            .offset_fetch(group_id, topics, require_stable)
-            .await
-    }
-
-    async fn committed_offset_topitions(
-        &self,
-        group_id: &str,
-    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
-        self.as_ref().committed_offset_topitions(group_id).await
-    }
-
-    async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
-        self.as_ref().metadata(topics).await
-    }
-
-    fn auto_create_topic_config(&self) -> AutoTopicCreate {
-        self.as_ref().auto_create_topic_config()
-    }
-
-    fn fetch_max_bytes(&self) -> u32 {
-        self.as_ref().fetch_max_bytes()
-    }
-
-    async fn upsert_user_scram_credential(
-        &self,
-        user: &str,
-        mechanism: ScramMechanism,
-        credential: ScramCredential,
-    ) -> Result<()> {
-        self.as_ref()
-            .upsert_user_scram_credential(user, mechanism, credential)
-            .await
-    }
-
-    async fn delete_user_scram_credential(
-        &self,
-        user: &str,
-        mechanism: ScramMechanism,
-    ) -> Result<()> {
-        self.as_ref()
-            .delete_user_scram_credential(user, mechanism)
-            .await
-    }
-
-    async fn user_scram_credential(
-        &self,
-        user: &str,
-        mechanism: ScramMechanism,
-    ) -> Result<Option<ScramCredential>> {
-        self.as_ref().user_scram_credential(user, mechanism).await
-    }
-
-    async fn describe_config(
-        &self,
-        name: &str,
-        resource: ConfigResource,
-        keys: Option<&[String]>,
-    ) -> Result<DescribeConfigsResult> {
-        self.as_ref().describe_config(name, resource, keys).await
-    }
-
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-        self.as_ref().list_groups(states_filter).await
-    }
-
-    async fn delete_groups(
-        &self,
-        group_ids: Option<&[String]>,
-    ) -> Result<Vec<DeletableGroupResult>> {
-        self.as_ref().delete_groups(group_ids).await
-    }
-
-    async fn describe_groups(
-        &self,
-        group_ids: Option<&[String]>,
-        include_authorized_operations: bool,
-    ) -> Result<Vec<NamedGroupDetail>> {
-        self.as_ref()
-            .describe_groups(group_ids, include_authorized_operations)
-            .await
-    }
-
-    async fn describe_topic_partitions(
-        &self,
-        topics: Option<&[TopicId]>,
-        partition_limit: i32,
-        cursor: Option<Topition>,
-    ) -> Result<Vec<DescribeTopicPartitionsResponseTopic>> {
-        self.as_ref()
-            .describe_topic_partitions(topics, partition_limit, cursor)
-            .await
-    }
-
-    async fn write_group_member(
-        &self,
-        group_id: &str,
-        member_id: &str,
-        member: MemberDoc,
-        version: Option<Version>,
-    ) -> Result<Version, UpdateError<MemberDoc>> {
-        self.as_ref()
-            .write_group_member(group_id, member_id, member, version)
-            .await
-    }
-
-    async fn read_group_member(
-        &self,
-        group_id: &str,
-        member_id: &str,
-    ) -> Result<Option<(MemberDoc, Version)>> {
-        self.as_ref().read_group_member(group_id, member_id).await
-    }
-
-    async fn delete_group_member(&self, group_id: &str, member_id: &str) -> Result<()> {
-        self.as_ref().delete_group_member(group_id, member_id).await
-    }
-
-    async fn list_group_members(
-        &self,
-        group_id: &str,
-    ) -> Result<BTreeMap<String, (MemberDoc, Version)>> {
-        self.as_ref().list_group_members(group_id).await
-    }
-
-    async fn list_group_member_stamps(&self, group_id: &str) -> Result<BTreeMap<String, i64>> {
-        self.as_ref().list_group_member_stamps(group_id).await
-    }
-
-    async fn read_group_generation(
-        &self,
-        group_id: &str,
-    ) -> Result<Option<(GenerationDoc, Version)>> {
-        self.as_ref().read_group_generation(group_id).await
-    }
-
-    async fn update_group_generation(
-        &self,
-        group_id: &str,
-        generation: GenerationDoc,
-        version: Option<Version>,
-    ) -> Result<Version, UpdateError<GenerationDoc>> {
-        self.as_ref()
-            .update_group_generation(group_id, generation, version)
-            .await
-    }
-
-    async fn create_group_assignment(
-        &self,
-        group_id: &str,
-        generation_id: i32,
-        assignment: AssignmentDoc,
-    ) -> Result<AssignmentOutcome> {
-        self.as_ref()
-            .create_group_assignment(group_id, generation_id, assignment)
-            .await
-    }
-
-    async fn read_group_assignment(
-        &self,
-        group_id: &str,
-        generation_id: i32,
-    ) -> Result<Option<AssignmentDoc>> {
-        self.as_ref()
-            .read_group_assignment(group_id, generation_id)
-            .await
-    }
-
-    async fn delete_group_assignments_before(
-        &self,
-        group_id: &str,
-        generation_id: i32,
-    ) -> Result<u64> {
-        self.as_ref()
-            .delete_group_assignments_before(group_id, generation_id)
-            .await
-    }
-
-    async fn create_acls(&self, bindings: &[AclBinding]) -> Result<Vec<ErrorCode>> {
-        self.as_ref().create_acls(bindings).await
-    }
-
-    async fn describe_acls(&self, filter: &AclFilter) -> Result<Vec<AclBinding>> {
-        self.as_ref().describe_acls(filter).await
-    }
-
-    async fn delete_acls(&self, filters: &[AclFilter]) -> Result<Vec<Vec<AclBinding>>> {
-        self.as_ref().delete_acls(filters).await
-    }
-
-    async fn alter_client_quotas(
-        &self,
-        alterations: &[QuotaAlteration],
-        validate_only: bool,
-    ) -> Result<Vec<ErrorCode>> {
-        self.as_ref()
-            .alter_client_quotas(alterations, validate_only)
-            .await
-    }
-
-    async fn describe_client_quotas(
-        &self,
-        components: &[QuotaFilterComponent],
-        strict: bool,
-    ) -> Result<Vec<(QuotaEntity, QuotaLimits)>> {
-        self.as_ref()
-            .describe_client_quotas(components, strict)
-            .await
-    }
-
-    async fn client_quotas(&self) -> Result<Quotas> {
-        self.as_ref().client_quotas().await
-    }
-
-    async fn assert_group_schema(&self) -> Result<()> {
-        self.as_ref().assert_group_schema().await
-    }
-
-    async fn init_producer(
-        &self,
-        transaction_id: Option<&str>,
-        transaction_timeout_ms: i32,
-        producer_id: Option<i64>,
-        producer_epoch: Option<i16>,
-    ) -> Result<ProducerIdResponse> {
-        self.as_ref()
-            .init_producer(
-                transaction_id,
-                transaction_timeout_ms,
-                producer_id,
-                producer_epoch,
-            )
-            .await
-    }
-
-    async fn txn_add_offsets(
-        &self,
-        transaction_id: &str,
-        producer_id: i64,
-        producer_epoch: i16,
-        group_id: &str,
-    ) -> Result<ErrorCode> {
-        self.as_ref()
-            .txn_add_offsets(transaction_id, producer_id, producer_epoch, group_id)
-            .await
-    }
-
-    async fn txn_add_partitions(
-        &self,
-        partitions: TxnAddPartitionsRequest,
-    ) -> Result<TxnAddPartitionsResponse> {
-        self.as_ref().txn_add_partitions(partitions).await
-    }
-
-    async fn txn_offset_commit(
-        &self,
-        offsets: TxnOffsetCommitRequest,
-    ) -> Result<Vec<TxnOffsetCommitResponseTopic>> {
-        self.as_ref().txn_offset_commit(offsets).await
-    }
-
-    async fn txn_end(
-        &self,
-        transaction_id: &str,
-        producer_id: i64,
-        producer_epoch: i16,
-        committed: bool,
-    ) -> Result<ErrorCode> {
-        self.as_ref()
-            .txn_end(transaction_id, producer_id, producer_epoch, committed)
-            .await
-    }
-
-    async fn maintain(&self, now: SystemTime) -> Result<()> {
-        self.as_ref().maintain(now).await
-    }
-
-    async fn cluster_id(&self) -> Result<String> {
-        self.as_ref().cluster_id().await
-    }
-
-    async fn node(&self) -> Result<i32> {
-        self.as_ref().node().await
-    }
-
-    async fn advertised_listener(&self) -> Result<Url> {
-        self.as_ref().advertised_listener().await
-    }
-
-    async fn ping(&self) -> Result<()> {
-        self.as_ref().ping().await
-    }
+macro_rules! box_delegation {
+    (
+        $(fn $name:ident(&$s:ident $(, $arg:ident : $ty:ty)* $(,)?) -> $ret:ty;)*
+        $(sync fn $sname:ident(&$ss:ident $(, $sarg:ident : $sty:ty)* $(,)?) -> $sret:ty;)*
+    ) => {
+        #[async_trait]
+        impl<T> Storage for Box<T>
+        where
+            T: Storage + ?Sized,
+        {
+            $(
+                async fn $name(&$s $(, $arg: $ty)*) -> $ret {
+                    $s.as_ref().$name($($arg),*).await
+                }
+            )*
+            $(
+                fn $sname(&$ss $(, $sarg: $sty)*) -> $sret {
+                    $ss.as_ref().$sname($($sarg),*)
+                }
+            )*
+        }
+    };
 }
+
+storage_methods!(arc_delegation);
+storage_methods!(box_delegation);
 
 pub type DynStorage = dyn Storage;
 pub type ArcDynStorage = Arc<DynStorage>;

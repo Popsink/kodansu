@@ -41,6 +41,7 @@ use tracing::{debug, instrument};
 use url::Url;
 use uuid::Uuid;
 
+use crate::delegate::storage_methods;
 use crate::{
     AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
     BrokerRegistrationRequest, CommittedOffset, GenerationDoc, ListOffsetResponse, MemberDoc,
@@ -179,249 +180,94 @@ where
     }
 }
 
-#[async_trait]
-impl<G> Storage for LatencyIntroducingStorage<G>
+/// The one method that carries a span.
+///
+/// `#[instrument]` cannot be generated: a `macro_rules!` does not expand into
+/// attribute position, so the generated `produce` below forwards here and the
+/// span sits on this frame instead (#551).
+impl<G> LatencyIntroducingStorage<G>
 where
     G: Storage + Clone,
 {
-    async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()> {
-        self.introduce_latency().await?;
-
-        self.storage.register_broker(broker_registration).await
-    }
-
-    async fn create_topic(&self, topic: CreatableTopic, validate_only: bool) -> Result<Uuid> {
-        self.introduce_latency().await?;
-
-        self.storage.create_topic(topic, validate_only).await
-    }
-
-    async fn incremental_alter_resource(
-        &self,
-        resource: AlterConfigsResource,
-    ) -> Result<AlterConfigsResourceResponse> {
-        self.introduce_latency().await?;
-
-        self.storage.incremental_alter_resource(resource).await
-    }
-
-    async fn delete_records(
-        &self,
-        topics: &[DeleteRecordsTopic],
-    ) -> Result<Vec<DeleteRecordsTopicResult>> {
-        self.introduce_latency().await?;
-
-        self.storage.delete_records(topics).await
-    }
-
-    async fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode> {
-        self.introduce_latency().await?;
-
-        self.storage.delete_topic(topic).await
-    }
-
-    async fn brokers(&self) -> Result<Vec<DescribeClusterBroker>> {
-        self.introduce_latency().await?;
-
-        self.storage.brokers().await
-    }
-
     #[instrument(skip_all, fields(transaction_id, topic = topition.topic, partition = topition.partition))]
-    async fn produce(
+    async fn traced_produce(
         &self,
         transaction_id: Option<&str>,
         topition: &Topition,
-        deflated: deflated::Batch,
+        batch: deflated::Batch,
     ) -> Result<i64> {
         self.introduce_latency().await?;
 
-        self.storage
-            .produce(transaction_id, topition, deflated)
-            .await
+        self.storage.produce(transaction_id, topition, batch).await
     }
+}
 
-    async fn fetch(
-        &self,
-        topition: &'_ Topition,
-        offset: i64,
-        min_bytes: u32,
-        max_bytes: u32,
-        isolation: IsolationLevel,
-        max_wait: Duration,
-    ) -> Result<Vec<deflated::Batch>> {
-        self.introduce_latency().await?;
+/// One body per method, and the reason this is a second macro: it is invoked
+/// in expression position, which `#[async_trait]` can see through, where an
+/// item-position call inside the `impl` would still be unexpanded when
+/// `async_trait` rewrites it (#551).
+///
+/// `$s` is the `self` token threaded from the signature list, so the receiver
+/// generated below and the `self` used here share a hygiene context.
+macro_rules! latency_body {
+    ($s:ident, produce, ($($arg:ident),*)) => {{
+        $s.traced_produce($($arg),*).await
+    }};
 
-        self.storage
-            .fetch(topition, offset, min_bytes, max_bytes, isolation, max_wait)
-            .await
-    }
+    ($s:ident, write_group_member, ($($arg:ident),*)) => {{
+        $s.introduce_latency().await?;
 
-    async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
-        self.introduce_latency().await?;
+        _ = $s.member_puts.fetch_add(1, Ordering::Relaxed);
 
-        self.storage.offset_stage(topition).await
-    }
+        $s.storage.write_group_member($($arg),*).await
+    }};
 
-    /// Delegated explicitly (#273) — see the note on
-    /// `ProduceRequestBatcher::offset_stage_at`. Absorbing these into the trait
-    /// defaults also meant this wrapper introduced no latency on them, which
-    /// quietly weakened the latency tests that exist to bound the fetch path.
-    async fn offset_stage_at(
-        &self,
-        topition: &Topition,
-        isolation: IsolationLevel,
-    ) -> Result<OffsetStage> {
-        self.introduce_latency().await?;
+    ($s:ident, read_group_member, ($($arg:ident),*)) => {{
+        $s.introduce_latency().await?;
 
-        self.storage.offset_stage_at(topition, isolation).await
-    }
+        _ = $s.member_reads.fetch_add(1, Ordering::Relaxed);
 
-    async fn write_group_member(
-        &self,
-        group_id: &str,
-        member_id: &str,
-        member: MemberDoc,
-        version: Option<Version>,
-    ) -> Result<Version, UpdateError<MemberDoc>> {
-        self.introduce_latency().await?;
+        $s.storage.read_group_member($($arg),*).await
+    }};
 
-        _ = self.member_puts.fetch_add(1, Ordering::Relaxed);
+    ($s:ident, list_group_members, ($($arg:ident),*)) => {{
+        $s.introduce_latency().await?;
 
-        self.storage
-            .write_group_member(group_id, member_id, member, version)
-            .await
-    }
+        _ = $s.member_lists.fetch_add(1, Ordering::Relaxed);
 
-    async fn read_group_member(
-        &self,
-        group_id: &str,
-        member_id: &str,
-    ) -> Result<Option<(MemberDoc, Version)>> {
-        self.introduce_latency().await?;
+        $s.storage.list_group_members($($arg),*).await
+    }};
 
-        _ = self.member_reads.fetch_add(1, Ordering::Relaxed);
-
-        self.storage.read_group_member(group_id, member_id).await
-    }
-
-    async fn delete_group_member(&self, group_id: &str, member_id: &str) -> Result<()> {
-        self.introduce_latency().await?;
-
-        self.storage.delete_group_member(group_id, member_id).await
-    }
-
-    async fn list_group_members(
-        &self,
-        group_id: &str,
-    ) -> Result<BTreeMap<String, (MemberDoc, Version)>> {
-        self.introduce_latency().await?;
-
-        _ = self.member_lists.fetch_add(1, Ordering::Relaxed);
-
-        self.storage.list_group_members(group_id).await
-    }
-
-    async fn list_group_member_stamps(&self, group_id: &str) -> Result<BTreeMap<String, i64>> {
-        self.introduce_latency().await?;
+    ($s:ident, list_group_member_stamps, ($($arg:ident),*)) => {{
+        $s.introduce_latency().await?;
 
         // Counted as a listing of the group's member documents, because that
         // is what it is: the "no LIST on the request path" assertion in
         // `group_scale` has to see the cheap listing batch admission added
         // (#427) as well as the expensive one it was written against.
-        _ = self.member_lists.fetch_add(1, Ordering::Relaxed);
+        _ = $s.member_lists.fetch_add(1, Ordering::Relaxed);
 
-        self.storage.list_group_member_stamps(group_id).await
-    }
+        $s.storage.list_group_member_stamps($($arg),*).await
+    }};
 
-    async fn create_acls(&self, bindings: &[AclBinding]) -> Result<Vec<ErrorCode>> {
-        self.introduce_latency().await?;
+    ($s:ident, update_group_generation, ($group_id:ident, $generation:ident, $version:ident)) => {{
+        $s.introduce_latency().await?;
 
-        self.storage.create_acls(bindings).await
-    }
-
-    async fn describe_acls(&self, filter: &AclFilter) -> Result<Vec<AclBinding>> {
-        self.introduce_latency().await?;
-
-        self.storage.describe_acls(filter).await
-    }
-
-    async fn delete_acls(&self, filters: &[AclFilter]) -> Result<Vec<Vec<AclBinding>>> {
-        self.introduce_latency().await?;
-
-        self.storage.delete_acls(filters).await
-    }
-
-    async fn alter_client_quotas(
-        &self,
-        alterations: &[QuotaAlteration],
-        validate_only: bool,
-    ) -> Result<Vec<ErrorCode>> {
-        self.introduce_latency().await?;
-
-        self.storage
-            .alter_client_quotas(alterations, validate_only)
-            .await
-    }
-
-    async fn describe_client_quotas(
-        &self,
-        components: &[QuotaFilterComponent],
-        strict: bool,
-    ) -> Result<Vec<(QuotaEntity, QuotaLimits)>> {
-        self.introduce_latency().await?;
-
-        self.storage
-            .describe_client_quotas(components, strict)
-            .await
-    }
-
-    async fn client_quotas(&self) -> Result<Quotas> {
-        self.introduce_latency().await?;
-
-        self.storage.client_quotas().await
-    }
-
-    async fn assert_group_schema(&self) -> Result<()> {
-        self.introduce_latency().await?;
-
-        self.storage.assert_group_schema().await
-    }
-
-    async fn read_group_generation(
-        &self,
-        group_id: &str,
-    ) -> Result<Option<(GenerationDoc, Version)>> {
-        self.introduce_latency().await?;
-
-        self.storage.read_group_generation(group_id).await
-    }
-
-    async fn update_group_generation(
-        &self,
-        group_id: &str,
-        generation: GenerationDoc,
-        version: Option<Version>,
-    ) -> Result<Version, UpdateError<GenerationDoc>> {
-        self.introduce_latency().await?;
-
-        _ = self.generation_updates.fetch_add(1, Ordering::Relaxed);
+        _ = $s.generation_updates.fetch_add(1, Ordering::Relaxed);
 
         // Injected loss (#486), before the write rather than after it: a CAS the
         // store accepted and this reported as lost would leave the two
         // disagreeing about what the group holds.
-        let held = self.outdate_generation_updates.load(Ordering::Relaxed);
+        let held = $s.outdate_generation_updates.load(Ordering::Relaxed);
 
         if let Some(left) = held.checked_sub(1) {
-            self.outdate_generation_updates
-                .store(left, Ordering::Relaxed);
+            $s.outdate_generation_updates.store(left, Ordering::Relaxed);
 
-            _ = self
-                .generation_cas_conflicts
-                .fetch_add(1, Ordering::Relaxed);
+            _ = $s.generation_cas_conflicts.fetch_add(1, Ordering::Relaxed);
 
-            let (current, version) = self
+            let (current, version) = $s
                 .storage
-                .read_group_generation(group_id)
+                .read_group_generation($group_id)
                 .await?
                 .unwrap_or_default();
 
@@ -431,9 +277,9 @@ where
             });
         }
 
-        let result = self
+        let result = $s
             .storage
-            .update_group_generation(group_id, generation, version)
+            .update_group_generation($group_id, $generation, $version)
             .await;
 
         // `Vanished` is a lost CAS too — the winner's document was deleted
@@ -443,288 +289,46 @@ where
             result,
             Err(UpdateError::Outdated { .. } | UpdateError::Vanished)
         ) {
-            _ = self
-                .generation_cas_conflicts
-                .fetch_add(1, Ordering::Relaxed);
+            _ = $s.generation_cas_conflicts.fetch_add(1, Ordering::Relaxed);
         }
 
         result
-    }
+    }};
 
-    async fn create_group_assignment(
-        &self,
-        group_id: &str,
-        generation_id: i32,
-        assignment: AssignmentDoc,
-    ) -> Result<AssignmentOutcome> {
-        self.introduce_latency().await?;
+    ($s:ident, $name:ident, ($($arg:ident),*)) => {{
+        $s.introduce_latency().await?;
 
-        self.storage
-            .create_group_assignment(group_id, generation_id, assignment)
-            .await
-    }
-
-    async fn read_group_assignment(
-        &self,
-        group_id: &str,
-        generation_id: i32,
-    ) -> Result<Option<AssignmentDoc>> {
-        self.introduce_latency().await?;
-
-        self.storage
-            .read_group_assignment(group_id, generation_id)
-            .await
-    }
-
-    async fn delete_group_assignments_before(
-        &self,
-        group_id: &str,
-        generation_id: i32,
-    ) -> Result<u64> {
-        self.introduce_latency().await?;
-
-        self.storage
-            .delete_group_assignments_before(group_id, generation_id)
-            .await
-    }
-
-    async fn list_offsets(
-        &self,
-        isolation_level: IsolationLevel,
-        offsets: &[(Topition, ListOffset)],
-    ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
-        self.introduce_latency().await?;
-
-        self.storage.list_offsets(isolation_level, offsets).await
-    }
-
-    async fn offset_commit(
-        &self,
-        group_id: &str,
-        retention_time_ms: Option<Duration>,
-        offsets: &[(Topition, OffsetCommitRequest)],
-    ) -> Result<Vec<(Topition, ErrorCode)>> {
-        self.introduce_latency().await?;
-
-        self.storage
-            .offset_commit(group_id, retention_time_ms, offsets)
-            .await
-    }
-
-    async fn offset_fetch(
-        &self,
-        group_id: Option<&str>,
-        topics: &[Topition],
-        require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
-        self.introduce_latency().await?;
-
-        self.storage
-            .offset_fetch(group_id, topics, require_stable)
-            .await
-    }
-
-    async fn committed_offset_topitions(
-        &self,
-        group_id: &str,
-    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
-        self.introduce_latency().await?;
-
-        self.storage.committed_offset_topitions(group_id).await
-    }
-
-    async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
-        self.introduce_latency().await?;
-
-        self.storage.metadata(topics).await
-    }
-
-    fn auto_create_topic_config(&self) -> AutoTopicCreate {
-        self.storage.auto_create_topic_config()
-    }
-
-    fn fetch_max_bytes(&self) -> u32 {
-        self.storage.fetch_max_bytes()
-    }
-
-    async fn upsert_user_scram_credential(
-        &self,
-        user: &str,
-        mechanism: ScramMechanism,
-        credential: ScramCredential,
-    ) -> Result<()> {
-        self.introduce_latency().await?;
-
-        self.storage
-            .upsert_user_scram_credential(user, mechanism, credential)
-            .await
-    }
-
-    async fn delete_user_scram_credential(
-        &self,
-        user: &str,
-        mechanism: ScramMechanism,
-    ) -> Result<()> {
-        self.introduce_latency().await?;
-
-        self.storage
-            .delete_user_scram_credential(user, mechanism)
-            .await
-    }
-
-    async fn user_scram_credential(
-        &self,
-        user: &str,
-        mechanism: ScramMechanism,
-    ) -> Result<Option<ScramCredential>> {
-        self.introduce_latency().await?;
-
-        self.storage.user_scram_credential(user, mechanism).await
-    }
-
-    async fn describe_config(
-        &self,
-        name: &str,
-        resource: ConfigResource,
-        keys: Option<&[String]>,
-    ) -> Result<DescribeConfigsResult> {
-        self.introduce_latency().await?;
-
-        self.storage.describe_config(name, resource, keys).await
-    }
-
-    async fn list_groups(&self, states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-        self.introduce_latency().await?;
-
-        self.storage.list_groups(states_filter).await
-    }
-
-    async fn delete_groups(
-        &self,
-        group_ids: Option<&[String]>,
-    ) -> Result<Vec<DeletableGroupResult>> {
-        self.introduce_latency().await?;
-
-        self.storage.delete_groups(group_ids).await
-    }
-
-    async fn describe_groups(
-        &self,
-        group_ids: Option<&[String]>,
-        include_authorized_operations: bool,
-    ) -> Result<Vec<NamedGroupDetail>> {
-        self.introduce_latency().await?;
-
-        self.storage
-            .describe_groups(group_ids, include_authorized_operations)
-            .await
-    }
-
-    async fn describe_topic_partitions(
-        &self,
-        topics: Option<&[TopicId]>,
-        partition_limit: i32,
-        cursor: Option<Topition>,
-    ) -> Result<Vec<DescribeTopicPartitionsResponseTopic>> {
-        self.introduce_latency().await?;
-
-        self.storage
-            .describe_topic_partitions(topics, partition_limit, cursor)
-            .await
-    }
-
-    async fn init_producer(
-        &self,
-        transaction_id: Option<&str>,
-        transaction_timeout_ms: i32,
-        producer_id: Option<i64>,
-        producer_epoch: Option<i16>,
-    ) -> Result<ProducerIdResponse> {
-        self.introduce_latency().await?;
-
-        self.storage
-            .init_producer(
-                transaction_id,
-                transaction_timeout_ms,
-                producer_id,
-                producer_epoch,
-            )
-            .await
-    }
-
-    async fn txn_add_offsets(
-        &self,
-        transaction_id: &str,
-        producer_id: i64,
-        producer_epoch: i16,
-        group_id: &str,
-    ) -> Result<ErrorCode> {
-        self.introduce_latency().await?;
-
-        self.storage
-            .txn_add_offsets(transaction_id, producer_id, producer_epoch, group_id)
-            .await
-    }
-
-    async fn txn_add_partitions(
-        &self,
-        partitions: TxnAddPartitionsRequest,
-    ) -> Result<TxnAddPartitionsResponse> {
-        self.introduce_latency().await?;
-
-        self.storage.txn_add_partitions(partitions).await
-    }
-
-    async fn txn_offset_commit(
-        &self,
-        offsets: TxnOffsetCommitRequest,
-    ) -> Result<Vec<TxnOffsetCommitResponseTopic>> {
-        self.introduce_latency().await?;
-
-        self.storage.txn_offset_commit(offsets).await
-    }
-
-    async fn txn_end(
-        &self,
-        transaction_id: &str,
-        producer_id: i64,
-        producer_epoch: i16,
-        committed: bool,
-    ) -> Result<ErrorCode> {
-        self.introduce_latency().await?;
-
-        self.storage
-            .txn_end(transaction_id, producer_id, producer_epoch, committed)
-            .await
-    }
-
-    async fn maintain(&self, now: SystemTime) -> Result<()> {
-        self.introduce_latency().await?;
-
-        self.storage.maintain(now).await
-    }
-
-    async fn cluster_id(&self) -> Result<String> {
-        self.introduce_latency().await?;
-
-        self.storage.cluster_id().await
-    }
-
-    async fn node(&self) -> Result<i32> {
-        self.introduce_latency().await?;
-
-        self.storage.node().await
-    }
-
-    async fn advertised_listener(&self) -> Result<Url> {
-        self.introduce_latency().await?;
-
-        self.storage.advertised_listener().await
-    }
-
-    async fn ping(&self) -> Result<()> {
-        self.introduce_latency().await?;
-
-        self.storage.ping().await
-    }
+        $s.storage.$name($($arg),*).await
+    }};
 }
+
+/// `Storage` for the latency-injecting wrapper, generated from
+/// [`storage_methods`](crate::delegate::storage_methods).
+///
+/// Forty-five of the fifty are `introduce_latency` then forward; five count
+/// something on the way past. All fifty were written out by hand until #551.
+macro_rules! latency_delegation {
+    (
+        $(fn $name:ident(&$s:ident $(, $arg:ident : $ty:ty)* $(,)?) -> $ret:ty;)*
+        $(sync fn $sname:ident(&$ss:ident $(, $sarg:ident : $sty:ty)* $(,)?) -> $sret:ty;)*
+    ) => {
+        #[async_trait]
+        impl<G> Storage for LatencyIntroducingStorage<G>
+        where
+            G: Storage + Clone,
+        {
+            $(
+                async fn $name(&$s $(, $arg: $ty)*) -> $ret {
+                    latency_body!($s, $name, ($($arg),*))
+                }
+            )*
+            $(
+                fn $sname(&$ss $(, $sarg: $sty)*) -> $sret {
+                    $ss.storage.$sname($($sarg),*)
+                }
+            )*
+        }
+    };
+}
+
+storage_methods!(latency_delegation);
