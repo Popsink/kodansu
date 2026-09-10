@@ -42,7 +42,7 @@ mod common;
 const NODE_ID: i32 = 111;
 const TRANSACTION_ID: &str = "txn-1";
 
-type Shared = std::sync::Arc<Box<dyn tansu_storage::Storage>>;
+type Shared = std::sync::Arc<dyn tansu_storage::Storage>;
 
 /// Storage with `txn-1` already open. The transaction has to exist first: the
 /// object store answers `UNSUPPORTED_VERSION` for a producer it has never

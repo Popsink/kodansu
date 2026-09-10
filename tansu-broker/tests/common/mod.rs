@@ -66,29 +66,28 @@ pub(crate) fn init_tracing() -> Result<DefaultGuard> {
     ))
 }
 
-pub(crate) enum StorageType {
-    InMemory,
-}
-
+/// The one storage every broker test runs against.
+///
+/// This took a `StorageType` and matched on it until #552. The enum had one
+/// variant — the PostgreSQL, libSQL, SlateDB and Turso arms left with #96 —
+/// and every call site passed `StorageType::InMemory`, so the parameter chose
+/// between one thing.
 pub(crate) async fn storage_container<C>(
-    storage_type: StorageType,
     cluster: C,
     node: i32,
     advertised_listener: Url,
-) -> Result<Arc<Box<dyn Storage>>>
+) -> Result<Arc<dyn Storage>>
 where
     C: Into<String>,
 {
-    match storage_type {
-        StorageType::InMemory => StorageContainer::builder()
-            .cluster_id(cluster)
-            .node_id(node)
-            .advertised_listener(advertised_listener)
-            .storage(Url::parse("memory://")?)
-            .build()
-            .await
-            .map_err(Into::into),
-    }
+    StorageContainer::builder()
+        .cluster_id(cluster)
+        .node_id(node)
+        .advertised_listener(advertised_listener)
+        .storage(Url::parse("memory://")?)
+        .build()
+        .await
+        .map_err(Into::into)
 }
 
 pub(crate) fn alphanumeric_string(length: usize) -> String {

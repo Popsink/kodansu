@@ -12,10 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Every case here builds a `memory://` container, which needs the one storage
+// engine this fork ships. The gate was on `mod in_memory` until #552 dissolved
+// it; with the module gone it belongs to the file.
+#![cfg(feature = "dynostore")]
+
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use bytes::Bytes;
-use common::{StorageType, alphanumeric_string, init_tracing, register_broker};
+use common::{alphanumeric_string, init_tracing, register_broker};
 use rama::{Context, Service};
 use rand::{prelude::*, rng};
 use tansu_broker::Result;
@@ -32,10 +38,18 @@ use uuid::Uuid;
 
 pub mod common;
 
-pub async fn empty_topic<G>(cluster_id: Uuid, broker_id: i32, sc: G) -> Result<()>
-where
-    G: Storage + Clone,
-{
+async fn storage_container(cluster: impl Into<String>, node: i32) -> Result<Arc<dyn Storage>> {
+    common::storage_container(cluster, node, Url::parse("tcp://127.0.0.1/")?).await
+}
+
+#[tokio::test]
+async fn empty_topic() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let sc = storage_container(cluster_id, broker_id).await?;
+
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
     let topic_name: String = alphanumeric_string(15);
@@ -101,9 +115,14 @@ where
         ErrorCode::try_from(fetch.error_code.unwrap())?
     );
 
-    for response in fetch.responses.as_ref().unwrap_or(&vec![]) {
-        for partition in response.partitions.as_ref().unwrap_or(&vec![]) {
-            for batch in &partition.records.as_ref().unwrap().batches {
+    // `.iter().flatten()` over an `Option`, not `.unwrap()`: an empty partition
+    // answers `records: None`, and this body is the one case that has one. It
+    // unwrapped because it had never run — its `mod in_memory` wrapper called
+    // `simple_non_txn`, the neighbouring body, so `empty_topic` compiled and
+    // was never executed (#552).
+    for response in fetch.responses.iter().flatten() {
+        for partition in response.partitions.iter().flatten() {
+            for batch in partition.records.iter().flat_map(|frame| &frame.batches) {
                 assert_eq!(-1, batch.producer_id);
                 assert_eq!(-1, batch.producer_epoch);
             }
@@ -125,10 +144,8 @@ where
                     .map(|partition| {
                         partition
                             .records
-                            .as_ref()
-                            .unwrap()
-                            .batches
                             .iter()
+                            .flat_map(|frame| &frame.batches)
                             .map(|batch| batch.record_count as i64)
                             .sum::<i64>()
                     })
@@ -140,11 +157,14 @@ where
     Ok(())
 }
 
-pub async fn simple_non_txn<C, G>(cluster_id: C, broker_id: i32, sc: G) -> Result<()>
-where
-    C: Into<String>,
-    G: Storage + Clone,
-{
+#[tokio::test]
+async fn simple_non_txn() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let sc = storage_container(cluster_id, broker_id).await?;
+
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
     let topic_name: String = alphanumeric_string(15);
@@ -309,54 +329,4 @@ where
     );
 
     Ok(())
-}
-
-#[cfg(feature = "dynostore")]
-mod in_memory {
-    use std::sync::Arc;
-
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String>,
-        node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
-        common::storage_container(
-            StorageType::InMemory,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn empty_topic() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::simple_non_txn(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn simple_non_txn() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::simple_non_txn(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
 }

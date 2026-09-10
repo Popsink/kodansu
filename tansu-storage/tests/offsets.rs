@@ -25,7 +25,7 @@ use crate::common::{Error, cluster_id, init_tracing, storage_url};
 
 mod common;
 
-async fn storage() -> Result<Arc<Box<dyn Storage>>, Error> {
+async fn storage() -> Result<Arc<dyn Storage>, Error> {
     StorageContainer::builder()
         .cluster_id(cluster_id())
         .node_id(111)
@@ -165,7 +165,7 @@ mod metadata {
     const GROUP: &str = "checkpointing";
     const CHECKPOINT: &str = "checkpoint-abc";
 
-    async fn storage() -> Result<Arc<Box<dyn Storage>>, Error> {
+    async fn storage() -> Result<Arc<dyn Storage>, Error> {
         let storage = StorageContainer::builder()
             .cluster_id(cluster_id())
             .node_id(111)
@@ -202,7 +202,7 @@ mod metadata {
         Ok(storage)
     }
 
-    async fn commit(storage: &Arc<Box<dyn Storage>>, metadata: Option<&str>) -> Result<(), Error> {
+    async fn commit(storage: &Arc<dyn Storage>, metadata: Option<&str>) -> Result<(), Error> {
         let committed = storage
             .offset_commit(
                 GROUP,

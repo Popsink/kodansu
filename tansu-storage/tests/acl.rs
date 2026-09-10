@@ -41,7 +41,7 @@ use tansu_storage::{
 };
 use url::Url;
 
-async fn storage() -> Result<Arc<Box<dyn Storage>>, Error> {
+async fn storage() -> Result<Arc<dyn Storage>, Error> {
     StorageContainer::builder()
         .cluster_id("tansu")
         .node_id(111)
@@ -76,7 +76,7 @@ fn describe_everything() -> DescribeAclsRequest {
 }
 
 async fn create(
-    storage: &Arc<Box<dyn Storage>>,
+    storage: &Arc<dyn Storage>,
     creations: Vec<AclCreation>,
 ) -> Result<Vec<i16>, Error> {
     let service = MapStateLayer::new({
@@ -104,7 +104,7 @@ async fn create(
 /// Every rule a filter selects, flattened out of the per-resource grouping the
 /// response uses, as `(resource_name, principal)`.
 async fn describe(
-    storage: &Arc<Box<dyn Storage>>,
+    storage: &Arc<dyn Storage>,
     request: DescribeAclsRequest,
 ) -> Result<Vec<(String, String)>, Error> {
     let service = MapStateLayer::new({

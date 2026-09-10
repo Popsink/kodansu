@@ -62,7 +62,7 @@ async fn serve_broker_stack() -> Result<u16> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let port = listener.local_addr()?.port();
 
-    let storage: Arc<Box<dyn Storage>> = StorageContainer::builder()
+    let storage: Arc<dyn Storage> = StorageContainer::builder()
         .cluster_id(Uuid::now_v7().to_string())
         .node_id(111)
         .advertised_listener(Url::parse("tcp://localhost:9092")?)

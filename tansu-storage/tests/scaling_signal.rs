@@ -141,7 +141,7 @@ async fn a_fetch_waiting_for_records_is_parked_rather_than_working() -> Result<(
     const TOPIC: &str = "parked";
     const MAX_WAIT: Duration = Duration::from_secs(5);
 
-    let storage: Arc<Box<dyn Storage>> = StorageContainer::builder()
+    let storage: Arc<dyn Storage> = StorageContainer::builder()
         .cluster_id("tansu")
         .node_id(111)
         .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)

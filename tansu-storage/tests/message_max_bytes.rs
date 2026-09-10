@@ -39,7 +39,7 @@ mod common;
 const TOPIC: &str = "message-max-bytes";
 const PARTITION: i32 = 0;
 
-async fn storage_from(query: &str) -> Result<Arc<Box<dyn Storage>>, Error> {
+async fn storage_from(query: &str) -> Result<Arc<dyn Storage>, Error> {
     let storage = StorageContainer::builder()
         .cluster_id(cluster_id())
         .node_id(111)
@@ -73,7 +73,7 @@ fn batch_of(value_bytes: usize) -> Result<deflated::Batch, Error> {
 }
 
 /// The error code the produce path answers for a batch of `value_bytes`.
-async fn produce(storage: &Arc<Box<dyn Storage>>, value_bytes: usize) -> Result<ErrorCode, Error> {
+async fn produce(storage: &Arc<dyn Storage>, value_bytes: usize) -> Result<ErrorCode, Error> {
     let service = {
         let storage = storage.clone();
         MapStateLayer::new(|_| storage).into_layer(ProduceService)

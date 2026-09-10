@@ -12,6 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Every case here builds a `memory://` container, which needs the one storage
+// engine this fork ships. The gate was on `mod in_memory` until #552 dissolved
+// it; with the module gone it belongs to the file.
+#![cfg(feature = "dynostore")]
+
+use std::sync::Arc;
+
 use common::{alphanumeric_string, register_broker};
 use tansu_broker::Result;
 use tansu_sans_io::{ErrorCode, NULL_TOPIC_ID, create_topics_request::CreatableTopic};
@@ -20,17 +27,27 @@ use tracing::debug;
 use url::Url;
 use uuid::Uuid;
 
+use common::init_tracing;
+use rand::{prelude::*, rng};
 pub mod common;
 
-pub async fn topics_none<G>(
-    cluster_id: impl Into<String>,
-    broker_id: i32,
+async fn storage_container(
+    cluster: impl Into<String>,
+    node: i32,
     advertised_listener: Url,
-    sc: G,
-) -> Result<()>
-where
-    G: Storage + Clone,
-{
+) -> Result<Arc<dyn Storage>> {
+    common::storage_container(cluster, node, advertised_listener).await
+}
+
+#[tokio::test]
+async fn topics_none() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let advertised_listener = Url::parse("tcp://example.com:9092/")?;
+    let sc = storage_container(cluster_id, broker_id, advertised_listener.clone()).await?;
+
     debug!(broker_id, %advertised_listener);
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
@@ -134,15 +151,15 @@ where
     Ok(())
 }
 
-pub async fn topics_some_empty<G>(
-    cluster_id: impl Into<String>,
-    broker_id: i32,
-    advertised_listener: Url,
-    sc: G,
-) -> Result<()>
-where
-    G: Storage + Clone,
-{
+#[tokio::test]
+async fn topics_some_empty() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let advertised_listener = Url::parse("tcp://example.com:9092/")?;
+    let sc = storage_container(cluster_id, broker_id, advertised_listener.clone()).await?;
+
     debug!(broker_id, %advertised_listener);
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
@@ -246,15 +263,15 @@ where
     Ok(())
 }
 
-pub async fn topics_some_matching_by_name<G>(
-    cluster_id: impl Into<String>,
-    broker_id: i32,
-    advertised_listener: Url,
-    sc: G,
-) -> Result<()>
-where
-    G: Storage + Clone,
-{
+#[tokio::test]
+async fn topics_some_matching_by_name() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let advertised_listener = Url::parse("tcp://example.com:9092/")?;
+    let sc = storage_container(cluster_id, broker_id, advertised_listener.clone()).await?;
+
     debug!(broker_id, %advertised_listener);
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
@@ -358,15 +375,15 @@ where
     Ok(())
 }
 
-pub async fn topics_some_not_matching_by_name<G>(
-    cluster_id: impl Into<String>,
-    broker_id: i32,
-    advertised_listener: Url,
-    sc: G,
-) -> Result<()>
-where
-    G: Storage + Clone,
-{
+#[tokio::test]
+async fn topics_some_not_matching_by_name() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let advertised_listener = Url::parse("tcp://example.com:9092/")?;
+    let sc = storage_container(cluster_id, broker_id, advertised_listener.clone()).await?;
+
     debug!(broker_id, %advertised_listener);
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
@@ -400,15 +417,15 @@ where
     Ok(())
 }
 
-pub async fn topics_some_matching_by_id<G>(
-    cluster_id: impl Into<String>,
-    broker_id: i32,
-    advertised_listener: Url,
-    sc: G,
-) -> Result<()>
-where
-    G: Storage + Clone,
-{
+#[tokio::test]
+async fn topics_some_matching_by_id() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let advertised_listener = Url::parse("tcp://example.com:9092/")?;
+    let sc = storage_container(cluster_id, broker_id, advertised_listener.clone()).await?;
+
     debug!(broker_id, %advertised_listener);
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
@@ -512,15 +529,15 @@ where
     Ok(())
 }
 
-pub async fn topics_some_not_matching_by_id<G>(
-    cluster_id: impl Into<String>,
-    broker_id: i32,
-    advertised_listener: Url,
-    sc: G,
-) -> Result<()>
-where
-    G: Storage + Clone,
-{
+#[tokio::test]
+async fn topics_some_not_matching_by_id() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let advertised_listener = Url::parse("tcp://example.com:9092/")?;
+    let sc = storage_container(cluster_id, broker_id, advertised_listener.clone()).await?;
+
     debug!(broker_id, %advertised_listener);
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
@@ -551,124 +568,4 @@ where
     assert_eq!(Some(id.as_bytes()), metadata.topics()[0].topic_id.as_ref());
 
     Ok(())
-}
-
-#[cfg(feature = "dynostore")]
-mod in_memory {
-    use std::sync::Arc;
-
-    use common::{StorageType, init_tracing};
-    use rand::{prelude::*, rng};
-
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String>,
-        node: i32,
-        advertised_listener: Url,
-    ) -> Result<Arc<Box<dyn Storage>>> {
-        common::storage_container(StorageType::InMemory, cluster, node, advertised_listener).await
-    }
-
-    #[tokio::test]
-    async fn topics_none() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster = Uuid::now_v7();
-        let node = rng().random_range(0..i32::MAX);
-        let advertised_listener = Url::parse("tcp://example.com:9092/")?;
-
-        super::topics_none(
-            cluster,
-            node,
-            advertised_listener.clone(),
-            storage_container(cluster, node, advertised_listener).await?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn topics_some_empty() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster = Uuid::now_v7();
-        let node = rng().random_range(0..i32::MAX);
-        let advertised_listener = Url::parse("tcp://example.com:9092/")?;
-
-        super::topics_some_empty(
-            cluster,
-            node,
-            advertised_listener.clone(),
-            storage_container(cluster, node, advertised_listener).await?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn topics_some_matching_by_name() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster = Uuid::now_v7();
-        let node = rng().random_range(0..i32::MAX);
-        let advertised_listener = Url::parse("tcp://example.com:9092/")?;
-
-        super::topics_some_matching_by_name(
-            cluster,
-            node,
-            advertised_listener.clone(),
-            storage_container(cluster, node, advertised_listener).await?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn topics_some_not_matching_by_name() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster = Uuid::now_v7();
-        let node = rng().random_range(0..i32::MAX);
-        let advertised_listener = Url::parse("tcp://example.com:9092/")?;
-
-        super::topics_some_not_matching_by_name(
-            cluster,
-            node,
-            advertised_listener.clone(),
-            storage_container(cluster, node, advertised_listener).await?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn topics_some_matching_by_id() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster = Uuid::now_v7();
-        let node = rng().random_range(0..i32::MAX);
-        let advertised_listener = Url::parse("tcp://example.com:9092/")?;
-
-        super::topics_some_matching_by_id(
-            cluster,
-            node,
-            advertised_listener.clone(),
-            storage_container(cluster, node, advertised_listener).await?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn topics_some_not_matching_by_id() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster = Uuid::now_v7();
-        let node = rng().random_range(0..i32::MAX);
-        let advertised_listener = Url::parse("tcp://example.com:9092/")?;
-
-        super::topics_some_not_matching_by_id(
-            cluster,
-            node,
-            advertised_listener.clone(),
-            storage_container(cluster, node, advertised_listener).await?,
-        )
-        .await
-    }
 }

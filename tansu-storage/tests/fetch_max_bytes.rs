@@ -65,7 +65,7 @@ const RECORDS: usize = 12;
 const CLIENT_ASK: i32 = 16 * 1024 * 1024;
 
 /// A store holding `RECORDS` batches, built with `query` on its storage URL.
-async fn seeded(query: &str) -> Result<Arc<Box<dyn Storage>>, Error> {
+async fn seeded(query: &str) -> Result<Arc<dyn Storage>, Error> {
     let storage = StorageContainer::builder()
         .cluster_id(cluster_id())
         .node_id(111)
@@ -101,7 +101,7 @@ async fn seeded(query: &str) -> Result<Arc<Box<dyn Storage>>, Error> {
 }
 
 /// Response bytes for a fetch of the whole partition asking for `max_bytes`.
-async fn delivered(storage: &Arc<Box<dyn Storage>>, max_bytes: i32) -> Result<usize, Error> {
+async fn delivered(storage: &Arc<dyn Storage>, max_bytes: i32) -> Result<usize, Error> {
     let service = {
         let storage = storage.clone();
         MapStateLayer::new(|_| storage).into_layer(FetchService)

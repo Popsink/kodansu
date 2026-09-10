@@ -3460,7 +3460,7 @@ mod tests {
             + Instant::now().duration_since(*STARTED.get_or_init(Instant::now))
     }
 
-    async fn memory_storage() -> Result<Arc<Box<dyn Storage>>> {
+    async fn memory_storage() -> Result<Arc<dyn Storage>> {
         StorageContainer::builder()
             .cluster_id("test")
             .node_id(111)
@@ -3473,7 +3473,7 @@ mod tests {
 
     /// The store every cost assertion runs over: it counts what was written
     /// without pretending to be a different engine.
-    type Counted = LatencyIntroducingStorage<Arc<Box<dyn Storage>>>;
+    type Counted = LatencyIntroducingStorage<Arc<dyn Storage>>;
 
     async fn counted_storage() -> Result<Counted> {
         memory_storage()

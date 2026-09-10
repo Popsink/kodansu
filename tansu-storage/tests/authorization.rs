@@ -60,7 +60,7 @@ const BOB: &str = "User:bob";
 const LATEST_CREATE_TOPICS_VERSION: i16 = 7;
 const HOST: &str = "10.0.0.1";
 
-async fn storage() -> Result<Arc<Box<dyn Storage>>, Error> {
+async fn storage() -> Result<Arc<dyn Storage>, Error> {
     StorageContainer::builder()
         .cluster_id("tansu")
         .node_id(111)
@@ -72,7 +72,7 @@ async fn storage() -> Result<Arc<Box<dyn Storage>>, Error> {
 
 /// The context a broker with `--authentication` builds for a request: who is
 /// asking, and the decision to ask.
-fn asking(storage: &Arc<Box<dyn Storage>>, principal: &str) -> Context<Arc<Box<dyn Storage>>> {
+fn asking(storage: &Arc<dyn Storage>, principal: &str) -> Context<Arc<dyn Storage>> {
     let mut ctx = Context::default();
 
     _ = ctx.insert(Requester {
@@ -89,7 +89,7 @@ fn asking(storage: &Arc<Box<dyn Storage>>, principal: &str) -> Context<Arc<Box<d
     ctx.map_state(|()| storage.clone())
 }
 
-async fn create_topic(storage: &Arc<Box<dyn Storage>>, name: &str) -> Result<(), Error> {
+async fn create_topic(storage: &Arc<dyn Storage>, name: &str) -> Result<(), Error> {
     let service = MapStateLayer::new({
         let storage = storage.clone();
         move |_| storage.clone()
@@ -127,7 +127,7 @@ fn allow(resource_name: &str, principal: &str, operation: Operation) -> AclBindi
 
 /// The error code every partition of `topic` came back with.
 async fn produce(
-    storage: &Arc<Box<dyn Storage>>,
+    storage: &Arc<dyn Storage>,
     principal: &str,
     topic: &str,
 ) -> Result<Vec<i16>, Error> {
@@ -168,7 +168,7 @@ async fn produce(
 }
 
 async fn fetch(
-    storage: &Arc<Box<dyn Storage>>,
+    storage: &Arc<dyn Storage>,
     principal: &str,
     topic: &str,
 ) -> Result<Vec<i16>, Error> {

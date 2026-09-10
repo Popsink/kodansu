@@ -32,7 +32,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use common::{StorageType, alphanumeric_string, register_broker};
+use common::{alphanumeric_string, register_broker};
 use opentelemetry::global;
 use opentelemetry_sdk::metrics::{
     InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
@@ -233,7 +233,6 @@ async fn a_join_reports_why_it_was_answered() -> Result<()> {
 
     let cluster = Uuid::now_v7();
     let storage = common::storage_container(
-        StorageType::InMemory,
         cluster.to_string(),
         111,
         Url::parse("tcp://127.0.0.1:9092/")?,
@@ -343,7 +342,6 @@ async fn a_sync_reports_why_it_bounced() -> Result<()> {
 
     let cluster = Uuid::now_v7();
     let storage = common::storage_container(
-        StorageType::InMemory,
         cluster.to_string(),
         111,
         Url::parse("tcp://127.0.0.1:9092/")?,

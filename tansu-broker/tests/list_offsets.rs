@@ -12,15 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Every case here builds a `memory://` container, which needs the one storage
+// engine this fork ships. The gate was on `mod in_memory` until #552 dissolved
+// it; with the module gone it belongs to the file.
+#![cfg(feature = "dynostore")]
 // One body walks every `ListOffset` variant against a produced log, so its
 // length and its branch count are the size of the matrix it covers, not
 // complexity #555 can ask anyone to remove.
 #![allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
-use common::{StorageType, alphanumeric_string, init_tracing, register_broker};
+use common::{alphanumeric_string, init_tracing, register_broker};
 use rama::{Context, Layer as _, Service};
 use rand::{prelude::*, rng};
 use tansu_broker::{Error, Result, service::storage};
@@ -67,7 +72,22 @@ where
         })
 }
 
-pub async fn multiple_record(broker: Broker) -> Result<()> {
+async fn storage_container(cluster: impl Into<String>, node: i32) -> Result<Arc<dyn Storage>> {
+    common::storage_container(cluster, node, Url::parse("tcp://127.0.0.1/")?).await
+}
+
+#[tokio::test]
+async fn multiple_record() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+
+    let sc = storage_container(cluster_id, broker_id).await?;
+    register_broker(cluster_id, broker_id, sc.clone()).await?;
+
+    let broker = broker(sc)?;
+
     let topic_name = &alphanumeric_string(15)[..];
     debug!(?topic_name);
 
@@ -571,10 +591,14 @@ pub async fn multiple_record(broker: Broker) -> Result<()> {
     Ok(())
 }
 
-pub async fn new_topic<G>(cluster_id: impl Into<String>, broker_id: i32, sc: G) -> Result<()>
-where
-    G: Storage + Clone,
-{
+#[tokio::test]
+async fn new_topic() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let sc = storage_container(cluster_id, broker_id).await?;
+
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
     let topic_name: String = alphanumeric_string(15);
@@ -670,10 +694,14 @@ where
     Ok(())
 }
 
-pub async fn single_record<G>(cluster_id: impl Into<String>, broker_id: i32, sc: G) -> Result<()>
-where
-    G: Storage + Clone,
-{
+#[tokio::test]
+async fn single_record() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let sc = storage_container(cluster_id, broker_id).await?;
+
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
     let topic_name: String = alphanumeric_string(15);
@@ -765,68 +793,4 @@ where
     assert_eq!(None, responses[0].1.offset);
 
     Ok(())
-}
-
-#[cfg(feature = "dynostore")]
-mod in_memory {
-    use std::sync::Arc;
-
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String>,
-        node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
-        common::storage_container(
-            StorageType::InMemory,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn multiple_record() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let sc = storage_container(cluster_id, broker_id).await?;
-        register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-        let broker = broker(sc)?;
-        super::multiple_record(broker).await
-    }
-
-    #[tokio::test]
-    async fn new_topic() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::new_topic(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn single_record() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::single_record(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
 }

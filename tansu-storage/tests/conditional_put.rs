@@ -537,7 +537,7 @@ async fn if_none_match_is_not_modified_until_the_object_changes() -> Result<(), 
 /// `inception` is pinned rather than `SystemTime::now()`: two details that
 /// differed by a timestamp would make the value assertions below pass whatever
 /// the store did.
-async fn engine() -> Result<Arc<Box<dyn Storage>>, Error> {
+async fn engine() -> Result<Arc<dyn Storage>, Error> {
     StorageContainer::builder()
         .cluster_id(cluster_id())
         .node_id(111)

@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Every case here builds a `memory://` container, which needs the one storage
+// engine this fork ships. The gate was on `mod in_memory` until #552 dissolved
+// it; with the module gone it belongs to the file.
+#![cfg(feature = "dynostore")]
 // One create-produce-maintain-fetch scenario, and it is long: #555's gates
 // measure shipped code, and the length here is the number of protocol
 // exchanges the case walks. #553 turns this file into a driver plus data,
@@ -20,10 +24,11 @@
 // coverage that went with them.
 #![allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use bytes::Bytes;
-use common::{StorageType, alphanumeric_string, init_tracing, register_broker};
+use common::{alphanumeric_string, init_tracing, register_broker};
 use rama::{Context, Layer as _, Service};
 use rand::{prelude::*, rng};
 use tansu_broker::{Error, Result, service::storage};
@@ -72,10 +77,20 @@ where
         })
 }
 
-pub async fn compact_only<G>(sc: G) -> Result<()>
-where
-    G: Storage + Clone,
-{
+async fn storage_container(cluster: impl Into<String>, node: i32) -> Result<Arc<dyn Storage>> {
+    common::storage_container(cluster, node, Url::parse("tcp://127.0.0.1/")?).await
+}
+
+#[tokio::test]
+async fn compact_only() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+
+    let sc = storage_container(cluster_id, broker_id).await?;
+    register_broker(cluster_id, broker_id, sc.clone()).await?;
+
     let broker = broker(sc.clone())?;
 
     let topic_name = &alphanumeric_string(15)[..];
@@ -504,36 +519,4 @@ where
     }
 
     Ok(())
-}
-
-mod in_memory {
-    use std::sync::Arc;
-
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String>,
-        node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
-        common::storage_container(
-            StorageType::InMemory,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn compact_only() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        let sc = storage_container(cluster_id, broker_id).await?;
-        register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-        super::compact_only(sc).await
-    }
 }

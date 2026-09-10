@@ -124,7 +124,7 @@ mod start_after {
     const NODE_ID: i32 = 111;
     const MAX_WAIT: Duration = Duration::from_secs(5);
 
-    async fn storage_container() -> Result<Arc<Box<dyn Storage>>, Error> {
+    async fn storage_container() -> Result<Arc<dyn Storage>, Error> {
         StorageContainer::builder()
             .cluster_id(cluster_id())
             .node_id(NODE_ID)
@@ -146,7 +146,7 @@ mod start_after {
     /// Produce `count` single-record batches; each occupies one offset, so base offsets are
     /// `0..count` and the high watermark ends at `count`.
     async fn produce_batches(
-        storage: &Arc<Box<dyn Storage>>,
+        storage: &Arc<dyn Storage>,
         topition: &Topition,
         count: i64,
     ) -> Result<(), Error> {
@@ -302,7 +302,7 @@ mod out_of_range {
     const TOPIC: &str = "out-of-range";
     const PARTITION: i32 = 0;
 
-    async fn storage_container() -> Result<Arc<Box<dyn Storage>>, Error> {
+    async fn storage_container() -> Result<Arc<dyn Storage>, Error> {
         StorageContainer::builder()
             .cluster_id(cluster_id())
             .node_id(NODE_ID)
@@ -313,7 +313,7 @@ mod out_of_range {
             .map_err(Into::into)
     }
 
-    async fn create_topic(storage: &Arc<Box<dyn Storage>>) -> Result<(), Error> {
+    async fn create_topic(storage: &Arc<dyn Storage>) -> Result<(), Error> {
         _ = storage
             .create_topic(
                 CreatableTopic::default()
@@ -329,7 +329,7 @@ mod out_of_range {
         Ok(())
     }
 
-    async fn produce(storage: &Arc<Box<dyn Storage>>, count: i64) -> Result<(), Error> {
+    async fn produce(storage: &Arc<dyn Storage>, count: i64) -> Result<(), Error> {
         let topition = Topition::new(TOPIC, PARTITION);
 
         for _ in 0..count {
@@ -349,10 +349,7 @@ mod out_of_range {
     }
 
     /// One partition's answer to a fetch at `offset`.
-    async fn fetch_at(
-        storage: &Arc<Box<dyn Storage>>,
-        offset: i64,
-    ) -> Result<PartitionData, Error> {
+    async fn fetch_at(storage: &Arc<dyn Storage>, offset: i64) -> Result<PartitionData, Error> {
         let service = {
             let storage = storage.clone();
             MapStateLayer::new(|_| storage).into_layer(FetchService)

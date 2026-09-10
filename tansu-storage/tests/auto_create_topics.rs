@@ -27,7 +27,7 @@ use url::Url;
 
 mod common;
 
-async fn storage(query: &str) -> Result<Arc<Box<dyn Storage>>, Error> {
+async fn storage(query: &str) -> Result<Arc<dyn Storage>, Error> {
     StorageContainer::builder()
         .cluster_id(cluster_id())
         .node_id(111)
@@ -39,7 +39,7 @@ async fn storage(query: &str) -> Result<Arc<Box<dyn Storage>>, Error> {
 }
 
 async fn metadata(
-    storage: Arc<Box<dyn Storage>>,
+    storage: Arc<dyn Storage>,
     name: &str,
     allow_auto_topic_creation: bool,
 ) -> Result<MetadataResponse, Error> {
@@ -60,7 +60,7 @@ async fn metadata(
 }
 
 async fn metadata_many(
-    storage: Arc<Box<dyn Storage>>,
+    storage: Arc<dyn Storage>,
     names: &[String],
     allow_auto_topic_creation: bool,
 ) -> Result<MetadataResponse, Error> {
@@ -287,7 +287,7 @@ async fn auto_create_stores_kafka_defaults_when_unconfigured() -> Result<(), Err
 /// The stored config of `name`, as `DescribeConfigs` reports it — which is what an
 /// operator sees and what maintenance reads.
 async fn describe(
-    storage: Arc<Box<dyn Storage>>,
+    storage: Arc<dyn Storage>,
     name: &str,
 ) -> Result<Vec<(String, Option<String>)>, Error> {
     let response = MapStateLayer::new(|_| storage)

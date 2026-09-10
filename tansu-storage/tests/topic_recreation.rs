@@ -67,7 +67,7 @@ mod common;
 const TOPIC: &str = "pqr";
 const PARTITION: i32 = 0;
 
-type Engine = Arc<Box<dyn Storage>>;
+type Engine = Arc<dyn Storage>;
 
 async fn storage(query: &str) -> Result<Engine, Error> {
     StorageContainer::builder()

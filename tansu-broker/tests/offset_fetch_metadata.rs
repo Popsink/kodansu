@@ -41,7 +41,7 @@ const TOPIC: &str = "commit-metadata";
 const GROUP: &str = "checkpointing";
 const CHECKPOINT: &str = "checkpoint-abc";
 
-async fn storage_with_a_commit() -> Result<Arc<Box<dyn Storage>>> {
+async fn storage_with_a_commit() -> Result<Arc<dyn Storage>> {
     let storage = StorageContainer::builder()
         .cluster_id(Uuid::now_v7().to_string())
         .node_id(111)

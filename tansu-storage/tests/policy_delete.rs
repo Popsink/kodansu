@@ -31,7 +31,7 @@ use url::Url;
 
 mod common;
 
-type Sc = Arc<Box<dyn Storage>>;
+type Sc = Arc<dyn Storage>;
 
 async fn default_storage() -> Result<Sc, Error> {
     StorageContainer::builder()

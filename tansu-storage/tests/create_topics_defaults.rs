@@ -29,7 +29,7 @@ use url::Url;
 
 mod common;
 
-type DynStorage = Arc<Box<dyn Storage>>;
+type DynStorage = Arc<dyn Storage>;
 
 /// A store carrying the broker-level `defaults`, which is where the injection now
 /// lives: `create_topic` is the single choke point, so every creation path
