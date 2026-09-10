@@ -3917,19 +3917,23 @@ dependencies = [
 name = "tansu-topic"
 version = "1.0.0-alpha.18"
 dependencies = [
+ "anyhow",
  "futures",
  "futures-core",
  "futures-util",
  "serde",
  "serde_json",
+ "tansu-broker",
  "tansu-client",
  "tansu-sans-io",
+ "tansu-storage",
  "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
 ]
 
 [[package]]

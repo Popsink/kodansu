@@ -42,7 +42,7 @@ jobs:
   # nothing off the shelf to turn on here.
   #
   # The ceiling is in the justfile rather than on the line below, unlike
-  # `coverage-ci 70`: it is set tight enough that one line of narration crosses
+  # `coverage-ci`'s floor: it is set tight enough that one line of narration crosses
   # it, so a second copy of the number in this file would mean `just comments`
   # on a laptop passing while CI fails. `justfile`'s `comments` recipe says what
   # the number is and what raising it commits you to.
@@ -197,10 +197,10 @@ jobs:
           cache: false
       - uses: taiki-e/install-action@nextest
       - uses: taiki-e/install-action@cargo-llvm-cov
-      # The floor is a ratchet, and 82 is deliberately under the ~84.06% measured
-      # when #549 deleted the unrun `tansu-sans-io` bin that had been 5.5% of the
-      # denominator: it is there to catch a change that deletes the tests
-      # covering the code it touches, not to police a decimal point.
+      # The floor is a ratchet, and 83 is deliberately under the ~85.29%
+      # measured once #556's second milestone put `tansu-topic` at 100%: it is
+      # there to catch a change that deletes the tests covering the code it
+      # touches, not to police a decimal point.
       #
       # Two points is more slack than `comments` gets below, and the reason is
       # that this number is not reproducible to the digit the way that one is.
@@ -213,7 +213,7 @@ jobs:
       #
       # Raise it when the real number moves up; never lower it to turn a red
       # build green, which is the one edit that makes this job decorative.
-      - run: just coverage-ci 82
+      - run: just coverage-ci 83
       - name: Coverage summary
         if: always()
         run: |

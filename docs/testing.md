@@ -80,7 +80,7 @@ rather than the write.
 ```shell
 just coverage          # summary in the terminal
 just coverage-html     # browsable report, opens in a browser
-just coverage-ci 82    # what CI runs: lcov + HTML + summary, floored at 82%
+just coverage-ci 83    # what CI runs: lcov + HTML + summary, floored at 83%
 ```
 
 All three need `cargo-llvm-cov` and the `llvm-tools-preview` component:
@@ -94,6 +94,10 @@ The `coverage` job on every PR publishes the line rate to the run summary and
 attaches `lcov.info` plus the HTML report as the `coverage` artifact. It also
 uploads to Codecov, but only if a `CODECOV_TOKEN` secret exists — the artifact is
 the fallback and needs no third-party account.
+
+The measured value is **85.29%** at the commit that put `tansu-topic` at 100%
+(#556's second milestone), up from 84.06% when #549 closed the orphan-bin hole.
+The floor below tracks it two points back.
 
 `just coverage-ci` takes a floor and fails under it. The floor is a **ratchet**:
 raise it as the real number rises, and never lower it to turn a red build green.
@@ -479,9 +483,20 @@ carries the assigned one — the whole defect is in the difference. `340 s`
 rather than `340 ms` is why no unit test was ever going to be the thing that
 found it.
 
-**`tansu-topic`.** The `tansu topic` subcommand is at or near 0%. It is a thin
-shell over code that is covered, but it has no test that would notice if the
-shell stopped delegating.
+**`tansu-topic` was here, and is not any more.** It sat at 0% — a thin shell
+over code that is covered, with no test that would notice if the shell stopped
+delegating. #556's second milestone put it at 100% by driving the real
+`Topic::main` against an in-process broker over `memory://` rather than unit
+testing the builders, because "the shell stopped delegating" is precisely what
+a unit test cannot see.
+
+Two things that pass came out of writing it, and both are worth copying. A
+first `create_carries_its_configs` asserted only `ErrorCode::None` and was
+**vacuous**: deleting the whole config map from `Create::main` still passed it,
+because a create with no configs is equally valid — it reads the configs back
+with `DescribeConfigs` now. And the no-broker case took **72 s** of connection
+backoff until `#[tokio::test(start_paused = true)]` took it to 0.03 s, the same
+rig #359 built for the coordinator tests.
 
 `tansu-perf` and `tansu-otel` used to sit in this paragraph alongside it, and
 `tansu-proxy` — 2 800 lines with no integration test — should have. All three
