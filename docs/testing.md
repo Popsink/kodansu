@@ -162,13 +162,18 @@ reads lower than `wc -l` over the same span: #550's table says 424 for
 moving the threshold, or the two disagree by a factor of two.
 
 The threshold is deliberately set on **shipped** code. Test and bench targets
-are an order of magnitude over it — a 1536-line body in
-`tansu-sans-io/tests/snappy.rs`, five 550-line near-copies in
-`tansu-broker/tests/policy_compact_delete.rs` — because a golden fixture is a
-byte table and a protocol test is a script, neither of which shortens. Those
-files carry a file-level `#![allow]` citing #553, the issue that will delete
-the bodies; the allow comes out with them. Widening the threshold to swallow a
-fixture table instead would have set it at 1536 and gated nothing.
+run over it — a 1536-line body in `tansu-sans-io/tests/snappy.rs`, two
+400-plus-line `DescribeConfigs` fixtures in
+`tansu-sans-io/tests/golden.rs` — because a golden fixture is a byte table and
+a protocol test is a script, neither of which shortens. Widening the threshold
+to swallow a fixture table would have set it at 1536 and gated nothing, so
+those carry an `#[allow]` instead, on the item where that is only two of a
+file's bodies and on the file where it is all of them.
+
+#553 took the count down rather than the threshold up: the near-copies in
+`tansu-broker/tests/policy_compact_delete.rs` and the fixture tables written
+out twice are gone, and the allows that cited it went with them. What is left
+is what a capture costs to write down.
 
 The generated protocol code is the other exemption. `tansu-sans-io/build.rs`
 emits two `From<Body>` impls of ~800 lines, one match arm per API key per

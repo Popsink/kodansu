@@ -36,10 +36,8 @@ tansu-sans-io/
 │       ├── header.rs        # Record Header (key/value byte pairs)
 │       ├── deflated.rs      # Compressed record batches (wire format)
 │       └── inflated.rs      # Decompressed record batches (in-memory)
-├── tests/                   # 18 test files
-│   ├── encode.rs            # Encoding tests
-│   ├── decode.rs            # Decoding tests
-│   ├── codec.rs             # Round-trip tests
+├── tests/                   # 17 test files
+│   ├── golden.rs            # Wire fixtures: bytes <-> value, both directions
 │   ├── api.rs               # API-level tests
 │   ├── snappy.rs            # Snappy compression tests
 │   └── ...

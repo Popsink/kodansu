@@ -213,9 +213,9 @@ fmt:
 # below it, with one difference in how tight it is set. Coverage's floor sits a
 # couple of points under the measured number because that measurement jitters by
 # ~8 lines run to run (#549 measured it three times over one tree). This one does
-# not jitter at all, and a tenth of a point here is ~110 lines of narration, so
-# the ceiling is the measured value itself — 2.86782372%, rounded up at the last
-# digit to the 2.8679 below, which is a tenth of a line of headroom. One added
+# not jitter at all, and a tenth of a point here is ~107 lines of narration, so
+# the ceiling is the measured value itself — 3.07219662%, rounded up at the last
+# digit to the 3.0722 below, which is a tenth of a line of headroom. One added
 # line of uncited narration fails; a line of rustdoc, a line of code, a trailing
 # comment, or a narration block citing an issue does not.
 #
@@ -250,6 +250,16 @@ fmt:
 # backends #96 removed — which is outside the ratio, so only the denominator
 # moved.
 #
+#   #553  -4489 lines, fixtures stated once  3192 -> 3180  2.95528192 -> 3.07219662
+#
+# The largest of the deletions and the largest single move this number has
+# made. #553 merged `decode.rs`, `encode.rs` and `codec.rs` into one
+# `golden.rs` — 43 of `encode.rs`'s 44 tables and 44 of `codec.rs`'s 46 were
+# byte-identical to a `decode.rs` table — and rewrote `compact_only` against
+# the helpers the other three cases in its file already use. Both are
+# comment-free literals coming out of the denominator; the numerator fell 12
+# because four file-level `#![allow]` blocks citing #553 went with them.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -259,7 +269,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.9553" top="12":
+comments ceiling="3.0722" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
