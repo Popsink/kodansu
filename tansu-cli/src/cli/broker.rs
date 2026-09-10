@@ -235,6 +235,17 @@ fn redact_password(mut url: Url) -> Url {
 }
 
 impl Arg {
+    /// The cluster id this was parsed with, for the flattening assertion in
+    /// `cli`'s tests: the fields are private to this module, and the parent
+    /// cannot see them (#556).
+    #[cfg(test)]
+    pub(super) fn cluster_id(&self) -> &str {
+        self.cluster_id.as_str()
+    }
+
+    /// Builds and then serves until cancelled. The build half is what the
+    /// tests below drive; serving is `tansu-broker`'s own suite, which has an
+    /// accept loop to stop and a client to answer (#556).
     pub(super) async fn main(self) -> Result<ErrorCode> {
         let started = Instant::now();
         self.build()
@@ -355,9 +366,14 @@ impl Default for Sheet {
 
 #[cfg(test)]
 mod tests {
+    use std::fs::write;
+
     use super::*;
+    use crate::Error;
     use clap::CommandFactory as _;
+    use rcgen::{CertifiedKey, generate_simple_self_signed};
     use tansu_storage::DEFAULT_RETENTION_MS;
+    use tempfile::tempdir;
 
     /// A broker started with no flag caps frames where the service layer says it
     /// does (#477). Asserted through clap rather than on the constant, because
@@ -536,5 +552,226 @@ mod tests {
         // The clap `default_value` is the string "7days"; pin that it resolves to
         // the same constant the storage layer would have used.
         assert_eq!(Ok(DEFAULT_RETENTION_MS), parse_retention_ms("7days"));
+    }
+    /// A throwaway certificate and key on disk, in the PEM form the two
+    /// arguments take. Generated per test rather than checked in, as
+    /// `tansu-broker`'s TLS suite does: no key material in the tree and
+    /// nothing to expire.
+    fn pem(dir: &Path) -> Result<(PathBuf, PathBuf)> {
+        let CertifiedKey { cert, signing_key } =
+            generate_simple_self_signed(vec![String::from("tansu.test")])
+                .map_err(|error| Error::Box(Box::new(error)))?;
+
+        let certs = dir.join("cert.pem");
+        let key = dir.join("key.pem");
+
+        write(&certs, cert.pem()).map_err(|error| Error::Box(Box::new(error)))?;
+        write(&key, signing_key.serialize_pem()).map_err(|error| Error::Box(Box::new(error)))?;
+
+        Ok((certs, key))
+    }
+
+    /// A password in a storage URL is printed at startup, into whatever
+    /// collects the broker's stdout. Redacted there, and the rest of the URL
+    /// left intact, because the line exists to tell an operator which store
+    /// this replica is on.
+    #[test]
+    fn the_storage_url_is_printed_without_its_password() -> Result<()> {
+        assert_eq!(
+            Url::parse("s3://someone@localhost:9000/tansu")?,
+            redact_password(Url::parse("s3://someone:hunter2@localhost:9000/tansu")?)
+        );
+
+        assert_eq!(
+            Url::parse("memory://tansu/")?,
+            redact_password(Url::parse("memory://tansu/")?)
+        );
+
+        Ok(())
+    }
+
+    /// #358's defect, at the argument layer: `--cert` and `--key` each
+    /// `requires` the other, so a half-configured pair is refused at parse
+    /// time rather than becoming a plaintext listener on the port an operator
+    /// just configured for TLS.
+    #[test]
+    fn a_half_configured_tls_pair_does_not_parse() {
+        assert!(Arg::try_parse_from(["tansu", "--cert", "cert.pem"]).is_err());
+        assert!(Arg::try_parse_from(["tansu", "--key", "key.pem"]).is_err());
+        assert!(Arg::try_parse_from(["tansu", "--cert", "cert.pem", "--key", "key.pem"]).is_ok());
+    }
+
+    /// The other half of #358: the pair is loaded, not merely accepted. A
+    /// chain and key that belong together become a server configuration.
+    #[test]
+    fn a_matching_certificate_and_key_load() -> Result<()> {
+        let dir = tempdir().map_err(|error| Error::Box(Box::new(error)))?;
+        let (certs, key) = pem(dir.path())?;
+
+        assert_eq!(1, load_certs(&certs)?.len());
+        assert!(server_config(&certs, &key).is_ok());
+
+        Ok(())
+    }
+
+    /// And the failure is a failure. This used to end in `.ok()`, which turned
+    /// an unreadable file, a malformed PEM or a mismatched key into `None` —
+    /// and `None` is a plaintext broker (#358). Each of the three is asserted
+    /// separately because `.ok()` swallowed all three alike.
+    #[test]
+    fn a_certificate_that_will_not_load_fails_startup() -> Result<()> {
+        let dir = tempdir().map_err(|error| Error::Box(Box::new(error)))?;
+        let (certs, key) = pem(dir.path())?;
+
+        let missing = dir.path().join("absent.pem");
+        assert!(load_certs(&missing).is_err());
+        assert!(load_private_key(&missing).is_err());
+
+        let malformed = dir.path().join("malformed.pem");
+        write(&malformed, "-----BEGIN CERTIFICATE-----\nnot base64\n")
+            .map_err(|error| Error::Box(Box::new(error)))?;
+        assert!(load_certs(&malformed).is_err());
+
+        let other = tempdir().map_err(|error| Error::Box(Box::new(error)))?;
+        let (_, unrelated) = pem(other.path())?;
+        assert!(
+            server_config(&certs, &unrelated).is_err(),
+            "a key that does not match the chain is not a TLS listener"
+        );
+
+        assert!(load_private_key(&key).is_ok());
+
+        Ok(())
+    }
+
+    /// The arguments reach a built broker. Nothing binds here — `build` stops
+    /// short of `listen` — so this is the parse-to-broker wiring on its own,
+    /// which is the part that has no other test and every argument runs
+    /// through.
+    ///
+    /// Gated: without the object store there is no engine at all, and
+    /// `memory://` is `UnsupportedStorageUrl` rather than a broker.
+    #[cfg(feature = "dynostore")]
+    #[tokio::test]
+    async fn the_arguments_build_a_broker() -> Result<()> {
+        _ = Arg::try_parse_from([
+            "tansu",
+            "--storage-engine",
+            "memory://tansu/",
+            "--listener-url",
+            "tcp://0.0.0.0:0",
+            "--authentication",
+            "--super-users",
+            "User:admin,User:ops",
+            "--quota-producer-byte-rate",
+            "1024",
+            "--quota-consumer-byte-rate",
+            "2048",
+            "--quota-request-rate",
+            "8",
+            "--quota-fleet-size",
+            "4",
+            "--default-retention-ms",
+            "forever",
+            "--socket-request-max-bytes",
+            "unlimited",
+        ])
+        .expect("every argument")
+        .build()
+        .await?;
+
+        Ok(())
+    }
+
+    /// `--silent` is the only difference between the two paths through
+    /// `build`, and the startup banner is what it silences. Both are built so
+    /// that neither arm can rot. Gated for the reason above.
+    #[cfg(feature = "dynostore")]
+    #[tokio::test]
+    async fn a_silent_broker_builds_the_same_way() -> Result<()> {
+        for extra in [&[][..], &["--silent"][..]] {
+            _ = Arg::try_parse_from(
+                ["tansu", "--storage-engine", "memory://tansu/"]
+                    .into_iter()
+                    .chain(extra.iter().copied()),
+            )
+            .expect("--storage-engine memory://tansu/")
+            .build()
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// An empty `--default-cleanup-policy` stores no policy at all, which is
+    /// not the same as storing `delete` — the engine reads an absent policy as
+    /// `delete` anyway, so this is about what the topic document holds (#223).
+    #[test]
+    fn an_empty_default_cleanup_policy_stores_none() {
+        assert_eq!(
+            "",
+            Arg::try_parse_from(["tansu", "--default-cleanup-policy", ""])
+                .expect("empty policy")
+                .default_cleanup_policy
+        );
+
+        assert_eq!(
+            DEFAULT_CLEANUP_POLICY,
+            Arg::try_parse_from(["tansu"])
+                .expect("no arguments")
+                .default_cleanup_policy
+        );
+    }
+
+    /// `--super-users` is the delimited option `--quota-fleet-size` must not
+    /// become, and its splitting is what makes a comma-separated list from a
+    /// Helm value work.
+    #[test]
+    fn the_super_users_are_a_list() {
+        assert_eq!(
+            vec![String::from("User:admin"), String::from("User:ops")],
+            Arg::try_parse_from(["tansu", "--super-users", "User:admin,User:ops"])
+                .expect("--super-users")
+                .super_users
+        );
+
+        assert_eq!(
+            Vec::<String>::new(),
+            Arg::try_parse_from(["tansu"])
+                .expect("no arguments")
+                .super_users
+        );
+    }
+
+    /// A duration that does not fit in `retention.ms` is refused rather than
+    /// wrapping into a negative — which is the one value both expiry paths
+    /// read as "retain forever", so an overflow would silently turn a very
+    /// long retention into an infinite one.
+    #[test]
+    fn a_retention_that_does_not_fit_is_refused() {
+        let err = parse_retention_ms("300000000years").expect_err("does not fit");
+
+        assert!(err.contains("does not fit in retention.ms"), "{err}");
+    }
+
+    /// A storage URL naming no engine fails startup, as `tansu_broker::Error`
+    /// — the conversion that carries a broker failure out of `build` and into
+    /// the CLI's own error type.
+    #[tokio::test]
+    async fn an_unsupported_storage_url_fails_startup() {
+        let error = Arg::try_parse_from(["tansu", "--storage-engine", "postgres://tansu/"])
+            .expect("--storage-engine postgres://tansu/")
+            .build()
+            .await
+            .expect_err("postgres:// is not an engine");
+
+        assert!(
+            matches!(error, Error::Server(_)),
+            "the broker's own error, not a box: {error:?}"
+        );
+        assert!(
+            format!("{error}").contains("UnsupportedStorageUrl"),
+            "the error must name the URL as the problem: {error}"
+        );
     }
 }
