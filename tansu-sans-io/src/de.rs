@@ -581,6 +581,10 @@ impl<'de> Deserializer<'de> for &mut Decoder<'de> {
         self.length
             .ok_or(Error::StringWithoutLength)
             .and_then(|length| {
+                if length > self.message_max_size.unwrap_or(MESSAGE_MAX_SIZE) {
+                    return Err(Error::MessageMaxSizeExceeded(length));
+                }
+
                 let mut buf = vec![0u8; length];
                 self.reader.read_exact(&mut buf)?;
                 from_utf8(buf.as_slice())
@@ -1506,5 +1510,434 @@ impl<'de> VariantAccess<'de> for Enum<'de, '_> {
             visitor = type_name_of_val(&visitor)
         );
         Deserializer::deserialize_struct(self.de, self.name, fields, visitor)
+    }
+}
+
+#[cfg(test)]
+mod accepted_forms {
+    //! What the two deserializers in this file accept, and what they refuse
+    //! (#556).
+    //!
+    //! Nothing on the wire says what a value is. The frame's API key and
+    //! version name a schema, and everything after that is position and width
+    //! — so a form outside the set a decoder reads cannot be guessed at from
+    //! the bytes. Refusing is the only answer that does not fabricate a value,
+    //! which is the same argument #351 makes for the encoder.
+
+    use super::*;
+    use bytes::Bytes;
+    use serde::{Deserialize, de::DeserializeOwned};
+    use std::{collections::BTreeMap, fmt::Debug, io::Cursor};
+
+    /// Reads a value with no message metadata in play, which is the decoder as
+    /// [`Decoder::new`] hands it out: no API key, no version, so every field is
+    /// valid, nothing is nullable and nothing is flexible.
+    fn decoded<T>(encoded: &[u8]) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let mut reader = Cursor::new(encoded);
+        let mut decoder = Decoder::new(&mut reader);
+        T::deserialize(&mut decoder)
+    }
+
+    /// Reads a value out of a record batch's bytes.
+    fn from_batch<T>(encoded: &[u8]) -> Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        T::deserialize(BatchDecoder::new(Bytes::copy_from_slice(encoded)))
+    }
+
+    fn assert_unexpected_type(error: Error) {
+        assert!(
+            matches!(error, Error::UnexpectedType(_)),
+            "expected UnexpectedType, got {error:?}"
+        );
+    }
+
+    /// A visitor that answers nothing, for the arms that refuse before they
+    /// reach one.
+    struct Nothing;
+
+    impl<'de> Visitor<'de> for Nothing {
+        type Value = ();
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("nothing")
+        }
+    }
+
+    /// A value asked for by a method a generated type never asks for.
+    ///
+    /// Each of these exists because `serde`'s own impls route elsewhere: `&str`
+    /// refuses a transient string, `Bytes` asks for a `byte_buf`, and there is
+    /// no `Deserialize` at all that calls `deserialize_identifier` outside a
+    /// derived enum.
+    macro_rules! asks_for {
+        ($name:ident, $method:ident) => {
+            #[derive(Debug)]
+            struct $name;
+
+            impl<'de> Deserialize<'de> for $name {
+                fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+                where
+                    D: Deserializer<'de>,
+                {
+                    deserializer.$method(Nothing).map(|()| Self)
+                }
+            }
+        };
+    }
+
+    asks_for!(Any, deserialize_any);
+    asks_for!(Identifier, deserialize_identifier);
+    asks_for!(IgnoredAny, deserialize_ignored_any);
+
+    /// A visitor that accepts a byte array, for the two arms that hand one
+    /// over.
+    struct Octets;
+
+    impl<'de> Visitor<'de> for Octets {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a byte array")
+        }
+
+        fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(v.to_vec())
+        }
+
+        fn visit_byte_buf<E>(self, v: Vec<u8>) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(v)
+        }
+    }
+
+    /// A byte array asked for by the borrowed arm, which `Bytes` does not use:
+    /// it needs an owned value, so it asks for a `byte_buf`.
+    #[derive(Debug)]
+    struct AsBytes(Vec<u8>);
+
+    impl<'de> Deserialize<'de> for AsBytes {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserializer.deserialize_bytes(Octets).map(AsBytes)
+        }
+    }
+
+    /// A byte array asked for by the owned arm.
+    #[derive(Debug)]
+    struct AsByteBuf(Vec<u8>);
+
+    impl<'de> Deserialize<'de> for AsByteBuf {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            deserializer.deserialize_byte_buf(Octets).map(AsByteBuf)
+        }
+    }
+
+    /// A string asked for by the borrowed arm.
+    #[derive(Debug)]
+    struct Str(String);
+
+    impl<'de> Deserialize<'de> for Str {
+        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            struct V;
+
+            impl<'de> Visitor<'de> for V {
+                type Value = String;
+
+                fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    formatter.write_str("a string")
+                }
+
+                fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+                where
+                    E: serde::de::Error,
+                {
+                    Ok(v.to_owned())
+                }
+            }
+
+            deserializer.deserialize_str(V).map(Str)
+        }
+    }
+
+    /// Every fixed-width number is big-endian.
+    ///
+    /// The unsigned widths and the floats are answered for even though the
+    /// generated types do not use them: Kafka's schema has `int8` through
+    /// `int64`, `uint16`, `uint32` and `float64`, and no `uint64` or `float32`
+    /// at all.
+    #[test]
+    fn every_fixed_width_number_is_big_endian() -> Result<()> {
+        assert!(decoded::<bool>(&[1])?);
+        assert!(!decoded::<bool>(&[0])?);
+        assert_eq!(-1i8, decoded::<i8>(&[255])?);
+        assert_eq!(-2i16, decoded::<i16>(&[255, 254])?);
+        assert_eq!(-3i32, decoded::<i32>(&[255, 255, 255, 253])?);
+        assert_eq!(
+            -4i64,
+            decoded::<i64>(&[255, 255, 255, 255, 255, 255, 255, 252])?
+        );
+        assert_eq!(7u8, decoded::<u8>(&[7])?);
+        assert_eq!(8u16, decoded::<u16>(&[0, 8])?);
+        assert_eq!(9u32, decoded::<u32>(&[0, 0, 0, 9])?);
+        assert_eq!(10u64, decoded::<u64>(&[0, 0, 0, 0, 0, 0, 0, 10])?);
+        assert_eq!(1.5f32, decoded::<f32>(&1.5f32.to_be_bytes())?);
+        assert_eq!(2.5f64, decoded::<f64>(&2.5f64.to_be_bytes())?);
+
+        Ok(())
+    }
+
+    /// Without a version, a string and a byte array carry a four-byte length:
+    /// the non-flexible encoding, which is what a decoder with no message
+    /// metadata falls back to.
+    #[test]
+    fn a_string_and_a_byte_array_carry_a_four_byte_length() -> Result<()> {
+        assert_eq!("abc", decoded::<String>(&[0, 0, 0, 3, b'a', b'b', b'c'])?);
+        assert_eq!("abc", decoded::<Str>(&[0, 0, 0, 3, b'a', b'b', b'c'])?.0);
+        assert_eq!(
+            Bytes::from_static(&[1, 2]),
+            decoded::<Bytes>(&[0, 0, 0, 2, 1, 2])?
+        );
+        assert_eq!(vec![1, 2], decoded::<AsBytes>(&[0, 0, 0, 2, 1, 2])?.0);
+        assert_eq!(vec![1, 2], decoded::<AsByteBuf>(&[0, 0, 0, 2, 1, 2])?.0);
+
+        Ok(())
+    }
+
+    /// A newtype struct is its inner value, with nothing around it.
+    ///
+    /// Which is what makes the generated wrappers — `Uuid`, the varint types,
+    /// the mezzanine newtypes — free on the wire.
+    #[test]
+    fn a_newtype_struct_is_its_inner_value() -> Result<()> {
+        #[derive(Debug, Deserialize, PartialEq)]
+        struct Wrapper(i32);
+
+        assert_eq!(Wrapper(7), decoded::<Wrapper>(&[0, 0, 0, 7])?);
+
+        Ok(())
+    }
+
+    /// A length past the maximum message size is refused before it is
+    /// allocated.
+    ///
+    /// The length is four bytes the peer chose, so a twelve-byte frame can ask
+    /// for four gigabytes. The guard is what stops `vec![0u8; length]` running
+    /// first and the read failing afterwards — which is a `Vec` allocation, not
+    /// a read, and so not something the frame size bounds. All three string and
+    /// bytes arms carry it: until #556 the borrowed one did not.
+    #[test]
+    fn a_length_past_the_maximum_message_size_is_refused_before_it_is_allocated() {
+        let hostile = [0x40, 0x00, 0x00, 0x01];
+
+        for error in [
+            decoded::<String>(&hostile).expect_err("a gigabyte string"),
+            decoded::<Str>(&hostile).expect_err("a gigabyte string"),
+            decoded::<AsByteBuf>(&hostile).expect_err("a gigabyte byte array"),
+        ] {
+            assert!(
+                matches!(error, Error::MessageMaxSizeExceeded(length)
+                    if length == MESSAGE_MAX_SIZE + 1),
+                "expected MessageMaxSizeExceeded, got {error:?}"
+            );
+        }
+    }
+
+    /// The protocol decoder refuses the forms the wire format cannot carry.
+    ///
+    /// `deserialize_any` is the one worth naming: a self-describing format
+    /// answers it, and this one cannot, so a `Deserialize` written against
+    /// `serde_json`'s data model fails here rather than reading the next bytes
+    /// as whatever it hoped for.
+    #[test]
+    fn the_protocol_decoder_refuses_what_the_wire_format_cannot_carry() {
+        let payload = [0, 0, 0, 1, 0, 0, 0, 0];
+
+        for error in [
+            decoded::<Any>(&payload).expect_err("a self-describing value"),
+            decoded::<char>(&payload).expect_err("a char"),
+            decoded::<()>(&payload).expect_err("a unit"),
+            decoded::<BTreeMap<i32, i32>>(&payload).expect_err("a map"),
+            decoded::<IgnoredAny>(&payload).expect_err("an ignored value"),
+        ] {
+            assert_unexpected_type(error);
+        }
+    }
+
+    /// A unit struct and a tuple struct of two fields are refused.
+    ///
+    /// Apart because a one-field tuple struct is a newtype struct, which the
+    /// decoder does support, and because both of these carry their name into
+    /// the error.
+    #[test]
+    fn a_unit_struct_and_a_tuple_struct_are_refused() {
+        #[allow(dead_code)]
+        #[derive(Debug, Deserialize)]
+        struct UnitStruct;
+
+        #[allow(dead_code)]
+        #[derive(Debug, Deserialize)]
+        struct TupleStruct(i32, i32);
+
+        for error in [
+            decoded::<UnitStruct>(&[]).expect_err("a unit struct"),
+            decoded::<TupleStruct>(&[0, 0, 0, 1, 0, 0, 0, 2]).expect_err("a tuple struct"),
+        ] {
+            assert_unexpected_type(error);
+        }
+    }
+
+    /// Asked which variant to read with no message metadata to answer from, the
+    /// decoder says so.
+    ///
+    /// [`Body`](crate::Body) and [`Header`](crate::Header) are enums, and which
+    /// variant to read comes from the API key — so a decoder that was handed
+    /// neither an API key nor a container it recognises has nothing to answer
+    /// with. `UnknownContainer` rather than a guess is what makes
+    /// `Frame::response_from_bytes` require the caller to supply the key.
+    #[test]
+    fn an_enum_with_no_message_metadata_is_an_unknown_container() {
+        let error = decoded::<Identifier>(&[]).expect_err("no container");
+
+        assert!(
+            matches!(error, Error::UnknownContainer),
+            "expected UnknownContainer, got {error:?}"
+        );
+    }
+
+    /// A record batch is read as bytes, and nothing else.
+    ///
+    /// [`BatchDecoder`] hands the whole of one batch to whoever asked for it,
+    /// which is `deflated::Batch`'s own `Decode` — it parses the fixed
+    /// forty-nine byte header itself, because the batch layout is not
+    /// version-negotiated and does not go through the message metadata.
+    #[test]
+    fn a_record_batch_is_read_as_bytes_and_nothing_else() -> Result<()> {
+        assert_eq!(
+            Bytes::from_static(&[1, 2, 3]),
+            from_batch::<Bytes>(&[1, 2, 3])?
+        );
+        assert_eq!(b"abc".to_vec(), from_batch::<AsBytes>(b"abc")?.0);
+
+        let payload = [0u8, 0, 0, 1, 0, 0, 0, 0];
+
+        for error in [
+            from_batch::<Any>(&payload).expect_err("a self-describing value"),
+            from_batch::<bool>(&payload).expect_err("a bool"),
+            from_batch::<i8>(&payload).expect_err("an i8"),
+            from_batch::<i16>(&payload).expect_err("an i16"),
+            from_batch::<i32>(&payload).expect_err("an i32"),
+            from_batch::<i64>(&payload).expect_err("an i64"),
+            from_batch::<u8>(&payload).expect_err("a u8"),
+            from_batch::<u16>(&payload).expect_err("a u16"),
+            from_batch::<u32>(&payload).expect_err("a u32"),
+            from_batch::<u64>(&payload).expect_err("a u64"),
+            from_batch::<f32>(&payload).expect_err("an f32"),
+            from_batch::<f64>(&payload).expect_err("an f64"),
+            from_batch::<char>(&payload).expect_err("a char"),
+            from_batch::<String>(&payload).expect_err("a string"),
+            from_batch::<Str>(&payload).expect_err("a borrowed string"),
+            from_batch::<Option<i32>>(&payload).expect_err("an option"),
+            from_batch::<()>(&payload).expect_err("a unit"),
+            from_batch::<Vec<i32>>(&payload).expect_err("a sequence"),
+            from_batch::<(i32, i32)>(&payload).expect_err("a tuple"),
+            from_batch::<BTreeMap<i32, i32>>(&payload).expect_err("a map"),
+            from_batch::<Identifier>(&payload).expect_err("an identifier"),
+            from_batch::<IgnoredAny>(&payload).expect_err("an ignored value"),
+        ] {
+            assert_unexpected_type(error);
+        }
+
+        Ok(())
+    }
+
+    /// A struct, a unit struct, a tuple struct, a newtype struct and an enum
+    /// are refused by the record-batch decoder too.
+    ///
+    /// Named separately because each carries its own name into the error, so
+    /// they cannot share the loop above.
+    #[test]
+    fn a_record_batch_refuses_every_named_form() {
+        #[allow(dead_code)]
+        #[derive(Debug, Deserialize)]
+        struct UnitStruct;
+
+        #[allow(dead_code)]
+        #[derive(Debug, Deserialize)]
+        struct TupleStruct(i32, i32);
+
+        #[allow(dead_code)]
+        #[derive(Debug, Deserialize)]
+        struct Newtype(i32);
+
+        #[allow(dead_code)]
+        #[derive(Debug, Deserialize)]
+        struct Pair {
+            first: i32,
+        }
+
+        #[allow(dead_code)]
+        #[derive(Debug, Deserialize)]
+        enum Variants {
+            Unit,
+        }
+
+        let payload = [0u8, 0, 0, 1];
+
+        for error in [
+            from_batch::<UnitStruct>(&payload).expect_err("a unit struct"),
+            from_batch::<TupleStruct>(&payload).expect_err("a tuple struct"),
+            from_batch::<Newtype>(&payload).expect_err("a newtype struct"),
+            from_batch::<Pair>(&payload).expect_err("a struct"),
+            from_batch::<Variants>(&payload).expect_err("an enum"),
+        ] {
+            assert_unexpected_type(error);
+        }
+    }
+
+    /// A batch whose declared length runs past the records it was read from is
+    /// refused.
+    ///
+    /// The records field is a length and then that many bytes of batches, each
+    /// of which declares its own length again. The two can disagree — the outer
+    /// length is what the frame supplied and the inner one is what the batch
+    /// header claims — and splitting on the claim is what would panic.
+    #[test]
+    fn a_batch_declaring_more_bytes_than_it_has_is_refused() {
+        let mut batch = Batch::new(Bytes::from_static(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3, 231]));
+
+        let error = batch
+            .next_element::<Bytes>()
+            .expect_err("a batch claiming 999 bytes of nothing");
+
+        assert!(
+            matches!(error, Error::Overflow),
+            "expected Overflow, got {error:?}"
+        );
+    }
+
+    /// A records field with nothing left in it is the end of the sequence.
+    #[test]
+    fn a_records_field_with_no_batches_left_ends_the_sequence() -> Result<()> {
+        assert_eq!(None, Batch::new(Bytes::new()).next_element::<Bytes>()?);
+
+        Ok(())
     }
 }

@@ -1034,12 +1034,12 @@ impl Serializer for &mut RecordBatchEncoder {
 
     #[instrument(skip(self))]
     fn serialize_char(self, v: char) -> std::result::Result<Self::Ok, Self::Error> {
-        unimplemented!("{v}")
+        Err(Error::UnexpectedType(format!("{v}")))
     }
 
     #[instrument(skip(self))]
     fn serialize_str(self, v: &str) -> std::result::Result<Self::Ok, Self::Error> {
-        unimplemented!("{v}")
+        Err(Error::UnexpectedType(v.into()))
     }
 
     #[instrument(skip(self))]
@@ -1058,12 +1058,12 @@ impl Serializer for &mut RecordBatchEncoder {
     where
         T: ?Sized + Serialize,
     {
-        unimplemented!("{}", type_name_of_val(value))
+        Err(Error::UnexpectedType(type_name_of_val(value).into()))
     }
 
     #[instrument(skip_all)]
     fn serialize_unit(self) -> std::result::Result<Self::Ok, Self::Error> {
-        unimplemented!()
+        Err(Error::UnexpectedType(String::from("unit")))
     }
 
     #[instrument(skip(self))]
@@ -1071,7 +1071,7 @@ impl Serializer for &mut RecordBatchEncoder {
         self,
         name: &'static str,
     ) -> std::result::Result<Self::Ok, Self::Error> {
-        unimplemented!()
+        Err(Error::UnexpectedType(name.into()))
     }
 
     #[instrument(skip(self))]
@@ -1081,7 +1081,9 @@ impl Serializer for &mut RecordBatchEncoder {
         variant_index: u32,
         variant: &'static str,
     ) -> std::result::Result<Self::Ok, Self::Error> {
-        unimplemented!("{name}, {variant_index}, {variant}")
+        Err(Error::UnexpectedType(format!(
+            "{name}, {variant_index}, {variant}"
+        )))
     }
 
     #[instrument(skip_all, fields(name, value = type_name::<T>()))]
@@ -1093,7 +1095,10 @@ impl Serializer for &mut RecordBatchEncoder {
     where
         T: ?Sized + Serialize,
     {
-        unimplemented!("{}, {name}", type_name_of_val(value))
+        Err(Error::UnexpectedType(format!(
+            "{}, {name}",
+            type_name_of_val(value)
+        )))
     }
 
     #[instrument(skip_all, fields(name, variant_index, variant, value = type_name::<T>()))]
@@ -1107,10 +1112,10 @@ impl Serializer for &mut RecordBatchEncoder {
     where
         T: ?Sized + Serialize,
     {
-        unimplemented!(
+        Err(Error::UnexpectedType(format!(
             "{}, {name}, {variant_index}, {variant}",
             type_name_of_val(value)
-        );
+        )))
     }
 
     #[instrument(skip(self))]
@@ -1123,7 +1128,7 @@ impl Serializer for &mut RecordBatchEncoder {
 
     #[instrument(skip(self))]
     fn serialize_tuple(self, len: usize) -> std::result::Result<Self::SerializeTuple, Self::Error> {
-        unimplemented!("{len}")
+        Err(Error::UnexpectedType(format!("{len}")))
     }
 
     #[instrument(skip(self))]
@@ -1132,7 +1137,7 @@ impl Serializer for &mut RecordBatchEncoder {
         name: &'static str,
         len: usize,
     ) -> std::result::Result<Self::SerializeTupleStruct, Self::Error> {
-        unimplemented!("{name}, {len}")
+        Err(Error::UnexpectedType(format!("{name}, {len}")))
     }
 
     #[instrument(skip(self))]
@@ -1143,7 +1148,9 @@ impl Serializer for &mut RecordBatchEncoder {
         variant: &'static str,
         len: usize,
     ) -> std::result::Result<Self::SerializeTupleVariant, Self::Error> {
-        unimplemented!("{name}, {variant_index}, {variant}, {len}")
+        Err(Error::UnexpectedType(format!(
+            "{name}, {variant_index}, {variant}, {len}"
+        )))
     }
 
     #[instrument(skip(self))]
@@ -1151,7 +1158,7 @@ impl Serializer for &mut RecordBatchEncoder {
         self,
         len: Option<usize>,
     ) -> std::result::Result<Self::SerializeMap, Self::Error> {
-        unimplemented!("{len:?}")
+        Err(Error::UnexpectedType(format!("{len:?}")))
     }
 
     #[instrument(skip(self))]
@@ -1202,11 +1209,11 @@ impl SerializeTuple for &mut RecordBatchEncoder {
     where
         T: ?Sized + Serialize,
     {
-        todo!()
+        Err(Error::UnexpectedType(type_name_of_val(value).into()))
     }
 
     fn end(self) -> std::result::Result<Self::Ok, Self::Error> {
-        todo!()
+        Err(Error::UnexpectedType(type_name::<Self>().into()))
     }
 }
 
@@ -1219,11 +1226,11 @@ impl SerializeTupleVariant for &mut RecordBatchEncoder {
     where
         T: ?Sized + Serialize,
     {
-        todo!()
+        Err(Error::UnexpectedType(type_name_of_val(value).into()))
     }
 
     fn end(self) -> std::result::Result<Self::Ok, Self::Error> {
-        todo!()
+        Err(Error::UnexpectedType(type_name::<Self>().into()))
     }
 }
 
@@ -1236,18 +1243,18 @@ impl SerializeMap for &mut RecordBatchEncoder {
     where
         T: ?Sized + Serialize,
     {
-        todo!()
+        Err(Error::UnexpectedType(type_name_of_val(key).into()))
     }
 
     fn serialize_value<T>(&mut self, value: &T) -> std::result::Result<(), Self::Error>
     where
         T: ?Sized + Serialize,
     {
-        todo!()
+        Err(Error::UnexpectedType(type_name_of_val(value).into()))
     }
 
     fn end(self) -> std::result::Result<Self::Ok, Self::Error> {
-        todo!()
+        Err(Error::UnexpectedType(type_name::<Self>().into()))
     }
 }
 
@@ -1282,11 +1289,11 @@ impl SerializeTupleStruct for &mut RecordBatchEncoder {
     where
         T: ?Sized + Serialize,
     {
-        todo!()
+        Err(Error::UnexpectedType(type_name_of_val(value).into()))
     }
 
     fn end(self) -> std::result::Result<Self::Ok, Self::Error> {
-        todo!()
+        Err(Error::UnexpectedType(type_name::<Self>().into()))
     }
 }
 
@@ -1503,6 +1510,276 @@ mod encode_allocation {
                 encoded.len().saturating_sub(estimate) as f64 / topics as f64,
             );
         }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod accepted_forms {
+    //! What the two serializers in this file accept, and what they refuse
+    //! (#556).
+    //!
+    //! Neither writes anything that says what a value *is* — the protocol is
+    //! positional and a record batch is a fixed layout — so a form outside the
+    //! set each one encodes cannot be skipped or approximated. It has to be an
+    //! error, and until #556 the record-batch encoder made it a panic instead:
+    //! twenty-two `todo!()` and `unimplemented!()` arms in a serializer whose
+    //! every other arm returns `Result`. Nothing in the tree reaches them,
+    //! which is exactly what was said about the allocation estimate in
+    //! `encode_allocation` before it took down two `tokio-rt-worker` threads
+    //! (#312).
+
+    use super::*;
+    use serde::Serialize;
+    use std::collections::BTreeMap;
+
+    #[derive(Serialize)]
+    struct UnitStruct;
+
+    #[derive(Serialize)]
+    enum Variants {
+        Unit,
+        Newtype(i32),
+        Tuple(i32, i32),
+    }
+
+    #[derive(Serialize)]
+    struct TupleStruct(i32, i32);
+
+    #[derive(Serialize)]
+    struct Newtype(i32);
+
+    /// What the protocol encoder writes for a value, with no message metadata
+    /// in play.
+    fn encoded<T>(value: &T) -> Result<Vec<u8>>
+    where
+        T: Serialize + ?Sized,
+    {
+        let mut encoder = Encoder::new(BytesMut::new());
+        value.serialize(&mut encoder)?;
+        Ok(Vec::from(&BytesMut::from(encoder)[..]))
+    }
+
+    /// What the record-batch encoder writes for a value.
+    fn in_batch<T>(value: &T) -> Result<Vec<u8>>
+    where
+        T: Serialize + ?Sized,
+    {
+        let mut encoder = RecordBatchEncoder::new(BytesMut::new());
+        value.serialize(&mut encoder)?;
+        Ok(Vec::from(&BytesMut::from(encoder)[..]))
+    }
+
+    fn assert_unexpected_type(error: Error) {
+        assert!(
+            matches!(error, Error::UnexpectedType(_)),
+            "expected UnexpectedType, got {error:?}"
+        );
+    }
+
+    /// Every fixed-width number is big-endian, in both encoders.
+    ///
+    /// The unsigned widths and the floats are here because the encoders answer
+    /// for them, not because Kafka's schema has them: the generated types use
+    /// the signed widths and `u8`/`u32` for record counts. An arm that exists
+    /// and is never exercised is an arm that can be wrong for as long as it
+    /// takes something to start using it.
+    #[test]
+    fn every_fixed_width_number_is_big_endian_in_both_encoders() -> Result<()> {
+        for encode in [encoded as fn(&u64) -> Result<Vec<u8>>, in_batch] {
+            assert_eq!(vec![0, 0, 0, 0, 0, 0, 0, 10], encode(&10u64)?);
+        }
+
+        assert_eq!(1.5f32.to_be_bytes().to_vec(), encoded(&1.5f32)?);
+        assert_eq!(2.5f64.to_be_bytes().to_vec(), encoded(&2.5f64)?);
+        assert_eq!(1.5f32.to_be_bytes().to_vec(), in_batch(&1.5f32)?);
+        assert_eq!(2.5f64.to_be_bytes().to_vec(), in_batch(&2.5f64)?);
+
+        assert_eq!(vec![1], in_batch(&true)?);
+        assert_eq!(vec![0, 8], in_batch(&8u16)?);
+
+        Ok(())
+    }
+
+    /// The protocol encoder refuses the forms the wire format has no encoding
+    /// for.
+    ///
+    /// A tuple struct and a tuple variant are refused at their first field
+    /// rather than when they are opened, and a map at its first key, because
+    /// the serializer's associated types are all `Self` — there is nowhere for
+    /// `serialize_map` itself to fail. An empty map is refused by `end`.
+    #[test]
+    fn the_protocol_encoder_refuses_what_the_wire_format_cannot_carry() {
+        for value in [
+            encoded(&'a'),
+            encoded(&()),
+            encoded(&UnitStruct),
+            encoded(&Variants::Unit),
+            encoded(&TupleStruct(1, 2)),
+            encoded(&Variants::Tuple(1, 2)),
+            encoded(&BTreeMap::from([(1i32, 2i32)])),
+            encoded(&BTreeMap::<i32, i32>::new()),
+        ] {
+            assert_unexpected_type(value.expect_err("a form the wire format cannot carry"));
+        }
+    }
+
+    /// A map's value is refused as well as its key, for a caller driving the
+    /// serializer by hand.
+    ///
+    /// A derived `Serialize` never gets past the key, which is why the value
+    /// has to refuse too rather than trusting that it cannot be reached.
+    #[test]
+    fn the_protocol_encoder_refuses_a_map_value_as_well_as_a_key() -> Result<()> {
+        let mut encoder = Encoder::new(BytesMut::new());
+        let mut map = (&mut encoder).serialize_map(Some(1))?;
+
+        assert_unexpected_type(
+            map.serialize_value(&1i32)
+                .expect_err("a map value has no encoding"),
+        );
+
+        Ok(())
+    }
+
+    /// A record batch is numbers and bytes, and nothing else.
+    ///
+    /// `bytes` is the record data, written raw with no length in front of it —
+    /// the batch header already said how long it is. Everything on this list
+    /// was a `todo!()` or an `unimplemented!()` until #556, including `str`:
+    /// a record batch has no string field at any version, and asking it to
+    /// write one aborted the process rather than returning the error every
+    /// caller of this serializer is already handling.
+    #[test]
+    fn a_record_batch_is_numbers_and_bytes_and_nothing_else() -> Result<()> {
+        assert_eq!(vec![1, 2, 3], in_batch(&Bytes::from_static(&[1, 2, 3]))?);
+
+        for value in [
+            in_batch(&'a'),
+            in_batch("abc"),
+            in_batch(&Some(1i32)),
+            in_batch(&()),
+            in_batch(&UnitStruct),
+            in_batch(&Variants::Unit),
+            in_batch(&Variants::Newtype(1)),
+            in_batch(&(1i32, 2i32)),
+            in_batch(&Newtype(7)),
+            in_batch(&TupleStruct(1, 2)),
+            in_batch(&Variants::Tuple(1, 2)),
+            in_batch(&BTreeMap::from([(1i32, 2i32)])),
+        ] {
+            assert_unexpected_type(value.expect_err("a form a record batch cannot carry"));
+        }
+
+        Ok(())
+    }
+
+    /// An absent field writes nothing in a record batch, where a present one is
+    /// refused.
+    ///
+    /// The asymmetry is deliberate and it is load-bearing: `deflated::Batch`
+    /// has no optional field, so `None` writing nothing is what lets an
+    /// `Option` in a *containing* struct pass through, while `Some` has no
+    /// layout to write into.
+    #[test]
+    fn an_absent_field_writes_nothing_in_a_record_batch() -> Result<()> {
+        assert!(in_batch(&Option::<i32>::None)?.is_empty());
+
+        Ok(())
+    }
+
+    /// The record-batch encoder's sequence and map drivers refuse their
+    /// elements, reached by hand because nothing hands them out.
+    ///
+    /// `serialize_tuple`, `serialize_tuple_struct`, `serialize_tuple_variant`
+    /// and `serialize_map` all refuse before returning one of these, so their
+    /// `serialize_*`/`end` pairs are unreachable through `Serialize`. They are
+    /// asserted rather than deleted because the trait requires them, and a
+    /// `todo!()` in a method the compiler insists exists is a panic waiting for
+    /// the day something calls it.
+    #[test]
+    fn the_record_batch_element_drivers_refuse_everything() {
+        let mut encoder = RecordBatchEncoder::new(BytesMut::new());
+
+        let mut tuple: &mut RecordBatchEncoder = &mut encoder;
+        assert_unexpected_type(
+            SerializeTuple::serialize_element(&mut tuple, &1i32).expect_err("a tuple element"),
+        );
+        assert_unexpected_type(SerializeTuple::end(tuple).expect_err("a tuple"));
+
+        let mut tuple_struct: &mut RecordBatchEncoder = &mut encoder;
+        assert_unexpected_type(
+            SerializeTupleStruct::serialize_field(&mut tuple_struct, &1i32)
+                .expect_err("a tuple struct field"),
+        );
+        assert_unexpected_type(
+            SerializeTupleStruct::end(tuple_struct).expect_err("a tuple struct"),
+        );
+
+        let mut tuple_variant: &mut RecordBatchEncoder = &mut encoder;
+        assert_unexpected_type(
+            SerializeTupleVariant::serialize_field(&mut tuple_variant, &1i32)
+                .expect_err("a tuple variant field"),
+        );
+        assert_unexpected_type(
+            SerializeTupleVariant::end(tuple_variant).expect_err("a tuple variant"),
+        );
+
+        let mut map: &mut RecordBatchEncoder = &mut encoder;
+        assert_unexpected_type(map.serialize_key(&1i32).expect_err("a map key"));
+        assert_unexpected_type(map.serialize_value(&1i32).expect_err("a map value"));
+        assert_unexpected_type(SerializeMap::end(map).expect_err("a map"));
+    }
+
+    /// The protocol encoder's tuple drivers refuse their `end` as well as
+    /// their fields, reached by hand because a derived `Serialize` stops at the
+    /// first field.
+    #[test]
+    fn the_protocol_tuple_drivers_refuse_their_end() {
+        let mut encoder = Encoder::new(BytesMut::new());
+
+        let tuple_struct = (&mut encoder).serialize_tuple_struct("TupleStruct", 2);
+        assert_unexpected_type(
+            tuple_struct
+                .and_then(SerializeTupleStruct::end)
+                .expect_err("a tuple struct"),
+        );
+
+        let tuple_variant = (&mut encoder).serialize_tuple_variant("Variants", 0, "Tuple", 2);
+        assert_unexpected_type(
+            tuple_variant
+                .and_then(SerializeTupleVariant::end)
+                .expect_err("a tuple variant"),
+        );
+    }
+
+    /// A struct variant is written as its fields, in both encoders, with
+    /// nothing saying which variant it was.
+    ///
+    /// That is how the `Body` enum is encoded — the API key in the header is
+    /// what names the variant — and it is why the record-batch encoder's
+    /// struct-variant arm is `Ok` rather than a refusal.
+    #[test]
+    fn a_struct_variant_is_written_as_its_fields() -> Result<()> {
+        #[derive(Serialize)]
+        enum Variants {
+            Struct { value: i16 },
+        }
+
+        assert_eq!(vec![0, 6], encoded(&Variants::Struct { value: 6 })?);
+        assert_eq!(vec![0, 6], in_batch(&Variants::Struct { value: 6 })?);
+
+        Ok(())
+    }
+
+    /// A newtype struct is its inner value, in both encoders.
+    #[test]
+    fn a_newtype_struct_is_its_inner_value() -> Result<()> {
+        #[derive(Serialize)]
+        struct Wrapper(i32);
+
+        assert_eq!(vec![0, 0, 0, 7], encoded(&Wrapper(7))?);
 
         Ok(())
     }
