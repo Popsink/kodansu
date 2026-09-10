@@ -244,7 +244,7 @@ use opentelemetry_semantic_conventions::SCHEMA_URL;
 use rama::{Context, Layer, Service};
 use rand::{prelude::*, rngs::SmallRng};
 use tansu_sans_io::{Body, Frame};
-use tokio::{net::lookup_host, sync::oneshot, task::JoinError, time::sleep};
+use tokio::{net::lookup_host, runtime::Handle, sync::oneshot, task::JoinError, time::sleep};
 use tracing::{debug, instrument};
 use url::Url;
 
@@ -505,11 +505,45 @@ pub async fn host_port(url: Url) -> Result<SocketAddr, Error> {
     Err(Error::UnknownHost(url))
 }
 
+/// Bucket boundaries for every duration histogram here, in milliseconds.
+///
+/// The OTel SDK's default ladder stops at a top finite bucket of 10 000 — of
+/// anything, whatever its unit. For a broker that is 10 s, and every request
+/// slower than that lands in `+Inf` together, which is where #535's 24 s
+/// Fetches were: a p99 computed over that ladder cannot say whether the tail is
+/// 11 s or 40 s, and #537 halving it would not have shown (#539).
+///
+/// Sixteen boundaries, the same count as the SDK default, so the memory and
+/// export cost is unchanged. Dense to 1 s because that is where a healthy
+/// broker sits, then decade-ish to a minute, which is past any timeout a client
+/// in this fleet uses.
+pub(crate) const DURATION_MS_BOUNDARIES: &[f64] = &[
+    1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0, 10000.0, 20000.0,
+    30000.0, 60000.0,
+];
+
+/// Bucket boundaries for every size histogram here, in bytes.
+///
+/// Same defect as the durations and worse: the default top finite bucket of
+/// 10 000 is 10 kB, and 9% of 91.6 M responses measured in production exceeded
+/// it, all of them in one `+Inf` bucket. #537 moved a response from 14.7 MB to
+/// 5.36 MB and the broker's own metrics could not see it (#539).
+///
+/// Powers of four to 1 MiB, then powers of two to 64 MiB. The top matters:
+/// the Fetch clamp defaults to 5 MiB and is a per-deployment key that has been
+/// run at 16 MiB, so the interesting region is exactly the one the default
+/// ladder collapses.
+pub(crate) const SIZE_BYTES_BOUNDARIES: &[f64] = &[
+    64.0, 256.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 1048576.0, 2097152.0, 4194304.0,
+    8388608.0, 16777216.0, 33554432.0, 67108864.0,
+];
+
 pub(crate) static DNS_LOOKUP_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
     METER
         .u64_histogram("dns_lookup_duration")
         .with_unit("ms")
         .with_description("DNS lookup latencies")
+        .with_boundaries(DURATION_MS_BOUNDARIES.to_vec())
         .build()
 });
 
@@ -518,6 +552,7 @@ pub(crate) static REQUEST_SIZE: LazyLock<Histogram<u64>> = LazyLock::new(|| {
         .u64_histogram("tansu_request_size")
         .with_unit("By")
         .with_description("The API request size in bytes")
+        .with_boundaries(SIZE_BYTES_BOUNDARIES.to_vec())
         .build()
 });
 
@@ -526,6 +561,7 @@ pub(crate) static RESPONSE_SIZE: LazyLock<Histogram<u64>> = LazyLock::new(|| {
         .u64_histogram("tansu_response_size")
         .with_unit("By")
         .with_description("The API response size in bytes")
+        .with_boundaries(SIZE_BYTES_BOUNDARIES.to_vec())
         .build()
 });
 
@@ -534,7 +570,84 @@ pub(crate) static REQUEST_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| 
         .u64_histogram("tansu_request_duration")
         .with_unit("ms")
         .with_description("The API request latencies in milliseconds")
+        .with_boundaries(DURATION_MS_BOUNDARIES.to_vec())
         .build()
+});
+
+/// How long the answer took to reach the socket, once the broker had it.
+///
+/// `tansu_request_duration` stamps when `inner.serve` returns, and `serve`
+/// returns an already-encoded frame — so `write_all` plus `flush` is the one
+/// part of answering a request that no histogram covered. #539 predicted it is
+/// small; this is what says so, and it is the series that separates "the broker
+/// was slow" from "the peer was not reading".
+///
+/// Recorded on the error path too. A write that fails after seconds of
+/// backpressure is the interesting sample, and an `inspect`-shaped stamp would
+/// drop exactly that one.
+pub(crate) static RESPONSE_WRITE_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    METER
+        .u64_histogram("tansu_response_write_duration")
+        .with_unit("ms")
+        .with_description("Time from the encoded response in hand to flush returning")
+        .with_boundaries(DURATION_MS_BOUNDARIES.to_vec())
+        .build()
+});
+
+/// Registers the two tokio runtime gauges, once per process.
+///
+/// `tansu_response_write_duration` on its own cannot say *why* a write was
+/// slow: "the peer is not draining its socket" and "the runtime is saturated
+/// and this continuation sat in a queue" produce the same number, and only the
+/// second is a broker defect (#539). These two are what tell them apart —
+/// a slow write with a shallow queue and idle workers is the peer.
+///
+/// Both are stable tokio API on a 64-bit target: `global_queue_depth` is
+/// ungated and `worker_total_busy_duration` needs only `target_has_atomic =
+/// "64"`, so neither asks for `--cfg tokio_unstable`.
+///
+/// The [`Handle`] is captured here rather than in the callback: the callback
+/// runs on the exporter's thread, which is not inside the runtime, and
+/// `Handle::current()` there would panic.
+///
+/// Call it from inside the runtime. Idempotent — a second call is the
+/// `LazyLock` already forced.
+pub fn register_runtime_gauges() {
+    _ = LazyLock::force(&RUNTIME_GAUGES);
+}
+
+static RUNTIME_GAUGES: LazyLock<()> = LazyLock::new(|| {
+    let Ok(handle) = Handle::try_current() else {
+        // Not in a runtime, so there is nothing to observe and no `Handle` to
+        // capture. The alternative is a panic in a metric registration, which
+        // is not a thing that should be able to stop a broker.
+        return;
+    };
+
+    let queue_depth = handle.clone();
+
+    _ = METER
+        .u64_observable_gauge("tansu_runtime_global_queue_depth")
+        .with_description("Tasks waiting in the runtime's global queue")
+        .with_callback(move |observer| {
+            observer.observe(queue_depth.metrics().global_queue_depth() as u64, &[])
+        })
+        .build();
+
+    _ = METER
+        .u64_observable_gauge("tansu_runtime_worker_busy_ms")
+        .with_unit("ms")
+        .with_description("Total time the runtime's workers have spent busy")
+        .with_callback(move |observer| {
+            let metrics = handle.metrics();
+
+            let busy = (0..metrics.num_workers())
+                .map(|worker| metrics.worker_total_busy_duration(worker).as_millis() as u64)
+                .sum();
+
+            observer.observe(busy, &[])
+        })
+        .build();
 });
 
 pub(crate) static API_REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
