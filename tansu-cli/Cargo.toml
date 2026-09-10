@@ -43,3 +43,12 @@ tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# A throwaway self-signed certificate for the `--cert`/`--key` tests (#358),
+# on the same terms as `tansu-broker`'s TLS suite: no key material in the
+# tree, and nothing to expire.
+rcgen.workspace = true
+
+tempfile.workspace = true
+tokio-util.workspace = true

@@ -16,6 +16,9 @@ use std::{collections::HashMap, env::vars, fmt, result, str::FromStr};
 
 mod cli;
 
+#[cfg(test)]
+mod harness;
+
 pub use cli::Cli;
 use regex::{Regex, Replacer};
 
@@ -103,5 +106,105 @@ where
             .replace(s)
             .and_then(|s| T::from_str(&s).map_err(Into::into))
             .map(|t| Self(t))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use url::Url;
+
+    fn var_rep(pairs: [(&str, &str); 2]) -> VarRep {
+        VarRep::from(
+            pairs
+                .into_iter()
+                .map(|(name, value)| (String::from(name), String::from(value)))
+                .collect::<HashMap<_, _>>(),
+        )
+    }
+
+    /// The `${VAR}` form is the only one expanded: a bare `$VAR` and a
+    /// `%VAR%` are left alone, because the values these appear in are URLs
+    /// and a `$` in a password is not a reference.
+    #[test]
+    fn only_the_braced_form_is_a_reference() -> Result<()> {
+        let vars = var_rep([("BUCKET", "tansu"), ("PORT", "9092")]);
+
+        assert_eq!("s3://tansu/", vars.replace("s3://${BUCKET}/")?);
+        assert_eq!("s3://$BUCKET/", vars.replace("s3://$BUCKET/")?);
+        assert_eq!("s3://%BUCKET%/", vars.replace("s3://%BUCKET%/")?);
+
+        Ok(())
+    }
+
+    /// An unset variable expands to nothing rather than being left in place.
+    /// It is the behaviour that makes `tcp://0.0.0.0:${PORT}` with no `PORT`
+    /// fail on the URL — visibly, at startup — instead of a broker listening
+    /// on a port nobody asked for.
+    #[test]
+    fn an_unset_variable_expands_to_nothing() -> Result<()> {
+        let vars = var_rep([("BUCKET", "tansu"), ("PORT", "9092")]);
+
+        assert_eq!("s3:///", vars.replace("s3://${MISSING}/")?);
+
+        Ok(())
+    }
+
+    /// `Regex::replace` replaces the *first* match only, which is what the
+    /// arguments this is used on need — one reference each — and is worth
+    /// pinning because it is not what `replace_all` would do.
+    #[test]
+    fn the_first_reference_is_the_one_expanded() -> Result<()> {
+        let vars = var_rep([("BUCKET", "tansu"), ("PORT", "9092")]);
+
+        assert_eq!("tansu:${PORT}", vars.replace("${BUCKET}:${PORT}")?);
+
+        Ok(())
+    }
+
+    /// The wrapper is what `--storage-engine 's3://${BUCKET}/'` goes through,
+    /// so it has to expand *before* the inner type parses. A URL that would
+    /// not parse un-expanded is the assertion: `memory://${UNSET}tansu/`
+    /// reaches `Url` as `memory://tansu/`.
+    #[test]
+    fn the_wrapper_expands_before_the_inner_type_parses() -> Result<()> {
+        assert_eq!(
+            Url::parse("memory://tansu/")?,
+            EnvVarExp::<Url>::from_str("memory://${TANSU_TEST_UNSET_VARIABLE}tansu/")?.into_inner()
+        );
+
+        Ok(())
+    }
+
+    /// A value with no reference in it is passed through untouched, which is
+    /// every argument in a deployment that does not use the feature.
+    #[test]
+    fn a_value_with_no_reference_is_passed_through() -> Result<()> {
+        assert_eq!(
+            Url::parse("tcp://localhost:9092")?,
+            EnvVarExp::<Url>::from_str("tcp://localhost:9092")?.into_inner()
+        );
+
+        Ok(())
+    }
+
+    /// The inner type's parse failure is the wrapper's error, not a panic and
+    /// not a silent default.
+    #[test]
+    fn the_inner_type_still_has_to_parse() {
+        assert!(matches!(
+            EnvVarExp::<Url>::from_str("not a url"),
+            Err(Error::Url(_))
+        ));
+    }
+
+    /// `Display` is `Debug`, which is what makes `main`'s error line name the
+    /// variant and its source rather than printing nothing.
+    #[test]
+    fn an_error_displays_as_its_debug_form() {
+        let error = Error::from(Url::parse("not a url").expect_err("not a url"));
+
+        assert_eq!(format!("{error:?}"), format!("{error}"));
+        assert!(format!("{error}").contains("RelativeUrlWithoutBase"));
     }
 }

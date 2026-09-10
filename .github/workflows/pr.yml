@@ -197,10 +197,10 @@ jobs:
           cache: false
       - uses: taiki-e/install-action@nextest
       - uses: taiki-e/install-action@cargo-llvm-cov
-      # The floor is a ratchet, and 83 is deliberately under the ~85.29%
-      # measured once #556's second milestone put `tansu-topic` at 100%: it is
-      # there to catch a change that deletes the tests covering the code it
-      # touches, not to police a decimal point.
+      # The floor is a ratchet, and 85 is deliberately under the ~87.22%
+      # measured once #556's third milestone took `tansu-cli` from 29% to 96%:
+      # it is there to catch a change that deletes the tests covering the code
+      # it touches, not to police a decimal point.
       #
       # Two points is more slack than `comments` gets below, and the reason is
       # that this number is not reproducible to the digit the way that one is.
@@ -213,7 +213,7 @@ jobs:
       #
       # Raise it when the real number moves up; never lower it to turn a red
       # build green, which is the one edit that makes this job decorative.
-      - run: just coverage-ci 83
+      - run: just coverage-ci 85
       - name: Coverage summary
         if: always()
         run: |

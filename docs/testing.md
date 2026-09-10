@@ -80,7 +80,7 @@ rather than the write.
 ```shell
 just coverage          # summary in the terminal
 just coverage-html     # browsable report, opens in a browser
-just coverage-ci 83    # what CI runs: lcov + HTML + summary, floored at 83%
+just coverage-ci 85    # what CI runs: lcov + HTML + summary, floored at 85%
 ```
 
 All three need `cargo-llvm-cov` and the `llvm-tools-preview` component:
@@ -95,9 +95,16 @@ attaches `lcov.info` plus the HTML report as the `coverage` artifact. It also
 uploads to Codecov, but only if a `CODECOV_TOKEN` secret exists — the artifact is
 the fallback and needs no third-party account.
 
-The measured value is **85.29%** at the commit that put `tansu-topic` at 100%
-(#556's second milestone), up from 84.06% when #549 closed the orphan-bin hole.
-The floor below tracks it two points back.
+The measured value is **87.22%** at the commit that took `tansu-cli` from 29% to
+96% (#556's third milestone), up from 85.29% when `tansu-topic` reached 100% and
+84.06% when #549 closed the orphan-bin hole. The floor below tracks it two points
+back.
+
+Two files in that crate are deliberately left uncovered rather than excluded from
+the denominator: `Cli::main`, which reads the real argv, and `broker::Arg::main`,
+which serves until cancelled. Each says so in a doc comment citing #556. An
+`--ignore-filename-regex` would make them invisible instead, and invisible is how
+a `main` stops being counted at all.
 
 `just coverage-ci` takes a floor and fails under it. The floor is a **ratchet**:
 raise it as the real number rises, and never lower it to turn a red build green.
