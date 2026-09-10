@@ -121,7 +121,7 @@ impl FrameClient {
     }
 }
 
-async fn storage() -> Result<Arc<Box<dyn Storage>>> {
+async fn storage() -> Result<Arc<dyn Storage>> {
     StorageContainer::builder()
         .cluster_id(Uuid::now_v7().to_string())
         .node_id(111)
@@ -135,7 +135,7 @@ async fn storage() -> Result<Arc<Box<dyn Storage>>> {
 /// The real broker stack on an ephemeral port, with the real group coordinator:
 /// nothing here is a stub, because the property under test is which APIs the
 /// production route table answers.
-async fn serve_broker_stack() -> Result<(u16, Arc<Box<dyn Storage>>)> {
+async fn serve_broker_stack() -> Result<(u16, Arc<dyn Storage>)> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let port = listener.local_addr()?.port();
     let storage = storage().await?;

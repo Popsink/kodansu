@@ -52,7 +52,7 @@ fn batch() -> Result<deflated::Batch, Error> {
         .map_err(Into::into)
 }
 
-async fn storage_from(query: &str) -> Result<Arc<Box<dyn Storage>>, Error> {
+async fn storage_from(query: &str) -> Result<Arc<dyn Storage>, Error> {
     StorageContainer::builder()
         .cluster_id(cluster_id())
         .node_id(111)

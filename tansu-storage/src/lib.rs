@@ -2689,7 +2689,7 @@ impl<T> From<serde_json::Error> for UpdateError<T> {
 /// This was an enum of `Null` / `DynoStore` with a hand-written ~750-line
 /// `Storage` impl mirroring the whole trait. Neither variant was ever
 /// constructed: `build()` returns the concrete engine behind
-/// `Arc<Box<dyn Storage>>`, so the impl was unreachable and its per-method
+/// `Arc<dyn Storage>`, so the impl was unreachable and its per-method
 /// request/error counters were never emitted — while two Grafana panels queried
 /// them and read a flat zero, which is how an operator concluded there was no
 /// storage traffic on a broker serving ~14.7k topics.
@@ -3105,7 +3105,7 @@ fn coalesce_tuning(storage: &Url) -> CoalesceTuning {
 }
 
 impl Builder<i32, String, Url, Url> {
-    pub async fn build(self) -> Result<Arc<Box<dyn Storage>>> {
+    pub async fn build(self) -> Result<Arc<dyn Storage>> {
         // Routed through [`Backend`] rather than matching `scheme()` here, so
         // that a backend added to one builder cannot be missing from the other
         // two: this match is exhaustive over the enum (#531).
@@ -3167,8 +3167,7 @@ impl Builder<i32, String, Url, Url> {
                             .with_minimum_size(minimum_size)
                             .with_maximum_delay(maximum_delay)
                     })
-                    .map(|storage| Box::new(storage) as Box<dyn Storage>)
-                    .map(Arc::new)
+                    .map(|storage| Arc::new(storage) as Arc<dyn Storage>)
             }
 
             #[cfg(feature = "dynostore")]
@@ -3241,8 +3240,7 @@ impl Builder<i32, String, Url, Url> {
                             .with_minimum_size(minimum_size)
                             .with_maximum_delay(maximum_delay)
                     })
-                    .map(|storage| Box::new(storage) as Box<dyn Storage>)
-                    .map(Arc::new)
+                    .map(|storage| Arc::new(storage) as Arc<dyn Storage>)
             }
 
             // Azure Data Lake Storage Gen2, hierarchical namespace on (#418).
@@ -3340,8 +3338,7 @@ impl Builder<i32, String, Url, Url> {
                             .with_minimum_size(minimum_size)
                             .with_maximum_delay(maximum_delay)
                     })
-                    .map(|storage| Box::new(storage) as Box<dyn Storage>)
-                    .map(Arc::new)
+                    .map(|storage| Arc::new(storage) as Arc<dyn Storage>)
             }
 
             #[cfg(feature = "dynostore")]
@@ -3354,8 +3351,7 @@ impl Builder<i32, String, Url, Url> {
                     .message_max_bytes(message_max_bytes(&self.storage))
                     .sealed_prefix_shape()
                     .await
-                    .map(|storage| Box::new(storage) as Box<dyn Storage>)
-                    .map(Arc::new)
+                    .map(|storage| Arc::new(storage) as Arc<dyn Storage>)
             }
 
             Backend::Null => Ok(null::Engine::new(
@@ -3363,8 +3359,7 @@ impl Builder<i32, String, Url, Url> {
                 self.node_id,
                 self.advertised_listener.clone(),
             ))
-            .map(|storage| Box::new(storage) as Box<dyn Storage>)
-            .map(Arc::new),
+            .map(|storage| Arc::new(storage) as Arc<dyn Storage>),
 
             // `file:///path/to/copy` is the offline audit's, and only the
             // audit's: a deployment already past the damage cannot be measured

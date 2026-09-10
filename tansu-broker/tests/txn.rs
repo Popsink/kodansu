@@ -12,15 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Every case here builds a `memory://` container, which needs the one storage
+// engine this fork ships. The gate was on `mod in_memory` until #552 dissolved
+// it; with the module gone it belongs to the file.
+#![cfg(feature = "dynostore")]
 // A transaction test is a scripted sequence of protocol exchanges, each with
 // its own assertion: the branch count #555's nursery gate sees is the length
 // of the script.
 #![allow(clippy::cognitive_complexity)]
 
-use std::{collections::BTreeMap, slice, time::Duration};
+use std::{collections::BTreeMap, slice, sync::Arc, time::Duration};
 
 use bytes::Bytes;
-use common::{StorageType, alphanumeric_string, init_tracing, register_broker};
+use common::{alphanumeric_string, init_tracing, register_broker};
 use rand::{prelude::*, rng};
 use tansu_broker::Result;
 use tansu_sans_io::{
@@ -40,161 +44,21 @@ use uuid::Uuid;
 
 pub mod common;
 
-pub async fn simple_txn_commit_offset_commit<G>(
-    cluster_id: impl Into<String>,
-    broker_id: i32,
-    sc: G,
-) -> Result<()>
-where
-    G: Storage + Clone,
-{
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
+// txns that overlap on the same topition
+//
 
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let num_partitions = 6;
-    let replication_factor = 0;
-
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let topic_id = sc
-        .create_topic(
-            CreatableTopic::default()
-                .name(topic_name.clone())
-                .num_partitions(num_partitions)
-                .replication_factor(replication_factor)
-                .assignments(assignments.clone())
-                .configs(configs.clone()),
-            false,
-        )
-        .await?;
-    debug!(?topic_id);
-
-    let transaction_timeout_ms = 10_000;
-
-    let partition_index = rng().random_range(0..num_partitions);
-
-    let transaction_id = alphanumeric_string(10);
-    let group_id = alphanumeric_string(10);
-
-    let producer = sc
-        .init_producer(
-            Some(transaction_id.as_str()),
-            transaction_timeout_ms,
-            Some(-1),
-            Some(-1),
-        )
-        .await
-        .inspect(|producer| debug!(transaction_id, ?producer))
-        .inspect_err(|err| error!(?err, transaction_id, transaction_timeout_ms))?;
-
-    let topition = Topition::new(topic_name.clone(), partition_index);
-
-    let offsets = sc
-        .offset_fetch(
-            Some(group_id.as_str()),
-            slice::from_ref(&topition),
-            Some(false),
-        )
-        .await
-        .inspect(|offsets| debug!(?offsets, ?topition))?;
-
-    assert!(offsets.contains_key(&topition));
-    assert_eq!(
-        Some(-1),
-        offsets.get(&topition).map(|committed| committed.offset)
-    );
-
-    let committed_offset = 32123;
-
-    let result = sc
-        .txn_offset_commit(TxnOffsetCommitRequest {
-            transaction_id: transaction_id.clone(),
-            group_id: group_id.clone(),
-            producer_id: producer.id,
-            producer_epoch: producer.epoch,
-            generation_id: None,
-            member_id: None,
-            group_instance_id: None,
-            topics: vec![
-                TxnOffsetCommitRequestTopic::default()
-                    .name(topic_name.clone())
-                    .partitions(Some(vec![
-                        TxnOffsetCommitRequestPartition::default()
-                            .partition_index(partition_index)
-                            .committed_offset(committed_offset)
-                            .committed_leader_epoch(None)
-                            .committed_metadata(None),
-                    ])),
-            ],
-        })
-        .await?;
-
-    assert_eq!(1, result.len());
-    assert_eq!(topic_name, result[0].name);
-    assert_eq!(1, result[0].partitions.as_ref().unwrap_or(&vec![]).len());
-    assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(result[0].partitions.as_ref().unwrap()[0].error_code)?
-    );
-
-    let offsets = sc
-        .offset_fetch(
-            Some(group_id.as_str()),
-            slice::from_ref(&topition),
-            Some(false),
-        )
-        .await
-        .inspect(|offsets| debug!(?offsets, ?topition))?;
-
-    assert!(offsets.contains_key(&topition));
-    assert_eq!(
-        Some(-1),
-        offsets.get(&topition).map(|committed| committed.offset)
-    );
-
-    let commit = true;
-    assert_eq!(
-        ErrorCode::None,
-        sc.txn_end(transaction_id.as_str(), producer.id, producer.epoch, commit)
-            .await
-            .inspect(|status| debug!(transaction_id, ?producer, commit, ?status))
-            .inspect_err(|err| error!(?err, transaction_id, ?producer, commit))?
-    );
-
-    let offsets = sc
-        .offset_fetch(
-            Some(group_id.as_str()),
-            slice::from_ref(&topition),
-            Some(false),
-        )
-        .await
-        .inspect(|offsets| debug!(?offsets, ?topition))?;
-
-    assert!(offsets.contains_key(&topition));
-    assert_eq!(
-        Some(committed_offset),
-        offsets.get(&topition).map(|committed| committed.offset)
-    );
-
-    assert_eq!(
-        ErrorCode::None,
-        sc.delete_topic(&TopicId::from(topic_id)).await?
-    );
-
-    Ok(())
+async fn storage_container(cluster: impl Into<String>, node: i32) -> Result<Arc<dyn Storage>> {
+    common::storage_container(cluster, node, Url::parse("tcp://127.0.0.1/")?).await
 }
 
-pub async fn simple_txn_commit_offset_abort<G>(
-    cluster_id: impl Into<String>,
-    broker_id: i32,
-    sc: G,
-) -> Result<()>
-where
-    G: Storage + Clone,
-{
+#[tokio::test]
+async fn simple_txn_commit_offset_abort() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let sc = storage_container(cluster_id, broker_id).await?;
+
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
     let topic_name: String = alphanumeric_string(15);
@@ -334,14 +198,161 @@ where
     Ok(())
 }
 
-pub async fn simple_txn_produce_commit<G>(
-    cluster_id: impl Into<String>,
-    broker_id: i32,
-    sc: G,
-) -> Result<()>
-where
-    G: Storage + Clone,
-{
+#[tokio::test]
+async fn simple_txn_commit_offset_commit() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let sc = storage_container(cluster_id, broker_id).await?;
+
+    register_broker(cluster_id, broker_id, sc.clone()).await?;
+
+    let topic_name: String = alphanumeric_string(15);
+    debug!(?topic_name);
+
+    let num_partitions = 6;
+    let replication_factor = 0;
+
+    let assignments = Some([].into());
+    let configs = Some([].into());
+
+    let topic_id = sc
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(num_partitions)
+                .replication_factor(replication_factor)
+                .assignments(assignments.clone())
+                .configs(configs.clone()),
+            false,
+        )
+        .await?;
+    debug!(?topic_id);
+
+    let transaction_timeout_ms = 10_000;
+
+    let partition_index = rng().random_range(0..num_partitions);
+
+    let transaction_id = alphanumeric_string(10);
+    let group_id = alphanumeric_string(10);
+
+    let producer = sc
+        .init_producer(
+            Some(transaction_id.as_str()),
+            transaction_timeout_ms,
+            Some(-1),
+            Some(-1),
+        )
+        .await
+        .inspect(|producer| debug!(transaction_id, ?producer))
+        .inspect_err(|err| error!(?err, transaction_id, transaction_timeout_ms))?;
+
+    let topition = Topition::new(topic_name.clone(), partition_index);
+
+    let offsets = sc
+        .offset_fetch(
+            Some(group_id.as_str()),
+            slice::from_ref(&topition),
+            Some(false),
+        )
+        .await
+        .inspect(|offsets| debug!(?offsets, ?topition))?;
+
+    assert!(offsets.contains_key(&topition));
+    assert_eq!(
+        Some(-1),
+        offsets.get(&topition).map(|committed| committed.offset)
+    );
+
+    let committed_offset = 32123;
+
+    let result = sc
+        .txn_offset_commit(TxnOffsetCommitRequest {
+            transaction_id: transaction_id.clone(),
+            group_id: group_id.clone(),
+            producer_id: producer.id,
+            producer_epoch: producer.epoch,
+            generation_id: None,
+            member_id: None,
+            group_instance_id: None,
+            topics: vec![
+                TxnOffsetCommitRequestTopic::default()
+                    .name(topic_name.clone())
+                    .partitions(Some(vec![
+                        TxnOffsetCommitRequestPartition::default()
+                            .partition_index(partition_index)
+                            .committed_offset(committed_offset)
+                            .committed_leader_epoch(None)
+                            .committed_metadata(None),
+                    ])),
+            ],
+        })
+        .await?;
+
+    assert_eq!(1, result.len());
+    assert_eq!(topic_name, result[0].name);
+    assert_eq!(1, result[0].partitions.as_ref().unwrap_or(&vec![]).len());
+    assert_eq!(
+        ErrorCode::None,
+        ErrorCode::try_from(result[0].partitions.as_ref().unwrap()[0].error_code)?
+    );
+
+    let offsets = sc
+        .offset_fetch(
+            Some(group_id.as_str()),
+            slice::from_ref(&topition),
+            Some(false),
+        )
+        .await
+        .inspect(|offsets| debug!(?offsets, ?topition))?;
+
+    assert!(offsets.contains_key(&topition));
+    assert_eq!(
+        Some(-1),
+        offsets.get(&topition).map(|committed| committed.offset)
+    );
+
+    let commit = true;
+    assert_eq!(
+        ErrorCode::None,
+        sc.txn_end(transaction_id.as_str(), producer.id, producer.epoch, commit)
+            .await
+            .inspect(|status| debug!(transaction_id, ?producer, commit, ?status))
+            .inspect_err(|err| error!(?err, transaction_id, ?producer, commit))?
+    );
+
+    let offsets = sc
+        .offset_fetch(
+            Some(group_id.as_str()),
+            slice::from_ref(&topition),
+            Some(false),
+        )
+        .await
+        .inspect(|offsets| debug!(?offsets, ?topition))?;
+
+    assert!(offsets.contains_key(&topition));
+    assert_eq!(
+        Some(committed_offset),
+        offsets.get(&topition).map(|committed| committed.offset)
+    );
+
+    assert_eq!(
+        ErrorCode::None,
+        sc.delete_topic(&TopicId::from(topic_id)).await?
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn simple_txn_produce_commit() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let sc = storage_container(cluster_id, broker_id).await?;
+
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
     let topic_name: String = alphanumeric_string(15);
@@ -621,14 +632,14 @@ where
     Ok(())
 }
 
-pub async fn simple_txn_produce_abort<G>(
-    cluster_id: impl Into<String>,
-    broker_id: i32,
-    sc: G,
-) -> Result<()>
-where
-    G: Storage + Clone,
-{
+#[tokio::test]
+async fn simple_txn_produce_abort() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let sc = storage_container(cluster_id, broker_id).await?;
+
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
     let topic_name: String = alphanumeric_string(15);
@@ -907,12 +918,14 @@ where
     Ok(())
 }
 
-// txns that overlap on the same topition
-//
-pub async fn with_overlap<G>(cluster_id: impl Into<String>, broker_id: i32, sc: G) -> Result<()>
-where
-    G: Storage + Clone,
-{
+#[tokio::test]
+async fn with_overlap() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let sc = storage_container(cluster_id, broker_id).await?;
+
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
     let topic_name: String = alphanumeric_string(15);
@@ -1272,14 +1285,14 @@ where
     Ok(())
 }
 
-pub async fn init_producer_twice<G>(
-    cluster_id: impl Into<String>,
-    broker_id: i32,
-    sc: G,
-) -> Result<()>
-where
-    G: Storage + Clone,
-{
+#[tokio::test]
+async fn init_producer_twice() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let sc = storage_container(cluster_id, broker_id).await?;
+
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
     let topic_name: String = alphanumeric_string(15);
@@ -1591,114 +1604,4 @@ where
     );
 
     Ok(())
-}
-
-#[cfg(feature = "dynostore")]
-mod in_memory {
-    use std::sync::Arc;
-
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String>,
-        node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
-        common::storage_container(
-            StorageType::InMemory,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn simple_txn_commit_offset_abort() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::simple_txn_commit_offset_abort(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn simple_txn_commit_offset_commit() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::simple_txn_commit_offset_commit(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn simple_txn_produce_commit() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::simple_txn_produce_commit(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn simple_txn_produce_abort() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::simple_txn_produce_abort(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn with_overlap() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::with_overlap(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn init_producer_twice() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::init_producer_twice(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
 }

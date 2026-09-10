@@ -60,7 +60,7 @@ const LINGER: Duration = Duration::from_millis(250);
 
 const PARTITIONS: i32 = 8;
 
-async fn storage() -> Result<Arc<Box<dyn Storage>>, Error> {
+async fn storage() -> Result<Arc<dyn Storage>, Error> {
     StorageContainer::builder()
         .cluster_id(cluster_id())
         .node_id(NODE_ID)
@@ -74,7 +74,7 @@ async fn storage() -> Result<Arc<Box<dyn Storage>>, Error> {
         .map_err(Into::into)
 }
 
-async fn create(storage: Arc<Box<dyn Storage>>, topic: &str, partitions: i32) -> Result<(), Error> {
+async fn create(storage: Arc<dyn Storage>, topic: &str, partitions: i32) -> Result<(), Error> {
     let create = MapStateLayer::new(move |_| storage.clone()).into_layer(CreateTopicsService);
 
     _ = create

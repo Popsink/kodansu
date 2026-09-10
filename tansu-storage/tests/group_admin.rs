@@ -44,7 +44,7 @@ mod common;
 const TOPIC: &str = "group-admin";
 const PARTITIONS: i32 = 2;
 
-async fn storage() -> Result<Arc<Box<dyn Storage>>, Error> {
+async fn storage() -> Result<Arc<dyn Storage>, Error> {
     let storage = StorageContainer::builder()
         .cluster_id(cluster_id())
         .node_id(111)
@@ -82,17 +82,13 @@ fn now_ms() -> i64 {
 /// `last_contact_ms` is stamped from the clock, not a literal: the read path
 /// judges a member document against its session (#523), so a fixed stamp is a
 /// member that fell silent in 1970 and a group that describes as `Empty`.
-async fn join(
-    storage: &Arc<Box<dyn Storage>>,
-    group_id: &str,
-    member_id: &str,
-) -> Result<(), Error> {
+async fn join(storage: &Arc<dyn Storage>, group_id: &str, member_id: &str) -> Result<(), Error> {
     joined_at(storage, group_id, member_id, now_ms()).await
 }
 
 /// As [`join`], with the member's last contact placed on the clock.
 async fn joined_at(
-    storage: &Arc<Box<dyn Storage>>,
+    storage: &Arc<dyn Storage>,
     group_id: &str,
     member_id: &str,
     last_contact_ms: i64,
@@ -131,10 +127,7 @@ async fn joined_at(
 
 /// One group's `DescribeGroups` answer, through the service — the shape a
 /// client reads, rather than the projection type behind it.
-async fn describe(
-    storage: &Arc<Box<dyn Storage>>,
-    group_id: &str,
-) -> Result<DescribedGroup, Error> {
+async fn describe(storage: &Arc<dyn Storage>, group_id: &str) -> Result<DescribedGroup, Error> {
     let service = {
         let storage = storage.clone();
         MapStateLayer::new(|_| storage).into_layer(DescribeGroupsService)

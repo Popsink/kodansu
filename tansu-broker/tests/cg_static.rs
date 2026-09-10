@@ -12,8 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Every case here builds a `memory://` container, which needs the one storage
+// engine this fork ships. The gate was on `mod in_memory` until #552 dissolved
+// it; with the module gone it belongs to the file.
+#![cfg(feature = "dynostore")]
+
+use std::sync::Arc;
+
 use bytes::Bytes;
-use common::{CLIENT_ID, COOPERATIVE_STICKY, PROTOCOL_TYPE, RANGE, StorageType, register_broker};
+use common::{CLIENT_ID, COOPERATIVE_STICKY, PROTOCOL_TYPE, RANGE, register_broker};
 use rand::{prelude::*, rng};
 use tansu_broker::{Result, coordinator::group::administrator::Controller};
 use tansu_sans_io::{ErrorCode, join_group_request::JoinGroupRequestProtocol};
@@ -24,14 +31,18 @@ use uuid::Uuid;
 
 mod common;
 
-pub async fn join_with_empty_member_id<G>(
-    cluster_id: impl Into<String>,
-    broker_id: i32,
-    sc: G,
-) -> Result<()>
-where
-    G: Storage + Clone,
-{
+async fn storage_container(cluster: impl Into<String>, node: i32) -> Result<Arc<dyn Storage>> {
+    common::storage_container(cluster, node, Url::parse("tcp://127.0.0.1/")?).await
+}
+
+#[tokio::test(start_paused = true)]
+async fn join_with_empty_member_id() -> Result<()> {
+    let _guard = common::init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let sc = storage_container(cluster_id, broker_id).await?;
+
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
     let mut controller = Controller::with_storage(sc)?.with_now(common::paused_clock);
@@ -95,14 +106,14 @@ where
     Ok(())
 }
 
-pub async fn rejoin_with_empty_member_id<G>(
-    cluster_id: impl Into<String>,
-    broker_id: i32,
-    sc: G,
-) -> Result<()>
-where
-    G: Storage + Clone,
-{
+#[tokio::test(start_paused = true)]
+async fn rejoin_with_empty_member_id() -> Result<()> {
+    let _guard = common::init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let sc = storage_container(cluster_id, broker_id).await?;
+
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
     let mut controller = Controller::with_storage(sc.clone())?;
@@ -183,51 +194,4 @@ where
     assert_eq!(1, rejoin_response.members.unwrap().len());
 
     Ok(())
-}
-
-#[cfg(feature = "dynostore")]
-mod in_memory {
-    use std::sync::Arc;
-
-    use super::*;
-
-    async fn storage_container(cluster: Uuid, node: i32) -> Result<Arc<Box<dyn Storage>>> {
-        common::storage_container(
-            StorageType::InMemory,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-        )
-        .await
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn join_with_empty_member_id() -> Result<()> {
-        let _guard = common::init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::join_with_empty_member_id(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn rejoin_with_empty_member_id() -> Result<()> {
-        let _guard = common::init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::rejoin_with_empty_member_id(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
 }

@@ -12,6 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Every case here builds a `memory://` container, which needs the one storage
+// engine this fork ships. The gate was on `mod in_memory` until #552 dissolved
+// it; with the module gone it belongs to the file.
+#![cfg(feature = "dynostore")]
+
+use std::sync::Arc;
+
 use common::register_broker;
 use rama::{Context, Service};
 use tansu_broker::Result;
@@ -24,18 +31,27 @@ use tracing::debug;
 use url::Url;
 use uuid::Uuid;
 
+use common::init_tracing;
+use rand::{prelude::*, rng};
 pub mod common;
 
-pub async fn describe<C, G>(
-    cluster_id: C,
-    broker_id: i32,
+async fn storage_container(
+    cluster: impl Into<String>,
+    node: i32,
     advertised_listener: Url,
-    sc: G,
-) -> Result<()>
-where
-    C: Into<String>,
-    G: Storage + Clone,
-{
+) -> Result<Arc<dyn Storage>> {
+    common::storage_container(cluster, node, advertised_listener).await
+}
+
+#[tokio::test]
+async fn describe() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let advertised_listener = Url::parse("tcp://example.com:9092/")?;
+    let sc = storage_container(cluster_id, broker_id, advertised_listener.clone()).await?;
+
     debug!(broker_id, %advertised_listener);
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
@@ -78,39 +94,4 @@ where
     ));
 
     Ok(())
-}
-
-#[cfg(feature = "dynostore")]
-mod in_memory {
-    use std::sync::Arc;
-
-    use common::{StorageType, init_tracing};
-    use rand::{prelude::*, rng};
-
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String>,
-        node: i32,
-        advertised_listener: Url,
-    ) -> Result<Arc<Box<dyn Storage>>> {
-        common::storage_container(StorageType::InMemory, cluster, node, advertised_listener).await
-    }
-
-    #[tokio::test]
-    async fn describe() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster = Uuid::now_v7();
-        let node = rng().random_range(0..i32::MAX);
-        let advertised_listener = Url::parse("tcp://example.com:9092/")?;
-
-        super::describe(
-            cluster,
-            node,
-            advertised_listener.clone(),
-            storage_container(cluster, node, advertised_listener).await?,
-        )
-        .await
-    }
 }

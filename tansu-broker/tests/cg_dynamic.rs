@@ -12,15 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Every case here builds a `memory://` container, which needs the one storage
+// engine this fork ships. The gate was on `mod in_memory` until #552 dissolved
+// it; with the module gone it belongs to the file.
+#![cfg(feature = "dynostore")]
 // A rebalance test is a scripted sequence of protocol exchanges, each with
 // its own assertion: the branch count #555's nursery gate sees is the length
 // of the script.
 #![allow(clippy::cognitive_complexity)]
 
+use std::sync::Arc;
+
 use bytes::Bytes;
 use common::{
-    CLIENT_ID, COOPERATIVE_STICKY, PROTOCOL_TYPE, RANGE, StorageType, alphanumeric_string,
-    heartbeat, join, join_group, register_broker, sync_group,
+    CLIENT_ID, COOPERATIVE_STICKY, PROTOCOL_TYPE, RANGE, alphanumeric_string, heartbeat, join,
+    join_group, register_broker, sync_group,
 };
 use rand::{prelude::*, rng};
 use tansu_broker::{Result, coordinator::group::administrator::Controller};
@@ -35,14 +41,18 @@ use uuid::Uuid;
 
 pub mod common;
 
-pub async fn reject_empty_member_id_on_join<G>(
-    cluster_id: impl Into<String>,
-    broker_id: i32,
-    sc: G,
-) -> Result<()>
-where
-    G: Storage + Clone,
-{
+async fn storage_container(cluster: impl Into<String>, node: i32) -> Result<Arc<dyn Storage>> {
+    common::storage_container(cluster, node, Url::parse("tcp://127.0.0.1/")?).await
+}
+
+#[tokio::test]
+async fn reject_empty_member_id_on_join() -> Result<()> {
+    let _guard = common::init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let sc = storage_container(cluster_id, broker_id).await?;
+
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
     let mut controller = Controller::with_storage(sc.clone())?;
@@ -98,10 +108,14 @@ where
     Ok(())
 }
 
-pub async fn lifecycle<G>(cluster_id: impl Into<String>, broker_id: i32, sc: G) -> Result<()>
-where
-    G: Storage + Clone,
-{
+#[tokio::test(start_paused = true)]
+async fn lifecycle() -> Result<()> {
+    let _guard = common::init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let sc = storage_container(cluster_id, broker_id).await?;
+
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
     let mut controller = Controller::with_storage(sc.clone())?;
@@ -423,65 +437,4 @@ where
     assert_eq!(ErrorCode::None, ErrorCode::try_from(error_code)?);
 
     Ok(())
-}
-
-#[cfg(feature = "dynostore")]
-mod in_memory {
-    use std::sync::Arc;
-
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String>,
-        node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
-        common::storage_container(
-            StorageType::InMemory,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn reject_empty_member_id_on_join() -> Result<()> {
-        let _guard = common::init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::reject_empty_member_id_on_join(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-
-    // Virtual time (#256). This test spent 610s of a 612s CI run asleep: it
-    // crosses the join long-poll's `session_timeout / 2` ceiling twice, and #195
-    // raised that ceiling to 300s by raising the session timeout to put member
-    // eviction out of reach. One knob served both needs, so no value could
-    // satisfy them at once — pausing the clock decouples them instead, leaving
-    // #195's property intact at zero wall-clock cost.
-    //
-    // Sound here only because the coordinator now measures how long it has been
-    // polling on tokio's clock rather than the wall clock: under `start_paused`
-    // a `SystemTime` deadline never advances while the sleeps return instantly,
-    // which would have turned the long-poll into an infinite loop.
-    #[tokio::test(start_paused = true)]
-    async fn lifecycle() -> Result<()> {
-        let _guard = common::init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::lifecycle(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
 }

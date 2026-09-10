@@ -31,7 +31,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use common::{StorageType, alphanumeric_string, register_broker};
+use common::{alphanumeric_string, register_broker};
 use opentelemetry::global;
 use opentelemetry_sdk::metrics::{
     InMemoryMetricExporter, PeriodicReader, SdkMeterProvider,
@@ -175,7 +175,6 @@ async fn a_member_whose_session_lapses_is_counted_as_evicted() -> Result<()> {
 
     let cluster = Uuid::now_v7();
     let storage = common::storage_container(
-        StorageType::InMemory,
         cluster.to_string(),
         111,
         Url::parse("tcp://127.0.0.1:9092/")?,

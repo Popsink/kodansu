@@ -109,7 +109,7 @@ const STEADY_HEARTBEATS: usize = 4;
 /// non-converging arrangement looping forever.
 const MAX_ROUNDS: usize = 32;
 
-type SharedStorage = Arc<Box<dyn Storage>>;
+type SharedStorage = Arc<dyn Storage>;
 type ReplicaStorage = LatencyIntroducingStorage<SharedStorage>;
 type Replica = Controller<ReplicaStorage>;
 

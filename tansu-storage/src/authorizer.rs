@@ -312,7 +312,7 @@ mod tests {
 
     fn authorizer(super_users: &[&str]) -> Authorizer {
         Authorizer::new(
-            Arc::new(Box::new(DynoStore::new("tansu", 111, InMemory::new())) as Box<dyn Storage>),
+            Arc::new(DynoStore::new("tansu", 111, InMemory::new())) as Arc<dyn Storage>,
             super_users.iter().map(|user| (*user).to_owned()),
         )
     }

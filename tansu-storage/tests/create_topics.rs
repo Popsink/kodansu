@@ -267,7 +267,7 @@ mod refusals {
 
     use crate::common::{Error, cluster_id, init_tracing, storage_url};
 
-    async fn storage() -> Result<Arc<Box<dyn Storage>>, Error> {
+    async fn storage() -> Result<Arc<dyn Storage>, Error> {
         StorageContainer::builder()
             .cluster_id(cluster_id())
             .node_id(111)
@@ -279,7 +279,7 @@ mod refusals {
     }
 
     async fn create(
-        storage: &Arc<Box<dyn Storage>>,
+        storage: &Arc<dyn Storage>,
         name: &str,
         num_partitions: i32,
         validate_only: bool,
@@ -313,7 +313,7 @@ mod refusals {
     }
 
     /// Whether the broker knows a topic by that name.
-    async fn exists(storage: &Arc<Box<dyn Storage>>, name: &str) -> Result<bool, Error> {
+    async fn exists(storage: &Arc<dyn Storage>, name: &str) -> Result<bool, Error> {
         let service = {
             let storage = storage.clone();
             MapStateLayer::new(|_| storage).into_layer(MetadataService)

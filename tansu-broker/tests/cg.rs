@@ -12,9 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::slice;
+// Every case here builds a `memory://` container, which needs the one storage
+// engine this fork ships. The gate was on `mod in_memory` until #552 dissolved
+// it; with the module gone it belongs to the file.
+#![cfg(feature = "dynostore")]
 
-use common::{StorageType, alphanumeric_string, init_tracing, register_broker};
+use std::{slice, sync::Arc};
+
+use common::{alphanumeric_string, init_tracing, register_broker};
 use rand::{prelude::*, rng};
 use tansu_broker::Result;
 use tansu_sans_io::{ErrorCode, create_topics_request::CreatableTopic};
@@ -25,10 +30,18 @@ use uuid::Uuid;
 
 pub mod common;
 
-pub async fn offset_commit<G>(cluster_id: impl Into<String>, broker_id: i32, sc: G) -> Result<()>
-where
-    G: Storage + Clone,
-{
+async fn storage_container(cluster: impl Into<String>, node: i32) -> Result<Arc<dyn Storage>> {
+    common::storage_container(cluster, node, Url::parse("tcp://127.0.0.1/")?).await
+}
+
+#[tokio::test]
+async fn offset_commit() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let sc = storage_container(cluster_id, broker_id).await?;
+
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
     let topic_name: String = alphanumeric_string(15);
@@ -98,14 +111,14 @@ where
     Ok(())
 }
 
-pub async fn topic_delete_cascade_to_offset_commit<G>(
-    cluster_id: impl Into<String>,
-    broker_id: i32,
-    sc: G,
-) -> Result<()>
-where
-    G: Storage + Clone,
-{
+#[tokio::test]
+async fn topic_delete_cascade_to_offset_commit() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let sc = storage_container(cluster_id, broker_id).await?;
+
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
     let topic_name: String = alphanumeric_string(15);
@@ -177,14 +190,14 @@ where
     Ok(())
 }
 
-pub async fn consumer_group_delete_cascade_to_offset_commit<G>(
-    cluster_id: impl Into<String>,
-    broker_id: i32,
-    sc: G,
-) -> Result<()>
-where
-    G: Storage + Clone,
-{
+#[tokio::test]
+async fn consumer_group_delete_cascade_to_offset_commit() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let sc = storage_container(cluster_id, broker_id).await?;
+
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
     let topic_name: String = alphanumeric_string(15);
@@ -259,14 +272,14 @@ where
     Ok(())
 }
 
-pub async fn delete_unknown_consumer_group<G>(
-    cluster_id: impl Into<String>,
-    broker_id: i32,
-    sc: G,
-) -> Result<()>
-where
-    G: Storage + Clone,
-{
+#[tokio::test]
+async fn delete_unknown_consumer_group() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let sc = storage_container(cluster_id, broker_id).await?;
+
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
     let group_id: String = alphanumeric_string(15);
@@ -282,14 +295,14 @@ where
     Ok(())
 }
 
-pub async fn offset_commit_unknown_topition<G>(
-    cluster_id: impl Into<String>,
-    broker_id: i32,
-    sc: G,
-) -> Result<()>
-where
-    G: Storage + Clone,
-{
+#[tokio::test]
+async fn offset_commit_unknown_topition() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let sc = storage_container(cluster_id, broker_id).await?;
+
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
     let topic_name: String = alphanumeric_string(15);
@@ -335,14 +348,14 @@ where
     Ok(())
 }
 
-pub async fn offset_fetch_unknown_topition<G>(
-    cluster_id: impl Into<String>,
-    broker_id: i32,
-    sc: G,
-) -> Result<()>
-where
-    G: Storage + Clone,
-{
+#[tokio::test]
+async fn offset_fetch_unknown_topition() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let sc = storage_container(cluster_id, broker_id).await?;
+
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
     let topic_name: String = alphanumeric_string(15);
@@ -372,139 +385,18 @@ where
     Ok(())
 }
 
-pub async fn list_groups_none<G>(cluster_id: impl Into<String>, broker_id: i32, sc: G) -> Result<()>
-where
-    G: Storage + Clone,
-{
+#[tokio::test]
+async fn list_groups_none() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let sc = storage_container(cluster_id, broker_id).await?;
+
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
     let groups = sc.list_groups(None).await?;
     assert_eq!(0, groups.len());
 
     Ok(())
-}
-
-#[cfg(feature = "dynostore")]
-mod in_memory {
-    use std::sync::Arc;
-
-    use super::*;
-
-    async fn storage_container(
-        cluster: impl Into<String>,
-        node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
-        common::storage_container(
-            StorageType::InMemory,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn offset_commit() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::offset_commit(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn topic_delete_cascade_to_offset_commit() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::topic_delete_cascade_to_offset_commit(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn consumer_group_delete_cascade_to_offset_commit() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::consumer_group_delete_cascade_to_offset_commit(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn delete_unknown_consumer_group() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::delete_unknown_consumer_group(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn offset_commit_unknown_topition() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::offset_commit_unknown_topition(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn offset_fetch_unknown_topition() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::offset_fetch_unknown_topition(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
-
-    #[tokio::test]
-    async fn list_groups_none() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::list_groups_none(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
 }

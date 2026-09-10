@@ -181,7 +181,7 @@ async fn settles(ready: impl Fn() -> bool) -> bool {
     .is_ok()
 }
 
-async fn storage() -> Result<Arc<Box<dyn Storage>>, Error> {
+async fn storage() -> Result<Arc<dyn Storage>, Error> {
     StorageContainer::builder()
         .cluster_id("tansu")
         .node_id(111)
@@ -192,7 +192,7 @@ async fn storage() -> Result<Arc<Box<dyn Storage>>, Error> {
 }
 
 async fn create_topic(
-    storage: &Arc<Box<dyn Storage>>,
+    storage: &Arc<dyn Storage>,
     name: &str,
     configs: Vec<CreatableTopicConfig>,
 ) -> Result<(), Error> {
@@ -211,7 +211,7 @@ async fn create_topic(
     Ok(())
 }
 
-async fn produce(storage: &Arc<Box<dyn Storage>>, topition: &Topition) -> Result<(), Error> {
+async fn produce(storage: &Arc<dyn Storage>, topition: &Topition) -> Result<(), Error> {
     let batch = inflated::Batch::builder()
         .record(
             Record::builder()

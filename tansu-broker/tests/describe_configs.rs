@@ -12,6 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Every case here builds a `memory://` container, which needs the one storage
+// engine this fork ships. The gate was on `mod in_memory` until #552 dissolved
+// it; with the module gone it belongs to the file.
+#![cfg(feature = "dynostore")]
+
+use std::sync::Arc;
+
+use common::init_tracing;
 use common::{alphanumeric_string, register_broker};
 use rama::{Context, Service};
 use rand::{prelude::*, rng};
@@ -29,91 +37,9 @@ use tansu_storage::{
     IncrementalAlterConfigsService, Storage,
 };
 use tracing::debug;
+use url::Url;
 use uuid::Uuid;
 pub mod common;
-
-pub async fn single_topic<C, G>(cluster_id: C, broker_id: i32, sc: G) -> Result<()>
-where
-    C: Into<String>,
-    G: Storage + Clone,
-{
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let cleanup_policy = "cleanup.policy";
-    let compact = "compact";
-
-    let num_partitions = 6;
-    let replication_factor = 0;
-    let assignments = Some([].into());
-    let configs = Some(
-        [CreatableTopicConfig::default()
-            .name(cleanup_policy.into())
-            .value(Some(compact.into()))]
-        .into(),
-    );
-
-    let topic_id = sc
-        .create_topic(
-            CreatableTopic::default()
-                .name(topic_name.clone())
-                .num_partitions(num_partitions)
-                .replication_factor(replication_factor)
-                .assignments(assignments.clone())
-                .configs(configs.clone()),
-            false,
-        )
-        .await?;
-
-    let resources = [DescribeConfigsResource::default()
-        .resource_type(ConfigResource::Topic.into())
-        .resource_name(topic_name.clone())
-        .configuration_keys(None)];
-
-    let include_synonyms = Some(false);
-    let include_documentation = Some(false);
-
-    let ctx = Context::with_state(sc);
-
-    let results = DescribeConfigsService
-        .serve(
-            ctx,
-            DescribeConfigsRequest::default()
-                .include_documentation(include_documentation)
-                .include_synonyms(include_synonyms)
-                .resources(Some(resources.into())),
-        )
-        .await?;
-
-    assert_eq!(
-        results,
-        DescribeConfigsResponse::default().results(Some(vec![
-            DescribeConfigsResult::default()
-                .error_code(ErrorCode::None.into())
-                .error_message(Some(ErrorCode::None.to_string()))
-                .resource_type(ConfigResource::Topic.into())
-                .resource_name(topic_name)
-                .configs(Some(
-                    [DescribeConfigsResourceResult::default()
-                        .name(cleanup_policy.into())
-                        .value(Some(compact.into()))
-                        .read_only(false)
-                        .is_default(None)
-                        .config_source(Some(ConfigSource::DefaultConfig.into()))
-                        .is_sensitive(false)
-                        .synonyms(Some([].into()))
-                        .config_type(Some(ConfigResource::Topic.into()))
-                        .documentation(Some("".into()))]
-                    .into()
-                ))
-        ],))
-    );
-
-    debug!(?topic_id);
-    Ok(())
-}
 
 /// The `DescribeConfigs` response for `topic_name` carrying exactly `rows`, in
 /// order. Since #225 the engine injects the broker-level defaults at
@@ -149,14 +75,18 @@ fn expected_configs(topic_name: &str, rows: &[(&str, &str)]) -> DescribeConfigsR
     ]))
 }
 
-pub async fn alter_single_topic<G>(
-    cluster_id: impl Into<String>,
-    broker_id: i32,
-    sc: G,
-) -> Result<()>
-where
-    G: Storage + Clone,
-{
+async fn storage_container(cluster: impl Into<String>, node: i32) -> Result<Arc<dyn Storage>> {
+    common::storage_container(cluster, node, Url::parse("tcp://127.0.0.1/")?).await
+}
+
+#[tokio::test]
+async fn alter_single_topic() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let sc = storage_container(cluster_id, broker_id).await?;
+
     register_broker(cluster_id, broker_id, sc.clone()).await?;
 
     let topic_name: String = alphanumeric_string(15);
@@ -353,55 +283,88 @@ where
     Ok(())
 }
 
-#[cfg(feature = "dynostore")]
-mod in_memory {
-    use std::sync::Arc;
+#[tokio::test]
+async fn single_topic() -> Result<()> {
+    let _guard = init_tracing()?;
 
-    use common::{StorageType, init_tracing};
-    use url::Url;
+    let cluster_id = Uuid::now_v7();
+    let broker_id = rng().random_range(0..i32::MAX);
+    let sc = storage_container(cluster_id, broker_id).await?;
 
-    use super::*;
+    register_broker(cluster_id, broker_id, sc.clone()).await?;
 
-    async fn storage_container(
-        cluster: impl Into<String>,
-        node: i32,
-    ) -> Result<Arc<Box<dyn Storage>>> {
-        common::storage_container(
-            StorageType::InMemory,
-            cluster,
-            node,
-            Url::parse("tcp://127.0.0.1/")?,
+    let topic_name: String = alphanumeric_string(15);
+    debug!(?topic_name);
+
+    let cleanup_policy = "cleanup.policy";
+    let compact = "compact";
+
+    let num_partitions = 6;
+    let replication_factor = 0;
+    let assignments = Some([].into());
+    let configs = Some(
+        [CreatableTopicConfig::default()
+            .name(cleanup_policy.into())
+            .value(Some(compact.into()))]
+        .into(),
+    );
+
+    let topic_id = sc
+        .create_topic(
+            CreatableTopic::default()
+                .name(topic_name.clone())
+                .num_partitions(num_partitions)
+                .replication_factor(replication_factor)
+                .assignments(assignments.clone())
+                .configs(configs.clone()),
+            false,
         )
-        .await
-    }
+        .await?;
 
-    #[tokio::test]
-    async fn alter_single_topic() -> Result<()> {
-        let _guard = init_tracing()?;
+    let resources = [DescribeConfigsResource::default()
+        .resource_type(ConfigResource::Topic.into())
+        .resource_name(topic_name.clone())
+        .configuration_keys(None)];
 
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
+    let include_synonyms = Some(false);
+    let include_documentation = Some(false);
 
-        super::alter_single_topic(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
+    let ctx = Context::with_state(sc);
+
+    let results = DescribeConfigsService
+        .serve(
+            ctx,
+            DescribeConfigsRequest::default()
+                .include_documentation(include_documentation)
+                .include_synonyms(include_synonyms)
+                .resources(Some(resources.into())),
         )
-        .await
-    }
+        .await?;
 
-    #[tokio::test]
-    async fn single_topic() -> Result<()> {
-        let _guard = init_tracing()?;
+    assert_eq!(
+        results,
+        DescribeConfigsResponse::default().results(Some(vec![
+            DescribeConfigsResult::default()
+                .error_code(ErrorCode::None.into())
+                .error_message(Some(ErrorCode::None.to_string()))
+                .resource_type(ConfigResource::Topic.into())
+                .resource_name(topic_name)
+                .configs(Some(
+                    [DescribeConfigsResourceResult::default()
+                        .name(cleanup_policy.into())
+                        .value(Some(compact.into()))
+                        .read_only(false)
+                        .is_default(None)
+                        .config_source(Some(ConfigSource::DefaultConfig.into()))
+                        .is_sensitive(false)
+                        .synonyms(Some([].into()))
+                        .config_type(Some(ConfigResource::Topic.into()))
+                        .documentation(Some("".into()))]
+                    .into()
+                ))
+        ],))
+    );
 
-        let cluster_id = Uuid::now_v7();
-        let broker_id = rng().random_range(0..i32::MAX);
-
-        super::single_topic(
-            cluster_id,
-            broker_id,
-            storage_container(cluster_id, broker_id).await?,
-        )
-        .await
-    }
+    debug!(?topic_id);
+    Ok(())
 }

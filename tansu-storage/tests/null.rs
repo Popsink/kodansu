@@ -56,7 +56,7 @@ const PORT: u16 = 9092;
 
 type Result<T = (), E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 
-async fn null_storage() -> Result<std::sync::Arc<Box<dyn Storage>>> {
+async fn null_storage() -> Result<std::sync::Arc<dyn Storage>> {
     StorageContainer::builder()
         .cluster_id(CLUSTER)
         .node_id(NODE_ID)

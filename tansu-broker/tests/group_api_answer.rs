@@ -192,7 +192,7 @@ impl Coordinator for AlwaysNotCoordinator {
     }
 }
 
-async fn storage() -> Result<Arc<Box<dyn Storage>>> {
+async fn storage() -> Result<Arc<dyn Storage>> {
     StorageContainer::builder()
         .cluster_id(Uuid::now_v7().to_string())
         .node_id(111)
