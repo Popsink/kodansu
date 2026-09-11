@@ -80,7 +80,7 @@ rather than the write.
 ```shell
 just coverage          # summary in the terminal
 just coverage-html     # browsable report, opens in a browser
-just coverage-ci 88    # what CI runs: lcov + HTML + summary, floored at 88%
+just coverage-ci 90    # what CI runs: lcov + HTML + summary, floored at 90%
 ```
 
 All three need `cargo-llvm-cov` and the `llvm-tools-preview` component:
@@ -95,11 +95,13 @@ attaches `lcov.info` plus the HTML report as the `coverage` artifact. It also
 uploads to Codecov, but only if a `CODECOV_TOKEN` secret exists — the artifact is
 the fallback and needs no third-party account.
 
-The measured value is **90.65%** at the commit that took the four wire codecs in
-`tansu-sans-io` from 35-69% to 90-98% (#556's fourth milestone), up from 87.22%
-when `tansu-cli` went from 29% to 96%, 85.29% when `tansu-topic` reached 100% and
-84.06% when #549 closed the orphan-bin hole. The floor below tracks it two points
-back.
+The measured value is **90.98%** at the commit that took the two `Storage`
+wrappers to 100% and 99% (#556's fifth and last milestone), up from 90.65% when
+the four wire codecs in `tansu-sans-io` went from 35-69% to 90-98%, 87.22% when
+`tansu-cli` went from 29% to 96%, 85.29% when `tansu-topic` reached 100% and
+84.06% when #549 closed the orphan-bin hole. The floor below tracks it a point
+back — the four steps before it left two, and #556's acceptance is a floor at
+90.
 
 What those codecs still do not cover is worth naming, because most of it is not a
 gap a test closes. The residual in `de.rs` and `ser.rs` is mostly the version
@@ -111,11 +113,19 @@ subscriber at debug level, and the `expecting()` impls, which `serde` calls only
 to build a type-error message that these codecs never produce, because their
 visitors are only ever handed a sequence.
 
-Two files in that crate are deliberately left uncovered rather than excluded from
-the denominator: `Cli::main`, which reads the real argv, and `broker::Arg::main`,
-which serves until cancelled. Each says so in a doc comment citing #556. An
+Two files in `tansu-cli` are deliberately left uncovered rather than excluded
+from the denominator: `Cli::main`, which reads the real argv, and
+`broker::Arg::main`, which serves until cancelled. Each says so in a doc comment citing #556. An
 `--ignore-filename-regex` would make them invisible instead, and invisible is how
 a `main` stops being counted at all.
+
+Two lines of `tansu-storage/src/null.rs` are all the fifth milestone left, and
+they are the `PoisonError` arms of two `Mutex::lock` calls. Reaching them needs a
+`Storage` method that panics while holding one of the engine's locks, and none
+does: every closure under a lock is a `BTreeMap` operation. Named here for the
+same reason the two `main`s above are — a line left uncovered on purpose is a
+decision, and a decision nobody wrote down is indistinguishable from an
+oversight.
 
 `just coverage-ci` takes a floor and fails under it. The floor is a **ratchet**:
 raise it as the real number rises, and never lower it to turn a red build green.
@@ -140,9 +150,13 @@ add one only if something runs it.
 The number is not reproducible to the digit. Measured three times over the one
 tree, the denominator held at 33 776 lines and the uncovered count came out 5383
 on darwin, then 5375 and 5383 on two runs of the `coverage` job — ~8 lines, 0.03
-points, of run-to-run jitter *within* a platform. That is why the floor sits two
-points under rather than at the measured value, the way `comments`' ceiling
-does: a floor at the measurement would go red on a re-run of a green commit.
+points, of run-to-run jitter *within* a platform. #556's fifth milestone
+measured it again on the larger tree and got the same answer — 3174 uncovered
+lines, then 3170 on a second run of the same command over the same commit, 4
+lines and 0.01 points apart. That is why the floor sits under rather than at the
+measured value, unlike `comments`' ceiling: a floor at the measurement would go
+red on a re-run of a green commit. The point it sits under by is thirty times
+that jitter, which is why closing one of the two costs nothing.
 
 Doc tests are not counted. `cargo llvm-cov` can only instrument them on nightly,
 and this workspace is pinned to a stable toolchain.

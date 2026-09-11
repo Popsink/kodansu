@@ -160,7 +160,7 @@ There are no smoke tests. The upstream `smoke` job was gated on `github.actor ==
 
 `just comments` reports the split, per file and repo-wide, and fails past the ceiling. It counts `//` at the start of a line only — a trailing `g(); // …` is invisible to it, because 214 of the 312 lines in this tree with `//` past column 0 have it inside a string literal (`Url::parse("memory://tansu/")`), and telling the two apart means lexing Rust. Write the trailing ones as if they were counted.
 
-The ceiling is a **ratchet at the measured value**, not a budget with room in it: 2.8228% at the commit that introduced it, tight enough that a single added line of uncited narration turns the build red. Raising it is allowed and is the escape hatch — say why the real number moved. `etc/comments.awk` carries the counting model; `justfile`'s `comments` recipe carries the reasoning.
+The ceiling is a **ratchet at the measured value**, not a budget with room in it: **2.9951%** today, tight enough that a single added line of uncited narration turns the build red. It has moved five times since the 2.8228% that introduced it, and never because anyone wrote narration — the ratio is non-doc over (non-doc + code), so a deletion raises it and a batch of new tests lowers it. Raising it is allowed and is the escape hatch — say why the real number moved. `etc/comments.awk` carries the counting model; `justfile`'s `comments` recipe carries the per-move reasoning.
 
 ## Lint Configuration
 
