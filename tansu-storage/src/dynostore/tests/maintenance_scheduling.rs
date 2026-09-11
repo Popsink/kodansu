@@ -141,7 +141,7 @@ fn stale_footer(base: i64, count: i64) -> SegmentFooter {
         writer_epoch: 1,
         nonce: 0,
         entries: vec![SubstreamEntry {
-            topic: TOPIC.to_owned(),
+            topic: TOPIC.into(),
             topic_id: None,
             partition: 0,
             base_offset: base,

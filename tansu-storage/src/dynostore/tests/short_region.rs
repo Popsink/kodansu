@@ -475,7 +475,7 @@ async fn an_entry_for_a_substream_the_object_does_not_hold_is_read_past() -> Res
         .await?
         .expect("a segment trailer");
     let honest = trailer.entries[0].byte_len;
-    trailer.entries[0].topic = format!("{PREFIX}.other");
+    trailer.entries[0].topic = format!("{PREFIX}.other").into();
 
     let object = bucket.get(&segment_path(1)).await?.bytes().await?;
     let mut rewritten = object.slice(..honest as usize).to_vec();
@@ -491,7 +491,7 @@ async fn an_entry_for_a_substream_the_object_does_not_hold_is_read_past() -> Res
         .read_segment_footer(&segment_path(1))
         .await?
         .expect("a segment trailer");
-    stale.entries[0].topic = TOPIC.to_owned();
+    stale.entries[0].topic = TOPIC.into();
     stale.entries[0].base_offset = 1;
     stale.entries[0].record_count = 1;
     stale.entries[0].byte_len = 20;
