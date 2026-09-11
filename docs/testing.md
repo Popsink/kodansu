@@ -152,8 +152,9 @@ tree, the denominator held at 33 776 lines and the uncovered count came out 5383
 on darwin, then 5375 and 5383 on two runs of the `coverage` job — ~8 lines, 0.03
 points, of run-to-run jitter *within* a platform. #556's fifth milestone
 measured it again on the larger tree and got the same answer — 3174 uncovered
-lines, then 3170 on a second run of the same command over the same commit, 4
-lines and 0.01 points apart. That is why the floor sits under rather than at the
+lines on darwin, 3170 on a second run of the same command over the same commit,
+and 3169 in this job on ubuntu: 5 lines and 0.01 points across two platforms and
+three runs. That is why the floor sits under rather than at the
 measured value, unlike `comments`' ceiling: a floor at the measurement would go
 red on a re-run of a green commit. The point it sits under by is thirty times
 that jitter, which is why closing one of the two costs nothing.
