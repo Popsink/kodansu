@@ -211,11 +211,11 @@ fmt:
 #
 # The ceiling is a ratchet, not a target — the same argument as `coverage-ci`
 # below it, with one difference in how tight it is set. Coverage's floor sits a
-# couple of points under the measured number because that measurement jitters by
-# ~8 lines run to run (#549 measured it three times over one tree). This one does
-# not jitter at all, and a tenth of a point here is ~107 lines of narration, so
-# the ceiling is the measured value itself — 3.07219662%, rounded up at the last
-# digit to the 3.0722 below, which is a tenth of a line of headroom. One added
+# point under the measured number because that measurement jitters by ~8 lines
+# run to run (#549 measured it three times over one tree). This one does not
+# jitter at all, and a tenth of a point here is ~107 lines of narration, so the
+# ceiling is the measured value itself — 2.99504904%, rounded up at the last
+# digit to the 2.9951 below, which is a tenth of a line of headroom. One added
 # line of uncited narration fails; a line of rustdoc, a line of code, a trailing
 # comment, or a narration block citing an issue does not.
 #
@@ -260,6 +260,17 @@ fmt:
 # comment-free literals coming out of the denominator; the numerator fell 12
 # because four file-level `#![allow]` blocks citing #553 went with them.
 #
+#   #567-#569 +2299 lines, cache owner, cli, codecs
+#                                       3180 -> 3164  3.07219662 -> 2.99077435
+#   #556   +432 lines, the wrappers     3164 -> 3182  2.99077435 -> 2.99504904
+#
+# Three PRs' worth of slack, re-ratcheted here rather than at each of them: the
+# ceiling stayed at #553's number while the tree grew back 2299 lines of code
+# and *lost* 16 lines of narration, so 0.08 points of the headroom below was
+# never anything anyone wrote. #556's fifth milestone is the +18 on the second
+# line — the `//` inside the two wrapper suites saying which assertion is
+# falsifiable and why — and 2.9951 is the measurement with those 18 in it.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -269,7 +280,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="3.0722" top="12":
+comments ceiling="2.9951" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

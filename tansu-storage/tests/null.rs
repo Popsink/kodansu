@@ -25,22 +25,36 @@
 //! read paths answer from the topics that were created, the write paths accept
 //! and discard, and the three methods that genuinely cannot work without storage
 //! say so with `FeatureNotEnabled` rather than panicking.
+//!
+//! The four document families below — members, generations, assignments, ACLs
+//! and quotas — are the part of the sink that is not a discard at all. It holds
+//! them in `BTreeMap`s behind the same CAS contract the object store gives, and
+//! the reason to assert that here rather than trust it is that a profiling run
+//! against `null://` drives the *whole* coordinator: a version this engine hands
+//! out and then fails to recognise puts the coordinator in a retry loop, and the
+//! flamegraph shows the retry rather than the work (#556's fifth milestone).
 
 use std::{collections::BTreeMap, time::Duration};
 
 use bytes::Bytes;
 use tansu_sans_io::{
     ConfigResource, ErrorCode, IsolationLevel, ListOffset, ScramMechanism,
+    acl::{Operation, Permission, Resource},
     add_partitions_to_txn_request::AddPartitionsToTxnTopic,
     create_topics_request::CreatableTopic,
     incremental_alter_configs_request::AlterConfigsResource,
+    join_group_response::JoinGroupResponseMember,
     record::{Record, deflated, inflated},
+    resource::Pattern,
     txn_offset_commit_request::TxnOffsetCommitRequestTopic,
 };
 use tansu_storage::{
-    BrokerRegistrationRequest, CommittedOffset, Error, GenerationDoc, NamedGroupDetail,
-    OffsetCommitRequest, ScramCredential, Storage, StorageContainer, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
+    AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
+    BrokerRegistrationRequest, CommittedOffset, DEFAULT_FETCH_MAX_BYTES, Error, GenerationDoc,
+    MemberDoc, NamedGroupDetail, OffsetCommitRequest, PRODUCER_BYTE_RATE, QuotaAlteration,
+    QuotaEntity, QuotaFilterComponent, QuotaLimits, QuotaMatch, QuotaOp, ScramCredential, Storage,
+    StorageContainer, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
+    TxnOffsetCommitRequest, USER_ENTITY, UpdateError, Version, WILDCARD_HOST,
 };
 use url::Url;
 use uuid::Uuid;
@@ -73,6 +87,49 @@ fn topic(name: &str, partitions: i32, replication_factor: i16) -> CreatableTopic
         .name(name.into())
         .num_partitions(partitions)
         .replication_factor(replication_factor)
+}
+
+fn member(member_id: &str, last_contact_ms: i64) -> MemberDoc {
+    MemberDoc {
+        last_contact_ms,
+        session_timeout_ms: 45_000,
+        join_response: JoinGroupResponseMember::default().member_id(member_id.into()),
+        ..Default::default()
+    }
+}
+
+fn assignment(generation_id: i32) -> AssignmentDoc {
+    AssignmentDoc {
+        generation_id,
+        leader: "m1".into(),
+        protocol_type: "consumer".into(),
+        protocol_name: "range".into(),
+        assignments: BTreeMap::from([("m1".to_owned(), Bytes::from_static(b"ab"))]),
+        assigned_at_ms: 1_000,
+    }
+}
+
+fn binding(operation: Operation) -> AclBinding {
+    AclBinding {
+        resource_type: Resource::Topic,
+        resource_name: "abc".into(),
+        pattern: Pattern::Literal,
+        principal: "User:alice".into(),
+        host: WILDCARD_HOST.into(),
+        operation,
+        permission: Permission::Allow,
+    }
+}
+
+fn alteration(user: &str, key: &str, value: f64) -> QuotaAlteration {
+    QuotaAlteration {
+        entity: QuotaEntity::User(user.into()),
+        ops: vec![QuotaOp {
+            key: key.into(),
+            value,
+            remove: false,
+        }],
+    }
 }
 
 /// The identity a broker announces at startup has to survive the round trip, or
@@ -486,6 +543,392 @@ async fn credentials_and_record_deletion_report_feature_not_enabled() -> Result 
             .await,
         Err(Error::FeatureNotEnabled { .. })
     ));
+
+    Ok(())
+}
+
+/// A member document is CAS'd on the version it was read at, and the sink has
+/// to recognise the versions it hands out.
+///
+/// The coordinator renews a member's liveness by read-modify-write under the
+/// held version, and reads a mismatch as "another replica got there first". An
+/// engine whose versions never match makes every renewal a lost race, and a
+/// profiling run then measures the retry.
+#[tokio::test]
+async fn a_member_document_cas_matches_the_version_it_handed_out() -> Result {
+    let _guard = init_tracing()?;
+
+    let storage = null_storage().await?;
+
+    let first = storage
+        .write_group_member("g1", "m1", member("m1", 1_000), None)
+        .await
+        .expect("create");
+
+    assert_eq!(
+        Some((member("m1", 1_000), first.clone())),
+        storage.read_group_member("g1", "m1").await?
+    );
+
+    let second = storage
+        .write_group_member("g1", "m1", member("m1", 2_000), Some(first.clone()))
+        .await
+        .expect("renew");
+    assert_ne!(first, second);
+
+    match storage
+        .write_group_member("g1", "m1", member("m1", 3_000), Some(first))
+        .await
+    {
+        Err(UpdateError::Outdated { current, version }) => {
+            assert_eq!(2_000, current.last_contact_ms);
+            assert_eq!(second, version);
+        }
+        otherwise => panic!("expected Outdated, got {otherwise:?}"),
+    }
+
+    // A CAS against a member that is not there cannot be `Outdated`: there is
+    // no `current` to merge onto, so the caller has to be told its identity is
+    // gone rather than handed a document to retry against.
+    match storage
+        .write_group_member("g1", "ghost", member("ghost", 1_000), Some(second))
+        .await
+    {
+        Err(UpdateError::Error(Error::Api(ErrorCode::UnknownMemberId))) => (),
+        otherwise => panic!("expected UnknownMemberId, got {otherwise:?}"),
+    }
+
+    Ok(())
+}
+
+/// Every read of a group's members is scoped to that group, and a delete
+/// removes one document rather than the group.
+///
+/// The documents are keyed `(group, member)` in one map, so "the members of g1"
+/// is a filter and not a lookup — which is exactly the shape that answers with
+/// another group's members if the filter is wrong.
+#[tokio::test]
+async fn a_group_sees_its_own_member_documents_and_no_others() -> Result {
+    let _guard = init_tracing()?;
+
+    let storage = null_storage().await?;
+
+    for (group, member_id, last_contact_ms) in [
+        ("g1", "m1", 1_000),
+        ("g1", "m2", 2_000),
+        ("g2", "m3", 3_000),
+    ] {
+        _ = storage
+            .write_group_member(group, member_id, member(member_id, last_contact_ms), None)
+            .await
+            .expect(member_id);
+    }
+
+    assert_eq!(
+        vec!["m1", "m2"],
+        storage
+            .list_group_members("g1")
+            .await?
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    );
+
+    // The cheap listing batch admission elects from (#427): the same member
+    // set, carrying each document's own stamp rather than the document.
+    assert_eq!(
+        BTreeMap::from([("m1".to_owned(), 1_000), ("m2".to_owned(), 2_000)]),
+        storage.list_group_member_stamps("g1").await?
+    );
+
+    storage.delete_group_member("g1", "m1").await?;
+
+    assert_eq!(None, storage.read_group_member("g1", "m1").await?);
+    assert_eq!(
+        vec!["m2"],
+        storage
+            .list_group_members("g1")
+            .await?
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        vec!["m3"],
+        storage
+            .list_group_members("g2")
+            .await?
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    );
+
+    Ok(())
+}
+
+/// A generation CAS against a group that does not exist is an error, not a
+/// lost race.
+///
+/// The distinction is the whole of the caller's retry: an `Outdated` says "read
+/// me again and merge", and there is nothing to read. Returning one for a group
+/// that was never written would send the coordinator round a loop whose next
+/// read answers `None`.
+#[tokio::test]
+async fn a_generation_cas_against_no_group_is_not_a_lost_race() -> Result {
+    let _guard = init_tracing()?;
+
+    let storage = null_storage().await?;
+
+    assert_eq!(None, storage.read_group_generation("g1").await?);
+
+    match storage
+        .update_group_generation("g1", GenerationDoc::default(), Some(Version::default()))
+        .await
+    {
+        Err(UpdateError::Error(Error::Api(ErrorCode::GroupIdNotFound))) => (),
+        otherwise => panic!("expected GroupIdNotFound, got {otherwise:?}"),
+    }
+
+    let written = storage
+        .update_group_generation(
+            "g1",
+            GenerationDoc {
+                generation_id: 1,
+                session_timeout_ms: 45_000,
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .expect("create");
+
+    let (held, version) = storage.read_group_generation("g1").await?.expect("g1");
+    assert_eq!(1, held.generation_id);
+    assert_eq!(written, version);
+
+    Ok(())
+}
+
+/// An assignment is create-only, and retired by generation rather than by age.
+///
+/// Create-only is what makes a generation's assignment safe to read without a
+/// version: two replicas racing to publish the same generation's assignment
+/// must not produce two different partition maps, so the loser is handed the
+/// winner's document and syncs from that.
+#[tokio::test]
+async fn an_assignment_is_written_once_and_retired_by_generation() -> Result {
+    let _guard = init_tracing()?;
+
+    let storage = null_storage().await?;
+
+    assert!(matches!(
+        storage
+            .create_group_assignment("g1", 1, assignment(1))
+            .await?,
+        AssignmentOutcome::Created(_)
+    ));
+
+    match storage
+        .create_group_assignment("g1", 1, assignment(9))
+        .await?
+    {
+        AssignmentOutcome::AlreadyExists(current) => assert_eq!(assignment(1), *current),
+        otherwise => panic!("expected AlreadyExists, got {otherwise:?}"),
+    }
+
+    assert_eq!(
+        Some(assignment(1)),
+        storage.read_group_assignment("g1", 1).await?
+    );
+    assert_eq!(None, storage.read_group_assignment("g1", 2).await?);
+
+    for (group, generation_id) in [("g1", 2), ("g1", 3), ("g2", 1)] {
+        _ = storage
+            .create_group_assignment(group, generation_id, assignment(generation_id))
+            .await?;
+    }
+
+    // Retiring below generation 3 leaves generation 3 and every other group's
+    // assignments where they were: the key is `(group, generation)`, so a
+    // retirement that ignored the group would empty the cluster.
+    assert_eq!(2, storage.delete_group_assignments_before("g1", 3).await?);
+    assert_eq!(None, storage.read_group_assignment("g1", 2).await?);
+    assert_eq!(
+        Some(assignment(3)),
+        storage.read_group_assignment("g1", 3).await?
+    );
+    assert_eq!(
+        Some(assignment(1)),
+        storage.read_group_assignment("g2", 1).await?
+    );
+
+    Ok(())
+}
+
+/// What an operator applies to the sink is what it describes back, and a
+/// narrowed delete removes only what it selected.
+///
+/// `kafka-acls.sh` against a `null://` broker is a plausible way to rehearse a
+/// rule set, and #363 is the precedent for why that has to be asserted rather
+/// than assumed: create and describe answered success without touching
+/// anything, so the tool appeared to work.
+#[tokio::test]
+async fn acls_applied_to_the_sink_are_the_acls_it_describes() -> Result {
+    let _guard = init_tracing()?;
+
+    let storage = null_storage().await?;
+
+    let read = binding(Operation::Read);
+    let write = binding(Operation::Write);
+
+    assert_eq!(
+        vec![ErrorCode::None; 2],
+        storage.create_acls(&[read.clone(), write.clone()]).await?
+    );
+
+    // Creating the same binding twice is not two bindings: they are held in a
+    // set, keyed by everything that makes a rule a rule.
+    assert_eq!(
+        vec![ErrorCode::None],
+        storage.create_acls(std::slice::from_ref(&read)).await?
+    );
+
+    assert_eq!(
+        vec![read.clone(), write.clone()],
+        storage.describe_acls(&AclFilter::any()).await?
+    );
+
+    let narrowed = AclFilter {
+        operation: Operation::Read,
+        ..AclFilter::any()
+    };
+
+    assert_eq!(vec![read.clone()], storage.describe_acls(&narrowed).await?);
+
+    assert_eq!(
+        vec![vec![read]],
+        storage.delete_acls(std::slice::from_ref(&narrowed)).await?
+    );
+
+    assert_eq!(vec![write], storage.describe_acls(&AclFilter::any()).await?);
+    assert!(storage.delete_acls(std::slice::from_ref(&narrowed)).await?[0].is_empty());
+
+    Ok(())
+}
+
+/// A quota alteration is validated against a copy, so a `validate_only` call
+/// and a refused key both leave the document as they found it.
+///
+/// The refusal matters more than it looks: `alter_client_quotas` answers one
+/// error code per alteration, and a partially-applied batch would leave the
+/// stored document in a state no client asked for and no describe explains.
+#[tokio::test]
+async fn a_quota_is_validated_against_a_copy_before_it_is_stored() -> Result {
+    let _guard = init_tracing()?;
+
+    let storage = null_storage().await?;
+
+    assert_eq!(
+        vec![ErrorCode::None],
+        storage
+            .alter_client_quotas(&[alteration("alice", PRODUCER_BYTE_RATE, 1_024.0)], true)
+            .await?
+    );
+    assert!(storage.client_quotas().await?.users.is_empty());
+
+    assert_eq!(
+        vec![ErrorCode::None],
+        storage
+            .alter_client_quotas(&[alteration("alice", PRODUCER_BYTE_RATE, 1_024.0)], false)
+            .await?
+    );
+
+    let alice = QuotaLimits {
+        producer_byte_rate: Some(1_024.0),
+        ..Default::default()
+    };
+
+    assert_eq!(
+        BTreeMap::from([("alice".to_owned(), alice)]),
+        storage.client_quotas().await?.users
+    );
+
+    assert_eq!(
+        vec![ErrorCode::InvalidConfig],
+        storage
+            .alter_client_quotas(&[alteration("bob", "no.such.rate", 1.0)], false)
+            .await?
+    );
+    assert!(!storage.client_quotas().await?.users.contains_key("bob"));
+
+    assert_eq!(
+        vec![(QuotaEntity::User("alice".into()), alice)],
+        storage
+            .describe_client_quotas(
+                &[QuotaFilterComponent {
+                    entity_type: USER_ENTITY.into(),
+                    matches: QuotaMatch::Exact("alice".into()),
+                }],
+                true,
+            )
+            .await?
+    );
+
+    // A strict filter that names no entity type this broker knows selects
+    // nothing, rather than everything.
+    assert!(storage.describe_client_quotas(&[], true).await?.is_empty());
+
+    // Removing the only key configured removes the entity rather than storing
+    // it empty, so a later describe says "no quota" and not "a quota with no
+    // values".
+    assert_eq!(
+        vec![ErrorCode::None],
+        storage
+            .alter_client_quotas(
+                &[QuotaAlteration {
+                    entity: QuotaEntity::User("alice".into()),
+                    ops: vec![QuotaOp {
+                        key: PRODUCER_BYTE_RATE.into(),
+                        value: 0.0,
+                        remove: true,
+                    }],
+                }],
+                false,
+            )
+            .await?
+    );
+    assert!(storage.client_quotas().await?.users.is_empty());
+
+    Ok(())
+}
+
+/// The three methods #551 stated rather than inherited answer what the trait
+/// defaults answered.
+///
+/// A default is a method a wrapper can forget without the compiler noticing
+/// (#273), which is why they were removed — and stating them means they can now
+/// drift from what they replaced, which is why this asserts the values rather
+/// than that they return at all.
+#[tokio::test]
+async fn the_stated_answers_are_the_ones_the_trait_defaults_gave() -> Result {
+    let _guard = init_tracing()?;
+
+    let storage = null_storage().await?;
+
+    assert_eq!(
+        AutoTopicCreate::default(),
+        storage.auto_create_topic_config()
+    );
+    assert_eq!(DEFAULT_FETCH_MAX_BYTES, storage.fetch_max_bytes());
+
+    let topition = Topition::new("abc", 0);
+
+    assert_eq!(
+        storage.offset_stage(&topition).await?,
+        storage
+            .offset_stage_at(&topition, IsolationLevel::ReadCommitted)
+            .await?
+    );
 
     Ok(())
 }

@@ -197,24 +197,25 @@ jobs:
           cache: false
       - uses: taiki-e/install-action@nextest
       - uses: taiki-e/install-action@cargo-llvm-cov
-      # The floor is a ratchet, and 88 is deliberately under the ~90.65%
-      # measured once #556's fourth milestone took the four wire codecs in
-      # `tansu-sans-io` from 35-69% to 90-98%: it is there to catch a change
-      # that deletes the tests covering the code it touches, not to police a
-      # decimal point.
+      # The floor is a ratchet, and 90 is deliberately under the ~90.98%
+      # measured once #556's fifth milestone took the two `Storage` wrappers to
+      # 100% and 99%: it is there to catch a change that deletes the tests
+      # covering the code it touches, not to police a decimal point.
       #
-      # Two points is more slack than `comments` gets below, and the reason is
-      # that this number is not reproducible to the digit the way that one is.
-      # #549 measured it three times over one tree — 5383 uncovered lines on
-      # darwin, then 5375 and 5383 on two runs of this job — so the denominator
-      # is stable at 33776 and the numerator moves by ~8 lines, 0.03 points, run
-      # to run within a single platform. A floor at the measured value would go
-      # red on a re-run of a green commit. The rest of the margin is for
-      # legitimate churn in what the suite covers.
+      # A point of slack rather than the two every step before this one left,
+      # and the reason is the acceptance #556 states: milestones 1-5 landed with
+      # the floor at 90. What the slack is *for* is that this number is not
+      # reproducible to the digit the way `comments`' ceiling is. #549 measured
+      # it three times over one tree — 5383 uncovered lines on darwin, then 5375
+      # and 5383 on two runs of this job — so the denominator is stable at 33776
+      # and the numerator moves by ~8 lines, 0.03 points, run to run within a
+      # single platform. A floor at the measured value would go red on a re-run
+      # of a green commit; 0.98 points is thirty times that jitter, and the two
+      # points earlier steps left was generous against the number it cites.
       #
       # Raise it when the real number moves up; never lower it to turn a red
       # build green, which is the one edit that makes this job decorative.
-      - run: just coverage-ci 88
+      - run: just coverage-ci 90
       - name: Coverage summary
         if: always()
         run: |
