@@ -17,7 +17,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, BTreeSet, HashMap, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map::Entry},
     fmt::{Debug, Display, Write as _},
     str::FromStr,
     sync::{
@@ -307,6 +307,18 @@ struct PrefixIndex {
     /// `(sub-stream, partition)` — and the distinct keys are the cluster's
     /// partition count, not the entry count.
     by_substream: HashMap<SubstreamKey, Vec<(u64, u32)>>,
+    /// One [`Arc<str>`] per distinct topic name in this prefix, handed to every
+    /// [`SubstreamEntry`] that names it (#476 item 2b).
+    ///
+    /// Sized by the prefix's **topics**, not its entries — 17 k names across the
+    /// whole fleet against 6.2 M entries per replica — which is the ratio the
+    /// interning buys. It is a set rather than a map because the key *is* the
+    /// value: `HashSet::get` returns the stored `Arc`, which is the one to clone.
+    ///
+    /// Swept, not grown for ever: see [`Self::forget_unused_topic_names`]. A
+    /// prefix outlives the topics routed into it, so without a sweep a pod that
+    /// has seen a year of topic churn holds a year of names.
+    topic_names: HashSet<Arc<str>>,
     /// When the live segment set was last reconciled by a listing; gates the
     /// TTL so a hot prefix lists at most once per [`DynoStore::HIGH_WATERMARK_HINT_TTL`].
     refreshed_at: Option<SystemTime>,
@@ -398,6 +410,7 @@ impl PrefixIndex {
 
         for entry in &mut cached.footer.entries {
             entry.retain_foldable_producers();
+            entry.topic = self.intern_topic(&entry.topic);
         }
 
         for (position, entry) in cached.footer.entries.iter().enumerate() {
@@ -440,9 +453,45 @@ impl PrefixIndex {
                 seqs.retain(|(seq, _)| keep(*seq));
                 !seqs.is_empty()
             });
+
+            self.forget_unused_topic_names();
         }
 
         dropped
+    }
+
+    /// The one [`Arc<str>`] this index uses for `topic`, adopting `topic`'s own
+    /// allocation the first time the name is seen (#476 item 2b).
+    ///
+    /// Called from [`Self::insert_segment`] and nowhere else. That is the
+    /// property worth keeping: interning is only sound while every sharer is
+    /// reachable from `segments`, because that is what
+    /// [`Self::forget_unused_topic_names`] counts.
+    fn intern_topic(&mut self, topic: &Arc<str>) -> Arc<str> {
+        if let Some(shared) = self.topic_names.get(topic) {
+            return shared.clone();
+        }
+
+        _ = self.topic_names.insert(topic.clone());
+        topic.clone()
+    }
+
+    /// Drop the interned names no cached footer names any more.
+    ///
+    /// The test is `Arc::strong_count == 1`: this set is the only other holder,
+    /// so a count of one means every entry that named it has been dropped. A
+    /// clone that escaped the index's lock inflates the count and keeps its name
+    /// one sweep longer, which costs one name and converges — the failure this
+    /// rules out is the opposite one, dropping a name an entry still points at,
+    /// which cannot happen because that entry *is* a strong reference.
+    ///
+    /// Run from [`Self::retain_segments`], which is the only path that drops a
+    /// cached footer, and only when it dropped one: it is O(topics in the
+    /// prefix) and a prefix's topic count is three orders of magnitude below its
+    /// entry count, so paying it per retained segment would cost more than the
+    /// names are worth.
+    fn forget_unused_topic_names(&mut self) {
+        self.topic_names.retain(|name| Arc::strong_count(name) > 1);
     }
 
     /// Withdraw `seq`'s contribution to [`Self::by_substream`]. Reads the footer
@@ -1194,6 +1243,22 @@ static PREFIX_INDEX_PRODUCER_COORDS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("tansu_prefix_index_producer_coords")
         .with_description("producer coordinates retained across every footer in the prefix index")
+        .build()
+});
+
+/// Distinct topic names held by the prefix index (#476 item 2b) — the
+/// denominator the interning turned `tansu_prefix_index_substream_entries` into.
+///
+/// Entries per name is what the change bought: it was 1 by construction when
+/// every entry carried its own copy, and it is now the mean number of sub-stream
+/// entries sharing one allocation. It is also the only way to see the sweep
+/// working — a name count that tracks the cluster's topics is right, one that
+/// only ever rises means [`PrefixIndex::forget_unused_topic_names`] is not being
+/// reached and the index is accumulating the names of deleted topics.
+static PREFIX_INDEX_TOPIC_NAMES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("tansu_prefix_index_topic_names")
+        .with_description("distinct interned topic names across the prefix index")
         .build()
 });
 
@@ -2060,7 +2125,23 @@ pub(crate) const SEGMENT_FOOTER_OVER_READ: usize = 64 * 1024;
 /// (the legacy `{offset}.batch` authority).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SubstreamEntry {
-    pub(crate) topic: String,
+    /// The topic name this sub-stream's records belong to.
+    ///
+    /// `Arc<str>` rather than `String` because the resident copy is the same
+    /// handful of names repeated millions of times (#476 item 2b): a name is a
+    /// property of the *topic*, and a topic contributes one entry per segment it
+    /// occupies, so a prefix holding a thousand segments of one topic held a
+    /// thousand copies of its name. The mean name on the production fleet is
+    /// **52.6 chars**: a `String` is 24 B here plus a 64 B allocator bin for it,
+    /// against 16 B for a pointer and a length into one shared allocation — ~72 B
+    /// an entry, and there were 6.24 M entries per replica on 2026-09-11.
+    ///
+    /// Sharing is not a property of the type — two `Arc<str>` built from the
+    /// same `&str` are two allocations. It is [`PrefixIndex::intern_topic`] that
+    /// makes this pay, and it is applied at the one chokepoint into the resident
+    /// cache, so an entry decoded but never cached keeps its own copy and costs
+    /// what it always did.
+    pub(crate) topic: Arc<str>,
     /// The id of the topic incarnation these records belong to (#442, footer
     /// v4), or `None` in a v1/v2/v3 entry and for a name-keyed topic.
     ///
@@ -2107,7 +2188,7 @@ impl SubstreamEntry {
     /// footer carries one, else the topic name.
     pub(crate) fn substream(&self) -> Substream {
         self.topic_id
-            .map_or_else(|| Substream::Name(self.topic.clone()), Substream::Id)
+            .map_or_else(|| Substream::Name(self.topic.to_string()), Substream::Id)
     }
 
     /// Whether this entry holds `substream`'s records.
@@ -2120,7 +2201,7 @@ impl SubstreamEntry {
     fn is(&self, substream: &Substream) -> bool {
         match substream {
             Substream::Id(id) => self.topic_id == Some(*id),
-            Substream::Name(name) => self.topic_id.is_none() && self.topic == *name,
+            Substream::Name(name) => self.topic_id.is_none() && *self.topic == **name,
         }
     }
 
@@ -2353,7 +2434,7 @@ impl RegionRead<'_> {
         CorruptRegion {
             prefix: self.prefix.to_owned(),
             seq: self.seq,
-            topic: self.entry.topic.clone(),
+            topic: self.entry.topic.to_string(),
             partition: self.entry.partition,
             base_offset: self.entry.base_offset,
             byte_start: self.entry.byte_start,
@@ -6270,27 +6351,31 @@ impl DynoStore {
             // path, so the O(segments) walk runs at most once per prefix per
             // `HIGH_WATERMARK_HINT_TTL`, and it is the point where the live set
             // has just been reconciled.
-            let (segments, entries, coords) =
-                index.values().fold((0u64, 0u64, 0u64), |(s, e, c), entry| {
-                    (
-                        s + entry.segments.len() as u64,
-                        e + entry
-                            .segments
-                            .values()
-                            .map(|cached| cached.footer.entries.len() as u64)
-                            .sum::<u64>(),
-                        c + entry
-                            .segments
-                            .values()
-                            .flat_map(|cached| cached.footer.entries.iter())
-                            .map(|entry| entry.producers.len() as u64)
-                            .sum::<u64>(),
-                    )
-                });
+            let (segments, entries, coords, names) =
+                index
+                    .values()
+                    .fold((0u64, 0u64, 0u64, 0u64), |(s, e, c, n), entry| {
+                        (
+                            s + entry.segments.len() as u64,
+                            e + entry
+                                .segments
+                                .values()
+                                .map(|cached| cached.footer.entries.len() as u64)
+                                .sum::<u64>(),
+                            c + entry
+                                .segments
+                                .values()
+                                .flat_map(|cached| cached.footer.entries.iter())
+                                .map(|entry| entry.producers.len() as u64)
+                                .sum::<u64>(),
+                            n + entry.topic_names.len() as u64,
+                        )
+                    });
 
             PREFIX_INDEX_SEGMENTS.record(segments, &[]);
             PREFIX_INDEX_SUBSTREAM_ENTRIES.record(entries, &[]);
             PREFIX_INDEX_PRODUCER_COORDS.record(coords, &[]);
+            PREFIX_INDEX_TOPIC_NAMES.record(names, &[]);
         }
         Ok(())
     }
@@ -9262,7 +9347,7 @@ impl DynoStore {
                                 .map(|e| {
                                     (
                                         e.substream(),
-                                        e.topic.clone(),
+                                        e.topic.to_string(),
                                         e.partition,
                                         e.base_offset + e.record_count,
                                     )
@@ -10032,7 +10117,7 @@ impl DynoStore {
                 footer
                     .entries
                     .iter()
-                    .map(|e| (e.substream(), e.topic.clone(), e.partition))
+                    .map(|e| (e.substream(), e.topic.to_string(), e.partition))
             })
             .collect();
 
@@ -10263,7 +10348,11 @@ impl DynoStore {
                     _ = segments_meta
                         .insert(*seq, (cached.footer.writer_epoch, cached.last_modified_ms));
                     for e in &cached.footer.entries {
-                        _ = substream_keys.insert((e.substream(), e.topic.clone(), e.partition));
+                        _ = substream_keys.insert((
+                            e.substream(),
+                            e.topic.to_string(),
+                            e.partition,
+                        ));
                     }
                 }
             }
@@ -11552,22 +11641,22 @@ impl DynoStore {
 
         self.refresh_prefix_index_forced(prefix).await?;
 
-        let substreams: BTreeSet<(Substream, String, i32)> =
-            self.prefixes
-                .index()?
-                .get(prefix)
-                .map(|index| {
-                    index
-                        .segments
-                        .values()
-                        .flat_map(|cached| {
-                            cached.footer.entries.iter().map(|entry| {
-                                (entry.substream(), entry.topic.clone(), entry.partition)
-                            })
+        let substreams: BTreeSet<(Substream, String, i32)> = self
+            .prefixes
+            .index()?
+            .get(prefix)
+            .map(|index| {
+                index
+                    .segments
+                    .values()
+                    .flat_map(|cached| {
+                        cached.footer.entries.iter().map(|entry| {
+                            (entry.substream(), entry.topic.to_string(), entry.partition)
                         })
-                        .collect()
-                })
-                .unwrap_or_default();
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
         let mut certified: Vec<Topition> = Vec::new();
 
@@ -11998,7 +12087,7 @@ impl DynoStore {
         warn!(
             prefix,
             seq,
-            topic = entry.topic,
+            topic = %entry.topic,
             partition = entry.partition,
             indexed = ?(entry.byte_start, entry.byte_len, entry.base_offset, entry.record_count),
             ?trailer,
@@ -12153,7 +12242,7 @@ impl DynoStore {
                 debug!(
                     prefix,
                     seq,
-                    topic = entry.topic,
+                    topic = %entry.topic,
                     partition = entry.partition,
                     batches = batches.len(),
                     ?tail,
@@ -12218,7 +12307,7 @@ impl DynoStore {
             }
 
             entries.push(SubstreamEntry {
-                topic: topition.topic().to_owned(),
+                topic: Arc::from(topition.topic()),
                 // v1 has no place to put one, so a v1 sub-stream is keyed by
                 // name — which is what every topic written by that path was
                 // (#442).
@@ -12392,7 +12481,7 @@ impl DynoStore {
             }
 
             entries.push(SubstreamEntry {
-                topic: topition.topic().to_owned(),
+                topic: Arc::from(topition.topic()),
                 topic_id: substream.id(),
                 partition: topition.partition(),
                 base_offset: *base_offset,
@@ -12532,8 +12621,9 @@ impl DynoStore {
 
         for _ in 0..entry_count {
             let topic_len = u16::from_be_bytes(take(&mut cursor, 2)?.try_into()?) as usize;
-            let topic = String::from_utf8(take(&mut cursor, topic_len)?.to_vec())
-                .map_err(|e| Error::Message(e.to_string()))?;
+            let topic: Arc<str> = str::from_utf8(take(&mut cursor, topic_len)?)
+                .map_err(|e| Error::Message(e.to_string()))?
+                .into();
             // v4 carries the topic id the records were produced under (#442). A
             // nil uuid means this sub-stream is keyed by name — the same state a
             // v1/v2/v3 entry is in, and the state every topic created before the
@@ -17324,7 +17414,7 @@ mod foldable_producers_tests {
 #[cfg(test)]
 mod prefix_index_substream_tests {
     use super::{CachedSegment, PrefixIndex, SegmentFooter, Substream, SubstreamEntry};
-    use std::collections::HashMap;
+    use std::{collections::HashMap, sync::Arc};
     use uuid::Uuid;
 
     fn entry(topic: &str, topic_id: Option<Uuid>, partition: i32, base: i64) -> SubstreamEntry {
@@ -17489,5 +17579,69 @@ mod prefix_index_substream_tests {
                 .by_substream
                 .contains_key(&(Substream::Name("never-written".into()), 0))
         );
+    }
+
+    /// The whole of #476 item 2b: a topic contributes one entry per segment it
+    /// occupies, and all of them have to name it through one allocation.
+    ///
+    /// `Arc::ptr_eq` rather than `==` on purpose — the names compare equal
+    /// whether or not anything is shared, which is exactly the state this
+    /// replaces, so an equality assertion would pass on the unfixed tree.
+    #[test]
+    fn every_entry_naming_a_topic_shares_one_allocation() {
+        let mut index = PrefixIndex::default();
+
+        for seq in 0..8 {
+            index.insert_segment(
+                seq,
+                segment(
+                    1,
+                    vec![
+                        entry("alpha", None, 0, seq as i64 * 10),
+                        entry("alpha", None, 1, seq as i64 * 10),
+                        entry("beta", None, 0, seq as i64 * 10),
+                    ],
+                ),
+            );
+        }
+
+        let names: Vec<&Arc<str>> = index
+            .segments
+            .values()
+            .flat_map(|cached| cached.footer.entries.iter())
+            .filter(|entry| &*entry.topic == "alpha")
+            .map(|entry| &entry.topic)
+            .collect();
+
+        assert_eq!(names.len(), 16);
+        assert!(names.iter().all(|name| Arc::ptr_eq(name, names[0])));
+        assert_eq!(&**names[0], "alpha");
+
+        // Two topics, 24 entries (#476): the count this index pays is its
+        // topics, which is what `tansu_prefix_index_topic_names` reports.
+        assert_eq!(index.topic_names.len(), 2);
+    }
+
+    /// A prefix outlives the topics routed into it, so the interner has to be a
+    /// cache and not a ledger.
+    #[test]
+    fn a_topic_with_no_entries_left_keeps_no_name() {
+        let mut index = PrefixIndex::default();
+
+        index.insert_segment(1, segment(1, vec![entry("alpha", None, 0, 0)]));
+        index.insert_segment(2, segment(1, vec![entry("beta", None, 0, 0)]));
+        index.insert_segment(3, segment(1, vec![entry("alpha", None, 0, 10)]));
+
+        assert_eq!(index.topic_names.len(), 2);
+
+        // `beta`'s only segment goes (#476); `alpha` still has two.
+        assert_eq!(index.retain_segments(|seq| seq != 2), 1);
+
+        let mut held: Vec<&str> = index.topic_names.iter().map(|name| &**name).collect();
+        held.sort_unstable();
+        assert_eq!(held, vec!["alpha"]);
+
+        assert_eq!(index.retain_segments(|_| false), 2);
+        assert!(index.topic_names.is_empty());
     }
 }

@@ -156,7 +156,7 @@ fn segment_path(seq: u64) -> Path {
 /// A SubstreamEntry for a topic-0 sub-stream (test scaffolding).
 fn entry(topic: &str, base: i64, count: i64) -> SubstreamEntry {
     SubstreamEntry {
-        topic: topic.to_owned(),
+        topic: topic.into(),
         topic_id: None,
         partition: 0,
         base_offset: base,
@@ -1789,7 +1789,7 @@ async fn epoch_fencing_drops_stale_overlapping_segment() -> Result<(), Error> {
     let topic = "org.env.conn.tab_a";
 
     let entry = |base: i64, count: i64| SubstreamEntry {
-        topic: topic.to_owned(),
+        topic: topic.into(),
         topic_id: None,
         partition: 0,
         base_offset: base,

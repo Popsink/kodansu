@@ -471,7 +471,7 @@ impl Audit {
 
             for entry in &footer.entries {
                 slices
-                    .entry((entry.substream(), entry.topic.clone(), entry.partition))
+                    .entry((entry.substream(), entry.topic.to_string(), entry.partition))
                     .or_default()
                     .push(Slice {
                         prefix: prefix.clone(),
