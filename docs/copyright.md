@@ -18,12 +18,13 @@ byte. Only the notice lines above it differ.
 | class | count | notice |
 |---|---|---|
 | inherited from tansu | 158 | Peter Morgan's line, unchanged |
-| inherited, rewritten in place here | 17 | Peter Morgan's line, then Popsink's |
-| written at Popsink | 98 | Popsink's line alone |
+| inherited, rewritten in place here | 35 | Peter Morgan's line, then Popsink's |
+| written at Popsink | 102 | Popsink's line alone |
 
-The first two rows are the 175 files `copyright.toml` calls `inherited`; the middle
-row is the subset it also calls `joint`. 158 + 17 + 98 = 273, every tracked `.rs`
-file. `just copyright` prints the total it checked, which is how to tell whether
+The first two rows are the 193 files `copyright.toml` calls `inherited`; the middle
+row is the subset it also calls `joint`. 158 + 35 + 102 = 295, every tracked `.rs`
+file. Eighteen of the 35 arrived together: #550 split `dynostore.rs` into
+`dynostore/` modules, and a move carries the notice with the lines. `just copyright` prints the total it checked, which is how to tell whether
 this table has drifted.
 
 Popsink's line is `// Copyright ⓒ 2026 Popsink SAS`. It claims 2026 and no earlier
@@ -125,9 +126,12 @@ git diff --no-renames --diff-filter=M --numstat "$BASE" HEAD -- '*.rs' |
   done | sort -rn
 ```
 
-Seventeen files qualify, led by `tansu-storage/src/dynostore.rs` (89% of today's
-content added here, +15864 lines) and
-`tansu-broker/src/coordinator/group/administrator.rs` (88%, +6187).
+Seventeen files qualified when this was measured, led by
+`tansu-storage/src/dynostore.rs` (89% of today's content added here, +15864
+lines) and `tansu-broker/src/coordinator/group/administrator.rs` (88%, +6187).
+#550 then split the first of those into eighteen modules, which inherit its
+classification rather than being re-measured: the split moved lines, so the
+share of each new file that is ours is the share of the span it took.
 
 Note that the measure is the share of the file that is *ours today*, not the share
 of upstream's that was deleted. The two disagree, and only the first is relevant to

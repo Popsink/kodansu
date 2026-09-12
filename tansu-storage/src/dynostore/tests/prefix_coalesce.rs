@@ -49,7 +49,7 @@ use crate::{
     Error, Result, Storage, TopicId, Topition, TxnAddPartitionsRequest,
     dynostore::{
         CoalesceTuning, CompactRun, DynoStore, Era, PrefixLease, SegmentFooter, ServedEnd,
-        Substream, SubstreamEntry, TxnProduceOffset, maybe_expirable,
+        Substream, SubstreamEntry, TxnProduceOffset, retention::maybe_expirable,
     },
     storage_error_code,
 };

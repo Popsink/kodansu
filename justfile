@@ -271,6 +271,16 @@ fmt:
 # line — the `//` inside the two wrapper suites saying which assertion is
 # falsifiable and why — and 2.9951 is the measurement with those 18 in it.
 #
+#   #550   +203 lines, dynostore split  3182 -> 3182   2.99504904 -> 2.98737267
+#
+# The first move made by a change that neither added nor deleted a line of
+# narration: #550 cut `dynostore.rs` into 18 modules, and the +203 is what a
+# split costs in code — an `impl DynoStore {` and its brace, a `use super::*;`
+# and a licence header per file, plus six delegations out of `impl Storage`.
+# The `//!` each new module opens with is rustdoc, outside the ratio. The
+# numerator is unchanged to the line because every `//` in this PR moved rather
+# than appeared.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -280,7 +290,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.9951" top="12":
+comments ceiling="2.9874" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
