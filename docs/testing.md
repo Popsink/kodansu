@@ -182,8 +182,8 @@ Both numbers are a **ratchet set at the measured worst shipped function**, the
 same construction as `comments`' ceiling and `coverage-ci`'s floor: green on
 the commit that set them, red on the next function to cross either. 350 is
 `ErrorCode`'s `Display` in `tansu-sans-io/src/lib.rs`, one arm per error code.
-34 is `expire_prefix_segments` in `tansu-storage/src/dynostore.rs`. Lower both
-as #550's follow-ups land; raising either is the escape hatch, on the same
+34 is `expire_prefix_segments`, in `tansu-storage/src/dynostore/retention.rs`
+since #550 split that file. Lower both as #550's follow-ups land; raising either is the escape hatch, on the same
 terms as the other two — say why the real number moved.
 
 Unlike the other two ratchets there is no jitter to leave room for, so these
@@ -191,7 +191,8 @@ sit *at* the measurement rather than under it.
 
 Clippy counts body lines after comments and blank lines are dropped, so it
 reads lower than `wc -l` over the same span: #550's table says 424 for
-`compact_prefix_segments` where clippy says 228. Quote the clippy number when
+`compact_prefix_segments` (394 after the split, which moved no line of it)
+where clippy says 228. Quote the clippy number when
 moving the threshold, or the two disagree by a factor of two.
 
 The threshold is deliberately set on **shipped** code. Test and bench targets

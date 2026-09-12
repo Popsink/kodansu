@@ -40,7 +40,10 @@ upstream = [
 # Files derived from tansu: they carry an `upstream` notice and nothing else.
 #
 # This list is closed to new code: it shrinks when an inherited file is deleted
-# and an entry is edited when one is moved, but it never grows on its own.
+# and an entry is edited when one is moved, but it never grows on its own. The
+# eighteen `dynostore/` modules are the one move it has recorded so far: #550
+# cut `dynostore.rs` into them without writing a line, so each is a destination
+# of an entry that was already here, not upstream code arriving.
 # Upstream code can only enter the tree through a deliberate port, and adding a
 # line here is the reviewable act that records one. (Nine of these arrived that way already, via
 # 27df1fb porting tansu-io#680; they are new files by tree comparison but
@@ -159,6 +162,24 @@ inherited = [
     "tansu-service/tests/tcp.rs",
     "tansu-storage/src/batch.rs",
     "tansu-storage/src/dynostore.rs",
+    "tansu-storage/src/dynostore/coalesce.rs",
+    "tansu-storage/src/dynostore/codec.rs",
+    "tansu-storage/src/dynostore/compaction.rs",
+    "tansu-storage/src/dynostore/fetch.rs",
+    "tansu-storage/src/dynostore/groups.rs",
+    "tansu-storage/src/dynostore/index.rs",
+    "tansu-storage/src/dynostore/maintenance.rs",
+    "tansu-storage/src/dynostore/metrics.rs",
+    "tansu-storage/src/dynostore/metron.rs",
+    "tansu-storage/src/dynostore/object.rs",
+    "tansu-storage/src/dynostore/principals.rs",
+    "tansu-storage/src/dynostore/retention.rs",
+    "tansu-storage/src/dynostore/routing.rs",
+    "tansu-storage/src/dynostore/segments.rs",
+    "tansu-storage/src/dynostore/storage.rs",
+    "tansu-storage/src/dynostore/topics.rs",
+    "tansu-storage/src/dynostore/txn.rs",
+    "tansu-storage/src/dynostore/watermarks.rs",
     "tansu-storage/src/dynostore/metadata.rs",
     "tansu-storage/src/dynostore/opticon.rs",
     "tansu-storage/src/dynostore/tests.rs",
@@ -240,6 +261,24 @@ joint = [
     "tansu-sans-io/tests/consumer.rs",
     "tansu-service/src/stream.rs",
     "tansu-storage/src/dynostore.rs",
+    "tansu-storage/src/dynostore/coalesce.rs",
+    "tansu-storage/src/dynostore/codec.rs",
+    "tansu-storage/src/dynostore/compaction.rs",
+    "tansu-storage/src/dynostore/fetch.rs",
+    "tansu-storage/src/dynostore/groups.rs",
+    "tansu-storage/src/dynostore/index.rs",
+    "tansu-storage/src/dynostore/maintenance.rs",
+    "tansu-storage/src/dynostore/metrics.rs",
+    "tansu-storage/src/dynostore/metron.rs",
+    "tansu-storage/src/dynostore/object.rs",
+    "tansu-storage/src/dynostore/principals.rs",
+    "tansu-storage/src/dynostore/retention.rs",
+    "tansu-storage/src/dynostore/routing.rs",
+    "tansu-storage/src/dynostore/segments.rs",
+    "tansu-storage/src/dynostore/storage.rs",
+    "tansu-storage/src/dynostore/topics.rs",
+    "tansu-storage/src/dynostore/txn.rs",
+    "tansu-storage/src/dynostore/watermarks.rs",
     "tansu-storage/src/dynostore/tests.rs",
     "tansu-storage/src/lib.rs",
     "tansu-storage/src/service/fetch.rs",
