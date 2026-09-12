@@ -421,7 +421,7 @@ impl DynoStore {
             .collect::<BTreeSet<_>>();
 
         let evicted = self.topics.retain_live(&live);
-        let (topics, partitions) = self.topics.record_occupancy();
+        let (topics, partitions) = self.topics.levels();
 
         if !evicted.is_empty() {
             debug!(

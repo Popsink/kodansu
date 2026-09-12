@@ -281,6 +281,16 @@ fmt:
 # numerator is unchanged to the line because every `//` in this PR moved rather
 # than appeared.
 #
+#   #573   +311 lines, the cache gauge 3182 -> 3182   2.98737267 -> 2.98157831
+#
+# The second move made by a change that neither added nor deleted a line of
+# narration, and the first where that is true of a change with a new file in
+# it. #573 records `tansu_cache_entries` from the index walk as well as the
+# maintenance tick, which is one call and one `//` block citing the issue —
+# exempt — and pays for itself with a 311-line integration test whose every
+# explanation is `//!` or `///`. So the numerator is unchanged to the line and
+# only the denominator moved.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -290,7 +300,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.9874" top="12":
+comments ceiling="2.9816" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
