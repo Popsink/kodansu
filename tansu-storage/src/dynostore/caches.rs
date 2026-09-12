@@ -47,9 +47,9 @@ use uuid::Uuid;
 use object_store::path::Path;
 
 use super::{
-    CachedWatermark, GroupOffsets, HeldLease, OffsetHint, OptiCon, PrefixIndex, ProducerDetail,
-    ProducerId, RetiredPrefixCache, SegmentReadTrace, ServedEnd, Topic, TopicIndex, TopicMetadata,
-    TopicRouting, Watermark,
+    CachedWatermark, DynoStore, GroupOffsets, HeldLease, OffsetHint, OptiCon, PrefixIndex,
+    ProducerDetail, ProducerId, RetiredPrefixCache, SegmentReadTrace, ServedEnd, Topic, TopicIndex,
+    TopicMetadata, TopicRouting, Watermark,
 };
 use crate::{Error, METER, Result, Topition};
 
@@ -69,12 +69,17 @@ static CACHE_ENTRIES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
-/// Topics this process holds metadata-cache entries for, after a maintenance
-/// sweep (#283).
+/// Topics this process holds metadata-cache entries for (#283).
 ///
 /// Kept beside the broken-down [`CACHE_ENTRIES`] rather than replaced by it: it
 /// is the series the memory investigations (#476, #543) are plotted against, and
 /// renaming it would silently empty those dashboards.
+///
+/// It used to be sampled immediately after a maintenance sweep, and so read as
+/// the *converged* level. Since #573 it is recorded wherever
+/// [`DynoStore::record_cache_occupancy`] is, which on a replica that never
+/// maintains is the level this process has grown to — which is the question
+/// being asked of it.
 static TOPIC_CACHE_TOPICS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("tansu_topic_cache_topics")
@@ -82,10 +87,10 @@ static TOPIC_CACHE_TOPICS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
-/// Partitions this process holds a watermark handle for, after a maintenance
-/// sweep (#283) — the partition-scale companion to [`TOPIC_CACHE_TOPICS`], and
-/// the larger of the two by the partition count, so it is the one that shows up
-/// first in RSS.
+/// Partitions this process holds a watermark handle for (#283) — the
+/// partition-scale companion to [`TOPIC_CACHE_TOPICS`], sampled on the same
+/// terms, and the larger of the two by the partition count, so it is the one
+/// that shows up first in RSS.
 static TOPIC_CACHE_PARTITIONS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
     METER
         .u64_gauge("tansu_topic_cache_partitions")
@@ -675,28 +680,32 @@ impl TopicCaches {
         evicted
     }
 
-    /// Record what each map holds, and answer `(topics, partitions)` for the
-    /// caller's log line (#554).
+    /// Record what each map holds (#554).
     ///
     /// Read from the maps rather than derived from the sweep's `live` set: these
     /// must report what is actually held, so a map populated by a path the sweep
     /// does not reach shows up as divergence from the cluster's topic count
     /// instead of being papered over. Every one is a `len()`, so the gauges cost
     /// nothing even at 14.7k topics.
-    pub(super) fn record_occupancy(&self) -> (usize, usize) {
-        let occupancy = self.occupancy();
-
-        for (cache, entries) in occupancy {
+    pub(super) fn record_occupancy(&self) {
+        for (cache, entries) in self.occupancy() {
             CACHE_ENTRIES.record(entries as u64, &[KeyValue::new("cache", cache)]);
         }
 
-        let topics = self.metas.len();
-        let partitions = self.watermarks.len();
+        let (topics, partitions) = self.levels();
 
         TOPIC_CACHE_TOPICS.record(topics as u64, &[]);
         TOPIC_CACHE_PARTITIONS.record(partitions as u64, &[]);
+    }
 
-        (topics, partitions)
+    /// The `(topics, partitions)` this group holds, for a caller's log line.
+    ///
+    /// Separate from [`Self::record_occupancy`] because the sweep wants to *say*
+    /// what it left behind without also being a recording site: since #573 the
+    /// gauges are recorded from one place per process rather than from whichever
+    /// path happens to run, and a log line is not that place.
+    pub(super) fn levels(&self) -> (usize, usize) {
+        (self.metas.len(), self.watermarks.len())
     }
 
     /// Rewind every next-offset hint's listing stamp to `at`, so a test can
@@ -1211,5 +1220,29 @@ impl ClientCaches {
         ] {
             CACHE_ENTRIES.record(entries as u64, &[KeyValue::new("cache", cache)]);
         }
+    }
+}
+
+impl DynoStore {
+    /// Record every cache group's occupancy, wherever this process is being
+    /// asked to serve from them (#573).
+    ///
+    /// #554 recorded [`CACHE_ENTRIES`] from the maintenance tick alone, which is
+    /// the one deployment where the maps it measures are empty. `tansu-external`
+    /// runs `?maintenance_interval=never` — the cleanup loop is the dedicated
+    /// maintainer's job — so the serving fleet never reached the recording site,
+    /// and the maintainer that did serves no clients: it reported
+    /// `routing_prefixes => 0` and `topic_ids => 0` while the ten replicas
+    /// holding those entries reported nothing at all. The stale routing pin
+    /// #554 fixed is a *serving* replica's failure, so the gauge was absent from
+    /// every process that could exhibit it.
+    ///
+    /// One call over the three groups rather than a call per group per site:
+    /// what makes a map's absence from the gauge noticeable is that the
+    /// inventory has a single reader.
+    pub(super) fn record_cache_occupancy(&self) {
+        self.topics.record_occupancy();
+        self.prefixes.record_occupancy();
+        self.clients.record_occupancy();
     }
 }

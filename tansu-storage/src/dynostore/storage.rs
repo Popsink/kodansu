@@ -1998,8 +1998,12 @@ impl Storage for DynoStore {
         // Per-cache occupancy (#554), on the same tick and for the same reason as
         // the topic-cache gauges above: the resident-memory work (#476, #543)
         // keeps landing on these maps and could not name which one.
-        self.prefixes.record_occupancy();
-        self.clients.record_occupancy();
+        //
+        // Kept here as well as on the index walk that records it everywhere
+        // (#573): a tick whose topic listing failed still has to report what this
+        // process holds, and that listing is the one thing above that is
+        // deliberately not `?`.
+        self.record_cache_occupancy();
 
         // Measurement only (#283): a failure here must not cost this replica its
         // retention and compaction, which is why it is not `?`.

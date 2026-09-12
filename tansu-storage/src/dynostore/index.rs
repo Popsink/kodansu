@@ -835,6 +835,17 @@ impl DynoStore {
             PREFIX_INDEX_PRODUCER_COORDS.record(coords, &[]);
             PREFIX_INDEX_TOPIC_NAMES.record(names, &[]);
         }
+
+        // Every cache's occupancy, on the same schedule and for the same reason
+        // as the four gauges above (#573): this walk is the one TTL-gated place
+        // both deployments reach, and the maintenance tick that used to be the
+        // sole recording site does not run on the serving fleet
+        // (`?maintenance_interval=never`) — which is the half where the maps
+        // actually fill. Outside the block above, not inside it: `prefix_index`
+        // is one of the nineteen `len()`s, and the guard just dropped is that
+        // map's lock.
+        self.record_cache_occupancy();
+
         Ok(())
     }
 
