@@ -441,6 +441,11 @@ on:
 - **Enforcement follows `--authentication`.** Without it there are no
   principals, so there is nothing to evaluate and nothing is refused. That is
   also why turning authentication on is what arms authorization.
+- **The ACL APIs themselves are refused until it is on.** `CreateAcls`,
+  `DescribeAcls` and `DeleteAcls` answer `SECURITY_DISABLED` on a broker with no
+  authorizer, as Kafka does. Storing a rule nothing will consult is worse than
+  refusing it: an operator is told the cluster is secured, a later describe
+  reads the rule back, and nothing enforces it.
 - **No rule is not permission.** A principal with nothing written about it is
   refused, which is the only tenable default for a mutualised fleet.
 - **Set `--super-users`.** Those two together mean a cluster with no ACLs

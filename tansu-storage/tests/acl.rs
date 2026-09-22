@@ -22,12 +22,15 @@
 //! This drives them the way `kafka-acls.sh` does, over the same request and
 //! response types, because the property that broke is not "the storage layer
 //! stores things" but "what an operator applies is what a later describe
-//! reports". Nothing is *enforced* yet — that is the next slice — so what these
-//! pin is the half that has to exist first and be right.
+//! reports".
+//!
+//! Every round trip here runs with an `Authorizer` in the context, because a
+//! broker without one answers all three `SECURITY_DISABLED` and there is no
+//! round trip to make (#578).
 
 use std::sync::Arc;
 
-use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
+use rama::{Context, Service as _};
 use tansu_sans_io::{
     CreateAclsRequest, DeleteAclsRequest, DescribeAclsRequest, ErrorCode,
     acl::{Operation, Permission, Resource},
@@ -36,10 +39,17 @@ use tansu_sans_io::{
     resource::Pattern,
 };
 use tansu_storage::{
-    CreateAclsService, DeleteAclsService, DescribeAclsService, Error, Storage, StorageContainer,
+    AclBinding, AclFilter, Authorizer, CreateAclsService, DeleteAclsService, DescribeAclsService,
+    Error, NO_AUTHORIZER, NO_AUTHORIZER_DESCRIBE, Requester, Storage, StorageContainer,
     WILDCARD_HOST,
 };
 use url::Url;
+
+/// A super user, so `kafka-acls.sh` gets past the cluster `ALTER` every one of
+/// these APIs requires — the escape that lets the first rule be written into a
+/// cluster that has none (#363).
+const ADMIN: &str = "User:admin";
+const HOST: &str = "10.0.0.1";
 
 async fn storage() -> Result<Arc<dyn Storage>, Error> {
     StorageContainer::builder()
@@ -49,6 +59,25 @@ async fn storage() -> Result<Arc<dyn Storage>, Error> {
         .storage(Url::parse("memory://")?)
         .build()
         .await
+}
+
+/// The context a broker with `--authentication` builds for an administrator.
+fn asking(storage: &Arc<dyn Storage>) -> Context<Arc<dyn Storage>> {
+    let mut ctx = Context::default();
+
+    _ = ctx.insert(Requester {
+        principal: Some(ADMIN.to_owned()),
+        host: HOST.into(),
+    });
+
+    _ = ctx.insert(Authorizer::new(storage.clone(), [ADMIN.to_owned()]));
+
+    ctx.map_state(|()| storage.clone())
+}
+
+/// And the one a broker without it builds: no authorizer anywhere.
+fn unauthenticated(storage: &Arc<dyn Storage>) -> Context<Arc<dyn Storage>> {
+    Context::default().map_state(|()| storage.clone())
 }
 
 fn creation(resource_name: &str, pattern: Pattern, principal: &str) -> AclCreation {
@@ -79,15 +108,9 @@ async fn create(
     storage: &Arc<dyn Storage>,
     creations: Vec<AclCreation>,
 ) -> Result<Vec<i16>, Error> {
-    let service = MapStateLayer::new({
-        let storage = storage.clone();
-        move |_| storage.clone()
-    })
-    .into_layer(CreateAclsService);
-
-    service
+    CreateAclsService
         .serve(
-            Context::default(),
+            asking(storage),
             CreateAclsRequest::default().creations(Some(creations)),
         )
         .await
@@ -107,13 +130,7 @@ async fn describe(
     storage: &Arc<dyn Storage>,
     request: DescribeAclsRequest,
 ) -> Result<Vec<(String, String)>, Error> {
-    let service = MapStateLayer::new({
-        let storage = storage.clone();
-        move |_| storage.clone()
-    })
-    .into_layer(DescribeAclsService);
-
-    let response = service.serve(Context::default(), request).await?;
+    let response = DescribeAclsService.serve(asking(storage), request).await?;
 
     assert_eq!(i16::from(ErrorCode::None), response.error_code);
 
@@ -246,15 +263,9 @@ async fn delete_removes_what_it_selects_and_says_what_it_removed() -> Result<(),
     )
     .await?;
 
-    let service = MapStateLayer::new({
-        let storage = storage.clone();
-        move |_| storage.clone()
-    })
-    .into_layer(DeleteAclsService);
-
-    let response = service
+    let response = DeleteAclsService
         .serve(
-            Context::default(),
+            asking(&storage),
             DeleteAclsRequest::default().filters(Some(vec![
                 DeleteAclsFilter::default()
                     .resource_type_filter(Resource::Any.into())
@@ -281,6 +292,151 @@ async fn delete_removes_what_it_selects_and_says_what_it_removed() -> Result<(),
         vec![("tenant-b.".to_owned(), "User:bob".to_owned())],
         describe(&storage, describe_everything()).await?,
         "the rule the filter did not select must survive",
+    );
+
+    Ok(())
+}
+
+/// A broker with no authorizer refuses to store a rule, rather than storing one
+/// nothing will consult.
+///
+/// This is the shape of the report in #578: an operator ran `create_acls`, was
+/// told it succeeded, and read the binding back weeks and several restarts
+/// later off a cluster that had never enforced a thing.
+#[tokio::test]
+async fn create_is_refused_without_an_authorizer() -> Result<(), Error> {
+    let storage = storage().await?;
+
+    let response = CreateAclsService
+        .serve(
+            unauthenticated(&storage),
+            CreateAclsRequest::default().creations(Some(vec![
+                creation("tenant-a.", Pattern::Prefixed, "User:alice"),
+                creation("shared", Pattern::Literal, "User:bob"),
+            ])),
+        )
+        .await?;
+
+    let results = response.results.unwrap_or_default();
+
+    assert_eq!(
+        vec![i16::from(ErrorCode::SecurityDisabled); 2],
+        results
+            .iter()
+            .map(|result| result.error_code)
+            .collect::<Vec<_>>(),
+        "one result per creation, in request order",
+    );
+
+    assert_eq!(
+        vec![Some(NO_AUTHORIZER.to_owned()); 2],
+        results
+            .iter()
+            .map(|result| result.error_message.clone())
+            .collect::<Vec<_>>(),
+    );
+
+    assert!(
+        storage.describe_acls(&AclFilter::any()).await?.is_empty(),
+        "a refused creation must not be stored",
+    );
+
+    Ok(())
+}
+
+/// And refuses to delete one, which matters because the answer would otherwise
+/// report rules removed from a cluster they were never protecting.
+#[tokio::test]
+async fn delete_is_refused_without_an_authorizer() -> Result<(), Error> {
+    let storage = storage().await?;
+
+    // Stored underneath the API, the way a broker upgraded from a release that
+    // accepted the creation arrives carrying them (#578).
+    _ = storage
+        .create_acls(&[AclBinding {
+            resource_type: Resource::Topic,
+            resource_name: "tenant-a.".into(),
+            pattern: Pattern::Prefixed,
+            principal: "User:alice".into(),
+            host: WILDCARD_HOST.into(),
+            operation: Operation::Read,
+            permission: Permission::Allow,
+        }])
+        .await?;
+
+    let response = DeleteAclsService
+        .serve(
+            unauthenticated(&storage),
+            DeleteAclsRequest::default().filters(Some(vec![
+                DeleteAclsFilter::default()
+                    .resource_type_filter(Resource::Any.into())
+                    .resource_name_filter(None)
+                    .pattern_type_filter(Some(Pattern::Any.into()))
+                    .principal_filter(None)
+                    .host_filter(None)
+                    .operation(Operation::Any.into())
+                    .permission_type(Permission::Any.into()),
+            ])),
+        )
+        .await?;
+
+    let results = response.filter_results.unwrap_or_default();
+    assert_eq!(1, results.len(), "one result per filter, in request order");
+    assert_eq!(
+        i16::from(ErrorCode::SecurityDisabled),
+        results[0].error_code
+    );
+    assert_eq!(Some(NO_AUTHORIZER.to_owned()), results[0].error_message);
+    assert_eq!(
+        Some([].into()),
+        results[0].matching_acls,
+        "a refusal removed nothing, and must not claim to have",
+    );
+
+    assert_eq!(
+        1,
+        storage.describe_acls(&AclFilter::any()).await?.len(),
+        "a refused deletion must not delete",
+    );
+
+    Ok(())
+}
+
+/// And refuses to read them back, which is the half that makes an audit honest.
+///
+/// A broker that answers an empty list here tells an auditor "no rules", which
+/// on a cluster that cannot have any is the wrong sentence; one carrying
+/// bindings written before #578 would answer worse, listing rules nothing
+/// enforces.
+#[tokio::test]
+async fn describe_is_refused_without_an_authorizer() -> Result<(), Error> {
+    let storage = storage().await?;
+
+    _ = storage
+        .create_acls(&[AclBinding {
+            resource_type: Resource::Topic,
+            resource_name: "tenant-a.".into(),
+            pattern: Pattern::Prefixed,
+            principal: "User:alice".into(),
+            host: WILDCARD_HOST.into(),
+            operation: Operation::Read,
+            permission: Permission::Allow,
+        }])
+        .await?;
+
+    let response = DescribeAclsService
+        .serve(unauthenticated(&storage), describe_everything())
+        .await?;
+
+    assert_eq!(i16::from(ErrorCode::SecurityDisabled), response.error_code);
+    assert_eq!(
+        Some(NO_AUTHORIZER_DESCRIBE.to_owned()),
+        response.error_message
+    );
+    assert_eq!(
+        Some([].into()),
+        response.resources,
+        "a stored binding must not be reported by a broker that cannot enforce it",
     );
 
     Ok(())

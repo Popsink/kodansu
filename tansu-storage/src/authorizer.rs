@@ -226,6 +226,17 @@ impl Authorizer {
     }
 }
 
+/// What the ACL APIs say when there is no [`Authorizer`] to alter or read.
+///
+/// Kafka's wording, verbatim, because an operator greps for it and a tool may
+/// match on it; it differs between the two by a trailing clause upstream has
+/// never unified, and copying that is cheaper than explaining the difference
+/// (#578).
+pub const NO_AUTHORIZER: &str = "No Authorizer is configured.";
+
+/// `DescribeAcls`' spelling of [`NO_AUTHORIZER`].
+pub const NO_AUTHORIZER_DESCRIBE: &str = "No Authorizer is configured on the broker";
+
 /// Whether this request path authorizes anything at all.
 ///
 /// For the handful of decisions that cannot be expressed as a question about a

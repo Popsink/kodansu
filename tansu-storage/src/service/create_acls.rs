@@ -22,7 +22,7 @@ use tansu_sans_io::{
 
 use tansu_sans_io::acl::Operation;
 
-use crate::{AclBinding, Error, Storage, authorized_cluster};
+use crate::{AclBinding, Error, NO_AUTHORIZER, Storage, authorized_cluster, enforcing};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CreateAclsService;
@@ -45,23 +45,28 @@ where
     ) -> Result<Self::Response, Self::Error> {
         let creations = req.creations.unwrap_or_default();
 
+        // Storing a rule that nothing will ever consult is worse than refusing
+        // it: an operator who "secures" a cluster this way is told every rule
+        // took effect, and a later describe reads them back, while the cluster
+        // stays wide open. Kafka refuses instead, and so do we (#578).
+        if !enforcing(&ctx) {
+            return Ok(refused(
+                creations.len(),
+                ErrorCode::SecurityDisabled,
+                Some(NO_AUTHORIZER),
+            ));
+        }
+
         // `ALTER` on the cluster, as Kafka requires — and the hole that made
         // every other rule provisional: an authenticated principal that can
         // delete the ACLs can grant itself anything, so enforcing everything
         // else while leaving this open enforces nothing (#363).
         if !authorized_cluster(&ctx, Operation::Alter).await {
-            return Ok(CreateAclsResponse::default()
-                .throttle_time_ms(0)
-                .results(Some(
-                    creations
-                        .iter()
-                        .map(|_| {
-                            AclCreationResult::default()
-                                .error_code(ErrorCode::ClusterAuthorizationFailed.into())
-                                .error_message(None)
-                        })
-                        .collect(),
-                )));
+            return Ok(refused(
+                creations.len(),
+                ErrorCode::ClusterAuthorizationFailed,
+                None,
+            ));
         }
 
         let bindings = creations
@@ -98,23 +103,36 @@ where
                     ))
             })
             .or_else(|error| {
-                // One error code per creation, in request order: a client
-                // matches results to creations positionally, so a short list
-                // is a client attributing the failure to the wrong rule.
                 tracing::error!(?error, "could not create acls");
 
-                Ok(CreateAclsResponse::default()
-                    .throttle_time_ms(0)
-                    .results(Some(
-                        creations
-                            .iter()
-                            .map(|_| {
-                                AclCreationResult::default()
-                                    .error_code(ErrorCode::UnknownServerError.into())
-                                    .error_message(Some("could not create acls".into()))
-                            })
-                            .collect(),
-                    )))
+                Ok(refused(
+                    creations.len(),
+                    ErrorCode::UnknownServerError,
+                    Some("could not create acls"),
+                ))
             })
     }
+}
+
+/// The same error against every creation the request carried.
+///
+/// One result per creation, in request order: a client matches results to
+/// creations positionally, so a short list is a client attributing the failure
+/// to the wrong rule.
+fn refused(
+    creations: usize,
+    error_code: ErrorCode,
+    error_message: Option<&str>,
+) -> CreateAclsResponse {
+    CreateAclsResponse::default()
+        .throttle_time_ms(0)
+        .results(Some(
+            (0..creations)
+                .map(|_| {
+                    AclCreationResult::default()
+                        .error_code(error_code.into())
+                        .error_message(error_message.map(str::to_owned))
+                })
+                .collect(),
+        ))
 }

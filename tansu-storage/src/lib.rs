@@ -175,7 +175,8 @@ pub use acl::{
 pub use backend::Backend;
 
 pub use authorizer::{
-    ACL_SNAPSHOT_TTL, Authorizer, Requester, authorized, authorized_cluster, enforcing,
+    ACL_SNAPSHOT_TTL, Authorizer, NO_AUTHORIZER, NO_AUTHORIZER_DESCRIBE, Requester, authorized,
+    authorized_cluster, enforcing,
 };
 
 pub use enforcer::{Charge, MAX_THROTTLE, QUOTA_SNAPSHOT_TTL, QuotaEnforcer};
