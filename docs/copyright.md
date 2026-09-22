@@ -17,13 +17,13 @@ byte. Only the notice lines above it differ.
 
 | class | count | notice |
 |---|---|---|
-| inherited from tansu | 158 | Peter Morgan's line, unchanged |
-| inherited, rewritten in place here | 35 | Peter Morgan's line, then Popsink's |
-| written at Popsink | 102 | Popsink's line alone |
+| inherited from tansu | 156 | Peter Morgan's line, unchanged |
+| inherited, rewritten in place here | 37 | Peter Morgan's line, then Popsink's |
+| written at Popsink | 103 | Popsink's line alone |
 
 The first two rows are the 193 files `copyright.toml` calls `inherited`; the middle
-row is the subset it also calls `joint`. 158 + 35 + 102 = 295, every tracked `.rs`
-file. Eighteen of the 35 arrived together: #550 split `dynostore.rs` into
+row is the subset it also calls `joint`. 156 + 37 + 103 = 296, every tracked `.rs`
+file. Eighteen of the 37 arrived together: #550 split `dynostore.rs` into
 `dynostore/` modules, and a move carries the notice with the lines. `just copyright` prints the total it checked, which is how to tell whether
 this table has drifted.
 

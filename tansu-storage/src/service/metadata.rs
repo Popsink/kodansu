@@ -15,12 +15,38 @@
 use rama::{Context, Service};
 use tansu_sans_io::{
     ApiKey, ErrorCode, MetadataRequest, MetadataResponse, create_topics_request::CreatableTopic,
+    metadata_response::MetadataResponseTopic,
 };
 use tracing::{error, instrument, warn};
 
 use tansu_sans_io::acl::{Operation, Resource};
 
-use crate::{Error, Result, Storage, TopicId, authorized, enforcing};
+use crate::{Error, Result, Storage, TopicId, authorized, enforcing, validation};
+
+/// Answer a name that cannot be a topic with `INVALID_TOPIC_EXCEPTION` rather
+/// than `UNKNOWN_TOPIC_OR_PARTITION` (#579), which is what Kafka's
+/// `KafkaApis.getTopicMetadata` does with `Topic.validate`.
+///
+/// The distinction is not cosmetic: "unknown" tells a client the topic is
+/// merely absent, so it retries, or waits for someone else to create it, or
+/// asks for it to be auto-created — none of which can ever succeed for a name
+/// the broker will always refuse.
+///
+/// Only an entry the engine reported unknown is relabelled. A topic that exists
+/// is answered on its own terms whatever it is called: a name stored before
+/// #443 started validating creations is still readable, and still deletable.
+fn refuse_malformed_name(topic: MetadataResponseTopic) -> MetadataResponseTopic {
+    match topic.name.as_deref() {
+        Some(name)
+            if topic.error_code == i16::from(ErrorCode::UnknownTopicOrPartition)
+                && validation::topic_name(name).is_err() =>
+        {
+            topic.error_code(ErrorCode::InvalidTopicException.into())
+        }
+
+        _ => topic,
+    }
+}
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`MetadataRequest`] returning [`MetadataRequest`].
 /// ```
@@ -113,6 +139,12 @@ where
                 .iter()
                 .filter(|topic| topic.error_code == unknown)
                 .filter_map(|topic| topic.name.clone())
+                // A malformed name is never offered to auto-create (#579).
+                // `create_topic` would refuse it anyway — it is the creation
+                // choke point that validates (#443) — but the refusal would
+                // arrive as a `warn!` in the broker's log while the client read
+                // `UNKNOWN_TOPIC_OR_PARTITION` and kept asking.
+                .filter(|name| validation::topic_name(name).is_ok())
                 .collect::<Vec<_>>();
 
             if !to_create.is_empty() {
@@ -177,7 +209,7 @@ where
             };
 
             if allowed {
-                visible.push(topic.to_owned());
+                visible.push(refuse_malformed_name(topic.to_owned()));
             } else if named {
                 visible.push(
                     topic

@@ -126,6 +126,18 @@ impl Storage for DynoStore {
                             .low_watermark(low_watermark)
                             .error_code(ErrorCode::None.into()),
 
+                        // A refusal, not a failure: the offset is outside the log
+                        // (#579). `storage_error_code` would flatten it to
+                        // `UnknownServerError`, which reads as "the broker
+                        // broke" for what is a client mistake, so the code the
+                        // engine chose is passed through. `-1` is Kafka's
+                        // `DeleteRecordsResponse.INVALID_LOW_WATERMARK`: nothing
+                        // moved, so there is no low watermark to report.
+                        Err(Error::Api(code)) => DeleteRecordsPartitionResult::default()
+                            .partition_index(partition.partition_index)
+                            .low_watermark(-1)
+                            .error_code(code.into()),
+
                         Err(err) => {
                             error!(?err, ?topition);
 
@@ -958,9 +970,19 @@ impl Storage for DynoStore {
                         })))
                 }
 
+                // A topic that does not exist is said not to exist (#579). An
+                // empty `ok` made `DescribeConfigs` an existence check that
+                // always answered yes, so tooling that probes a topic this way —
+                // rather than through `Metadata`, which does not auto-create —
+                // saw every name it asked about as a real topic with no config.
+                //
+                // `topic_is_compacted` reads through this arm on a produce or
+                // fetch whose memo has expired, and reads only `configs`: an
+                // absent topic has no `cleanup.policy` either way, so the code
+                // change does not move a routing verdict.
                 Ok(None) => Ok(DescribeConfigsResult::default()
-                    .error_code(ErrorCode::None.into())
-                    .error_message(Some(ErrorCode::None.to_string()))
+                    .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                    .error_message(Some(ErrorCode::UnknownTopicOrPartition.to_string()))
                     .resource_type(i8::from(resource))
                     .resource_name(name.into())
                     .configs(Some(vec![]))),

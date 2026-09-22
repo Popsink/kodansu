@@ -1238,6 +1238,12 @@ impl DynoStore {
     /// is gone.) `before` of `-1` means the log end offset — truncate
     /// everything.
     ///
+    /// Any other offset outside `0..=high` is refused with
+    /// [`ErrorCode::OffsetOutOfRange`] (#579). It used to be clamped to the high
+    /// watermark, which made `delete_records(9999)` on a ten-record partition
+    /// answer `ok` after deleting all ten: a truncation typo, or an offset read
+    /// off the wrong partition, was silent and irreversible instead of loud.
+    ///
     /// The floor is **monotonic**: max-folded against any existing floor
     /// inside the watermark CAS (`with_mut` re-applies the closure on
     /// conflict), so a later call with a lower offset cannot regress it — and
@@ -1253,7 +1259,16 @@ impl DynoStore {
         // longer advanced on the produce hot path (#13).
         let high = self.high_watermark(topition).await?;
 
-        let before = if before < 0 { high } else { before.min(high) };
+        // `-1` is the only negative Kafka's `Partition.deleteRecordsOnLeader`
+        // accepts, and it means the log end offset; everything else outside the
+        // log is `OFFSET_OUT_OF_RANGE` rather than a clamp (#579).
+        let before = match before {
+            -1 => high,
+            offset if offset < 0 || offset > high => {
+                return Err(Error::Api(ErrorCode::OffsetOutOfRange));
+            }
+            offset => offset,
+        };
 
         // Nothing physical is deleted here any more (#179): the per-partition
         // `records/` objects this used to remove cannot be created, and the

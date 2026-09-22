@@ -345,3 +345,123 @@ async fn idempotent_on_repeat() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// A malformed name on the auto-create path is refused with
+/// `INVALID_TOPIC_EXCEPTION`, and no topic is created (#579).
+///
+/// The creation itself was already refused — `create_topic` is the choke point
+/// that validates (#443) — but the refusal went to the broker's log as a
+/// `warn!` while the client read `UNKNOWN_TOPIC_OR_PARTITION`: a client told the
+/// topic is merely absent asks again, forever, for a name that can never exist.
+#[tokio::test]
+async fn a_malformed_name_is_refused_rather_than_auto_created() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = storage("").await?;
+    let name = "bad name/!";
+
+    let response = metadata(storage.clone(), name, true).await?;
+
+    let topics = response.topics.as_deref().unwrap_or_default();
+    assert_eq!(1, topics.len());
+    assert_eq!(Some(name), topics[0].name.as_deref());
+    assert_eq!(
+        i16::from(ErrorCode::InvalidTopicException),
+        topics[0].error_code
+    );
+    assert!(
+        topics[0]
+            .partitions
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty()
+    );
+
+    // Nothing was created (#579). The refusal is not only the error code: the
+    // storage-layer validation (#443) already stopped the write, and this keeps
+    // the two answers tied together.
+    assert!(
+        storage
+            .metadata(None)
+            .await?
+            .topics()
+            .iter()
+            .all(|topic| topic.name.as_deref() != Some(name)),
+        "a topic the broker refused to create must not exist"
+    );
+
+    Ok(())
+}
+
+/// The same answer without auto-create: the name is refused on its own terms,
+/// not because creation was attempted and failed.
+#[tokio::test]
+async fn a_malformed_name_is_refused_with_auto_create_off() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    for storage in [
+        storage("auto_create_topics=false").await?,
+        storage("").await?,
+    ] {
+        let response = metadata(storage, "bad name/!", false).await?;
+
+        assert_eq!(
+            i16::from(ErrorCode::InvalidTopicException),
+            response.topics.as_deref().unwrap_or_default()[0].error_code
+        );
+    }
+
+    Ok(())
+}
+
+/// Every name `CreateTopics` refuses, `Metadata` refuses the same way: one rule,
+/// two doors. The `..` cases are the ones a charset check alone would let
+/// through.
+#[tokio::test]
+async fn the_refused_names_are_the_ones_create_topics_refuses() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    for name in [
+        "",
+        ".",
+        "..",
+        "with space",
+        "with/slash",
+        "naïve",
+        "emoji🙂",
+    ] {
+        let response = metadata(storage("").await?, name, true).await?;
+
+        assert_eq!(
+            i16::from(ErrorCode::InvalidTopicException),
+            response.topics.as_deref().unwrap_or_default()[0].error_code,
+            "{name} must be refused",
+        );
+    }
+
+    Ok(())
+}
+
+/// A well-formed name in the same request is unaffected: the refusal is
+/// per-topic, so one bad name in a client's subscription does not cost it the
+/// topics it spelled correctly.
+#[tokio::test]
+async fn a_malformed_name_does_not_taint_its_neighbours() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let requested = ["good-one".to_owned(), "bad name/!".to_owned()];
+
+    let response = metadata_many(storage("").await?, &requested, true).await?;
+    let topics = response.topics.as_deref().unwrap_or_default();
+
+    assert_eq!(2, topics.len());
+    assert_eq!(Some("good-one"), topics[0].name.as_deref());
+    assert_eq!(i16::from(ErrorCode::None), topics[0].error_code);
+    assert_eq!(Some("bad name/!"), topics[1].name.as_deref());
+    assert_eq!(
+        i16::from(ErrorCode::InvalidTopicException),
+        topics[1].error_code
+    );
+
+    Ok(())
+}
