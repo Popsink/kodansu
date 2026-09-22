@@ -54,9 +54,14 @@ use crate::{Error, Result, Storage};
 ///     )
 ///     .await?;
 ///
+/// // "abcba" was never created, so it is reported as unknown rather than as a
+/// // topic with an empty config (#579).
 /// let results = response.results.unwrap_or_default();
 /// assert_eq!(1, results.len());
-/// assert_eq!(ErrorCode::None, ErrorCode::try_from(results[0].error_code)?);
+/// assert_eq!(
+///     ErrorCode::UnknownTopicOrPartition,
+///     ErrorCode::try_from(results[0].error_code)?
+/// );
 /// assert!(results[0].configs.as_deref().unwrap_or_default().is_empty());
 /// # Ok(())
 /// # }

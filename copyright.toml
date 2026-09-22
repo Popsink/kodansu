@@ -284,6 +284,8 @@ joint = [
     "tansu-storage/src/service/fetch.rs",
     "tansu-storage/tests/create_topics.rs",
     "tansu-storage/tests/delete_groups.rs",
+    "tansu-storage/tests/delete_records.rs",
+    "tansu-storage/tests/describe_configs.rs",
     "tansu-storage/tests/fetch.rs",
     "tansu-storage/tests/get_telemetry_subscriptions.rs",
     "tansu-storage/tests/list_offsets.rs",

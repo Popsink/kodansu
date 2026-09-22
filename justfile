@@ -214,8 +214,8 @@ fmt:
 # point under the measured number because that measurement jitters by ~8 lines
 # run to run (#549 measured it three times over one tree). This one does not
 # jitter at all, and a tenth of a point here is ~107 lines of narration, so the
-# ceiling is the measured value itself — 2.99504904%, rounded up at the last
-# digit to the 2.9951 below, which is a tenth of a line of headroom. One added
+# ceiling is the measured value itself — 2.97319267%, rounded up at the last
+# digit to the 2.9732 below, which is a tenth of a line of headroom. One added
 # line of uncited narration fails; a line of rustdoc, a line of code, a trailing
 # comment, or a narration block citing an issue does not.
 #
@@ -291,6 +291,17 @@ fmt:
 # explanation is `//!` or `///`. So the numerator is unchanged to the line and
 # only the denominator moved.
 #
+#   #579   +301 lines, three residuals  3182 -> 3182   2.98157831 -> 2.97319267
+#
+# The third move made by a change that neither added nor deleted a line of
+# uncited narration. #579's is four `//` blocks — two in the engine, one in the
+# metadata service, one in `delete_records_before` — and every one cites the
+# issue. The +301 is what six `DeleteRecords` cases, four malformed-name cases
+# and a rewritten `DescribeConfigs` suite cost in code; their explanations are
+# `///` on the test functions, outside the ratio. The two `//` blocks that are
+# inside a test body cite #579 too — they name the falsifiable assertion, the
+# same reason #556's wrappers carry theirs.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -300,7 +311,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.9816" top="12":
+comments ceiling="2.9732" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
