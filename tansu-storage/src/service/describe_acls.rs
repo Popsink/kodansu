@@ -23,7 +23,9 @@ use tansu_sans_io::{
 
 use tansu_sans_io::acl::Operation;
 
-use crate::{AclBinding, AclFilter, Error, Storage, authorized_cluster};
+use crate::{
+    AclBinding, AclFilter, Error, NO_AUTHORIZER_DESCRIBE, Storage, authorized_cluster, enforcing,
+};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DescribeAclsService;
@@ -44,14 +46,22 @@ where
         ctx: Context<G>,
         req: DescribeAclsRequest,
     ) -> Result<Self::Response, Self::Error> {
+        // Kafka refuses this one too, and refusing is what makes an audit
+        // honest: reading an empty list off a broker that has no authorizer
+        // says "no rules", when the truth is "no rules are possible" — and a
+        // broker carrying bindings stored before #578 would answer worse than
+        // that, listing rules nothing enforces (#578).
+        if !enforcing(&ctx) {
+            return Ok(refused(
+                ErrorCode::SecurityDisabled,
+                Some(NO_AUTHORIZER_DESCRIBE),
+            ));
+        }
+
         // Reading the rules tells a principal what every other principal may
         // do, which on a mutualised fleet names the other tenants (#363).
         if !authorized_cluster(&ctx, Operation::Describe).await {
-            return Ok(DescribeAclsResponse::default()
-                .throttle_time_ms(0)
-                .error_code(ErrorCode::ClusterAuthorizationFailed.into())
-                .error_message(None)
-                .resources(Some([].into())));
+            return Ok(refused(ErrorCode::ClusterAuthorizationFailed, None));
         }
 
         let filter = AclFilter {
@@ -78,14 +88,25 @@ where
                 // protected. Retriable is both true and actionable.
                 tracing::error!(?error, "could not describe acls");
 
-                Ok(DescribeAclsResponse::default()
-                    .throttle_time_ms(0)
-                    .error_code(ErrorCode::UnknownServerError.into())
-                    .error_message(Some("could not describe acls".into()))
-                    .resources(Some([].into())))
+                Ok(refused(
+                    ErrorCode::UnknownServerError,
+                    Some("could not describe acls"),
+                ))
             }
         }
     }
+}
+
+/// An error in place of an answer, with no resources.
+///
+/// The error is the whole response here rather than one entry per request item:
+/// `DescribeAcls` carries a single filter and answers a single error code.
+fn refused(error_code: ErrorCode, error_message: Option<&str>) -> DescribeAclsResponse {
+    DescribeAclsResponse::default()
+        .throttle_time_ms(0)
+        .error_code(error_code.into())
+        .error_message(error_message.map(str::to_owned))
+        .resources(Some([].into()))
 }
 
 /// Bindings grouped by the resource they are on, which is the shape the

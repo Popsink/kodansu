@@ -22,7 +22,7 @@ use tansu_sans_io::{
 
 use tansu_sans_io::acl::Operation;
 
-use crate::{AclFilter, Error, Storage, authorized_cluster};
+use crate::{AclFilter, Error, NO_AUTHORIZER, Storage, authorized_cluster, enforcing};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct DeleteAclsService;
@@ -45,22 +45,24 @@ where
     ) -> Result<Self::Response, Self::Error> {
         let requested = req.filters.unwrap_or_default();
 
+        // See `CreateAcls`: with nothing to enforce the rules, reporting them
+        // deleted is as misleading as reporting them created (#578).
+        if !enforcing(&ctx) {
+            return Ok(refused(
+                requested.len(),
+                ErrorCode::SecurityDisabled,
+                Some(NO_AUTHORIZER),
+            ));
+        }
+
         // See `CreateAcls`: a principal that can delete the rules can grant
         // itself anything (#363).
         if !authorized_cluster(&ctx, Operation::Alter).await {
-            return Ok(DeleteAclsResponse::default()
-                .throttle_time_ms(0)
-                .filter_results(Some(
-                    requested
-                        .iter()
-                        .map(|_| {
-                            DeleteAclsFilterResult::default()
-                                .error_code(ErrorCode::ClusterAuthorizationFailed.into())
-                                .error_message(None)
-                                .matching_acls(Some([].into()))
-                        })
-                        .collect(),
-                )));
+            return Ok(refused(
+                requested.len(),
+                ErrorCode::ClusterAuthorizationFailed,
+                None,
+            ));
         }
 
         let filters = requested
@@ -108,24 +110,37 @@ where
                 ))),
 
             Err(error) => {
-                // One result per filter, in request order, for the same reason
-                // creations are: a client matches them positionally.
                 tracing::error!(?error, "could not delete acls");
 
-                Ok(DeleteAclsResponse::default()
-                    .throttle_time_ms(0)
-                    .filter_results(Some(
-                        requested
-                            .iter()
-                            .map(|_| {
-                                DeleteAclsFilterResult::default()
-                                    .error_code(ErrorCode::UnknownServerError.into())
-                                    .error_message(Some("could not delete acls".into()))
-                                    .matching_acls(Some([].into()))
-                            })
-                            .collect(),
-                    )))
+                Ok(refused(
+                    requested.len(),
+                    ErrorCode::UnknownServerError,
+                    Some("could not delete acls"),
+                ))
             }
         }
     }
+}
+
+/// The same error against every filter the request carried, matching nothing.
+///
+/// One result per filter, in request order, for the same reason creations are:
+/// a client matches them positionally.
+fn refused(
+    filters: usize,
+    error_code: ErrorCode,
+    error_message: Option<&str>,
+) -> DeleteAclsResponse {
+    DeleteAclsResponse::default()
+        .throttle_time_ms(0)
+        .filter_results(Some(
+            (0..filters)
+                .map(|_| {
+                    DeleteAclsFilterResult::default()
+                        .error_code(error_code.into())
+                        .error_message(error_message.map(str::to_owned))
+                        .matching_acls(Some([].into()))
+                })
+                .collect(),
+        ))
 }

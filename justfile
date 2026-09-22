@@ -302,6 +302,18 @@ fmt:
 # inside a test body cite #579 too — they name the falsifiable assertion, the
 # same reason #556's wrappers carry theirs.
 #
+#   #578   +144 lines, security disabled 3182 -> 3177  2.97319267 -> 2.96469798
+#
+# The first move where the numerator *fell* without a deletion. #578 makes the
+# three ACL APIs answer `SECURITY_DISABLED` with no authorizer configured, and
+# the five lines it loses are two uncited blocks that became rustdoc: each of
+# `create_acls.rs` and `delete_acls.rs` had a `//` inside an error arm saying
+# why the response carries one result per request item, and collapsing the
+# three arms of each into a `refused()` helper moved that sentence onto the
+# helper as `///`, where it belongs and where the ratio does not see it. The
+# new narration is four `//` blocks, all citing #578. The +144 is three refusal
+# cases and the authorizer harness `tests/acl.rs` now needs.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -311,7 +323,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.9732" top="12":
+comments ceiling="2.9647" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
