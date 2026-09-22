@@ -214,8 +214,8 @@ fmt:
 # point under the measured number because that measurement jitters by ~8 lines
 # run to run (#549 measured it three times over one tree). This one does not
 # jitter at all, and a tenth of a point here is ~107 lines of narration, so the
-# ceiling is the measured value itself — 2.97319267%, rounded up at the last
-# digit to the 2.9732 below, which is a tenth of a line of headroom. One added
+# ceiling is the measured value itself — 2.95488155%, rounded up at the last
+# digit to the 2.9549 below, which is a tenth of a line of headroom. One added
 # line of uncited narration fails; a line of rustdoc, a line of code, a trailing
 # comment, or a narration block citing an issue does not.
 #
@@ -314,6 +314,16 @@ fmt:
 # new narration is four `//` blocks, all citing #578. The +144 is three refusal
 # cases and the authorizer harness `tests/acl.rs` now needs.
 #
+#   #577   +356 lines, per-record times 3177 -> 3177  2.96469798 -> 2.95488155
+#
+# The fourth move made by a change that neither added nor deleted a line of
+# uncited narration. #577 resolves `offsetsForTimes` to the record rather than
+# to the segment holding it: three new `//` blocks on the read path and three
+# in the tests, each citing an issue, over two that moved with the branch they
+# explain. The +356 is what the record scan, the region read it needs and three
+# regression tests cost in code; their explanations are the 91 lines of `///`
+# that came with them, outside the ratio.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -323,7 +333,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.9647" top="12":
+comments ceiling="2.9549" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

@@ -711,6 +711,220 @@ impl DynoStore {
             .map(|ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms as u64)))
     }
 
+    /// GET one sub-stream region's bytes and decode its batches, or `None` when
+    /// the segment has gone (retention #61 / compaction #66) or its bytes
+    /// disagree with the index entry the read was planned from (#397).
+    ///
+    /// The fetch path repairs both of those in place and restarts, because a
+    /// fetch that trusts a wrong entry hands the wrong bytes to a consumer. This
+    /// caller only needs to know whether the region can be believed: it has an
+    /// answer from the index alone to fall back on, and repairing the index from
+    /// a `ListOffsets` would make a positioning query pay for it.
+    ///
+    /// Counted as a fetch's region read is ([`Self::note_segment_data_read`]):
+    /// it is the same ranged GET against the same object, and a
+    /// `tansu_prefix_segment_data_gets` that left it out would under-report what
+    /// the bucket is asked for.
+    async fn read_substream_region(
+        &self,
+        prefix: &str,
+        fenced: &FencedSegment,
+    ) -> Result<Option<Vec<deflated::Batch>>> {
+        let entry = &fenced.entry;
+        let location = self.segment_location(prefix, fenced.seq);
+
+        self.note_segment_data_read(prefix, fenced.seq, entry.byte_start, entry.byte_len);
+
+        let encoded = match self
+            .object_store
+            .get_opts(
+                &location,
+                GetOptions {
+                    range: Some(GetRange::Bounded(
+                        entry.byte_start..entry.byte_start + entry.byte_len,
+                    )),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(result) => result.bytes().await.map_err(Error::from)?,
+
+            Err(object_store::Error::NotFound { .. }) => {
+                SEGMENT_VANISHED_BEFORE_READ.add(1, &[]);
+                SEGMENT_ABSENT.add(1, &[KeyValue::new("caller", "list_offsets")]);
+                return Ok(None);
+            }
+
+            // Preserve the storage error so it is classified retriable rather
+            // than fatal `-1` (#6/#129).
+            Err(error) => {
+                error!(?error, location = %location);
+                return Err(Error::from(error));
+            }
+        };
+
+        if (encoded.len() as u64) < entry.byte_len {
+            debug!(
+                prefix,
+                seq = fenced.seq,
+                read_len = encoded.len(),
+                "short region"
+            );
+            return Ok(None);
+        }
+
+        match self.decode_region(prefix, fenced.seq, entry, encoded) {
+            Ok(batches) => Ok(Some(batches)),
+
+            Err(error) => {
+                debug!(?error, prefix, seq = fenced.seq, "undecodable region");
+                Ok(None)
+            }
+        }
+    }
+
+    /// The first record in `batches` whose timestamp reaches `target_ms`, as
+    /// `(offset, timestamp)`, considering only offsets at or after `from`
+    /// (#577).
+    ///
+    /// `base_offset` is the region's absolute base: batches carry the offsets
+    /// they were encoded with and the footer entry is what says where they now
+    /// live, so the scan re-bases them running, exactly as the fetch path does.
+    ///
+    /// A batch whose `max_timestamp` is below the target holds no such record, so
+    /// it is skipped without being inflated — which is what keeps this cheap: one
+    /// batch of the region is decompressed, not the region. `LogAppendTime`
+    /// batches give every record the batch's own timestamp, as Kafka's
+    /// `Record.timestamp()` reports them.
+    ///
+    /// The scan is Kafka's `FileRecords.searchForTimestamp`, including its
+    /// ordering: the answer is the first *qualifying record in offset order*, not
+    /// the earliest timestamp at or after the target. The two differ only for a
+    /// producer whose timestamps go backwards, and a client that rewinds to this
+    /// offset still reads everything after it.
+    fn first_record_at_or_after(
+        batches: &[deflated::Batch],
+        base_offset: i64,
+        from: i64,
+        target_ms: i64,
+    ) -> Option<(i64, i64)> {
+        let mut running = base_offset;
+
+        for batch in batches {
+            let base = running;
+            running += i64::from(batch.last_offset_delta) + 1;
+
+            if running <= from || batch.max_timestamp < target_ms {
+                continue;
+            }
+
+            let log_append = BatchAttribute::try_from(batch.attributes)
+                .map(|attributes| attributes.timestamp == TimestampType::LogAppendTime)
+                .unwrap_or_default();
+
+            let inflated = match inflated::Batch::try_from(batch) {
+                Ok(inflated) => inflated,
+
+                // The fetch path answers this partition `CORRUPT_MESSAGE`; here
+                // the caller's index-only answer stands, which is what this
+                // resolved to before #577 read anything.
+                Err(error) => {
+                    warn!(?error, base, "cannot read a batch's record timestamps");
+                    return None;
+                }
+            };
+
+            for record in &inflated.records {
+                let offset = base + i64::from(record.offset_delta);
+
+                if offset < from {
+                    continue;
+                }
+
+                let timestamp = if log_append {
+                    batch.max_timestamp
+                } else {
+                    inflated.base_timestamp + record.timestamp_delta
+                };
+
+                if timestamp >= target_ms {
+                    return Some((offset, timestamp));
+                }
+            }
+        }
+
+        None
+    }
+
+    /// The offset of the earliest record at or after `target_ms`, with that
+    /// record's own timestamp — `offsetsForTimes` (#105), resolved per record
+    /// (#577). `None` when no record reaches the target.
+    ///
+    /// The footer index locates the segment, free and in memory: the earliest one
+    /// whose greatest record timestamp reaches the target. That used to be the
+    /// whole answer, and the offset it gave was the segment's first served one. A
+    /// segment holds many batches and a batch holds many records, so "resume from
+    /// T" rewound to the start of whatever the writer had coalesced — silently,
+    /// and only ever backwards, which is why it survived: one record per batch
+    /// answers correctly, and every consumer re-reading a batch's worth of
+    /// records looks like ordinary at-least-once duplication. A CDC producer
+    /// batches heavily, so the rewind is proportional to how well the producer
+    /// batches.
+    ///
+    /// So the located region is read — one ranged GET of exactly this
+    /// sub-stream's bytes, the read a fetch at that offset would make anyway —
+    /// and scanned per record ([`Self::first_record_at_or_after`]), which is what
+    /// Kafka does once its time index has named a position.
+    ///
+    /// That is the cost of the fix, and it is a real one: a timestamp query used
+    /// to be answered entirely from the warm index, and now costs one region GET
+    /// per partition, issued at [`Storage::list_offsets`]'s bounded concurrency
+    /// like every other per-partition read in that request. EARLIEST and LATEST
+    /// are untouched — they resolve to positions the index knows exactly, and
+    /// neither reads a byte.
+    ///
+    /// The read is best-effort: a segment retired between locate and read, or one
+    /// whose bytes will not decode, falls back to the offset the index alone
+    /// gives. That is the answer this shipped for, it never skips records, and
+    /// `ListOffsets` carries a consumer's whole assignment — one unreadable
+    /// segment must not fail the request.
+    pub(super) async fn timestamp_offset(
+        &self,
+        topition: &Topition,
+        target_ms: i64,
+    ) -> Result<Option<(i64, i64)>> {
+        let (prefix, substream) = self.routed_substream_of(topition).await?;
+        self.refresh_prefix_index(&prefix).await?;
+
+        let Some(fenced) = self
+            .valid_substream_segments(&prefix, &substream, topition.partition())?
+            .into_iter()
+            .find(|fenced| {
+                fenced.entry.max_timestamp >= 0 && fenced.entry.max_timestamp >= target_ms
+            })
+        else {
+            return Ok(None);
+        };
+
+        // A truncated segment survives physically (#176), so the located base
+        // offset can sit below the truncation floor — clamp, exactly as EARLIEST
+        // does. `served_from`, not `base_offset`: a clipped entry's head belongs
+        // to the segment before it (#461), whose records are all older than the
+        // target.
+        let from = fenced.served_from.max(self.truncate_floor(topition).await?);
+        let located = (from, fenced.entry.max_timestamp);
+
+        let Some(batches) = self.read_substream_region(&prefix, &fenced).await? else {
+            return Ok(Some(located));
+        };
+
+        Ok(Some(
+            Self::first_record_at_or_after(&batches, fenced.entry.base_offset, from, target_ms)
+                .unwrap_or(located),
+        ))
+    }
+
     /// Resolve one partition's `ListOffsets` entry: the offset (and best-effort
     /// timestamp) for `offset_request`. `stable` maps a topition to its first
     /// unstable offset under read-committed isolation (empty for
@@ -775,44 +989,26 @@ impl DynoStore {
             }));
         }
 
-        // Prefix-coalesced TIMESTAMP / `offsetsForTimes` (#105): resolve from
-        // the footer index — the earliest segment whose newest record
-        // timestamp is at/after the target — instead of the legacy `records/`
-        // scan that used to follow, which for a pure-segment topic found nothing
-        // and wrongly returned offset 0. This is an in-memory scan of the warm
-        // index (no per-segment I/O); `None` (→ -1 on the wire) when no record is
+        // Prefix-coalesced TIMESTAMP / `offsetsForTimes` (#105), resolved to the
+        // record rather than to the segment holding it (#577) — see
+        // [`Self::timestamp_offset`]. `None` (→ -1 on the wire) when no record is
         // at or after the target, matching Kafka's "no offset" semantics.
         if let ListOffset::Timestamp(target) = offset_request {
-            let (prefix, substream) = self.routed_substream_of(topition).await?;
-            self.refresh_prefix_index(&prefix).await?;
+            // Never negative, which is what lets the answer below be widened to
+            // a `u64` unchecked (#577): the found record's timestamp is at or
+            // after it.
             let target_ms = target
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map(|elapsed| elapsed.as_millis() as i64)
                 .unwrap_or(0);
 
-            let found = self
-                .valid_substream_segments(&prefix, &substream, topition.partition())?
-                .into_iter()
-                .find(|fenced| {
-                    fenced.entry.max_timestamp >= 0 && fenced.entry.max_timestamp >= target_ms
-                });
-
-            // A truncated segment survives physically (#176), so the located
-            // base offset can sit below the truncation floor — clamp, exactly
-            // as EARLIEST does. `served_from`, not `base_offset`: a clipped
-            // entry's head belongs to the segment before it (#461), whose
-            // records are all older than the target.
-            let offset = match &found {
-                Some(fenced) => Some(fenced.served_from.max(self.truncate_floor(topition).await?)),
-                None => None,
-            };
+            let found = self.timestamp_offset(topition, target_ms).await?;
 
             return Ok(Some(ListOffsetResponse {
                 error_code: ErrorCode::None,
-                offset,
-                timestamp: found.as_ref().map(|fenced| {
-                    SystemTime::UNIX_EPOCH
-                        + Duration::from_millis(fenced.entry.max_timestamp as u64)
+                offset: found.map(|(offset, _)| offset),
+                timestamp: found.map(|(_, timestamp)| {
+                    SystemTime::UNIX_EPOCH + Duration::from_millis(timestamp as u64)
                 }),
             }));
         }
