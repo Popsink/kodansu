@@ -29,7 +29,7 @@
 //! frame can carry stops the scan and is reported with the segment it came from,
 //! rather than raising an error carrying nothing).
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use futures::TryStreamExt as _;
@@ -38,7 +38,7 @@ use object_store::{
 };
 use rama::{Context, Service as _};
 use tansu_sans_io::{
-    ErrorCode, FetchRequest, IsolationLevel,
+    ErrorCode, FetchRequest, IsolationLevel, ListOffset,
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
     fetch_request::{FetchPartition, FetchTopic},
     record::{Record, deflated, inflated},
@@ -468,6 +468,68 @@ async fn a_corrupt_region_fails_its_partition_and_the_request_is_still_answered(
             .await,
         Err(Error::CorruptSegment(_))
     ));
+
+    Ok(())
+}
+
+/// A `ListOffsets` timestamp over a damaged region answers from the index
+/// rather than failing the request (#577).
+///
+/// Resolving a timestamp to a *record* means reading the region the footer
+/// index located, so that read meets the same damage a `Fetch` does. A fetch
+/// answers its partition `CORRUPT_MESSAGE`, because those bytes *are* the
+/// response; here they only refine an answer the index already has, and the
+/// region's first served offset is still a position a client can seek to — it
+/// is what this resolved to for every target before it read anything, and it is
+/// below the record asked for, never above it. `ListOffsets` carries a
+/// consumer's whole assignment, so one damaged segment in it must not cost the
+/// other 1 499 partitions their positions.
+#[tokio::test]
+async fn a_timestamp_over_a_corrupt_region_answers_from_the_index() -> Result<(), Error> {
+    let _guard = super::init_tracing()?;
+
+    let bucket = InMemory::new();
+    let store = store(&bucket);
+
+    create_topic(&store, OFFSETS, &[("cleanup.policy", "compact")]).await?;
+    create_topic(&store, TABLE, &[]).await?;
+
+    let offsets = Topition::new(OFFSETS, 0);
+    let table = Topition::new(TABLE, 0);
+
+    const BASE: i64 = 1_700_000_000_000;
+    const SECOND: i64 = 1_000;
+    let stamps = [BASE, BASE + SECOND, BASE + 2 * SECOND];
+
+    for tp in [&offsets, &table] {
+        assert_eq!(
+            0,
+            store
+                .produce(None, tp, super::batch_stamped(&stamps)?)
+                .await?
+        );
+    }
+
+    corrupt_stored_region(&bucket, OFFSETS).await?;
+
+    let ask = async |tp: &Topition| -> Result<(ErrorCode, Option<i64>)> {
+        let answered = store
+            .list_offsets(
+                IsolationLevel::ReadUncommitted,
+                &[(
+                    tp.to_owned(),
+                    ListOffset::Timestamp(
+                        SystemTime::UNIX_EPOCH + Duration::from_millis(stamps[2] as u64),
+                    ),
+                )],
+            )
+            .await?;
+
+        Ok((answered[0].1.error_code, answered[0].1.offset))
+    };
+
+    assert_eq!((ErrorCode::None, Some(2)), ask(&table).await?);
+    assert_eq!((ErrorCode::None, Some(0)), ask(&offsets).await?);
 
     Ok(())
 }

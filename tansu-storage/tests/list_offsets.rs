@@ -581,3 +581,157 @@ async fn a_timestamp_no_record_reaches_has_no_offset() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// `offsetsForTimes` resolves to the first RECORD at or after the target, not
+/// to the base offset of the batch holding it (#577).
+///
+/// Ten records with one second between them, produced in a single batch, and a
+/// target halfway through: Kafka answers offset 5, this answered 0 — the whole
+/// batch rewound, because the search stopped at the segment the footer index
+/// named and took its base offset. One record per batch happened to answer
+/// correctly, which is what made this look like a working timestamp index.
+#[tokio::test]
+async fn a_timestamp_resolves_inside_the_batch_holding_it() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    const NODE_ID: i32 = 111;
+    const TOPIC: &str = "offsets-for-times-in-batch";
+    const RECORDS: i32 = 10;
+
+    let storage = StorageContainer::builder()
+        .cluster_id(cluster_id())
+        .node_id(NODE_ID)
+        .advertised_listener(Url::parse("tcp://localhost:9092")?)
+        .storage(storage_url()?)
+        .build()
+        .await?;
+
+    _ = {
+        let storage = storage.clone();
+        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    }
+    .serve(
+        Context::default(),
+        CreateTopicsRequest::default()
+            .topics(Some(
+                [CreatableTopic::default()
+                    .name(TOPIC.into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into()))]
+                .into(),
+            ))
+            .validate_only(Some(false)),
+    )
+    .await?;
+
+    // One second between records (#577), so a target between two of them is
+    // unambiguous.
+    let base_timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("now is after the epoch")
+        .as_millis() as i64;
+    let at = |record: i32| base_timestamp + i64::from(record) * 1_000;
+
+    let mut builder = Batch::builder()
+        .base_timestamp(base_timestamp)
+        .max_timestamp(at(RECORDS - 1))
+        .last_offset_delta(RECORDS - 1);
+
+    for record in 0..RECORDS {
+        builder = builder.record(
+            Record::builder()
+                .offset_delta(record)
+                .timestamp_delta(i64::from(record) * 1_000)
+                .value(Some(Bytes::copy_from_slice(
+                    format!("record-{record}").as_bytes(),
+                ))),
+        );
+    }
+
+    let batch = builder.build().and_then(deflated::Batch::try_from)?;
+
+    _ = {
+        let storage = storage.clone();
+        MapStateLayer::new(|_| storage).into_layer(ProduceService)
+    }
+    .serve(
+        Context::default(),
+        ProduceRequest::default()
+            .acks(-1)
+            .timeout_ms(30_000)
+            .topic_data(Some(
+                [TopicProduceData::default()
+                    .name(TOPIC.into())
+                    .partition_data(Some(
+                        [PartitionProduceData::default()
+                            .index(0)
+                            .records(Some(deflated::Frame {
+                                batches: [batch].into(),
+                            }))]
+                        .into(),
+                    ))]
+                .into(),
+            )),
+    )
+    .await?;
+
+    let list_offsets = MapStateLayer::new(|_| storage).into_layer(ListOffsetsService);
+
+    let ask = async |timestamp: i64| -> Result<ListOffsetsPartitionResponse, Error> {
+        let response = list_offsets
+            .serve(
+                Context::default(),
+                ListOffsetsRequest::default()
+                    .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
+                    .replica_id(NODE_ID)
+                    .topics(Some(
+                        [ListOffsetsTopic::default()
+                            .name(TOPIC.into())
+                            .partitions(Some(
+                                [ListOffsetsPartition::default()
+                                    .current_leader_epoch(Some(-1))
+                                    .partition_index(0)
+                                    .timestamp(timestamp)]
+                                .into(),
+                            ))]
+                        .into(),
+                    )),
+            )
+            .await?;
+
+        let topics = response.topics.as_deref().unwrap_or_default();
+        assert_eq!(1, topics.len());
+
+        let partitions = topics[0].partitions.as_deref().unwrap_or_default();
+        assert_eq!(1, partitions.len());
+
+        Ok(partitions[0].clone())
+    };
+
+    let mid = ask(at(4) + 500).await?;
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(mid.error_code)?);
+    assert_eq!(Some(5), mid.offset);
+    assert_eq!(Some(at(5)), mid.timestamp);
+
+    for record in 0..RECORDS {
+        let answered = ask(at(record)).await?;
+        assert_eq!(
+            Some(i64::from(record)),
+            answered.offset,
+            "at record {record}"
+        );
+        assert_eq!(Some(at(record)), answered.timestamp, "at record {record}");
+    }
+
+    let before = ask(base_timestamp - 1).await?;
+    assert_eq!(Some(0), before.offset);
+    assert_eq!(Some(base_timestamp), before.timestamp);
+
+    let after = ask(at(RECORDS - 1) + 1).await?;
+    assert_eq!(Some(-1), after.offset);
+    assert_eq!(Some(-1), after.timestamp);
+
+    Ok(())
+}

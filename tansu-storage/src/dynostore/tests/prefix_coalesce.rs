@@ -5300,3 +5300,100 @@ async fn the_reconciliation_leaves_a_healthy_or_drained_partition_alone() -> Res
 
     Ok(())
 }
+
+/// `offsetsForTimes` resolves to the record, across the batches of a MERGED
+/// region (#577).
+///
+/// The shape a maintained prefix is in: three batches fused into one segment,
+/// so the sub-stream is one region of nine records and the footer index can say
+/// nothing finer than "this segment reaches your timestamp". Answering from the
+/// index alone therefore rewound to offset 0 for every target in the log — the
+/// whole merged region re-delivered. What makes this the interesting case and
+/// not just a bigger version of the single-batch one is the offset arithmetic:
+/// the batches carry the offsets they were *encoded* with, and only the footer
+/// entry says where the region now begins, so a record's offset is a running
+/// count from the entry's base and nothing else.
+#[tokio::test]
+async fn list_offsets_timestamp_resolves_within_a_merged_region() -> Result<(), Error> {
+    let bucket = InMemory::new();
+
+    // One segment per batch and a merge over all of them (#577), so the
+    // produced batches are fused rather than left one to a segment — where the
+    // segment-granular answer would have been right by accident. `keep_hot` is
+    // 16 by default and would leave every segment here in the untouched tail.
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).coalesce_tuning(CoalesceTuning {
+        coalesce_linger: Some(Duration::from_millis(1)),
+        coalesce_batches: Some(1),
+        prefix_compact_min_segments: Some(1),
+        prefix_compact_keep_hot: Some(0),
+        ..Default::default()
+    });
+
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    // Recent stamps (#577): `maintain` also runs retention, and an epoch-era
+    // timestamp would have the whole log expire before it merged.
+    const SECOND: i64 = 1_000;
+    const BATCHES: i64 = 3;
+    const PER_BATCH: i64 = 3;
+
+    let base = now_ms() - BATCHES * PER_BATCH * SECOND;
+    let at = |offset: i64| base + offset * SECOND;
+
+    for batch in 0..BATCHES {
+        let stamps: Vec<i64> = (0..PER_BATCH).map(|n| at(batch * PER_BATCH + n)).collect();
+
+        assert_eq!(
+            batch * PER_BATCH,
+            store
+                .produce(None, &a, super::batch_stamped(&stamps)?)
+                .await?
+        );
+    }
+
+    store.maintain(SystemTime::now()).await?;
+    assert_eq!(1, segments(&bucket).await.len(), "one merged segment");
+
+    let ask = async |timestamp: i64| -> Result<(Option<i64>, Option<SystemTime>)> {
+        let answered = store
+            .list_offsets(
+                IsolationLevel::ReadUncommitted,
+                &[(
+                    a.clone(),
+                    ListOffset::Timestamp(
+                        SystemTime::UNIX_EPOCH + Duration::from_millis(timestamp as u64),
+                    ),
+                )],
+            )
+            .await?;
+
+        Ok((answered[0].1.offset, answered[0].1.timestamp))
+    };
+
+    for offset in 0..BATCHES * PER_BATCH {
+        assert_eq!(
+            (
+                Some(offset),
+                Some(SystemTime::UNIX_EPOCH + Duration::from_millis(at(offset) as u64)),
+            ),
+            ask(at(offset)).await?,
+            "at record {offset}",
+        );
+
+        assert_eq!(
+            Some(offset),
+            ask(at(offset) - SECOND / 2).await?.0,
+            "between record {offset} and the one before it",
+        );
+    }
+
+    assert_eq!(
+        (None, None),
+        ask(at(BATCHES * PER_BATCH - 1) + 1).await?,
+        "no record is at or after this",
+    );
+
+    Ok(())
+}

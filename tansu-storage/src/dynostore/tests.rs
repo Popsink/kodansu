@@ -20,6 +20,9 @@ use std::{collections::BTreeMap, fs::File, sync::Arc, thread};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::EnvFilter;
 
+use bytes::Bytes;
+use tansu_sans_io::record::{Record, deflated, inflated};
+
 use crate::{Error, Result, Topition};
 
 use super::{DynoStore, ServedEnd, Watermark};
@@ -62,6 +65,36 @@ mod short_region;
 mod substream_identity;
 mod topic_churn;
 mod watermark_hint;
+
+/// A batch whose records carry `timestamps`, one record each, in offset order
+/// (#577).
+///
+/// [`batch_at`] stamps the batch and leaves every record on the batch's own
+/// base, which is all whole-segment retention needs to see. Resolving a
+/// timestamp to a *record* needs the records to differ from each other.
+pub(crate) fn batch_stamped(timestamps: &[i64]) -> Result<deflated::Batch> {
+    let base = timestamps.first().copied().unwrap_or_default();
+
+    timestamps
+        .iter()
+        .enumerate()
+        .fold(inflated::Batch::builder(), |builder, (n, timestamp)| {
+            builder.record(
+                Record::builder()
+                    .offset_delta(n as i32)
+                    .timestamp_delta(timestamp - base)
+                    .value(Some(Bytes::copy_from_slice(
+                        format!("record-{n}").as_bytes(),
+                    ))),
+            )
+        })
+        .last_offset_delta(timestamps.len() as i32 - 1)
+        .base_timestamp(base)
+        .max_timestamp(timestamps.iter().copied().max().unwrap_or(base))
+        .build()
+        .and_then(deflated::Batch::try_from)
+        .map_err(Into::into)
+}
 
 /// Write a legacy `{group}.json` — the single group object the #359 cutover
 /// left behind.
