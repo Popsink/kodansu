@@ -20,8 +20,18 @@ services:
         target: /etc/dashboards
       - grafana:/var/lib/grafana
     pull_policy: missing
+  # Chainguard's build of MinIO, not MinIO's own (#583). MinIO stopped
+  # publishing community images in October 2025 and then closed the archives:
+  # `minio/minio` left Docker Hub, and on 2026-09-25 `quay.io/minio/minio` began
+  # refusing anonymous pulls — every tag, not just `latest`, so pinning an older
+  # one does not get the image back. Chainguard rebuilds the AGPL source daily
+  # and serves it anonymously; the binary is the same upstream release.
+  #
+  # Untagged on purpose: `:latest` is the only tag Chainguard publishes for free,
+  # so there is nothing to pin to. Their image also ships `mc`, `bash` and
+  # `timeout`, which is why `minio-mc` and the healthcheck below are unchanged.
   minio:
-    image: quay.io/minio/minio
+    image: chainguard/minio
     command: server /data --console-address ":9001"
     volumes:
       - minio:/data
