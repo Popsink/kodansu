@@ -226,7 +226,7 @@ target that pins them, and it runs against whichever store
 `TANSU_TEST_STORAGE_URL` names.
 
 Verified green on `memory://`, on `s3://` against minio and on `az://` against
-Azurite (`object_store` 0.14.1, `quay.io/minio/minio`,
+Azurite (`object_store` 0.14.1, `chainguard/minio`,
 `mcr.microsoft.com/azure-storage/azurite`):
 
 | property | how it is pinned |
