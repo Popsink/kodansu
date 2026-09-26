@@ -64,6 +64,24 @@ const RECORDS: usize = 12;
 /// asking for more than the broker will give.
 const CLIENT_ASK: i32 = 16 * 1024 * 1024;
 
+/// The poll deadline every assertion below runs under.
+///
+/// Not a wait these tests spend: `min_bytes` is 1 against a seeded log, so the
+/// poll loop returns on its first pass. It is the budget the *read* runs under.
+/// `fetch_prefix_coalesced` stops mid-plan once `max.wait.ms` is gone and
+/// answers with the segments it already has — right for a client that asked to
+/// be answered by a deadline, and fatal for a test that reads a short answer as
+/// a clamp.
+///
+/// At 1 s that is what happened (#585). Against minio on a loaded runner the
+/// nightly's raised-clamp case came back with two of twelve batches and read it
+/// as the clamp never having moved (`storage` run 36214983904, 2026-09-26); on
+/// `memory://` the same read is microseconds, so `just test` never saw it. Ten
+/// seconds is an order of magnitude past the truncation point and still under
+/// the 30 s `NEXTEST_PROFILE=ci` names a slow test at, so a read that really is
+/// slow is reported rather than absorbed into a passing assertion.
+const MAX_WAIT_MS: i32 = 10_000;
+
 /// A store holding `RECORDS` batches, built with `query` on its storage URL.
 async fn seeded(query: &str) -> Result<Arc<dyn Storage>, Error> {
     let storage = StorageContainer::builder()
@@ -111,7 +129,7 @@ async fn delivered(storage: &Arc<dyn Storage>, max_bytes: i32) -> Result<usize, 
         .serve(
             Context::default(),
             FetchRequest::default()
-                .max_wait_ms(1_000)
+                .max_wait_ms(MAX_WAIT_MS)
                 .min_bytes(1)
                 .max_bytes(Some(max_bytes))
                 .isolation_level(Some(i8::from(IsolationLevel::ReadUncommitted)))
@@ -169,7 +187,13 @@ fn assert_bounded(delivered: usize, bound: usize, what: &str) {
 }
 
 /// The production case, and the reason the issue exists: the client asks for
-/// 16 MiB, the log holds ~6 MiB, and 5 MiB comes back.
+/// 16 MiB, the log holds ~9 MiB, and 5 MiB comes back.
+///
+/// Bounded from *both* sides (#585). An upper bound alone is satisfied by a
+/// response that came back short for a reason that is not the clamp — the
+/// deadline of [`MAX_WAIT_MS`] is the one that has actually happened — and then
+/// the case this whole file exists for passes without the clamp being exercised
+/// at all. A 5 MiB budget spent over 768 KiB batches fills to within one batch.
 #[tokio::test]
 async fn the_default_clamp_bounds_a_client_asking_for_more() -> Result<(), Error> {
     let _guard = init_tracing()?;
@@ -177,6 +201,12 @@ async fn the_default_clamp_bounds_a_client_asking_for_more() -> Result<(), Error
     let delivered = delivered(&seeded("").await?, CLIENT_ASK).await?;
 
     assert_bounded(delivered, 5 * 1024 * 1024, "default clamp");
+
+    assert!(
+        delivered > 5 * 1024 * 1024 - RECORD_BYTES,
+        "the default clamp answered with {delivered} bytes of a {} byte log,          short of the 5 MiB it bounds to by more than the batch it stops on:          something other than the clamp cut this response",
+        RECORDS * RECORD_BYTES,
+    );
 
     assert!(
         delivered < RECORDS * RECORD_BYTES,
