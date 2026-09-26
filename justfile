@@ -324,6 +324,17 @@ fmt:
 # regression tests cost in code; their explanations are the 91 lines of `///`
 # that came with them, outside the ratio.
 #
+#   #585     +6 lines, the fetch deadline 3177 -> 3177  2.95488155 -> 2.95471667
+#
+# The smallest move this number has made, and the fifth by a change that neither
+# added nor deleted a line of narration. #585 gives `fetch_max_bytes.rs` a poll
+# deadline that cannot bind and bounds the default-clamp case from below: six
+# lines of code — a `const`, an `assert!` and its message — against 22 lines of
+# `///` saying why the clock, not the clamp, was deciding what the nightly
+# measured. The explanation is rustdoc precisely because it is long; as `//`
+# inside the test body it would have cost the tenth of a point this ceiling does
+# not have.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -333,7 +344,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.9549" top="12":
+comments ceiling="2.9548" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
