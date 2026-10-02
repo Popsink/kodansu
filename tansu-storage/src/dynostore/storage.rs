@@ -201,6 +201,15 @@ impl Storage for DynoStore {
         topition: &Topition,
         deflated: deflated::Batch,
     ) -> Result<i64> {
+        self.admit(transaction_id, topition, deflated).await?.await
+    }
+
+    async fn admit(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: deflated::Batch,
+    ) -> Result<crate::Ack> {
         {
             // Kafka's `message.max.bytes`, refused before anything is buffered
             // (#443). Without a cap an unbounded payload reaches the write path,
@@ -259,57 +268,74 @@ impl Storage for DynoStore {
             // `meta.transactions`, `txn_end` would find nothing to mark, and a
             // read-committed consumer would read aborted data as committed (the
             // #81 bug class).
-            let offset = self.enqueue_prefix_coalesced(topition, deflated).await?;
+            let acked = self.admit_prefix_coalesced(topition, deflated).await?;
 
-            // Register the produced range on the open transaction. Covers the
-            // end-transaction marker too (`txn_end` produces it with the
-            // transaction id and the transactional attribute), extending
-            // `offset_end` over the marker's offset. Idempotent under retries:
-            // a leaseless `Duplicate` ack returns the *original* offset, and
-            // the `and_modify` below only ever widens `offset_end`.
-            if let Some(transaction_id) = transaction_id
-                && attributes.transaction
-            {
-                self.meta
-                    .with_mut(&self.object_store, |meta| {
-                        if let Some(transaction) = meta.transactions.get_mut(transaction_id) {
-                            debug!(?transaction);
+            // Owned, because the registration runs after the ack, which the
+            // caller awaits whenever it likes (#588). Cloned only for a
+            // transactional batch: nothing else needs the store past the buffer.
+            let registration = transaction_id
+                .filter(|_| attributes.transaction)
+                .map(|transaction_id| (self.clone(), transaction_id.to_owned(), topition.clone()));
 
-                            if let Some(txn_detail) = transaction.epochs.get_mut(&producer_epoch) {
-                                debug!(?txn_detail);
+            Ok(Box::pin(async move {
+                let offset = acked
+                    .await
+                    .map_err(|_| Error::Api(ErrorCode::UnknownServerError))??;
 
-                                let offset_end = offset + last_offset_delta as i64;
+                // Register the produced range on the open transaction. Covers
+                // the end-transaction marker too (`txn_end` produces it with
+                // the transaction id and the transactional attribute),
+                // extending `offset_end` over the marker's offset. Idempotent
+                // under retries: a leaseless `Duplicate` ack returns the
+                // *original* offset, and the `and_modify` below only ever
+                // widens `offset_end`.
+                if let Some((store, transaction_id, topition)) = registration {
+                    let transaction_id = transaction_id.as_str();
 
-                                _ = txn_detail
-                                    .produces
-                                    .entry(topition.topic.clone())
-                                    .or_default()
-                                    .entry(topition.partition)
-                                    .and_modify(|entry| {
-                                        let range = entry.get_or_insert(TxnProduceOffset {
+                    store
+                        .meta
+                        .with_mut(&store.object_store, |meta| {
+                            if let Some(transaction) = meta.transactions.get_mut(transaction_id) {
+                                debug!(?transaction);
+
+                                if let Some(txn_detail) =
+                                    transaction.epochs.get_mut(&producer_epoch)
+                                {
+                                    debug!(?txn_detail);
+
+                                    let offset_end = offset + last_offset_delta as i64;
+
+                                    _ = txn_detail
+                                        .produces
+                                        .entry(topition.topic.clone())
+                                        .or_default()
+                                        .entry(topition.partition)
+                                        .and_modify(|entry| {
+                                            let range = entry.get_or_insert(TxnProduceOffset {
+                                                offset_start: offset,
+                                                offset_end,
+                                            });
+
+                                            if offset_end > range.offset_end {
+                                                range.offset_end = offset_end;
+                                            }
+                                        })
+                                        .or_insert(Some(TxnProduceOffset {
                                             offset_start: offset,
                                             offset_end,
-                                        });
-
-                                        if offset_end > range.offset_end {
-                                            range.offset_end = offset_end;
-                                        }
-                                    })
-                                    .or_insert(Some(TxnProduceOffset {
-                                        offset_start: offset,
-                                        offset_end,
-                                    }));
+                                        }));
+                                }
                             }
-                        }
 
-                        Ok(())
-                    })
-                    .await
-                    .inspect(|outcome| debug!(?outcome, transaction_id, ?topition))
-                    .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
-            }
+                            Ok(())
+                        })
+                        .await
+                        .inspect(|outcome| debug!(?outcome, transaction_id, ?topition))
+                        .inspect_err(|err| error!(?err, transaction_id, ?topition))?;
+                }
 
-            Ok(offset)
+                Ok(offset)
+            }))
         }
     }
 

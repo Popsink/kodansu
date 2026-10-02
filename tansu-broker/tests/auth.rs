@@ -830,6 +830,16 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
+    async fn admit(
+        &self,
+        _transaction_id: Option<&str>,
+        _topition: &Topition,
+        _deflated: Batch,
+    ) -> tansu_storage::Result<tansu_storage::Ack> {
+        unimplemented!()
+    }
+
+    #[instrument(skip_all)]
     async fn fetch(
         &self,
         _topition: &Topition,

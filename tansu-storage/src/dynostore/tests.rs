@@ -51,6 +51,7 @@ mod meta_growth;
 mod metadata_visibility;
 mod offset_assignment;
 mod offset_commit;
+mod pipelined_admission;
 mod prefix_coalesce;
 mod prefix_shape;
 mod quarantine_segment;

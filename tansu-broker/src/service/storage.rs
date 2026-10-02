@@ -26,7 +26,7 @@ use tansu_sans_io::{
     IncrementalAlterConfigsRequest, InitProducerIdRequest, ListGroupsRequest, ListOffsetsRequest,
     ListPartitionReassignmentsRequest, MetadataRequest, ProduceRequest, TxnOffsetCommitRequest,
 };
-use tansu_service::{FrameRequestLayer, FrameRouteBuilder, NoResponse};
+use tansu_service::{Admission, FrameRequestLayer, FrameRouteBuilder, NoResponse};
 use tansu_storage::{
     AlterClientQuotasService, AlterUserScramCredentialsService, ConsumerGroupDescribeService,
     CreateAclsService, CreateTopicsService, DeleteAclsService, DeleteGroupsService,
@@ -35,8 +35,8 @@ use tansu_storage::{
     DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
     FindCoordinatorService, IncrementalAlterConfigsService, InitProducerIdService,
     ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService, MetadataService,
-    ProduceService, Storage, TxnAddOffsetsService, TxnAddPartitionService, TxnEndService,
-    TxnOffsetCommitService,
+    OnAdmitted, ProduceService, Storage, TxnAddOffsetsService, TxnAddPartitionService,
+    TxnEndService, TxnOffsetCommitService,
 };
 use tracing::warn;
 
@@ -628,8 +628,31 @@ where
 /// [`NoResponse`], which lives with the connection loop that acts on it. The
 /// records are still written and still awaited — `acks=0` withholds the answer,
 /// it does not withhold the durability.
+///
+/// The same layer decides whether a produce may be **pipelined** (#588): the
+/// connection reads its next request once this one's batches are in their
+/// windows, rather than once they are durable. Only when every batch is
+/// idempotent, because pipelining puts two requests for one partition into
+/// different windows, and the earlier window can fail while the later one
+/// succeeds. An idempotent batch behind the failure is refused
+/// `OUT_OF_ORDER_SEQUENCE_NUMBER` by the flush — the producer table expects
+/// the failed batch's sequence first — and the client retries both in order.
+/// A batch without a sequence has nothing to refuse it, and would be written
+/// past the gap. `acks=0` never pipelines: it is not idempotent, and its
+/// answer is silence either way.
 #[derive(Clone, Debug)]
 struct Acks<S>(S);
+
+/// Whether every batch `req` carries is idempotent (#588).
+fn idempotent(req: &ProduceRequest) -> bool {
+    req.topic_data
+        .iter()
+        .flatten()
+        .flat_map(|topic| topic.partition_data.iter().flatten())
+        .flat_map(|partition| partition.records.iter())
+        .flat_map(|records| records.batches.iter())
+        .all(|batch| batch.is_idempotent())
+}
 
 impl<State, S> Service<State, ProduceRequest> for Acks<S>
 where
@@ -641,9 +664,16 @@ where
 
     async fn serve(
         &self,
-        ctx: Context<State>,
+        mut ctx: Context<State>,
         req: ProduceRequest,
     ) -> Result<Self::Response, Self::Error> {
+        if req.acks != 0
+            && idempotent(&req)
+            && let Some(admission) = ctx.get::<Admission>().cloned()
+        {
+            _ = ctx.insert(OnAdmitted::new(move || admission.admitted()));
+        }
+
         if req.acks == 0 {
             if let Some(no_response) = ctx.get::<NoResponse>() {
                 no_response.set();

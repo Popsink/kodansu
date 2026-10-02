@@ -271,6 +271,10 @@ pub struct Broker<G, S> {
     /// (#477). Kafka's `socket.request.max.bytes`.
     maximum_frame_size: Option<usize>,
 
+    /// Requests a connection may read ahead of their answers (#588), `None`
+    /// for [`TcpContext::PIPELINE_DEPTH`].
+    pipeline_depth: Option<usize>,
+
     maintenance: Maintenance,
 
     cancellation: CancellationToken,
@@ -310,6 +314,7 @@ where
             // Armed, as `TcpContext::default()` is: a `Broker` built directly
             // rather than through the builder gets the same cap (#477).
             maximum_frame_size: Some(TcpContext::MAXIMUM_FRAME_SIZE),
+            pipeline_depth: None,
 
             maintenance: Maintenance::default(),
 
@@ -741,7 +746,10 @@ where
         stream.set_nodelay(true)?;
 
         let service = services(
-            TcpContext::default()
+            self.pipeline_depth
+                .map_or_else(TcpContext::default, |depth| {
+                    TcpContext::default().pipeline_depth(depth)
+                })
                 .cluster_id(Some(self.cluster_id.clone()))
                 .maximum_frame_size(self.maximum_frame_size)
                 // So this connection is closed the next time it is idle between
@@ -900,6 +908,12 @@ pub struct Builder<N, C, I, A, S, L> {
     /// any. Defaults to Kafka's `socket.request.max.bytes`.
     maximum_frame_size: Option<usize>,
 
+    /// Requests a connection may read ahead of their answers (#588). `None`,
+    /// which is what `Default` gives, is [`TcpContext::PIPELINE_DEPTH`] — an
+    /// `Option` because a derived `0` would turn pipelining off for every
+    /// broker built without asking.
+    pipeline_depth: Option<usize>,
+
     cancellation: CancellationToken,
 }
 
@@ -934,6 +948,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             quota_defaults: self.quota_defaults,
             quota_fleet_size: self.quota_fleet_size,
             maximum_frame_size: self.maximum_frame_size,
+            pipeline_depth: self.pipeline_depth,
             cancellation: self.cancellation,
         }
     }
@@ -957,6 +972,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             quota_defaults: self.quota_defaults,
             quota_fleet_size: self.quota_fleet_size,
             maximum_frame_size: self.maximum_frame_size,
+            pipeline_depth: self.pipeline_depth,
             cancellation: self.cancellation,
         }
     }
@@ -980,6 +996,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             quota_defaults: self.quota_defaults,
             quota_fleet_size: self.quota_fleet_size,
             maximum_frame_size: self.maximum_frame_size,
+            pipeline_depth: self.pipeline_depth,
             cancellation: self.cancellation,
         }
     }
@@ -1006,6 +1023,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             quota_defaults: self.quota_defaults,
             quota_fleet_size: self.quota_fleet_size,
             maximum_frame_size: self.maximum_frame_size,
+            pipeline_depth: self.pipeline_depth,
             cancellation: self.cancellation,
         }
     }
@@ -1068,6 +1086,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             quota_defaults: self.quota_defaults,
             quota_fleet_size: self.quota_fleet_size,
             maximum_frame_size: self.maximum_frame_size,
+            pipeline_depth: self.pipeline_depth,
             cancellation: self.cancellation,
         }
     }
@@ -1093,6 +1112,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             quota_defaults: self.quota_defaults,
             quota_fleet_size: self.quota_fleet_size,
             maximum_frame_size: self.maximum_frame_size,
+            pipeline_depth: self.pipeline_depth,
             cancellation: self.cancellation,
         }
     }
@@ -1150,6 +1170,16 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
     pub fn maximum_frame_size(self, maximum_frame_size: Option<usize>) -> Self {
         Self {
             maximum_frame_size,
+            ..self
+        }
+    }
+
+    /// Read at most `pipeline_depth` requests on a connection ahead of their
+    /// answers (#588); `1` turns pipelining off. See
+    /// [`TcpContext::PIPELINE_DEPTH`] for why the default is also the most.
+    pub fn pipeline_depth(self, pipeline_depth: usize) -> Self {
+        Self {
+            pipeline_depth: Some(pipeline_depth),
             ..self
         }
     }
@@ -1250,6 +1280,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             silent: self.silent,
             maintenance: self.maintenance,
             maximum_frame_size: self.maximum_frame_size,
+            pipeline_depth: self.pipeline_depth,
             cancellation: self.cancellation,
         })
     }

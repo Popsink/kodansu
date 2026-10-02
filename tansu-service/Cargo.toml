@@ -19,6 +19,7 @@ opentelemetry_sdk.workspace = true
 [dependencies]
 async-trait.workspace = true
 bytes.workspace = true
+futures.workspace = true
 indicatif.workspace = true
 nanoid.workspace = true
 opentelemetry-semantic-conventions.workspace = true

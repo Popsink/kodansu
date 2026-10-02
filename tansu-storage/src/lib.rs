@@ -94,9 +94,11 @@ use std::{
     array::TryFromSliceError,
     collections::BTreeMap,
     fmt::{self, Debug, Display, Formatter},
+    future::Future,
     io,
     marker::PhantomData,
     num::{ParseIntError, TryFromIntError},
+    pin::Pin,
     result,
     str::FromStr,
     sync::{Arc, LazyLock, PoisonError},
@@ -202,8 +204,8 @@ pub use service::{
     DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
     FindCoordinatorService, GetTelemetrySubscriptionsService, IncrementalAlterConfigsService,
     InitProducerIdService, ListGroupsService, ListOffsetsService,
-    ListPartitionReassignmentsService, MetadataService, ProduceService, TxnAddOffsetsService,
-    TxnAddPartitionService, TxnEndService, TxnOffsetCommitService,
+    ListPartitionReassignmentsService, MetadataService, OnAdmitted, ProduceService,
+    TxnAddOffsetsService, TxnAddPartitionService, TxnEndService, TxnOffsetCommitService,
 };
 
 #[cfg(feature = "dynostore")]
@@ -1442,6 +1444,13 @@ impl From<TxnState> for String {
     }
 }
 
+/// A batch [admitted](Storage::admit) to storage, resolving to its base offset
+/// once it is durable (#588).
+///
+/// `'static` and owned, so whoever admitted the batch can go and admit the next
+/// one — from the same connection — while this one waits for its window.
+pub type Ack = Pin<Box<dyn Future<Output = Result<i64>> + Send + 'static>>;
+
 /// Storage
 ///
 /// The Core storage abstraction. All storage engines implement this type.
@@ -1478,6 +1487,25 @@ pub trait Storage: Debug + Send + Sync + 'static {
         topition: &Topition,
         batch: deflated::Batch,
     ) -> Result<i64>;
+
+    /// Admit a deflated batch to this storage, without waiting for it to be
+    /// durable (#588).
+    ///
+    /// Returns once the batch holds its place in the write order: a batch
+    /// admitted after this one returns is written after it. The [`Ack`] then
+    /// resolves to what [`Self::produce`] would have returned.
+    ///
+    /// That ordering is the whole contract, and it is what lets a connection
+    /// pipeline its produces — the next request is read once this one is
+    /// admitted, not once it is acknowledged. An engine with nothing to admit
+    /// into may return an [`Ack`] that is already resolved, which is correct
+    /// and gives a connection nothing to pipeline.
+    async fn admit(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        batch: deflated::Batch,
+    ) -> Result<Ack>;
 
     /// Fetch deflated batches from storage.
     async fn fetch(

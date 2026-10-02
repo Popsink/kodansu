@@ -43,7 +43,7 @@ use url::Url;
 use uuid::Uuid;
 
 use crate::{
-    AclBinding, AclFilter, Acls, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
+    Ack, AclBinding, AclFilter, Acls, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
     BrokerRegistrationRequest, CommittedOffset, DEFAULT_FETCH_MAX_BYTES, Error, GenerationDoc,
     GroupDetailResponse, ListOffsetResponse, MemberDoc, MetadataResponse, NamedGroupDetail,
     OffsetCommitRequest, OffsetStage, ProducerIdResponse, QuotaAlteration, QuotaEntity,
@@ -190,6 +190,20 @@ impl Storage for Engine {
         _deflated: Batch,
     ) -> Result<i64> {
         Ok(6)
+    }
+
+    /// Nothing to wait for, so nothing to pipeline: the [`Ack`] is already
+    /// resolved, with the offset [`Self::produce`] answers.
+    #[instrument(skip_all)]
+    async fn admit(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: Batch,
+    ) -> Result<Ack> {
+        let produced = self.produce(transaction_id, topition, deflated).await;
+
+        Ok(Box::pin(std::future::ready(produced)))
     }
 
     #[instrument(skip_all)]

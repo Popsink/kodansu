@@ -3771,6 +3771,7 @@ dependencies = [
  "tansu-broker",
  "tansu-client",
  "tansu-sans-io",
+ "tansu-service",
  "tansu-storage",
  "tansu-topic",
  "tempfile",
@@ -3855,6 +3856,7 @@ version = "1.0.0-alpha.20"
 dependencies = [
  "async-trait",
  "bytes",
+ "futures",
  "indicatif",
  "nanoid",
  "opentelemetry",

@@ -43,7 +43,7 @@ use uuid::Uuid;
 
 use crate::delegate::storage_methods;
 use crate::{
-    AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
+    Ack, AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
     BrokerRegistrationRequest, CommittedOffset, GenerationDoc, ListOffsetResponse, MemberDoc,
     MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
     QuotaAlteration, QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas, Result,

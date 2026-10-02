@@ -65,7 +65,7 @@ pub use list_groups::ListGroupsService;
 pub use list_offsets::ListOffsetsService;
 pub use list_partition_reassignments::ListPartitionReassignmentsService;
 pub use metadata::MetadataService;
-pub use produce::ProduceService;
+pub use produce::{OnAdmitted, ProduceService};
 pub use txn::add_offsets::AddOffsetsService as TxnAddOffsetsService;
 pub use txn::add_partitions::AddPartitionService as TxnAddPartitionService;
 pub use txn::end::EndService as TxnEndService;
