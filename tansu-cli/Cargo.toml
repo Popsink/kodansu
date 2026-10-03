@@ -50,5 +50,9 @@ uuid.workspace = true
 # tree, and nothing to expire.
 rcgen.workspace = true
 
+# `--pipeline-depth`'s default is the connection loop's constant, asserted
+# rather than restated (#588).
+tansu-service.workspace = true
+
 tempfile.workspace = true
 tokio-util.workspace = true

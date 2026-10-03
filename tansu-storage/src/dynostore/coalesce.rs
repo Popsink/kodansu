@@ -209,17 +209,24 @@ impl DynoStore {
         }
     }
 
-    /// Buffer `deflated` for a prefix-coalesced flush and await its assigned
-    /// offset (#57). Keyed by the topition's connector prefix, so one buffer
-    /// accumulates batches across every topic under the prefix and flushes them
-    /// into one shared segment object. (It replaced a per-partition buffer,
-    /// deleted with the rest of #50 in #177.) The
+    /// Buffer `deflated` for a prefix-coalesced flush, returning the receiver
+    /// its assigned offset arrives on (#57). Keyed by the topition's connector
+    /// prefix, so one buffer accumulates batches across every topic under the
+    /// prefix and flushes them into one shared segment object. (It replaced a
+    /// per-partition buffer, deleted with the rest of #50 in #177.) The
     /// idempotent sequence and schema were already validated by `produce`.
-    pub(super) async fn enqueue_prefix_coalesced(
+    ///
+    /// Returns once the batch is in the buffer, which is what
+    /// [`Storage::admit`] promises (#588): buffer order is offset order, so a
+    /// batch buffered after this call returns takes a later offset. A batch
+    /// that fills the buffer flushes it here, inline, and so returns only after
+    /// that flush — the order still holds, and the next batch starts the next
+    /// window.
+    pub(super) async fn admit_prefix_coalesced(
         &self,
         topition: &Topition,
         deflated: deflated::Batch,
-    ) -> Result<i64> {
+    ) -> Result<oneshot::Receiver<Result<i64>>> {
         // Routed, not `prefix_of` (#175): a compacted topic's batches buffer —
         // and flush — under its dedicated prefix. This is where the `#113` memo
         // is first consulted when the flag is on (`produce`'s eligibility gate
@@ -302,9 +309,7 @@ impl DynoStore {
             Action::Wait => {}
         }
 
-        offset
-            .await
-            .map_err(|_| Error::Api(ErrorCode::UnknownServerError))?
+        Ok(offset)
     }
 
     /// Flush a drained prefix buffer as one shared segment object and resolve

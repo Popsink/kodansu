@@ -335,6 +335,22 @@ fmt:
 # inside the test body it would have cost the tenth of a point this ceiling does
 # not have.
 #
+#   #588  +1074 lines, pipelined produce 3177 -> 3174  2.95471667 -> 2.92281342
+#
+# #588 lets one connection pipeline its idempotent produces, so a producer's
+# five in-flight requests share one coalescing window instead of taking one
+# each. The +1074 is the connection loop split into a reader and an ordered
+# answerer, `Storage::admit` threaded through the engine and its wrappers, and
+# three suites: the loop's own, the engine's failed-window hazard, and a broker
+# run over a socket. The numerator fell by three: one uncited block narrated
+# the `info_span!` beneath it and went, and every new `//` block cites the
+# issue whose decision it records — #588 for the loop's ordering, #89 for why
+# an admitted produce is never cancelled, #440 for `acks=0`. It sat at
+# 2.92459089 until the loop's two "read the next request" channels became one
+# `Notify`: twelve lines of code went and no narration with them, which is the
+# deletion this ratio rises on. `--pipeline-depth` then added 78 lines and no
+# `//` at all — its reasoning is the `///` on `TcpContext::PIPELINE_DEPTH`.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -344,7 +360,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.9548" top="12":
+comments ceiling="2.9229" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

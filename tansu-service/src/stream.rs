@@ -16,9 +16,11 @@
 use std::{
     error::{self},
     fmt::Debug,
+    future::Future,
     io,
     marker::PhantomData,
     net::SocketAddr,
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -27,18 +29,20 @@ use std::{
 };
 
 use bytes::Bytes;
+use futures::{StreamExt as _, stream::FuturesOrdered};
 use nanoid::nanoid;
 use opentelemetry::KeyValue;
 use rama::{Context, Layer, Service};
-use tansu_sans_io::RootMessageMeta;
+use tansu_sans_io::{ApiKey as _, ProduceRequest, RootMessageMeta};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufWriter},
     net::{TcpListener, TcpStream},
+    sync::{Notify, Semaphore, SemaphorePermit, mpsc},
     task::JoinSet,
     time::sleep,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, instrument, warn};
+use tracing::{Instrument as _, debug, error, info_span, instrument, warn};
 
 use crate::{
     BYTES_RECEIVED, BYTES_SENT, Classify, Error, REQUEST_DURATION, REQUEST_SIZE,
@@ -130,8 +134,11 @@ impl Throttle {
 /// on at the bottom, by the loop that writes frames. Nothing in between has any
 /// business carrying it.
 ///
-/// Set per request and taken exactly once, by the same sequential loop, so
-/// there is no window in which it could leak into the next request.
+/// One per request, and taken exactly once, when that request's answer is
+/// due. It used to be one per connection, which was sound only while the loop
+/// served one request at a time; with produces pipelined (#588) a cell shared
+/// between requests in flight together would silence whichever was answered
+/// next.
 #[derive(Clone, Debug, Default)]
 pub struct NoResponse(Arc<AtomicBool>);
 
@@ -141,12 +148,60 @@ impl NoResponse {
         self.0.store(true, Ordering::Release);
     }
 
-    /// Whether the request just served asked for silence, clearing it for the
-    /// next one.
+    /// Whether the request asked for silence.
     fn take(&self) -> bool {
         self.0.swap(false, Ordering::AcqRel)
     }
 }
+
+/// That a request has nothing left to admit, so the next one may be read
+/// (#588).
+///
+/// A connection used to read a request, wait for its answer, write it, and only
+/// then read the next. For a produce, the answer waits on the coalescing window
+/// and its segment PUT — so a producer's later requests sat unread in the
+/// socket, and a window never held more than one request from any connection.
+/// For a prefix with one writer, which is the common case, the linger was then
+/// pure latency: there was never a second request to coalesce with.
+///
+/// One per request, in that request's context. Whoever knows the request is
+/// admitted says so — for a produce, once every batch is in its window — and
+/// the next frame is read without waiting for the answer. The answers are still
+/// written in request order, because a Kafka client matches each one to its
+/// oldest request in flight.
+///
+/// Signalling is a promise about **order**, not durability: nothing the next
+/// request does may overtake this one. A request nobody signals for is
+/// answered before the next is read, as every request used to be — its answer
+/// is the other thing that fires this.
+#[derive(Clone, Debug, Default)]
+pub struct Admission(Arc<Notify>);
+
+impl Admission {
+    /// This request is admitted: the next may be read.
+    pub fn admitted(&self) {
+        self.0.notify_one();
+    }
+
+    /// Until the request is admitted or answered, whichever comes first. A
+    /// signal sent before this is awaited is kept, not lost.
+    async fn wait(&self) {
+        self.0.notified().await
+    }
+}
+
+/// A request read and not yet answered, apart from the answer itself.
+struct Owed<'a> {
+    /// From the frame read to its answer written (#362).
+    _in_flight: InFlight,
+    _slot: SemaphorePermit<'a>,
+    attributes: Vec<KeyValue>,
+    no_response: NoResponse,
+    admission: Admission,
+}
+
+/// What a request owes its client, still being worked out.
+type Answer<'a, E> = Pin<Box<dyn Future<Output = Result<Bytes, E>> + Send + 'a>>;
 
 /// The address of the connected peer, put into the service [`Context`] by
 /// whoever accepted the connection.
@@ -319,6 +374,11 @@ pub struct TcpContext {
     /// The default is a token nothing cancels, so a stack built without one
     /// serves connections until the client goes away, as before.
     drain: CancellationToken,
+
+    /// How many requests one connection may have read and not yet answered
+    /// (#588): [`Self::PIPELINE_DEPTH`] unless an operator lowers it, and `1`
+    /// is pipelining turned off.
+    pipeline_depth: usize,
 }
 
 /// Armed, unlike every `Option` beside it.
@@ -338,6 +398,7 @@ impl Default for TcpContext {
             cluster_id: None,
             maximum_frame_size: Some(Self::MAXIMUM_FRAME_SIZE),
             drain: CancellationToken::default(),
+            pipeline_depth: Self::PIPELINE_DEPTH,
         }
     }
 }
@@ -350,6 +411,26 @@ impl TcpContext {
     /// deployment that raises it past this has to raise this too — hence
     /// `--socket-request-max-bytes`.
     pub const MAXIMUM_FRAME_SIZE: usize = 100 * 1024 * 1024;
+
+    /// The most requests one connection may have read and not yet answered
+    /// (#588), and the default.
+    ///
+    /// Kafka's own `max.in.flight.requests.per.connection` default, and the
+    /// most an idempotent producer may set — Java and librdkafka both refuse
+    /// more with `enable.idempotence` on. Only idempotent produces are
+    /// pipelined, so no request this broker would pipeline ever arrives behind
+    /// more than this many others, and a deeper pipeline would hold memory
+    /// nothing uses: each slot is a whole request, up to
+    /// `socket.request.max.bytes`.
+    ///
+    /// It is also `IDEMPOTENT_WINDOW` in `tansu-storage`: the five batches per
+    /// producer the duplicate check remembers. Kafka caps the client at five
+    /// for that reason — a batch it resends is still in the window — so the two
+    /// numbers move together or not at all.
+    ///
+    /// A client configured for more is not refused: its next request waits in
+    /// the socket until an answer frees a slot.
+    pub const PIPELINE_DEPTH: usize = 5;
 
     pub fn cluster_id(self, cluster_id: Option<String>) -> Self {
         Self { cluster_id, ..self }
@@ -365,6 +446,16 @@ impl TcpContext {
     /// Watch `drain` for this process being asked to stop (#361).
     pub fn drain(self, drain: CancellationToken) -> Self {
         Self { drain, ..self }
+    }
+
+    /// Read at most `pipeline_depth` requests ahead of their answers (#588),
+    /// held to `1..=`[`Self::PIPELINE_DEPTH`]: `1` turns pipelining off, and
+    /// above the most an idempotent producer may send there is nothing to hold.
+    pub fn pipeline_depth(self, pipeline_depth: usize) -> Self {
+        Self {
+            pipeline_depth: pipeline_depth.clamp(1, Self::PIPELINE_DEPTH),
+            ..self
+        }
     }
 }
 
@@ -706,61 +797,6 @@ where
 
         written.map_err(Into::into)
     }
-
-    /// Everything a request owes its caller once its first four bytes have
-    /// been read: the body, the answer, and the answer written back.
-    ///
-    /// Split from the wait above it so the drain has somewhere to interrupt
-    /// that is not *inside* a request (#361).
-    #[instrument(skip_all, fields(id = nanoid!()))]
-    async fn answer<R>(
-        &self,
-        req: &mut R,
-        size: [u8; 4],
-        attributes: &[KeyValue],
-        ctx: Context<TcpContext>,
-    ) -> Result<(), S::Error>
-    where
-        R: AsyncReadExt + AsyncWriteExt + Unpin,
-    {
-        // From here to the response written: the span over which this replica
-        // owes the client something, which is what "in flight" has to mean for
-        // the difference against `tansu_requests_parked` to be work (#362).
-        let _in_flight = InFlight::enter();
-
-        let no_response = ctx.get::<NoResponse>().cloned();
-
-        let request = self.read(req, size).await?;
-
-        // Per-API, not just per-connection (#410). `tansu_api_requests` has
-        // carried `api_key` all along and the histograms had not, so there was
-        // no per-API latency or size series at all — and a fleet where one API
-        // is 20% of its traffic could not say what answering it costs.
-        //
-        // Derived here rather than in `process`, which is where #410 put it:
-        // `write` is called with what this function holds, so
-        // `tansu_response_size` and `tansu_response_write_duration` were left
-        // labelled `cluster_id` alone (#539).
-        let attributes = {
-            let mut attributes = attributes.to_vec();
-            attributes.push(KeyValue::new("api_key", frame_api_key(&request)));
-            attributes
-        };
-        let attributes = attributes.as_slice();
-
-        let response = self.process(attributes, ctx, request).await?;
-
-        // `Produce` with `acks=0` is answered with silence, because that is what
-        // the protocol says and what the client is built for — see
-        // [`NoResponse`]. The work still happened and is still counted; only the
-        // frame is withheld.
-        if no_response.is_some_and(|no_response| no_response.take()) {
-            debug!("acks=0: the request is served and gets no response");
-            return Ok(());
-        }
-
-        self.write(req, response, attributes).await
-    }
 }
 
 impl<S, State, Stream> Service<TcpContext, Stream> for TcpBytesService<S, State>
@@ -778,7 +814,7 @@ where
     async fn serve(
         &self,
         ctx: Context<TcpContext>,
-        mut req: Stream,
+        req: Stream,
     ) -> Result<Self::Response, Self::Error> {
         let attributes = {
             let state = ctx.state();
@@ -794,77 +830,219 @@ where
 
         let maximum_frame_size = ctx.state().maximum_frame_size;
         let drain = ctx.state().drain.clone();
+        let depth = ctx.state().pipeline_depth;
 
         // One cell for the life of the connection, and the same one every
         // request writes into: the quota layer above finds it in the context,
-        // and this loop drains it below (#384).
+        // and the reader below drains it before its next read (#384). Shared
+        // rather than per request even with produces pipelined (#588), because
+        // what it owes is the *connection's* silence: the longest delay any
+        // answered request asked for, taken before the next frame is read.
         let throttle = Throttle::default();
-
-        // Likewise one cell for the life of the connection, taken by `answer`
-        // after each request: the loop is sequential, so a value set while
-        // serving request N is always consumed by request N (#440).
-        let no_response = NoResponse::default();
 
         let ctx = {
             let mut ctx = ctx;
             _ = ctx.insert(throttle.clone());
-            _ = ctx.insert(no_response);
             ctx
         };
 
-        loop {
-            // The only place a connection may be ended by the drain: between
-            // requests, with nothing owed to the client. `biased` so the drain
-            // wins over a frame that has already arrived — that request is
-            // retried on a connection to a replica that is staying, where a
-            // cut mid-request could not be (#361).
-            let size = tokio::select! {
-                biased;
+        // Two halves, so a request can be read while an earlier one is still
+        // being answered (#588). One task drives both, so nothing here outlives
+        // the connection or needs to be `'static`.
+        let slots = Semaphore::new(depth);
+        let (mut reader, mut writer) = tokio::io::split(req);
+        let (owe, mut owed) = mpsc::channel::<(Owed<'_>, Answer<'_, S::Error>)>(depth);
 
-                () = drain.cancelled() => {
-                    debug!("closing an idle connection: this replica is stopping");
-                    return Ok(());
-                }
+        // Cancelled by the answering half when it can no longer answer, so the
+        // reading half stops reading requests nobody will answer (#588).
+        let stop = CancellationToken::new();
 
-                size = self.wait(&mut req, maximum_frame_size) => size?,
-            };
+        let reading = async {
+            // Owned, so it is dropped when reading ends: that is what tells
+            // the answering half nothing more is coming (#588).
+            let owe = owe;
 
-            self.answer(&mut req, size, &attributes[..], ctx.clone())
-                .await?;
-
-            // The response is already written, and this request is no longer in
-            // flight — `answer` dropped its guard on the way out. What is left
-            // is the mute, and it happens here, where no counter and no
-            // histogram is watching (#384).
-            //
-            // Deliberately *not* wrapped in `Parked` either: parked is
-            // subtracted from in flight to get the fleet's `busy`, and counting
-            // a wait that was never counted as in flight would push that
-            // expression negative. The wait shows up in `tansu_throttled_time`
-            // and nowhere else.
-            let delay = throttle.take();
-
-            if !delay.is_zero() {
-                debug!(?delay, "muting a connection over its quota");
-
-                THROTTLED_REQUESTS.add(1, &attributes[..]);
-                THROTTLED_TIME.add(delay.as_millis() as u64, &attributes[..]);
-
-                // The drain still wins: a replica that has been asked to stop
-                // must not hold a muted connection open for the throttle before
-                // noticing (#361).
-                tokio::select! {
+            loop {
+                // Where a connection may be ended by the drain: between
+                // requests. `biased` so the drain wins over a frame that has
+                // already arrived — that request is retried on a connection to
+                // a replica that is staying, where a cut mid-request could not
+                // be (#361). Whatever has already been read is still answered:
+                // the answering half runs until everything owed is written.
+                let size = tokio::select! {
                     biased;
 
                     () = drain.cancelled() => {
-                        debug!("closing a throttled connection: this replica is stopping");
+                        debug!("closing an idle connection: this replica is stopping");
                         return Ok(());
                     }
 
-                    () = sleep(delay) => {}
+                    size = self.wait(&mut reader, maximum_frame_size) => size?,
+                };
+
+                // Before the body is read, so what a connection holds is
+                // bounded by the slots and not by them plus one (#588).
+                let Ok(slot) = slots.acquire().await else {
+                    return Ok(());
+                };
+
+                let request = self.read(&mut reader, size).await?;
+
+                // Per-API, not just per-connection (#410), and derived here so
+                // the response histograms carry it too (#539).
+                let api_key = frame_api_key(&request);
+                let labels = {
+                    let mut labels = attributes.clone();
+                    labels.push(KeyValue::new("api_key", api_key));
+                    labels
+                };
+
+                // Anything but a produce is a barrier (#588): it is served only
+                // once everything before it is answered, so every other API
+                // sees exactly the connection it saw before pipelining — a
+                // `Fetch` or an `EndTxn` behind a produce sees it acknowledged.
+                if api_key != i64::from(ProduceRequest::KEY) {
+                    _ = slots.acquire_many(depth as u32 - 1).await;
+                }
+
+                // From here to the response written: the span over which this
+                // replica owes the client something, which is what "in flight"
+                // has to mean for the difference against
+                // `tansu_requests_parked` to be work (#362). After the barrier,
+                // because a request waiting on it is not being served (#588).
+                let in_flight = InFlight::enter();
+
+                let no_response = NoResponse::default();
+                let admission = Admission::default();
+
+                let mut ctx = ctx.clone();
+                _ = ctx.insert(no_response.clone());
+                _ = ctx.insert(admission.clone());
+
+                let answer: Answer<'_, S::Error> = {
+                    let labels = labels.clone();
+                    Box::pin(
+                        async move { self.process(&labels, ctx, request).await }
+                            .instrument(info_span!("answer", id = nanoid!())),
+                    )
+                };
+
+                let owing = Owed {
+                    _in_flight: in_flight,
+                    _slot: slot,
+                    attributes: labels,
+                    no_response,
+                    admission: admission.clone(),
+                };
+
+                if owe.send((owing, answer)).await.is_err() {
+                    return Ok(());
+                }
+
+                // The next frame is read once this request is admitted, or
+                // once it is answered — whichever comes first. A request that
+                // never signals admission is answered first, which is every
+                // request but a pipelined produce (#588).
+                admission.wait().await;
+
+                // The mute happens here, before the next read, where no counter
+                // and no histogram is watching (#384).
+                //
+                // Deliberately *not* wrapped in `Parked` either: parked is
+                // subtracted from in flight to get the fleet's `busy`, and
+                // counting a wait that was never counted as in flight would
+                // push that expression negative. The wait shows up in
+                // `tansu_throttled_time` and nowhere else.
+                let delay = throttle.take();
+
+                if !delay.is_zero() {
+                    debug!(?delay, "muting a connection over its quota");
+
+                    THROTTLED_REQUESTS.add(1, &attributes[..]);
+                    THROTTLED_TIME.add(delay.as_millis() as u64, &attributes[..]);
+
+                    // The drain still wins: a replica that has been asked to
+                    // stop must not hold a muted connection open for the
+                    // throttle before noticing (#361).
+                    tokio::select! {
+                        biased;
+
+                        () = drain.cancelled() => {
+                            debug!("closing a throttled connection: this replica is stopping");
+                            return Ok(());
+                        }
+
+                        () = sleep(delay) => {}
+                    }
                 }
             }
-        }
+        };
+
+        let reading = async { stop.run_until_cancelled(reading).await.unwrap_or(Ok(())) };
+
+        let answering = async {
+            let mut answers = FuturesOrdered::new();
+            let mut open = true;
+            let mut failed = None;
+
+            loop {
+                tokio::select! {
+                    next = owed.recv(), if open && failed.is_none() => match next {
+                        Some((owing, answer)) => {
+                            answers.push_back(async move { (owing, answer.await) })
+                        }
+
+                        None => open = false,
+                    },
+
+                    // In request order, however they complete: a Kafka client
+                    // matches each answer to its oldest request in flight (#588).
+                    Some((owing, answer)) = answers.next(), if !answers.is_empty() => {
+                        // Once one answer cannot be written, none after it
+                        // can be: the client would match them to the wrong
+                        // requests. They are still run to the end rather than
+                        // dropped — a produce may be the one flushing its
+                        // window, and cancelling a segment PUT mid-flight is
+                        // the ambiguous create the flush exists to avoid (#89).
+                        if failed.is_none() {
+                            let written = match answer {
+                                // `Produce` with `acks=0` is answered with
+                                // silence, because that is what the protocol
+                                // says and what the client is built for — see
+                                // [`NoResponse`] (#440). The work still happened
+                                // and is still counted; only the frame is withheld.
+                                Ok(_) if owing.no_response.take() => {
+                                    debug!("acks=0: the request is served and gets no response");
+                                    Ok(())
+                                }
+
+                                Ok(frame) => self.write(&mut writer, frame, &owing.attributes).await,
+
+                                // Deliberately not logged here: it ends the
+                                // connection, and the boundary that ends it
+                                // logs it (#289).
+                                Err(error) => Err(error),
+                            };
+
+                            if let Err(error) = written {
+                                failed = Some(error);
+                                stop.cancel();
+                            }
+                        }
+
+                        owing.admission.admitted();
+                    }
+
+                    else => break,
+                }
+            }
+
+            failed.map_or(Ok(()), Err)
+        };
+
+        let (read, answered) = tokio::join!(reading, answering);
+
+        answered.and(read)
     }
 }
 
@@ -914,6 +1092,7 @@ where
 mod tests {
     use std::{
         pin::Pin,
+        sync::Mutex,
         task::{Context as TaskContext, Poll},
     };
 
@@ -1421,5 +1600,455 @@ mod tests {
 
         drop(client);
         _ = connection.await;
+    }
+
+    /// A frame the loop takes for a `Produce` — the API key at the head of
+    /// the header — followed by an id the fake service below reads back.
+    fn produce(id: u8) -> Vec<u8> {
+        frame(&[0, 0, id])
+    }
+
+    /// A frame the loop takes for a `Metadata`: anything but a produce.
+    fn metadata(id: u8) -> Vec<u8> {
+        frame(&[0, 3, id])
+    }
+
+    /// A produce path the tests can hold open (#588).
+    ///
+    /// A produce is admitted and then waits for `gate` before it is answered,
+    /// which is a coalescing window that has not flushed yet. Once the gate
+    /// opens, the higher the id the sooner it completes, so answers written in
+    /// completion order would come out backwards. Anything that is not a
+    /// produce is answered at once, recording how many produces were still
+    /// outstanding when it was served.
+    #[derive(Clone, Debug)]
+    struct Pipelined {
+        log: Arc<Mutex<Vec<(&'static str, u8)>>>,
+        gate: Arc<tokio::sync::watch::Sender<bool>>,
+        outstanding: Arc<AtomicU64>,
+        slow_admission: Option<(u8, Duration)>,
+        fails: Option<u8>,
+    }
+
+    impl Pipelined {
+        fn new() -> Self {
+            Self {
+                log: Arc::default(),
+                gate: Arc::new(tokio::sync::watch::channel(false).0),
+                outstanding: Arc::default(),
+                slow_admission: None,
+                fails: None,
+            }
+        }
+
+        fn note(&self, event: &'static str, id: u8) {
+            self.log.lock().expect("log").push((event, id));
+        }
+
+        fn noted(&self, event: &'static str) -> Vec<u8> {
+            self.log
+                .lock()
+                .expect("log")
+                .iter()
+                .filter(|(noted, _)| *noted == event)
+                .map(|(_, id)| *id)
+                .collect()
+        }
+
+        fn open(&self) {
+            _ = self.gate.send_replace(true);
+        }
+
+        /// Wait for `event` to have been noted `count` times. Under a paused
+        /// clock the timeout fires only once nothing else can run, so missing
+        /// it means the loop never got there, not that it was slow.
+        async fn until(&self, event: &'static str, count: usize) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while self.noted(event).len() < count {
+                    sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{event} noted {:?}, expected {count}", self.noted(event)));
+        }
+    }
+
+    impl Service<(), Bytes> for Pipelined {
+        type Response = Bytes;
+        type Error = Error;
+
+        async fn serve(&self, ctx: Context<()>, req: Bytes) -> Result<Bytes, Error> {
+            let id = req[6];
+            self.note("started", id);
+
+            if req[4..6] != [0, 0] {
+                let outstanding = self.outstanding.load(Ordering::Acquire) as u8;
+                self.note("outstanding when served", outstanding);
+                return Ok(req);
+            }
+
+            if let Some((slow, delay)) = self.slow_admission
+                && slow == id
+            {
+                sleep(delay).await;
+            }
+
+            _ = self.outstanding.fetch_add(1, Ordering::AcqRel);
+            self.note("admitted", id);
+            ctx.get::<Admission>().expect("an admission").admitted();
+
+            if self.fails == Some(id) {
+                _ = self.outstanding.fetch_sub(1, Ordering::AcqRel);
+                return Err(Error::Message(format!("request {id} fails")));
+            }
+
+            _ = self.gate.subscribe().wait_for(|open| *open).await;
+            sleep(Duration::from_millis(u64::from(10 - id))).await;
+
+            _ = self.outstanding.fetch_sub(1, Ordering::AcqRel);
+            self.note("completed", id);
+
+            Ok(req)
+        }
+    }
+
+    fn connect(
+        inner: Pipelined,
+        context: TcpContext,
+    ) -> (
+        tokio::io::DuplexStream,
+        tokio::task::JoinHandle<Result<(), Error>>,
+    ) {
+        let service: TcpBytesService<Pipelined, ()> = TcpBytesService {
+            inner,
+            _state: PhantomData,
+        };
+
+        let (client, server) = tokio::io::duplex(4096);
+
+        let connection =
+            tokio::spawn(async move { service.serve(Context::with_state(context), server).await });
+
+        (client, connection)
+    }
+
+    async fn answered(client: &mut tokio::io::DuplexStream, expected: Vec<u8>) {
+        let mut response = vec![0u8; expected.len()];
+        _ = client.read_exact(&mut response).await.expect("a response");
+        assert_eq!(expected, response);
+    }
+
+    /// **The defect #588 is about: one produce per window per connection.**
+    ///
+    /// Five produces are sent and the first is held, as a window that has not
+    /// flushed holds it. The loop that waited for an answer before reading the
+    /// next request admits one and stops, so all five being admitted at once is
+    /// the assertion. They then complete backwards, and are answered forwards,
+    /// because a Kafka client matches each answer to its oldest request.
+    #[tokio::test(start_paused = true)]
+    async fn admitted_produces_are_read_ahead_and_answered_in_order() {
+        let inner = Pipelined::new();
+        let (mut client, connection) = connect(inner.clone(), TcpContext::default());
+
+        for id in 1..=5 {
+            client.write_all(&produce(id)).await.expect("request");
+        }
+
+        inner.until("admitted", 5).await;
+        assert_eq!(vec![1, 2, 3, 4, 5], inner.noted("admitted"));
+        assert!(inner.noted("completed").is_empty());
+
+        inner.open();
+
+        for id in 1..=5 {
+            answered(&mut client, produce(id)).await;
+        }
+
+        assert_eq!(vec![5, 4, 3, 2, 1], inner.noted("completed"));
+
+        drop(client);
+        _ = connection.await;
+    }
+
+    /// **Ordered admission: the next request is not even started until this
+    /// one is admitted** (#588).
+    ///
+    /// The storage engine can await a metadata read before it buffers a batch
+    /// (`routed_substream_of`), so two produces admitted concurrently could
+    /// buffer in either order — and buffer order is offset order. Request 1 is
+    /// slow to admit here; were request 2 started before request 1 had been
+    /// admitted, it would be admitted first and take the lower offset.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_admission_is_not_overtaken() {
+        let inner = Pipelined {
+            slow_admission: Some((1, Duration::from_millis(100))),
+            ..Pipelined::new()
+        };
+        inner.open();
+
+        let (mut client, connection) = connect(inner.clone(), TcpContext::default());
+
+        client.write_all(&produce(1)).await.expect("request");
+        client.write_all(&produce(2)).await.expect("request");
+
+        answered(&mut client, produce(1)).await;
+        answered(&mut client, produce(2)).await;
+
+        assert_eq!(
+            vec![
+                ("started", 1),
+                ("admitted", 1),
+                ("started", 2),
+                ("admitted", 2)
+            ],
+            inner
+                .log
+                .lock()
+                .expect("log")
+                .iter()
+                .filter(|(event, _)| *event != "completed")
+                .copied()
+                .collect::<Vec<_>>(),
+        );
+
+        drop(client);
+        _ = connection.await;
+    }
+
+    /// **Anything but a produce is a barrier** (#588): it is not served while a
+    /// produce read before it is unanswered, so a `Fetch` or `EndTxn` behind a
+    /// produce sees exactly what it saw before pipelining.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_that_is_not_a_produce_waits_for_every_produce_before_it() {
+        let inner = Pipelined::new();
+        let (mut client, connection) = connect(inner.clone(), TcpContext::default());
+
+        client.write_all(&produce(1)).await.expect("request");
+        client.write_all(&produce(2)).await.expect("request");
+        client.write_all(&metadata(3)).await.expect("request");
+
+        inner.until("admitted", 2).await;
+        sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            !inner.noted("started").contains(&3),
+            "served behind produces still in flight",
+        );
+
+        inner.open();
+
+        answered(&mut client, produce(1)).await;
+        answered(&mut client, produce(2)).await;
+        answered(&mut client, metadata(3)).await;
+
+        assert_eq!(vec![0], inner.noted("outstanding when served"));
+
+        drop(client);
+        _ = connection.await;
+    }
+
+    /// The broker bounds what one connection holds, whatever the client's
+    /// `max.in.flight` (#588): past [`TcpContext::PIPELINE_DEPTH`], the next request waits
+    /// in the socket until an answer frees a slot.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_holds_at_most_the_pipeline_depth() {
+        let inner = Pipelined::new();
+        let (mut client, connection) = connect(inner.clone(), TcpContext::default());
+
+        for id in 1..=7 {
+            client.write_all(&produce(id)).await.expect("request");
+        }
+
+        inner.until("admitted", TcpContext::PIPELINE_DEPTH).await;
+        sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(TcpContext::PIPELINE_DEPTH, inner.noted("admitted").len());
+
+        inner.open();
+
+        for id in 1..=7 {
+            answered(&mut client, produce(id)).await;
+        }
+
+        drop(client);
+        _ = connection.await;
+    }
+
+    /// A drain ends a connection with nothing owed (#361), and with produces
+    /// pipelined that means every one already read is answered first (#588).
+    #[tokio::test(start_paused = true)]
+    async fn a_drain_answers_everything_already_read() {
+        let drain = CancellationToken::new();
+        let inner = Pipelined::new();
+        let (mut client, connection) =
+            connect(inner.clone(), TcpContext::default().drain(drain.clone()));
+
+        for id in 1..=3 {
+            client.write_all(&produce(id)).await.expect("request");
+        }
+
+        inner.until("admitted", 3).await;
+
+        drain.cancel();
+        inner.open();
+
+        for id in 1..=3 {
+            answered(&mut client, produce(id)).await;
+        }
+
+        let mut trailing = [0u8; 1];
+        assert_eq!(
+            0,
+            client.read(&mut trailing).await.expect("a close"),
+            "the drain closes the connection once nothing is owed",
+        );
+
+        assert!(connection.await.expect("joined").is_ok());
+    }
+
+    /// **An answer that fails does not cancel the requests behind it** (#588).
+    ///
+    /// The connection ends — an answer after the failed one would be matched
+    /// to the wrong request — but a produce already admitted runs to the end.
+    /// It may be the one flushing its window, and cancelling a segment PUT
+    /// mid-flight is the ambiguous create the flush exists to resolve.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_answer_drains_the_requests_behind_it() {
+        let inner = Pipelined {
+            fails: Some(2),
+            ..Pipelined::new()
+        };
+        let (mut client, connection) = connect(inner.clone(), TcpContext::default());
+
+        for id in 1..=3 {
+            client.write_all(&produce(id)).await.expect("request");
+        }
+
+        inner.until("admitted", 3).await;
+        inner.open();
+
+        answered(&mut client, produce(1)).await;
+
+        let mut trailing = [0u8; 1];
+        assert_eq!(
+            0,
+            client.read(&mut trailing).await.expect("a close"),
+            "nothing is answered after the failure",
+        );
+
+        assert!(connection.await.expect("joined").is_err());
+        assert_eq!(vec![3, 1], inner.noted("completed"));
+    }
+
+    /// **A request waiting on the barrier is not in flight** (#588, #362).
+    ///
+    /// `tansu_requests_in_flight` is what the scaler reads as work. A
+    /// `Metadata` queued behind two produces held in their window is waiting,
+    /// not being served, so the gauge says two — the produces — and not three.
+    #[tokio::test(start_paused = true)]
+    async fn a_request_waiting_on_the_barrier_is_not_in_flight() {
+        let exporter = InMemoryMetricExporterBuilder::new()
+            .with_temporality(Temporality::Cumulative)
+            .build();
+
+        let provider = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(exporter.clone()).build())
+            .build();
+
+        global::set_meter_provider(provider.clone());
+
+        let in_flight = || {
+            provider.force_flush().expect("flush");
+
+            exporter
+                .get_finished_metrics()
+                .expect("metrics")
+                .iter()
+                .flat_map(|resource| {
+                    resource
+                        .scope_metrics()
+                        .flat_map(|scope| scope.metrics())
+                        .filter(|metric| metric.name() == "tansu_requests_in_flight")
+                        .filter_map(|metric| match metric.data() {
+                            AggregatedMetrics::I64(MetricData::Sum(sum)) => {
+                                Some(sum.data_points().map(|point| point.value()).sum::<i64>())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .next_back()
+                .unwrap_or_default()
+        };
+
+        let inner = Pipelined::new();
+        let (mut client, connection) = connect(inner.clone(), TcpContext::default());
+
+        client.write_all(&produce(1)).await.expect("request");
+        client.write_all(&produce(2)).await.expect("request");
+        client.write_all(&metadata(3)).await.expect("request");
+
+        inner.until("admitted", 2).await;
+        sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(2, in_flight(), "the request behind the barrier is counted");
+
+        inner.open();
+
+        answered(&mut client, produce(1)).await;
+        answered(&mut client, produce(2)).await;
+        answered(&mut client, metadata(3)).await;
+
+        assert_eq!(0, in_flight());
+
+        drop(client);
+        _ = connection.await;
+    }
+
+    /// **A depth of one is pipelining turned off** (#588): with the first
+    /// produce held in its window, the second is not read, exactly as every
+    /// request was served before.
+    #[tokio::test(start_paused = true)]
+    async fn a_depth_of_one_reads_nothing_ahead() {
+        let inner = Pipelined::new();
+        let (mut client, connection) =
+            connect(inner.clone(), TcpContext::default().pipeline_depth(1));
+
+        for id in 1..=3 {
+            client.write_all(&produce(id)).await.expect("request");
+        }
+
+        inner.until("admitted", 1).await;
+        sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(vec![1], inner.noted("started"), "read ahead at depth one");
+
+        inner.open();
+
+        for id in 1..=3 {
+            answered(&mut client, produce(id)).await;
+        }
+
+        drop(client);
+        _ = connection.await;
+    }
+
+    /// The depth is held to what pipelining can use (#588): zero would read
+    /// nothing at all, and past [`TcpContext::PIPELINE_DEPTH`] no idempotent
+    /// producer could fill it.
+    #[test]
+    fn the_depth_is_held_to_what_pipelining_can_use() {
+        assert_eq!(
+            TcpContext::PIPELINE_DEPTH,
+            TcpContext::default().pipeline_depth
+        );
+
+        for (asked, held) in [(0, 1), (1, 1), (3, 3), (5, 5), (64, 5)] {
+            assert_eq!(
+                held,
+                TcpContext::default().pipeline_depth(asked).pipeline_depth,
+                "asked for {asked}"
+            );
+        }
     }
 }

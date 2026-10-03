@@ -298,8 +298,8 @@ impl Drop for Parked {
 }
 
 pub use stream::{
-    BytesLayer, BytesService, BytesTcpService, NoResponse, Peer, TcpBytesLayer, TcpBytesService,
-    TcpContext, TcpContextLayer, TcpContextService, TcpListenerLayer, Throttle,
+    Admission, BytesLayer, BytesService, BytesTcpService, NoResponse, Peer, TcpBytesLayer,
+    TcpBytesService, TcpContext, TcpContextLayer, TcpContextService, TcpListenerLayer, Throttle,
 };
 
 /// Requests answered with a non-zero `throttle_time_ms` (#384).

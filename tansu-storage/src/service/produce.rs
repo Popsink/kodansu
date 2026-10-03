@@ -14,6 +14,8 @@
 
 use std::{
     collections::BTreeMap,
+    fmt::{self, Debug, Formatter},
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -28,7 +30,7 @@ use tracing::{debug, error, instrument, warn};
 
 use tansu_sans_io::acl::{Operation, Resource};
 
-use crate::{Error, Result, Storage, Topition, authorized, storage_error_code};
+use crate::{Ack, Error, Result, Storage, Topition, authorized, storage_error_code};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`ProduceRequest`] returning [`ProduceResponse`].
 /// ```
@@ -150,6 +152,50 @@ impl ApiKey for ProduceService {
     const KEY: i16 = ProduceRequest::KEY;
 }
 
+/// Told when a produce request has nothing left to admit (#588).
+///
+/// Found in the request's [`Context`], put there by whoever can use it: the
+/// connection loop reads the next request once this fires, rather than once
+/// this one is acknowledged. Every batch of the request is then in its window,
+/// so a batch the next request carries is written after all of them.
+///
+/// Absent, nothing changes: the request is served exactly as it would be with
+/// the hook, and nobody is told.
+#[derive(Clone)]
+pub struct OnAdmitted(Arc<dyn Fn() + Send + Sync>);
+
+impl OnAdmitted {
+    pub fn new(admitted: impl Fn() + Send + Sync + 'static) -> Self {
+        Self(Arc::new(admitted))
+    }
+
+    fn admitted(&self) {
+        (self.0)()
+    }
+}
+
+impl Debug for OnAdmitted {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct(stringify!(OnAdmitted)).finish()
+    }
+}
+
+/// One partition entry once it has been admitted (#588).
+enum Admitted {
+    /// Nothing left to wait for: refused before reaching storage, or failed
+    /// on the way.
+    Answered(PartitionProduceResponse),
+
+    /// The entry's last batch is in its window, and `ack` resolves when it is
+    /// durable. `base_offset` is the first batch's, when there was more than one.
+    Waiting {
+        tp: Topition,
+        index: i32,
+        base_offset: Option<i64>,
+        ack: Ack,
+    },
+}
+
 impl ProduceService {
     fn error(&self, index: i32, error_code: ErrorCode) -> PartitionProduceResponse {
         PartitionProduceResponse::default()
@@ -163,144 +209,194 @@ impl ProduceService {
             .current_leader(None)
     }
 
+    fn produced(&self, index: i32, base_offset: i64) -> PartitionProduceResponse {
+        PartitionProduceResponse::default()
+            .index(index)
+            .error_code(ErrorCode::None.into())
+            .base_offset(base_offset)
+            .log_append_time_ms(Some(-1))
+            .log_start_offset(Some(0))
+            .record_errors(Some([].into()))
+            .error_message(None)
+            .current_leader(None)
+    }
+
+    /// The answer for a batch storage refused, whether it refused to admit it
+    /// or to acknowledge it.
+    fn failed(&self, tp: &Topition, index: i32, error: Error) -> PartitionProduceResponse {
+        match &error {
+            // Expected idempotent-producer outcomes (a retried batch already
+            // persisted) — routine, not a failure (#37).
+            err if err.is_expected_idempotent_outcome() => {
+                debug!(?err)
+            }
+            storage_api @ Error::Api(_) => {
+                warn!(?storage_api)
+            }
+            otherwise => error!(?otherwise),
+        }
+
+        match error {
+            Error::Api(error_code) => {
+                debug!(?self, ?error_code);
+                self.error(index, error_code)
+            }
+
+            otherwise => {
+                // A transient storage failure (e.g. an S3 error under load) was
+                // previously surfaced as UNKNOWN_SERVER_ERROR (-1), which
+                // clients treat as fatal and drop the whole batch (#6). Map
+                // storage errors to a *retriable* code so clients retry
+                // instead, and log the underlying error with its
+                // topic-partition so it isn't opaque.
+                let error_code = storage_error_code(&otherwise);
+                warn!(?otherwise, ?tp, ?error_code, "produce storage error");
+                self.error(index, error_code)
+            }
+        }
+    }
+
+    /// Admit every batch of one partition entry, leaving the last one's ack
+    /// outstanding.
     #[instrument(skip_all)]
-    async fn partition<G>(
+    async fn admit<G>(
         &self,
         ctx: &Context<G>,
         transaction_id: Option<&str>,
         name: &str,
         partition: PartitionProduceData,
-    ) -> PartitionProduceResponse
+    ) -> Admitted
     where
         G: Storage,
     {
-        if let Some(records) = partition.records {
-            let mut base_offset = None;
+        let Some(records) = partition.records else {
+            return Admitted::Answered(self.error(partition.index, ErrorCode::UnknownServerError));
+        };
 
-            for mut batch in records.batches {
-                let tp = Topition::new(name, partition.index);
+        let mut base_offset = None;
+        let mut batches = records.batches.into_iter().peekable();
 
-                // Refuse a record format this broker does not read, and do it
-                // before the CRC gate below (#320).
-                //
-                // The order is the point. A pre-v2 MessageSet also fails that
-                // gate — its checksum is a CRC-32 over a different range, not
-                // the CRC-32C of a v2 payload — so legacy producers were
-                // already being turned away, but as a side effect, and told
-                // "your CRC is wrong" when the truth is that this broker does
-                // not read their message format. Deciding here makes the
-                // refusal deliberate, and keeps it from moving the next time
-                // the CRC path is touched.
-                //
-                // UNSUPPORTED_FOR_MESSAGE_FORMAT (43) rather than
-                // UNSUPPORTED_VERSION (35): the API version was understood, it
-                // is the record format inside it that is not supported. Kafka
-                // answers 43 for the same reason.
-                if !batch.is_record_batch_v2() {
+        while let Some(mut batch) = batches.next() {
+            let tp = Topition::new(name, partition.index);
+
+            // Refuse a record format this broker does not read, and do it
+            // before the CRC gate below (#320).
+            //
+            // The order is the point. A pre-v2 MessageSet also fails that
+            // gate — its checksum is a CRC-32 over a different range, not
+            // the CRC-32C of a v2 payload — so legacy producers were
+            // already being turned away, but as a side effect, and told
+            // "your CRC is wrong" when the truth is that this broker does
+            // not read their message format. Deciding here makes the
+            // refusal deliberate, and keeps it from moving the next time
+            // the CRC path is touched.
+            //
+            // UNSUPPORTED_FOR_MESSAGE_FORMAT (43) rather than
+            // UNSUPPORTED_VERSION (35): the API version was understood, it
+            // is the record format inside it that is not supported. Kafka
+            // answers 43 for the same reason.
+            if !batch.is_record_batch_v2() {
+                warn!(
+                    ?tp,
+                    magic = batch.magic,
+                    "rejecting a record format this broker does not read"
+                );
+                return Admitted::Answered(
+                    self.error(partition.index, ErrorCode::UnsupportedForMessageFormat),
+                );
+            }
+
+            // Refuse a batch whose CRC does not cover its payload, as
+            // Kafka's LogValidator does, rather than storing it and
+            // discovering the corruption on the read side (#271).
+            //
+            // This has to happen here, and before the LogAppendTime
+            // rewrite below: the decoder logs a mismatch and carries on,
+            // because it is shared with the path that reads bytes back
+            // out of storage — and that rewrite mutates two CRC-covered
+            // timestamps without recomputing the CRC, so a stored batch
+            // legitimately carries a stale one. The reasoning is spelt
+            // out at the mismatch in `deflated::Batch`'s `TryFrom<Bytes>`.
+            match batch.crc_matches() {
+                Ok(true) => (),
+
+                Ok(false) => {
                     warn!(
                         ?tp,
-                        magic = batch.magic,
-                        "rejecting a record format this broker does not read"
+                        crc = batch.crc,
+                        record_count = batch.record_count,
+                        "rejecting a batch whose crc does not match its payload"
                     );
-                    return self.error(partition.index, ErrorCode::UnsupportedForMessageFormat);
+                    return Admitted::Answered(
+                        self.error(partition.index, ErrorCode::CorruptMessage),
+                    );
                 }
 
-                // Refuse a batch whose CRC does not cover its payload, as
-                // Kafka's LogValidator does, rather than storing it and
-                // discovering the corruption on the read side (#271).
-                //
-                // This has to happen here, and before the LogAppendTime
-                // rewrite below: the decoder logs a mismatch and carries on,
-                // because it is shared with the path that reads bytes back
-                // out of storage — and that rewrite mutates two CRC-covered
-                // timestamps without recomputing the CRC, so a stored batch
-                // legitimately carries a stale one. The reasoning is spelt
-                // out at the mismatch in `deflated::Batch`'s `TryFrom<Bytes>`.
-                match batch.crc_matches() {
-                    Ok(true) => (),
-
-                    Ok(false) => {
-                        warn!(
-                            ?tp,
-                            crc = batch.crc,
-                            record_count = batch.record_count,
-                            "rejecting a batch whose crc does not match its payload"
-                        );
-                        return self.error(partition.index, ErrorCode::CorruptMessage);
-                    }
-
-                    // The batch cannot be re-encoded to check it, so it
-                    // cannot be stored either. Same answer.
-                    Err(err) => {
-                        warn!(?err, ?tp, "cannot verify a batch crc");
-                        return self.error(partition.index, ErrorCode::CorruptMessage);
-                    }
-                }
-
-                if BatchAttribute::try_from(batch.attributes)
-                    .map(|attributes| attributes.timestamp == TimestampType::LogAppendTime)
-                    .unwrap_or_default()
-                {
-                    let base_timestamp = SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|duration| duration.as_millis() as i64)
-                        .unwrap_or_default();
-
-                    batch.base_timestamp = base_timestamp;
-                    batch.max_timestamp = base_timestamp;
-                }
-
-                match ctx
-                    .state()
-                    .produce(transaction_id, &tp, batch)
-                    .await
-                    .inspect_err(|err| match err {
-                        // Expected idempotent-producer outcomes (a retried batch
-                        // already persisted) — routine, not a failure (#37).
-                        err if err.is_expected_idempotent_outcome() => {
-                            debug!(?err)
-                        }
-                        storage_api @ Error::Api(_) => {
-                            warn!(?storage_api)
-                        }
-                        otherwise => error!(?otherwise),
-                    }) {
-                    Ok(offset) => _ = base_offset.get_or_insert(offset),
-
-                    Err(Error::Api(error_code)) => {
-                        debug!(?self, ?error_code);
-                        return self.error(partition.index, error_code);
-                    }
-
-                    Err(otherwise) => {
-                        // A transient storage failure (e.g. an S3 error under
-                        // load) was previously surfaced as UNKNOWN_SERVER_ERROR
-                        // (-1), which clients treat as fatal and drop the whole
-                        // batch (#6). Map storage errors to a *retriable* code
-                        // so clients retry instead, and log the underlying error
-                        // with its topic-partition so it isn't opaque.
-                        let error_code = storage_error_code(&otherwise);
-                        warn!(?otherwise, ?tp, ?error_code, "produce storage error");
-                        return self.error(partition.index, error_code);
-                    }
+                // The batch cannot be re-encoded to check it, so it
+                // cannot be stored either. Same answer.
+                Err(err) => {
+                    warn!(?err, ?tp, "cannot verify a batch crc");
+                    return Admitted::Answered(
+                        self.error(partition.index, ErrorCode::CorruptMessage),
+                    );
                 }
             }
 
-            if let Some(base_offset) = base_offset {
-                PartitionProduceResponse::default()
-                    .index(partition.index)
-                    .error_code(ErrorCode::None.into())
-                    .base_offset(base_offset)
-                    .log_append_time_ms(Some(-1))
-                    .log_start_offset(Some(0))
-                    .record_errors(Some([].into()))
-                    .error_message(None)
-                    .current_leader(None)
-            } else {
-                self.error(partition.index, ErrorCode::UnknownServerError)
+            if BatchAttribute::try_from(batch.attributes)
+                .map(|attributes| attributes.timestamp == TimestampType::LogAppendTime)
+                .unwrap_or_default()
+            {
+                let base_timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as i64)
+                    .unwrap_or_default();
+
+                batch.base_timestamp = base_timestamp;
+                batch.max_timestamp = base_timestamp;
             }
-        } else {
-            self.error(partition.index, ErrorCode::UnknownServerError)
+
+            let ack = match ctx.state().admit(transaction_id, &tp, batch).await {
+                Ok(ack) => ack,
+                Err(error) => return Admitted::Answered(self.failed(&tp, partition.index, error)),
+            };
+
+            if batches.peek().is_none() {
+                return Admitted::Waiting {
+                    tp,
+                    index: partition.index,
+                    base_offset,
+                    ack,
+                };
+            }
+
+            // A batch is admitted only once the one before it in the entry is
+            // acknowledged, as it was before #588. Admitted together, a window
+            // that filled between them could fail ahead of one that succeeds,
+            // leaving a gap that nothing rejects for a producer without
+            // sequence numbers.
+            match ack.await {
+                Ok(offset) => _ = base_offset.get_or_insert(offset),
+                Err(error) => return Admitted::Answered(self.failed(&tp, partition.index, error)),
+            }
+        }
+
+        Admitted::Answered(self.error(partition.index, ErrorCode::UnknownServerError))
+    }
+
+    /// Wait for an admitted entry's outstanding ack, if it has one.
+    async fn complete(&self, admitted: Admitted) -> PartitionProduceResponse {
+        match admitted {
+            Admitted::Answered(response) => response,
+
+            Admitted::Waiting {
+                tp,
+                index,
+                base_offset,
+                ack,
+            } => match ack.await {
+                Ok(offset) => self.produced(index, base_offset.unwrap_or(offset)),
+                Err(error) => self.failed(&tp, index, error),
+            },
         }
     }
 
@@ -397,32 +493,65 @@ where
             names.push(topic.name);
         }
 
-        let writes = grouped.into_iter().map(|(topition, entries)| {
+        // Admitted first, acknowledged second (#588). Once every batch of the
+        // request is in its window, `OnAdmitted` says so, and a connection
+        // that pipelines reads its next request — whose batches can then share
+        // the windows this one is waiting on, instead of each request having a
+        // window to itself.
+        let admissions = grouped.into_iter().map(|(topition, entries)| {
             let ctx = &ctx;
 
             async move {
-                let mut written = Vec::with_capacity(entries.len());
+                let mut admitted = Vec::with_capacity(entries.len());
+                let mut entries = entries.into_iter().peekable();
 
-                for (index, position, partition) in entries {
-                    written.push((
-                        index,
-                        position,
-                        self.partition(ctx, transaction_id, topition.topic(), partition)
-                            .await,
-                    ));
+                while let Some((index, position, partition)) = entries.next() {
+                    let entry = self
+                        .admit(ctx, transaction_id, topition.topic(), partition)
+                        .await;
+
+                    // The same topition named twice is two appends to one log,
+                    // so the second waits on the first exactly as the batches
+                    // within one entry do (#439).
+                    let entry = if entries.peek().is_some() {
+                        Admitted::Answered(self.complete(entry).await)
+                    } else {
+                        entry
+                    };
+
+                    admitted.push((index, position, entry));
                 }
 
-                written
+                admitted
             }
         });
 
-        {
-            let mut writes = futures::stream::iter(writes).buffer_unordered(PRODUCE_CONCURRENCY);
+        let mut admitted = Vec::new();
 
-            while let Some(written) = writes.next().await {
-                for (index, position, response) in written {
-                    responses[index][position] = Some(response);
-                }
+        {
+            let mut admissions =
+                futures::stream::iter(admissions).buffer_unordered(PRODUCE_CONCURRENCY);
+
+            while let Some(entries) = admissions.next().await {
+                admitted.extend(entries);
+            }
+        }
+
+        if let Some(on_admitted) = ctx.get::<OnAdmitted>() {
+            on_admitted.admitted();
+        }
+
+        {
+            let mut completions =
+                futures::stream::iter(admitted.into_iter().map(
+                    |(index, position, entry)| async move {
+                        (index, position, self.complete(entry).await)
+                    },
+                ))
+                .buffer_unordered(PRODUCE_CONCURRENCY);
+
+            while let Some((index, position, response)) = completions.next().await {
+                responses[index][position] = Some(response);
             }
         }
 

@@ -127,6 +127,10 @@ pub(super) struct Arg {
     #[arg(long, env = "SOCKET_REQUEST_MAX_BYTES", value_parser = parse_frame_size, default_value_t = SOCKET_REQUEST_MAX_BYTES)]
     socket_request_max_bytes: usize,
 
+    /// Requests one connection may have read and not yet answered, 1 to 5. Only an idempotent producer's requests are read ahead, so they share a coalescing window; 1 turns that off, and 5 — the default — is the most an idempotent producer may have in flight.
+    #[arg(long, env = "PIPELINE_DEPTH", value_parser = clap::value_parser!(u8).range(1..=5), default_value_t = 5)]
+    pipeline_depth: u8,
+
     /// Silent
     #[arg(long)]
     silent: bool,
@@ -309,6 +313,7 @@ impl Arg {
             .maximum_frame_size(
                 (self.socket_request_max_bytes > 0).then_some(self.socket_request_max_bytes),
             )
+            .pipeline_depth(usize::from(self.pipeline_depth))
             .silent(self.silent);
 
         if !self.silent {
@@ -387,6 +392,28 @@ mod tests {
                 .expect("no arguments")
                 .socket_request_max_bytes,
         );
+    }
+
+    /// A broker started with no flag pipelines as deep as an idempotent producer
+    /// can send, and the flag refuses what the connection loop would only clamp
+    /// (#588): an operator asking for 0 or 64 is told so, not quietly given 1 or
+    /// 5.
+    #[test]
+    fn the_pipeline_depth_defaults_to_the_most_and_refuses_the_rest() {
+        let depth = |args: &[&str]| Arg::try_parse_from(args).map(|arg| arg.pipeline_depth);
+
+        assert_eq!(
+            Some(tansu_service::TcpContext::PIPELINE_DEPTH),
+            depth(&["tansu"]).ok().map(usize::from)
+        );
+        assert_eq!(Some(1), depth(&["tansu", "--pipeline-depth", "1"]).ok());
+
+        for refused in ["0", "6"] {
+            assert!(
+                depth(&["tansu", "--pipeline-depth", refused]).is_err(),
+                "--pipeline-depth {refused} was accepted"
+            );
+        }
     }
 
     /// `0` and `unlimited` are how an operator turns the cap off *on purpose* —

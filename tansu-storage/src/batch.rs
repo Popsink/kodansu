@@ -48,7 +48,7 @@ use uuid::Uuid;
 
 use crate::delegate::storage_methods;
 use crate::{
-    AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
+    Ack, AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
     BrokerRegistrationRequest, CommittedOffset, Error, GenerationDoc, ListOffsetResponse, METER,
     MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
     ProducerIdResponse, QuotaAlteration, QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas,
@@ -405,7 +405,35 @@ where
     }
 }
 
-/// One body per method: `produce` batches, the other fifty-one forward.
+/// Admission through the batcher (#588).
+///
+/// With no `maximum_delay` the batcher is a pass-through, and admission goes
+/// straight to the engine underneath — which is every deployment that has not
+/// asked for batching. With one, a batch's place in the write order is not
+/// decided until its ticket is sent, so admitting is producing: the [`Ack`] is
+/// already resolved, and a connection has nothing to pipeline behind it.
+impl<G> ProduceRequestBatcher<G>
+where
+    G: Storage + Clone,
+{
+    async fn batched_admit(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        batch: deflated::Batch,
+    ) -> Result<Ack> {
+        if self.maximum_delay.is_none() {
+            return self.storage.admit(transaction_id, topition, batch).await;
+        }
+
+        let produced = self.batched_produce(transaction_id, topition, batch).await;
+
+        Ok(Box::pin(std::future::ready(produced)))
+    }
+}
+
+/// One body per method: `produce` and `admit` batch, the other fifty-one
+/// forward.
 ///
 /// Invoked in expression position, which `#[async_trait]` can see through —
 /// an item-position call inside the `impl` would still be unexpanded when
@@ -413,6 +441,10 @@ where
 macro_rules! batcher_body {
     ($s:ident, produce, ($($arg:ident),*)) => {{
         $s.batched_produce($($arg),*).await
+    }};
+
+    ($s:ident, admit, ($($arg:ident),*)) => {{
+        $s.batched_admit($($arg),*).await
     }};
 
     ($s:ident, $name:ident, ($($arg:ident),*)) => {{
@@ -423,8 +455,8 @@ macro_rules! batcher_body {
 /// `Storage` for the produce batcher, generated from
 /// [`storage_methods`](crate::delegate::storage_methods).
 ///
-/// Fifty-one of the fifty-two are `self.storage.m(args).await`, written out by
-/// hand until #551.
+/// Fifty-one of the fifty-three are `self.storage.m(args).await`, written out
+/// by hand until #551.
 macro_rules! batcher_delegation {
     (
         $(fn $name:ident(&$s:ident $(, $arg:ident : $ty:ty)* $(,)?) -> $ret:ty;)*

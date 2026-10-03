@@ -56,7 +56,7 @@
 //! method that carries the attribute, and the generated trait method forwards
 //! to it.
 
-/// The fifty-two [`Storage`](crate::Storage) methods, handed to `$expand`.
+/// The fifty-three [`Storage`](crate::Storage) methods, handed to `$expand`.
 ///
 /// The signatures are stated as `fn name(&self, arg: Ty) -> Ret;` — no
 /// `async`, because every expander adds it, and the receiver is a real `self`
@@ -75,6 +75,7 @@ macro_rules! storage_methods {
             fn delete_topic(&self, topic: &TopicId) -> Result<ErrorCode>;
             fn brokers(&self) -> Result<Vec<DescribeClusterBroker>>;
             fn produce(&self, transaction_id: Option<&str>, topition: &Topition, batch: deflated::Batch) -> Result<i64>;
+            fn admit(&self, transaction_id: Option<&str>, topition: &Topition, batch: deflated::Batch) -> Result<Ack>;
             fn fetch(&self, topition: &'_ Topition, offset: i64, min_bytes: u32, max_bytes: u32, isolation: IsolationLevel, max_wait: Duration) -> Result<Vec<deflated::Batch>>;
             fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage>;
             fn offset_stage_at(&self, topition: &Topition, isolation: IsolationLevel) -> Result<OffsetStage>;
