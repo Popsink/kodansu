@@ -1176,7 +1176,8 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
 
     /// Read at most `pipeline_depth` requests on a connection ahead of their
     /// answers (#588); `1` turns pipelining off. See
-    /// [`TcpContext::PIPELINE_DEPTH`] for why the default is also the most.
+    /// [`TcpContext::PIPELINE_DEPTH`] for the default and
+    /// [`TcpContext::MAXIMUM_PIPELINE_DEPTH`] for what raising it costs.
     pub fn pipeline_depth(self, pipeline_depth: usize) -> Self {
         Self {
             pipeline_depth: Some(pipeline_depth),

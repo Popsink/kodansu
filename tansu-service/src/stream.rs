@@ -376,8 +376,8 @@ pub struct TcpContext {
     drain: CancellationToken,
 
     /// How many requests one connection may have read and not yet answered
-    /// (#588): [`Self::PIPELINE_DEPTH`] unless an operator lowers it, and `1`
-    /// is pipelining turned off.
+    /// (#588): [`Self::PIPELINE_DEPTH`] unless an operator changes it, `1` is
+    /// pipelining turned off, and [`Self::MAXIMUM_PIPELINE_DEPTH`] the most.
     pipeline_depth: usize,
 }
 
@@ -412,25 +412,33 @@ impl TcpContext {
     /// `--socket-request-max-bytes`.
     pub const MAXIMUM_FRAME_SIZE: usize = 100 * 1024 * 1024;
 
-    /// The most requests one connection may have read and not yet answered
-    /// (#588), and the default.
+    /// How many requests one connection may have read and not yet answered
+    /// by default (#588).
     ///
     /// Kafka's own `max.in.flight.requests.per.connection` default, and the
     /// most an idempotent producer may set — Java and librdkafka both refuse
-    /// more with `enable.idempotence` on. Only idempotent produces are
-    /// pipelined, so no request this broker would pipeline ever arrives behind
-    /// more than this many others, and a deeper pipeline would hold memory
-    /// nothing uses: each slot is a whole request, up to
-    /// `socket.request.max.bytes`.
+    /// more with `enable.idempotence` on. Every producer can fill five, and
+    /// none needs the broker to hold more before its requests share a window.
     ///
     /// It is also `IDEMPOTENT_WINDOW` in `tansu-storage`: the five batches per
     /// producer the duplicate check remembers. Kafka caps the client at five
     /// for that reason — a batch it resends is still in the window — so the two
-    /// numbers move together or not at all.
+    /// numbers move together or not at all. A deeper pipeline does not touch
+    /// that: no idempotent producer ever has a sixth request to send.
     ///
     /// A client configured for more is not refused: its next request waits in
     /// the socket until an answer frees a slot.
     pub const PIPELINE_DEPTH: usize = 5;
+
+    /// The most an operator may raise [`Self::PIPELINE_DEPTH`] to (#588).
+    ///
+    /// Above five only a producer without idempotence has anything to send —
+    /// a snapshot producer allowed ten requests in flight, say — and what it
+    /// buys is a window that fills: ten requests of `message.max.bytes` 10 MiB
+    /// pass a 64 MiB `coalesce_bytes`, so the window flushes on size instead of
+    /// waiting out its linger. What it costs is memory: each slot is a whole
+    /// request, up to `socket.request.max.bytes`, held per connection.
+    pub const MAXIMUM_PIPELINE_DEPTH: usize = 10;
 
     pub fn cluster_id(self, cluster_id: Option<String>) -> Self {
         Self { cluster_id, ..self }
@@ -449,11 +457,12 @@ impl TcpContext {
     }
 
     /// Read at most `pipeline_depth` requests ahead of their answers (#588),
-    /// held to `1..=`[`Self::PIPELINE_DEPTH`]: `1` turns pipelining off, and
-    /// above the most an idempotent producer may send there is nothing to hold.
+    /// held to `1..=`[`Self::MAXIMUM_PIPELINE_DEPTH`]: `1` turns pipelining
+    /// off, and each slot above it is another whole request a connection may
+    /// hold.
     pub fn pipeline_depth(self, pipeline_depth: usize) -> Self {
         Self {
-            pipeline_depth: pipeline_depth.clamp(1, Self::PIPELINE_DEPTH),
+            pipeline_depth: pipeline_depth.clamp(1, Self::MAXIMUM_PIPELINE_DEPTH),
             ..self
         }
     }
@@ -1703,7 +1712,7 @@ mod tests {
             }
 
             _ = self.gate.subscribe().wait_for(|open| *open).await;
-            sleep(Duration::from_millis(u64::from(10 - id))).await;
+            sleep(Duration::from_millis(u64::from(u8::MAX - id))).await;
 
             _ = self.outstanding.fetch_sub(1, Ordering::AcqRel);
             self.note("completed", id);
@@ -1874,6 +1883,35 @@ mod tests {
         _ = connection.await;
     }
 
+    /// An operator may raise the depth past an idempotent producer's five, up
+    /// to [`TcpContext::MAXIMUM_PIPELINE_DEPTH`] (#588): a snapshot producer
+    /// allowed ten in flight then has all ten read into one window.
+    #[tokio::test(start_paused = true)]
+    async fn a_raised_depth_reads_further_ahead() {
+        let depth = TcpContext::MAXIMUM_PIPELINE_DEPTH;
+        let inner = Pipelined::new();
+        let (mut client, connection) =
+            connect(inner.clone(), TcpContext::default().pipeline_depth(depth));
+
+        for id in 1..=12 {
+            client.write_all(&produce(id)).await.expect("request");
+        }
+
+        inner.until("admitted", depth).await;
+        sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(depth, inner.noted("admitted").len());
+
+        inner.open();
+
+        for id in 1..=12 {
+            answered(&mut client, produce(id)).await;
+        }
+
+        drop(client);
+        _ = connection.await;
+    }
+
     /// A drain ends a connection with nothing owed (#361), and with produces
     /// pipelined that means every one already read is answered first (#588).
     #[tokio::test(start_paused = true)]
@@ -2033,9 +2071,9 @@ mod tests {
         _ = connection.await;
     }
 
-    /// The depth is held to what pipelining can use (#588): zero would read
-    /// nothing at all, and past [`TcpContext::PIPELINE_DEPTH`] no idempotent
-    /// producer could fill it.
+    /// The depth is held to `1..=`[`TcpContext::MAXIMUM_PIPELINE_DEPTH`]
+    /// (#588): zero would read nothing at all, and the ceiling bounds what one
+    /// connection holds.
     #[test]
     fn the_depth_is_held_to_what_pipelining_can_use() {
         assert_eq!(
@@ -2043,7 +2081,7 @@ mod tests {
             TcpContext::default().pipeline_depth
         );
 
-        for (asked, held) in [(0, 1), (1, 1), (3, 3), (5, 5), (64, 5)] {
+        for (asked, held) in [(0, 1), (1, 1), (3, 3), (5, 5), (10, 10), (64, 10)] {
             assert_eq!(
                 held,
                 TcpContext::default().pipeline_depth(asked).pipeline_depth,
