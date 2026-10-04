@@ -127,7 +127,7 @@ pub(super) struct Arg {
     #[arg(long, env = "SOCKET_REQUEST_MAX_BYTES", value_parser = parse_frame_size, default_value_t = SOCKET_REQUEST_MAX_BYTES)]
     socket_request_max_bytes: usize,
 
-    /// Requests one connection may have read and not yet answered, 1 to 5. Only an idempotent producer's requests are read ahead, so they share a coalescing window; 1 turns that off, and 5 — the default — is the most an idempotent producer may have in flight.
+    /// Requests one connection may have read and not yet answered, 1 to 5. A producer's requests (acks=1 or all) are read ahead, so they share a coalescing window; 1 turns that off, and 5 — the default — is the most an idempotent producer may have in flight.
     #[arg(long, env = "PIPELINE_DEPTH", value_parser = clap::value_parser!(u8).range(1..=5), default_value_t = 5)]
     pipeline_depth: u8,
 

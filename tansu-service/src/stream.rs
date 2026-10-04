@@ -417,11 +417,9 @@ impl TcpContext {
     ///
     /// Kafka's own `max.in.flight.requests.per.connection` default, and the
     /// most an idempotent producer may set — Java and librdkafka both refuse
-    /// more with `enable.idempotence` on. Only idempotent produces are
-    /// pipelined, so no request this broker would pipeline ever arrives behind
-    /// more than this many others, and a deeper pipeline would hold memory
-    /// nothing uses: each slot is a whole request, up to
-    /// `socket.request.max.bytes`.
+    /// more with `enable.idempotence` on. A producer without idempotence may
+    /// set more, and is held to this: each slot is a whole request, up to
+    /// `socket.request.max.bytes`, and five is what every producer can fill.
     ///
     /// It is also `IDEMPOTENT_WINDOW` in `tansu-storage`: the five batches per
     /// producer the duplicate check remembers. Kafka caps the client at five
@@ -450,7 +448,7 @@ impl TcpContext {
 
     /// Read at most `pipeline_depth` requests ahead of their answers (#588),
     /// held to `1..=`[`Self::PIPELINE_DEPTH`]: `1` turns pipelining off, and
-    /// above the most an idempotent producer may send there is nothing to hold.
+    /// each slot above it is another whole request a connection may hold.
     pub fn pipeline_depth(self, pipeline_depth: usize) -> Self {
         Self {
             pipeline_depth: pipeline_depth.clamp(1, Self::PIPELINE_DEPTH),
@@ -2033,9 +2031,9 @@ mod tests {
         _ = connection.await;
     }
 
-    /// The depth is held to what pipelining can use (#588): zero would read
-    /// nothing at all, and past [`TcpContext::PIPELINE_DEPTH`] no idempotent
-    /// producer could fill it.
+    /// The depth is held to `1..=`[`TcpContext::PIPELINE_DEPTH`] (#588): zero
+    /// would read nothing at all, and the ceiling bounds what one connection
+    /// holds.
     #[test]
     fn the_depth_is_held_to_what_pipelining_can_use() {
         assert_eq!(

@@ -357,6 +357,13 @@ fmt:
 # from one window register in whatever order they are polled. The one `//`
 # block it added cites #588, so the 26 lines of fix and test lower the ratio.
 #
+#   #588  -10 lines, every produce pipelined 3174 -> 3174  2.92208689 -> 2.92235593
+#
+# The follow-up drops the idempotent-only gate: a client without idempotence
+# that sends a second request before the first is answered is reordered by a
+# failed window whether or not the broker pipelines it. The `idempotent()`
+# filter went and no `//` with it, which is the deletion this ratio rises on.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -366,7 +373,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.9221" top="12":
+comments ceiling="2.9224" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
