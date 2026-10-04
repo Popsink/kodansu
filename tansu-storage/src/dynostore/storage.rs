@@ -316,6 +316,13 @@ impl Storage for DynoStore {
                                                 offset_end,
                                             });
 
+                                            // Both ends, because pipelined acks
+                                            // from one window register in
+                                            // whatever order they are polled:
+                                            // a later batch can land first
+                                            // (#588).
+                                            range.offset_start = range.offset_start.min(offset);
+
                                             if offset_end > range.offset_end {
                                                 range.offset_end = offset_end;
                                             }

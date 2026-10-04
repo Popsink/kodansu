@@ -351,6 +351,12 @@ fmt:
 # deletion this ratio rises on. `--pipeline-depth` then added 78 lines and no
 # `//` at all — its reasoning is the `///` on `TcpContext::PIPELINE_DEPTH`.
 #
+#   #588  +26 lines, transaction range   3174 -> 3174  2.92281342 -> 2.92208689
+#
+# A pipelined transaction's produced range widens at both ends, because acks
+# from one window register in whatever order they are polled. The one `//`
+# block it added cites #588, so the 26 lines of fix and test lower the ratio.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -360,7 +366,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.9229" top="12":
+comments ceiling="2.9221" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
