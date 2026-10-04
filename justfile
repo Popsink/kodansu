@@ -364,6 +364,13 @@ fmt:
 # failed window whether or not the broker pipelines it. The `idempotent()`
 # filter went and no `//` with it, which is the deletion this ratio rises on.
 #
+#   #588  +26 lines, depth up to ten     3174 -> 3174  2.92235593 -> 2,92165653
+#
+# `--pipeline-depth` goes to ten for a producer without idempotence that has
+# more than five requests to send. The reasoning is the `///` on
+# `TcpContext::MAXIMUM_PIPELINE_DEPTH`; the code is that constant, the clamp
+# and a test, with no `//` added.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -373,7 +380,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.9224" top="12":
+comments ceiling="2.9217" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
