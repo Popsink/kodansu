@@ -1574,6 +1574,11 @@ pub trait Storage: Debug + Send + Sync + 'static {
     ) -> Result<BTreeMap<Topition, CommittedOffset>>;
 
     /// Query broker and topic metadata.
+    ///
+    /// `None` asks for every topic and `Some` for exactly the topics listed, so
+    /// an empty list answers with the brokers and no topic at all (#593). The
+    /// wire's v0 `[]`, which means every topic, is resolved to `None` before it
+    /// gets here.
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse>;
 
     /// The broker's auto-topic-creation policy.

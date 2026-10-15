@@ -732,6 +732,21 @@ pub enum Header {
     },
 }
 
+/// The API version a request arrived at, placed in a service's context by the
+/// layer that decoded its frame.
+///
+/// A typed request does not carry its version: the decoder spends it choosing
+/// which fields to read. That is enough until a field means different things in
+/// different versions with the same shape on the wire — `Metadata`'s empty
+/// topic list is "every topic" at v0 and "no topics" from v1 (#593) — and then
+/// the handler has to ask.
+///
+/// Absent when a request was built in process rather than read off a
+/// connection; a handler then treats it as the latest version, which is the
+/// version an in-process client encodes at.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RequestApiVersion(pub i16);
+
 impl MaximumAllocationSize for Header {
     fn maximum_allocation_size(&self) -> Result<usize> {
         match self {

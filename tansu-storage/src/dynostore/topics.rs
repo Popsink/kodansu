@@ -803,7 +803,12 @@ impl DynoStore {
                     .collect()
             }
 
-            _ => {
+            // A list that names nothing asks for nothing: the brokers and the
+            // cluster, without one topic (#593). `MetadataService` has already
+            // turned a v0 `[]`, which means every topic, into `None`.
+            Some(_) => vec![],
+
+            None => {
                 let mut responses = vec![];
 
                 for topic_metadata in self.topics_index().await?.iter() {
