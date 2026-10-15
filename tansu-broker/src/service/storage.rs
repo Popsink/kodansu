@@ -631,28 +631,19 @@ where
 ///
 /// The same layer decides whether a produce may be **pipelined** (#588): the
 /// connection reads its next request once this one's batches are in their
-/// windows, rather than once they are durable. Only when every batch is
-/// idempotent, because pipelining puts two requests for one partition into
-/// different windows, and the earlier window can fail while the later one
-/// succeeds. An idempotent batch behind the failure is refused
-/// `OUT_OF_ORDER_SEQUENCE_NUMBER` by the flush — the producer table expects
-/// the failed batch's sequence first — and the client retries both in order.
-/// A batch without a sequence has nothing to refuse it, and would be written
-/// past the gap. `acks=0` never pipelines: it is not idempotent, and its
-/// answer is silence either way.
+/// windows, rather than once they are durable. Every produce with `acks != 0`
+/// is. Pipelining puts two requests for one partition into different windows,
+/// and the earlier window can fail while the later one succeeds — but a client
+/// can only have sent the later request while the earlier was unanswered, and
+/// on that connection the broker could never have stopped it: unpipelined, the
+/// later request is read after the earlier fails and lands ahead of its retry
+/// all the same. An idempotent batch is refused `OUT_OF_ORDER_SEQUENCE_NUMBER`
+/// behind the gap either way; a batch without a sequence is reordered either
+/// way, which is Kafka's contract for `max.in.flight` above one without
+/// idempotence, and what a snapshot producer that reads each key once asks for.
+/// `acks=0` does not pipeline: its answer is silence either way.
 #[derive(Clone, Debug)]
 struct Acks<S>(S);
-
-/// Whether every batch `req` carries is idempotent (#588).
-fn idempotent(req: &ProduceRequest) -> bool {
-    req.topic_data
-        .iter()
-        .flatten()
-        .flat_map(|topic| topic.partition_data.iter().flatten())
-        .flat_map(|partition| partition.records.iter())
-        .flat_map(|records| records.batches.iter())
-        .all(|batch| batch.is_idempotent())
-}
 
 impl<State, S> Service<State, ProduceRequest> for Acks<S>
 where
@@ -668,7 +659,6 @@ where
         req: ProduceRequest,
     ) -> Result<Self::Response, Self::Error> {
         if req.acks != 0
-            && idempotent(&req)
             && let Some(admission) = ctx.get::<Admission>().cloned()
         {
             _ = ctx.insert(OnAdmitted::new(move || admission.admitted()));

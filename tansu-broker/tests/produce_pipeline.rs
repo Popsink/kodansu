@@ -272,15 +272,16 @@ async fn five_produces_in_flight_share_one_window() -> Result<()> {
     Ok(())
 }
 
-/// **Produces without a sequence are not pipelined**, and are answered
-/// exactly as before #588: one window each.
+/// **Produces without a sequence are pipelined too**: a snapshot producer
+/// with idempotence off shares a window exactly as an idempotent one does.
 ///
-/// A window that fails ahead of one that succeeds leaves a gap, and with no
-/// sequence number nothing refuses the batch written past it — see
+/// A window that fails ahead of one that succeeds still leaves a gap that
+/// nothing refuses — see
 /// `a_batch_without_a_sequence_behind_a_failed_window_is_written_past_it` in
-/// the engine's tests.
+/// the engine's tests — but that reordering is one the client opted into by
+/// sending the second request before the first was answered.
 #[tokio::test]
-async fn produces_without_a_sequence_take_a_window_each() -> Result<()> {
+async fn produces_without_a_sequence_share_one_window() -> Result<()> {
     let (port, bucket) = serve_broker_stack().await?;
     let mut sock = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await?;
 
@@ -297,7 +298,7 @@ async fn produces_without_a_sequence_take_a_window_each() -> Result<()> {
         answers,
     );
 
-    assert_eq!(5, segments(&bucket).await?, "one window per request");
+    assert_eq!(1, segments(&bucket).await?, "one window, one PUT");
 
     Ok(())
 }

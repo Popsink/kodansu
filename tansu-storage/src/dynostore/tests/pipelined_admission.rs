@@ -20,8 +20,9 @@
 //! window and take offsets in admission order. And a batch admitted behind a
 //! window that then fails lands in the *next* window — which an idempotent
 //! batch survives, because the producer table refuses it, and a batch without
-//! a sequence does not. That last test is why the broker only pipelines
-//! idempotent produces.
+//! a sequence does not. That last case is no reason to keep such a batch out
+//! of the pipeline: its client sent the second request before the first was
+//! answered, and an unpipelined connection would have reordered it the same.
 
 use std::{
     fmt::{self, Debug, Display},
@@ -292,12 +293,13 @@ async fn an_idempotent_batch_behind_a_failed_window_is_refused() -> Result<()> {
     Ok(())
 }
 
-/// **The same hazard without a sequence, and the reason the broker does not
-/// pipeline it.**
+/// **The same hazard without a sequence.**
 ///
 /// Nothing refuses the second batch, so it is written while the first is not —
-/// and the first, retried, lands after it. Pinned so that whoever widens
-/// pipelining to producers without sequence numbers finds out what it costs.
+/// and the first, retried, lands after it. Kafka's contract for a producer
+/// with more than one request in flight and no idempotence, and the same
+/// outcome a connection that reads one request at a time gives it: the second
+/// request is read once the first has failed, and lands ahead of the retry.
 #[tokio::test]
 async fn a_batch_without_a_sequence_behind_a_failed_window_is_written_past_it() -> Result<()> {
     let _guard = init_tracing()?;

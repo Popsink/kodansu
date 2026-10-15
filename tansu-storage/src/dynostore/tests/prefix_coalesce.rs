@@ -5114,6 +5114,45 @@ async fn transactional_duplicate_reregistration_is_idempotent() -> Result<(), Er
     Ok(())
 }
 
+/// Two pipelined transactional batches share a window, and their acks register
+/// the produced range in whatever order the connection polls them (#588). The
+/// later batch registering first must not leave the earlier one outside the
+/// range: an abort would not mark it, and a read-committed consumer would read
+/// it.
+#[tokio::test]
+async fn pipelined_transactional_acks_register_in_any_order() -> Result<(), Error> {
+    let bucket = InMemory::new();
+    let store = DynoStore::new(CLUSTER, NODE, bucket.clone());
+
+    let topic = "org.env.conn.tab_a";
+    create_topic(&store, topic).await?;
+    let a = Topition::new(topic, 0);
+
+    let txn = "txn-pipelined";
+    let (pid, epoch) = begin_txn(&store, txn, &[topic]).await?;
+
+    let first = store
+        .admit(Some(txn), &a, txn_batch(pid, epoch, 0, 2)?)
+        .await?;
+    let second = store
+        .admit(Some(txn), &a, txn_batch(pid, epoch, 2, 2)?)
+        .await?;
+
+    assert_eq!(2, second.await?);
+    assert_eq!(0, first.await?);
+    assert_eq!(1, segments(&bucket).await.len(), "one window, one PUT");
+
+    assert_eq!(
+        Some(TxnProduceOffset {
+            offset_start: 0,
+            offset_end: 3,
+        }),
+        produced_range(&store, txn, epoch, &a).await?
+    );
+
+    Ok(())
+}
+
 /// A gap left by an expiry that never certified it is certified by the
 /// reconciliation pass, and the fetch inside it goes from empty-forever to
 /// `OFFSET_OUT_OF_RANGE` (#290).
