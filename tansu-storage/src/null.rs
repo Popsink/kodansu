@@ -300,7 +300,8 @@ impl Storage for Engine {
     }
 
     #[instrument(skip_all)]
-    async fn metadata(&self, _topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
+    async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
+        let asks_for_none = topics.is_some_and(<[TopicId]>::is_empty);
         let node_id = self.node;
         let host = self
             .advertised_listener
@@ -315,6 +316,7 @@ impl Storage for Engine {
             .map(|topics| {
                 topics
                     .iter()
+                    .filter(|_| !asks_for_none)
                     .map(|topic| {
                         MetadataResponseTopic::default()
                             .error_code(ErrorCode::None.into())

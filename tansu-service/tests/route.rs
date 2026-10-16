@@ -18,7 +18,7 @@ use rama::{
 };
 use tansu_sans_io::{
     ApiKey as _, ApiVersionsRequest, ErrorCode, Frame, Header, MetadataRequest, MetadataResponse,
-    metadata_response::MetadataResponseBroker,
+    RequestApiVersion, RootMessageMeta, metadata_response::MetadataResponseBroker,
 };
 use tansu_service::{
     BytesFrameLayer, BytesLayer, FrameApiKeyMatcher, FrameBytesLayer, FrameRequestLayer,
@@ -400,6 +400,64 @@ async fn api_key_hijack() -> Result<(), Error> {
     let brokers = response.brokers.unwrap_or_default();
     assert_eq!(1, brokers.len());
     assert_eq!(111, brokers[0].node_id);
+
+    Ok(())
+}
+
+/// A typed handler learns the version its request was decoded at (#593):
+/// `Metadata`'s empty topic list means opposite things at v0 and from v1, and
+/// nothing in the decoded request says which.
+#[tokio::test]
+async fn a_handler_sees_the_version_its_request_arrived_at() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let rl = RequestLayer::<MetadataRequest>::new().into_layer(ResponseService::new(
+        |ctx: Context<()>, _req: MetadataRequest| {
+            Ok::<_, Error>(
+                MetadataResponse::default()
+                    .brokers(Some([].into()))
+                    .topics(Some([].into()))
+                    .controller_id(
+                        ctx.get::<RequestApiVersion>()
+                            .map(|RequestApiVersion(version)| i32::from(*version)),
+                    )
+                    .throttle_time_ms(Some(0))
+                    .cluster_authorized_operations(Some(-1)),
+            )
+        },
+    ));
+
+    let service = (
+        RequestFrameLayer,
+        FrameBytesLayer,
+        BytesLayer,
+        BytesFrameLayer::default(),
+    )
+        .into_layer(
+            FrameRouteService::<(), Error>::builder()
+                .with_service(rl)
+                .and_then(|builder| builder.build())?,
+        );
+
+    let latest = RootMessageMeta::messages()
+        .requests()
+        .get(&MetadataRequest::KEY)
+        .map(|meta| meta.version.valid().end)
+        .map(i32::from);
+
+    let response = service
+        .serve(
+            Context::default(),
+            MetadataRequest::default()
+                .topics(Some([].into()))
+                .allow_auto_topic_creation(Some(false))
+                .include_cluster_authorized_operations(Some(false))
+                .include_topic_authorized_operations(Some(false)),
+        )
+        .await?;
+
+    assert!(latest.is_some());
+    assert_eq!(latest, response.controller_id);
 
     Ok(())
 }

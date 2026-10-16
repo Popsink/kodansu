@@ -14,8 +14,8 @@
 
 use rama::{Context, Service};
 use tansu_sans_io::{
-    ApiKey, ErrorCode, MetadataRequest, MetadataResponse, create_topics_request::CreatableTopic,
-    metadata_response::MetadataResponseTopic,
+    ApiKey, ErrorCode, MetadataRequest, MetadataResponse, RequestApiVersion,
+    create_topics_request::CreatableTopic, metadata_response::MetadataResponseTopic,
 };
 use tracing::{error, instrument, warn};
 
@@ -45,6 +45,26 @@ fn refuse_malformed_name(topic: MetadataResponseTopic) -> MetadataResponseTopic 
         }
 
         _ => topic,
+    }
+}
+
+/// The topics a request asks about, as the engine reads them: `None` for every
+/// topic, and `Some` — empty or not — for exactly the topics listed.
+///
+/// The wire gives an empty list two meanings (#593). At v0 the list is not
+/// nullable, so `[]` is the only way to ask for every topic; from v1 `null`
+/// asks for every topic and `[]` asks for none, which is what a client sends
+/// when it wants the broker list alone — at bootstrap, from
+/// `describeCluster`, before it has used a topic. Answering that `[]` with the
+/// whole cluster made `Metadata` 87 % of the bytes one fleet sent, and showed
+/// every tenant every other tenant's topics.
+///
+/// No version in the context means the request was built in process, where the
+/// client encodes at the latest version, so `[]` keeps its v1+ meaning.
+fn resolve_topics<T>(topics: Option<Vec<T>>, version: Option<RequestApiVersion>) -> Option<Vec<T>> {
+    match topics {
+        Some(topics) if topics.is_empty() && version == Some(RequestApiVersion(0)) => None,
+        topics => topics,
     }
 }
 
@@ -113,8 +133,7 @@ where
     ) -> Result<Self::Response, Self::Error> {
         let allow_auto_topic_creation = req.allow_auto_topic_creation.unwrap_or(false);
 
-        let topics = req
-            .topics
+        let topics = resolve_topics(req.topics, ctx.get::<RequestApiVersion>().copied())
             .map(|topics| topics.iter().map(TopicId::from).collect::<Vec<_>>());
 
         let mut response = ctx

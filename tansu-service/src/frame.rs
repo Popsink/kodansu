@@ -25,8 +25,8 @@ use rama::{Context, Layer, Service, context::Extensions, matcher::Matcher, servi
 use rsasl::config::SASLConfig;
 use tansu_auth::Authentication;
 use tansu_sans_io::{
-    ApiKey, ApiVersionsRequest, Body, Frame, Header, Request, Response, RootMessageMeta,
-    SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
+    ApiKey, ApiVersionsRequest, Body, Frame, Header, Request, RequestApiVersion, Response,
+    RootMessageMeta, SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
 };
 use tokio::task::spawn_blocking;
 use tracing::{debug, error, instrument};
@@ -345,6 +345,8 @@ where
             if let Some(authentication) = self.af.as_ref().map(|af| af.authentication.clone()) {
                 assert!(ctx.insert(authentication).is_none());
             }
+
+            _ = ctx.insert(RequestApiVersion(api_version));
 
             self.inner
                 .serve(ctx, req)

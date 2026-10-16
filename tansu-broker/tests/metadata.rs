@@ -151,6 +151,8 @@ async fn topics_none() -> Result<()> {
     Ok(())
 }
 
+/// An empty list asks for the brokers and no topic at all (#593); `topics_none`
+/// is the request for every topic.
 #[tokio::test]
 async fn topics_some_empty() -> Result<()> {
     let _guard = init_tracing()?;
@@ -171,7 +173,7 @@ async fn topics_some_empty() -> Result<()> {
     let assignments = Some([].into());
     let configs = Some([].into());
 
-    let id = sc
+    _ = sc
         .create_topic(
             CreatableTopic::default()
                 .name(topic_name.clone())
@@ -200,65 +202,7 @@ async fn topics_some_empty() -> Result<()> {
         metadata.brokers()[0].port
     );
 
-    assert_eq!(1, metadata.topics().len());
-    assert_eq!(i16::from(ErrorCode::None), metadata.topics()[0].error_code);
-    assert_eq!(Some(topic_name), metadata.topics()[0].name);
-    assert_eq!(Some(id.as_bytes()), metadata.topics()[0].topic_id.as_ref());
-
-    let partitions = metadata.topics()[0]
-        .partitions
-        .as_deref()
-        .unwrap_or_default();
-
-    assert_eq!(num_partitions, partitions.len() as i32);
-
-    assert!(
-        partitions
-            .iter()
-            .map(|partition| partition.leader_id)
-            .inspect(|leader_id| debug!(leader_id))
-            .all(|leader_id| leader_id == broker_id)
-    );
-
-    assert!(
-        partitions
-            .iter()
-            .map(|partition| partition.leader_epoch)
-            .inspect(|leader_epoch| debug!(leader_epoch))
-            .all(|leader_epoch| leader_epoch == Some(0))
-    );
-
-    assert!(
-        partitions
-            .iter()
-            .map(|partition| partition.offline_replicas.as_deref().unwrap_or_default())
-            .inspect(|offline_replicas| debug!(?offline_replicas))
-            .all(|offline_replicas| offline_replicas.is_empty())
-    );
-
-    assert!(
-        partitions
-            .iter()
-            .map(|partition| partition.replica_nodes.as_deref().unwrap_or_default())
-            .inspect(|replica_nodes| debug!(?replica_nodes))
-            .all(
-                |replica_nodes| (replica_nodes.len() as i16) == replication_factor
-                    && replica_nodes
-                        .iter()
-                        .all(|replica_node| *replica_node == broker_id)
-            )
-    );
-
-    assert!(
-        partitions
-            .iter()
-            .map(|partition| partition.isr_nodes.as_deref().unwrap_or_default())
-            .inspect(|isr_nodes| debug!(?isr_nodes))
-            .all(|isr_nodes| {
-                (isr_nodes.len() as i16) == replication_factor
-                    && isr_nodes.iter().all(|isr_node| *isr_node == broker_id)
-            })
-    );
+    assert!(metadata.topics().is_empty());
 
     Ok(())
 }

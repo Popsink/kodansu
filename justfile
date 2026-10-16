@@ -371,6 +371,15 @@ fmt:
 # `TcpContext::MAXIMUM_PIPELINE_DEPTH`; the code is that constant, the clamp
 # and a test, with no `//` added.
 #
+#   #593  +81 lines, empty metadata list  3174 -> 3174  2.92165653 -> 2.91947979
+#
+# `Metadata` answers an empty topic list from v1 with no topic, and a v0 one with
+# every topic, which takes the handler knowing the version its request arrived
+# at. The one `//` block it added cites #593; the reasoning is the `///` on
+# `RequestApiVersion` and `resolve_topics`, and most of the lines are the
+# conformance tests. It fell less than they would make it: the broker test that
+# pinned `[]` to every topic lost the 51 lines asserting on that topic.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -380,7 +389,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.9217" top="12":
+comments ceiling="2.9195" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
