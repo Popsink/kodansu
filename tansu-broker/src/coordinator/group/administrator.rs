@@ -2061,6 +2061,47 @@ where
             .into())
     }
 
+    /// What a commit from a member the current generation names, carrying
+    /// generation `claimed` rather than `current`, is answered — or `None` when
+    /// it is accepted (#598).
+    ///
+    /// Every composition change moves the generation at once, where Kafka's
+    /// classic group only moves it when the join phase completes. So the
+    /// commit a consumer makes from its revoke callback — under the generation
+    /// it is giving partitions up from — arrives one generation behind, and
+    /// fencing it replayed everything read since the member's last commit on
+    /// every rebalance. Kafka accepts that commit, so this accepts the same
+    /// window: exactly one generation behind, and before `current` has an
+    /// assignment, so no partition has a new owner the commit could overwrite.
+    /// Once the assignment exists the answer is `RebalanceInProgress`, as
+    /// Kafka's is in `CompletingRebalance`.
+    ///
+    /// The read and the commit are not one atomic step, so an assignment
+    /// written between them lets this commit land after the new owner has been
+    /// told its partitions. That owner fetches, consumes and commits before its
+    /// own commit can be overwritten — seconds against the milliseconds this
+    /// commit is in flight — so the worst case is the replay that fencing the
+    /// commit used to cause every time.
+    ///
+    /// Anything further behind is still `IllegalGeneration`: an assignment for
+    /// a generation in between may have handed the partitions on.
+    async fn stale_commit_verdict(
+        &self,
+        group_id: &str,
+        current: i32,
+        claimed: i32,
+    ) -> Result<Option<ErrorCode>> {
+        if current.checked_sub(1) != Some(claimed) {
+            return Ok(Some(ErrorCode::IllegalGeneration));
+        }
+
+        Ok(self
+            .storage
+            .read_group_assignment(group_id, current)
+            .await?
+            .map(|_| ErrorCode::RebalanceInProgress))
+    }
+
     async fn commit_offset(&self, detail: &OffsetCommit<'_>) -> Result<Body> {
         let retention_time_ms = detail.retention_time_ms.map_or(Ok(None), |ms| {
             u64::try_from(ms)
@@ -3118,18 +3159,21 @@ where
                 .await?;
 
             if generation.generation_id != generation_id {
+                let error_code = self
+                    .stale_commit_verdict(group_id, generation.generation_id, generation_id)
+                    .await?;
+
                 debug!(
                     group_id,
                     member_id,
                     generation_id,
                     current = generation.generation_id,
-                    offset_commit_outcome = ?ErrorCode::IllegalGeneration,
+                    offset_commit_outcome = ?error_code.unwrap_or(ErrorCode::None),
                 );
 
-                return Ok(offset_commit_error(
-                    &offset_commit,
-                    ErrorCode::IllegalGeneration,
-                ));
+                if let Some(error_code) = error_code {
+                    return Ok(offset_commit_error(&offset_commit, error_code));
+                }
             }
         }
 
@@ -3431,6 +3475,7 @@ mod tests {
     use std::sync::OnceLock;
     use tansu_sans_io::{
         consumer::ConsumerProtocolSubscription,
+        create_topics_request::CreatableTopic,
         offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
     };
     use tansu_storage::{LatencyIntroducingStorage, StorageContainer};
@@ -5776,6 +5821,190 @@ mod tests {
         assert!(
             stamp().await? > before,
             "a member the generation names has just contacted us, so it is alive"
+        );
+
+        Ok(())
+    }
+
+    /// Commit `offset` to partition 0 of `topic` as `member_id` on
+    /// `generation_id`, answering the one partition's error code.
+    async fn commit_one<O>(
+        controller: &Controller<O>,
+        group_id: &str,
+        member_id: &str,
+        generation_id: i32,
+        topic: &str,
+        offset: i64,
+    ) -> Result<ErrorCode>
+    where
+        O: Storage + Clone,
+    {
+        let topics = [OffsetCommitRequestTopic::default()
+            .name(topic.into())
+            .partitions(Some(vec![
+                OffsetCommitRequestPartition::default()
+                    .partition_index(0)
+                    .committed_offset(offset)
+                    .committed_leader_epoch(Some(0))
+                    .commit_timestamp(None)
+                    .committed_metadata(Some("".into())),
+            ]))];
+
+        let body = controller
+            .offset_commit(OffsetCommit {
+                group_id,
+                generation_id_or_member_epoch: Some(generation_id),
+                member_id: Some(member_id),
+                group_instance_id: None,
+                retention_time_ms: None,
+                topics: Some(&topics[..]),
+            })
+            .await?;
+
+        let Body::OffsetCommitResponse(response) = body else {
+            panic!("{body:?}");
+        };
+
+        response
+            .topics
+            .as_deref()
+            .and_then(<[_]>::first)
+            .and_then(|topic| topic.partitions.as_deref().and_then(<[_]>::first))
+            .map(|partition| ErrorCode::try_from(partition.error_code))
+            .expect("a partition response")
+            .map_err(Into::into)
+    }
+
+    fn assignment_doc(generation_id: i32, leader: &str) -> AssignmentDoc {
+        AssignmentDoc {
+            generation_id,
+            leader: leader.to_owned(),
+            protocol_type: CONSUMER.into(),
+            protocol_name: RANGE.into(),
+            assignments: BTreeMap::from([(leader.to_owned(), assignment_of(leader).assignment)]),
+            assigned_at_ms: epoch_ms(paused_clock()),
+        }
+    }
+
+    /// The commit a consumer makes from its revoke callback is kept (#598).
+    ///
+    /// A composition change moves the generation at once, so that commit
+    /// carries the generation just left. Fencing it made the next owner resume
+    /// from the member's previous commit, replaying everything in between on
+    /// every rebalance — Kafka accepts it until the join phase completes.
+    #[tokio::test(start_paused = true)]
+    async fn a_revoke_commit_from_the_previous_generation_is_kept() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "revoke-commit";
+        const LEADER: &str = "m-1";
+        const FOLLOWER: &str = "m-2";
+        const TOPIC: &str = "t";
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+
+        _ = storage
+            .create_topic(
+                CreatableTopic::default()
+                    .name(TOPIC.into())
+                    .num_partitions(1)
+                    .replication_factor(1)
+                    .assignments(Some([].into()))
+                    .configs(Some([].into())),
+                false,
+            )
+            .await?;
+
+        let generation_id =
+            forming_group_of_two(&storage, GROUP_ID, LEADER, FOLLOWER, Duration::ZERO).await?;
+
+        assert_eq!(
+            ErrorCode::None,
+            commit_one(
+                &controller,
+                GROUP_ID,
+                FOLLOWER,
+                generation_id - 1,
+                TOPIC,
+                42
+            )
+            .await?,
+            "no partition of the current generation has an owner yet"
+        );
+
+        let topition = Topition::new(TOPIC, 0);
+        let committed = storage
+            .offset_fetch(Some(GROUP_ID), std::slice::from_ref(&topition), None)
+            .await?;
+
+        assert_eq!(
+            Some(42),
+            committed.get(&topition).map(|committed| committed.offset),
+            "and the next owner resumes from it"
+        );
+
+        Ok(())
+    }
+
+    /// Once the current generation is assigned, a commit from the previous one
+    /// could overwrite the new owner's, so it is told to re-join (#598).
+    #[tokio::test(start_paused = true)]
+    async fn a_previous_generation_commit_after_the_assignment_is_refused() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "assigned-before-revoke-commit";
+        const LEADER: &str = "m-1";
+        const FOLLOWER: &str = "m-2";
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+
+        let generation_id =
+            forming_group_of_two(&storage, GROUP_ID, LEADER, FOLLOWER, Duration::ZERO).await?;
+
+        _ = storage
+            .create_group_assignment(
+                GROUP_ID,
+                generation_id,
+                assignment_doc(generation_id, LEADER),
+            )
+            .await?;
+
+        assert_eq!(
+            ErrorCode::RebalanceInProgress,
+            commit_one(&controller, GROUP_ID, FOLLOWER, generation_id - 1, "t", 42).await?
+        );
+
+        Ok(())
+    }
+
+    /// Only the generation just left is accepted, and only from a member the
+    /// current one still names (#598).
+    #[tokio::test(start_paused = true)]
+    async fn an_older_or_unknown_commit_is_still_fenced() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        const GROUP_ID: &str = "older-commit";
+        const LEADER: &str = "m-1";
+        const FOLLOWER: &str = "m-2";
+
+        let storage = memory_storage().await?;
+        let controller = Controller::with_storage(storage.clone())?.with_now(paused_clock);
+
+        let generation_id =
+            forming_group_of_two(&storage, GROUP_ID, LEADER, FOLLOWER, Duration::ZERO).await?;
+
+        assert_eq!(
+            ErrorCode::IllegalGeneration,
+            commit_one(&controller, GROUP_ID, FOLLOWER, generation_id - 2, "t", 42).await?,
+            "a generation in between may have handed the partitions on"
+        );
+
+        assert_eq!(
+            ErrorCode::UnknownMemberId,
+            commit_one(&controller, GROUP_ID, "m-left", generation_id - 1, "t", 42).await?,
+            "a member that left owns nothing to commit"
         );
 
         Ok(())

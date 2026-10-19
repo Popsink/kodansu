@@ -380,6 +380,14 @@ fmt:
 # conformance tests. It fell less than they would make it: the broker test that
 # pinned `[]` to every topic lost the 51 lines asserting on that topic.
 #
+#   #598  +161 lines, revoke-time commit  3174 -> 3174  2.91947979 -> 2.91513593
+#
+# A commit one generation behind, from a member the current generation names,
+# is accepted until that generation is assigned, as Kafka accepts the commit a
+# consumer makes from its revoke callback. The reasoning is the `///` on
+# `stale_commit_verdict`; the rest is the verdict and three tests, with no `//`
+# added.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -389,7 +397,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.9195" top="12":
+comments ceiling="2.9152" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
