@@ -1113,6 +1113,10 @@ pub(super) struct PrefixLocks {
     /// advanced the hint, writing two segments at the same offsets. The segment
     /// `Create` only guards the *sequence* name, not offsets, so this lock — not
     /// the create-race — is the per-prefix offset authority.
+    ///
+    /// Since #590 every flush of a prefix comes off that prefix's one flush
+    /// queue worker, so the lock is uncontended in the produce path; it stays
+    /// as the guarantee, and the queue is what puts the flushes in close order.
     flush: LockedMap<String, Arc<tokio::sync::Mutex<()>>>,
 
     /// Per-prefix single-flight for the stale-index refresh and the certified

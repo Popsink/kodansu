@@ -35,6 +35,7 @@ mod delete_groups;
 mod divergent_batch;
 mod fenced_overlap;
 mod flush_conflict;
+mod flush_queue;
 mod gcs;
 mod gcs_generation;
 mod gcs_retry;

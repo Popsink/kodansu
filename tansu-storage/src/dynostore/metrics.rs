@@ -87,6 +87,24 @@ pub(super) static SEGMENT_FLUSHES: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// How long one segment create-PUT of a prefix flush took, in milliseconds
+/// (#590): every attempt, won or lost, since a lost race is still a PUT the
+/// window waited on.
+///
+/// This is the stall #590 took off the admission path. A window that closes
+/// while the previous one's PUT is in flight now fills behind it rather than
+/// waiting for it, so the gap between windows is this duration less the fill
+/// time — and it is read here rather than inferred from produce latency.
+/// `tansu_object_store_request_duration` carries the same requests among every
+/// other `put_opts`, which is why the segment PUT has its own instrument.
+pub(super) static SEGMENT_PUT_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    METER
+        .u64_histogram("tansu_prefix_segment_put_duration")
+        .with_unit("ms")
+        .with_description("segment create-PUT latency of a prefix flush, in milliseconds")
+        .build()
+});
+
 /// Compaction runs refused rather than performed, by reason (#461).
 ///
 /// Expected to be **flat zero**. A non-zero value means compaction met a run it
