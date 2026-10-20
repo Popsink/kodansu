@@ -34,6 +34,7 @@ mod delete_fan_out;
 mod delete_groups;
 mod divergent_batch;
 mod fenced_overlap;
+mod fetch_read_concurrency;
 mod flush_conflict;
 mod gcs;
 mod gcs_generation;

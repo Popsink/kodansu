@@ -2319,6 +2319,14 @@ fn coalesce_tuning(storage: &Url) -> CoalesceTuning {
                     .ok()
                     .and_then(|size| u32::try_from(size).ok());
             }
+            "fetch_read_concurrency" => {
+                tuning.fetch_read_concurrency = value
+                    .parse()
+                    .inspect_err(
+                        |err| warn!(storage = %storage, key = "fetch_read_concurrency", value, ?err),
+                    )
+                    .ok();
+            }
             "prefix_compact_min_segments" => {
                 tuning.prefix_compact_min_segments = value
                     .parse()
@@ -3181,6 +3189,28 @@ mod tests {
             None,
             coalesce_tuning(&Url::parse("s3://tansu/?fetch_max_bytes=4G")?).fetch_max_bytes
         );
+
+        Ok(())
+    }
+
+    /// The region read fan-out (#587): absent, unparseable or zero keeps
+    /// [`dynostore::DynoStore::FETCH_READ_CONCURRENCY`] — zero refused rather
+    /// than taken, because `buffered(0)` never polls a read and the fetch
+    /// would hang until the client's timeout.
+    #[cfg(feature = "dynostore")]
+    #[test]
+    fn fetch_read_concurrency_parses() -> Result<()> {
+        let parse = |url: &str| -> Result<Option<usize>> {
+            Ok(coalesce_tuning(&Url::parse(url)?)
+                .fetch_read_concurrency
+                .map(std::num::NonZeroUsize::get))
+        };
+
+        assert_eq!(Some(128), parse("s3://tansu/?fetch_read_concurrency=128")?);
+        assert_eq!(None, parse("s3://tansu/")?);
+        assert_eq!(None, parse("s3://tansu/?fetch_read_concurrency=lots")?);
+        assert_eq!(None, parse("s3://tansu/?fetch_read_concurrency=0")?);
+        assert_eq!(None, parse("s3://tansu/?fetch_read_concurrency=-1")?);
 
         Ok(())
     }
