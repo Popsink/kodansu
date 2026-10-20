@@ -388,6 +388,13 @@ fmt:
 # `stale_commit_verdict`; the rest is the verdict and three tests, with no `//`
 # added.
 #
+#   #594  +600 lines, refusal classes    3174 -> 3173  2.91513593 -> 2.90336454
+#
+# A compaction refusal is classified before it is logged, and only a missing
+# range stays at `ERROR`. The tiling loop moved into `tiling_breaks`, which took
+# its one uncited `//` with it; the reasoning is the `///` on `TilingBreak` and
+# `tiling_log_start`, and most of the lines are one test per class.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -397,7 +404,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.9152" top="12":
+comments ceiling="2.9034" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
