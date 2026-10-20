@@ -124,6 +124,7 @@ mod metron;
 mod object;
 mod opticon;
 mod principals;
+mod probe;
 mod retention;
 mod routing;
 mod segments;
