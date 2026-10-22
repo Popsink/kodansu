@@ -989,6 +989,16 @@ pub(crate) struct FencedSegment {
     pub(crate) entry: SubstreamEntry,
 }
 
+/// A [`FencedSegment`] borrowed from the prefix index, for a caller of
+/// [`DynoStore::with_fenced_segments`] that reads the view under the lock and
+/// clones only what it keeps (#606).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FencedRef<'a> {
+    pub(crate) seq: u64,
+    pub(crate) served_from: i64,
+    pub(crate) entry: &'a SubstreamEntry,
+}
+
 /// Why a [`DynoStore::decode_frame`] scan stopped (#386).
 ///
 /// The bytes cannot say whether stopping early is benign, so the scan reports

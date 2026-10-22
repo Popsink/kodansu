@@ -388,6 +388,14 @@ fmt:
 # `stale_commit_verdict`; the rest is the verdict and three tests, with no `//`
 # added.
 #
+#   #606  +118 lines, fenced view borrowed  3174 -> 3175  2.91513593 -> 2.91418082
+#
+# The request path reads a sub-stream's fenced view in place under the prefix
+# index lock instead of cloning all of it, and the tail is a scan for the
+# greatest end. The reasoning is the `///` on `with_fenced_segments` and
+# `substream_tail`; the one `//` block added cites #606, and the line counted
+# is a fetch-plan comment rewrapped one level deeper inside the closure.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -397,7 +405,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.9152" top="12":
+comments ceiling="2.9142" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

@@ -759,9 +759,7 @@ impl DynoStore {
         topition: &Topition,
     ) -> Result<i64> {
         let segment_tail = self
-            .valid_substream_segments(prefix, substream, topition.partition())?
-            .last()
-            .map(FencedSegment::end)
+            .substream_tail(prefix, substream, topition.partition())?
             .unwrap_or(0);
         let cached = self.cached_high(topition)?.unwrap_or(0);
 
@@ -826,23 +824,25 @@ impl DynoStore {
         topition: &Topition,
         producer_id: i64,
     ) -> Result<ProducerTail> {
-        let mut tail = ProducerTail::default();
-        for fenced in self.valid_substream_segments(prefix, substream, topition.partition())? {
-            for pc in &fenced.entry.producers {
-                if !pc.folds() {
-                    continue;
-                }
-                if pc.producer_id == producer_id {
-                    tail.fold(
-                        pc.producer_epoch,
-                        pc.base_sequence,
-                        pc.last_sequence,
-                        fenced.entry.base_offset + pc.offset_delta as i64,
-                    );
+        self.with_fenced_segments(prefix, substream, topition.partition(), |fenced| {
+            let mut tail = ProducerTail::default();
+            for fenced in fenced {
+                for pc in &fenced.entry.producers {
+                    if !pc.folds() {
+                        continue;
+                    }
+                    if pc.producer_id == producer_id {
+                        tail.fold(
+                            pc.producer_epoch,
+                            pc.base_sequence,
+                            pc.last_sequence,
+                            fenced.entry.base_offset + pc.offset_delta as i64,
+                        );
+                    }
                 }
             }
-        }
-        Ok(tail)
+            tail
+        })
     }
 
     /// Leaseless finalization (#88): like [`Self::finalize_prefix_flush`] but acks

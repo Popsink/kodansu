@@ -385,10 +385,7 @@ impl DynoStore {
         // as an `Option` because "holds segments at all" is what separates the
         // state #290 is about from a drained partition (#299) — see
         // [`Self::note_floor_above_tail`].
-        let tail = self
-            .valid_substream_segments(&prefix, &substream, topition.partition())?
-            .last()
-            .map(FencedSegment::end);
+        let tail = self.substream_tail(&prefix, &substream, topition.partition())?;
 
         // Certified after the refresh above, so the floor covers every
         // watermark advance whose segment deletion that listing could have
@@ -540,9 +537,7 @@ impl DynoStore {
         self.note_floor_above_tail(
             &prefix,
             topition,
-            self.valid_substream_segments(&prefix, &substream, topition.partition())?
-                .last()
-                .map(FencedSegment::end),
+            self.substream_tail(&prefix, &substream, topition.partition())?,
             from_watermark,
         );
 
