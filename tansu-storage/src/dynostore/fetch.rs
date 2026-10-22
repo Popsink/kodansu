@@ -327,9 +327,6 @@ impl DynoStore {
 
         for _ in 0..MAX_ATTEMPTS {
             self.refresh_prefix_index(&prefix).await?;
-            let segments =
-                self.valid_substream_segments(&prefix, &substream, topition.partition())?;
-
             // Plan the reads from the index before issuing any (#426).
             //
             // Every input to the decision is an index field: the offset skip and
@@ -347,32 +344,42 @@ impl DynoStore {
             // latency over 64 segments in one partition: 2 ms at 0 ms, 431 ms at
             // 5 ms, 1 417 ms at 20 ms — exactly linear, and that is the innermost
             // loop alone.
-            let mut bytes = max_bytes as u64;
-            let mut plan: Vec<FencedSegment> = Vec::new();
+            //
+            // Planned inside the fenced view rather than over a copy of it (#606):
+            // only the segments the plan keeps are cloned, which for a caught-up
+            // consumer is none at all.
+            let plan =
+                self.with_fenced_segments(&prefix, &substream, topition.partition(), |segments| {
+                    let mut bytes = max_bytes as u64;
+                    let mut plan: Vec<FencedSegment> = Vec::new();
 
-            for fenced in segments {
-                // Segments are sorted by base offset; skip those ending at/before
-                // the requested offset, stop once one starts at/past the HWM.
-                if fenced.end() <= offset {
-                    continue;
-                }
-                if fenced.entry.base_offset >= high_watermark {
-                    break;
-                }
+                    for fenced in segments {
+                        // Segments are sorted by base offset; skip those ending
+                        // at/before the requested offset, stop once one starts
+                        // at/past the HWM.
+                        if fenced.end() <= offset {
+                            continue;
+                        }
+                        if fenced.entry.base_offset >= high_watermark {
+                            break;
+                        }
 
-                // The budget admits the entry that crosses it and stops *after*,
-                // which is what the serial loop did: it read the region, pushed
-                // its batches, and only then compared. Preserved exactly —
-                // returning one region fewer per round trip is a behaviour change
-                // a client would see.
-                let byte_len = fenced.entry.byte_len;
-                plan.push(fenced);
+                        // The budget admits the entry that crosses it and stops
+                        // *after*, which is what the serial loop did: it read the
+                        // region, pushed its batches, and only then compared.
+                        // Preserved exactly — returning one region fewer per round
+                        // trip is a behaviour change a client would see.
+                        let byte_len = fenced.entry.byte_len;
+                        plan.push(fenced.cloned());
 
-                if byte_len > bytes {
-                    break;
-                }
-                bytes = bytes.saturating_sub(byte_len);
-            }
+                        if byte_len > bytes {
+                            break;
+                        }
+                        bytes = bytes.saturating_sub(byte_len);
+                    }
+
+                    plan
+                })?;
 
             // `&str` rather than the `String`, so each read's future captures a
             // `Copy` borrow instead of moving the prefix the attempt loop reuses.
@@ -699,9 +706,9 @@ impl DynoStore {
         let (prefix, substream) = self.routed_substream_of(topition).await?;
         self.refresh_prefix_index(&prefix).await?;
         Ok(self
-            .valid_substream_segments(&prefix, &substream, topition.partition())?
-            .last()
-            .map(|fenced| fenced.entry.max_timestamp)
+            .with_fenced_segments(&prefix, &substream, topition.partition(), |fenced| {
+                fenced.last().map(|fenced| fenced.entry.max_timestamp)
+            })?
             .filter(|&ms| ms >= 0)
             .map(|ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms as u64)))
     }
@@ -892,12 +899,15 @@ impl DynoStore {
         let (prefix, substream) = self.routed_substream_of(topition).await?;
         self.refresh_prefix_index(&prefix).await?;
 
-        let Some(fenced) = self
-            .valid_substream_segments(&prefix, &substream, topition.partition())?
-            .into_iter()
-            .find(|fenced| {
-                fenced.entry.max_timestamp >= 0 && fenced.entry.max_timestamp >= target_ms
-            })
+        let Some(fenced) =
+            self.with_fenced_segments(&prefix, &substream, topition.partition(), |fenced| {
+                fenced
+                    .iter()
+                    .find(|fenced| {
+                        fenced.entry.max_timestamp >= 0 && fenced.entry.max_timestamp >= target_ms
+                    })
+                    .map(FencedRef::cloned)
+            })?
         else {
             return Ok(None);
         };

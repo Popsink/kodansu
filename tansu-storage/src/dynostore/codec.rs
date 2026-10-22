@@ -156,6 +156,22 @@ impl FencedSegment {
     }
 }
 
+impl FencedRef<'_> {
+    /// One past the last offset this segment serves.
+    pub(super) fn end(&self) -> i64 {
+        self.entry.base_offset + self.entry.record_count
+    }
+
+    /// The owned [`FencedSegment`], for a caller keeping it past the lock.
+    pub(super) fn cloned(&self) -> FencedSegment {
+        FencedSegment {
+            seq: self.seq,
+            served_from: self.served_from,
+            entry: self.entry.clone(),
+        }
+    }
+}
+
 impl FrameTail {
     /// Byte offset within the region where the scan stopped.
     pub(super) fn at(&self) -> usize {
