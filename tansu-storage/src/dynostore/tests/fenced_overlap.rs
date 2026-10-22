@@ -258,6 +258,48 @@ async fn a_segment_wholly_inside_the_frontier_is_still_dropped() -> Result<()> {
     Ok(())
 }
 
+/// `substream_tail` answers the high watermark, offset recovery and the
+/// leaseless flush base without building the fenced view (#606), on the claim
+/// that the view's last entry always ends at the greatest end of any entry. Pin
+/// it against the view over every overlap shape the fencing distinguishes, so a
+/// change to the fencing that broke the claim fails here rather than as an
+/// offset reused on a flush.
+#[tokio::test]
+async fn the_tail_shortcut_agrees_with_the_fenced_view() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let shapes: [&[(u64, i64, i64)]; 7] = [
+        &[],
+        &[(1, 0, 100), (2, 100, 100), (3, 200, 50)],
+        &[(9, 0, 200), (1, 0, 100), (2, 100, 100)],
+        &[(1, 0, 100), (2, 50, 9_950)],
+        &[(1, 0, 1_000), (2, 10, 10), (3, 1_000, 5)],
+        &[(1, 0, 100), (2, 100, 100), (7, 0, 200), (8, 200, 10)],
+        &[(1, 0, 100), (2, 0, 100), (3, 40, 60)],
+    ];
+
+    for shape in shapes {
+        let store = DynoStore::new(CLUSTER, NODE, InMemory::new());
+
+        for &(seq, base, count) in shape {
+            store.index_insert(PREFIX, seq, footer(base, count), 0)?;
+        }
+
+        let substream = Substream::Name(TOPIC.into());
+
+        assert_eq!(
+            store
+                .valid_substream_segments(PREFIX, &substream, 0)?
+                .last()
+                .map(|fenced| fenced.end()),
+            store.substream_tail(PREFIX, &substream, 0)?,
+            "{shape:?}",
+        );
+    }
+
+    Ok(())
+}
+
 /// The read path across a batch-aligned overlap: the batches wholly below the
 /// frontier are skipped after decoding — served once, by the segment that owns
 /// them — and the tail past the frontier is served rather than silently

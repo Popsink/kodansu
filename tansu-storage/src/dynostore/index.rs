@@ -950,16 +950,63 @@ impl DynoStore {
         substream: &Substream,
         partition: i32,
     ) -> Result<Vec<FencedSegment>> {
-        // Through `substream_entries` (#492), so the lock is held for this
-        // sub-stream's own segments rather than for a scan of the whole prefix.
-        let mut segs: Vec<(i64, u64, SubstreamEntry)> = self
-            .prefixes
-            .index()?
+        self.with_fenced_segments(prefix, substream, partition, |fenced| {
+            fenced.iter().map(FencedRef::cloned).collect()
+        })
+    }
+
+    /// One past the last offset `substream` holds in `prefix`'s index, or `None`
+    /// when it holds no segment: `valid_substream_segments(..).last().end()`
+    /// without building the view (#606).
+    ///
+    /// The fenced view's last entry always ends at the greatest end of any entry
+    /// — an entry reaching past everything before it is never dropped — so the
+    /// tail is a scan for that maximum, with nothing sorted and nothing cloned.
+    pub(super) fn substream_tail(
+        &self,
+        prefix: &str,
+        substream: &Substream,
+        partition: i32,
+    ) -> Result<Option<i64>> {
+        self.prefixes.index().map(|index| {
+            index.get(prefix).and_then(|index| {
+                index
+                    .substream_entries(substream, partition)
+                    .map(|(_, _, entry)| entry.base_offset + entry.record_count)
+                    .max()
+            })
+        })
+    }
+
+    /// Hand `f` the epoch-fenced view of a sub-stream (see
+    /// [`Self::valid_substream_segments`]) *borrowed* from the index, under its
+    /// lock, so a caller that wants a few segments clones those and not the rest
+    /// (#606).
+    ///
+    /// The index is one mutex for every prefix, and the request path reads it on
+    /// every fetch: the read plan, the high watermark and the flush base each
+    /// built the whole view, cloning ~1,000 entries — and their producer
+    /// coordinates — per partition, to use one or two of them. Measured at
+    /// ~28 µs a call, that is a core of serialised work at the fleet's fetch
+    /// rate, which is the ceiling #606 found every replica pinned at.
+    ///
+    /// `f` runs under the lock, so it must not await or do work it could do after
+    /// returning.
+    pub(super) fn with_fenced_segments<T>(
+        &self,
+        prefix: &str,
+        substream: &Substream,
+        partition: i32,
+        f: impl FnOnce(&[FencedRef<'_>]) -> T,
+    ) -> Result<T> {
+        let index = self.prefixes.index()?;
+
+        let mut segs: Vec<(i64, u64, &SubstreamEntry)> = index
             .get(prefix)
             .map(|index| {
                 index
                     .substream_entries(substream, partition)
-                    .map(|(seq, writer_epoch, entry)| (writer_epoch, seq, entry.clone()))
+                    .map(|(seq, writer_epoch, entry)| (writer_epoch, seq, entry))
                     .collect()
             })
             .unwrap_or_default();
@@ -978,7 +1025,7 @@ impl DynoStore {
                 .then_with(|| b.1.cmp(&a.1))
         });
 
-        let mut out: Vec<FencedSegment> = Vec::with_capacity(segs.len());
+        let mut out: Vec<FencedRef<'_>> = Vec::with_capacity(segs.len());
         let mut covered_to = i64::MIN;
         for (_epoch, seq, entry) in segs {
             let end = entry.base_offset + entry.record_count;
@@ -1010,13 +1057,14 @@ impl DynoStore {
             };
 
             covered_to = end;
-            out.push(FencedSegment {
+            out.push(FencedRef {
                 seq,
                 served_from,
                 entry,
             });
         }
-        Ok(out)
+
+        Ok(f(&out))
     }
 
     /// Recover a prefix-coalesced sub-stream's next offset (#58) when the
@@ -1036,9 +1084,7 @@ impl DynoStore {
         self.refresh_prefix_index(&prefix).await?;
 
         let segment_tail = self
-            .valid_substream_segments(&prefix, &substream, topition.partition())?
-            .last()
-            .map(FencedSegment::end)
+            .substream_tail(&prefix, &substream, topition.partition())?
             .unwrap_or(0);
 
         // `persisted_floor` is supplied by the caller (the persisted
@@ -1056,10 +1102,9 @@ impl DynoStore {
     pub(super) async fn segment_region_start(&self, topition: &Topition) -> Result<Option<i64>> {
         let (prefix, substream) = self.routed_substream_of(topition).await?;
         self.refresh_prefix_index(&prefix).await?;
-        Ok(self
-            .valid_substream_segments(&prefix, &substream, topition.partition())?
-            .first()
-            .map(|fenced| fenced.entry.base_offset))
+        self.with_fenced_segments(&prefix, &substream, topition.partition(), |fenced| {
+            fenced.first().map(|fenced| fenced.entry.base_offset)
+        })
     }
 }
 
