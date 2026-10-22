@@ -405,6 +405,13 @@ fmt:
 # ceiling falls further than this move: `main` already measured 2.87445872
 # under the 2.9034 that #594 set.
 #
+#   #607  +380 lines, offsets read error  3174 -> 3177  2.87354241 -> 2.86844172
+#
+# A failed read of a group's offsets object is answered retriably rather than
+# as a group with no offsets, which `auto.offset.reset` replayed whole topics
+# from. The `//` blocks it added cite #607 or #6/#129; most of the lines are a
+# failing object store and the two tests that drive it.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -414,7 +421,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.8736" top="12":
+comments ceiling="2.8685" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

@@ -38,8 +38,21 @@
 //! per-partition objects, so it resumes from the last offset committed before the
 //! upgrade rather than from nothing.
 
+use async_trait::async_trait;
 use bytes::Bytes;
-use object_store::{ObjectStoreExt as _, PutPayload, memory::InMemory, path::Path};
+use futures::stream::BoxStream;
+use object_store::{
+    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
+    ObjectStoreExt as _, PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory,
+    path::Path,
+};
+use std::{
+    fmt::{self, Debug, Display},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering::SeqCst},
+    },
+};
 use tansu_sans_io::{ErrorCode, create_topics_request::CreatableTopic};
 
 use crate::{
@@ -369,6 +382,181 @@ async fn two_replicas_committing_the_same_group_do_not_lose_each_other() -> Resu
             .get(&Topition::new(TOPIC, 1))
             .map(|committed| committed.offset)
     );
+
+    Ok(())
+}
+
+/// Fails every read of the group's `offsets.json` while `failing` is set, the
+/// way a throttled or 5xx-ing bucket does, and passes everything else through.
+#[derive(Clone)]
+struct FailingGroupOffsets {
+    inner: InMemory,
+    failing: Arc<AtomicBool>,
+}
+
+impl Debug for FailingGroupOffsets {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FailingGroupOffsets").finish()
+    }
+}
+
+impl Display for FailingGroupOffsets {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FailingGroupOffsets").finish()
+    }
+}
+
+#[async_trait]
+impl ObjectStore for FailingGroupOffsets {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> Result<PutResult, object_store::Error> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        opts: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> Result<GetResult, object_store::Error> {
+        if self.failing.load(SeqCst) && location.as_ref().ends_with("/offsets.json") {
+            return Err(object_store::Error::Generic {
+                store: "FailingGroupOffsets",
+                source: "503 Slow Down".into(),
+            });
+        }
+
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, Result<Path, object_store::Error>>,
+    ) -> BoxStream<'static, Result<Path, object_store::Error>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list(prefix)
+    }
+
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list_with_offset(prefix, offset)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> Result<ListResult, object_store::Error> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        opts: CopyOptions,
+    ) -> Result<(), object_store::Error> {
+        self.inner.copy_opts(from, to, opts).await
+    }
+}
+
+/// #607: a failed read of the group's offsets object is a retriable error, not
+/// a group with no offsets.
+///
+/// It used to default to empty, so every partition fell through to a
+/// per-partition object that a group created since #415 never had, and the
+/// group was answered `-1` everywhere. `auto.offset.reset=earliest` turned that
+/// into a replay of whole topics — 50 groups across three tenants in one
+/// morning of object-store distress.
+#[tokio::test]
+async fn a_failed_group_offsets_read_is_retriable_not_minus_one() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let writer = DynoStore::new(CLUSTER, NODE, bucket.clone());
+    create_topic(&writer, TOPIC, 2).await?;
+
+    let topitions = [Topition::new(TOPIC, 0), Topition::new(TOPIC, 1)];
+
+    _ = writer
+        .offset_commit(
+            GROUP,
+            None,
+            &topitions
+                .iter()
+                .map(|topition| {
+                    (
+                        topition.clone(),
+                        OffsetCommitRequest::default().offset(1_900_000),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+
+    let failing = Arc::new(AtomicBool::new(true));
+    let reader = DynoStore::new(
+        CLUSTER,
+        NODE,
+        FailingGroupOffsets {
+            inner: bucket.clone(),
+            failing: failing.clone(),
+        },
+    );
+
+    let fetched = reader
+        .offset_fetch(Some(GROUP), &topitions, Some(false))
+        .await;
+
+    assert!(
+        matches!(
+            fetched,
+            Err(Error::Api(ErrorCode::CoordinatorLoadInProgress))
+        ),
+        "{fetched:?}"
+    );
+
+    // The all-topics form: answering it without the group object loses every
+    // partition that lives only there.
+    let all = reader.committed_offset_topitions(GROUP).await;
+
+    assert!(
+        matches!(all, Err(Error::Api(ErrorCode::CoordinatorLoadInProgress))),
+        "{all:?}"
+    );
+
+    // And once the store answers again, so does the group — from where it was.
+    failing.store(false, SeqCst);
+
+    let fetched = reader
+        .offset_fetch(Some(GROUP), &topitions, Some(false))
+        .await?;
+
+    for topition in &topitions {
+        assert_eq!(
+            Some(1_900_000),
+            fetched.get(topition).map(|committed| committed.offset)
+        );
+    }
 
     Ok(())
 }

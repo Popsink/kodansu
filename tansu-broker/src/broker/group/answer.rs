@@ -113,13 +113,16 @@ pub(super) fn leave_group(error_code: ErrorCode) -> Body {
 /// version, so answering in the wrong shape produces a response with no error
 /// code in it at all — a success, as far as the client is concerned. Mirroring
 /// the request is what the coordinator's own `offset_fetch` does.
+///
+/// Up to v7 `topics` is a required array, so the legacy shape answers it empty:
+/// `None` there failed to encode and dropped the connection instead (#607).
 pub(super) fn offset_fetch(
     error_code: ErrorCode,
     groups: Option<&[OffsetFetchRequestGroup]>,
 ) -> Body {
     OffsetFetchResponse::default()
         .throttle_time_ms(Some(0))
-        .topics(None)
+        .topics(groups.is_none().then(Vec::new))
         .error_code(Some(error_code.into()))
         .groups(groups.map(|groups| {
             groups
@@ -249,6 +252,7 @@ mod tests {
             fetch.error_code.map(ErrorCode::try_from).transpose()?
         );
         assert_eq!(None, fetch.groups);
+        assert_eq!(Some(vec![]), fetch.topics);
 
         Ok(())
     }
