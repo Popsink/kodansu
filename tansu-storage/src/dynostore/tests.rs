@@ -38,6 +38,7 @@ mod divergent_batch;
 mod fenced_overlap;
 mod fetch_read_concurrency;
 mod flush_conflict;
+mod flush_queue;
 mod gcs;
 mod gcs_generation;
 mod gcs_retry;
