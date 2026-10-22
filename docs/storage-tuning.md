@@ -58,11 +58,27 @@ cluster-wide produce rate:
 > coalescing and client-side batching compose — the broker can only merge what
 > the client sends it as distinct batches.
 
+Since produce pipelining (#588), the linger is no longer the only thing that
+closes a busy producer's window. A connection reads up to `--pipeline-depth`
+requests ahead of their answers, so one producer's in-flight requests share a
+window, and that window flushes on size as soon as they fill `coalesce_bytes`.
+A window that closes on size never pays the linger. Whether one producer *can*
+fill it is the subject of
+[`coalesce_bytes` — the ceiling one writer can fill](#coalesce_bytes--the-ceiling-one-writer-can-fill):
+past that ceiling every window waits out the timer again, and the longer the
+linger, the more that costs.
+
 Validate any change by sweeping the param in one deployment and watching S3
 `PutRequests` (CloudWatch) against produce p99 latency, rather than adopting a
 figure blind.
 
 ### The linger is also a per-connection request-rate ceiling
+
+> Measured before produce pipelining (#588). At the default
+> `--pipeline-depth 5` a connection's produce requests are read five ahead and
+> share a window, so the ceiling below is what `--pipeline-depth 1` gives, and
+> what a client that sends one request at a time still gets. The next sections
+> say what changed.
 
 A broker connection is served **one request at a time**: the loop reads a frame,
 answers it, and only then reads the next. (Apache Kafka does the same — it mutes
@@ -132,9 +148,125 @@ the order the client wrote them, as the batches within one entry always have. No
 Kafka client sends that shape and the protocol does not say what it means, but a
 hand-rolled one that does gets ordering rather than a race.
 
-This does not move the per-connection ceiling — that is still one request at a
-time per connection, and still `1 / (linger + PUT)`. It removes the penalty for
-*width*, which is the dimension a CDC workload grows in.
+This does not move the per-connection ceiling, which depends on depth, not
+width (see the next section). It removes the penalty for *width*, which is the
+dimension a CDC workload grows in.
+
+### `coalesce_bytes` — the ceiling one writer can fill
+
+The section above describes a connection served one request at a time, which
+is what `--pipeline-depth 1` still gives. At the default depth of 5 (#588), a
+connection reads up to five produce requests (`acks=1` or `all`) before the
+first is answered, and they land in the same window. The window then closes on
+whichever trigger fires first, and for one busy producer that is either
+`coalesce_bytes` or the linger.
+
+One producer can put at most **`pipeline_depth × request size`** into a window
+before it has to wait for an ack — the smaller of the broker's
+`--pipeline-depth` and the producer's `max.in.flight.requests.per.connection`,
+times what each request carries. That is a ceiling on `coalesce_bytes`, for a
+prefix with one writer:
+
+- **`coalesce_bytes ≤ pipeline_depth × request size`**: windows close on size,
+  and the linger stops costing throughput.
+- **`coalesce_bytes` above it**: no window ever reaches the byte trigger. Every
+  window waits out the full linger with the producer stalled behind it, and
+  holds only what one depth of requests carried.
+
+The `coalesce_batches` count trigger (64) does not rescue it in the common
+case: five requests of one partition each are five batches.
+
+#### Measured (#591)
+
+- #589's build (`1208c653`), release profile, against `compose.yaml`'s minio,
+  with the bucket emptied before every run.
+- `kafka-producer-perf-test` from `apache/kafka:4.1.0`: one idempotent producer,
+  one partition, 600 000 × 500 B records, `acks=all`, lz4, `linger.ms=50`,
+  `batch.size=524288`, `max.in.flight=5`; broker at the default
+  `--pipeline-depth 5`.
+- The producer's own metrics on that workload: 957 records per request (one
+  partition, so one batch per request), `batch-size-avg` 485 691 B, max
+  499 488 B, `compression-rate-avg` 0.995 — the payload is effectively
+  incompressible, so wire bytes are PUT bytes. Five requests are ~2.4 MB: the
+  ceiling sits between 2 and 4 MiB.
+- Two repetitions per cell, ranges shown. Every run's segments were all in the
+  bucket, with no broker warning or error.
+
+Records/s · segment PUTs · average produce latency:
+
+| `coalesce_bytes` | 50 ms linger | 1 s linger |
+|---|---|---|
+| `1M` (default) | 230k–241k · 225 · ~204 ms | 162k · 216–218 · ~325 ms |
+| **`2M`** | **245k–249k · 139–146 · ~190 ms** | **201k–228k · 133–138 · 221–248 ms** |
+| `4M` | 57k–58k · 125 · ~980 ms | **4.5k–4.6k** · 125 · ~12.8 s |
+| `8M` | 60k–61k · 125 · ~930 ms | **4.6k** · 125 · ~12.7 s |
+
+Every `4M` and `8M` run wrote exactly **125 segments of ~2.4 MB** — 300 MB ÷
+125. That is the in-flight ceiling, not the configured cap.
+
+Just under the ceiling is the sweet spot: at `2M`, 512 KiB requests take ~38 %
+fewer PUTs than the default at the same throughput with a 50 ms linger, and
+24–40 % more throughput with a 1 s linger.
+
+#### Why the cost past the ceiling depends on the linger
+
+Past the ceiling a window holds one depth of requests — ~2.4 MB here — and lasts
+one linger, so throughput is roughly `pipeline_depth × request size / linger`,
+whatever `coalesce_bytes` says. That is ~4× slower than `2M` at a 50 ms linger
+and **44–50× slower at 1 s**, a typical production linger, where it falls to
+2.2 MB/s against 96–109 MB/s at `2M`. The longer the linger you
+chose for its PUT savings, the harder a `coalesce_bytes` past the ceiling
+undoes it.
+
+#### Small requests are already past it at the default
+
+At depth 5, any request under **~205 KiB** (1 MiB ÷ 5) cannot fill the default
+`1M` window from one producer, so those windows already close on the timer.
+#589's own runs show it: 128 KiB requests at a 50 ms linger, default
+`coalesce_bytes`, gave 15.1k–16.6k records/s — five requests are 640 KiB, under
+the cap. Pipelining still helped there (167 PUTs and ~4× the throughput of the
+unpipelined broker), because five requests now share each window instead of
+one. It was not measured at a 1 s linger, where the rule predicts the same
+collapse as the `4M` row above.
+
+So raising `coalesce_bytes` is a trade across the fleet's request sizes: `2M`
+wins for 512 KiB requests and loses nothing for larger ones, but moves smaller
+requests further past their ceiling. Larger requests at the source raise the
+ceiling — 2 MiB requests put it near 8 MiB at depth 5. The default stays at
+`1M` until there is fleet data on request sizes, records per batch and writers
+per prefix to choose by.
+
+#### Several writers on one prefix raise it
+
+The window is per prefix, not per connection, so every producer writing under
+the prefix contributes its in-flight requests to the same window. Two writers
+at depth 5 can fill twice the bytes before either needs an ack. That follows
+from the buffer being keyed by prefix; it has not been measured.
+
+#### Backfill mode moves the ceiling out of reach
+
+A batch of **at least 1 000 records** (`PREFIX_BACKFILL_MIN_RECORDS`,
+`tansu-storage/src/dynostore.rs`) marks its window as backfill when it is
+admitted, and a backfill window's triggers relax in `flush_thresholds`
+(`tansu-storage/src/dynostore/coalesce.rs`): the byte trigger becomes
+`max(coalesce_bytes, 32 MiB)` (`BACKFILL_COALESCE_BYTES`), and the count
+trigger moves past the 100 000-record cap (`COALESCE_MAX_RECORDS`), which is
+left as the only other limit. That was designed for bulk backfill (#90), where
+each large batch should flush as roughly its own segment instead of one small
+segment per batch.
+
+With pipelining it also catches an ordinary steady producer. The benchmark
+above sat at 957 records per batch, just under the threshold. The same 512 KiB
+`batch.size` with ~100 B records is ~5 000 records per batch: every window is
+then backfill, its byte trigger is 32 MiB, five requests are ~2.5 MB, and
+25 000 records are well under the record cap. Nothing but the linger closes the
+window, so the producer is timer-bound **whatever `coalesce_bytes` says** —
+the `4M` row at its linger.
+
+That is a prediction from the code, not a measurement: the case (≥ 1 000
+records per batch, one producer, 1 s linger, on minio) has not been benchmarked
+yet. Until it has, do not count on #588 to lift the linger for a small-record
+producer with large batches.
 
 ## `segment_format` — the footer version this deployment writes
 
