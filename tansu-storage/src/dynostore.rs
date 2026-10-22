@@ -770,6 +770,9 @@ pub struct CoalesceTuning {
     pub prefix_compact_min_segments: Option<usize>,
     pub prefix_compact_target_bytes: Option<usize>,
     pub prefix_compact_keep_hot: Option<usize>,
+    /// Largest sub-stream region a compaction writes (#610); `0` writes each
+    /// sub-stream as one region. See [`DynoStore::PREFIX_COMPACT_REGION_BYTES`].
+    pub prefix_compact_region_bytes: Option<usize>,
     /// Per-partition `seen` key-set cap for the per-key compaction pass (#175).
     pub prefix_compact_seen_keys: Option<usize>,
     /// Maintenance recency window (#126); set to ~0.9× `maintenance_interval`.
@@ -1881,6 +1884,28 @@ impl DynoStore {
     /// [`Self::PREFIX_COMPACT_MIN_SEGMENTS`] (a count trigger, independent of the
     /// target), not by this size. Overridable via `prefix_compact_target_bytes`.
     const PREFIX_COMPACT_TARGET_BYTES: usize = 16 << 20;
+
+    /// Largest sub-stream region a compaction writes (#610): a sub-stream with
+    /// more bytes than this in a merged segment is written as several footer
+    /// entries, split at batch boundaries, rather than one.
+    ///
+    /// A `Fetch` reads every region its plan admits with one ranged GET over the
+    /// region's whole extent, and returns at most `max_bytes` plus one batch of
+    /// it (#535). On an uncompacted prefix a region is one flush window, so that
+    /// is cheap; a merge used to fold a sub-stream into one region of up to
+    /// [`Self::PREFIX_COMPACT_TARGET_BYTES`], and a consumer working through it
+    /// paid that whole GET on every `Fetch`. Measured with 64 MiB targets: 12.6
+    /// GiB read from the store to serve 286 MiB, and ~4.4 MB/s for one
+    /// partition.
+    ///
+    /// The read side needs nothing new: the plan already skips whole regions by
+    /// offset, so a fetch reads about `max_bytes` plus one region. 1 MiB is
+    /// Kafka's default `max.partition.fetch.bytes` and this engine's default
+    /// `coalesce_bytes`, which keeps a catching-up consumer within ~2x of the
+    /// bytes it is served — and, because an uncompacted flush window is at most
+    /// that size too, a merge never leaves a sub-stream with more entries than
+    /// the flushes it merged had. Overridable via `prefix_compact_region_bytes`.
+    const PREFIX_COMPACT_REGION_BYTES: usize = 1 << 20;
 
     /// Newest segments never compacted (#66): the actively-produced tail is left
     /// out of the merge, so compaction never rewrites a segment a producer is

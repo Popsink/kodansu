@@ -168,6 +168,8 @@ pub(super) struct Tuning {
     pub(super) prefix_compact_min_segments: usize,
     pub(super) prefix_compact_target_bytes: usize,
     pub(super) prefix_compact_keep_hot: usize,
+    /// Largest sub-stream region a compaction writes (#610), `0` for no cap.
+    pub(super) prefix_compact_region_bytes: usize,
 
     /// Bound on the per-key pass's `seen` key set for one partition (#175). The
     /// set is O(distinct keys per partition) — identical to the legacy
@@ -211,6 +213,7 @@ impl Tuning {
             prefix_compact_min_segments,
             prefix_compact_target_bytes,
             prefix_compact_keep_hot,
+            prefix_compact_region_bytes,
             prefix_compact_seen_keys,
             maintenance_recency,
             flush_max_elapsed,
@@ -237,6 +240,7 @@ impl Tuning {
             prefix_compact_min_segments,
             prefix_compact_target_bytes,
             prefix_compact_keep_hot,
+            prefix_compact_region_bytes,
             prefix_compact_seen_keys,
             maintenance_recency,
             flush_max_elapsed,
@@ -267,6 +271,7 @@ impl Tuning {
             prefix_compact_min_segments: DynoStore::PREFIX_COMPACT_MIN_SEGMENTS,
             prefix_compact_target_bytes: DynoStore::PREFIX_COMPACT_TARGET_BYTES,
             prefix_compact_keep_hot: DynoStore::PREFIX_COMPACT_KEEP_HOT,
+            prefix_compact_region_bytes: DynoStore::PREFIX_COMPACT_REGION_BYTES,
             prefix_compact_seen_keys: DynoStore::PREFIX_COMPACT_SEEN_KEYS,
             maintenance_recency: DynoStore::MAINTENANCE_RECENCY,
             flush_max_elapsed: DynoStore::FLUSH_MAX_ELAPSED,

@@ -331,8 +331,9 @@ impl DynoStore {
             //
             // Every input to the decision is an index field: the offset skip and
             // the high-watermark stop come from `base_offset`/`record_count`, and
-            // the byte budget consumes `entry.byte_len`, which is the cached
-            // footer's claim and not the response's length. So the set of
+            // the byte budget consumes `entry.byte_len` (prorated above the fetch
+            // offset, #610), which is the cached footer's claim and not the
+            // response's length. So the set of
             // segments this fetch will read is known before the first GET — which
             // is the whole reason the reads can be concurrent instead of a chain.
             //
@@ -369,7 +370,7 @@ impl DynoStore {
                         // region, pushed its batches, and only then compared.
                         // Preserved exactly — returning one region fewer per round
                         // trip is a behaviour change a client would see.
-                        let byte_len = fenced.entry.byte_len;
+                        let byte_len = fenced.bytes_from(offset);
                         plan.push(fenced.cloned());
 
                         if byte_len > bytes {
