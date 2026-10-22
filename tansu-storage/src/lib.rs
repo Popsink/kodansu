@@ -297,6 +297,19 @@ pub struct DivergentBatch {
 pub enum Error {
     Api(ErrorCode),
 
+    /// The object store behind the storage URL does not honour the
+    /// conditional writes the broker is built on (#597), so the store is not
+    /// built. `reason` names the header that was ignored or the error the probe
+    /// got instead, and how to proceed — see `DynoStore::conditional_put_probed`.
+    ///
+    /// Fatal on purpose. A store that ignores `If-None-Match: *` or `If-Match`
+    /// does not error, it overwrites: produce, fetch and `ping()` all work, and
+    /// the damage is duplicated offsets and lost group state under concurrency.
+    ConditionalPutRefused {
+        scheme: String,
+        reason: String,
+    },
+
     /// A segment region whose bytes are not the batch frames its footer entry
     /// claims (#386). Answered to the client as `CORRUPT_MESSAGE` for that
     /// partition — see [`storage_error_code`].
@@ -2319,6 +2332,14 @@ fn coalesce_tuning(storage: &Url) -> CoalesceTuning {
                     .ok()
                     .and_then(|size| u32::try_from(size).ok());
             }
+            "fetch_read_concurrency" => {
+                tuning.fetch_read_concurrency = value
+                    .parse()
+                    .inspect_err(
+                        |err| warn!(storage = %storage, key = "fetch_read_concurrency", value, ?err),
+                    )
+                    .ok();
+            }
             "prefix_compact_min_segments" => {
                 tuning.prefix_compact_min_segments = value
                     .parse()
@@ -2486,6 +2507,8 @@ impl Builder<i32, String, Url, Url> {
                             .message_max_bytes(message_max_bytes(&self.storage))
                     })
                     .map_err(Error::from)?
+                    .conditional_put_probed(&self.storage)
+                    .await?
                     .sealed_prefix_shape()
                     .await
                     .map(|storage| {
@@ -2559,6 +2582,8 @@ impl Builder<i32, String, Url, Url> {
                             .message_max_bytes(message_max_bytes(&self.storage))
                     })
                     .map_err(Error::from)?
+                    .conditional_put_probed(&self.storage)
+                    .await?
                     .sealed_prefix_shape()
                     .await
                     .map(|storage| {
@@ -2657,6 +2682,8 @@ impl Builder<i32, String, Url, Url> {
                             .message_max_bytes(message_max_bytes(&self.storage))
                     })
                     .map_err(Error::from)?
+                    .conditional_put_probed(&self.storage)
+                    .await?
                     .sealed_prefix_shape()
                     .await
                     .map(|storage| {
@@ -3181,6 +3208,28 @@ mod tests {
             None,
             coalesce_tuning(&Url::parse("s3://tansu/?fetch_max_bytes=4G")?).fetch_max_bytes
         );
+
+        Ok(())
+    }
+
+    /// The region read fan-out (#587): absent, unparseable or zero keeps
+    /// [`dynostore::DynoStore::FETCH_READ_CONCURRENCY`] — zero refused rather
+    /// than taken, because `buffered(0)` never polls a read and the fetch
+    /// would hang until the client's timeout.
+    #[cfg(feature = "dynostore")]
+    #[test]
+    fn fetch_read_concurrency_parses() -> Result<()> {
+        let parse = |url: &str| -> Result<Option<usize>> {
+            Ok(coalesce_tuning(&Url::parse(url)?)
+                .fetch_read_concurrency
+                .map(std::num::NonZeroUsize::get))
+        };
+
+        assert_eq!(Some(128), parse("s3://tansu/?fetch_read_concurrency=128")?);
+        assert_eq!(None, parse("s3://tansu/")?);
+        assert_eq!(None, parse("s3://tansu/?fetch_read_concurrency=lots")?);
+        assert_eq!(None, parse("s3://tansu/?fetch_read_concurrency=0")?);
+        assert_eq!(None, parse("s3://tansu/?fetch_read_concurrency=-1")?);
 
         Ok(())
     }

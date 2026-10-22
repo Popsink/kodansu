@@ -251,6 +251,42 @@ feeds `all-green`.
 That is a real gain and it is also the *whole* gain. What a green Azurite run
 does not prove is below, and it is not a short list.
 
+### At boot: the conditional-put probe (#597)
+
+The conformance target pins the stores CI runs. It cannot pin the store an
+operator points `s3://` at, and a store that *ignores* `If-None-Match: *` or
+`If-Match` does not error — it overwrites. `ping()` succeeds, produce and fetch
+work, and the damage turns up later as duplicated offsets and lost group state.
+
+So every `s3`, `gs` and `az`/`abfss` store is probed when it is built, before
+the prefix-shape seal (which is itself a create-only PUT replicas race for), on
+a key of the replica's own — `__probe/conditional-put/<writer id>-<uuid>`,
+outside every cluster's tree:
+
+| step | request | a conforming store |
+|---|---|---|
+| 1 | create-only PUT | succeeds |
+| 2 | create-only PUT, same key | `AlreadyExists` |
+| 3 | PUT on a version it never issued (`invented_version()`'s shape) | `Precondition` |
+| 4 | PUT on the version step 1 returned | succeeds |
+| 5 | DELETE | — |
+
+Step 2 or 3 succeeding refuses to start with `ConditionalPutRefused`, naming the
+ignored header (`x-goog-if-generation-match` on `gs`) and the scheme; any other
+error in steps 1–4 (`NotImplemented`, a `400`, bad credentials) is a refusal
+carrying that error. `memory://` and `null://` are not probed. The outcome is an
+INFO or ERROR line and `tansu_conditional_put_probes{scheme, outcome}`, with
+`outcome` one of `conforming`, `skipped`, `if_none_match_ignored`,
+`if_match_ignored` and `failed`.
+
+`?skip_conditional_put_check=true` on the storage URL skips it, with a WARN on
+every start. Only `true` skips: any other value warns and probes.
+
+The probe is unit-tested against an `ObjectStore` wrapper that drops one
+precondition at a time (`dynostore/tests/conditional_put_probe.rs`). It costs
+four PUTs and a DELETE per store build; on `gs` the per-object rate limiter
+spaces those PUTs about a second apart.
+
 ### One divergence between `InMemory` and S3
 
 `InMemory`'s etag is a per-object **write counter**; S3's is the **MD5 of the

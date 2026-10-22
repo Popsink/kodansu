@@ -48,8 +48,9 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map::Entry},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, btree_map::Entry},
     fmt::{Debug, Display, Write as _},
+    num::NonZeroUsize,
     str::FromStr,
     sync::{
         Arc, LazyLock, Mutex,
@@ -103,7 +104,7 @@ use tansu_sans_io::{
     to_system_time,
     txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
 };
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, instrument, warn};
 use url::Url;
@@ -124,6 +125,7 @@ mod metron;
 mod object;
 mod opticon;
 mod principals;
+mod probe;
 mod retention;
 mod routing;
 mod segments;
@@ -217,6 +219,13 @@ pub struct DynoStore {
     /// produce and its flush.
     prefix_coalesce_buffers: Arc<Mutex<BTreeMap<String, PrefixCoalesceBuffer>>>,
 
+    /// Per-prefix FIFO of closed windows waiting for their segment PUT (#590),
+    /// drained by one worker per prefix. Only ever locked after
+    /// `prefix_coalesce_buffers` (or alone), never before it, which is what
+    /// lets a window be taken and enqueued in one critical section. See
+    /// [`PrefixFlushQueue`].
+    prefix_flush_queues: Arc<Mutex<BTreeMap<String, PrefixFlushQueue>>>,
+
     object_store: Arc<DynObjectStore>,
 
     /// The same cache as `object_store`, typed, so a test can expire its etag
@@ -254,6 +263,40 @@ struct PrefixCoalesceBuffer {
     /// backfill floors so a folded-in snapshot (#90) coalesces into a few large
     /// segments instead of one per batch. Reset with the buffer on flush.
     backfill: bool,
+}
+
+/// The closed windows of one prefix, waiting for their segment PUT in the order
+/// they closed (#590).
+///
+/// A window is pushed here in the same critical section of
+/// `prefix_coalesce_buffers` that takes it — by the threshold path and the
+/// linger timer alike — so queue order is close order by construction, and one
+/// worker drains it front to back: one flush in flight per prefix, as when
+/// the threshold flush ran inline, but off the admitting task.
+#[derive(Debug)]
+struct PrefixFlushQueue {
+    closed: VecDeque<PrefixCoalesceBuffer>,
+    /// Windows ever pushed: the 1-based position the next one takes.
+    enqueued: u64,
+    /// Whether a worker is draining `closed`. Set by whoever pushes onto an
+    /// idle queue, cleared by the worker when it finds `closed` empty — both
+    /// under the lock, so there is never more than one worker and a pushed
+    /// window is never left without one.
+    draining: bool,
+    /// Windows whose flush has started, which admission back-pressure waits
+    /// on (see [`DynoStore::FLUSH_QUEUE_DEPTH`]).
+    started: watch::Sender<u64>,
+}
+
+impl Default for PrefixFlushQueue {
+    fn default() -> Self {
+        Self {
+            closed: VecDeque::new(),
+            enqueued: 0,
+            draining: false,
+            started: watch::Sender::new(0),
+        }
+    }
 }
 
 /// The durable per-prefix single-writer lease (#59), stored at
@@ -761,6 +804,13 @@ pub struct CoalesceTuning {
     /// the bound is per fetch in flight — for fewer round trips per record,
     /// which is the only term a single-partition consumer can amortise.
     pub fetch_max_bytes: Option<u32>,
+
+    /// Ranged region GETs one `Fetch` keeps in flight per sub-stream (#587);
+    /// `None` keeps [`DynoStore::FETCH_READ_CONCURRENCY`]. The number of GETs a
+    /// fetch makes does not change with it, only how many wait at once, so
+    /// raising it trades burstiness against the store's per-prefix request
+    /// rate, and region bodies held in memory, for fewer round trips.
+    pub fetch_read_concurrency: Option<NonZeroUsize>,
 }
 
 /// Process-wide counter making each [`DynoStore`]'s `writer_id` unique (#59), so
@@ -1644,6 +1694,7 @@ impl DynoStore {
             tuning: Tuning::new(),
             clients: ClientCaches::default(),
             prefix_coalesce_buffers: Arc::new(Mutex::new(BTreeMap::new())),
+            prefix_flush_queues: Arc::new(Mutex::new(BTreeMap::new())),
             topics: TopicCaches::default(),
             prefixes: PrefixCaches::default(),
             prefix_locks: PrefixLocks::default(),
@@ -1779,6 +1830,12 @@ impl DynoStore {
     const COALESCE_BATCHES: usize = 64;
     const COALESCE_BYTES: usize = 1 << 20;
     const COALESCE_MAX_RECORDS: i64 = 100_000;
+
+    /// Ranged region GETs in flight for one sub-stream's fetch (#426), matching
+    /// the footer warm's `FOOTER_FETCH_CONCURRENCY` and every other fan-out in
+    /// the engine. Overridable via `fetch_read_concurrency` (#587): a fetch over
+    /// small regions waits about one round trip per this many regions.
+    pub const FETCH_READ_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 
     /// Byte floor for a flush buffer that has ingested a backfill-class batch
     /// (span ≥ [`Self::PREFIX_BACKFILL_MIN_RECORDS`]) once the #62 bypass is

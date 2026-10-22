@@ -323,12 +323,6 @@ impl DynoStore {
         /// restart cleanly. Bounded so a genuinely missing object can't loop.
         const MAX_ATTEMPTS: usize = 3;
 
-        /// Ranged region GETs in flight for one sub-stream (#426), matching the
-        /// footer warm's `FOOTER_FETCH_CONCURRENCY` immediately above it and every
-        /// other fan-out in the engine (`list_offsets`, `offset_commit`,
-        /// `offset_fetch`, `metadata_fetch`, `list_state`, `describe`).
-        const SEGMENT_READ_CONCURRENCY: usize = 32;
-
         let (prefix, substream) = self.routed_substream_of(topition).await?;
 
         for _ in 0..MAX_ATTEMPTS {
@@ -487,7 +481,8 @@ impl DynoStore {
                 })
                 .collect::<Vec<_>>();
 
-            let mut reads = futures::stream::iter(reads).buffered(SEGMENT_READ_CONCURRENCY);
+            let mut reads =
+                futures::stream::iter(reads).buffered(self.tuning.fetch_read_concurrency.get());
 
             let mut batches = vec![];
             let mut restart = false;

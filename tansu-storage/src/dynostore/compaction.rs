@@ -16,6 +16,8 @@
 //! Compaction (#66): the size-merge that bounds the segment count, and the
 //! per-key pass that enforces `cleanup.policy=compact` (#175).
 
+use std::ops::Range;
+
 use super::*;
 
 impl CompactRun {
@@ -25,6 +27,185 @@ impl CompactRun {
             Self::Drained => "drained",
             Self::Retry => "retry",
         }
+    }
+}
+
+/// What a break in a run's tiling actually is (#594), and so how loudly it is
+/// reported — the `reason` on `tansu_prefix_segment_compact_refused`.
+///
+/// Every break refuses the run either way (#399, #461): the merge reads its
+/// output back by running offsets from the first region, so any break shifts
+/// the records above it. What differs is whether a record is gone. All
+/// breaks used to be one `ERROR` line, ~58k a week on the EU fleet, and the
+/// read-path checks in #594 found every conclusive sample readable — so the
+/// one signal that would show a new #461 hole was buried under false alarms.
+/// Now only [`Self::Missing`] is an error, and `reason="missing"` is the rate
+/// to alert on.
+///
+/// Declared in ascending severity, so the worst break of a run is its `max`.
+#[derive(Copy, Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) enum TilingBreak {
+    /// Every missing offset is served by a live segment outside the run: the
+    /// common case, a merged segment's fresh high sequence holding the low
+    /// offsets between two older run members.
+    OutsideRun,
+
+    /// The offsets nothing serves are all below the partition's log start —
+    /// under its `DeleteRecords` floor, or in the aged head retention is about
+    /// to delete.
+    BelowLogStart,
+
+    /// The partition's topic is `cleanup.policy=compact`, where a gap is
+    /// expected rather than a loss.
+    CompactedTopic,
+
+    /// Not a gap: a region starts *below* where the previous one ended, the
+    /// fenced view having clipped it inside a batch it cannot split. Nothing is
+    /// lost, but the overlap it comes from is meant to be flat zero
+    /// (`tansu_prefix_segment_overlap_clipped`).
+    Straddle,
+
+    /// Offsets above the log start that no live segment holds: #461.
+    Missing,
+}
+
+impl TilingBreak {
+    /// Classify the break where the run expected `expected` and its next region
+    /// starts at `region_base`, given the `[from, to)` spans the live segments
+    /// outside the run serve.
+    pub(super) fn of(
+        expected: i64,
+        region_base: i64,
+        outside: &[(i64, i64)],
+        log_start: i64,
+        compacted: bool,
+    ) -> Self {
+        if region_base < expected {
+            return Self::Straddle;
+        }
+
+        match highest_unserved(expected..region_base, outside) {
+            None => Self::OutsideRun,
+            Some(offset) if offset < log_start => Self::BelowLogStart,
+            Some(_) if compacted => Self::CompactedTopic,
+            Some(_) => Self::Missing,
+        }
+    }
+
+    pub(super) fn reason(self) -> &'static str {
+        match self {
+            Self::OutsideRun => "outside_run",
+            Self::BelowLogStart => "below_log_start",
+            Self::CompactedTopic => "compacted_topic",
+            Self::Straddle => "straddle",
+            Self::Missing => "missing",
+        }
+    }
+
+    /// `warn` for a straddle because it was an `ERROR` before #594 and still
+    /// marks the overlap shape #461 came from; production runs at `warn`.
+    pub(super) fn level(self) -> tracing::Level {
+        match self {
+            Self::OutsideRun | Self::BelowLogStart | Self::CompactedTopic => tracing::Level::DEBUG,
+            Self::Straddle => tracing::Level::WARN,
+            Self::Missing => tracing::Level::ERROR,
+        }
+    }
+
+    fn log(self, prefix: &str, topic: &str, partition: i32, seq: u64, gap: (i64, i64)) {
+        let (expected, region_base) = gap;
+        let reason = self.reason();
+
+        macro_rules! refusal {
+            ($level:ident) => {
+                $level!(
+                    prefix,
+                    topic,
+                    partition,
+                    seq,
+                    expected,
+                    region_base,
+                    reason,
+                    "refusing to compact: the run's fenced regions do not tile \
+                     contiguously, and merging them would shift offsets"
+                )
+            };
+        }
+
+        match self.level() {
+            tracing::Level::ERROR => refusal!(error),
+            tracing::Level::WARN => refusal!(warn),
+            _ => refusal!(debug),
+        }
+    }
+}
+
+/// The highest offset in `range` that none of the `[from, to)` spans serve.
+fn highest_unserved(range: Range<i64>, spans: &[(i64, i64)]) -> Option<i64> {
+    let mut spans = spans.to_vec();
+    spans.sort_unstable();
+
+    let mut cursor = range.start;
+    let mut highest = None;
+    for (from, to) in spans {
+        if cursor >= range.end {
+            break;
+        }
+
+        if from > cursor {
+            highest = Some(from.min(range.end) - 1);
+        }
+
+        cursor = cursor.max(to);
+    }
+
+    if cursor < range.end {
+        highest = Some(range.end - 1);
+    }
+
+    highest
+}
+
+/// Each `(seq, expected, region_base)` where `in_run` stops tiling `[base, ..)`.
+///
+/// Re-anchored past each break, so a second break in the same sub-stream is
+/// found in the same pass.
+fn tiling_breaks(in_run: &[(u64, i64, Vec<deflated::Batch>)]) -> Vec<(u64, i64, i64)> {
+    let mut breaks = Vec::new();
+    let Some(&(_, mut expected, _)) = in_run.first() else {
+        return breaks;
+    };
+
+    for (seq, region_base, region) in in_run {
+        if *region_base != expected {
+            breaks.push((*seq, expected, *region_base));
+            expected = *region_base;
+        }
+
+        expected += region
+            .iter()
+            .map(|batch| batch.last_offset_delta as i64 + 1)
+            .sum::<i64>();
+    }
+
+    breaks
+}
+
+/// The time retention ages `cached` by, as `expire_prefix_segments` does: its
+/// newest record, or the object's append time when timestamps are unset.
+fn retention_age_ms(cached: &CachedSegment) -> i64 {
+    let newest = cached
+        .footer
+        .entries
+        .iter()
+        .map(|e| e.max_timestamp)
+        .max()
+        .unwrap_or(i64::MIN);
+
+    if newest > 0 {
+        newest
+    } else {
+        cached.last_modified_ms
     }
 }
 
@@ -272,6 +453,7 @@ impl DynoStore {
         let mut substreams: Vec<SubstreamWrite> = Vec::new();
         let mut merged_epoch = i64::MIN;
         let mut seams: BTreeSet<u64> = BTreeSet::new();
+        let mut worst: Option<TilingBreak> = None;
 
         for (substream, topic, partition) in substream_keys {
             let in_run = self.decode_fenced_regions(prefix, &substream, partition, &objects)?;
@@ -309,38 +491,26 @@ impl DynoStore {
             // the segments on either side merge as their own runs. Every seam is
             // collected before returning, not just the first, so the prefix
             // converges in one pass rather than one seam per pass.
-            let mut expected = base;
-            let mut tiles = true;
-            for (seq, region_base, region) in &in_run {
-                if *region_base != expected {
-                    tiles = false;
-                    _ = seams.insert(*seq);
+            let breaks = tiling_breaks(&in_run);
+            for &(seq, expected, region_base) in &breaks {
+                _ = seams.insert(seq);
 
-                    error!(
+                let class = self
+                    .classify_tiling_break(
                         prefix,
-                        topic,
-                        partition,
-                        seq,
-                        expected,
-                        region_base,
-                        "refusing to compact: the run's fenced regions do not tile \
-                         contiguously, and merging them would shift offsets"
-                    );
-
-                    // Re-anchor past the break so a second seam in the same
-                    // sub-stream is found in this pass too.
-                    expected = *region_base;
-                }
-
-                expected += region
-                    .iter()
-                    .map(|batch| batch.last_offset_delta as i64 + 1)
-                    .sum::<i64>();
+                        &substream,
+                        &Topition::new(topic.as_str(), partition),
+                        &run,
+                        (expected, region_base),
+                    )
+                    .await;
+                class.log(prefix, &topic, partition, seq, (expected, region_base));
+                worst = worst.max(Some(class));
             }
 
             // The run is already refused; this sub-stream's batches would only
             // be carried into a merge that will not happen.
-            if !tiles {
+            if !breaks.is_empty() {
                 continue;
             }
 
@@ -359,8 +529,8 @@ impl DynoStore {
             });
         }
 
-        if !seams.is_empty() {
-            SEGMENT_COMPACT_REFUSED.add(1, &[KeyValue::new("reason", "run_not_contiguous")]);
+        if let Some(worst) = worst {
+            SEGMENT_COMPACT_REFUSED.add(1, &[KeyValue::new("reason", worst.reason())]);
 
             // `Retry` when something was learned: the drain loop re-selects at
             // once with the seams honoured, so both sides of each break merge in
@@ -422,6 +592,97 @@ impl DynoStore {
         );
 
         Ok(CompactRun::Merged(run.len() as u64))
+    }
+
+    /// Classify the break `gap = (expected, region_base)` in `run`'s tiling of
+    /// `topition` (#594), from the cached index and what this process already
+    /// knows of the partition.
+    ///
+    /// Infallible on purpose: a lookup that fails leaves the break looking
+    /// *worse*, never better — no outside coverage, no log start, not
+    /// compacted — so an outage cannot hide a real hole at `debug`.
+    pub(super) async fn classify_tiling_break(
+        &self,
+        prefix: &str,
+        substream: &Substream,
+        topition: &Topition,
+        run: &[u64],
+        gap: (i64, i64),
+    ) -> TilingBreak {
+        let (expected, region_base) = gap;
+
+        let outside: Vec<(i64, i64)> = self
+            .valid_substream_segments(prefix, substream, topition.partition())
+            .inspect_err(|err| warn!(?err, prefix))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|fenced| !run.contains(&fenced.seq))
+            .map(|fenced| (fenced.served_from, fenced.end()))
+            .collect();
+
+        let log_start = self
+            .tiling_log_start(prefix, substream, topition)
+            .await
+            .inspect_err(|err| warn!(?err, prefix))
+            .unwrap_or(i64::MIN);
+
+        let compacted = self
+            .topic_is_compacted(topition.topic())
+            .await
+            .inspect_err(|err| warn!(?err, prefix))
+            .unwrap_or_default();
+
+        TilingBreak::of(expected, region_base, &outside, log_start, compacted)
+    }
+
+    /// Where `topition`'s log will start once retention has run (#594): its
+    /// `DeleteRecords` floor, or past the head of segments already older than
+    /// the prefix's retention threshold, whichever is higher.
+    ///
+    /// The head and not every aged segment, because retention walks a
+    /// sub-stream in offset order and stops at the first segment it keeps.
+    /// That head is what the EU check in #594 found under 7 of 12 refusals:
+    /// segments still indexed, still selected, already past retention.
+    async fn tiling_log_start(
+        &self,
+        prefix: &str,
+        substream: &Substream,
+        topition: &Topition,
+    ) -> Result<i64> {
+        let floor = self.truncate_floor(topition).await?;
+
+        let now_ms = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|since| since.as_millis() as i64)
+            .unwrap_or_default();
+        let owned = BTreeSet::from([prefix.to_owned()]);
+        let Some(threshold) = self
+            .segment_retention_thresholds(now_ms, Some(&owned))
+            .await?
+            .get(prefix)
+            .copied()
+        else {
+            return Ok(floor);
+        };
+
+        let fenced = self.valid_substream_segments(prefix, substream, topition.partition())?;
+        let index = self.prefixes.index()?;
+        let segments = index.get(prefix).map(|entry| &entry.segments);
+
+        let mut start = i64::MIN;
+        for fenced in fenced {
+            if segments
+                .and_then(|segments| segments.get(&fenced.seq))
+                .is_none_or(|cached| retention_age_ms(cached) >= threshold)
+            {
+                start = start.max(fenced.served_from);
+                break;
+            }
+
+            start = fenced.end();
+        }
+
+        Ok(start.max(floor))
     }
 
     /// Enforce `cleanup.policy=compact` over a compacted topic's dedicated
@@ -1011,5 +1272,87 @@ impl DynoStore {
             attempts = MAX_ATTEMPTS,
             "per-key compaction still finding undecodable segments; the rest wait for the next tick"
         );
+    }
+}
+
+#[cfg(test)]
+mod tiling_break_tests {
+    use super::{TilingBreak, highest_unserved};
+    use tracing::Level;
+
+    /// The run expected offset 50 next and found 100.
+    const GAP: (i64, i64) = (50, 100);
+
+    fn of(outside: &[(i64, i64)], log_start: i64, compacted: bool) -> TilingBreak {
+        TilingBreak::of(GAP.0, GAP.1, outside, log_start, compacted)
+    }
+
+    #[test]
+    fn served_outside_the_run_is_outside_run_at_debug() {
+        let class = of(&[(40, 70), (70, 120)], 0, false);
+        assert_eq!(TilingBreak::OutsideRun, class);
+        assert_eq!("outside_run", class.reason());
+        assert_eq!(Level::DEBUG, class.level());
+    }
+
+    #[test]
+    fn unserved_below_the_log_start_is_below_log_start_at_debug() {
+        let class = of(&[(80, 100)], 80, false);
+        assert_eq!(TilingBreak::BelowLogStart, class);
+        assert_eq!("below_log_start", class.reason());
+        assert_eq!(Level::DEBUG, class.level());
+    }
+
+    #[test]
+    fn unserved_on_a_compacted_topic_is_compacted_topic_at_debug() {
+        let class = of(&[], 0, true);
+        assert_eq!(TilingBreak::CompactedTopic, class);
+        assert_eq!("compacted_topic", class.reason());
+        assert_eq!(Level::DEBUG, class.level());
+    }
+
+    /// A region starting below the expected offset is an overlap the fenced
+    /// view clipped inside a batch, not a gap.
+    #[test]
+    fn a_region_below_the_frontier_is_a_straddle_at_warn() {
+        let class = TilingBreak::of(100, 50, &[], 0, false);
+        assert_eq!(TilingBreak::Straddle, class);
+        assert_eq!("straddle", class.reason());
+        assert_eq!(Level::WARN, class.level());
+    }
+
+    /// One unserved offset above the log start is a loss, whatever covers the
+    /// rest — and the precedence above never outranks it on a delete topic.
+    #[test]
+    fn unserved_above_the_log_start_is_missing_at_error() {
+        let class = of(&[(50, 98)], 98, false);
+        assert_eq!(TilingBreak::Missing, class);
+        assert_eq!("missing", class.reason());
+        assert_eq!(Level::ERROR, class.level());
+    }
+
+    /// A run's metric carries its worst break.
+    #[test]
+    fn missing_is_the_worst_break() {
+        assert_eq!(
+            Some(TilingBreak::Missing),
+            [
+                TilingBreak::OutsideRun,
+                TilingBreak::Missing,
+                TilingBreak::Straddle,
+                TilingBreak::BelowLogStart,
+            ]
+            .into_iter()
+            .max()
+        );
+    }
+
+    #[test]
+    fn highest_unserved_finds_the_top_of_the_last_hole() {
+        assert_eq!(Some(99), highest_unserved(50..100, &[]));
+        assert_eq!(None, highest_unserved(50..100, &[(0, 60), (60, 100)]));
+        assert_eq!(Some(69), highest_unserved(50..100, &[(70, 100), (0, 55)]));
+        assert_eq!(Some(99), highest_unserved(50..100, &[(60, 70)]));
+        assert_eq!(None, highest_unserved(50..100, &[(0, 200)]));
     }
 }

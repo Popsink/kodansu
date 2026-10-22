@@ -219,9 +219,11 @@ impl DynoStore {
     /// Returns once the batch is in the buffer, which is what
     /// [`Storage::admit`] promises (#588): buffer order is offset order, so a
     /// batch buffered after this call returns takes a later offset. A batch
-    /// that fills the buffer flushes it here, inline, and so returns only after
-    /// that flush — the order still holds, and the next batch starts the next
-    /// window.
+    /// that fills the buffer closes the window and hands it to the prefix's
+    /// flush queue (#590) rather than flushing it here, so the next batch
+    /// starts the next window while this one's PUT is in flight. The queue
+    /// starts flushes in the order windows closed, which keeps the order; the
+    /// only wait left is [`Self::FLUSH_QUEUE_DEPTH`]'s back-pressure.
     pub(super) async fn admit_prefix_coalesced(
         &self,
         topition: &Topition,
@@ -246,7 +248,7 @@ impl DynoStore {
         let control = deflated.is_control();
 
         enum Action {
-            Flush(PrefixCoalesceBuffer),
+            Closed(Option<(u64, watch::Receiver<u64>)>),
             StartTimer,
             Wait,
         }
@@ -275,7 +277,7 @@ impl DynoStore {
                 || buffer.records >= Self::COALESCE_MAX_RECORDS
                 || control
             {
-                Action::Flush(std::mem::take(buffer))
+                Action::Closed(self.enqueue_prefix_flush(&prefix, std::mem::take(buffer)))
             } else if first {
                 Action::StartTimer
             } else {
@@ -284,7 +286,15 @@ impl DynoStore {
         };
 
         match action {
-            Action::Flush(buffer) => self.flush_prefix_coalesced(&prefix, buffer).await,
+            Action::Closed(Some((position, mut started))) => {
+                // An `Err` is the queue gone with the store: nothing left to
+                // wait for (#590).
+                _ = started
+                    .wait_for(|&started| position <= started + Self::FLUSH_QUEUE_DEPTH)
+                    .await;
+            }
+
+            Action::Closed(None) | Action::Wait => {}
 
             Action::StartTimer => {
                 let store = self.clone();
@@ -294,22 +304,114 @@ impl DynoStore {
                 _ = tokio::spawn(async move {
                     sleep(linger).await;
 
-                    let buffer = store
-                        .prefix_coalesce_buffers
-                        .lock()
-                        .ok()
-                        .and_then(|mut buffers| buffers.remove(&prefix));
-
-                    if let Some(buffer) = buffer.filter(|buffer| !buffer.pending.is_empty()) {
-                        store.flush_prefix_coalesced(&prefix, buffer).await;
+                    // Taken and enqueued under the one buffers lock, as on the
+                    // threshold path: before #590 the timer took the buffer and
+                    // only then queued for the flush lock, which a window closed
+                    // after it could reach first.
+                    if let Ok(mut buffers) = store.prefix_coalesce_buffers.lock()
+                        && let Some(buffer) = buffers
+                            .remove(&prefix)
+                            .filter(|buffer| !buffer.pending.is_empty())
+                    {
+                        _ = store.enqueue_prefix_flush(&prefix, buffer);
                     }
                 });
             }
-
-            Action::Wait => {}
         }
 
         Ok(offset)
+    }
+
+    /// How many closed windows of a prefix may wait behind the flush in flight
+    /// before admission waits too (#590).
+    ///
+    /// One. A window that closes while the previous PUT is in flight is queued
+    /// and its admission returns at once, so the connection reads on and fills
+    /// a third window; the request that closes *that* one waits until the
+    /// queued window starts. One prefix therefore holds at most three windows —
+    /// in flight, queued, filling — about 3 × `coalesce_bytes`, where the
+    /// inline flush held two. Zero would make every window that closes behind a
+    /// PUT wait for it, so fill and PUT overlap only when filling is the slower
+    /// of the two; more than one buys no throughput, since the worker flushes
+    /// one window at a time however many are queued, and only adds memory and
+    /// latency behind a slow PUT.
+    ///
+    /// The bound is per prefix, not per connection: windows closed by any
+    /// connection share the count. The linger timer enqueues without waiting —
+    /// there is no admission behind it to slow down — so it can push the queue
+    /// one past the bound, never more than one per window it closes.
+    pub(super) const FLUSH_QUEUE_DEPTH: u64 = 1;
+
+    /// Push a closed window onto `prefix`'s flush queue (#590), starting the
+    /// queue's worker if it is idle, and return the window's position with a
+    /// receiver of how many windows have started flushing — what the admitting
+    /// task waits on for back-pressure.
+    ///
+    /// Called with `prefix_coalesce_buffers` held, by the same critical section
+    /// that took the window, so positions are handed out in close order. A
+    /// queue that cannot be locked fails the window's producers for a retry
+    /// rather than dropping their acks, and returns `None`.
+    ///
+    /// The worker is a detached task that nothing cancels: a queued flush runs
+    /// to completion on a drain (#361) for the same reason one in flight does
+    /// (#89) — a cut segment PUT is the ambiguous create — and the drain waits
+    /// for it because every request the window holds is waiting on its ack.
+    pub(super) fn enqueue_prefix_flush(
+        &self,
+        prefix: &str,
+        buffer: PrefixCoalesceBuffer,
+    ) -> Option<(u64, watch::Receiver<u64>)> {
+        let mut queues = match self.prefix_flush_queues.lock() {
+            Ok(queues) => queues,
+            Err(poisoned) => {
+                Self::fail_prefix_flush(buffer, poisoned.into(), prefix);
+                return None;
+            }
+        };
+        let queue = queues.entry(prefix.to_owned()).or_default();
+
+        queue.closed.push_back(buffer);
+        queue.enqueued += 1;
+
+        if !queue.draining {
+            queue.draining = true;
+            _ = tokio::spawn(self.clone().drain_prefix_flush_queue(prefix.to_owned()));
+        }
+
+        Some((queue.enqueued, queue.started.subscribe()))
+    }
+
+    /// The worker of `prefix`'s flush queue (#590): flush the closed windows
+    /// front to back, one at a time, until the queue is empty.
+    ///
+    /// Each flush runs in a task of its own and is awaited, so a flush that
+    /// panics drops its own window's acks — as the inline flush did — instead
+    /// of taking the worker down with it and stranding every window behind it.
+    async fn drain_prefix_flush_queue(self, prefix: String) {
+        loop {
+            let next = self.prefix_flush_queues.lock().ok().and_then(|mut queues| {
+                let queue = queues.get_mut(&prefix)?;
+                let next = queue.closed.pop_front();
+                match next {
+                    Some(_) => queue.started.send_modify(|started| *started += 1),
+                    None => queue.draining = false,
+                }
+                next
+            });
+
+            let Some(buffer) = next else {
+                return;
+            };
+
+            let store = self.clone();
+            let flushing = prefix.clone();
+            if let Err(error) =
+                tokio::spawn(async move { store.flush_prefix_coalesced(&flushing, buffer).await })
+                    .await
+            {
+                error!(?error, prefix, "prefix flush did not complete");
+            }
+        }
     }
 
     /// Flush a drained prefix buffer as one shared segment object and resolve
@@ -640,6 +742,10 @@ impl DynoStore {
                     },
                 )
                 .await;
+            SEGMENT_PUT_DURATION.record(
+                put_started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+                &[],
+            );
             put_elapsed += put_started.elapsed();
 
             // Resolve the PUT, including the ambiguous case, through the one

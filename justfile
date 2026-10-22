@@ -388,13 +388,22 @@ fmt:
 # `stale_commit_verdict`; the rest is the verdict and three tests, with no `//`
 # added.
 #
-#   #606  +118 lines, fenced view borrowed  3174 -> 3175  2.91513593 -> 2.91418082
+#   #594  +600 lines, refusal classes    3174 -> 3173  2.91513593 -> 2.90336454
+#
+# A compaction refusal is classified before it is logged, and only a missing
+# range stays at `ERROR`. The tiling loop moved into `tiling_breaks`, which took
+# its one uncited `//` with it; the reasoning is the `///` on `TilingBreak` and
+# `tiling_log_start`, and most of the lines are one test per class.
+#
+#   #606  +118 lines, fenced view borrowed  3173 -> 3174  2.87445872 -> 2.87354241
 #
 # The request path reads a sub-stream's fenced view in place under the prefix
 # index lock instead of cloning all of it, and the tail is a scan for the
 # greatest end. The reasoning is the `///` on `with_fenced_segments` and
 # `substream_tail`; the one `//` block added cites #606, and the line counted
-# is a fetch-plan comment rewrapped one level deeper inside the closure.
+# is a fetch-plan comment rewrapped one level deeper inside the closure. The
+# ceiling falls further than this move: `main` already measured 2.87445872
+# under the 2.9034 that #594 set.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -405,7 +414,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.9142" top="12":
+comments ceiling="2.8736" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
