@@ -133,9 +133,20 @@ range landed at which offset. An external reader that only serves records can
 skip it; one that wants to recognise duplicates does not have to keep separate
 state.
 
-To read a sub-stream from `offset`: find its entry, ranged-GET
-`[byte_start, byte_start + byte_len)`, decode the region, and assign offsets
-running from `base_offset`.
+To read a sub-stream from `offset`: find the entry whose offset range holds
+it, ranged-GET `[byte_start, byte_start + byte_len)`, decode the region, and
+assign offsets running from `base_offset`.
+
+**One segment can hold several entries for the same sub-stream (#610).**
+Compaction caps a region at `prefix_compact_region_bytes` (1 MiB by default), so
+a sub-stream with more bytes than that in a merged segment is written as
+consecutive entries. They are split at batch boundaries, each starting where the
+previous one's records end, and they are laid out in offset order. Their offset
+ranges are disjoint, so a reader that resolves an offset by range, as
+[Resolving overlaps](#resolving-overlaps) already requires across segments,
+needs nothing new. A reader that takes the **first** entry matching
+`(sub-stream, partition)` in a footer reads only the lowest of those regions,
+and must instead select by offset range or walk every match.
 
 #### Sub-stream identity (v4)
 

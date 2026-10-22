@@ -412,6 +412,16 @@ fmt:
 # from. The `//` blocks it added cite #607 or #6/#129; most of the lines are a
 # failing object store and the two tests that drive it.
 #
+#   #610  +603 lines, capped regions  3177 -> 3179  2.86844172 -> 2.85991885
+#
+# Compaction caps a sub-stream's region at `prefix_compact_region_bytes`, so a
+# fetch on a compacted prefix reads about what it serves instead of the whole
+# merged region. The reasoning is the `///` on `PREFIX_COMPACT_REGION_BYTES`,
+# `capped_regions`, `region_of` and `bytes_from`. The fetch-plan comment it
+# touches and the test's bound cite #610; the two lines counted say why that
+# test compares offset spans rather than batches, and most of the lines are the
+# test that counts the store bytes a read costs.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -421,7 +431,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.8685" top="12":
+comments ceiling="2.8600" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

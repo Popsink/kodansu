@@ -191,6 +191,64 @@ fn tiling_breaks(in_run: &[(u64, i64, Vec<deflated::Batch>)]) -> Vec<(u64, i64, 
     breaks
 }
 
+/// `substreams` with every region over `cap` bytes split into consecutive
+/// regions of at most `cap` bytes each (#610), at batch boundaries; `0` is no
+/// cap.
+///
+/// A batch is opaque, so one larger than `cap` is a region of its own. The
+/// pieces tile the original exactly — each starts where the previous one's
+/// records end — so a reader of the fenced view sees the same offsets it did
+/// from the single region, in smaller reads.
+pub(super) fn capped_regions(substreams: Vec<SubstreamWrite>, cap: usize) -> Vec<SubstreamWrite> {
+    if cap == 0 {
+        return substreams;
+    }
+
+    let mut capped = Vec::with_capacity(substreams.len());
+
+    for SubstreamWrite {
+        topition,
+        substream,
+        base_offset,
+        batches,
+    } in substreams
+    {
+        let mut base = base_offset;
+        let mut next = base_offset;
+        let mut bytes = 0usize;
+        let mut region = Vec::new();
+
+        for batch in batches {
+            let size = batch.wire_size();
+
+            if !region.is_empty() && bytes + size > cap {
+                capped.push(SubstreamWrite {
+                    topition: topition.clone(),
+                    substream: substream.clone(),
+                    base_offset: base,
+                    batches: std::mem::take(&mut region),
+                });
+
+                base = next;
+                bytes = 0;
+            }
+
+            next += batch.last_offset_delta as i64 + 1;
+            bytes += size;
+            region.push(batch);
+        }
+
+        capped.push(SubstreamWrite {
+            topition,
+            substream,
+            base_offset: base,
+            batches: region,
+        });
+    }
+
+    capped
+}
+
 /// The time retention ages `cached` by, as `expire_prefix_segments` does: its
 /// newest record, or the object's append time when timestamps are unset.
 fn retention_age_ms(cached: &CachedSegment) -> i64 {
@@ -562,6 +620,7 @@ impl DynoStore {
             // instead of being re-appended. A fresh per-segment nonce (#89) is
             // stamped as on any create.
             let nonce = rng().random::<u64>();
+            let substreams = capped_regions(substreams, self.tuning.prefix_compact_region_bytes);
             let (payload, footer) = self.encode_segment_indexed(
                 &substreams,
                 merged_epoch.max(0),
@@ -941,14 +1000,15 @@ impl DynoStore {
         // exactly as for a #66 merge. `index_insert` keeps the original append
         // time so `compact,delete` retention is not reset by the rewrite.
         for seq in &dirty {
-            let Some(substreams) = outputs.get(seq) else {
+            let Some(substreams) = outputs.remove(seq) else {
                 continue;
             };
+            let substreams = capped_regions(substreams, self.tuning.prefix_compact_region_bytes);
             let (epoch, last_modified) = segments_meta.get(seq).copied().unwrap_or((0, i64::MIN));
 
             let nonce = rng().random::<u64>();
             let (payload, footer) = self.encode_segment_indexed(
-                substreams,
+                &substreams,
                 epoch.max(0),
                 nonce,
                 self.tuning.segment_format_version,

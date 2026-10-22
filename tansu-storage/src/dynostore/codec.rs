@@ -162,6 +162,27 @@ impl FencedRef<'_> {
         self.entry.base_offset + self.entry.record_count
     }
 
+    /// The share of this region's bytes that holds offsets at or above
+    /// `offset`, prorated by record count: what a fetch from `offset` can spend
+    /// of it, because the response skips every batch below `offset` (#535).
+    ///
+    /// The fetch plan used to charge its budget the region's whole `byte_len`.
+    /// While a sub-stream sat in one region per segment the difference was the
+    /// last region read, but with compaction capping regions (#610) a fetch
+    /// starting late in a region charged bytes it would never return. It then
+    /// left the next region unread and returned a fraction of `max_bytes`: one
+    /// batch where the uncapped read returned two.
+    pub(super) fn bytes_from(&self, offset: i64) -> u64 {
+        let records = self.entry.record_count;
+        let above = self.end() - offset.max(self.entry.base_offset);
+
+        if records <= 0 || above >= records {
+            return self.entry.byte_len;
+        }
+
+        (u128::from(self.entry.byte_len) * above.max(0) as u128 / records as u128) as u64
+    }
+
     /// The owned [`FencedSegment`], for a caller keeping it past the lock.
     pub(super) fn cloned(&self) -> FencedSegment {
         FencedSegment {
@@ -353,6 +374,27 @@ impl SegmentFooter {
             .iter()
             .find(|entry| entry.partition == partition && entry.is(substream))
     }
+
+    /// The entry in this footer for the region `entry` claims to describe: its
+    /// sub-stream's entry at the same `base_offset`, or failing that the
+    /// sub-stream's first, as [`Self::get`].
+    ///
+    /// A compacted segment holds a large sub-stream as several regions (#610),
+    /// so the sub-stream alone no longer names one entry. Resolving against the
+    /// first would find a region above a correct entry's and adopt the trailer
+    /// it already agrees with, which retries the same read to the same verdict.
+    pub(super) fn region_of(&self, entry: &SubstreamEntry) -> Option<&SubstreamEntry> {
+        let substream = entry.substream();
+
+        self.entries
+            .iter()
+            .find(|own| {
+                own.partition == entry.partition
+                    && own.is(&substream)
+                    && own.base_offset == entry.base_offset
+            })
+            .or_else(|| self.get(&substream, entry.partition))
+    }
 }
 
 impl DynoStore {
@@ -403,7 +445,7 @@ impl DynoStore {
             ));
         };
 
-        let Some(own) = footer.get(&entry.substream(), entry.partition) else {
+        let Some(own) = footer.region_of(entry) else {
             return Err(read.short_of_extent(format!(
                 "object's own footer holds no {}-{} region",
                 entry.topic, entry.partition
@@ -472,7 +514,7 @@ impl DynoStore {
         // the index named a 41st). An entry present but at a different extent is
         // the same fault seen through a partial overlap.
         let disagrees = footer
-            .get(&entry.substream(), entry.partition)
+            .region_of(entry)
             .is_none_or(|own| own.byte_start != entry.byte_start || own.byte_len != entry.byte_len);
 
         if !disagrees {
@@ -497,7 +539,7 @@ impl DynoStore {
         footer: SegmentFooter,
     ) -> Result<()> {
         // Read out before the footer is moved into the index.
-        let trailer = footer.get(&entry.substream(), entry.partition).map(|own| {
+        let trailer = footer.region_of(entry).map(|own| {
             (
                 own.byte_start,
                 own.byte_len,
