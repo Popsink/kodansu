@@ -384,6 +384,53 @@ binary rather than up.
 
 An unparseable value, or one past `u32`, keeps the default and logs a warning.
 
+## `fetch_read_concurrency` — region GETs one `Fetch` keeps in flight
+
+How many ranged region GETs one fetch of one partition issues at once, defaulting
+to `32` (#426, made a key in #587).
+
+```
+s3://my-bucket/?fetch_read_concurrency=128
+```
+
+A fetch reads one ranged GET per flush region, and on a backlog of small regions
+that is a lot of them: a 5 MiB response cut from ~24 KB regions is ~200 GETs.
+They are issued in waves of this width, each wave waiting for its slowest GET, so
+a fetch costs roughly one LIST, one footer GET and then `⌈regions ÷ width⌉` data
+rounds. With an injected 50 ms per request, that response took 481 ms at `32`,
+328 ms at `64`, 221 ms at `128` and 167 ms at `256`; past the number of regions a
+fetch reads, a wider setting buys nothing. Large regions (a busy topic, or a
+compacted prefix) are a handful of GETs and do not notice the key at all.
+
+**Raising it costs no requests.** A fetch makes the same GETs at any width — the
+bill and the request rate per fetch do not move. What it trades is:
+
+- **Burstiness against per-prefix throttling.** The same GETs arrive in fewer,
+  taller bursts. S3 and GCS rate-limit per key prefix, so a wide setting on a
+  replica serving several backlogged consumers of one prefix is what would hit
+  that limit first. It shows as `tansu_object_store_request_error` on `get_opts`
+  — and as rising tail latency before that.
+- **Memory.** Up to this many region bodies are held per fetch in flight, on top
+  of what [`fetch_max_bytes`](#fetch_max_bytes--the-largest-fetch-response-this-broker-returns)
+  already charges, so it matters most where regions are large — which is where
+  it helps least.
+
+### A/B on one replica
+
+1. Put one replica on `?fetch_read_concurrency=128` and leave another, serving a
+   comparable backlogged consumer, on the default.
+2. Compare, side by side: `Fetch` request duration;
+   `tansu_object_store_request_duration` for `get_opts` at p50 and p99 (each wave
+   waits for its slowest GET, so the p99 is what a wave costs); and region GETs
+   per `Fetch` — segment data reads divided by `Fetch` requests — which should
+   match between the two, since the width does not change it.
+3. Watch `tansu_object_store_request_error` and RSS on the wide replica. Errors
+   rising there and not on the control mean the store is pushing back; narrow it
+   again.
+
+An unparseable or zero value keeps `32` and logs a warning; zero is refused
+because a width of nothing would never issue a read.
+
 ## Producer idempotency checkpoint — removed
 
 There is nothing to tune here any more. The lazily-checkpointed per-producer

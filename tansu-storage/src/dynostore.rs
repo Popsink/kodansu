@@ -50,6 +50,7 @@ use std::{
     cmp::Reverse,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet, btree_map::Entry},
     fmt::{Debug, Display, Write as _},
+    num::NonZeroUsize,
     str::FromStr,
     sync::{
         Arc, LazyLock, Mutex,
@@ -761,6 +762,13 @@ pub struct CoalesceTuning {
     /// the bound is per fetch in flight — for fewer round trips per record,
     /// which is the only term a single-partition consumer can amortise.
     pub fetch_max_bytes: Option<u32>,
+
+    /// Ranged region GETs one `Fetch` keeps in flight per sub-stream (#587);
+    /// `None` keeps [`DynoStore::FETCH_READ_CONCURRENCY`]. The number of GETs a
+    /// fetch makes does not change with it, only how many wait at once, so
+    /// raising it trades burstiness against the store's per-prefix request
+    /// rate, and region bodies held in memory, for fewer round trips.
+    pub fetch_read_concurrency: Option<NonZeroUsize>,
 }
 
 /// Process-wide counter making each [`DynoStore`]'s `writer_id` unique (#59), so
@@ -1769,6 +1777,12 @@ impl DynoStore {
     const COALESCE_BATCHES: usize = 64;
     const COALESCE_BYTES: usize = 1 << 20;
     const COALESCE_MAX_RECORDS: i64 = 100_000;
+
+    /// Ranged region GETs in flight for one sub-stream's fetch (#426), matching
+    /// the footer warm's `FOOTER_FETCH_CONCURRENCY` and every other fan-out in
+    /// the engine. Overridable via `fetch_read_concurrency` (#587): a fetch over
+    /// small regions waits about one round trip per this many regions.
+    pub const FETCH_READ_CONCURRENCY: NonZeroUsize = NonZeroUsize::new(32).unwrap();
 
     /// Byte floor for a flush buffer that has ingested a backfill-class batch
     /// (span ≥ [`Self::PREFIX_BACKFILL_MIN_RECORDS`]) once the #62 bypass is
