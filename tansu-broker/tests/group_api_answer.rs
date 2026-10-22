@@ -535,3 +535,166 @@ async fn a_non_api_error_still_ends_the_connection() -> Result<()> {
 
     Ok(())
 }
+
+/// #607: an offsets read that failed in the store is answered with the
+/// retriable code storage chose, in both request shapes.
+///
+/// Storage reports it as its own `Error::Api`, which reaches the service
+/// wrapped in `Error::Storage`. Only the broker's `Error::Api` was answered, so
+/// the client saw a dropped connection instead of `COORDINATOR_LOAD_IN_PROGRESS`.
+/// The legacy shape was dropped even for a broker `Error::Api`: its answer left
+/// out `topics`, which v7 and below cannot encode without.
+#[tokio::test]
+async fn a_failed_offsets_read_is_answered_retriably() -> Result<()> {
+    #[derive(Clone, Debug)]
+    struct OffsetsUnavailable;
+
+    #[async_trait]
+    impl Coordinator for OffsetsUnavailable {
+        async fn join(
+            &self,
+            _client_id: Option<&str>,
+            _group_id: &str,
+            _session_timeout_ms: i32,
+            _rebalance_timeout_ms: Option<i32>,
+            _member_id: &str,
+            _group_instance_id: Option<&str>,
+            _protocol_type: &str,
+            _protocols: Option<&[JoinGroupRequestProtocol]>,
+            _reason: Option<&str>,
+        ) -> Result<Body, Error> {
+            unreachable!()
+        }
+
+        async fn sync(
+            &self,
+            _group_id: &str,
+            _generation_id: i32,
+            _member_id: &str,
+            _group_instance_id: Option<&str>,
+            _protocol_type: Option<&str>,
+            _protocol_name: Option<&str>,
+            _assignments: Option<&[SyncGroupRequestAssignment]>,
+        ) -> Result<Body, Error> {
+            unreachable!()
+        }
+
+        async fn heartbeat(
+            &self,
+            _group_id: &str,
+            _generation_id: i32,
+            _member_id: &str,
+            _group_instance_id: Option<&str>,
+        ) -> Result<Body, Error> {
+            unreachable!()
+        }
+
+        async fn leave(
+            &self,
+            _group_id: &str,
+            _member_id: Option<&str>,
+            _members: Option<&[MemberIdentity]>,
+        ) -> Result<Body, Error> {
+            unreachable!()
+        }
+
+        async fn offset_commit(&self, _detail: OffsetCommit<'_>) -> Result<Body, Error> {
+            unreachable!()
+        }
+
+        async fn offset_fetch(
+            &self,
+            _group_id: Option<&str>,
+            _topics: Option<&[OffsetFetchRequestTopic]>,
+            _groups: Option<&[OffsetFetchRequestGroup]>,
+            _require_stable: Option<bool>,
+        ) -> Result<Body, Error> {
+            Err(Error::Storage(tansu_storage::Error::Api(
+                ErrorCode::CoordinatorLoadInProgress,
+            )))
+        }
+    }
+
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let port = listener.local_addr()?.port();
+    let storage = storage().await?;
+
+    _ = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let Ok(service) = services(
+                TcpContext::default().cluster_id(Some("tansu-607".into())),
+                OffsetsUnavailable,
+                storage.clone(),
+                None,
+                None,
+                None,
+            ) else {
+                return;
+            };
+
+            _ = tokio::spawn(async move {
+                _ = service.serve(Context::default(), stream).await;
+            });
+        }
+    });
+
+    let client = FrameClient::connect(port).await?;
+    let load_in_progress = i16::from(ErrorCode::CoordinatorLoadInProgress);
+
+    let groups = OffsetFetchRequest::default()
+        .groups(Some(vec![
+            OffsetFetchRequestGroup::default()
+                .group_id("g-607".into())
+                .member_id(Some("".into()))
+                .member_epoch(Some(-1))
+                .topics(Some(vec![
+                    OffsetFetchRequestTopics::default()
+                        .name("t-607".into())
+                        .partition_indexes(Some(vec![0])),
+                ])),
+        ]))
+        .require_stable(Some(false))
+        .into();
+
+    let Body::OffsetFetchResponse(fetch) = timeout(
+        Duration::from_secs(10),
+        client.call(OffsetFetchRequest::KEY, Some("c-607"), groups),
+    )
+    .await??
+    else {
+        panic!("not an OffsetFetchResponse")
+    };
+
+    assert_eq!(
+        vec![("g-607".to_owned(), load_in_progress)],
+        fetch
+            .groups
+            .unwrap_or_default()
+            .into_iter()
+            .map(|group| (group.group_id, group.error_code))
+            .collect::<Vec<_>>(),
+    );
+
+    let legacy = OffsetFetchRequest::default()
+        .group_id(Some("g-607".into()))
+        .topics(Some(vec![
+            OffsetFetchRequestTopic::default()
+                .name("t-607".into())
+                .partition_indexes(Some(vec![0])),
+        ]))
+        .require_stable(Some(false))
+        .into();
+
+    let Body::OffsetFetchResponse(fetch) = timeout(
+        Duration::from_secs(10),
+        client.call(OffsetFetchRequest::KEY, Some("c-607"), legacy),
+    )
+    .await??
+    else {
+        panic!("not an OffsetFetchResponse")
+    };
+
+    assert_eq!(Some(load_in_progress), fetch.error_code);
+
+    Ok(())
+}

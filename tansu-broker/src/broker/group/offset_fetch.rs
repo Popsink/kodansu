@@ -87,11 +87,14 @@ where
                 // An `Error::Api` is an answer the broker chose, not a failure.
                 // Answering it here is what stops it from ending the connection
                 // with no response written — `early eof` to the caller (#300). See
-                // [`super::answer`].
-                Error::Api(error_code) => Ok(answer::offset_fetch(
-                    error_code,
-                    offset_fetch.groups.as_deref(),
-                )),
+                // [`super::answer`]. Storage answers a failed offsets read the
+                // same way (#607).
+                Error::Api(error_code) | Error::Storage(tansu_storage::Error::Api(error_code)) => {
+                    Ok(answer::offset_fetch(
+                        error_code,
+                        offset_fetch.groups.as_deref(),
+                    ))
+                }
 
                 otherwise => Err(otherwise),
             })

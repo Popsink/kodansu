@@ -784,13 +784,14 @@ impl Storage for DynoStore {
         // has nothing under the `offsets/` prefix to list, and a group that has
         // not committed since the upgrade has nothing in the new object — an
         // `OffsetFetch(all)` that took either alone would answer empty for one of
-        // them, which is a consumer resuming from nothing.
+        // them, which is a consumer resuming from nothing. A failed read is that
+        // same consumer, so it is an error and not an empty object (#607).
         let mut topitions: Vec<Topition> = match self.group_offsets(group_id)? {
             Some(offsets) => offsets
                 .get_opt(&self.object_store)
                 .await
-                .inspect_err(|error| warn!(?error, group_id, "group offsets"))
-                .unwrap_or_default()
+                .inspect_err(|error| error!(?error, group_id, "group offsets"))
+                .map_err(offsets_unavailable)?
                 .map(|group| group.topitions().collect())
                 .unwrap_or_default(),
 
@@ -811,7 +812,7 @@ impl Storage for DynoStore {
                 .inspect(|meta| debug!(?meta))
                 .transpose()
                 .inspect_err(|error| error!(?error))
-                .map_err(Error::from)?
+                .map_err(|error| offsets_unavailable(Error::from(error)))?
             {
                 debug!(?meta);
                 let Some(topic): Option<String> = meta
@@ -889,12 +890,18 @@ impl Storage for DynoStore {
             // which is how the layout migrates without a fold-everything pass,
             // and why a rollback still finds the pre-upgrade offsets where it
             // expects them.
+            //
+            // Only an absent object means "no offsets" (#607). A failed read used
+            // to default to empty here, every partition then fell through to a
+            // per-partition object that a group created since #415 never had,
+            // and the group was answered `-1` everywhere: `auto.offset.reset`
+            // replayed whole topics for 50 groups across three tenants.
             let group = match self.group_offsets(group_id)? {
                 Some(offsets) => offsets
                     .get_opt(&self.object_store)
                     .await
-                    .inspect_err(|error| warn!(?error, group_id, "group offsets"))
-                    .unwrap_or_default()
+                    .inspect_err(|error| error!(?error, group_id, "group offsets"))
+                    .map_err(offsets_unavailable)?
                     .unwrap_or_default(),
 
                 None => GroupOffsets::default(),
@@ -940,7 +947,8 @@ impl Storage for DynoStore {
                                 // failure is retriable, not fatal `-1` (#6/#129).
                                 Err(Error::from(error))
                             }
-                        }?;
+                        }
+                        .map_err(offsets_unavailable)?;
 
                         Ok::<_, Error>((topition.to_owned(), committed))
                     }
@@ -2173,5 +2181,19 @@ impl Storage for DynoStore {
         // Verify connectivity by listing objects at the root
         let _ = self.scan(Scan::Ping, &Path::from("/")).next().await;
         Ok(())
+    }
+}
+
+/// What a committed-offset read that failed in the store answers.
+///
+/// [`ErrorCode::CoordinatorLoadInProgress`] is the code `OffsetFetch` clients
+/// retry, and the one a group describe already answers for the same failure.
+/// Without it the error ends the connection, or worse, was swallowed into a
+/// `-1` that `auto.offset.reset` turns into a replay of the whole topic (#607).
+fn offsets_unavailable(error: Error) -> Error {
+    if matches!(error, Error::ObjectStore(_)) {
+        Error::Api(ErrorCode::CoordinatorLoadInProgress)
+    } else {
+        error
     }
 }
