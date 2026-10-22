@@ -22,7 +22,7 @@
 //! reading every field. Grouped, `coalesce_tuning` also stops being a
 //! twelve-arm struct update.
 
-use std::time::Duration;
+use std::{num::NonZeroUsize, time::Duration};
 
 use url::Url;
 
@@ -108,6 +108,11 @@ pub(super) struct Tuning {
     /// `fetch_max_bytes`, so one replica can be run against a wider bound and
     /// compared with the rest of the fleet without a rebuild.
     pub(super) fetch_max_bytes: u32,
+
+    /// Ranged region GETs one fetch keeps in flight per sub-stream (#587).
+    /// Seeded from [`DynoStore::FETCH_READ_CONCURRENCY`] and overridable per
+    /// deployment via `fetch_read_concurrency`.
+    pub(super) fetch_read_concurrency: NonZeroUsize,
 
     /// How long the high-watermark view (per-partition hint and prefix index)
     /// is served from memory before a read re-lists (#500). Defaults to
@@ -202,6 +207,7 @@ impl Tuning {
             coalesce_batches,
             coalesce_bytes,
             fetch_max_bytes,
+            fetch_read_concurrency,
             prefix_compact_min_segments,
             prefix_compact_target_bytes,
             prefix_compact_keep_hot,
@@ -227,6 +233,7 @@ impl Tuning {
             coalesce_batches,
             coalesce_bytes,
             fetch_max_bytes,
+            fetch_read_concurrency,
             prefix_compact_min_segments,
             prefix_compact_target_bytes,
             prefix_compact_keep_hot,
@@ -252,6 +259,7 @@ impl Tuning {
             coalesce_batches: DynoStore::COALESCE_BATCHES,
             coalesce_bytes: DynoStore::COALESCE_BYTES,
             fetch_max_bytes: DEFAULT_FETCH_MAX_BYTES,
+            fetch_read_concurrency: DynoStore::FETCH_READ_CONCURRENCY,
             watermark_hint_ttl: DynoStore::HIGH_WATERMARK_HINT_TTL,
             prefix_depth: DynoStore::PREFIX_DEPTH,
             prefix_separator: DynoStore::PREFIX_SEPARATOR.to_owned(),

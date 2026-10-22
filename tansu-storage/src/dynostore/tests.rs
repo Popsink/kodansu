@@ -28,13 +28,17 @@ use crate::{Error, Result, Topition};
 use super::{DynoStore, ServedEnd, Watermark};
 
 mod azure_suffix;
+mod compact_refusal;
 mod compact_segments;
+mod conditional_put_probe;
 mod corrupt_region;
 mod delete_fan_out;
 mod delete_groups;
 mod divergent_batch;
 mod fenced_overlap;
+mod fetch_read_concurrency;
 mod flush_conflict;
+mod flush_queue;
 mod gcs;
 mod gcs_generation;
 mod gcs_retry;

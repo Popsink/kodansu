@@ -455,7 +455,7 @@ async fn produce_fan_out_under_the_per_object_cap() -> Result<()> {
 /// Exactly linear, and that is the innermost loop alone — the two outer loops
 /// (partitions, then topics) multiply on top. The GET *count* is unchanged by
 /// the fix; what changes is that they overlap, so the wall clock is
-/// `O(N / SEGMENT_READ_CONCURRENCY)` round trips. Asserted loosely enough to
+/// `O(N / FETCH_READ_CONCURRENCY)` round trips. Asserted loosely enough to
 /// survive a loaded runner and tightly enough that a return to the serial shape
 /// cannot pass.
 ///

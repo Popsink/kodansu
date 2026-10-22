@@ -388,12 +388,20 @@ fmt:
 # `stale_commit_verdict`; the rest is the verdict and three tests, with no `//`
 # added.
 #
-#   #607  +380 lines, offsets read error  3174 -> 3177  2.91513593 -> 2.90984695
+#   #594  +600 lines, refusal classes    3174 -> 3173  2.91513593 -> 2.90336454
+#
+# A compaction refusal is classified before it is logged, and only a missing
+# range stays at `ERROR`. The tiling loop moved into `tiling_breaks`, which took
+# its one uncited `//` with it; the reasoning is the `///` on `TilingBreak` and
+# `tiling_log_start`, and most of the lines are one test per class.
+#
+#   #607  +380 lines, offsets read error  3173 -> 3176  2.87445872 -> 2.86935232
 #
 # A failed read of a group's offsets object is answered retriably rather than
 # as a group with no offsets, which `auto.offset.reset` replayed whole topics
 # from. The `//` blocks it added cite #607 or #6/#129; most of the lines are a
-# failing object store and the two tests that drive it.
+# failing object store and the two tests that drive it. The 2.87445872 it
+# starts from is `main` after #590, which moved the ratio without the ceiling.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -404,7 +412,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.9099" top="12":
+comments ceiling="2.8694" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

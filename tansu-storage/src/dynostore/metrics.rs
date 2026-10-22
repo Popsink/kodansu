@@ -87,20 +87,43 @@ pub(super) static SEGMENT_FLUSHES: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .build()
 });
 
+/// How long one segment create-PUT of a prefix flush took, in milliseconds
+/// (#590): every attempt, won or lost, since a lost race is still a PUT the
+/// window waited on.
+///
+/// This is the stall #590 took off the admission path. A window that closes
+/// while the previous one's PUT is in flight now fills behind it rather than
+/// waiting for it, so the gap between windows is this duration less the fill
+/// time — and it is read here rather than inferred from produce latency.
+/// `tansu_object_store_request_duration` carries the same requests among every
+/// other `put_opts`, which is why the segment PUT has its own instrument.
+pub(super) static SEGMENT_PUT_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    METER
+        .u64_histogram("tansu_prefix_segment_put_duration")
+        .with_unit("ms")
+        .with_description("segment create-PUT latency of a prefix flush, in milliseconds")
+        .build()
+});
+
 /// Compaction runs refused rather than performed, by reason (#461).
 ///
-/// Expected to be **flat zero**. A non-zero value means compaction met a run it
-/// could not merge without losing records and declined. Since #399 that costs
+/// A non-zero value means compaction met a run it could not merge without
+/// shifting offsets and declined. Since #399 that costs
 /// one refusal per newly met seam per process, not a permanent stall: the break
 /// is memoized ([`PrefixCaches`]) and later runs are selected around
 /// it, so the segments on either side still merge. A *sustained* rate here
-/// therefore means seams are being newly discovered — run `tansu audit` on the
-/// bucket to see whether records are still being lost, or the fleet is merely
-/// restarting and re-learning old ones.
+/// therefore means seams are being newly discovered.
+///
+/// `reason` is the run's worst break, from `TilingBreak` in `compaction.rs`
+/// (#594). `outside_run`, `below_log_start`, `compacted_topic` and `straddle`
+/// lose nothing — the read-path checks in #594 found the fleet's refusals to be
+/// these. **`missing`** is offsets above the log start that no live segment
+/// holds, expected to be **flat zero** and the one to alert on: run `tansu
+/// audit` on the bucket when it is not.
 pub(super) static SEGMENT_COMPACT_REFUSED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_prefix_segment_compact_refused")
-        .with_description("compaction runs refused to avoid losing records")
+        .with_description("compaction runs refused to avoid shifting offsets")
         .build()
 });
 
@@ -920,5 +943,17 @@ pub(super) static LIST_SCANS: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_object_store_list_scans")
         .with_description("object store listings issued, by call site")
+        .build()
+});
+
+/// The boot-time conditional-put probe (#597), one per store build, by `scheme`
+/// and `outcome`: `conforming`, `skipped` (`?skip_conditional_put_check=true`),
+/// `if_none_match_ignored`, `if_match_ignored` or `failed`. Every outcome but
+/// the first two is a broker that refused to start, so a fleet is audited by
+/// asking which replicas last reported anything other than `conforming`.
+pub(super) static CONDITIONAL_PUT_PROBES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_conditional_put_probes")
+        .with_description("boot-time conditional-put probes, by storage scheme and outcome")
         .build()
 });
