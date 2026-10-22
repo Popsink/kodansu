@@ -922,3 +922,15 @@ pub(super) static LIST_SCANS: LazyLock<Counter<u64>> = LazyLock::new(|| {
         .with_description("object store listings issued, by call site")
         .build()
 });
+
+/// The boot-time conditional-put probe (#597), one per store build, by `scheme`
+/// and `outcome`: `conforming`, `skipped` (`?skip_conditional_put_check=true`),
+/// `if_none_match_ignored`, `if_match_ignored` or `failed`. Every outcome but
+/// the first two is a broker that refused to start, so a fleet is audited by
+/// asking which replicas last reported anything other than `conforming`.
+pub(super) static CONDITIONAL_PUT_PROBES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_conditional_put_probes")
+        .with_description("boot-time conditional-put probes, by storage scheme and outcome")
+        .build()
+});

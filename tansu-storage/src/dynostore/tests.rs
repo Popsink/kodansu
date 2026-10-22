@@ -29,6 +29,7 @@ use super::{DynoStore, ServedEnd, Watermark};
 
 mod azure_suffix;
 mod compact_segments;
+mod conditional_put_probe;
 mod corrupt_region;
 mod delete_fan_out;
 mod delete_groups;

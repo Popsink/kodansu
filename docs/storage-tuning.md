@@ -442,6 +442,24 @@ sequence object `producers/{id}.json` (#48) went with the legacy write path
 ignored from #178 until #227, and are now in the deprecated-key list: a storage
 URL still carrying them starts and logs one warning, rather than failing.
 
+## `skip_conditional_put_check` — the boot-time conditional-put probe
+
+Every object-store backend is probed at startup for the two conditional writes
+the broker is built on (#597): a create-only PUT must be refused on an existing
+key, and a PUT conditioned on a version the store never issued must be refused.
+A store that accepts either silently overwrites, and the broker refuses to start
+with `ConditionalPutRefused` naming the ignored header. `docs/testing.md`
+§ *Conditional put* has the steps, the metric and the messages.
+
+```
+s3://my-bucket/?skip_conditional_put_check=true
+```
+
+skips the probe and logs a WARN on every start. It is for a store known to
+serialise every writer some other way, not for making a refusal go away: the
+refusal is the broker telling you offsets and group state will be lost under
+concurrency.
+
 ## Prefix coalescing — virtual topics
 
 The broker coalesces per **connector prefix** (`org.env.conn` — by default the

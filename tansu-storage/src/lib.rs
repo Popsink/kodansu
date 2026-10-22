@@ -297,6 +297,19 @@ pub struct DivergentBatch {
 pub enum Error {
     Api(ErrorCode),
 
+    /// The object store behind the storage URL does not honour the
+    /// conditional writes the broker is built on (#597), so the store is not
+    /// built. `reason` names the header that was ignored or the error the probe
+    /// got instead, and how to proceed — see `DynoStore::conditional_put_probed`.
+    ///
+    /// Fatal on purpose. A store that ignores `If-None-Match: *` or `If-Match`
+    /// does not error, it overwrites: produce, fetch and `ping()` all work, and
+    /// the damage is duplicated offsets and lost group state under concurrency.
+    ConditionalPutRefused {
+        scheme: String,
+        reason: String,
+    },
+
     /// A segment region whose bytes are not the batch frames its footer entry
     /// claims (#386). Answered to the client as `CORRUPT_MESSAGE` for that
     /// partition — see [`storage_error_code`].
@@ -2494,6 +2507,8 @@ impl Builder<i32, String, Url, Url> {
                             .message_max_bytes(message_max_bytes(&self.storage))
                     })
                     .map_err(Error::from)?
+                    .conditional_put_probed(&self.storage)
+                    .await?
                     .sealed_prefix_shape()
                     .await
                     .map(|storage| {
@@ -2567,6 +2582,8 @@ impl Builder<i32, String, Url, Url> {
                             .message_max_bytes(message_max_bytes(&self.storage))
                     })
                     .map_err(Error::from)?
+                    .conditional_put_probed(&self.storage)
+                    .await?
                     .sealed_prefix_shape()
                     .await
                     .map(|storage| {
@@ -2665,6 +2682,8 @@ impl Builder<i32, String, Url, Url> {
                             .message_max_bytes(message_max_bytes(&self.storage))
                     })
                     .map_err(Error::from)?
+                    .conditional_put_probed(&self.storage)
+                    .await?
                     .sealed_prefix_shape()
                     .await
                     .map(|storage| {
