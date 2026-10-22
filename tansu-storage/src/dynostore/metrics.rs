@@ -89,18 +89,23 @@ pub(super) static SEGMENT_FLUSHES: LazyLock<Counter<u64>> = LazyLock::new(|| {
 
 /// Compaction runs refused rather than performed, by reason (#461).
 ///
-/// Expected to be **flat zero**. A non-zero value means compaction met a run it
-/// could not merge without losing records and declined. Since #399 that costs
+/// A non-zero value means compaction met a run it could not merge without
+/// shifting offsets and declined. Since #399 that costs
 /// one refusal per newly met seam per process, not a permanent stall: the break
 /// is memoized ([`PrefixCaches`]) and later runs are selected around
 /// it, so the segments on either side still merge. A *sustained* rate here
-/// therefore means seams are being newly discovered — run `tansu audit` on the
-/// bucket to see whether records are still being lost, or the fleet is merely
-/// restarting and re-learning old ones.
+/// therefore means seams are being newly discovered.
+///
+/// `reason` is the run's worst break, from `TilingBreak` in `compaction.rs`
+/// (#594). `outside_run`, `below_log_start`, `compacted_topic` and `straddle`
+/// lose nothing — the read-path checks in #594 found the fleet's refusals to be
+/// these. **`missing`** is offsets above the log start that no live segment
+/// holds, expected to be **flat zero** and the one to alert on: run `tansu
+/// audit` on the bucket when it is not.
 pub(super) static SEGMENT_COMPACT_REFUSED: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("tansu_prefix_segment_compact_refused")
-        .with_description("compaction runs refused to avoid losing records")
+        .with_description("compaction runs refused to avoid shifting offsets")
         .build()
 });
 

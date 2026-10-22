@@ -28,6 +28,7 @@ use crate::{Error, Result, Topition};
 use super::{DynoStore, ServedEnd, Watermark};
 
 mod azure_suffix;
+mod compact_refusal;
 mod compact_segments;
 mod conditional_put_probe;
 mod corrupt_region;
