@@ -465,6 +465,14 @@ fmt:
 # block above the check, which cites the issue; most of the lines are the
 # check and the two-replica test.
 #
+#   #605  +263 lines, idle connections  3180 -> 3180  2.83346699 -> 2.82684256
+#
+# Accepted client sockets get TCP keepalive, and a connection with nothing owed
+# and nothing read for `connections.max.idle.ms` is closed between requests. The
+# reasoning is the `///` on `TcpContext::CONNECTIONS_MAX_IDLE`, `Keepalive` and
+# `idle`; the two `//` blocks added cite #605, and most of the lines are the CLI
+# flags and the tests.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -474,7 +482,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.8335" top="12":
+comments ceiling="2.8269" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

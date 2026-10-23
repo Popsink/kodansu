@@ -16,6 +16,7 @@
 use std::{
     path::{Path, PathBuf},
     str::FromStr as _,
+    time::Duration,
 };
 
 use crate::{EnvVarExp, Result, cli::storage_engines};
@@ -31,7 +32,7 @@ use rustls::{
     },
 };
 use tansu_broker::{
-    NODE_ID, SOCKET_REQUEST_MAX_BYTES, broker::Broker,
+    Keepalive, NODE_ID, SOCKET_REQUEST_MAX_BYTES, broker::Broker,
     coordinator::group::administrator::Controller,
 };
 use tansu_sans_io::ErrorCode;
@@ -131,9 +132,43 @@ pub(super) struct Arg {
     #[arg(long, env = "PIPELINE_DEPTH", value_parser = clap::value_parser!(u8).range(1..=10), default_value_t = 5)]
     pipeline_depth: u8,
 
+    /// Close a connection that has had no request in flight and nothing read for this many milliseconds, Kafka's `connections.max.idle.ms`. A long-poll Fetch or a produce waiting on its window is in flight, so it is never cut; a client simply reconnects. 0 never closes an idle connection.
+    #[arg(long, env = "CONNECTIONS_MAX_IDLE_MS", default_value_t = 600_000)]
+    connections_max_idle_ms: u64,
+
+    /// Seconds of silence before TCP keepalive probes a client connection, so a client that vanished without closing its socket is reaped. 0 turns keepalive off.
+    #[arg(long, env = "TCP_KEEPALIVE_SECS", value_parser = clap::value_parser!(u64).range(0..=32767), default_value_t = 60)]
+    tcp_keepalive_secs: u64,
+
+    /// Seconds between unanswered TCP keepalive probes.
+    #[arg(long, env = "TCP_KEEPALIVE_INTERVAL_SECS", value_parser = clap::value_parser!(u64).range(1..=32767), default_value_t = 10)]
+    tcp_keepalive_interval_secs: u64,
+
+    /// Unanswered TCP keepalive probes before the connection is reset.
+    #[arg(long, env = "TCP_KEEPALIVE_RETRIES", value_parser = clap::value_parser!(u32).range(1..=127), default_value_t = 3)]
+    tcp_keepalive_retries: u32,
+
     /// Silent
     #[arg(long)]
     silent: bool,
+}
+
+impl Arg {
+    /// Zero is the CLI's way of saying "never"; the service layer says it with
+    /// `None`, as it does for the frame cap.
+    fn connections_max_idle(&self) -> Option<Duration> {
+        (self.connections_max_idle_ms > 0)
+            .then(|| Duration::from_millis(self.connections_max_idle_ms))
+    }
+
+    /// `None` when `--tcp-keepalive-secs` is zero.
+    fn keepalive(&self) -> Option<Keepalive> {
+        (self.tcp_keepalive_secs > 0).then(|| Keepalive {
+            time: Duration::from_secs(self.tcp_keepalive_secs),
+            interval: Duration::from_secs(self.tcp_keepalive_interval_secs),
+            retries: self.tcp_keepalive_retries,
+        })
+    }
 }
 
 /// Parse the frame cap: a size, or an explicit request for none.
@@ -262,6 +297,8 @@ impl Arg {
     }
 
     async fn build(self) -> Result<Broker<Controller<ArcDynStorage>, ArcDynStorage>> {
+        let connections_max_idle = self.connections_max_idle();
+        let keepalive = self.keepalive();
         let cluster_id = self.cluster_id;
         let incarnation_id = Uuid::now_v7();
         let otlp_endpoint_url = self
@@ -314,6 +351,8 @@ impl Arg {
                 (self.socket_request_max_bytes > 0).then_some(self.socket_request_max_bytes),
             )
             .pipeline_depth(usize::from(self.pipeline_depth))
+            .connections_max_idle(connections_max_idle)
+            .keepalive(keepalive)
             .silent(self.silent);
 
         if !self.silent {
@@ -420,6 +459,55 @@ mod tests {
                 "--pipeline-depth {refused} was accepted"
             );
         }
+    }
+
+    /// A broker started with no flag closes idle connections after Kafka's
+    /// `connections.max.idle.ms` and probes silent ones with keepalive, both as
+    /// the service layer defines them (#605); zero turns either off.
+    #[test]
+    fn idle_connections_are_reaped_by_default_and_can_be_kept() {
+        let arg = |args: &[&str]| Arg::try_parse_from(args).expect("arguments");
+
+        let default = arg(&["tansu"]);
+        assert_eq!(
+            Some(tansu_broker::CONNECTIONS_MAX_IDLE),
+            default.connections_max_idle()
+        );
+        assert_eq!(Some(Keepalive::default()), default.keepalive());
+
+        let off = arg(&[
+            "tansu",
+            "--connections-max-idle-ms",
+            "0",
+            "--tcp-keepalive-secs",
+            "0",
+        ]);
+        assert_eq!(None, off.connections_max_idle());
+        assert_eq!(None, off.keepalive());
+
+        let tuned = arg(&[
+            "tansu",
+            "--connections-max-idle-ms",
+            "30000",
+            "--tcp-keepalive-secs",
+            "30",
+            "--tcp-keepalive-interval-secs",
+            "5",
+            "--tcp-keepalive-retries",
+            "4",
+        ]);
+        assert_eq!(Some(Duration::from_secs(30)), tuned.connections_max_idle());
+        assert_eq!(
+            Some(Keepalive {
+                time: Duration::from_secs(30),
+                interval: Duration::from_secs(5),
+                retries: 4,
+            }),
+            tuned.keepalive()
+        );
+
+        assert!(Arg::try_parse_from(["tansu", "--tcp-keepalive-retries", "0"]).is_err());
+        assert!(Arg::try_parse_from(["tansu", "--tcp-keepalive-interval-secs", "0"]).is_err());
     }
 
     /// `0` and `unlimited` are how an operator turns the cap off *on purpose* —

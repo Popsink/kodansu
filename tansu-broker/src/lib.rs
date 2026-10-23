@@ -72,6 +72,14 @@ pub const NODE_ID: i32 = 111;
 /// [`NODE_ID`].
 pub const SOCKET_REQUEST_MAX_BYTES: usize = tansu_service::TcpContext::MAXIMUM_FRAME_SIZE;
 
+/// Kafka's `connections.max.idle.ms` default (#605), re-exported for the CLI
+/// on the same terms as [`SOCKET_REQUEST_MAX_BYTES`].
+pub const CONNECTIONS_MAX_IDLE: Duration = tansu_service::TcpContext::CONNECTIONS_MAX_IDLE;
+
+/// TCP keepalive for an accepted connection (#605), re-exported so the CLI can
+/// build one without depending on `tansu-service`.
+pub use tansu_service::Keepalive;
+
 pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {
     global::meter_with_scope(
         InstrumentationScope::builder(env!("CARGO_PKG_NAME"))

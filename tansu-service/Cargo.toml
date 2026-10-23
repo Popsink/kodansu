@@ -27,6 +27,7 @@ opentelemetry.workspace = true
 rama.workspace = true
 rand.workspace = true
 rsasl.workspace = true
+socket2.workspace = true
 tansu-auth.workspace = true
 tansu-sans-io.workspace = true
 thiserror.workspace = true
