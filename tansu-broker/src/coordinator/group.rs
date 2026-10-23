@@ -13,12 +13,14 @@
 // limitations under the License.
 
 pub mod administrator;
+mod assignor;
+mod consumer;
 
 use crate::Result;
 use async_trait::async_trait;
 use std::fmt::Debug;
 use tansu_sans_io::{
-    Body,
+    Body, ConsumerGroupHeartbeatRequest,
     join_group_request::JoinGroupRequestProtocol,
     leave_group_request::MemberIdentity,
     offset_commit_request::OffsetCommitRequestTopic,
@@ -77,6 +79,14 @@ pub trait Coordinator: Clone + Debug + Send + Sync + 'static {
         group_id: &str,
         member_id: Option<&str>,
         members: Option<&[MemberIdentity]>,
+    ) -> Result<Body>;
+
+    /// A KIP-848 `ConsumerGroupHeartbeat` (#612): join, heartbeat,
+    /// acknowledge, or leave a `consumer` protocol group.
+    async fn consumer_group_heartbeat(
+        &self,
+        client_id: Option<&str>,
+        request: &ConsumerGroupHeartbeatRequest,
     ) -> Result<Body>;
 
     async fn offset_commit(&self, detail: OffsetCommit<'_>) -> Result<Body>;

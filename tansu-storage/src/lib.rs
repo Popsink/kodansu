@@ -157,6 +157,7 @@ mod authorizer;
 use crate::delegate::storage_methods;
 mod backend;
 mod batch;
+mod consumer_group;
 mod delegate;
 mod enforcer;
 mod group;
@@ -187,6 +188,11 @@ pub use quota::{
     CONSUMER_BYTE_RATE, PRODUCER_BYTE_RATE, QUOTA_KEYS, QuotaAlteration, QuotaEntity,
     QuotaFilterComponent, QuotaKeyError, QuotaLimits, QuotaMatch, QuotaOp, Quotas, REQUEST_RATE,
     USER_ENTITY, user_of,
+};
+
+pub use consumer_group::{
+    CONSUMER_HEARTBEAT_INTERVAL_MS, CONSUMER_SESSION_TIMEOUT_MS, ConsumerGroupDoc, ConsumerMember,
+    LEAVING_STATIC_MEMBER_EPOCH, MemberState, Partitions, SubscribedTopic, flatten, grouped,
 };
 
 pub use group::{
@@ -1808,6 +1814,26 @@ pub trait Storage: Debug + Send + Sync + 'static {
         group_id: &str,
         generation_id: i32,
     ) -> Result<u64>;
+
+    /// A KIP-848 consumer group's document and its version, or `None` when the
+    /// group has none — which is how a classic group and a group that does
+    /// not exist both read (#612).
+    async fn read_consumer_group(
+        &self,
+        group_id: &str,
+    ) -> Result<Option<(ConsumerGroupDoc, Version)>>;
+
+    /// Conditionally write a KIP-848 consumer group's document (#612).
+    ///
+    /// `version` is `None` to create — so two replicas racing to create the
+    /// same group cannot both win — and `Some` to CAS, exactly as
+    /// [`Self::update_group_generation`].
+    async fn update_consumer_group(
+        &self,
+        group_id: &str,
+        group: ConsumerGroupDoc,
+        version: Option<Version>,
+    ) -> Result<Version, UpdateError<ConsumerGroupDoc>>;
 
     /// Create each ACL, answering one error code per creation **in request
     /// order** (#363).

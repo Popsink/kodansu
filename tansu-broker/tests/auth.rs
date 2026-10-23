@@ -47,11 +47,11 @@ use tansu_sans_io::{
 use tansu_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
 use tansu_storage::{
     AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
-    BrokerRegistrationRequest, CommittedOffset, GenerationDoc, ListOffsetResponse, MemberDoc,
-    MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse,
-    QuotaAlteration, QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas, ScramCredential,
-    Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, UpdateError, Version,
+    BrokerRegistrationRequest, CommittedOffset, ConsumerGroupDoc, GenerationDoc,
+    ListOffsetResponse, MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
+    OffsetStage, ProducerIdResponse, QuotaAlteration, QuotaEntity, QuotaFilterComponent,
+    QuotaLimits, Quotas, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
 };
 use tracing::{debug, instrument};
 use url::Url;
@@ -1059,6 +1059,22 @@ impl Storage for Engine {
         _generation: GenerationDoc,
         _version: Option<Version>,
     ) -> tansu_storage::Result<Version, UpdateError<GenerationDoc>> {
+        unimplemented!()
+    }
+
+    async fn read_consumer_group(
+        &self,
+        _group_id: &str,
+    ) -> tansu_storage::Result<Option<(ConsumerGroupDoc, Version)>> {
+        unimplemented!()
+    }
+
+    async fn update_consumer_group(
+        &self,
+        _group_id: &str,
+        _group: ConsumerGroupDoc,
+        _version: Option<Version>,
+    ) -> tansu_storage::Result<Version, UpdateError<ConsumerGroupDoc>> {
         unimplemented!()
     }
 

@@ -19,6 +19,13 @@
 
 use super::*;
 
+/// `ListGroups`' name for a group driven by `JoinGroup` / `SyncGroup`.
+pub(super) const CLASSIC_GROUP_TYPE: &str = "classic";
+
+/// `ListGroups`' name for a KIP-848 group driven by `ConsumerGroupHeartbeat`
+/// (#612).
+pub(super) const CONSUMER_GROUP_TYPE: &str = "consumer";
+
 impl GroupOffsets {
     pub(super) fn get(&self, topition: &Topition) -> Option<&OffsetCommitRequest> {
         self.committed
@@ -127,6 +134,14 @@ impl DynoStore {
     pub(super) fn group_generation_location(&self, group_id: &str) -> Option<Path> {
         self.group_prefix(group_id)
             .map(|prefix| Path::from(format!("{prefix}/generation.json")))
+    }
+
+    /// A KIP-848 consumer group's document (#612), beside the classic
+    /// group's objects under the same prefix so expiry and `DeleteGroups`
+    /// cover it without knowing it is there.
+    pub(super) fn consumer_group_location(&self, group_id: &str) -> Option<Path> {
+        self.group_prefix(group_id)
+            .map(|prefix| Path::from(format!("{prefix}/consumer.json")))
     }
 
     /// `assignment/` under a group's prefix (#359).
@@ -378,9 +393,21 @@ impl DynoStore {
     /// a group listed `Stable` and described `Empty` is exactly the
     /// disagreement #475 closed. [`Self::any_member_live`] is what keeps that
     /// agreement affordable here.
-    pub(super) async fn group_state(&self, group_id: &str) -> Result<ConsumerGroupState> {
+    ///
+    /// The first element is the group's type as `ListGroups` reports it: a
+    /// group with no generation but a KIP-848 document is a `consumer` group,
+    /// whose state is the document's own (#612). Only a group with no
+    /// generation pays for that second read, so a classic group's listing
+    /// costs what it did.
+    pub(super) async fn group_state(
+        &self,
+        group_id: &str,
+    ) -> Result<(&'static str, ConsumerGroupState)> {
         let Some((generation, _)) = self.read_group_generation(group_id).await? else {
-            return Ok(ConsumerGroupState::Empty);
+            return Ok(match self.read_consumer_group(group_id).await? {
+                Some((group, _)) => (CONSUMER_GROUP_TYPE, group.state(Self::now_ms())),
+                None => (CLASSIC_GROUP_TYPE, ConsumerGroupState::Empty),
+            });
         };
 
         let assignment = self
@@ -400,11 +427,14 @@ impl DynoStore {
             BTreeMap::new()
         };
 
-        Ok(ConsumerGroupState::from(&GroupDetail {
-            members,
-            state: Self::composed_group_state(&generation, assignment),
-            ..Default::default()
-        }))
+        Ok((
+            CLASSIC_GROUP_TYPE,
+            ConsumerGroupState::from(&GroupDetail {
+                members,
+                state: Self::composed_group_state(&generation, assignment),
+                ..Default::default()
+            }),
+        ))
     }
 
     /// Whether any member this generation names has been heard from inside its

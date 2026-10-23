@@ -87,7 +87,28 @@ where
         // of groups is a list of the other tenants' workloads.
         let mut groups = Vec::with_capacity(listed.len());
 
+        // KIP-848's `TypesFilter` (#612): as with states, an empty filter is
+        // no filter, and Kafka matches the type names case-insensitively.
+        let types = req
+            .types_filter
+            .filter(|types| !types.is_empty())
+            .map(|types| {
+                types
+                    .iter()
+                    .map(|group_type| group_type.to_lowercase())
+                    .collect::<Vec<_>>()
+            });
+
         for group in listed {
+            if let Some(ref types) = types
+                && !group
+                    .group_type
+                    .as_deref()
+                    .is_some_and(|group_type| types.contains(&group_type.to_lowercase()))
+            {
+                continue;
+            }
+
             if authorized(
                 &ctx,
                 Resource::Group,
