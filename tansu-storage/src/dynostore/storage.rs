@@ -524,6 +524,27 @@ impl Storage for DynoStore {
         })
     }
 
+    /// Lists the topition's prefix, bypassing the index TTL, and folds the
+    /// listed tail into the high-watermark hint before resolving the stage, so
+    /// the log end is the store's and not this replica's last look at it.
+    ///
+    /// The tail goes through `mark_listed`, which only ever raises the hint:
+    /// a forced listing that observed less than a hint already holds — a
+    /// sub-stream whose tail segment a peer retired — never lowers it.
+    async fn offset_stage_refreshed(&self, topition: &Topition) -> Result<OffsetStage> {
+        let (prefix, substream) = self.routed_substream_of(topition).await?;
+        let listed_at = SystemTime::now();
+
+        self.refresh_prefix_index_forced(&prefix).await?;
+
+        if let Some(tail) = self.substream_tail(&prefix, &substream, topition.partition())? {
+            self.mark_listed(topition, tail, listed_at)?;
+        }
+
+        self.offset_stage_at(topition, IsolationLevel::ReadUncommitted)
+            .await
+    }
+
     async fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage> {
         let (stable, aborted_raw) = self
             .meta

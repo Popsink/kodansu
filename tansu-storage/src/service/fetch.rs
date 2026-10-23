@@ -20,6 +20,7 @@ use std::{
 };
 
 use futures::{StreamExt as _, TryStreamExt as _};
+use opentelemetry::KeyValue;
 use rama::{Context, Service};
 use tansu_sans_io::{
     ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel, NULL_TOPIC_ID,
@@ -32,12 +33,13 @@ use tansu_sans_io::{
     record::deflated::{Batch, Frame},
 };
 use tokio::time::{Duration, Instant, sleep};
-use tracing::{debug, error, instrument};
+use tracing::{debug, error, info, instrument, warn};
 
 use tansu_sans_io::acl::{Operation, Resource};
 
 use crate::{
-    Error, OffsetStage, Parked, Result, Storage, Topition, authorized, storage_error_code,
+    Error, FETCH_OUT_OF_RANGE, OffsetStage, Parked, Result, Storage, Topition, authorized,
+    storage_error_code,
 };
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`FetchRequest`] returning [`FetchResponse`].
@@ -324,16 +326,58 @@ impl FetchService {
             }
         };
 
+        // `log` is this replica's view, and a consumer's position may come from
+        // another replica's: a pod that has just started, or one inside its
+        // index TTL, can see a log end below what its peer already served.
+        // Answered from that view, `OFFSET_OUT_OF_RANGE` reset whole consumer
+        // groups to `earliest` during the euw3 rollout of alpha.21
+        // (Popsink/data-plane#5470), so the store has the last word before the
+        // answer is given.
         if offset < log.log_start() || offset > log.high_watermark() {
-            debug!(
+            let refreshed = match ctx.state().offset_stage_refreshed(&tp).await {
+                Ok(refreshed) => refreshed,
+
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        ?tp,
+                        offset,
+                        high_watermark = log.high_watermark(),
+                        "cannot confirm a fetch position outside the log; answering empty"
+                    );
+                    FETCH_OUT_OF_RANGE.add(1, &[KeyValue::new("outcome", "unresolved")]);
+
+                    return Ok(self.bounded_partition(partition_index, &log, ErrorCode::None));
+                }
+            };
+
+            if offset < refreshed.log_start() || offset > refreshed.high_watermark() {
+                info!(
+                    ?tp,
+                    offset,
+                    log_start = refreshed.log_start(),
+                    high_watermark = refreshed.high_watermark(),
+                    "fetch position is outside the log; answering OFFSET_OUT_OF_RANGE"
+                );
+                FETCH_OUT_OF_RANGE.add(1, &[KeyValue::new("outcome", "confirmed")]);
+
+                return Ok(self.bounded_partition(
+                    partition_index,
+                    &refreshed,
+                    ErrorCode::OffsetOutOfRange,
+                ));
+            }
+
+            warn!(
                 ?tp,
                 offset,
-                log_start = log.log_start(),
-                high_watermark = log.high_watermark(),
-                "fetch offset is outside the log"
+                stale_log_start = log.log_start(),
+                stale_high_watermark = log.high_watermark(),
+                log_start = refreshed.log_start(),
+                high_watermark = refreshed.high_watermark(),
+                "fetch position was outside a lagging view of the log; serving it"
             );
-
-            return Ok(self.out_of_range_partition(partition_index, &log));
+            FETCH_OUT_OF_RANGE.add(1, &[KeyValue::new("outcome", "refuted")]);
         }
 
         // Kafka's own per-partition cap, which this path ignored: it passed the
@@ -524,7 +568,9 @@ impl FetchService {
     /// that has no readable state: a `high_watermark` of 0 with a
     /// `log_start_offset` of -1 claims nothing, so a client that looks past the
     /// error code cannot mistake it for an empty-but-healthy partition.
-    /// A fetch position outside the log (#444).
+    /// A partition answered with `error_code` and no records, carrying the
+    /// log's bounds: a fetch position outside the log (#444), or one that could
+    /// not be confirmed outside it and is answered empty (Popsink/data-plane#5470).
     ///
     /// Distinct from [`Self::unservable_partition`], which reports zeroed
     /// bounds because it does not have any: this one carries the **real**
@@ -532,10 +578,15 @@ impl FetchService {
     /// itself is looking at. Answering `OFFSET_OUT_OF_RANGE` with a log start of
     /// `-1` would tell a consumer its position is invalid and give it nothing to
     /// move to.
-    fn out_of_range_partition(&self, partition_index: i32, log: &OffsetStage) -> PartitionData {
+    fn bounded_partition(
+        &self,
+        partition_index: i32,
+        log: &OffsetStage,
+        error_code: ErrorCode,
+    ) -> PartitionData {
         PartitionData::default()
             .partition_index(partition_index)
-            .error_code(ErrorCode::OffsetOutOfRange.into())
+            .error_code(error_code.into())
             .high_watermark(log.high_watermark())
             .last_stable_offset(Some(log.last_stable()))
             .log_start_offset(Some(log.log_start()))

@@ -244,6 +244,10 @@ impl Storage for Engine {
         self.offset_stage(topition).await
     }
 
+    async fn offset_stage_refreshed(&self, topition: &Topition) -> Result<OffsetStage> {
+        self.offset_stage(topition).await
+    }
+
     #[instrument(skip_all)]
     async fn offset_commit(
         &self,

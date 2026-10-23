@@ -84,7 +84,7 @@ use object_store::{BackoffConfig, RetryConfig};
 
 use opentelemetry::{
     InstrumentationScope, global,
-    metrics::{Meter, UpDownCounter},
+    metrics::{Counter, Meter, UpDownCounter},
 };
 use opentelemetry_semantic_conventions::SCHEMA_URL;
 
@@ -1557,6 +1557,23 @@ pub trait Storage: Debug + Send + Sync + 'static {
         isolation: IsolationLevel,
     ) -> Result<OffsetStage>;
 
+    /// The read-uncommitted [`OffsetStage`] after this replica has caught up
+    /// with the store, for a decision a lagging view must not make.
+    ///
+    /// [`Self::offset_stage_at`] answers from whatever this replica last saw,
+    /// which on a stateless fleet can trail what another replica already served:
+    /// a pod that has just started, or one inside its index TTL. That is fine
+    /// for reporting offsets and wrong for refusing one. A Fetch whose position
+    /// lies past the stage's log end was answered `OFFSET_OUT_OF_RANGE` (#444),
+    /// and a consumer with `auto.offset.reset=earliest` replays its whole topic
+    /// on that answer — which is what a broker rollout did to several groups on
+    /// euw3 (Popsink/data-plane#5470). The Fetch service asks this before it
+    /// says so.
+    ///
+    /// A backend whose view cannot lag says so by delegating to
+    /// [`Self::offset_stage_at`]; there is no default body, for #551's reason.
+    async fn offset_stage_refreshed(&self, topition: &Topition) -> Result<OffsetStage>;
+
     /// Query the offsets for one or more topic partitions.
     async fn list_offsets(
         &self,
@@ -2787,6 +2804,22 @@ pub(crate) static REQUESTS_PARKED: LazyLock<UpDownCounter<i64>> = LazyLock::new(
     METER
         .i64_up_down_counter("tansu_requests_parked")
         .with_description("API requests parked in a long poll, waiting rather than working")
+        .build()
+});
+
+/// Fetch positions found outside this replica's view of the log, by what a
+/// forced listing then said (Popsink/data-plane#5470): `confirmed` was
+/// answered `OFFSET_OUT_OF_RANGE`, `refuted` was a lagging view and was served,
+/// `unresolved` could not be checked and was answered empty.
+///
+/// `OFFSET_OUT_OF_RANGE` is the answer a consumer turns into a reset, and a
+/// reset to `earliest` is a whole-topic replay, so every one of them is worth
+/// seeing. A non-zero `refuted` rate is the measure of how often a lagging pod
+/// would have replayed a consumer before this check existed.
+pub(crate) static FETCH_OUT_OF_RANGE: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_fetch_out_of_range")
+        .with_description("fetch positions outside a replica's view of the log, by outcome")
         .build()
 });
 
