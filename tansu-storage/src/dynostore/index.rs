@@ -612,159 +612,202 @@ impl DynoStore {
         }
 
         let listing = self.segment_prefix(prefix);
-        let mut stream = match start_after.filter(|_| !whole_prefix) {
-            Some(seq) => self.scan_from(
-                Scan::SegmentIndex,
-                &listing,
-                &self.segment_location(prefix, seq),
-            ),
-            None => self.scan(Scan::SegmentIndex, &listing),
-        };
+        let mut after = start_after.filter(|_| !whole_prefix);
+        let mut live: BTreeSet<u64> = BTreeSet::new();
+        let mut relists = 0;
 
-        let mut discovered: Vec<(u64, Path, i64)> = Vec::new();
-        while let Some(meta) = stream
-            .next()
-            .await
-            .transpose()
-            .inspect_err(|err| error!(?err, prefix))?
-        {
-            let Some(seq) = Self::segment_seq_of(&meta.location) else {
-                continue;
+        // A footer that vanished between the LIST and its GET was retired by a
+        // peer, and if it was merged, its replacement was written at a sequence
+        // above this listing: the index would hold neither, and a fetch inside
+        // the run would be served the next segment up, past its offset
+        // (Popsink/data-plane#5470). A replacement is always created before the
+        // deletion it retires, so a listing taken after the 404 sees it — list
+        // again after this one's maximum until a pass meets no vanished footer.
+        let settled = loop {
+            let mut stream = match after {
+                Some(seq) => self.scan_from(
+                    Scan::SegmentIndex,
+                    &listing,
+                    &self.segment_location(prefix, seq),
+                ),
+                None => self.scan(Scan::SegmentIndex, &listing),
             };
-            discovered.push((seq, meta.location, meta.last_modified.timestamp_millis()));
-        }
 
-        // What is really under the prefix, from the store's own answer (#399).
-        //
-        // Only a whole-prefix listing may say so — see [`listed_population`].
-        // Costs nothing, the listing was walked anyway, and it is the count the
-        // index-derived gauge could never be: an index holds what a replica has
-        // seen, not what a bucket holds.
-        if let Some(population) = listed_population(discovered.len(), whole_prefix) {
-            SEGMENTS_LIVE.record(population, &[KeyValue::new("prefix", prefix.to_string())]);
-        }
+            let mut discovered: Vec<(u64, Path, i64)> = Vec::new();
+            while let Some(meta) = stream
+                .next()
+                .await
+                .transpose()
+                .inspect_err(|err| error!(?err, prefix))?
+            {
+                let Some(seq) = Self::segment_seq_of(&meta.location) else {
+                    continue;
+                };
+                discovered.push((seq, meta.location, meta.last_modified.timestamp_millis()));
+            }
 
-        // The whole live set, kept only for the downward pass — a listing that
-        // completed, so what it did not return below its own maximum is retired
-        // (#408). Collected before the footers are consumed; an incremental
-        // listing has no business pruning anything and builds nothing.
-        let live: BTreeSet<u64> = if reconcile {
-            discovered.iter().map(|(seq, _, _)| *seq).collect()
-        } else {
-            BTreeSet::new()
-        };
+            // What is really under the prefix, from the store's own answer (#399).
+            //
+            // Only a whole-prefix listing may say so — see [`listed_population`].
+            // Costs nothing, the listing was walked anyway, and it is the count the
+            // index-derived gauge could never be: an index holds what a replica has
+            // seen, not what a bucket holds.
+            if let Some(population) =
+                listed_population(discovered.len(), whole_prefix).filter(|_| relists == 0)
+            {
+                SEGMENTS_LIVE.record(population, &[KeyValue::new("prefix", prefix.to_string())]);
+            }
 
-        // Fetch not-yet-cached footers CONCURRENTLY and commit each to the index
-        // as it arrives (#105). Two properties matter at scale — with compaction
-        // disabled a prefix accrues thousands of segments:
-        //
-        // - **Concurrency.** A sequential footer-per-segment loop is O(#segments)
-        //   round-trips; a cold `list_offsets` (LATEST via `high_watermark`,
-        //   EARLIEST via `segment_region_start`) then blocked past the 60s client
-        //   timeout, stalling the whole read path. `buffered` keeps up to
-        //   `FOOTER_FETCH_CONCURRENCY` ranged GETs in flight (as the topic-index
-        //   warm does), cutting wall-time ~N×.
-        // - **Incremental, in-order commit.** Committing per footer rather than
-        //   once at the end means a request the client abandons at its timeout
-        //   (dropping this future) still leaves progress cached — so the index
-        //   warms across attempts instead of restarting from zero (the
-        //   "sustained, not decaying" stall). Ordered `buffered` preserves the
-        //   ascending-sequence LIST order, so the committed set stays a
-        //   contiguous prefix and the next refresh's `start_after` watermark is
-        //   correct even after a partial build.
-        const FOOTER_FETCH_CONCURRENCY: usize = 32;
+            // The whole live set, kept only for the downward pass — a listing that
+            // completed, so what it did not return below its own maximum is retired
+            // (#408). Collected before the footers are consumed; an incremental
+            // listing has no business pruning anything and builds nothing.
+            if reconcile {
+                live.extend(discovered.iter().map(|(seq, _, _)| *seq));
+            }
 
-        // Already resolved: decoded segments *and* the undecodable names (#157) —
-        // re-GETting a footer that will not decode again costs a request per
-        // refresh (per flush, on the forced path) and never makes progress.
-        let cached: BTreeSet<u64> = self
-            .prefixes
-            .index()?
-            .get(prefix)
-            .map(|entry| {
-                entry
-                    .segments
-                    .keys()
-                    .copied()
-                    .chain(entry.opaque.iter().copied())
-                    .collect()
+            let listed_max = discovered.iter().map(|(seq, _, _)| *seq).max();
+
+            // Fetch not-yet-cached footers CONCURRENTLY and commit each to the index
+            // as it arrives (#105). Two properties matter at scale — with compaction
+            // disabled a prefix accrues thousands of segments:
+            //
+            // - **Concurrency.** A sequential footer-per-segment loop is O(#segments)
+            //   round-trips; a cold `list_offsets` (LATEST via `high_watermark`,
+            //   EARLIEST via `segment_region_start`) then blocked past the 60s client
+            //   timeout, stalling the whole read path. `buffered` keeps up to
+            //   `FOOTER_FETCH_CONCURRENCY` ranged GETs in flight (as the topic-index
+            //   warm does), cutting wall-time ~N×.
+            // - **Incremental, in-order commit.** Committing per footer rather than
+            //   once at the end means a request the client abandons at its timeout
+            //   (dropping this future) still leaves progress cached — so the index
+            //   warms across attempts instead of restarting from zero (the
+            //   "sustained, not decaying" stall). Ordered `buffered` preserves the
+            //   ascending-sequence LIST order, so the committed set stays a
+            //   contiguous prefix and the next refresh's `start_after` watermark is
+            //   correct even after a partial build.
+            const FOOTER_FETCH_CONCURRENCY: usize = 32;
+
+            // Already resolved: decoded segments *and* the undecodable names (#157) —
+            // re-GETting a footer that will not decode again costs a request per
+            // refresh (per flush, on the forced path) and never makes progress.
+            let cached: BTreeSet<u64> = self
+                .prefixes
+                .index()?
+                .get(prefix)
+                .map(|entry| {
+                    entry
+                        .segments
+                        .keys()
+                        .copied()
+                        .chain(entry.opaque.iter().copied())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let mut footers = futures::stream::iter(
+                discovered
+                    .into_iter()
+                    .filter(|(seq, _, _)| !cached.contains(seq)),
+            )
+            .map(|(seq, location, last_modified_ms)| async move {
+                match self.read_segment_footer(&location).await {
+                    Ok(Some(footer)) => Ok((seq, last_modified_ms, FooterOutcome::Decoded(footer))),
+                    Ok(None) => Ok((seq, last_modified_ms, FooterOutcome::Undecodable)),
+                    // Gone between the LIST that discovered it and this GET:
+                    // concurrent compaction (#66) merged it away, or retention (#61)
+                    // reclaimed it. Not an integrity fault and not this reader's
+                    // problem — before #191 the `?` below turned it into a failed
+                    // index refresh and a raw `ObjectStore(NotFound)` escaping
+                    // `ListOffsets` all the way to the connection error path.
+                    Err(Error::ObjectStore(ref inner))
+                        if matches!(**inner, object_store::Error::NotFound { .. }) =>
+                    {
+                        Ok((seq, last_modified_ms, FooterOutcome::Vanished))
+                    }
+                    Err(error) => Err(error),
+                }
             })
-            .unwrap_or_default();
+            .buffered(FOOTER_FETCH_CONCURRENCY);
 
-        let mut footers = futures::stream::iter(
-            discovered
-                .into_iter()
-                .filter(|(seq, _, _)| !cached.contains(seq)),
-        )
-        .map(|(seq, location, last_modified_ms)| async move {
-            match self.read_segment_footer(&location).await {
-                Ok(Some(footer)) => Ok((seq, last_modified_ms, FooterOutcome::Decoded(footer))),
-                Ok(None) => Ok((seq, last_modified_ms, FooterOutcome::Undecodable)),
-                // Gone between the LIST that discovered it and this GET:
-                // concurrent compaction (#66) merged it away, or retention (#61)
-                // reclaimed it. Not an integrity fault and not this reader's
-                // problem — before #191 the `?` below turned it into a failed
-                // index refresh and a raw `ObjectStore(NotFound)` escaping
-                // `ListOffsets` all the way to the connection error path.
-                Err(Error::ObjectStore(ref inner))
-                    if matches!(**inner, object_store::Error::NotFound { .. }) =>
-                {
-                    Ok((seq, last_modified_ms, FooterOutcome::Vanished))
-                }
-                Err(error) => Err(error),
-            }
-        })
-        .buffered(FOOTER_FETCH_CONCURRENCY);
+            let mut vanished = 0usize;
 
-        while let Some(result) = footers.next().await {
-            let (seq, last_modified_ms, footer) = result?;
-            let mut index = self.prefixes.index()?;
-            let entry = index.entry(prefix.to_owned()).or_default();
-            match footer {
-                FooterOutcome::Decoded(footer) => {
-                    entry.insert_segment(
-                        seq,
-                        CachedSegment {
-                            footer,
-                            last_modified_ms,
-                        },
-                    );
-                }
-
-                // The object holds a sequence but carries no decodable footer, so
-                // it can never join the readable set — record the *name* as
-                // resolved (#157) so the leaseless arbiter steps over it instead
-                // of re-deriving an occupied candidate until its budget is gone,
-                // and so the next refresh does not re-GET this footer.
-                FooterOutcome::Undecodable => {
-                    if entry.opaque.insert(seq) {
-                        SEGMENT_FOOTER_UNDECODABLE.add(1, &[]);
-                        warn!(
-                            prefix,
+            while let Some(result) = footers.next().await {
+                let (seq, last_modified_ms, footer) = result?;
+                let mut index = self.prefixes.index()?;
+                let entry = index.entry(prefix.to_owned()).or_default();
+                match footer {
+                    FooterOutcome::Decoded(footer) => {
+                        entry.insert_segment(
                             seq,
-                            "segment object has no decodable footer; stepping over the sequence"
+                            CachedSegment {
+                                footer,
+                                last_modified_ms,
+                            },
                         );
                     }
-                }
 
-                // Deleted under us (#191). Same bookkeeping as an undecodable
-                // name — resolved, unreadable, stepped over — but logged
-                // separately: an operator seeing "no decodable footer" for an
-                // object that maintenance simply reclaimed would go looking for
-                // corruption that is not there. Sequences are never reused
-                // (#77), so caching it as resolved is permanent and correct.
-                FooterOutcome::Vanished => {
-                    if entry.opaque.insert(seq) {
-                        SEGMENT_VANISHED_BEFORE_READ.add(1, &[]);
-                        SEGMENT_ABSENT.add(1, &[KeyValue::new("caller", "refresh")]);
-                        debug!(
-                            prefix,
-                            seq, "segment deleted before its footer could be read; stepping over"
-                        );
+                    // The object holds a sequence but carries no decodable footer, so
+                    // it can never join the readable set — record the *name* as
+                    // resolved (#157) so the leaseless arbiter steps over it instead
+                    // of re-deriving an occupied candidate until its budget is gone,
+                    // and so the next refresh does not re-GET this footer.
+                    FooterOutcome::Undecodable => {
+                        if entry.opaque.insert(seq) {
+                            SEGMENT_FOOTER_UNDECODABLE.add(1, &[]);
+                            warn!(
+                                prefix,
+                                seq,
+                                "segment object has no decodable footer; stepping over the sequence"
+                            );
+                        }
+                    }
+
+                    // Deleted under us (#191). Same bookkeeping as an undecodable
+                    // name — resolved, unreadable, stepped over — but logged
+                    // separately: an operator seeing "no decodable footer" for an
+                    // object that maintenance simply reclaimed would go looking for
+                    // corruption that is not there. Sequences are never reused
+                    // (#77), so caching it as resolved is permanent and correct.
+                    FooterOutcome::Vanished => {
+                        vanished += 1;
+                        if entry.opaque.insert(seq) {
+                            SEGMENT_VANISHED_BEFORE_READ.add(1, &[]);
+                            SEGMENT_ABSENT.add(1, &[KeyValue::new("caller", "refresh")]);
+                            debug!(
+                                prefix,
+                                seq,
+                                "segment deleted before its footer could be read; stepping over"
+                            );
+                        }
                     }
                 }
             }
-        }
+
+            if vanished == 0 {
+                break true;
+            }
+
+            if relists == Self::PREFIX_INDEX_MAX_RELISTS {
+                warn!(
+                    prefix,
+                    vanished,
+                    relists,
+                    "footers still vanishing after re-listing; leaving the index stale"
+                );
+                break false;
+            }
+
+            relists += 1;
+            PREFIX_INDEX_LISTS.add(
+                1,
+                &[
+                    KeyValue::new("path", path),
+                    KeyValue::new("reason", "vanished"),
+                ],
+            );
+            after = after.max(listed_max);
+        };
 
         // Whole live set observed: stamp fresh so the TTL fast-path can serve.
         // The listing may reflect another replica's segment deletions (which an
@@ -774,7 +817,7 @@ impl DynoStore {
         {
             let mut index = self.prefixes.index()?;
             let entry = index.entry(prefix.to_owned()).or_default();
-            entry.refreshed_at = Some(SystemTime::now());
+            entry.refreshed_at = settled.then(SystemTime::now);
             entry.generation += 1;
 
             // The downward half (#408). **Only entries below the listing's own

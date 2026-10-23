@@ -422,7 +422,16 @@ fmt:
 # test compares offset spans rather than batches, and most of the lines are the
 # test that counts the store bytes a read costs.
 #
-#   #617  +244 lines, ghost straddle  3179 -> 3179  2.85991885 -> 2.85365481
+#   #5470 +193 lines, vanished footers  3179 -> 3179  2.85991885 -> 2.85414160
+#
+# A prefix-index refresh whose footer GET 404s lists again after its own
+# maximum, because a peer's merge wrote the replacement above the listing it
+# took (Popsink/data-plane#5470). The one `//` block added cites the issue; the
+# reasoning is the `///` on `PREFIX_INDEX_MAX_RELISTS`, and most of the lines
+# are the refresh body indented into the loop and the test that races a merge
+# against a cold build.
+#
+#   #617  +244 lines, ghost straddle  3179 -> 3179  2.85414160 -> 2.84790282
 #
 # A broker's ghost original straddling two of a capped merge's regions is
 # dropped instead of served clipped, so `tansu_substream_overlap_clipped` is
@@ -440,7 +449,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.8537" top="12":
+comments ceiling="2.8480" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
