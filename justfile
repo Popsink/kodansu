@@ -438,6 +438,14 @@ fmt:
 # The reasoning is the `///` on `refuse_divergent_run` and `first_divergence`;
 # the one `//` block it adds cites #614, and the rest is code and its tests.
 #
+#   #616  +205 lines, merge folds below  3179 -> 3179  2.84685717 -> 2.84362309
+#
+# A compaction that wins a name above segments its index has not seen folds
+# them in before inserting the merged segment, instead of moving the listing
+# cursor past them until the reconcile. The reasoning is the `///` on
+# `fold_below_won`; the test's one `//` block cites #616, and most of the lines
+# are the test.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -447,7 +455,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.8469" top="12":
+comments ceiling="2.8437" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

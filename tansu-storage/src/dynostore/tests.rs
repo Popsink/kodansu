@@ -31,6 +31,7 @@ mod azure_suffix;
 mod compact_refusal;
 mod compact_segments;
 mod compacted_region_reads;
+mod compaction_cursor;
 mod conditional_put_probe;
 mod corrupt_region;
 mod delete_fan_out;
