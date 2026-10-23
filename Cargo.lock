@@ -3865,6 +3865,7 @@ dependencies = [
  "rama",
  "rand 0.10.1",
  "rsasl",
+ "socket2 0.6.3",
  "tansu-auth",
  "tansu-sans-io",
  "thiserror",

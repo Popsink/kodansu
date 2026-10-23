@@ -16,7 +16,7 @@
 use std::{
     error::{self},
     fmt::Debug,
-    future::Future,
+    future::{Future, pending},
     io,
     marker::PhantomData,
     net::SocketAddr,
@@ -33,6 +33,7 @@ use futures::{StreamExt as _, stream::FuturesOrdered};
 use nanoid::nanoid;
 use opentelemetry::KeyValue;
 use rama::{Context, Layer, Service};
+use socket2::{SockRef, TcpKeepalive};
 use tansu_sans_io::{ApiKey as _, ProduceRequest, RootMessageMeta};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt, BufWriter},
@@ -379,6 +380,12 @@ pub struct TcpContext {
     /// (#588): [`Self::PIPELINE_DEPTH`] unless an operator changes it, `1` is
     /// pipelining turned off, and [`Self::MAXIMUM_PIPELINE_DEPTH`] the most.
     pipeline_depth: usize,
+
+    /// How long a connection may sit with nothing owed and nothing read before
+    /// it is closed (#605), `None` to hold it for as long as the peer does.
+    /// Kafka's `connections.max.idle.ms`; [`Self::CONNECTIONS_MAX_IDLE`] unless
+    /// an operator changes it.
+    connections_max_idle: Option<Duration>,
 }
 
 /// Armed, unlike every `Option` beside it.
@@ -399,6 +406,7 @@ impl Default for TcpContext {
             maximum_frame_size: Some(Self::MAXIMUM_FRAME_SIZE),
             drain: CancellationToken::default(),
             pipeline_depth: Self::PIPELINE_DEPTH,
+            connections_max_idle: Some(Self::CONNECTIONS_MAX_IDLE),
         }
     }
 }
@@ -440,6 +448,22 @@ impl TcpContext {
     /// request, up to `socket.request.max.bytes`, held per connection.
     pub const MAXIMUM_PIPELINE_DEPTH: usize = 10;
 
+    /// Kafka's `connections.max.idle.ms` default, and ours (#605).
+    ///
+    /// A client that vanishes without a FIN or an RST leaves its socket
+    /// `ESTABLISHED` here, and nothing used to close it: one task, one file
+    /// descriptor and the connection's buffers, for as long as the replica
+    /// lived. Keepalive ([`Keepalive`]) reaps a peer that is *gone*; this reaps
+    /// one that is alive but silent, or hidden behind a middlebox that answers
+    /// the probes on its behalf.
+    ///
+    /// Idle means nothing owed: the clock starts when the last request read has
+    /// been answered, so a long-poll `Fetch`, a `JoinGroup` waiting on its
+    /// rebalance or a produce held in its window is never cut. A client is
+    /// closed only between requests, which it handles as any reconnect — what
+    /// it already does against Kafka.
+    pub const CONNECTIONS_MAX_IDLE: Duration = Duration::from_secs(600);
+
     pub fn cluster_id(self, cluster_id: Option<String>) -> Self {
         Self { cluster_id, ..self }
     }
@@ -466,6 +490,81 @@ impl TcpContext {
             ..self
         }
     }
+
+    /// Close a connection that has owed nothing and read nothing for
+    /// `connections_max_idle` (#605), `None` never to.
+    pub fn connections_max_idle(self, connections_max_idle: Option<Duration>) -> Self {
+        Self {
+            connections_max_idle,
+            ..self
+        }
+    }
+}
+
+/// TCP keepalive for an accepted socket (#605).
+///
+/// Without it, a peer that disappears without a FIN or an RST — a pod killed,
+/// a node gone, the last packet lost — leaves its socket `ESTABLISHED` for as
+/// long as the broker lives: nothing ever probes it. With it, the kernel probes
+/// a connection that has been silent for [`Self::time`], every
+/// [`Self::interval`], and resets it after [`Self::retries`] go unanswered.
+///
+/// Explicit rather than the kernel's own defaults, which wait two hours before
+/// the first probe. A connection that is merely quiet costs a probe a minute
+/// and stays open; the idle deadline in [`TcpContext`] is what closes those.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Keepalive {
+    /// Silence before the first probe.
+    pub time: Duration,
+    /// Between unanswered probes.
+    pub interval: Duration,
+    /// Unanswered probes before the connection is reset.
+    pub retries: u32,
+}
+
+/// 60 s, 10 s and 3: a vanished peer is reaped within a minute and a half.
+impl Default for Keepalive {
+    fn default() -> Self {
+        Self {
+            time: Duration::from_secs(60),
+            interval: Duration::from_secs(10),
+            retries: 3,
+        }
+    }
+}
+
+impl Keepalive {
+    /// Turn keepalive on for `stream` with these parameters.
+    ///
+    /// The kernel counts in whole seconds, so anything finer is truncated.
+    pub fn apply(&self, stream: &TcpStream) -> io::Result<()> {
+        SockRef::from(stream).set_tcp_keepalive(
+            &TcpKeepalive::new()
+                .with_time(self.time)
+                .with_interval(self.interval)
+                .with_retries(self.retries),
+        )
+    }
+}
+
+/// Until a connection has owed nothing and read nothing for `timeout` (#605),
+/// or never when there is none.
+///
+/// Every slot is held while the clock runs, which is what "owed nothing"
+/// means: a slot is taken before a request is read and given back once it has
+/// been answered. That holding blocks no one — the only other taker is the
+/// reader, and it is the reader waiting on this. It lets go as soon as a frame
+/// arrives, because that ends the `select!` this is polled in.
+async fn idle(slots: &Semaphore, depth: usize, timeout: Option<Duration>) {
+    let Some(timeout) = timeout else {
+        return pending().await;
+    };
+
+    let Ok(_nothing_owed) = slots.acquire_many(depth as u32).await else {
+        return pending().await;
+    };
+
+    sleep(timeout).await
 }
 
 /// A [`Layer`] that injects the [`TcpContext`] into the service [`Context`] state
@@ -840,6 +939,7 @@ where
         let maximum_frame_size = ctx.state().maximum_frame_size;
         let drain = ctx.state().drain.clone();
         let depth = ctx.state().pipeline_depth;
+        let connections_max_idle = ctx.state().connections_max_idle;
 
         // One cell for the life of the connection, and the same one every
         // request writes into: the quota layer above finds it in the context,
@@ -887,6 +987,13 @@ where
                     }
 
                     size = self.wait(&mut reader, maximum_frame_size) => size?,
+
+                    // Last, so a frame that arrives as the deadline passes is
+                    // read, not cut (#605).
+                    () = idle(&slots, depth, connections_max_idle) => {
+                        debug!(?connections_max_idle, "closing an idle connection: connections.max.idle.ms passed with nothing owed");
+                        return Ok(());
+                    }
                 };
 
                 // Before the body is read, so what a connection holds is
@@ -2088,5 +2195,146 @@ mod tests {
                 "asked for {asked}"
             );
         }
+    }
+
+    /// Wait for the server to close `client`, and say how long that took.
+    async fn closed(client: &mut tokio::io::DuplexStream) -> Duration {
+        let started = tokio::time::Instant::now();
+        let mut trailing = [0u8; 1];
+
+        assert_eq!(
+            0,
+            client.read(&mut trailing).await.expect("a close"),
+            "the server wrote something instead of closing",
+        );
+
+        started.elapsed()
+    }
+
+    /// Whether `idle` is the deadline, give or take the timer's tick.
+    fn at_the_deadline(idle: Duration) -> bool {
+        (TcpContext::CONNECTIONS_MAX_IDLE
+            ..TcpContext::CONNECTIONS_MAX_IDLE + Duration::from_secs(1))
+            .contains(&idle)
+    }
+
+    /// **A client that sends a request and then goes silent is disconnected**
+    /// (#605), once `connections.max.idle.ms` has passed since its answer —
+    /// and not before, which is what the connection held for weeks did.
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_connection_is_closed_after_connections_max_idle() {
+        let inner = Pipelined::new();
+        let (mut client, connection) = connect(inner.clone(), TcpContext::default());
+
+        client.write_all(&metadata(1)).await.expect("request");
+        answered(&mut client, metadata(1)).await;
+
+        let idle = closed(&mut client).await;
+        assert!(at_the_deadline(idle), "closed after {idle:?}");
+
+        assert!(connection.await.expect("joined").is_ok());
+    }
+
+    /// **A request in flight is not idleness** (#605): a produce held in its
+    /// window far longer than the deadline — as a long-poll `Fetch` or a
+    /// `JoinGroup` can be — keeps its connection reading, and the clock
+    /// starts only once everything read has been answered.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_owed_an_answer_is_not_idle() {
+        let inner = Pipelined::new();
+        let (mut client, connection) = connect(inner.clone(), TcpContext::default());
+
+        client.write_all(&produce(1)).await.expect("request");
+        inner.until("admitted", 1).await;
+
+        sleep(TcpContext::CONNECTIONS_MAX_IDLE * 3).await;
+
+        client.write_all(&produce(2)).await.expect("request");
+        inner.until("admitted", 2).await;
+
+        inner.open();
+        answered(&mut client, produce(1)).await;
+        answered(&mut client, produce(2)).await;
+
+        let idle = closed(&mut client).await;
+        assert!(
+            at_the_deadline(idle),
+            "closed {idle:?} after its last answer"
+        );
+
+        assert!(connection.await.expect("joined").is_ok());
+    }
+
+    /// Every request restarts the clock (#605): a client that asks more often
+    /// than the deadline keeps one connection however long it stays.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_in_use_is_kept() {
+        let inner = Pipelined::new();
+        let (mut client, connection) = connect(inner.clone(), TcpContext::default());
+
+        for id in 1..=6 {
+            sleep(TcpContext::CONNECTIONS_MAX_IDLE - Duration::from_secs(1)).await;
+
+            client.write_all(&metadata(id)).await.expect("request");
+            answered(&mut client, metadata(id)).await;
+        }
+
+        assert!(!connection.is_finished(), "closed while in use");
+
+        drop(client);
+        _ = connection.await;
+    }
+
+    /// `None` is the deadline turned off (#605): an idle connection is held
+    /// for as long as the peer holds it, as every connection used to be.
+    #[tokio::test(start_paused = true)]
+    async fn no_deadline_keeps_an_idle_connection() {
+        let inner = Pipelined::new();
+        let (mut client, connection) = connect(
+            inner.clone(),
+            TcpContext::default().connections_max_idle(None),
+        );
+
+        client.write_all(&metadata(1)).await.expect("request");
+        answered(&mut client, metadata(1)).await;
+
+        sleep(TcpContext::CONNECTIONS_MAX_IDLE * 10).await;
+        assert!(!connection.is_finished(), "closed with no deadline");
+
+        drop(client);
+        _ = connection.await;
+    }
+
+    /// The probe parameters land on the socket as given (#605) — what `ss -o`
+    /// shows as `timer:(keepalive,…)` on a broker's client connections.
+    #[tokio::test]
+    async fn keepalive_is_set_on_an_accepted_socket() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("address");
+
+        let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+        let _client = client.expect("connect");
+        let (server, _) = accepted.expect("accept");
+
+        assert!(!SockRef::from(&server).keepalive().expect("SO_KEEPALIVE"));
+
+        let keepalive = Keepalive {
+            time: Duration::from_secs(30),
+            interval: Duration::from_secs(5),
+            retries: 4,
+        };
+        keepalive.apply(&server).expect("keepalive");
+
+        let socket = SockRef::from(&server);
+        assert!(socket.keepalive().expect("SO_KEEPALIVE"));
+        assert_eq!(keepalive.time, socket.tcp_keepalive_time().expect("time"));
+        assert_eq!(
+            keepalive.interval,
+            socket.tcp_keepalive_interval().expect("interval")
+        );
+        assert_eq!(
+            keepalive.retries,
+            socket.tcp_keepalive_retries().expect("retries")
+        );
     }
 }
