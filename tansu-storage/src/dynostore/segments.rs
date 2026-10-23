@@ -719,6 +719,7 @@ impl DynoStore {
                 SegmentCreate::Won => {
                     SEGMENT_CREATES.add(1, &attributes);
                     self.set_seq(prefix, candidate + 1)?;
+                    self.fold_below_won(prefix, candidate).await;
                     return Ok(candidate);
                 }
 
@@ -754,6 +755,48 @@ impl DynoStore {
         );
         // Retriable: contention exhaustion, not a permanent fault (#6/#129).
         Err(Error::Api(ErrorCode::KafkaStorageError))
+    }
+
+    /// Fold every segment between the index cursor and `won` into the prefix
+    /// index, before the caller's `index_insert` moves the cursor to `won`
+    /// (#616).
+    ///
+    /// The first candidate in [`Self::assign_and_create_segment`] comes from
+    /// the process's own hint or a name-only [`Self::tail_next_seq`], never
+    /// from the index, so a create can win a name above segments a broker made
+    /// after the index was last refreshed. Both the incremental listing and
+    /// the tail probe start at [`PrefixIndex::resolved_max`], so once the
+    /// merged segment is inserted those segments are invisible until the
+    /// whole-prefix reconcile — and run selection, expiry and coverage spend
+    /// that window on a view with holes in it.
+    ///
+    /// A forced refresh rather than a footer GET per skipped sequence: it is
+    /// the same fold the leaseless flush does before it claims (#91), it lists
+    /// incrementally from the cursor so it costs O(skipped), and it resolves
+    /// what a per-sequence fold cannot — names freed under a raised floor and
+    /// undecodable objects. It runs only when the won name is *not* the
+    /// cursor's successor, which is every create whose candidate the index
+    /// already accounts for, so the steady state pays nothing.
+    ///
+    /// A failed refresh is logged, not returned: the segment is already
+    /// durable, and failing here would leave it unindexed and its run
+    /// unretired. The hole it leaves is the one the reconcile closed before.
+    async fn fold_below_won(&self, prefix: &str, won: u64) {
+        let cursor = match self.prefixes.index() {
+            Ok(index) => index.get(prefix).and_then(PrefixIndex::resolved_max),
+            Err(error) => {
+                warn!(?error, prefix, won, "reading the index cursor");
+                return;
+            }
+        };
+
+        if cursor.is_some_and(|cursor| cursor + 1 >= won) {
+            return;
+        }
+
+        if let Err(error) = self.refresh_prefix_index_forced(prefix).await {
+            warn!(?error, prefix, won, ?cursor, "folding below a won segment");
+        }
     }
 
     /// Read a segment's self-describing footer (#58/#64) with at most two ranged

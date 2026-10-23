@@ -438,7 +438,15 @@ fmt:
 # The reasoning is the `///` on `refuse_divergent_run` and `first_divergence`;
 # the one `//` block it adds cites #614, and the rest is code and its tests.
 #
-#   #617  +244 lines, ghost straddle  3179 -> 3179  2.84685717 -> 2.84065016
+#   #616  +205 lines, merge folds below  3179 -> 3179  2.84685717 -> 2.84362309
+#
+# A compaction that wins a name above segments its index has not seen folds
+# them in before inserting the merged segment, instead of moving the listing
+# cursor past them until the reconcile. The reasoning is the `///` on
+# `fold_below_won`; the test's one `//` block cites #616, and most of the lines
+# are the test.
+#
+#   #617  +244 lines, ghost straddle  3179 -> 3179  2.84362309 -> 2.83743016
 #
 # A broker's ghost original straddling two of a capped merge's regions is
 # dropped instead of served clipped, so `tansu_substream_overlap_clipped` is
@@ -456,7 +464,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.8407" top="12":
+comments ceiling="2.8375" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
