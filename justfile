@@ -422,7 +422,7 @@ fmt:
 # test compares offset spans rather than batches, and most of the lines are the
 # test that counts the store bytes a read costs.
 #
-#   #614  +400 lines, divergent overlap  3179 -> 3179  2.85991885 -> 2.85719422
+#   #614  +420 lines, divergent overlap  3179 -> 3179  2.85991885 -> 2.85260494
 #
 # A merge refuses a run in which two segments hold different batches at the
 # same offsets, instead of keeping the fenced winner and retiring the other.
@@ -438,7 +438,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.8572" top="12":
+comments ceiling="2.8527" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

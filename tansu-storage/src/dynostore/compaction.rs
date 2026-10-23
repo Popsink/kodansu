@@ -714,7 +714,13 @@ impl DynoStore {
     /// So the merge compares the run's raw regions, not the fenced view, batch
     /// by batch: an overlap whose batches agree on offsets and CRC is a copy and
     /// merges as before; anything else keeps both objects, out of every future
-    /// run in this process, and says so at `error`. Readers are unaffected — the
+    /// run in this process, and says so at `error`.
+    ///
+    /// Only within one `writer_epoch`. A lower epoch losing to a higher one is
+    /// the fence working — a zombie writer's region, never acknowledged — and
+    /// dropping it is what the epoch is for. The reported overlap was two
+    /// segments of the same leaseless era, where no rule says which side is
+    /// right. Readers are unaffected — the
     /// fenced view still answers them — but the evidence survives for
     /// `tansu audit`, and no record is retired on the strength of a priority
     /// rule.
@@ -729,7 +735,7 @@ impl DynoStore {
         let mut divergent = false;
 
         for (substream, topic, partition) in substream_keys {
-            let mut spans = Vec::new();
+            let mut spans: BTreeMap<i64, Vec<BatchSpan>> = BTreeMap::new();
 
             for (seq, footer) in footers {
                 let Some(object) = objects.get(seq) else {
@@ -756,17 +762,20 @@ impl DynoStore {
                     {
                         let from = running;
                         running += batch.last_offset_delta as i64 + 1;
-                        spans.push(BatchSpan {
-                            from,
-                            to: running,
-                            seq: *seq,
-                            crc: batch.crc,
-                        });
+                        spans
+                            .entry(footer.writer_epoch)
+                            .or_default()
+                            .push(BatchSpan {
+                                from,
+                                to: running,
+                                seq: *seq,
+                                crc: batch.crc,
+                            });
                     }
                 }
             }
 
-            let Some((kept, other)) = first_divergence(spans) else {
+            let Some((kept, other)) = spans.into_values().find_map(first_divergence) else {
                 continue;
             };
 
