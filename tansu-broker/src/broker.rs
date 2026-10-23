@@ -40,7 +40,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tansu_sans_io::{ErrorCode, RootMessageMeta};
-use tansu_service::{Classify as _, Peer, Severity, TcpContext};
+use tansu_service::{Classify as _, Keepalive, Peer, Severity, TcpContext};
 use tansu_storage::{
     ArcDynStorage, Authorizer, BrokerRegistrationRequest, QuotaEnforcer, QuotaLimits, Storage,
     StorageContainer, TopicDefaults,
@@ -239,6 +239,31 @@ async fn maintenance_tick(interval: Option<&mut time::Interval>) {
     }
 }
 
+/// What reaps a connection whose client has gone quiet or gone away (#605).
+///
+/// Both armed by default, as the frame cap is (#477): a broker built without
+/// asking gets Kafka's `connections.max.idle.ms` and a keepalive that probes
+/// within a minute, rather than holding a vanished client's socket until it
+/// restarts.
+#[derive(Clone, Copy, Debug)]
+struct Liveness {
+    /// See [`TcpContext::CONNECTIONS_MAX_IDLE`]; `None` never closes an idle
+    /// connection.
+    connections_max_idle: Option<Duration>,
+
+    /// See [`Keepalive`]; `None` leaves `SO_KEEPALIVE` off.
+    keepalive: Option<Keepalive>,
+}
+
+impl Default for Liveness {
+    fn default() -> Self {
+        Self {
+            connections_max_idle: Some(TcpContext::CONNECTIONS_MAX_IDLE),
+            keepalive: Some(Keepalive::default()),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Broker<G, S> {
     node_id: i32,
@@ -274,6 +299,8 @@ pub struct Broker<G, S> {
     /// Requests a connection may read ahead of their answers (#588), `None`
     /// for [`TcpContext::PIPELINE_DEPTH`].
     pipeline_depth: Option<usize>,
+
+    liveness: Liveness,
 
     maintenance: Maintenance,
 
@@ -315,6 +342,7 @@ where
             // rather than through the builder gets the same cap (#477).
             maximum_frame_size: Some(TcpContext::MAXIMUM_FRAME_SIZE),
             pipeline_depth: None,
+            liveness: Liveness::default(),
 
             maintenance: Maintenance::default(),
 
@@ -745,6 +773,15 @@ where
 
         stream.set_nodelay(true)?;
 
+        // Warned and served without, not `?`: an error here ends the accept
+        // loop, and a peer that resets between `accept` and this call must not
+        // take every other connection with it (#605).
+        if let Some(keepalive) = self.liveness.keepalive
+            && let Err(err) = keepalive.apply(&stream)
+        {
+            warn!(%addr, ?err, "could not turn TCP keepalive on; serving the connection without it");
+        }
+
         let service = services(
             self.pipeline_depth
                 .map_or_else(TcpContext::default, |depth| {
@@ -752,6 +789,7 @@ where
                 })
                 .cluster_id(Some(self.cluster_id.clone()))
                 .maximum_frame_size(self.maximum_frame_size)
+                .connections_max_idle(self.liveness.connections_max_idle)
                 // So this connection is closed the next time it is idle between
                 // requests, rather than held open until the client goes away and
                 // the drain runs out of patience (#361).
@@ -914,6 +952,9 @@ pub struct Builder<N, C, I, A, S, L> {
     /// broker built without asking.
     pipeline_depth: Option<usize>,
 
+    /// The idle deadline and keepalive (#605), armed by `Default`.
+    liveness: Liveness,
+
     cancellation: CancellationToken,
 }
 
@@ -949,6 +990,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             quota_fleet_size: self.quota_fleet_size,
             maximum_frame_size: self.maximum_frame_size,
             pipeline_depth: self.pipeline_depth,
+            liveness: self.liveness,
             cancellation: self.cancellation,
         }
     }
@@ -973,6 +1015,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             quota_fleet_size: self.quota_fleet_size,
             maximum_frame_size: self.maximum_frame_size,
             pipeline_depth: self.pipeline_depth,
+            liveness: self.liveness,
             cancellation: self.cancellation,
         }
     }
@@ -997,6 +1040,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             quota_fleet_size: self.quota_fleet_size,
             maximum_frame_size: self.maximum_frame_size,
             pipeline_depth: self.pipeline_depth,
+            liveness: self.liveness,
             cancellation: self.cancellation,
         }
     }
@@ -1024,6 +1068,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             quota_fleet_size: self.quota_fleet_size,
             maximum_frame_size: self.maximum_frame_size,
             pipeline_depth: self.pipeline_depth,
+            liveness: self.liveness,
             cancellation: self.cancellation,
         }
     }
@@ -1087,6 +1132,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             quota_fleet_size: self.quota_fleet_size,
             maximum_frame_size: self.maximum_frame_size,
             pipeline_depth: self.pipeline_depth,
+            liveness: self.liveness,
             cancellation: self.cancellation,
         }
     }
@@ -1113,6 +1159,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             quota_fleet_size: self.quota_fleet_size,
             maximum_frame_size: self.maximum_frame_size,
             pipeline_depth: self.pipeline_depth,
+            liveness: self.liveness,
             cancellation: self.cancellation,
         }
     }
@@ -1181,6 +1228,31 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
     pub fn pipeline_depth(self, pipeline_depth: usize) -> Self {
         Self {
             pipeline_depth: Some(pipeline_depth),
+            ..self
+        }
+    }
+
+    /// Close a connection that has owed nothing and read nothing for
+    /// `connections_max_idle` (#605), Kafka's `connections.max.idle.ms`;
+    /// `None` never does. See [`TcpContext::CONNECTIONS_MAX_IDLE`].
+    pub fn connections_max_idle(self, connections_max_idle: Option<Duration>) -> Self {
+        Self {
+            liveness: Liveness {
+                connections_max_idle,
+                ..self.liveness
+            },
+            ..self
+        }
+    }
+
+    /// TCP keepalive on every accepted connection (#605); `None` leaves it
+    /// off. See [`Keepalive`].
+    pub fn keepalive(self, keepalive: Option<Keepalive>) -> Self {
+        Self {
+            liveness: Liveness {
+                keepalive,
+                ..self.liveness
+            },
             ..self
         }
     }
@@ -1282,6 +1354,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             maintenance: self.maintenance,
             maximum_frame_size: self.maximum_frame_size,
             pipeline_depth: self.pipeline_depth,
+            liveness: self.liveness,
             cancellation: self.cancellation,
         })
     }

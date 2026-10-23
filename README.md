@@ -216,6 +216,10 @@ The options that matter in a deployment, each with its environment variable:
 | `--quota-request-rate` | `QUOTA_REQUEST_RATE` | — | Default requests/second, likewise. |
 | `--quota-fleet-size` | `QUOTA_FLEET_SIZE` | `1` | How many replicas a configured quota is shared between. `1` enforces each limit on every replica, as Apache Kafka does. |
 | `--socket-request-max-bytes` | `SOCKET_REQUEST_MAX_BYTES` | `104857600` | Largest request frame the listener will read, Kafka's `socket.request.max.bytes`. A size in the IEC units the storage keys use (`100M`, `8m`) or a byte count; `0`/`unlimited` reads whatever a client announces. Must be at least the engine's `message_max_bytes`. |
+| `--connections-max-idle-ms` | `CONNECTIONS_MAX_IDLE_MS` | `600000` | Close a connection with no request in flight and nothing read for this long, Kafka's `connections.max.idle.ms`. A long-poll `Fetch` or a produce waiting on its window is in flight, so it is never cut; the client reconnects. `0` never closes an idle connection. |
+| `--tcp-keepalive-secs` | `TCP_KEEPALIVE_SECS` | `60` | Silence before TCP keepalive probes a client connection, so one whose client vanished without a FIN or RST is reaped. `0` turns keepalive off. |
+| `--tcp-keepalive-interval-secs` | `TCP_KEEPALIVE_INTERVAL_SECS` | `10` | Between unanswered keepalive probes. |
+| `--tcp-keepalive-retries` | `TCP_KEEPALIVE_RETRIES` | `3` | Unanswered probes before the connection is reset: with the defaults, a vanished client is reaped within 90 s. |
 
 The URL and address options accept `${VAR}` references, expanded when the argument is
 parsed.

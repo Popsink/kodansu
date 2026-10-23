@@ -465,7 +465,15 @@ fmt:
 # block above the check, which cites the issue; most of the lines are the
 # check and the two-replica test.
 #
-#   #594  +336 lines, straddle-free runs  3180 -> 3179  2.83346699 -> 2.82708452
+#   #605  +263 lines, idle connections  3180 -> 3180  2.83346699 -> 2.82684256
+#
+# Accepted client sockets get TCP keepalive, and a connection with nothing owed
+# and nothing read for `connections.max.idle.ms` is closed between requests. The
+# reasoning is the `///` on `TcpContext::CONNECTIONS_MAX_IDLE`, `Keepalive` and
+# `idle`; the two `//` blocks added cite #605, and most of the lines are the CLI
+# flags and the tests.
+#
+#   #594  +336 lines, straddle-free runs  3180 -> 3179  2.82684256 -> 2.8205 (rebased on #605)
 #
 # Selection shortens a run whose offsets have a gap that segments outside it
 # serve, instead of building it and learning the seam from a refusal. The
@@ -482,7 +490,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.8271" top="12":
+comments ceiling="2.8206" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
