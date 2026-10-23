@@ -422,6 +422,15 @@ fmt:
 # test compares offset spans rather than batches, and most of the lines are the
 # test that counts the store bytes a read costs.
 #
+#   #5470 +193 lines, vanished footers  3179 -> 3179  2.85991885 -> 2.85414160
+#
+# A prefix-index refresh whose footer GET 404s lists again after its own
+# maximum, because a peer's merge wrote the replacement above the listing it
+# took (Popsink/data-plane#5470). The one `//` block added cites the issue; the
+# reasoning is the `///` on `PREFIX_INDEX_MAX_RELISTS`, and most of the lines
+# are the refresh body indented into the loop and the test that races a merge
+# against a cold build.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -431,7 +440,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.8600" top="12":
+comments ceiling="2.8542" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

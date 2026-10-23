@@ -1997,6 +1997,18 @@ impl DynoStore {
     /// before.
     const PREFIX_INDEX_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
 
+    /// How many times one refresh lists again after a footer GET 404s
+    /// (Popsink/data-plane#5470).
+    ///
+    /// A 404 means a peer retired the segment after the listing was taken, and a
+    /// merge writes its replacement above that listing, so the listing no longer
+    /// covers the offsets. Each re-list starts after the previous one's maximum,
+    /// so it is a tail listing, and it is only repeated when the merge it
+    /// catches up with has itself been merged away in the meantime. Past the
+    /// bound the refresh still commits what it found but leaves the index
+    /// stale, so the next read lists again instead of trusting a hole.
+    const PREFIX_INDEX_MAX_RELISTS: usize = 4;
+
     /// How long a member document must have been untouched before the reclaim
     /// will consider it (#486).
     ///

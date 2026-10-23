@@ -70,6 +70,7 @@ mod segment_create;
 mod short_region;
 mod substream_identity;
 mod topic_churn;
+mod vanished_footer;
 mod watermark_hint;
 
 /// A batch whose records carry `timestamps`, one record each, in offset order
