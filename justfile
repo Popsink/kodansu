@@ -481,6 +481,12 @@ fmt:
 # it rewords cites #594, and the one line removed was a test comment asserting
 # the refusal this takes away. Most of the lines are tests.
 #
+#   #590  +61 lines, linger timer keeps to its window  3179 -> 3179  2.8205 -> 2.8199
+#
+# Each coalescing window carries a number, and its linger timer flushes the
+# prefix's buffer only while it still holds that window. The `//` block added
+# cites #590; most of the lines are the doc on the new field and a test.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -490,7 +496,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.8206" top="12":
+comments ceiling="2.8200" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
