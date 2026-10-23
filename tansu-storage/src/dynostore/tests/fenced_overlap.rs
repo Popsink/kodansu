@@ -268,7 +268,7 @@ async fn a_segment_wholly_inside_the_frontier_is_still_dropped() -> Result<()> {
 async fn the_tail_shortcut_agrees_with_the_fenced_view() -> Result<()> {
     let _guard = init_tracing()?;
 
-    let shapes: [&[(u64, i64, i64)]; 7] = [
+    let shapes: [&[(u64, i64, i64)]; 8] = [
         &[],
         &[(1, 0, 100), (2, 100, 100), (3, 200, 50)],
         &[(9, 0, 200), (1, 0, 100), (2, 100, 100)],
@@ -276,6 +276,7 @@ async fn the_tail_shortcut_agrees_with_the_fenced_view() -> Result<()> {
         &[(1, 0, 1_000), (2, 10, 10), (3, 1_000, 5)],
         &[(1, 0, 100), (2, 100, 100), (7, 0, 200), (8, 200, 10)],
         &[(1, 0, 100), (2, 0, 100), (3, 40, 60)],
+        &[(1, 10, 10), (9, 0, 15), (10, 15, 15)],
     ];
 
     for shape in shapes {

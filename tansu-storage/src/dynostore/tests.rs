@@ -45,6 +45,7 @@ mod flush_queue;
 mod gcs;
 mod gcs_generation;
 mod gcs_retry;
+mod ghost_originals;
 mod group_describe;
 mod group_documents;
 mod group_expiry;
