@@ -486,6 +486,12 @@ fmt:
 # Each coalescing window carries a number, and its linger timer flushes the
 # prefix's buffer only while it still holds that window. The `//` block added
 # cites #590; most of the lines are the doc on the new field and a test.
+#   #605  +49 lines, keepalive reap is expected  3179 -> 3176  2.8199 -> 2.8165 (rebased on #590)
+#
+# A socket reaped by keepalive ends in `TimedOut`, which now classifies as
+# `Severity::Expected` beside `ConnectionReset`. The two `//` blocks on those
+# arms now cite #605, which takes three uncited lines out of the count; the rest
+# is two tests.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -496,7 +502,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.8200" top="12":
+comments ceiling="2.8166" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
