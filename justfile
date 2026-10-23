@@ -481,6 +481,13 @@ fmt:
 # it rewords cites #594, and the one line removed was a test comment asserting
 # the refusal this takes away. Most of the lines are tests.
 #
+#   #605  +49 lines, keepalive reap is expected  3179 -> 3176  2.8205 -> 2.8171
+#
+# A socket reaped by keepalive ends in `TimedOut`, which now classifies as
+# `Severity::Expected` beside `ConnectionReset`. The two `//` blocks on those
+# arms now cite #605, which takes three uncited lines out of the count; the rest
+# is two tests.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -490,7 +497,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.8206" top="12":
+comments ceiling="2.8172" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
