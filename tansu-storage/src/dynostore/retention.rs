@@ -537,30 +537,9 @@ impl DynoStore {
     /// with this segment excluded, so the failure is somewhere the skip list
     /// cannot reach and retrying the drain would spin.
     pub(super) fn quarantine_segment(&self, region: &CorruptRegion) -> Result<bool> {
-        let held = {
-            let mut quarantined = self.prefixes.quarantined()?;
-            let seqs = quarantined.entry(region.prefix.clone()).or_default();
-
-            if !seqs.contains(&region.seq) && seqs.len() >= Self::PREFIX_QUARANTINE_CAP {
-                warn!(
-                    prefix = region.prefix,
-                    seq = region.seq,
-                    cap = Self::PREFIX_QUARANTINE_CAP,
-                    "quarantine cap reached; this prefix's drain still ends on this segment"
-                );
-
-                return Ok(false);
-            }
-
-            if !seqs.insert(region.seq) {
-                return Ok(false);
-            }
-
-            seqs.len() as u64
-        };
-
-        SEGMENT_QUARANTINES.add(1, &[]);
-        SEGMENTS_QUARANTINED.record(held, &[KeyValue::new("prefix", region.prefix.clone())]);
+        if !self.quarantine_seq(&region.prefix, region.seq)? {
+            return Ok(false);
+        }
 
         // Once, at `warn` — the whole region detail, so the object is
         // identifiable — where this used to be an `ERROR` on every maintenance
@@ -570,6 +549,38 @@ impl DynoStore {
             ?region,
             "excluding an undecodable segment from this prefix's compaction"
         );
+
+        Ok(true)
+    }
+
+    /// Exclude segment `seq` from `prefix`'s future compaction runs, answering
+    /// as [`Self::quarantine_segment`] does. The caller says why: an
+    /// undecodable region (#398) or a divergent overlap (#614).
+    pub(super) fn quarantine_seq(&self, prefix: &str, seq: u64) -> Result<bool> {
+        let held = {
+            let mut quarantined = self.prefixes.quarantined()?;
+            let seqs = quarantined.entry(prefix.to_owned()).or_default();
+
+            if !seqs.contains(&seq) && seqs.len() >= Self::PREFIX_QUARANTINE_CAP {
+                warn!(
+                    prefix,
+                    seq,
+                    cap = Self::PREFIX_QUARANTINE_CAP,
+                    "quarantine cap reached; this prefix's drain still ends on this segment"
+                );
+
+                return Ok(false);
+            }
+
+            if !seqs.insert(seq) {
+                return Ok(false);
+            }
+
+            seqs.len() as u64
+        };
+
+        SEGMENT_QUARANTINES.add(1, &[]);
+        SEGMENTS_QUARANTINED.record(held, &[KeyValue::new("prefix", prefix.to_owned())]);
 
         Ok(true)
     }
