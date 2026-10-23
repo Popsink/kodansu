@@ -465,6 +465,14 @@ fmt:
 # block above the check, which cites the issue; most of the lines are the
 # check and the two-replica test.
 #
+#   #594  +336 lines, straddle-free runs  3180 -> 3179  2.83346699 -> 2.82708452
+#
+# Selection shortens a run whose offsets have a gap that segments outside it
+# serve, instead of building it and learning the seam from a refusal. The
+# reasoning is the `///` on `straddle_free_len` and `RunUnion`; the `//` block
+# it rewords cites #594, and the one line removed was a test comment asserting
+# the refusal this takes away. Most of the lines are tests.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -474,7 +482,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.8335" top="12":
+comments ceiling="2.8271" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

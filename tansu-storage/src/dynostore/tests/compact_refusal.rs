@@ -20,7 +20,10 @@
 //! [`DynoStore::classify_tiling_break`] gives each shape against a real store,
 //! so the one class that means a lost record, `missing`, is the only `ERROR`.
 
-use std::time::{Duration, SystemTime};
+use std::{
+    collections::BTreeSet,
+    time::{Duration, SystemTime},
+};
 
 use object_store::{ObjectStoreExt as _, memory::InMemory, path::Path};
 use tansu_sans_io::{
@@ -112,14 +115,60 @@ async fn put_segment(
     base: i64,
     batch: deflated::Batch,
 ) -> Result<()> {
+    put_segment_in(store, bucket, PREFIX, seq, base, batch).await
+}
+
+/// [`put_segment`] under `prefix`: a compacted topic's is its own name.
+async fn put_segment_in(
+    store: &DynoStore,
+    bucket: &InMemory,
+    prefix: &str,
+    seq: u64,
+    base: i64,
+    batch: deflated::Batch,
+) -> Result<()> {
     let (payload, _footer) =
         store.encode_segment_v3(&[(Topition::new(TOPIC, 0), base, vec![batch])], 1, seq)?;
     let path = Path::from(format!(
-        "clusters/{CLUSTER}/prefixes/{PREFIX}/segments/{seq:0>20}.seg"
+        "clusters/{CLUSTER}/prefixes/{prefix}/segments/{seq:0>20}.seg"
     ));
     _ = bucket.put(&path, payload).await?;
 
     Ok(())
+}
+
+/// A batch with one record per key, at consecutive offset deltas.
+fn keyed(keys: &[&str]) -> Result<deflated::Batch> {
+    keys.iter()
+        .enumerate()
+        .fold(inflated::Batch::builder(), |builder, (n, key)| {
+            builder.record(
+                Record::builder()
+                    .offset_delta(n as i32)
+                    .key(Some(Bytes::copy_from_slice(key.as_bytes())))
+                    .value(Some(Bytes::copy_from_slice(
+                        format!("value-{n}").as_bytes(),
+                    ))),
+            )
+        })
+        .last_offset_delta(keys.len() as i32 - 1)
+        .build()
+        .and_then(deflated::Batch::try_from)
+        .map_err(Into::into)
+}
+
+/// The `(seq, from, to)` spans the fenced view of `TOPIC` serves in `prefix`.
+fn served(store: &DynoStore, prefix: &str) -> Result<Vec<(u64, i64, i64)>> {
+    Ok(store
+        .valid_substream_segments(prefix, &Substream::Name(TOPIC.into()), 0)?
+        .into_iter()
+        .map(|fenced| (fenced.seq, fenced.served_from, fenced.end()))
+        .collect())
+}
+
+/// Just the `[from, to)` of each span [`served`] returns.
+fn offsets(spans: &[(u64, i64, i64)]) -> Vec<(i64, i64)> {
+    spans.iter().map(|(_, from, to)| (*from, *to)).collect()
 }
 
 /// `[0, 50)` in segment 0 and `[100, 150)` in segment 1: [`GAP`] between them.
@@ -160,12 +209,6 @@ async fn a_gap_served_outside_the_run_is_outside_run() -> Result<()> {
 
     assert_eq!(TilingBreak::OutsideRun, classify(&store).await?);
     assert_eq!(tracing::Level::DEBUG, TilingBreak::OutsideRun.level());
-
-    // Selection really does build that run and refuse it.
-    assert!(matches!(
-        store.compact_prefix_segments(PREFIX).await?,
-        CompactRun::Retry,
-    ));
 
     Ok(())
 }
@@ -246,6 +289,103 @@ async fn a_gap_nothing_serves_is_missing() -> Result<()> {
 
     assert_eq!(TilingBreak::Missing, classify(&store).await?);
     assert_eq!(tracing::Level::ERROR, TilingBreak::Missing.level());
+
+    Ok(())
+}
+
+/// Selection does not build a run across a segment outside it (#594): the
+/// fleet's `outside_run` shape, where segment 3 holds `[50, 100)` at a higher
+/// sequence than the segments either side of it, and stays hot.
+///
+/// Until #594 selection built `[0, 1, 2]`, fetched it, refused it at the
+/// tiling check and learned a seam — once for every merged segment. Now it
+/// never builds it: `[0]` is left alone, and `[1, 2]`, which tile, merge.
+#[tokio::test]
+async fn selection_stops_a_run_before_a_segment_outside_it() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let store = new_store(&bucket);
+    create_topic(&store, &[]).await?;
+
+    put_gap(&store, &bucket).await?;
+    put_segment(&store, &bucket, 2, 150, batch(50)?).await?;
+    put_segment(&store, &bucket, 3, 50, batch(50)?).await?;
+
+    assert!(matches!(
+        store.compact_prefix_segments(PREFIX).await?,
+        CompactRun::Merged(2),
+    ));
+    assert!(store.compact_seams_of(PREFIX)?.is_empty());
+
+    let served = served(&store, PREFIX)?;
+    assert_eq!(vec![(0, 50), (50, 100), (100, 200)], offsets(&served));
+    assert_eq!((0, 3), (served[0].0, served[1].0));
+
+    Ok(())
+}
+
+/// A hole nothing serves is still met, refused and learned (#461): selection
+/// only steers around a gap other segments fill, so `missing` keeps its
+/// `ERROR` and its seam.
+#[tokio::test]
+async fn selection_still_meets_a_hole_nothing_serves() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let store = new_store(&bucket);
+    create_topic(&store, &[]).await?;
+
+    put_gap(&store, &bucket).await?;
+    put_segment(&store, &bucket, 2, 150, batch(50)?).await?;
+
+    assert!(matches!(
+        store.compact_prefix_segments(PREFIX).await?,
+        CompactRun::Retry,
+    ));
+    assert_eq!(BTreeSet::from([1]), store.compact_seams_of(PREFIX)?);
+
+    Ok(())
+}
+
+/// Key compaction does not open a gap in the tiling (#594), so a gap on a
+/// compacted topic is not one it made, and fusing across it would shift
+/// offsets exactly as on any other topic.
+///
+/// The per-key pass keeps every batch's offset span — a stripped batch keeps
+/// its `last_offset_delta` (#175) — so after it removes a record the regions
+/// still tile `[0, 8)`. What it does do is rewrite segment 1 at a fresh high
+/// sequence, the shape of a merged segment, and selection steers around that
+/// rather than refusing the run.
+#[tokio::test]
+async fn a_per_key_rewrite_keeps_the_tiling_whole() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let store = new_store(&bucket);
+    create_topic(&store, &[("cleanup.policy", "compact")]).await?;
+
+    put_segment_in(&store, &bucket, TOPIC, 0, 0, keyed(&["x", "y"])?).await?;
+    put_segment_in(&store, &bucket, TOPIC, 1, 2, keyed(&["a", "a"])?).await?;
+    put_segment_in(&store, &bucket, TOPIC, 2, 4, keyed(&["c", "d"])?).await?;
+    put_segment_in(&store, &bucket, TOPIC, 3, 6, keyed(&["e", "f"])?).await?;
+    store.refresh_prefix_index_forced(TOPIC).await?;
+
+    assert_eq!(1, store.compact_prefix_per_key(TOPIC).await?);
+
+    let rewritten = served(&store, TOPIC)?;
+    assert_eq!(vec![(0, 2), (2, 4), (4, 6), (6, 8)], offsets(&rewritten));
+    assert!(rewritten[1].0 > 3);
+
+    assert!(matches!(
+        store.compact_prefix_segments(TOPIC).await?,
+        CompactRun::Merged(2),
+    ));
+    assert!(store.compact_seams_of(TOPIC)?.is_empty());
+    assert_eq!(
+        vec![(0, 2), (2, 4), (4, 8)],
+        offsets(&served(&store, TOPIC)?)
+    );
 
     Ok(())
 }
