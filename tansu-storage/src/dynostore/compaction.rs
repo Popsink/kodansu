@@ -166,6 +166,61 @@ fn highest_unserved(range: Range<i64>, spans: &[(i64, i64)]) -> Option<i64> {
     highest
 }
 
+/// The offsets a candidate run's raw footer entries hold, per sub-stream, as
+/// sorted disjoint `[from, to)` intervals (#594).
+///
+/// Unlike [`RunCoverage`] this tolerates overlap — a batch-aligned overlap is
+/// one the fenced merge heals — and only answers whether the run holds every
+/// offset between its lowest and its highest.
+#[derive(Debug, Default)]
+pub(super) struct RunUnion {
+    spans: BTreeMap<SubstreamKey, Vec<(i64, i64)>>,
+}
+
+impl RunUnion {
+    /// Fold in `[from, to)`, coalescing every interval it overlaps or abuts.
+    pub(super) fn insert(&mut self, key: SubstreamKey, from: i64, to: i64) {
+        if to <= from {
+            return;
+        }
+
+        let spans = self.spans.entry(key).or_default();
+        let (mut from, mut to) = (from, to);
+
+        spans.retain(|&(held_from, held_to)| {
+            if held_from <= to && held_to >= from {
+                from = from.min(held_from);
+                to = to.max(held_to);
+                false
+            } else {
+                true
+            }
+        });
+
+        let at = spans.partition_point(|&(held_from, _)| held_from < from);
+        spans.insert(at, (from, to));
+    }
+
+    /// Whether every sub-stream is one unbroken interval.
+    pub(super) fn is_connected(&self) -> bool {
+        self.spans.values().all(|spans| spans.len() <= 1)
+    }
+
+    /// Each sub-stream with a break, and the ranges between its intervals.
+    pub(super) fn gaps(&self) -> Vec<(SubstreamKey, Vec<Range<i64>>)> {
+        self.spans
+            .iter()
+            .filter(|(_, spans)| spans.len() > 1)
+            .map(|(key, spans)| {
+                (
+                    key.clone(),
+                    spans.windows(2).map(|pair| pair[0].1..pair[1].0).collect(),
+                )
+            })
+            .collect()
+    }
+}
+
 /// Each `(seq, expected, region_base)` where `in_run` stops tiling `[base, ..)`.
 ///
 /// Re-anchored past each break, so a second break in the same sub-stream is
@@ -362,10 +417,10 @@ impl DynoStore {
 
         // The offset spans a run would cover, needed only once this prefix is
         // known to have a hole in its tiling — a quarantined segment (#398) or a
-        // learned seam (#399) — see [`RunCoverage`]. Skipped entirely otherwise:
-        // a prefix with neither is contiguous by construction, and this clones a
-        // `Vec<SubstreamEntry>` per segment on a path that walks tens of
-        // thousands of them per drain.
+        // learned seam (#399) — see [`RunCoverage`]. Skipped entirely otherwise,
+        // because this clones a `Vec<SubstreamEntry>` per segment on a path that
+        // walks tens of thousands of them per drain; a prefix with neither is
+        // kept off a merged segment's offsets by `straddle_free_len` (#594).
         //
         // The coverage guard is what makes the seam memo *sufficient* rather
         // than merely helpful. A seam is a sequence, but the tiling breaks in
@@ -469,8 +524,17 @@ impl DynoStore {
                 }
 
                 if end - start >= 2 {
-                    chosen = segs[start..end].iter().map(|(seq, ..)| *seq).collect();
-                    chosen_last_modified = segs[start..end]
+                    let candidate: Vec<u64> =
+                        segs[start..end].iter().map(|(seq, ..)| *seq).collect();
+                    let take = self.straddle_free_len(prefix, &candidate)?;
+
+                    if take < 2 {
+                        start += 1;
+                        continue;
+                    }
+
+                    chosen = candidate[..take].to_vec();
+                    chosen_last_modified = segs[start..start + take]
                         .iter()
                         .map(|(_, _, last_modified, _)| *last_modified)
                         .max()
@@ -809,6 +873,83 @@ impl DynoStore {
         } else {
             CompactRun::Drained
         }))
+    }
+
+    /// How many of `run`'s leading segments selection may merge without
+    /// straddling a segment outside it (#594): all of them, unless the run's
+    /// offsets have a gap that live segments outside the run fully serve — then
+    /// only the longest leading stretch whose offsets are unbroken.
+    ///
+    /// Sequence order is not offset order once compaction has run: a merged
+    /// segment, or a per-key rewrite (#175), holds low offsets at a fresh high
+    /// sequence, so a sequence-contiguous run can hold the offsets on both
+    /// sides of one and not the offsets in it. The tiling check refuses such a
+    /// run, but only after fetching it, and [`RunCoverage`] only stops it from
+    /// being built once a refusal has taught selection a seam: every merged
+    /// segment cost a refusal first. That was the `outside_run` class, the bulk
+    /// of the refusals #594 counted.
+    ///
+    /// A gap nothing outside the run fully serves is *not* avoided here: that is
+    /// a `below_log_start`, `compacted_topic` or `missing` break, and the merge
+    /// must still meet it, refuse it, say so and learn its seam — avoiding it
+    /// silently would hide the one break that is a lost record (#461). Nor does
+    /// this weaken that refusal: it only ever shortens a run, and whatever run
+    /// it lets through is checked exactly as before.
+    ///
+    /// A failed lookup of the outside segments leaves the run whole, which is
+    /// the behaviour before #594. `run` is ascending, as selection builds it.
+    pub(super) fn straddle_free_len(&self, prefix: &str, run: &[u64]) -> Result<usize> {
+        let mut union = RunUnion::default();
+        let mut connected = 0;
+
+        {
+            let index = self.prefixes.index()?;
+            let Some(entry) = index.get(prefix) else {
+                return Ok(run.len());
+            };
+
+            for (n, seq) in run.iter().enumerate() {
+                if let Some(cached) = entry.segments.get(seq) {
+                    for e in &cached.footer.entries {
+                        union.insert(
+                            (e.substream(), e.partition),
+                            e.base_offset,
+                            e.base_offset + e.record_count,
+                        );
+                    }
+                }
+
+                if union.is_connected() {
+                    connected = n + 1;
+                }
+            }
+        }
+
+        if connected == run.len() {
+            return Ok(run.len());
+        }
+
+        for ((substream, partition), gaps) in union.gaps() {
+            let outside: Vec<(i64, i64)> = self
+                .with_fenced_segments(prefix, &substream, partition, |fenced| {
+                    fenced
+                        .iter()
+                        .filter(|fenced| run.binary_search(&fenced.seq).is_err())
+                        .map(|fenced| (fenced.served_from, fenced.end()))
+                        .collect()
+                })
+                .inspect_err(|err| warn!(?err, prefix))
+                .unwrap_or_default();
+
+            if gaps
+                .into_iter()
+                .any(|gap| highest_unserved(gap, &outside).is_none())
+            {
+                return Ok(connected);
+            }
+        }
+
+        Ok(run.len())
     }
 
     /// Classify the break `gap = (expected, region_base)` in `run`'s tiling of
@@ -1495,7 +1636,9 @@ impl DynoStore {
 
 #[cfg(test)]
 mod tiling_break_tests {
-    use super::{TilingBreak, highest_unserved};
+    use std::ops::Range;
+
+    use super::{RunUnion, TilingBreak, highest_unserved};
     use tracing::Level;
 
     /// The run expected offset 50 next and found 100.
@@ -1572,5 +1715,43 @@ mod tiling_break_tests {
         assert_eq!(Some(69), highest_unserved(50..100, &[(70, 100), (0, 55)]));
         assert_eq!(Some(99), highest_unserved(50..100, &[(60, 70)]));
         assert_eq!(None, highest_unserved(50..100, &[(0, 200)]));
+    }
+
+    fn key() -> super::SubstreamKey {
+        (super::Substream::Name("t".into()), 0)
+    }
+
+    /// A merged segment's low offsets arriving after the run's high ones (#594).
+    #[test]
+    fn a_union_is_broken_until_its_gap_is_filled() {
+        let mut union = RunUnion::default();
+        union.insert(key(), 100, 150);
+        assert!(union.is_connected());
+
+        union.insert(key(), 0, 50);
+        assert!(!union.is_connected());
+        let gap: Range<i64> = 50..100;
+        assert_eq!(vec![(key(), vec![gap])], union.gaps());
+
+        union.insert(key(), 50, 100);
+        assert!(union.is_connected());
+        assert!(union.gaps().is_empty());
+    }
+
+    /// An overlap is not a gap: the fenced merge heals a batch-aligned one.
+    #[test]
+    fn a_union_coalesces_overlap_and_ignores_empty_spans() {
+        let mut union = RunUnion::default();
+        union.insert(key(), 0, 60);
+        union.insert(key(), 40, 100);
+        union.insert(key(), 200, 200);
+        assert!(union.is_connected());
+
+        union.insert(key(), 300, 310);
+        union.insert(key(), 150, 160);
+        assert_eq!(vec![(key(), vec![100..150, 160..300])], union.gaps());
+
+        union.insert(key(), 90, 400);
+        assert!(union.is_connected());
     }
 }
