@@ -350,8 +350,12 @@ async fn compaction_heals_a_batch_aligned_overlap() -> Result<()> {
     create_topic(&store, TOPIC).await?;
     let tp = Topition::new(TOPIC, 0);
 
-    put_segment(&store, &bucket, 0, 0, vec![batch(50)?, batch(50)?]).await?;
-    put_segment(&store, &bucket, 1, 50, vec![batch(50)?, batch(100)?]).await?;
+    // The same batch in both segments: a duplicated write, which is what a
+    // merge may heal. Two `batch(50)` calls are two batches, stamped with the
+    // clock, and refusing to fuse those is #614.
+    let duplicated = batch(50)?;
+    put_segment(&store, &bucket, 0, 0, vec![batch(50)?, duplicated.clone()]).await?;
+    put_segment(&store, &bucket, 1, 50, vec![duplicated, batch(100)?]).await?;
 
     store.refresh_prefix_index_forced(PREFIX).await?;
     assert!(matches!(

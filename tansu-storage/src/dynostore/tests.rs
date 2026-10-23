@@ -37,6 +37,7 @@ mod corrupt_region;
 mod delete_fan_out;
 mod delete_groups;
 mod divergent_batch;
+mod divergent_overlap;
 mod fenced_overlap;
 mod fetch_read_concurrency;
 mod flush_conflict;
@@ -71,6 +72,7 @@ mod segment_create;
 mod short_region;
 mod substream_identity;
 mod topic_churn;
+mod vanished_footer;
 mod watermark_hint;
 
 /// A batch whose records carry `timestamps`, one record each, in offset order

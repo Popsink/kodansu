@@ -191,6 +191,41 @@ fn tiling_breaks(in_run: &[(u64, i64, Vec<deflated::Batch>)]) -> Vec<(u64, i64, 
     breaks
 }
 
+/// One batch of a run's raw region, at the offsets its own entry gives it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(super) struct BatchSpan {
+    pub(super) from: i64,
+    pub(super) to: i64,
+    pub(super) seq: u64,
+    pub(super) crc: u32,
+}
+
+/// The first two batches in `spans` that claim overlapping offsets without
+/// being the same batch (#614): the same span and the same CRC is a copy, any
+/// other overlap is two different records competing for one offset.
+pub(super) fn first_divergence(mut spans: Vec<BatchSpan>) -> Option<(BatchSpan, BatchSpan)> {
+    spans.sort_unstable_by_key(|span| (span.from, span.to, span.seq));
+
+    let mut reach: Option<BatchSpan> = None;
+    for span in spans {
+        if let Some(held) = reach
+            && span.from < held.to
+        {
+            if (span.from, span.to, span.crc) != (held.from, held.to, held.crc) {
+                return Some((held, span));
+            }
+
+            continue;
+        }
+
+        if reach.is_none_or(|held| span.to > held.to) {
+            reach = Some(span);
+        }
+    }
+
+    None
+}
+
 /// `substreams` with every region over `cap` bytes split into consecutive
 /// regions of at most `cap` bytes each (#610), at batch boundaries; `0` is no
 /// cap.
@@ -508,6 +543,15 @@ impl DynoStore {
             })
             .collect();
 
+        // Before the fenced view picks a winner (#614): merging keeps one side of
+        // an overlap and retires the other, which is only harmless when both
+        // sides hold the same batches.
+        if let Some(refused) =
+            self.refuse_divergent_run(prefix, &substream_keys, &footers, &objects)?
+        {
+            return Ok(refused);
+        }
+
         let mut substreams: Vec<SubstreamWrite> = Vec::new();
         let mut merged_epoch = i64::MIN;
         let mut seams: BTreeSet<u64> = BTreeSet::new();
@@ -651,6 +695,120 @@ impl DynoStore {
         );
 
         Ok(CompactRun::Merged(run.len() as u64))
+    }
+
+    /// Refuse a run in which two segments put **different** batches at the same
+    /// offsets of one sub-stream (#614), quarantining both, or `None` when every
+    /// overlap in the run is a copy of the same batches.
+    ///
+    /// The fenced view resolves an overlap by priority and the merge then
+    /// retires the whole run, so whatever the losing side held is deleted, and
+    /// the offsets it covered are served from the winner from then on. That is
+    /// the healing #461 wants when the two sides are the same records — a merged
+    /// segment against its originals, a duplicated write — and it is exactly
+    /// the reported failure when they are not: on the use1 cluster a consumer
+    /// was served one side at 12:46, the merge at 13:21 kept the other, and the
+    /// partition has served different records at those offsets ever since, with
+    /// nothing in the bucket left to show it.
+    ///
+    /// So the merge compares the run's raw regions, not the fenced view, batch
+    /// by batch: an overlap whose batches agree on offsets and CRC is a copy and
+    /// merges as before; anything else keeps both objects, out of every future
+    /// run in this process, and says so at `error`.
+    ///
+    /// Only within one `writer_epoch`. A lower epoch losing to a higher one is
+    /// the fence working — a zombie writer's region, never acknowledged — and
+    /// dropping it is what the epoch is for. The reported overlap was two
+    /// segments of the same leaseless era, where no rule says which side is
+    /// right. Readers are unaffected — the
+    /// fenced view still answers them — but the evidence survives for
+    /// `tansu audit`, and no record is retired on the strength of a priority
+    /// rule.
+    pub(super) fn refuse_divergent_run(
+        &self,
+        prefix: &str,
+        substream_keys: &BTreeSet<(Substream, String, i32)>,
+        footers: &BTreeMap<u64, SegmentFooter>,
+        objects: &BTreeMap<u64, Bytes>,
+    ) -> Result<Option<CompactRun>> {
+        let mut learned = false;
+        let mut divergent = false;
+
+        for (substream, topic, partition) in substream_keys {
+            let mut spans: BTreeMap<i64, Vec<BatchSpan>> = BTreeMap::new();
+
+            for (seq, footer) in footers {
+                let Some(object) = objects.get(seq) else {
+                    continue;
+                };
+
+                for entry in footer
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.partition == *partition && entry.is(substream))
+                {
+                    let start = entry.byte_start as usize;
+                    let end = start + entry.byte_len as usize;
+
+                    // A region past its object fails the merge in
+                    // `decode_fenced_regions` (#397), with its own diagnosis.
+                    if end > object.len() {
+                        continue;
+                    }
+
+                    let mut running = entry.base_offset;
+                    for batch in
+                        self.decode_region(prefix, *seq, entry, object.slice(start..end))?
+                    {
+                        let from = running;
+                        running += batch.last_offset_delta as i64 + 1;
+                        spans
+                            .entry(footer.writer_epoch)
+                            .or_default()
+                            .push(BatchSpan {
+                                from,
+                                to: running,
+                                seq: *seq,
+                                crc: batch.crc,
+                            });
+                    }
+                }
+            }
+
+            let Some((kept, other)) = spans.into_values().find_map(first_divergence) else {
+                continue;
+            };
+
+            divergent = true;
+
+            error!(
+                prefix,
+                topic,
+                partition,
+                seq = kept.seq,
+                offsets = ?(kept.from, kept.to),
+                other_seq = other.seq,
+                other_offsets = ?(other.from, other.to),
+                "refusing to compact: two segments hold different batches at the same \
+                 offsets, and merging would retire one of them"
+            );
+
+            for seq in [kept.seq, other.seq] {
+                learned |= self.quarantine_seq(prefix, seq)?;
+            }
+        }
+
+        if !divergent {
+            return Ok(None);
+        }
+
+        SEGMENT_COMPACT_REFUSED.add(1, &[KeyValue::new("reason", "divergent_overlap")]);
+
+        Ok(Some(if learned {
+            CompactRun::Retry
+        } else {
+            CompactRun::Drained
+        }))
     }
 
     /// Classify the break `gap = (expected, region_base)` in `run`'s tiling of

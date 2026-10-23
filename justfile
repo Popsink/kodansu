@@ -422,7 +422,23 @@ fmt:
 # test compares offset spans rather than batches, and most of the lines are the
 # test that counts the store bytes a read costs.
 #
-#   #616  +205 lines, merge folds below  3179 -> 3179  2.85991885 -> 2.85665504
+#   #5470 +193 lines, vanished footers  3179 -> 3179  2.85991885 -> 2.85414160
+#
+# A prefix-index refresh whose footer GET 404s lists again after its own
+# maximum, because a peer's merge wrote the replacement above the listing it
+# took (Popsink/data-plane#5470). The one `//` block added cites the issue; the
+# reasoning is the `///` on `PREFIX_INDEX_MAX_RELISTS`, and most of the lines
+# are the refresh body indented into the loop and the test that races a merge
+# against a cold build.
+#
+#   #614  +420 lines, divergent overlap  3179 -> 3179  2.85414160 -> 2.84685717
+#
+# A merge refuses a run in which two segments hold different batches at the
+# same offsets, instead of keeping the fenced winner and retiring the other.
+# The reasoning is the `///` on `refuse_divergent_run` and `first_divergence`;
+# the one `//` block it adds cites #614, and the rest is code and its tests.
+#
+#   #616  +205 lines, merge folds below  3179 -> 3179  2.84685717 -> 2.84362309
 #
 # A compaction that wins a name above segments its index has not seen folds
 # them in before inserting the merged segment, instead of moving the listing
@@ -439,7 +455,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.8567" top="12":
+comments ceiling="2.8437" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
