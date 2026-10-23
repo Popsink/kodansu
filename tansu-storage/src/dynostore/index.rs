@@ -36,6 +36,38 @@ fn listed_population(discovered: usize, whole_prefix: bool) -> Option<u64> {
     whole_prefix.then_some(discovered as u64)
 }
 
+/// Whether `[from, to)` is covered by entries of `later` that outrank `rank`
+/// (`(writer_epoch, seq)`, higher wins), as the fenced view sorts them (#616).
+///
+/// `later` is in ascending base offset, so the scan stops at the first gap: an
+/// entry beginning past what the outranking ones cover so far leaves an offset
+/// held only by the entry being decided. That bounds it to the entries
+/// beginning below `to` — the few a straddle overlaps, not the sub-stream.
+fn tail_outranked(
+    later: &[(i64, u64, &SubstreamEntry)],
+    rank: (i64, u64),
+    from: i64,
+    to: i64,
+) -> bool {
+    let mut covered = from;
+
+    for &(epoch, seq, entry) in later {
+        if entry.base_offset > covered {
+            break;
+        }
+
+        if (epoch, seq) > rank {
+            covered = covered.max(entry.base_offset + entry.record_count);
+
+            if covered >= to {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 impl PrefixIndex {
     /// The highest sequence this process has *resolved* by a listing — decoded
     /// into `segments` or recorded as [`Self::opaque`]. Both the leaseless
@@ -938,7 +970,8 @@ impl DynoStore {
     /// offset ranges overlap. On overlap the higher `writer_epoch` wins: an
     /// entry wholly inside the range those winners cover is dropped — so a
     /// stale-epoch segment is ignored on read/recovery, exactly as the epic
-    /// requires — and an entry that reaches **past** that range is served
+    /// requires, as is one whose head and tail are both held by entries that
+    /// outrank it (#616) — and an entry that reaches **past** that range is served
     /// clipped to its tail ([`FencedSegment::served_from`], #461), because the
     /// tail is held by nothing else and dropping it loses those offsets
     /// everywhere this view is consumed: fetch, recovery, the high watermark,
@@ -1027,7 +1060,8 @@ impl DynoStore {
 
         let mut out: Vec<FencedRef<'_>> = Vec::with_capacity(segs.len());
         let mut covered_to = i64::MIN;
-        for (_epoch, seq, entry) in segs {
+        let mut frontier_rank = (i64::MIN, 0);
+        for (i, &(epoch, seq, entry)) in segs.iter().enumerate() {
             let end = entry.base_offset + entry.record_count;
 
             // Wholly inside what an already-accepted (>= epoch) segment covers:
@@ -1049,6 +1083,22 @@ impl DynoStore {
             // durably on the compaction path, where `retire_segments` deletes
             // the run after the merge. The same error, from the same source,
             // was in the audit until #460.
+            //
+            // Unless both halves are held by entries that outrank this one: the
+            // head by the entry that set the frontier, the tail by later ones.
+            // That is a broker's ghost original against a merge #610 wrote as
+            // capped regions, the first ending inside the ghost and the next
+            // beginning inside it (#616) — wholly covered by the merge, as the
+            // one-region merge covered it, and dropped as that one was.
+            // Clipping it counted an overlap the bucket does not have, on every
+            // fenced read, and planned reads from a deleted object.
+            if entry.base_offset < covered_to
+                && frontier_rank > (epoch, seq)
+                && tail_outranked(&segs[i + 1..], (epoch, seq), covered_to, end)
+            {
+                continue;
+            }
+
             let served_from = if entry.base_offset < covered_to {
                 SEGMENT_OVERLAP_CLIPPED.add(1, &[]);
                 covered_to
@@ -1057,6 +1107,7 @@ impl DynoStore {
             };
 
             covered_to = end;
+            frontier_rank = (epoch, seq);
             out.push(FencedRef {
                 seq,
                 served_from,

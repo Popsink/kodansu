@@ -422,6 +422,14 @@ fmt:
 # test compares offset spans rather than batches, and most of the lines are the
 # test that counts the store bytes a read costs.
 #
+#   #616  +30 code lines, ghost straddle  3179 -> 3179  2.85991885 -> 2.85914720
+#
+# A broker's ghost original straddling two of a capped merge's regions is
+# dropped instead of served clipped, so `tansu_substream_overlap_clipped` is
+# flat zero again outside a real overlap. The reasoning is the `///` on
+# `tail_outranked` and the one `//` block added, which cites #616; nothing
+# counted moved, and the code lines are the helper and its tests.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -431,7 +439,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.8600" top="12":
+comments ceiling="2.8592" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
