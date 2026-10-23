@@ -422,6 +422,13 @@ fmt:
 # test compares offset spans rather than batches, and most of the lines are the
 # test that counts the store bytes a read costs.
 #
+#   #614  +400 lines, divergent overlap  3179 -> 3179  2.85991885 -> 2.85719422
+#
+# A merge refuses a run in which two segments hold different batches at the
+# same offsets, instead of keeping the fenced winner and retiring the other.
+# The reasoning is the `///` on `refuse_divergent_run` and `first_divergence`;
+# the one `//` block it adds cites #614, and the rest is code and its tests.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -431,7 +438,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.8600" top="12":
+comments ceiling="2.8572" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
