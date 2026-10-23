@@ -134,7 +134,7 @@ pub(super) static SEGMENT_COMPACT_REFUSED: LazyLock<Counter<u64>> = LazyLock::ne
 /// Expected to be **flat zero**: the one healthy overlap is a merged segment's
 /// originals, and those are wholly inside what the merge covers — dropped, not
 /// clipped, including when the merge is several capped regions (#610) and an
-/// original straddles two of them (#616). A non-zero value means a prefix carries the overlap shape whose
+/// original straddles two of them (#617). A non-zero value means a prefix carries the overlap shape whose
 /// *drop* used to destroy records; the clip serves them, and `tansu audit` on
 /// the bucket names the prefixes and segments so the writer that produced the
 /// overlap can be found.

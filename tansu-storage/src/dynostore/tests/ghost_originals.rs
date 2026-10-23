@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A broker's ghost originals against a capped merge (#616).
+//! A broker's ghost originals against a capped merge (#617).
 //!
 //! A broker learns of a merge through the add-only incremental refresh: it
 //! folds the merged segment in and keeps the originals the merge retired until
@@ -150,6 +150,9 @@ async fn consumed(store: &DynoStore, tp: &Topition) -> Result<Vec<i64>> {
 /// and a consumer served every offset exactly once — both while the originals'
 /// objects still exist (the merge's write→delete window) and after they are
 /// gone.
+///
+/// The broker's second forced refresh falls within the reconcile interval, so
+/// it is the incremental one: it folds the merged segment in and drops nothing.
 #[tokio::test]
 async fn ghost_originals_are_dropped_not_clipped_against_a_capped_merge() -> Result<()> {
     let _guard = init_tracing()?;
@@ -193,8 +196,6 @@ async fn ghost_originals_are_dropped_not_clipped_against_a_capped_merge() -> Res
     ));
     assert_eq!(1, segments(&bucket).await?.len());
 
-    // Within the reconcile interval this is the incremental refresh: it folds
-    // the merged segment in and drops nothing.
     broker.refresh_prefix_index_forced(PREFIX).await?;
 
     let substream = Substream::Name(TOPIC.into());
@@ -273,23 +274,26 @@ fn served(segments: &[Segment<'_>]) -> Result<Vec<(u64, i64, i64)>> {
 
 /// The drop is for an entry whose head *and* tail are held by entries that
 /// outrank it, and nothing wider: an overlap the bucket really carries is still
-/// served clipped, and still counted.
+/// served clipped, and still counted. In order:
+///
+/// 1. The ghost: seq 9's capped regions outrank seq 1 on both sides.
+/// 2. A higher writer epoch outranks a higher sequence.
+/// 3. Each entry outranks the one before it, so the frontier was set by a lower
+///    rank: seq 2's head is held, but not by anything that outranks it.
+/// 4. The tail is held only by a lower rank: clipped, as before.
+/// 5. A gap in what outranks it leaves offsets only the straddler holds.
 #[test]
 fn only_an_outranked_straddle_is_dropped() -> Result<()> {
-    // The ghost: seq 9's capped regions outrank seq 1 on both sides.
     assert_eq!(
         vec![(9, 0, 15), (9, 15, 30)],
         served(&[(1, 1, &[(10, 10)]), (9, 1, &[(0, 15), (15, 15)])])?,
     );
 
-    // A higher writer epoch outranks a higher sequence.
     assert_eq!(
         vec![(1, 0, 15), (2, 15, 30)],
         served(&[(1, 2, &[(0, 15)]), (2, 2, &[(15, 15)]), (5, 1, &[(10, 10)])])?,
     );
 
-    // Each entry outranks the one before it, so the frontier was set by a
-    // lower rank: seq 2's head is held, but not by anything that outranks it.
     assert_eq!(
         vec![(1, 0, 100), (2, 100, 150), (3, 150, 200)],
         served(&[
@@ -299,13 +303,11 @@ fn only_an_outranked_straddle_is_dropped() -> Result<()> {
         ])?,
     );
 
-    // The tail is held only by a lower rank: clipped, as before.
     assert_eq!(
         vec![(9, 0, 15), (5, 15, 20), (1, 20, 30)],
         served(&[(9, 1, &[(0, 15)]), (5, 1, &[(10, 10)]), (1, 1, &[(15, 15)])])?,
     );
 
-    // A gap in what outranks it leaves offsets only the straddler holds.
     assert_eq!(
         vec![(9, 0, 15), (1, 15, 30), (9, 30, 40)],
         served(&[(1, 1, &[(10, 20)]), (9, 1, &[(0, 15), (20, 20)])])?,

@@ -37,7 +37,7 @@ fn listed_population(discovered: usize, whole_prefix: bool) -> Option<u64> {
 }
 
 /// Whether `[from, to)` is covered by entries of `later` that outrank `rank`
-/// (`(writer_epoch, seq)`, higher wins), as the fenced view sorts them (#616).
+/// (`(writer_epoch, seq)`, higher wins), as the fenced view sorts them (#617).
 ///
 /// `later` is in ascending base offset, so the scan stops at the first gap: an
 /// entry beginning past what the outranking ones cover so far leaves an offset
@@ -971,7 +971,7 @@ impl DynoStore {
     /// entry wholly inside the range those winners cover is dropped — so a
     /// stale-epoch segment is ignored on read/recovery, exactly as the epic
     /// requires, as is one whose head and tail are both held by entries that
-    /// outrank it (#616) — and an entry that reaches **past** that range is served
+    /// outrank it (#617) — and an entry that reaches **past** that range is served
     /// clipped to its tail ([`FencedSegment::served_from`], #461), because the
     /// tail is held by nothing else and dropping it loses those offsets
     /// everywhere this view is consumed: fetch, recovery, the high watermark,
@@ -1088,7 +1088,7 @@ impl DynoStore {
             // head by the entry that set the frontier, the tail by later ones.
             // That is a broker's ghost original against a merge #610 wrote as
             // capped regions, the first ending inside the ghost and the next
-            // beginning inside it (#616) — wholly covered by the merge, as the
+            // beginning inside it (#617) — wholly covered by the merge, as the
             // one-region merge covered it, and dropped as that one was.
             // Clipping it counted an overlap the bucket does not have, on every
             // fenced read, and planned reads from a deleted object.
