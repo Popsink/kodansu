@@ -455,6 +455,16 @@ fmt:
 # counted moved; the test's case labels are its `///`, and most of the lines
 # are the helper and the two tests.
 #
+#   #5470 +340 lines, refreshed out of range  3179 -> 3180  2.83743016 -> 2.83346699
+#
+# A Fetch position outside this replica's view of the log is checked against
+# a forced listing before it is answered `OFFSET_OUT_OF_RANGE`, which a
+# lagging pod answered to consumers its peers had served, and librdkafka
+# turned into whole-topic replays (Popsink/data-plane#5470). The reasoning is
+# the `///` on `offset_stage_refreshed` and `FETCH_OUT_OF_RANGE` and the
+# block above the check, which cites the issue; most of the lines are the
+# check and the two-replica test.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -464,7 +474,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.8375" top="12":
+comments ceiling="2.8335" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

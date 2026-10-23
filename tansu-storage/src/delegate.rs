@@ -79,6 +79,7 @@ macro_rules! storage_methods {
             fn fetch(&self, topition: &'_ Topition, offset: i64, min_bytes: u32, max_bytes: u32, isolation: IsolationLevel, max_wait: Duration) -> Result<Vec<deflated::Batch>>;
             fn offset_stage(&self, topition: &Topition) -> Result<OffsetStage>;
             fn offset_stage_at(&self, topition: &Topition, isolation: IsolationLevel) -> Result<OffsetStage>;
+            fn offset_stage_refreshed(&self, topition: &Topition) -> Result<OffsetStage>;
             fn list_offsets(&self, isolation_level: IsolationLevel, offsets: &[(Topition, ListOffset)]) -> Result<Vec<(Topition, ListOffsetResponse)>>;
             fn offset_commit(&self, group_id: &str, retention_time_ms: Option<Duration>, offsets: &[(Topition, OffsetCommitRequest)]) -> Result<Vec<(Topition, ErrorCode)>>;
             fn offset_fetch(&self, group_id: Option<&str>, topics: &[Topition], require_stable: Option<bool>) -> Result<BTreeMap<Topition, CommittedOffset>>;

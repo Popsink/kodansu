@@ -870,6 +870,14 @@ impl Storage for Engine {
         unimplemented!()
     }
 
+    #[instrument(skip_all)]
+    async fn offset_stage_refreshed(
+        &self,
+        _topition: &Topition,
+    ) -> tansu_storage::Result<OffsetStage> {
+        unimplemented!()
+    }
+
     fn auto_create_topic_config(&self) -> AutoTopicCreate {
         unimplemented!()
     }

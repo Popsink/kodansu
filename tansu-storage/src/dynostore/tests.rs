@@ -71,6 +71,7 @@ mod scram_credentials;
 mod segment;
 mod segment_create;
 mod short_region;
+mod stale_out_of_range;
 mod substream_identity;
 mod topic_churn;
 mod vanished_footer;
