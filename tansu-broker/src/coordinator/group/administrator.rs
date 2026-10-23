@@ -76,7 +76,7 @@ use opentelemetry::{
 };
 use rand::{prelude::*, rng};
 use tansu_sans_io::{
-    Body, ErrorCode,
+    Body, ConsumerGroupHeartbeatRequest, ErrorCode,
     consumer::{CONSUMER, MemberAssignment, MemberMetadata},
     heartbeat_response::HeartbeatResponse,
     join_group_request::JoinGroupRequestProtocol,
@@ -98,7 +98,7 @@ use tansu_sans_io::{
 use tansu_service::Parked;
 use tansu_storage::{
     AssignmentDoc, AssignmentOutcome, ConsumerGroupState, GenerationDoc, MemberDoc, MemberRef,
-    OffsetCommitRequest, Storage, Topition, UpdateError, Version,
+    OffsetCommitRequest, Storage, TopicId, Topition, UpdateError, Version,
 };
 use tokio::time::{Duration, Instant, sleep};
 use tokio_util::sync::CancellationToken;
@@ -107,7 +107,10 @@ use uuid::Uuid;
 
 use crate::{Error, METER, Result};
 
-use super::{Coordinator, OffsetCommit};
+use super::{
+    Coordinator, OffsetCommit,
+    consumer::{self, Resolved},
+};
 
 /// How long a static member with nothing to act on is damped on the **sync**
 /// path before it is answered (#486).
@@ -174,6 +177,18 @@ const CAS_CONFLICT_WARN: u32 = 16;
 /// retry against a group being hammered by another replica would hold the
 /// request open indefinitely rather than let the client retry.
 const MAX_GENERATION_CAS_ATTEMPTS: u32 = 64;
+
+/// How long a replica serves a consumer-protocol group's heartbeats from the
+/// subscribed topic metadata it last resolved for that group (#612).
+///
+/// A join or a change of subscription always resolves afresh. This bounds how
+/// late a partition added to a subscribed topic is noticed, without putting a
+/// `Metadata` read on every heartbeat of every member.
+const CONSUMER_METADATA_REFRESH: Duration = Duration::from_secs(30);
+
+/// Groups whose metadata this replica resolved recently, at most. As
+/// [`LIVENESS_STAMPS_HELD`], a bound on memory and nothing else.
+const CONSUMER_METADATA_CHECKS_HELD: usize = 16_384;
 
 /// The session timeout to assume when a group or a member declares none.
 /// Kafka's own default, and the value this coordinator has always fallen back
@@ -369,6 +384,13 @@ fn sweep_attempts() -> ExpiringSizedCache<String, i64> {
     let mut attempts = ExpiringSizedCache::new(SWEEP_ATTEMPT_TTL);
     _ = attempts.size_limit(SWEEP_ATTEMPTS_HELD);
     attempts
+}
+
+/// The memo behind [`Controller::consumer_metadata_checks`] (#612).
+fn consumer_metadata_checks() -> ExpiringSizedCache<String, ()> {
+    let mut checks = ExpiringSizedCache::new(CONSUMER_METADATA_REFRESH);
+    _ = checks.size_limit(CONSUMER_METADATA_CHECKS_HELD);
+    checks
 }
 
 /// The memo behind [`Controller::liveness_stamps`].
@@ -1049,6 +1071,14 @@ pub struct Controller<O> {
     /// done.
     sweep_attempts: Arc<Mutex<ExpiringSizedCache<String, i64>>>,
 
+    /// Consumer-protocol groups whose subscribed topic metadata this replica
+    /// resolved within [`CONSUMER_METADATA_REFRESH`] (#612).
+    ///
+    /// Like every other memo here it can only suppress work: a cold replica
+    /// resolves on the first heartbeat it serves, and the group's document —
+    /// not this — holds the metadata the target assignment was computed from.
+    consumer_metadata_checks: Arc<Mutex<ExpiringSizedCache<String, ()>>>,
+
     /// Cancelled when this process has been asked to stop (#361).
     ///
     /// Only the long polls read it, and only to stop *waiting*: a cancelled
@@ -1101,6 +1131,7 @@ where
             ))),
             liveness_stamps: Arc::new(Mutex::new(liveness_stamps())),
             sweep_attempts: Arc::new(Mutex::new(sweep_attempts())),
+            consumer_metadata_checks: Arc::new(Mutex::new(consumer_metadata_checks())),
             cancellation: CancellationToken::new(),
             now: SystemTime::now,
         })
@@ -2333,6 +2364,7 @@ where
         // every sampled one written exactly once. A retry is the same join, so
         // it is the same member.
         let mut minted_for_instance: Option<String> = None;
+        let mut consumer_checked = false;
 
         loop {
             COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_loop")]);
@@ -2389,6 +2421,23 @@ where
 
                 None => &protocols[0],
             };
+
+            // A group is one type for its whole life (#612). Only a classic
+            // group with nobody in it can be a consumer-protocol group's id
+            // too, so a populated one never pays for the read.
+            if !consumer_checked && view.generation.members.is_empty() {
+                consumer_checked = true;
+
+                if self.is_live_consumer(group_id, now_ms).await? {
+                    debug!(join_outcome = ?ErrorCode::InconsistentGroupProtocol);
+                    return Ok(join_error(
+                        &view,
+                        ErrorCode::InconsistentGroupProtocol,
+                        member_id,
+                        protocol_type,
+                    ));
+                }
+            }
 
             if member_id.is_empty() && group_instance_id.is_none() {
                 // KIP-394: reply with a generated member id but leave the group
@@ -3126,21 +3175,28 @@ where
         // stops the commit path creating group state for a group that has
         // none (#272).
         if generation_id >= 0 && !member_id.is_empty() {
-            let Some((generation, _)) = self.storage.read_group_generation(group_id).await? else {
-                debug!(group_id, member_id, offset_commit_outcome = ?ErrorCode::UnknownMemberId);
-                return Ok(offset_commit_error(
-                    &offset_commit,
-                    ErrorCode::UnknownMemberId,
-                ));
-            };
+            let generation = self
+                .storage
+                .read_group_generation(group_id)
+                .await?
+                .map(|(generation, _)| generation)
+                .filter(|generation| generation.members.contains_key(member_id));
 
-            if !generation.members.contains_key(member_id) {
-                debug!(group_id, member_id, offset_commit_outcome = ?ErrorCode::UnknownMemberId);
-                return Ok(offset_commit_error(
-                    &offset_commit,
-                    ErrorCode::UnknownMemberId,
-                ));
-            }
+            // Not a classic member, so a KIP-848 one or nobody: the commit
+            // carries a member epoch, judged against the consumer group (#612).
+            let Some(generation) = generation else {
+                let verdict = self
+                    .consumer_commit_verdict(group_id, member_id, generation_id)
+                    .await?;
+
+                debug!(group_id, member_id, offset_commit_outcome = ?verdict.unwrap_or(ErrorCode::None));
+
+                if let Some(error_code) = verdict {
+                    return Ok(offset_commit_error(&offset_commit, error_code));
+                }
+
+                return self.commit_or_unknown(&offset_commit).await;
+            };
 
             // A member that commits is a member that is alive. Folding liveness
             // into the commit path — commits arrive every ~5s — makes most
@@ -3177,17 +3233,7 @@ where
             }
         }
 
-        match self.commit_offset(&offset_commit).await {
-            Ok(body) => Ok(body),
-
-            Err(reason) => {
-                debug!(?reason);
-                Ok(offset_commit_error(
-                    &offset_commit,
-                    ErrorCode::UnknownMemberId,
-                ))
-            }
-        }
+        self.commit_or_unknown(&offset_commit).await
     }
 
     #[instrument(skip_all)]
@@ -3202,7 +3248,71 @@ where
 
         COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "offset_fetch")]);
 
-        self.fetch_offset(group_id, topics, groups, require_stable)
+        let Some(groups) = groups else {
+            return self
+                .fetch_offset(group_id, topics, None, require_stable)
+                .await;
+        };
+
+        let mut refused = Vec::with_capacity(groups.len());
+
+        for group in groups {
+            refused.push(self.consumer_fetch_verdict(group).await?);
+        }
+
+        if refused.iter().all(Option::is_none) {
+            return self
+                .fetch_offset(group_id, topics, Some(groups), require_stable)
+                .await;
+        }
+
+        let admitted = groups
+            .iter()
+            .zip(&refused)
+            .filter(|(_, refused)| refused.is_none())
+            .map(|(group, _)| group.clone())
+            .collect::<Vec<_>>();
+
+        let Body::OffsetFetchResponse(mut response) = self
+            .fetch_offset(group_id, topics, Some(&admitted), require_stable)
+            .await?
+        else {
+            return Err(Error::Message(String::from(
+                "offset fetch answered another API",
+            )));
+        };
+
+        let mut answered = response.groups.take().unwrap_or_default().into_iter();
+
+        response.groups = Some(
+            groups
+                .iter()
+                .zip(refused)
+                .filter_map(|(group, refused)| match refused {
+                    Some(error_code) => Some(
+                        OffsetFetchResponseGroup::default()
+                            .group_id(group.group_id.clone())
+                            .topics(Some([].into()))
+                            .error_code(error_code.into()),
+                    ),
+
+                    None => answered.next(),
+                })
+                .collect(),
+        );
+
+        Ok(response.into())
+    }
+
+    #[instrument(skip(self, request), fields(group_id = request.group_id, member_epoch = request.member_epoch))]
+    async fn consumer_group_heartbeat(
+        &self,
+        client_id: Option<&str>,
+        request: &ConsumerGroupHeartbeatRequest,
+    ) -> Result<Body> {
+        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "consumer_group_heartbeat")]);
+
+        self.consumer_heartbeat(client_id.unwrap_or_default(), request)
             .await
     }
 
@@ -3456,6 +3566,282 @@ where
         debug!(sync_outcome = ?ErrorCode::None, generation_id = after.generation_id());
 
         Ok(answered(after, body))
+    }
+}
+
+/// The KIP-848 consumer group protocol (#612).
+///
+/// The same discipline as the classic group's `generation.json`: read the
+/// group's document, apply a pure function of it, the request and the clock
+/// ([`consumer::apply`]), and write it back under etag CAS — a lost race is a
+/// full re-read and re-apply, never a replay. Nothing about the group survives
+/// the request on this replica except the metadata memo, which can only skip a
+/// read.
+impl<O> Controller<O>
+where
+    O: Storage + Clone,
+{
+    /// Whether this heartbeat should resolve the subscribed topics afresh: on
+    /// a join or a change of subscription always, otherwise once per
+    /// [`CONSUMER_METADATA_REFRESH`] per group on this replica.
+    fn consumer_metadata_due(&self, request: &ConsumerGroupHeartbeatRequest) -> bool {
+        request.member_epoch == 0
+            || request.subscribed_topic_names.is_some()
+            || self
+                .consumer_metadata_checks
+                .lock()
+                .map_or(true, |checks| checks.get(&request.group_id).is_none())
+    }
+
+    fn consumer_metadata_noted(&self, group_id: &str) {
+        if let Ok(mut checks) = self.consumer_metadata_checks.lock() {
+            _ = checks.insert_evict(group_id.to_owned(), (), true);
+        }
+    }
+
+    /// The topics among `names` that exist, with their id and partition count.
+    async fn resolve_topics(&self, names: &BTreeSet<String>) -> Result<Resolved> {
+        if names.is_empty() {
+            return Ok(Resolved::new());
+        }
+
+        let topics = names.iter().cloned().map(TopicId::Name).collect::<Vec<_>>();
+        let metadata = self.storage.metadata(Some(&topics)).await?;
+
+        Ok(metadata
+            .topics()
+            .iter()
+            .filter(|topic| topic.error_code == i16::from(ErrorCode::None))
+            .filter_map(|topic| {
+                let partitions = topic.partitions.as_ref().map_or(0, Vec::len);
+
+                Some((
+                    topic.name.clone()?,
+                    (
+                        Uuid::from_bytes(topic.topic_id?),
+                        i32::try_from(partitions).ok()?,
+                    ),
+                ))
+            })
+            .collect())
+    }
+
+    /// Whether `group_id` is a classic group with a live member, which a group
+    /// is for its whole life: a consumer-protocol member may not take it over.
+    ///
+    /// Live as `DescribeGroups` judges it (#523): a member whose document says
+    /// its session lapsed does not count, so a classic group whose consumers
+    /// all stopped can be taken over without waiting for a classic request to
+    /// sweep it. A document that cannot be read counts as live.
+    async fn is_live_classic(&self, group_id: &str, now_ms: i64) -> Result<bool> {
+        let Some((generation, _)) = self.storage.read_group_generation(group_id).await? else {
+            return Ok(false);
+        };
+
+        for member_id in generation.members.keys() {
+            let lapsed = self
+                .storage
+                .read_group_member(group_id, member_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|(member, _)| member.is_expired(now_ms));
+
+            if !lapsed {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Whether `group_id` is a consumer-protocol group with a live member, which
+    /// a classic `JoinGroup` may not take over.
+    async fn is_live_consumer(&self, group_id: &str, now_ms: i64) -> Result<bool> {
+        Ok(self
+            .storage
+            .read_consumer_group(group_id)
+            .await?
+            .is_some_and(|(group, _)| group.has_live_members(now_ms)))
+    }
+
+    async fn consumer_heartbeat(
+        &self,
+        client_id: &str,
+        request: &ConsumerGroupHeartbeatRequest,
+    ) -> Result<Body> {
+        let group_id = request.group_id.as_str();
+        let mut conflicts = 0u32;
+
+        loop {
+            let now_ms = epoch_ms((self.now)());
+            let held = self.storage.read_consumer_group(group_id).await?;
+
+            // A heartbeat for a group with no document is a member whose
+            // group is gone, and `UNKNOWN_MEMBER_ID` is what makes the client
+            // rejoin rather than fail fatally (#612).
+            if held.is_none() && request.member_epoch != 0 {
+                return Ok(consumer::error_response(ErrorCode::UnknownMemberId).into());
+            }
+
+            if request.member_epoch == 0
+                && held
+                    .as_ref()
+                    .is_none_or(|(group, _)| !group.has_live_members(now_ms))
+                && self.is_live_classic(group_id, now_ms).await?
+            {
+                debug!(group_id, "a consumer-protocol join of a classic group");
+                return Ok(consumer::error_response(ErrorCode::GroupIdNotFound).into());
+            }
+
+            let group = held.as_ref().map(|(group, _)| group);
+
+            let resolved = if self.consumer_metadata_due(request) {
+                Some(
+                    self.resolve_topics(&consumer::subscribed_names(group, request))
+                        .await?,
+                )
+            } else {
+                None
+            };
+
+            let transition =
+                match consumer::apply(group, request, client_id, resolved.as_ref(), now_ms) {
+                    Ok(transition) => transition,
+
+                    Err(error_code) => {
+                        debug!(group_id, member_id = request.member_id, ?error_code);
+                        return Ok(consumer::error_response(error_code).into());
+                    }
+                };
+
+            if resolved.is_some() {
+                self.consumer_metadata_noted(group_id);
+            }
+
+            if !transition.changed {
+                return Ok(transition.response.into());
+            }
+
+            match self
+                .storage
+                .update_consumer_group(
+                    group_id,
+                    transition.group.bumped(),
+                    held.map(|(_, version)| version),
+                )
+                .await
+            {
+                Ok(_) => return Ok(transition.response.into()),
+
+                Err(UpdateError::Outdated { .. } | UpdateError::Vanished) => {
+                    if conflicts >= MAX_GENERATION_CAS_ATTEMPTS {
+                        return Ok(
+                            consumer::error_response(ErrorCode::CoordinatorLoadInProgress).into(),
+                        );
+                    }
+
+                    self.generation_conflict(
+                        group_id,
+                        "consumer_group_heartbeat_outdated",
+                        &mut conflicts,
+                    )
+                    .await;
+                }
+
+                Err(error) => return Err(update_error(error)),
+            }
+        }
+    }
+
+    /// What a commit from `member_id` at `member_epoch` is answered when the
+    /// classic generation does not name it — `None` when it is accepted.
+    ///
+    /// KIP-848's offset commit rule: a member of a consumer-protocol group
+    /// commits at exactly its current epoch, and anything else is
+    /// `STALE_MEMBER_EPOCH`. A member no group of either kind names is
+    /// `UNKNOWN_MEMBER_ID`, as it always was.
+    async fn consumer_commit_verdict(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        member_epoch: i32,
+    ) -> Result<Option<ErrorCode>> {
+        let now_ms = epoch_ms((self.now)());
+
+        let current = self
+            .storage
+            .read_consumer_group(group_id)
+            .await?
+            .and_then(|(group, _)| {
+                group
+                    .members
+                    .get(member_id)
+                    .filter(|member| !member.is_expired(now_ms))
+                    .map(|member| member.member_epoch)
+            });
+
+        Ok(match current {
+            None => Some(ErrorCode::UnknownMemberId),
+            Some(current) if current == member_epoch => None,
+            Some(_) => Some(ErrorCode::StaleMemberEpoch),
+        })
+    }
+
+    /// Commit, answering `UNKNOWN_MEMBER_ID` for a commit the store refused.
+    async fn commit_or_unknown(&self, offset_commit: &OffsetCommit<'_>) -> Result<Body> {
+        match self.commit_offset(offset_commit).await {
+            Ok(body) => Ok(body),
+
+            Err(reason) => {
+                debug!(?reason);
+                Ok(offset_commit_error(
+                    offset_commit,
+                    ErrorCode::UnknownMemberId,
+                ))
+            }
+        }
+    }
+
+    /// What an `OffsetFetch` for `group` is answered when it names a member of
+    /// a consumer-protocol group — `None` when it is served.
+    ///
+    /// Only a request that names a member and an epoch is checked, and only
+    /// against a consumer-protocol group: an admin fetch names neither, and a
+    /// classic member never sends an epoch.
+    async fn consumer_fetch_verdict(
+        &self,
+        group: &OffsetFetchRequestGroup,
+    ) -> Result<Option<ErrorCode>> {
+        let Some(member_id) = group
+            .member_id
+            .as_deref()
+            .filter(|member_id| !member_id.is_empty())
+        else {
+            return Ok(None);
+        };
+
+        let Some(member_epoch) = group.member_epoch.filter(|epoch| *epoch >= 0) else {
+            return Ok(None);
+        };
+
+        let now_ms = epoch_ms((self.now)());
+
+        let Some((held, _)) = self.storage.read_consumer_group(&group.group_id).await? else {
+            return Ok(None);
+        };
+
+        Ok(
+            match held
+                .members
+                .get(member_id)
+                .filter(|member| !member.is_expired(now_ms))
+            {
+                None => Some(ErrorCode::UnknownMemberId),
+                Some(member) if member.member_epoch == member_epoch => None,
+                Some(_) => Some(ErrorCode::StaleMemberEpoch),
+            },
+        )
     }
 }
 

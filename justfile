@@ -481,6 +481,15 @@ fmt:
 # it rewords cites #594, and the one line removed was a test comment asserting
 # the refusal this takes away. Most of the lines are tests.
 #
+#   #612  +3328 lines, consumer protocol  3179 -> 3179  2.8205 -> 2.7624 (rebased on #605, #594)
+#
+# The KIP-848 consumer group protocol: `ConsumerGroupHeartbeat`, the server-side
+# assignors, member-epoch offset fencing and the consumer-group admin answers.
+# The reasoning is the `///` on the new modules (`consumer_group`, `consumer`,
+# `assignor`) and on the coordinator's new methods; every `//` block added
+# cites #612, so nothing counted moved, and the ratio falls because most of the
+# lines are code and tests.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -490,7 +499,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.8206" top="12":
+comments ceiling="2.7625" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

@@ -44,12 +44,12 @@ use uuid::Uuid;
 
 use crate::{
     Ack, AclBinding, AclFilter, Acls, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
-    BrokerRegistrationRequest, CommittedOffset, DEFAULT_FETCH_MAX_BYTES, Error, GenerationDoc,
-    GroupDetailResponse, ListOffsetResponse, MemberDoc, MetadataResponse, NamedGroupDetail,
-    OffsetCommitRequest, OffsetStage, ProducerIdResponse, QuotaAlteration, QuotaEntity,
-    QuotaFilterComponent, QuotaLimits, Quotas, Result, ScramCredential, Storage, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-    Version,
+    BrokerRegistrationRequest, CommittedOffset, ConsumerGroupDoc, DEFAULT_FETCH_MAX_BYTES, Error,
+    GenerationDoc, GroupDetailResponse, ListOffsetResponse, MemberDoc, MetadataResponse,
+    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, QuotaAlteration,
+    QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas, Result, ScramCredential, Storage,
+    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
+    UpdateError, Version,
 };
 
 /// A stored document with the version identifying it, as the object store
@@ -66,6 +66,9 @@ type GenerationDocs = BTreeMap<String, Held<GenerationDoc>>;
 /// immutable, so there is nothing to condition a later write on.
 type AssignmentDocs = BTreeMap<(String, i32), AssignmentDoc>;
 
+/// KIP-848 consumer group documents keyed by group (#612).
+type ConsumerGroupDocs = BTreeMap<String, Held<ConsumerGroupDoc>>;
+
 #[derive(Clone, Debug)]
 pub(crate) struct Engine {
     cluster: String,
@@ -81,6 +84,7 @@ pub(crate) struct Engine {
     members: Arc<Mutex<MemberDocs>>,
     generations: Arc<Mutex<GenerationDocs>>,
     assignments: Arc<Mutex<AssignmentDocs>>,
+    consumer_groups: Arc<Mutex<ConsumerGroupDocs>>,
 }
 
 impl Engine {
@@ -95,6 +99,7 @@ impl Engine {
             members: Arc::new(Mutex::new(BTreeMap::new())),
             generations: Arc::new(Mutex::new(BTreeMap::new())),
             assignments: Arc::new(Mutex::new(BTreeMap::new())),
+            consumer_groups: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -666,6 +671,47 @@ impl Storage for Engine {
                 _ => {
                     let version = Self::next_version();
                     _ = generations.insert(group_id.to_owned(), (generation, version.clone()));
+                    Ok(version)
+                }
+            })
+    }
+
+    #[instrument(skip_all)]
+    async fn read_consumer_group(
+        &self,
+        group_id: &str,
+    ) -> Result<Option<(ConsumerGroupDoc, Version)>> {
+        self.consumer_groups
+            .lock()
+            .map_err(Into::into)
+            .map(|groups| groups.get(group_id).cloned())
+    }
+
+    #[instrument(skip_all)]
+    async fn update_consumer_group(
+        &self,
+        group_id: &str,
+        group: ConsumerGroupDoc,
+        version: Option<Version>,
+    ) -> Result<Version, UpdateError<ConsumerGroupDoc>> {
+        self.consumer_groups
+            .lock()
+            .map_err(|err| UpdateError::Error(err.into()))
+            .and_then(|mut groups| match groups.get(group_id) {
+                Some((current, held)) if Some(held) != version.as_ref() => {
+                    Err(UpdateError::Outdated {
+                        current: Box::new(current.clone()),
+                        version: held.clone(),
+                    })
+                }
+
+                None if version.is_some() => {
+                    Err(UpdateError::Error(Error::Api(ErrorCode::GroupIdNotFound)))
+                }
+
+                _ => {
+                    let version = Self::next_version();
+                    _ = groups.insert(group_id.to_owned(), (group, version.clone()));
                     Ok(version)
                 }
             })

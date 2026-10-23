@@ -12,10 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::{collections::BTreeMap, time::SystemTime};
+
 use rama::{Context, Service};
 use tansu_sans_io::{
     ApiKey, ConsumerGroupDescribeRequest,
     consumer_group_describe_response::{ConsumerGroupDescribeResponse, DescribedGroup},
+    to_timestamp,
 };
 use tracing::{debug, instrument};
 
@@ -23,10 +26,13 @@ use crate::{Error, Result, Storage};
 
 /// A [`Service`] using [`Storage`] as [`Context`] taking [`ConsumerGroupDescribeRequest`] returning [`ConsumerGroupDescribeResponse`].
 ///
-/// This engine holds classic groups only, so every group is answered
-/// [`ErrorCode::GroupIdNotFound`] here — the code that sends an AdminClient to
+/// A KIP-848 group — one with a [`ConsumerGroupDoc`](crate::ConsumerGroupDoc)
+/// — is reported from that document: members, epochs, current and target
+/// assignments (#612). Every other group is answered
+/// [`ErrorCode::GroupIdNotFound`](tansu_sans_io::ErrorCode::GroupIdNotFound),
+/// the code that sends an AdminClient to
 /// [`DescribeGroups`](crate::DescribeGroupsService), which is the path that
-/// carries the membership.
+/// carries a classic group's membership.
 /// ```
 /// use rama::{Context, Layer, Service as _, layer::MapStateLayer};
 /// use tansu_sans_io::{ConsumerGroupDescribeRequest, ErrorCode};
@@ -84,21 +90,48 @@ where
         ctx: Context<G>,
         req: ConsumerGroupDescribeRequest,
     ) -> Result<Self::Response, Self::Error> {
-        ctx.state()
-            .describe_groups(req.group_ids.as_deref(), req.include_authorized_operations)
-            .await
-            .inspect(|described| debug!(?described))
-            .map(|described| {
-                described
-                    .iter()
-                    .map(DescribedGroup::from)
-                    .collect::<Vec<_>>()
+        let storage = ctx.state();
+        let group_ids = req.group_ids.unwrap_or_default();
+        let now_ms = to_timestamp(&SystemTime::now()).unwrap_or_default();
+
+        let mut consumer = BTreeMap::new();
+        let mut classic = Vec::new();
+
+        for group_id in &group_ids {
+            match storage.read_consumer_group(group_id).await? {
+                Some((group, _)) => {
+                    _ = consumer.insert(group_id.clone(), group.described(group_id, now_ms));
+                }
+
+                None => classic.push(group_id.clone()),
+            }
+        }
+
+        let classic = if classic.is_empty() {
+            BTreeMap::new()
+        } else {
+            storage
+                .describe_groups(Some(&classic), req.include_authorized_operations)
+                .await
+                .inspect(|described| debug!(?described))?
+                .iter()
+                .map(DescribedGroup::from)
+                .map(|described| (described.group_id.clone(), described))
+                .collect()
+        };
+
+        let groups = group_ids
+            .iter()
+            .filter_map(|group_id| {
+                consumer
+                    .get(group_id)
+                    .or_else(|| classic.get(group_id))
+                    .cloned()
             })
-            .map(Some)
-            .map(|groups| {
-                ConsumerGroupDescribeResponse::default()
-                    .throttle_time_ms(0)
-                    .groups(groups)
-            })
+            .collect();
+
+        Ok(ConsumerGroupDescribeResponse::default()
+            .throttle_time_ms(0)
+            .groups(Some(groups)))
     }
 }
