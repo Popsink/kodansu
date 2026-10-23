@@ -593,6 +593,14 @@ impl Serializer for &mut Encoder {
 
             Ok(())
         } else {
+            // The presence byte of a nullable structure: the `1` that pairs
+            // with the `-1` `serialize_none` writes, and that the decoder
+            // already reads. Without it `ConsumerGroupHeartbeat`'s assignment
+            // decoded as an empty one on every client (#612).
+            if self.is_valid() && self.is_nullable() && self.is_structure() && !self.is_sequence() {
+                self.working.put_i8(1);
+            }
+
             value.serialize(self)
         }
     }

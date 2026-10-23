@@ -17,17 +17,17 @@ use rama::{
     layer::{MapErrLayer, MapStateLayer},
 };
 use tansu_sans_io::{
-    ApiKey as _, HeartbeatRequest, JoinGroupRequest, LeaveGroupRequest, OffsetCommitRequest,
-    OffsetFetchRequest, SyncGroupRequest,
+    ApiKey as _, ConsumerGroupHeartbeatRequest, HeartbeatRequest, JoinGroupRequest,
+    LeaveGroupRequest, OffsetCommitRequest, OffsetFetchRequest, SyncGroupRequest,
 };
 use tansu_service::FrameRouteBuilder;
 
 use crate::{
     Error,
     broker::group::{
-        heartbeat::HeartbeatService, join::JoinGroupService, leave::LeaveGroupService,
-        offset_commit::OffsetCommitService, offset_fetch::OffsetFetchService,
-        sync::SyncGroupService,
+        consumer_group_heartbeat::ConsumerGroupHeartbeatService, heartbeat::HeartbeatService,
+        join::JoinGroupService, leave::LeaveGroupService, offset_commit::OffsetCommitService,
+        offset_fetch::OffsetFetchService, sync::SyncGroupService,
     },
     coordinator::group::Coordinator,
 };
@@ -40,6 +40,7 @@ where
     C: Coordinator,
 {
     [
+        consumer_group_heartbeat,
         heartbeat,
         join_group,
         leave_group,
@@ -51,6 +52,29 @@ where
     .try_fold(builder, |builder, service| {
         service(builder, coordinator.clone())
     })
+}
+
+/// `ConsumerGroupHeartbeat`, and with it the advertisement that this broker
+/// speaks the KIP-848 consumer group protocol (#612): `ApiVersions` is derived
+/// from the routes registered here.
+pub fn consumer_group_heartbeat<C>(
+    builder: FrameRouteBuilder<(), Error>,
+    coordinator: C,
+) -> Result<FrameRouteBuilder<(), Error>, Error>
+where
+    C: Coordinator,
+{
+    builder
+        .with_route(
+            ConsumerGroupHeartbeatRequest::KEY,
+            (
+                MapErrLayer::new(Error::from),
+                MapStateLayer::new(|_| coordinator),
+            )
+                .into_layer(ConsumerGroupHeartbeatService)
+                .boxed(),
+        )
+        .map_err(Into::into)
 }
 
 pub fn heartbeat<C>(

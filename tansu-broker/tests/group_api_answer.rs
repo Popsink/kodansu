@@ -49,8 +49,8 @@ use tansu_client::{
     BytesConnectionService, ConnectionManager, FrameConnectionLayer, FramePoolLayer, Pool,
 };
 use tansu_sans_io::{
-    ApiKey as _, Body, ErrorCode, Frame, Header, HeartbeatRequest, JoinGroupRequest,
-    LeaveGroupRequest, OffsetCommitRequest, OffsetFetchRequest, SyncGroupRequest,
+    ApiKey as _, Body, ConsumerGroupHeartbeatRequest, ErrorCode, Frame, Header, HeartbeatRequest,
+    JoinGroupRequest, LeaveGroupRequest, OffsetCommitRequest, OffsetFetchRequest, SyncGroupRequest,
     join_group_request::JoinGroupRequestProtocol,
     leave_group_request::MemberIdentity,
     offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
@@ -173,6 +173,14 @@ impl Coordinator for AlwaysNotCoordinator {
         _group_id: &str,
         _member_id: Option<&str>,
         _members: Option<&[MemberIdentity]>,
+    ) -> Result<Body, Error> {
+        Err(Error::Api(ErrorCode::NotCoordinator))
+    }
+
+    async fn consumer_group_heartbeat(
+        &self,
+        _client_id: Option<&str>,
+        _request: &ConsumerGroupHeartbeatRequest,
     ) -> Result<Body, Error> {
         Err(Error::Api(ErrorCode::NotCoordinator))
     }
@@ -455,6 +463,14 @@ async fn a_non_api_error_still_ends_the_connection() -> Result<()> {
             unreachable!()
         }
 
+        async fn consumer_group_heartbeat(
+            &self,
+            _client_id: Option<&str>,
+            _request: &ConsumerGroupHeartbeatRequest,
+        ) -> Result<Body, Error> {
+            unreachable!()
+        }
+
         async fn offset_commit(&self, _detail: OffsetCommit<'_>) -> Result<Body, Error> {
             unreachable!()
         }
@@ -594,6 +610,14 @@ async fn a_failed_offsets_read_is_answered_retriably() -> Result<()> {
             _group_id: &str,
             _member_id: Option<&str>,
             _members: Option<&[MemberIdentity]>,
+        ) -> Result<Body, Error> {
+            unreachable!()
+        }
+
+        async fn consumer_group_heartbeat(
+            &self,
+            _client_id: Option<&str>,
+            _request: &ConsumerGroupHeartbeatRequest,
         ) -> Result<Body, Error> {
             unreachable!()
         }

@@ -492,6 +492,14 @@ fmt:
 # `Severity::Expected` beside `ConnectionReset`. The two `//` blocks on those
 # arms now cite #605, which takes three uncited lines out of the count; the rest
 # is two tests.
+#   #612  +3328 lines, consumer protocol  3176 -> 3176  2.8165 -> 2.7585 (rebased on #605, #594, #590)
+#
+# The KIP-848 consumer group protocol: `ConsumerGroupHeartbeat`, the server-side
+# assignors, member-epoch offset fencing and the consumer-group admin answers.
+# The reasoning is the `///` on the new modules (`consumer_group`, `consumer`,
+# `assignor`) and on the coordinator's new methods; every `//` block added
+# cites #612, so nothing counted moved, and the ratio falls because most of the
+# lines are code and tests.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -502,7 +510,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.8166" top="12":
+comments ceiling="2.7586" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
