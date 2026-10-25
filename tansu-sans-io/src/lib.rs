@@ -980,6 +980,7 @@ impl TryFrom<&i16> for ErrorCode {
             117 => Ok(Self::UnknownSubscriptionId),
             118 => Ok(Self::TelemetryTooLarge),
             119 => Ok(Self::InvalidRegistration),
+            128 => Ok(Self::InvalidRegularExpression),
             otherwise => Err(Error::UnknownApiErrorCode(*otherwise)),
         }
     }
@@ -1115,6 +1116,7 @@ impl From<&ErrorCode> for i16 {
             ErrorCode::UnknownSubscriptionId => 117,
             ErrorCode::TelemetryTooLarge => 118,
             ErrorCode::InvalidRegistration => 119,
+            ErrorCode::InvalidRegularExpression => 128,
         }
     }
 }
@@ -1470,6 +1472,9 @@ impl Display for ErrorCode {
             ErrorCode::InvalidRegistration => {
                 f.write_str("The controller has considered the broker registration to be invalid.")
             }
+            ErrorCode::InvalidRegularExpression => {
+                f.write_str("The regular expression is not valid.")
+            }
         }
     }
 }
@@ -1602,6 +1607,7 @@ pub enum ErrorCode {
     UnknownSubscriptionId,
     TelemetryTooLarge,
     InvalidRegistration,
+    InvalidRegularExpression,
 }
 
 #[derive(

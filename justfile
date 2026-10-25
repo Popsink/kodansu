@@ -505,6 +505,11 @@ fmt:
 # client_host, `--group-consumer-*` options and a shorter metadata window for
 # consumer-protocol groups. The two `//` blocks added cite #628; the rest is
 # code, docs and tests.
+#   #625  +560 lines, pattern subscriptions  3176 -> 3176  2.7506 -> 2.7427 (stacked on #628)
+#
+# ConsumerGroupHeartbeat v1 and its SubscribedTopicRegex, resolved against the
+# topic list, and Metadata answering a topic asked for by id. No `//` block was
+# added; the reasoning is in `///`, and the rest is code and tests.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -515,7 +520,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7507" top="12":
+comments ceiling="2.7428" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

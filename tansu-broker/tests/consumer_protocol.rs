@@ -719,3 +719,124 @@ async fn consumer_group_heartbeat_is_advertised_and_answered() -> Result<()> {
 
     Ok(())
 }
+
+async fn create_topic(storage: &Arc<dyn Storage>, name: &str, partitions: i32) -> Result<Uuid> {
+    storage
+        .create_topic(
+            CreatableTopic::default()
+                .name(name.into())
+                .num_partitions(partitions)
+                .replication_factor(1)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await
+        .map_err(Into::into)
+}
+
+/// Partitions by topic id, as a heartbeat assigned them.
+fn assigned_by_topic(response: &ConsumerGroupHeartbeatResponse) -> BTreeMap<Uuid, Vec<i32>> {
+    response
+        .assignment
+        .iter()
+        .flat_map(|assignment| assignment.topic_partitions.iter().flatten())
+        .map(|topic| {
+            (
+                Uuid::from_bytes(topic.topic_id),
+                topic.partitions.clone().unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// A pattern subscription (#625) takes in every matching topic, including one
+/// created after the member joined, and leaves the others alone.
+#[tokio::test(start_paused = true)]
+async fn a_pattern_subscription_follows_the_topics_it_matches() -> Result<()> {
+    let mut fixture = fixture().await?;
+    let eu = create_topic(&fixture.storage, "orders-eu", 2).await?;
+    let member_id = Uuid::new_v4().to_string();
+
+    let Body::ConsumerGroupHeartbeatResponse(joined) = fixture
+        .coordinator
+        .consumer_group_heartbeat(
+            None,
+            None,
+            &ConsumerGroupHeartbeatRequest::default()
+                .group_id("pattern".into())
+                .member_id(member_id.clone())
+                .member_epoch(0)
+                .rebalance_timeout_ms(300_000)
+                .subscribed_topic_names(Some(vec![]))
+                .subscribed_topic_regex(Some("orders-.*".into()))
+                .topic_partitions(Some(vec![])),
+        )
+        .await?
+    else {
+        return Err(anyhow!("not a heartbeat response"));
+    };
+
+    assert_eq!(i16::from(ErrorCode::None), joined.error_code);
+    assert_eq!(
+        BTreeMap::from([(eu, vec![0, 1])]),
+        assigned_by_topic(&joined),
+        "{TOPIC} does not match"
+    );
+
+    let us = create_topic(&fixture.storage, "orders-us", 3).await?;
+
+    // A replica that has not resolved the group yet, as any other replica
+    // would be, or this one once its refresh window has passed.
+    fixture.coordinator = Controller::with_storage(fixture.storage.clone())?.with_now(paused_clock);
+
+    let Body::ConsumerGroupHeartbeatResponse(refreshed) = fixture
+        .coordinator
+        .consumer_group_heartbeat(
+            None,
+            None,
+            &ConsumerGroupHeartbeatRequest::default()
+                .group_id("pattern".into())
+                .member_id(member_id.clone())
+                .member_epoch(joined.member_epoch)
+                .topic_partitions(Some(vec![
+                    TopicPartitions::default()
+                        .topic_id(eu.into_bytes())
+                        .partitions(Some(vec![0, 1])),
+                ])),
+        )
+        .await?
+    else {
+        return Err(anyhow!("not a heartbeat response"));
+    };
+
+    assert_eq!(i16::from(ErrorCode::None), refreshed.error_code);
+    assert_eq!(joined.member_epoch + 1, refreshed.member_epoch);
+    assert_eq!(
+        BTreeMap::from([(eu, vec![0, 1]), (us, vec![0, 1, 2])]),
+        assigned_by_topic(&refreshed)
+    );
+
+    let Body::ConsumerGroupHeartbeatResponse(refused) = fixture
+        .coordinator
+        .consumer_group_heartbeat(
+            None,
+            None,
+            &ConsumerGroupHeartbeatRequest::default()
+                .group_id("pattern".into())
+                .member_id(member_id)
+                .member_epoch(refreshed.member_epoch)
+                .subscribed_topic_regex(Some("orders-(".into())),
+        )
+        .await?
+    else {
+        return Err(anyhow!("not a heartbeat response"));
+    };
+
+    assert_eq!(
+        i16::from(ErrorCode::InvalidRegularExpression),
+        refused.error_code
+    );
+
+    Ok(())
+}

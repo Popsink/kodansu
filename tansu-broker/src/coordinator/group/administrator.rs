@@ -109,7 +109,7 @@ use crate::{Error, METER, Result};
 
 use super::{
     Coordinator, OffsetCommit,
-    consumer::{self, Client, ConsumerGroupConfig, Resolved},
+    consumer::{self, Client, ConsumerGroupConfig, Resolved, Subscriptions},
 };
 
 /// How long a static member with nothing to act on is damped on the **sync**
@@ -3612,6 +3612,7 @@ where
     fn consumer_metadata_due(&self, request: &ConsumerGroupHeartbeatRequest) -> bool {
         request.member_epoch == 0
             || request.subscribed_topic_names.is_some()
+            || request.subscribed_topic_regex.is_some()
             || self
                 .consumer_metadata_checks
                 .lock()
@@ -3624,19 +3625,40 @@ where
         }
     }
 
-    /// The topics among `names` that exist, with their id and partition count.
-    async fn resolve_topics(&self, names: &BTreeSet<String>) -> Result<Resolved> {
-        if names.is_empty() {
+    /// The topics `subscriptions` take in that exist, with their id and
+    /// partition count.
+    ///
+    /// Names alone are looked up by name. A pattern needs every topic there is
+    /// (#625), which the storage answers from the same in-memory index, so a
+    /// pattern costs a scan of that index and no request; a topic created
+    /// since is matched at the next refresh, which is what bumps the epoch.
+    async fn resolve_topics(&self, subscriptions: &Subscriptions) -> Result<Resolved> {
+        let metadata = if !subscriptions.patterns.is_empty() {
+            self.storage.metadata(None).await?
+        } else if subscriptions.names.is_empty() {
             return Ok(Resolved::new());
-        }
+        } else {
+            let topics = subscriptions
+                .names
+                .iter()
+                .cloned()
+                .map(TopicId::Name)
+                .collect::<Vec<_>>();
 
-        let topics = names.iter().cloned().map(TopicId::Name).collect::<Vec<_>>();
-        let metadata = self.storage.metadata(Some(&topics)).await?;
+            self.storage.metadata(Some(&topics)).await?
+        };
 
         Ok(metadata
             .topics()
             .iter()
             .filter(|topic| topic.error_code == i16::from(ErrorCode::None))
+            .filter(|topic| topic.is_internal != Some(true))
+            .filter(|topic| {
+                topic
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| subscriptions.includes(name))
+            })
             .filter_map(|topic| {
                 let partitions = topic.partitions.as_ref().map_or(0, Vec::len);
 
@@ -3723,7 +3745,7 @@ where
 
             let resolved = if self.consumer_metadata_due(request) {
                 Some(
-                    self.resolve_topics(&consumer::subscribed_names(group, request))
+                    self.resolve_topics(&consumer::subscriptions(group, request))
                         .await?,
                 )
             } else {

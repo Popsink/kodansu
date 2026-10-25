@@ -719,14 +719,20 @@ impl From<&FetchTopic> for TopicId {
     }
 }
 
+/// By id whenever the id is not the null one, as Kafka resolves it (#625).
+///
+/// From v10 a topic may be asked for by id, and the Java client does exactly
+/// that to name the topics of a KIP-848 assignment it has no metadata for. It
+/// sends the id with `name` at its non-null default, `""`, so reading the name
+/// first asked for a topic called `""` and answered `INVALID_TOPIC_EXCEPTION`:
+/// a pattern-subscribed consumer could never resolve what it was assigned.
 impl From<&MetadataRequestTopic> for TopicId {
     fn from(value: &MetadataRequestTopic) -> Self {
-        if let Some(ref name) = value.name {
-            Self::Name(name.into())
-        } else if let Some(ref id) = value.topic_id {
-            Self::Id(Uuid::from_bytes(*id))
-        } else {
-            panic!("neither name nor uuid")
+        match (value.topic_id, value.name.as_deref()) {
+            (Some(id), _) if id != NULL_TOPIC_ID => Self::Id(Uuid::from_bytes(id)),
+            (_, Some(name)) => Self::Name(name.into()),
+            (Some(id), None) => Self::Id(Uuid::from_bytes(id)),
+            (None, None) => panic!("neither name nor uuid"),
         }
     }
 }

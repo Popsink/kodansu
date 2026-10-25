@@ -56,6 +56,39 @@ fn a_join_request_decodes() -> Result<()> {
     Ok(())
 }
 
+/// Version 1 carries the subscription pattern (#625); version 0 has no room
+/// for it and drops it.
+#[test]
+fn a_pattern_subscription_round_trips_at_v1_only() -> Result<()> {
+    let body = ConsumerGroupHeartbeatRequest::default()
+        .group_id("g".into())
+        .member_id("m".into())
+        .member_epoch(0)
+        .rebalance_timeout_ms(1)
+        .subscribed_topic_names(Some(vec![]))
+        .subscribed_topic_regex(Some("orders-.*".into()))
+        .topic_partitions(Some(vec![]));
+
+    let at = |api_version| {
+        Frame::request(
+            Header::Request {
+                api_key: API_KEY,
+                api_version,
+                correlation_id: 7,
+                client_id: Some("c".into()),
+            },
+            body.clone().into(),
+        )
+        .and_then(Frame::request_from_bytes)
+        .and_then(|frame| ConsumerGroupHeartbeatRequest::try_from(frame.body))
+    };
+
+    assert_eq!(Some("orders-.*".into()), at(1)?.subscribed_topic_regex);
+    assert_eq!(None, at(0)?.subscribed_topic_regex);
+
+    Ok(())
+}
+
 #[test]
 fn an_assignment_carries_its_presence_byte() -> Result<()> {
     let body = ConsumerGroupHeartbeatResponse::default()
