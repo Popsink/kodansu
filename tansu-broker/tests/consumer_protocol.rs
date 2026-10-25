@@ -29,7 +29,9 @@ use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
 use tansu_broker::{
-    coordinator::group::{Coordinator, OffsetCommit, administrator::Controller},
+    coordinator::group::{
+        ConsumerGroupConfig, Coordinator, MigrationPolicy, OffsetCommit, administrator::Controller,
+    },
     service::services,
 };
 use tansu_client::{
@@ -591,17 +593,27 @@ async fn classic_join(fixture: &Fixture, group_id: &str) -> Result<i16> {
     Err(anyhow!("never admitted"))
 }
 
+/// A classic member is served by a live consumer group, as Kafka serves one
+/// (#626), and a consumer-protocol member converts a live classic group unless
+/// the migration policy is `disabled`, which is #612's behaviour.
 #[tokio::test(start_paused = true)]
-async fn a_group_does_not_mix_protocols() -> Result<()> {
-    let fixture = fixture().await?;
+async fn the_protocols_mix_only_as_the_migration_policy_allows() -> Result<()> {
+    let mut fixture = fixture().await?;
 
     _ = Member::new("consumer-first").beat(&fixture).await?;
 
     assert_eq!(
-        i16::from(ErrorCode::InconsistentGroupProtocol),
+        i16::from(ErrorCode::None),
         classic_join(&fixture, "consumer-first").await?,
-        "a classic member may not join a consumer-protocol group"
+        "a classic member joins a consumer-protocol group"
     );
+
+    fixture.coordinator = Controller::with_storage(fixture.storage.clone())?
+        .with_now(paused_clock)
+        .with_consumer_group_config(ConsumerGroupConfig {
+            migration: MigrationPolicy::Disabled,
+            ..Default::default()
+        });
 
     assert_eq!(
         i16::from(ErrorCode::None),
@@ -612,7 +624,16 @@ async fn a_group_does_not_mix_protocols() -> Result<()> {
     assert_eq!(
         i16::from(ErrorCode::GroupIdNotFound),
         refused.error_code,
-        "a consumer-protocol member may not join a classic group"
+        "without migration, a consumer-protocol member may not join a classic group"
+    );
+
+    fixture.coordinator = Controller::with_storage(fixture.storage.clone())?.with_now(paused_clock);
+
+    let converted = Member::new("classic-first").beat(&fixture).await?;
+    assert_eq!(
+        i16::from(ErrorCode::None),
+        converted.error_code,
+        "with it, the member converts the group"
     );
 
     Ok(())

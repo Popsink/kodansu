@@ -34,7 +34,7 @@ use rustls::{
 use tansu_broker::{
     Keepalive, NODE_ID, SOCKET_REQUEST_MAX_BYTES,
     broker::Broker,
-    coordinator::group::{ConsumerGroupConfig, administrator::Controller},
+    coordinator::group::{ConsumerGroupConfig, MigrationPolicy, administrator::Controller},
 };
 use tansu_sans_io::ErrorCode;
 use tansu_storage::{
@@ -164,9 +164,32 @@ pub(super) struct Arg {
     #[arg(long, env = "GROUP_CONSUMER_MAX_SIZE", default_value_t = 0)]
     group_consumer_max_size: u32,
 
+    /// Whether a running classic group may become a `group.protocol=consumer` group, Kafka's `group.consumer.migration.policy`. `upgrade`, the default, converts it when its first member comes back speaking the consumer protocol, so a rolling restart adopts KIP-848 without stopping the group; `disabled` refuses that member until the classic members have all gone.
+    #[arg(long, env = "GROUP_CONSUMER_MIGRATION_POLICY", value_enum, default_value_t = Migration::Upgrade)]
+    group_consumer_migration_policy: Migration,
+
     /// Silent
     #[arg(long)]
     silent: bool,
+}
+
+/// `--group-consumer-migration-policy` (#626). Kafka's `downgrade` and
+/// `bidirectional` are not offered: a consumer group serves classic members
+/// already, so going back member by member needs no conversion.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, clap::ValueEnum)]
+enum Migration {
+    Disabled,
+    #[default]
+    Upgrade,
+}
+
+impl From<Migration> for MigrationPolicy {
+    fn from(value: Migration) -> Self {
+        match value {
+            Migration::Disabled => Self::Disabled,
+            Migration::Upgrade => Self::Upgrade,
+        }
+    }
 }
 
 impl Arg {
@@ -196,6 +219,7 @@ impl Arg {
             heartbeat_interval_ms: self.group_consumer_heartbeat_interval_ms,
             max_size: (self.group_consumer_max_size > 0)
                 .then(|| usize::try_from(self.group_consumer_max_size).unwrap_or(usize::MAX)),
+            migration: self.group_consumer_migration_policy.into(),
         })
     }
 
@@ -488,6 +512,14 @@ mod tests {
         assert_eq!(ConsumerGroupConfig::default(), defaults);
         assert_eq!(45_000, defaults.session_timeout_ms);
         assert_eq!(None, defaults.max_size);
+        assert_eq!(MigrationPolicy::Upgrade, defaults.migration);
+
+        assert_eq!(
+            Some(MigrationPolicy::Disabled),
+            config(&["tansu", "--group-consumer-migration-policy", "disabled"])
+                .ok()
+                .map(|config| config.migration)
+        );
 
         assert_eq!(
             Some(Some(200)),

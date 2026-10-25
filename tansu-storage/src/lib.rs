@@ -191,9 +191,9 @@ pub use quota::{
 };
 
 pub use consumer_group::{
-    CONSUMER_HEARTBEAT_INTERVAL_MS, CONSUMER_SESSION_TIMEOUT_MS, ConsumerGroupDoc, ConsumerMember,
-    ContactStamps, LEAVING_STATIC_MEMBER_EPOCH, MemberState, Partitions, SubscribedTopic, flatten,
-    grouped,
+    CONSUMER_HEARTBEAT_INTERVAL_MS, CONSUMER_SESSION_TIMEOUT_MS, ClassicMember, ConsumerGroupDoc,
+    ConsumerMember, ContactStamps, LEAVING_STATIC_MEMBER_EPOCH, MemberState, Partitions,
+    SubscribedTopic, flatten, grouped,
 };
 
 pub use group::{

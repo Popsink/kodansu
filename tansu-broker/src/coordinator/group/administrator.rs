@@ -110,8 +110,38 @@ use crate::{Error, METER, Result};
 
 use super::{
     Coordinator, OffsetCommit,
-    consumer::{self, Client, ConsumerGroupConfig, Liveness, Resolved, Subscriptions},
+    consumer::{
+        self, Client, ConsumerGroupConfig, Liveness, MigrationPolicy, Resolved, Subscriptions,
+        Transition,
+    },
+    migration,
 };
+
+/// What [`Controller::convert`] did with a classic group (#626).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Conversion {
+    Converted,
+
+    /// The classic group may not be converted, and the joining member is
+    /// answered this.
+    Refused(ErrorCode),
+
+    /// The classic group moved under the conversion's CAS, and has to be read
+    /// again.
+    Outdated,
+}
+
+/// Which group serves a classic request (#626): see
+/// [`Controller::classic_route`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Route {
+    Classic,
+    Consumer,
+
+    /// The classic group was just taken back, and the request starts again
+    /// from a fresh read.
+    Reread,
+}
 
 /// How long a static member with nothing to act on is damped on the **sync**
 /// path before it is answered (#486).
@@ -1530,7 +1560,10 @@ where
         view: &GroupView,
         now: SystemTime,
     ) -> Result<Option<GroupView>> {
-        if !view.exists() || view.generation.members.is_empty() {
+        // A converted group's members are the snapshot its consumer group is
+        // built from (#626): sweeping them would move the generation the
+        // conversion is keyed on, and rebuild the consumer group over itself.
+        if !view.exists() || view.generation.members.is_empty() || view.generation.is_converted() {
             return Ok(None);
         }
 
@@ -2433,6 +2466,44 @@ where
                 ));
             };
 
+            // A converted group, or one only the consumer protocol holds, is
+            // the consumer group's to serve (#626). Only such a group can be,
+            // so a populated classic one never pays for the read.
+            if !consumer_checked
+                && (view.generation.is_converted() || view.generation.members.is_empty())
+            {
+                consumer_checked = true;
+
+                match self
+                    .classic_route(group_id, &view, &[], true, now_ms)
+                    .await?
+                {
+                    Route::Classic => {}
+
+                    Route::Consumer => {
+                        return self
+                            .classic_join_to_consumer(
+                                group_id,
+                                client_id,
+                                migration::ClassicJoin {
+                                    member_id,
+                                    instance_id: group_instance_id,
+                                    session_timeout_ms,
+                                    rebalance_timeout_ms,
+                                    protocol_type,
+                                    protocols,
+                                },
+                            )
+                            .await;
+                    }
+
+                    Route::Reread => {
+                        consumer_checked = false;
+                        continue;
+                    }
+                }
+            }
+
             // The group's protocol, once it has one, is what every later member
             // must speak. The first member to join settles it, along with the
             // timeouts the group is run on.
@@ -2456,23 +2527,6 @@ where
 
                 None => &protocols[0],
             };
-
-            // A group is one type for its whole life (#612). Only a classic
-            // group with nobody in it can be a consumer-protocol group's id
-            // too, so a populated one never pays for the read.
-            if !consumer_checked && view.generation.members.is_empty() {
-                consumer_checked = true;
-
-                if self.is_live_consumer(group_id, now_ms).await? {
-                    debug!(join_outcome = ?ErrorCode::InconsistentGroupProtocol);
-                    return Ok(join_error(
-                        &view,
-                        ErrorCode::InconsistentGroupProtocol,
-                        member_id,
-                        protocol_type,
-                    ));
-                }
-            }
 
             if member_id.is_empty() && group_instance_id.is_none() {
                 // KIP-394: reply with a generated member id but leave the group
@@ -2983,6 +3037,24 @@ where
             let now = (self.now)();
             let mut view = self.read_view(group_id).await?;
 
+            let named = [(member_id.to_owned(), group_instance_id.map(str::to_owned))];
+
+            if self
+                .classic_route(group_id, &view, &named, false, epoch_ms(now))
+                .await?
+                == Route::Consumer
+            {
+                return self
+                    .classic_sync_to_consumer(
+                        group_id,
+                        generation_id,
+                        member_id,
+                        group_instance_id,
+                        (protocol_type, protocol_name),
+                    )
+                    .await;
+            }
+
             if let Some(swept) = self.sweep(group_id, &view, now).await? {
                 view = swept;
             }
@@ -3075,6 +3147,14 @@ where
             let now = (self.now)();
             let now_ms = epoch_ms(now);
             let view = self.read_view(group_id).await?;
+
+            if self
+                .classic_route(group_id, &view, &departing, false, now_ms)
+                .await?
+                == Route::Consumer
+            {
+                return self.classic_leave_to_consumer(group_id, &departing).await;
+            }
 
             let mut next = view.generation.clone();
             let mut left = BTreeSet::new();
@@ -3215,7 +3295,9 @@ where
                 .read_group_generation(group_id)
                 .await?
                 .map(|(generation, _)| generation)
-                .filter(|generation| generation.members.contains_key(member_id));
+                .filter(|generation| {
+                    !generation.is_converted() && generation.members.contains_key(member_id)
+                });
 
             // Not a classic member, so a KIP-848 one or nobody: the commit
             // carries a member epoch, judged against the consumer group (#612).
@@ -3370,6 +3452,23 @@ where
 
         let now = (self.now)();
         let mut view = self.read_view(group_id).await?;
+
+        let named = [(member_id.to_owned(), group_instance_id.map(str::to_owned))];
+
+        if self
+            .classic_route(group_id, &view, &named, false, epoch_ms(now))
+            .await?
+            == Route::Consumer
+        {
+            return self
+                .classic_heartbeat_to_consumer(
+                    group_id,
+                    generation_id,
+                    member_id,
+                    group_instance_id,
+                )
+                .await;
+        }
 
         if let Some(swept) = self.sweep(group_id, &view, now).await? {
             view = swept;
@@ -3699,10 +3798,18 @@ where
     /// its session lapsed does not count, so a classic group whose consumers
     /// all stopped can be taken over without waiting for a classic request to
     /// sweep it. A document that cannot be read counts as live.
-    async fn is_live_classic(&self, group_id: &str, now_ms: i64) -> Result<bool> {
-        let Some((generation, _)) = self.storage.read_group_generation(group_id).await? else {
+    ///
+    /// A converted group is not one (#626): its members are the snapshot the
+    /// consumer group was built from.
+    async fn is_live_classic_generation(
+        &self,
+        group_id: &str,
+        generation: &GenerationDoc,
+        now_ms: i64,
+    ) -> Result<bool> {
+        if generation.is_converted() {
             return Ok(false);
-        };
+        }
 
         for member_id in generation.members.keys() {
             let lapsed = self
@@ -3799,19 +3906,37 @@ where
         }
     }
 
-    async fn consumer_heartbeat(
+    /// One request against a consumer group's document (#612): `step` is
+    /// applied to the group as read, and what it decides is written back
+    /// under the document's etag, renewed as a liveness stamp (#627), or
+    /// answered as it stands — and on a lost CAS, re-read and re-applied. A
+    /// consumer heartbeat and every classic request a consumer group serves
+    /// (#626) go through here.
+    ///
+    /// `refresh` resolves the topics `subscriptions` names and lists the
+    /// members' stamps, so `step` can rebalance on new metadata and sweep
+    /// lapsed members. The stamps are listed before the document is read, so
+    /// a member the document no longer names was gone before the listing was
+    /// taken, and its stamps are safe to forget.
+    async fn consumer_transition<R, S, F>(
         &self,
-        client: Client<'_>,
-        request: &ConsumerGroupHeartbeatRequest,
-    ) -> Result<Body> {
-        let group_id = request.group_id.as_str();
+        group_id: &str,
+        sender: &str,
+        refresh: bool,
+        subscriptions: S,
+        mut step: F,
+    ) -> Result<Result<R, ErrorCode>>
+    where
+        S: Fn(Option<&ConsumerGroupDoc>) -> Subscriptions,
+        F: FnMut(
+            Option<&ConsumerGroupDoc>,
+            Option<&Resolved>,
+            &Liveness,
+            i64,
+        ) -> std::result::Result<Transition<R>, ErrorCode>,
+    {
         let mut conflicts = 0u32;
 
-        let refresh = self.consumer_metadata_due(request, epoch_ms((self.now)()));
-
-        // Listed before the document is read, so a member the document no
-        // longer names was gone before the listing was taken, and its stamps
-        // are safe to forget (#627).
         let stamps = if refresh {
             Some(self.storage.list_consumer_member_stamps(group_id).await?)
         } else {
@@ -3821,53 +3946,21 @@ where
         loop {
             let now_ms = epoch_ms((self.now)());
             let held = self.storage.read_consumer_group(group_id).await?;
-            let liveness = self.consumer_liveness(group_id, &request.member_id, stamps.as_ref());
-
-            // A heartbeat for a group with no document is a member whose
-            // group is gone, and `UNKNOWN_MEMBER_ID` is what makes the client
-            // rejoin rather than fail fatally (#612).
-            if held.is_none() && request.member_epoch != 0 {
-                return Ok(consumer::error_response(ErrorCode::UnknownMemberId).into());
-            }
-
-            if request.member_epoch == 0
-                && held.as_ref().is_none_or(|(group, _)| {
-                    !group
-                        .clone()
-                        .with_contacts(stamps.as_ref().unwrap_or(&ContactStamps::new()))
-                        .has_live_members(now_ms)
-                })
-                && self.is_live_classic(group_id, now_ms).await?
-            {
-                debug!(group_id, "a consumer-protocol join of a classic group");
-                return Ok(consumer::error_response(ErrorCode::GroupIdNotFound).into());
-            }
-
+            let liveness = self.consumer_liveness(group_id, sender, stamps.as_ref());
             let group = held.as_ref().map(|(group, _)| group);
 
             let resolved = if refresh {
-                Some(
-                    self.resolve_topics(&consumer::subscriptions(group, request))
-                        .await?,
-                )
+                Some(self.resolve_topics(&subscriptions(group)).await?)
             } else {
                 None
             };
 
-            let transition = match consumer::apply(
-                group,
-                request,
-                client,
-                resolved.as_ref(),
-                &liveness,
-                &self.consumer_group_config,
-                now_ms,
-            ) {
+            let transition = match step(group, resolved.as_ref(), &liveness, now_ms) {
                 Ok(transition) => transition,
 
                 Err(error_code) => {
-                    debug!(group_id, member_id = request.member_id, ?error_code);
-                    return Ok(consumer::error_response(error_code).into());
+                    debug!(group_id, sender, ?error_code);
+                    return Ok(Err(error_code));
                 }
             };
 
@@ -3875,10 +3968,16 @@ where
                 self.consumer_metadata_noted(group_id, now_ms);
             }
 
-            let member_id = transition.response.member_id.clone().unwrap_or_default();
+            let Transition {
+                group: next,
+                changed,
+                renew,
+                member_id,
+                response,
+            } = transition;
 
-            if !transition.changed {
-                if transition.renew {
+            if !changed {
+                if renew && !member_id.is_empty() {
                     self.storage
                         .renew_consumer_member(group_id, &member_id, now_ms)
                         .await?;
@@ -3886,53 +3985,554 @@ where
                 }
 
                 if let Some(stamps) = stamps.as_ref() {
-                    self.forget_stale_stamps(group_id, &transition.group, stamps)
-                        .await;
+                    self.forget_stale_stamps(group_id, &next, stamps).await;
                 }
 
-                return Ok(transition.response.into());
+                return Ok(Ok(response));
             }
 
             match self
                 .storage
                 .update_consumer_group(
                     group_id,
-                    transition.group.clone().bumped(),
+                    next.clone().bumped(),
                     held.map(|(_, version)| version),
                 )
                 .await
             {
                 Ok(_) => {
-                    if transition.group.members.contains_key(&member_id) {
+                    if next.members.contains_key(&member_id) {
                         self.note_liveness(group_id, &member_id, now_ms);
                     }
 
                     if let Some(stamps) = stamps.as_ref() {
-                        self.forget_stale_stamps(group_id, &transition.group, stamps)
-                            .await;
+                        self.forget_stale_stamps(group_id, &next, stamps).await;
                     }
 
-                    return Ok(transition.response.into());
+                    return Ok(Ok(response));
                 }
 
                 Err(UpdateError::Outdated { .. } | UpdateError::Vanished) => {
                     if conflicts >= MAX_GENERATION_CAS_ATTEMPTS {
-                        return Ok(
-                            consumer::error_response(ErrorCode::CoordinatorLoadInProgress).into(),
-                        );
+                        return Ok(Err(ErrorCode::CoordinatorLoadInProgress));
                     }
 
-                    self.generation_conflict(
-                        group_id,
-                        "consumer_group_heartbeat_outdated",
-                        &mut conflicts,
-                    )
-                    .await;
+                    self.generation_conflict(group_id, "consumer_group_outdated", &mut conflicts)
+                        .await;
                 }
 
                 Err(error) => return Err(update_error(error)),
             }
         }
+    }
+
+    async fn consumer_heartbeat(
+        &self,
+        client: Client<'_>,
+        request: &ConsumerGroupHeartbeatRequest,
+    ) -> Result<Body> {
+        let group_id = request.group_id.as_str();
+
+        if request.member_epoch == 0
+            && let Some(error_code) = self.consumer_join_admission(group_id).await?
+        {
+            debug!(
+                group_id,
+                ?error_code,
+                "a consumer-protocol join of a classic group"
+            );
+            return Ok(consumer::error_response(error_code).into());
+        }
+
+        let refresh = self.consumer_metadata_due(request, epoch_ms((self.now)()));
+        let config = self.consumer_group_config;
+
+        let answered = self
+            .consumer_transition(
+                group_id,
+                &request.member_id,
+                refresh,
+                |group| consumer::subscriptions(group, request),
+                |held, resolved, liveness, now_ms| {
+                    // A heartbeat for a group with no document is a member
+                    // whose group is gone, and `UNKNOWN_MEMBER_ID` is what
+                    // makes the client rejoin rather than fail fatally (#612).
+                    if held.is_none() && request.member_epoch != 0 {
+                        return Err(ErrorCode::UnknownMemberId);
+                    }
+
+                    consumer::apply(held, request, client, resolved, liveness, &config, now_ms)
+                },
+            )
+            .await?;
+
+        Ok(match answered {
+            Ok(response) => response.into(),
+            Err(error_code) => consumer::error_response(error_code).into(),
+        })
+    }
+
+    /// Whether a consumer-protocol member may join `group_id`: answered
+    /// `None` when it may, and the error to refuse it with otherwise.
+    ///
+    /// A group nobody holds, or a consumer group, always admits it. A classic
+    /// group with a live member admits it only by being converted (#626),
+    /// which the migration policy must allow; Kafka refuses it otherwise with
+    /// `GROUP_ID_NOT_FOUND`, as #612 did unconditionally.
+    async fn consumer_join_admission(&self, group_id: &str) -> Result<Option<ErrorCode>> {
+        for _ in 0..=MAX_GENERATION_CAS_ATTEMPTS {
+            let now_ms = epoch_ms((self.now)());
+
+            if self.is_live_consumer(group_id, now_ms).await? {
+                return Ok(None);
+            }
+
+            let view = self.read_view(group_id).await?;
+
+            if view.generation.is_converted() {
+                return Ok(self
+                    .complete_conversion(group_id, &view.generation)
+                    .await?
+                    .err());
+            }
+
+            if !self
+                .is_live_classic_generation(group_id, &view.generation, now_ms)
+                .await?
+            {
+                return Ok(None);
+            }
+
+            match self.convert(group_id, &view, now_ms).await? {
+                Conversion::Converted => return Ok(None),
+                Conversion::Refused(error_code) => return Ok(Some(error_code)),
+                Conversion::Outdated => continue,
+            }
+        }
+
+        Ok(Some(ErrorCode::CoordinatorLoadInProgress))
+    }
+
+    /// Convert the classic group `view` holds to a consumer group (#626),
+    /// Kafka's `convertToConsumerGroup`, when the migration policy allows it.
+    ///
+    /// Built first and committed second. The consumer group is built from the
+    /// classic group as read and refused before anything is written if it
+    /// cannot be — a subscription that does not parse, an assignor's user data
+    /// that has nowhere to go. Then one CAS of `generation.json` marks the
+    /// classic group converted: the commit point, which exactly one replica
+    /// wins, and after which every classic request is the consumer group's.
+    /// [`Self::complete_conversion`] then writes `consumer.json` from the same
+    /// snapshot, which any replica that finds it missing does again.
+    async fn convert(&self, group_id: &str, view: &GroupView, now_ms: i64) -> Result<Conversion> {
+        let config = &self.consumer_group_config;
+
+        if config.migration == MigrationPolicy::Disabled
+            || view.generation.protocol_type.as_deref() != Some(CONSUMER)
+            || config
+                .max_size
+                .is_some_and(|max_size| view.generation.members.len() > max_size)
+        {
+            return Ok(Conversion::Refused(ErrorCode::GroupIdNotFound));
+        }
+
+        if let Err(error_code) = self
+            .converted(group_id, &view.generation, None, now_ms)
+            .await?
+        {
+            return Ok(Conversion::Refused(error_code));
+        }
+
+        let mut marked = view.generation.clone();
+        marked.consumer_since_ms = Some(now_ms);
+
+        match self
+            .storage
+            .update_group_generation(group_id, marked.clone().bumped(), view.version.clone())
+            .await
+        {
+            Ok(_) => {}
+            Err(UpdateError::Outdated { .. } | UpdateError::Vanished) => {
+                return Ok(Conversion::Outdated);
+            }
+            Err(error) => return Err(update_error(error)),
+        }
+
+        info!(
+            group_id,
+            generation_id = marked.generation_id,
+            members = marked.members.len(),
+            "a classic group converted to a consumer group"
+        );
+
+        Ok(match self.complete_conversion(group_id, &marked).await? {
+            Ok(()) => Conversion::Converted,
+            Err(error_code) => Conversion::Refused(error_code),
+        })
+    }
+
+    /// The consumer group the classic `generation` becomes over `held`, from
+    /// its members' documents and its assignment (#626).
+    async fn converted(
+        &self,
+        group_id: &str,
+        generation: &GenerationDoc,
+        held: Option<&ConsumerGroupDoc>,
+        now_ms: i64,
+    ) -> Result<std::result::Result<ConsumerGroupDoc, ErrorCode>> {
+        let mut members = BTreeMap::new();
+
+        for member_id in generation.members.keys() {
+            if let Some((member, _)) = self.storage.read_group_member(group_id, member_id).await? {
+                _ = members.insert(member_id.clone(), member);
+            }
+        }
+
+        let assignment = if generation.leader.is_some() && generation.generation_id >= 0 {
+            self.storage
+                .read_group_assignment(group_id, generation.generation_id)
+                .await?
+        } else {
+            None
+        };
+
+        let names = members
+            .values()
+            .flat_map(|member| migration::subscribed_topics(&member.join_response.metadata))
+            .collect();
+
+        let resolved = self
+            .resolve_topics(&Subscriptions {
+                names,
+                patterns: vec![],
+            })
+            .await?;
+
+        Ok(migration::from_classic(
+            generation,
+            &members,
+            assignment.as_ref(),
+            &resolved,
+            held,
+            now_ms,
+        ))
+    }
+
+    /// Write `consumer.json` for a classic group marked converted, unless it
+    /// already holds that conversion (#626). Idempotent, so whichever replica
+    /// first finds a conversion incomplete — this one, or one that served a
+    /// request after this one stopped — completes it.
+    async fn complete_conversion(
+        &self,
+        group_id: &str,
+        generation: &GenerationDoc,
+    ) -> Result<std::result::Result<(), ErrorCode>> {
+        let mut conflicts = 0u32;
+
+        loop {
+            let held = self.storage.read_consumer_group(group_id).await?;
+
+            if held.as_ref().is_some_and(|(group, _)| {
+                group.classic_generation == Some(generation.generation_id)
+            }) {
+                return Ok(Ok(()));
+            }
+
+            let now_ms = epoch_ms((self.now)());
+
+            let group = match self
+                .converted(
+                    group_id,
+                    generation,
+                    held.as_ref().map(|(group, _)| group),
+                    now_ms,
+                )
+                .await?
+            {
+                Ok(group) => group,
+                Err(error_code) => return Ok(Err(error_code)),
+            };
+
+            match self
+                .storage
+                .update_consumer_group(group_id, group.bumped(), held.map(|(_, version)| version))
+                .await
+            {
+                Ok(_) => return Ok(Ok(())),
+
+                Err(UpdateError::Outdated { .. } | UpdateError::Vanished) => {
+                    if conflicts >= MAX_GENERATION_CAS_ATTEMPTS {
+                        return Ok(Err(ErrorCode::CoordinatorLoadInProgress));
+                    }
+
+                    self.generation_conflict(group_id, "conversion_outdated", &mut conflicts)
+                        .await;
+                }
+
+                Err(error) => return Err(update_error(error)),
+            }
+        }
+    }
+
+    /// Whether the consumer group serves a classic request against `view`,
+    /// which names `named` (#626).
+    ///
+    /// A converted classic group is the consumer group's, whoever asks —
+    /// unless everyone the conversion carried has gone and a classic member is
+    /// joining, in which case the classic group is its to take back, and the
+    /// caller reads it again. Otherwise only a request naming a member the
+    /// classic generation does not have is worth a read of the consumer
+    /// group: a classic member joining a group the consumer protocol holds, or
+    /// a member that joined through it since.
+    async fn classic_route(
+        &self,
+        group_id: &str,
+        view: &GroupView,
+        named: &[(String, Option<String>)],
+        joining: bool,
+        now_ms: i64,
+    ) -> Result<Route> {
+        if view.generation.is_converted() {
+            if let Err(error_code) = self.complete_conversion(group_id, &view.generation).await? {
+                warn!(group_id, ?error_code, "a conversion could not be completed");
+            }
+
+            if joining && !self.is_live_consumer(group_id, now_ms).await? {
+                let mut taken_back = view.generation.clone();
+                taken_back.consumer_since_ms = None;
+                taken_back.members.clear();
+                taken_back.leader = None;
+                taken_back.generation_id = taken_back.generation_id.saturating_add(1);
+                taken_back.members_changed_at_ms = now_ms;
+                taken_back.state_since_ms = now_ms;
+
+                return match self
+                    .storage
+                    .update_group_generation(group_id, taken_back.bumped(), view.version.clone())
+                    .await
+                {
+                    Ok(_) | Err(UpdateError::Outdated { .. } | UpdateError::Vanished) => {
+                        Ok(Route::Reread)
+                    }
+
+                    Err(error) => Err(update_error(error)),
+                };
+            }
+
+            return Ok(Route::Consumer);
+        }
+
+        if joining {
+            return Ok(
+                if view.generation.members.is_empty()
+                    && self.is_live_consumer(group_id, now_ms).await?
+                {
+                    Route::Consumer
+                } else {
+                    Route::Classic
+                },
+            );
+        }
+
+        let known = |member_id: &String, instance_id: &Option<String>| {
+            view.generation.members.contains_key(member_id)
+                || instance_id.as_deref().is_some_and(|instance_id| {
+                    view.generation
+                        .members
+                        .values()
+                        .any(|member| member.group_instance_id.as_deref() == Some(instance_id))
+                })
+        };
+
+        if named
+            .iter()
+            .any(|(member_id, instance_id)| known(member_id, instance_id))
+        {
+            return Ok(Route::Classic);
+        }
+
+        let Some((group, _)) = self.storage.read_consumer_group(group_id).await? else {
+            return Ok(Route::Classic);
+        };
+
+        Ok(
+            if named.iter().any(|(member_id, instance_id)| {
+                group.members.contains_key(member_id)
+                    || instance_id.as_deref().is_some_and(|instance_id| {
+                        group
+                            .members
+                            .values()
+                            .any(|member| member.instance_id.as_deref() == Some(instance_id))
+                    })
+            }) {
+                Route::Consumer
+            } else {
+                Route::Classic
+            },
+        )
+    }
+
+    /// A classic `JoinGroup` the consumer group serves (#626).
+    async fn classic_join_to_consumer(
+        &self,
+        group_id: &str,
+        client_id: Option<&str>,
+        join: migration::ClassicJoin<'_>,
+    ) -> Result<Body> {
+        let client = Client {
+            id: client_id.unwrap_or_default(),
+            host: "",
+        };
+
+        let subscribed = join
+            .protocols
+            .iter()
+            .flat_map(|protocol| migration::subscribed_topics(&protocol.metadata))
+            .collect::<Vec<_>>();
+
+        let synthetic = ConsumerGroupHeartbeatRequest::default()
+            .group_id(group_id.into())
+            .member_id(join.member_id.into())
+            .subscribed_topic_names(Some(subscribed));
+
+        let config = self.consumer_group_config;
+
+        let answered = self
+            .consumer_transition(
+                group_id,
+                join.member_id,
+                true,
+                |group| consumer::subscriptions(group, &synthetic),
+                |held, resolved, liveness, now_ms| {
+                    migration::join(held, &join, client, resolved, liveness, &config, now_ms)
+                },
+            )
+            .await?;
+
+        Ok(answered.unwrap_or_else(|error_code| {
+            JoinGroupResponse::default()
+                .throttle_time_ms(Some(0))
+                .error_code(error_code.into())
+                .generation_id(-1)
+                .protocol_type(Some(CONSUMER.into()))
+                .protocol_name(Some("".into()))
+                .leader("".into())
+                .skip_assignment(Some(false))
+                .member_id(join.member_id.into())
+                .members(Some([].into()))
+                .into()
+        }))
+    }
+
+    /// A classic `SyncGroup` the consumer group serves (#626).
+    async fn classic_sync_to_consumer(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+        member_id: &str,
+        group_instance_id: Option<&str>,
+        protocol: (Option<&str>, Option<&str>),
+    ) -> Result<Body> {
+        let answered = self
+            .consumer_transition(
+                group_id,
+                member_id,
+                false,
+                |_| Subscriptions::default(),
+                |held, _, liveness, now_ms| {
+                    migration::sync(
+                        held,
+                        member_id,
+                        group_instance_id,
+                        generation_id,
+                        protocol,
+                        liveness,
+                        now_ms,
+                    )
+                },
+            )
+            .await?;
+
+        Ok(answered.unwrap_or_else(|error_code| {
+            SyncGroupResponse::default()
+                .throttle_time_ms(Some(0))
+                .error_code(error_code.into())
+                .protocol_type(Some(CONSUMER.into()))
+                .protocol_name(protocol.1.map(str::to_owned))
+                .assignment(Bytes::from_static(b""))
+                .into()
+        }))
+    }
+
+    /// A classic `Heartbeat` the consumer group serves (#626). It refreshes
+    /// the group as a consumer heartbeat does, so a group whose members have
+    /// all gone back to the classic protocol is still swept and still follows
+    /// its topics.
+    async fn classic_heartbeat_to_consumer(
+        &self,
+        group_id: &str,
+        generation_id: i32,
+        member_id: &str,
+        group_instance_id: Option<&str>,
+    ) -> Result<Body> {
+        let probe = ConsumerGroupHeartbeatRequest::default()
+            .group_id(group_id.into())
+            .member_id(member_id.into())
+            .member_epoch(generation_id);
+
+        let refresh = self.consumer_metadata_due(&probe, epoch_ms((self.now)()));
+
+        let answered = self
+            .consumer_transition(
+                group_id,
+                member_id,
+                refresh,
+                |group| consumer::subscriptions(group, &probe),
+                |held, resolved, liveness, now_ms| {
+                    migration::heartbeat(
+                        held,
+                        member_id,
+                        group_instance_id,
+                        generation_id,
+                        resolved,
+                        liveness,
+                        now_ms,
+                    )
+                },
+            )
+            .await?;
+
+        Ok(answered.unwrap_or_else(|error_code| {
+            HeartbeatResponse::default()
+                .throttle_time_ms(Some(0))
+                .error_code(error_code.into())
+                .into()
+        }))
+    }
+
+    /// A classic `LeaveGroup` the consumer group serves (#626).
+    async fn classic_leave_to_consumer(
+        &self,
+        group_id: &str,
+        departing: &[(String, Option<String>)],
+    ) -> Result<Body> {
+        let answered = self
+            .consumer_transition(
+                group_id,
+                "",
+                false,
+                |_| Subscriptions::default(),
+                |held, _, liveness, now_ms| migration::leave(held, departing, liveness, now_ms),
+            )
+            .await?;
+
+        Ok(answered.unwrap_or_else(|error_code| {
+            LeaveGroupResponse::default()
+                .throttle_time_ms(Some(0))
+                .error_code(error_code.into())
+                .members(Some([].into()))
+                .into()
+        }))
     }
 
     /// What a commit from `member_id` at `member_epoch` is answered when the
@@ -3961,13 +4561,17 @@ where
                 group
                     .members
                     .get(member_id)
-                    .map(|member| member.member_epoch)
+                    .map(|member| (member.member_epoch, member.classic.is_some()))
             });
 
         Ok(match current {
             None => Some(ErrorCode::UnknownMemberId),
-            Some(current) if current == member_epoch => None,
-            Some(_) => Some(ErrorCode::StaleMemberEpoch),
+            Some((current, _)) if current == member_epoch => None,
+
+            // A classic member commits at its generation, which is its epoch,
+            // and is told so in the classic protocol's own words (#626).
+            Some((_, true)) => Some(ErrorCode::IllegalGeneration),
+            Some((_, false)) => Some(ErrorCode::StaleMemberEpoch),
         })
     }
 
