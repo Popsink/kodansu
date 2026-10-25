@@ -20,6 +20,7 @@ use tansu_sans_io::{
     ApiKey, ConsumerGroupHeartbeatRequest, ErrorCode, Frame, Header,
     acl::{Operation, Resource},
 };
+use tansu_service::Peer;
 use tansu_storage::authorized;
 use tracing::instrument;
 
@@ -49,6 +50,12 @@ where
 
         let request = ConsumerGroupHeartbeatRequest::try_from(req.body)?;
 
+        // As Kafka prints an `InetAddress`, which `kafka-consumer-groups`
+        // shows as is in its HOST column (#628).
+        let client_host = ctx
+            .get::<Peer>()
+            .map(|Peer(addr)| format!("/{}", addr.ip()));
+
         // `READ` on the group, as for the classic `JoinGroup` and `Heartbeat`
         // (#363).
         if !authorized(&ctx, Resource::Group, &request.group_id, Operation::Read).await {
@@ -60,7 +67,7 @@ where
         }
 
         ctx.state_mut()
-            .consumer_group_heartbeat(client_id.as_deref(), &request)
+            .consumer_group_heartbeat(client_id.as_deref(), client_host.as_deref(), &request)
             .await
             .or_else(|error| match error {
                 // An answer the broker chose, not a failure (#300).

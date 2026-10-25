@@ -16,6 +16,8 @@ pub mod administrator;
 mod assignor;
 mod consumer;
 
+pub use consumer::ConsumerGroupConfig;
+
 use crate::Result;
 use async_trait::async_trait;
 use std::fmt::Debug;
@@ -83,9 +85,13 @@ pub trait Coordinator: Clone + Debug + Send + Sync + 'static {
 
     /// A KIP-848 `ConsumerGroupHeartbeat` (#612): join, heartbeat,
     /// acknowledge, or leave a `consumer` protocol group.
+    ///
+    /// `client_host` is the peer's address as `ConsumerGroupDescribe` reports
+    /// it, `/10.0.0.1` (#628).
     async fn consumer_group_heartbeat(
         &self,
         client_id: Option<&str>,
+        client_host: Option<&str>,
         request: &ConsumerGroupHeartbeatRequest,
     ) -> Result<Body>;
 

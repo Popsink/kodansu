@@ -220,6 +220,9 @@ The options that matter in a deployment, each with its environment variable:
 | `--tcp-keepalive-secs` | `TCP_KEEPALIVE_SECS` | `60` | Silence before TCP keepalive probes a client connection, so one whose client vanished without a FIN or RST is reaped. `0` turns keepalive off. |
 | `--tcp-keepalive-interval-secs` | `TCP_KEEPALIVE_INTERVAL_SECS` | `10` | Between unanswered keepalive probes. |
 | `--tcp-keepalive-retries` | `TCP_KEEPALIVE_RETRIES` | `3` | Unanswered probes before the connection is reset: with the defaults, a vanished client is reaped within 90 s. |
+| `--group-consumer-session-timeout-ms` | `GROUP_CONSUMER_SESSION_TIMEOUT_MS` | `45000` | The session a `group.protocol=consumer` member is held to, Kafka's `group.consumer.session.timeout.ms`. |
+| `--group-consumer-heartbeat-interval-ms` | `GROUP_CONSUMER_HEARTBEAT_INTERVAL_MS` | `5000` | How often such a member is told to heartbeat, Kafka's `group.consumer.heartbeat.interval.ms`. Must be less than the session timeout. |
+| `--group-consumer-max-size` | `GROUP_CONSUMER_MAX_SIZE` | `0` | The most members a consumer-protocol group admits, Kafka's `group.consumer.max.size`; one joining past it is refused with `GROUP_MAX_SIZE_REACHED`. `0` is unbounded. |
 
 The URL and address options accept `${VAR}` references, expanded when the argument is
 parsed.

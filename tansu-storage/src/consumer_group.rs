@@ -54,11 +54,12 @@ use uuid::Uuid;
 
 use crate::ConsumerGroupState;
 
-/// The session a consumer-protocol member is held to, Kafka's default
-/// `group.consumer.session.timeout.ms`.
+/// The session a consumer-protocol member is held to unless the broker is
+/// configured otherwise, Kafka's default `group.consumer.session.timeout.ms`.
 pub const CONSUMER_SESSION_TIMEOUT_MS: i32 = 45_000;
 
-/// How often a consumer-protocol member is told to heartbeat, Kafka's default
+/// How often a consumer-protocol member is told to heartbeat unless the broker
+/// is configured otherwise, Kafka's default
 /// `group.consumer.heartbeat.interval.ms`.
 pub const CONSUMER_HEARTBEAT_INTERVAL_MS: i32 = 5_000;
 

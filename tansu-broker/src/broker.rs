@@ -17,7 +17,7 @@ pub mod group;
 
 use crate::{
     CancelKind, METER, Result,
-    coordinator::group::{Coordinator, administrator::Controller},
+    coordinator::group::{ConsumerGroupConfig, Coordinator, administrator::Controller},
     otel,
     service::services,
 };
@@ -955,6 +955,10 @@ pub struct Builder<N, C, I, A, S, L> {
     /// The idle deadline and keepalive (#605), armed by `Default`.
     liveness: Liveness,
 
+    /// The policy consumer-protocol groups are held to (#628), Kafka's
+    /// defaults unless asked otherwise.
+    consumer_group_config: ConsumerGroupConfig,
+
     cancellation: CancellationToken,
 }
 
@@ -991,6 +995,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             maximum_frame_size: self.maximum_frame_size,
             pipeline_depth: self.pipeline_depth,
             liveness: self.liveness,
+            consumer_group_config: self.consumer_group_config,
             cancellation: self.cancellation,
         }
     }
@@ -1016,6 +1021,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             maximum_frame_size: self.maximum_frame_size,
             pipeline_depth: self.pipeline_depth,
             liveness: self.liveness,
+            consumer_group_config: self.consumer_group_config,
             cancellation: self.cancellation,
         }
     }
@@ -1041,6 +1047,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             maximum_frame_size: self.maximum_frame_size,
             pipeline_depth: self.pipeline_depth,
             liveness: self.liveness,
+            consumer_group_config: self.consumer_group_config,
             cancellation: self.cancellation,
         }
     }
@@ -1069,6 +1076,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             maximum_frame_size: self.maximum_frame_size,
             pipeline_depth: self.pipeline_depth,
             liveness: self.liveness,
+            consumer_group_config: self.consumer_group_config,
             cancellation: self.cancellation,
         }
     }
@@ -1133,6 +1141,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             maximum_frame_size: self.maximum_frame_size,
             pipeline_depth: self.pipeline_depth,
             liveness: self.liveness,
+            consumer_group_config: self.consumer_group_config,
             cancellation: self.cancellation,
         }
     }
@@ -1160,6 +1169,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
             maximum_frame_size: self.maximum_frame_size,
             pipeline_depth: self.pipeline_depth,
             liveness: self.liveness,
+            consumer_group_config: self.consumer_group_config,
             cancellation: self.cancellation,
         }
     }
@@ -1257,6 +1267,14 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
         }
     }
 
+    /// Hold consumer-protocol groups to `consumer_group_config` (#628).
+    pub fn consumer_group_config(self, consumer_group_config: ConsumerGroupConfig) -> Self {
+        Self {
+            consumer_group_config,
+            ..self
+        }
+    }
+
     pub fn quota_fleet_size(self, quota_fleet_size: u32) -> Self {
         Self {
             quota_fleet_size,
@@ -1311,6 +1329,7 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
         // decomposed group objects (#359) made a group's writes independent, so
         // routing them to one replica bought nothing that the CAS does not.
         let groups = Controller::with_storage(storage.clone())?
+            .with_consumer_group_config(self.consumer_group_config)
             // So an in-flight `JoinGroup` or `SyncGroup` answers when this
             // replica is asked to stop, rather than being cut mid-poll (#361).
             .with_cancellation(self.cancellation.clone());
