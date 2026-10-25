@@ -30,7 +30,7 @@
 //! `crate::Error` says these are produced "by design" on every rollout, and
 //! every one of them cost a connection.
 //!
-//! Each API answers in its own shape, which is why this is six functions and
+//! Each API answers in its own shape, which is why this is seven functions and
 //! not one: `OffsetCommit` in particular has no top-level error code — the code
 //! goes on every partition the request named — so it needs the request to build
 //! its answer.
@@ -43,6 +43,7 @@
 use bytes::Bytes;
 use tansu_sans_io::{
     Body, ErrorCode,
+    consumer_group_heartbeat_response::ConsumerGroupHeartbeatResponse,
     heartbeat_response::HeartbeatResponse,
     join_group_response::JoinGroupResponse,
     leave_group_response::LeaveGroupResponse,
@@ -92,6 +93,19 @@ pub(super) fn heartbeat(error_code: ErrorCode) -> Body {
     HeartbeatResponse::default()
         .throttle_time_ms(Some(0))
         .error_code(error_code.into())
+        .into()
+}
+
+/// `ConsumerGroupHeartbeat` answered with `error_code` (#612).
+pub(super) fn consumer_group_heartbeat(error_code: ErrorCode) -> Body {
+    ConsumerGroupHeartbeatResponse::default()
+        .throttle_time_ms(0)
+        .error_code(error_code.into())
+        .error_message(Some(error_code.to_string()))
+        .member_id(None)
+        .member_epoch(-1)
+        .heartbeat_interval_ms(0)
+        .assignment(None)
         .into()
 }
 

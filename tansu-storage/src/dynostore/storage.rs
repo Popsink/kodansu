@@ -16,6 +16,7 @@
 //! The [`Storage`] trait implementation: one method per Kafka API, each of
 //! them a thin arrangement of the helpers the sibling modules define.
 
+use super::groups::CLASSIC_GROUP_TYPE;
 use super::*;
 
 #[async_trait]
@@ -1216,12 +1217,12 @@ impl Storage for DynoStore {
             }
         }
 
-        let listed = |group_id: String, state: String| {
+        let listed = |group_id: String, group_type: &str, state: String| {
             ListedGroup::default()
                 .group_id(group_id)
                 .protocol_type("consumer".into())
                 .group_state(Some(state))
-                .group_type(Some("classic".into()))
+                .group_type(Some(group_type.into()))
         };
 
         let wanted = states_filter
@@ -1234,22 +1235,21 @@ impl Storage for DynoStore {
                 // 5xx. Not knowing is not a state the group is in, and a
                 // filter that names it is asking for exactly the groups this
                 // replica could not read.
-                let state = self
+                let (group_type, state) = self
                     .group_state(&group_id)
                     .await
                     .inspect_err(|err| debug!(?err, group_id))
-                    .unwrap_or(ConsumerGroupState::Unknown)
-                    .to_string();
+                    .unwrap_or((CLASSIC_GROUP_TYPE, ConsumerGroupState::Unknown));
 
-                (group_id, state)
+                (group_id, group_type, state.to_string())
             }))
             .buffered(LIST_STATE_CONCURRENCY)
-            .filter_map(|(group_id, state)| {
+            .filter_map(|(group_id, group_type, state)| {
                 let keep = wanted
                     .as_ref()
                     .is_none_or(|wanted| wanted.contains(state.as_str()));
 
-                async move { keep.then(|| listed(group_id, state)) }
+                async move { keep.then(|| listed(group_id, group_type, state)) }
             })
             .collect::<Vec<_>>()
             .await,
@@ -1319,10 +1319,26 @@ impl Storage for DynoStore {
 
                 debug!(group_id, ?view);
 
-                if let Some(detail) = view.as_ref()
-                    && !detail.members.is_empty()
+                let consumer = if view.is_none() {
+                    self.read_consumer_group(group_id)
+                        .await
+                        .inspect_err(|error| {
+                            error!(?error, group_id, "reading the consumer group")
+                        })?
+                } else {
+                    None
+                };
+
+                let live_consumers = consumer
+                    .as_ref()
+                    .is_some_and(|(group, _)| group.has_live_members(Self::now_ms()));
+
+                if live_consumers
+                    || view
+                        .as_ref()
+                        .is_some_and(|detail| !detail.members.is_empty())
                 {
-                    debug!(group_id, members = detail.members.len(), "non-empty group");
+                    debug!(group_id, "non-empty group");
 
                     results.push(
                         DeletableGroupResult::default()
@@ -1379,7 +1395,7 @@ impl Storage for DynoStore {
                 // group that never existed answered `NONE` (#445). Tooling that
                 // distinguishes "idle group" from "nonexistent group" had
                 // nothing to read.
-                let existed = view.is_some() || !deleted.is_empty();
+                let existed = view.is_some() || consumer.is_some() || !deleted.is_empty();
 
                 results.push(
                     DeletableGroupResult::default()
@@ -1438,6 +1454,18 @@ impl Storage for DynoStore {
                     // still not consulted: it describes a membership that a
                     // quiesce made vacuous, and reading it would put a 404 on
                     // the describe path of every group in the cluster, forever.
+                    Ok(None)
+                        if self
+                            .read_consumer_group(&group_id)
+                            .await
+                            .is_ok_and(|group| group.is_some()) =>
+                    {
+                        // Kafka's answer for a KIP-848 group on the classic
+                        // describe (#612): it is what sends an AdminClient to
+                        // `ConsumerGroupDescribe`, which reports it for real.
+                        NamedGroupDetail::error_code(group_id, ErrorCode::GroupIdNotFound)
+                    }
+
                     Ok(None) => match self.group_remnants_exist(&group_id).await {
                         // It is there, with nobody in it.
                         Ok(true) => NamedGroupDetail::found(group_id, GroupDetail::default()),
@@ -1669,6 +1697,37 @@ impl Storage for DynoStore {
                 "assignment create reported a missing etag",
             ))),
         }
+    }
+
+    async fn read_consumer_group(
+        &self,
+        group_id: &str,
+    ) -> Result<Option<(ConsumerGroupDoc, Version)>> {
+        let Some(location) = self.consumer_group_location(group_id) else {
+            return Ok(None);
+        };
+
+        Self::absent_is_none(self.get::<ConsumerGroupDoc>(&location).await)
+    }
+
+    async fn update_consumer_group(
+        &self,
+        group_id: &str,
+        group: ConsumerGroupDoc,
+        version: Option<Version>,
+    ) -> Result<Version, UpdateError<ConsumerGroupDoc>> {
+        let location = self
+            .consumer_group_location(group_id)
+            .ok_or_else(|| UpdateError::Error(Error::Api(ErrorCode::InvalidGroupId)))?;
+
+        self.put(
+            &location,
+            group,
+            json_content_type(),
+            version.map(Into::into),
+        )
+        .await
+        .map(Into::into)
     }
 
     async fn read_group_assignment(

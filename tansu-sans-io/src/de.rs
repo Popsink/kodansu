@@ -259,7 +259,12 @@ impl<'de> Decoder<'de> {
             self.is_valid(),
         );
 
-        if self.in_header() || self.is_nullable() || !self.is_valid() {
+        // An element of a nullable array of strings is itself a non-nullable
+        // string: the nullability is the array's. Reading it as nullable left
+        // `ConsumerGroupHeartbeat`'s `SubscribedTopicNames` undecodable (#612).
+        let nullable = self.is_nullable() && !self.in_seq_of_primitive;
+
+        if self.in_header() || nullable || !self.is_valid() {
             debug!(
                 "field: {} is not a mandatory non nullable length",
                 self.field_name()

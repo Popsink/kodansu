@@ -14,6 +14,7 @@
 
 mod answer;
 
+pub mod consumer_group_heartbeat;
 pub mod heartbeat;
 pub mod join;
 pub mod leave;
