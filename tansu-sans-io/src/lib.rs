@@ -1122,6 +1122,10 @@ impl From<&ErrorCode> for i16 {
 }
 
 impl Display for ErrorCode {
+    // One arm per Kafka error code, each its upstream message: it grows with
+    // the protocol rather than with any logic, so it is exempt here rather
+    // than by widening the threshold for every function (#625).
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             ErrorCode::UnknownServerError => f.write_str(
