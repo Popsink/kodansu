@@ -144,13 +144,15 @@ impl tansu_service::Classify for Error {
                 | ErrorCode::IllegalGeneration,
             ) => Severity::Expected,
 
-            // The peer went away mid-request.
+            // The peer went away mid-request, or vanished and was reaped by
+            // keepalive, which surfaces as `TimedOut` (#605).
             Self::Io(io)
                 if matches!(
                     io.kind(),
                     io::ErrorKind::UnexpectedEof
                         | io::ErrorKind::BrokenPipe
                         | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::TimedOut
                 ) =>
             {
                 Severity::Expected
@@ -239,5 +241,19 @@ impl FromStr for TracingFormat {
             "json" => Ok(Self::Json),
             otherwise => Err(Error::UnsupportedTracingFormat(otherwise.to_owned())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tansu_service::{Classify, Severity};
+
+    #[test]
+    fn a_peer_reaped_by_keepalive_is_expected() {
+        assert_eq!(
+            Severity::Expected,
+            Error::from(io::Error::from(io::ErrorKind::TimedOut)).severity()
+        );
     }
 }

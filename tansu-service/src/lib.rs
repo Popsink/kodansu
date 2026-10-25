@@ -399,13 +399,15 @@ impl Classify for Error {
     fn severity(&self) -> Severity {
         match self {
             // The peer went away. Routine for a broker that clients connect to
-            // and disconnect from continuously.
+            // and disconnect from continuously. `TimedOut` is how a peer that
+            // vanished without a FIN dies once keepalive gives up on it (#605).
             Self::Io(io)
                 if matches!(
                     io.kind(),
                     io::ErrorKind::UnexpectedEof
                         | io::ErrorKind::BrokenPipe
                         | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::TimedOut
                 ) =>
             {
                 Severity::Expected
@@ -807,5 +809,26 @@ where
         let result = self.inner.serve(ctx, req).await;
         self.introduce_latency().await?;
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_peer_reaped_by_keepalive_is_expected() {
+        for kind in [
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::TimedOut,
+        ] {
+            assert_eq!(
+                Severity::Expected,
+                Error::from(io::Error::from(kind)).severity(),
+                "{kind:?}"
+            );
+        }
     }
 }
