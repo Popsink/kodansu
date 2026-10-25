@@ -100,7 +100,12 @@ where
         for group_id in &group_ids {
             match storage.read_consumer_group(group_id).await? {
                 Some((group, _)) => {
-                    _ = consumer.insert(group_id.clone(), group.described(group_id, now_ms));
+                    let stamps = storage.list_consumer_member_stamps(group_id).await?;
+
+                    _ = consumer.insert(
+                        group_id.clone(),
+                        group.with_contacts(&stamps).described(group_id, now_ms),
+                    );
                 }
 
                 None => classic.push(group_id.clone()),

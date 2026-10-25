@@ -21,7 +21,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     net::Ipv4Addr,
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     time::Duration,
 };
 
@@ -48,8 +48,8 @@ use tansu_sans_io::{
 };
 use tansu_service::{FrameBytesLayer, Peer, TcpContext};
 use tansu_storage::{
-    ConsumerGroupDescribeService, DeleteGroupsService, DescribeGroupsService, ListGroupsService,
-    Storage, StorageContainer,
+    CONSUMER_SESSION_TIMEOUT_MS, ConsumerGroupDescribeService, DeleteGroupsService,
+    DescribeGroupsService, LatencyIntroducingStorage, ListGroupsService, Storage, StorageContainer,
 };
 use tokio::{net::TcpListener, time::advance};
 use url::Url;
@@ -836,6 +836,91 @@ async fn a_pattern_subscription_follows_the_topics_it_matches() -> Result<()> {
     assert_eq!(
         i16::from(ErrorCode::InvalidRegularExpression),
         refused.error_code
+    );
+
+    Ok(())
+}
+
+/// A stable group of a few hundred members keeps every member alive for
+/// several sessions without writing its document once (#627): liveness is
+/// renewed with each member's own stamp, and `consumer.json` is written only
+/// when the group's epoch or assignment moves.
+#[tokio::test(start_paused = true)]
+async fn a_stable_group_heartbeats_without_writing_its_document() -> Result<()> {
+    const MEMBERS: usize = 200;
+    const SESSIONS: u64 = 2;
+
+    let unwrapped = fixture().await?;
+    let counted = LatencyIntroducingStorage::new(unwrapped.storage.clone()).with_latency(0..1);
+    let updates = counted.consumer_group_updates_handle();
+    let renewals = counted.consumer_renewals_handle();
+    let storage: Arc<dyn Storage> = Arc::new(counted);
+
+    let fixture = Fixture {
+        coordinator: Controller::with_storage(storage.clone())?.with_now(paused_clock),
+        storage,
+        topic_id: unwrapped.topic_id,
+    };
+
+    let mut members = (0..MEMBERS)
+        .map(|_| Member::new("hundreds"))
+        .collect::<Vec<_>>();
+
+    converge(&fixture, &mut members).await?;
+    disjoint_and_complete(&members);
+
+    let (formed, _) = fixture
+        .storage
+        .read_consumer_group("hundreds")
+        .await?
+        .ok_or_else(|| anyhow!("no group"))?;
+
+    assert_eq!(MEMBERS, formed.members.len());
+
+    updates.store(0, Ordering::Relaxed);
+    renewals.store(0, Ordering::Relaxed);
+
+    let beats = SESSIONS * u64::try_from(CONSUMER_SESSION_TIMEOUT_MS)? / 5_000;
+
+    for _ in 0..beats {
+        advance(Duration::from_secs(5)).await;
+
+        for member in &mut members {
+            let response = member.beat(&fixture).await?;
+            assert_eq!(i16::from(ErrorCode::None), response.error_code);
+        }
+    }
+
+    assert_eq!(
+        0,
+        updates.load(Ordering::Relaxed),
+        "a stable group writes no document"
+    );
+
+    let renewed = renewals.load(Ordering::Relaxed);
+    let half_sessions = SESSIONS * 2;
+    assert!(
+        renewed >= MEMBERS as u64 * (half_sessions - 2)
+            && renewed <= MEMBERS as u64 * half_sessions,
+        "{renewed} renewals: about one per member per session/2"
+    );
+
+    let (held, _) = fixture
+        .storage
+        .read_consumer_group("hundreds")
+        .await?
+        .ok_or_else(|| anyhow!("no group"))?;
+
+    assert_eq!(formed.group_epoch, held.group_epoch);
+    assert_eq!(MEMBERS, held.members.len(), "nobody lapsed");
+
+    let stamps = fixture
+        .storage
+        .list_consumer_member_stamps("hundreds")
+        .await?;
+    assert!(
+        stamps.values().all(|stamps| stamps.len() <= 2),
+        "superseded stamps are swept"
     );
 
     Ok(())

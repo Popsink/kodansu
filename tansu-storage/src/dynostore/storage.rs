@@ -18,6 +18,7 @@
 
 use super::groups::CLASSIC_GROUP_TYPE;
 use super::*;
+use crate::ContactStamps;
 
 #[async_trait]
 impl Storage for DynoStore {
@@ -1329,9 +1330,13 @@ impl Storage for DynoStore {
                     None
                 };
 
-                let live_consumers = consumer
-                    .as_ref()
-                    .is_some_and(|(group, _)| group.has_live_members(Self::now_ms()));
+                let live_consumers = match consumer.as_ref() {
+                    Some((group, _)) => group
+                        .clone()
+                        .with_contacts(&self.list_consumer_member_stamps(group_id).await?)
+                        .has_live_members(Self::now_ms()),
+                    None => false,
+                };
 
                 if live_consumers
                     || view
@@ -1708,6 +1713,75 @@ impl Storage for DynoStore {
         };
 
         Self::absent_is_none(self.get::<ConsumerGroupDoc>(&location).await)
+    }
+
+    async fn renew_consumer_member(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        last_contact_ms: i64,
+    ) -> Result<()> {
+        let location = self
+            .consumer_liveness_location(group_id, member_id, last_contact_ms)
+            .ok_or(Error::Api(ErrorCode::InvalidGroupId))?;
+
+        _ = self
+            .object_store
+            .put_opts(
+                &location,
+                PutPayload::default(),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    ..Default::default()
+                },
+            )
+            .await?;
+
+        Ok(())
+    }
+
+    async fn list_consumer_member_stamps(&self, group_id: &str) -> Result<ContactStamps> {
+        let Some(prefix) = self.consumer_liveness_prefix(group_id) else {
+            return Ok(ContactStamps::new());
+        };
+
+        let mut stamps = ContactStamps::new();
+        let mut listing = self.scan(Scan::Group, &prefix);
+
+        while let Some(meta) = listing.next().await.transpose()? {
+            if let Some((member_id, stamp)) = Self::listed_consumer_stamp(&meta.location) {
+                _ = stamps.entry(member_id).or_default().insert(stamp);
+            }
+        }
+
+        Ok(stamps)
+    }
+
+    async fn delete_consumer_member_stamps(
+        &self,
+        group_id: &str,
+        stamps: &[(String, i64)],
+    ) -> Result<()> {
+        let condemned = stamps
+            .iter()
+            .filter_map(|(member_id, stamp)| {
+                self.consumer_liveness_location(group_id, member_id, *stamp)
+            })
+            .collect::<Vec<_>>();
+
+        if condemned.is_empty() {
+            return Ok(());
+        }
+
+        let deleted = self
+            .object_store
+            .delete_stream(futures::stream::iter(condemned.into_iter().map(Ok)).boxed())
+            .try_collect::<Vec<Path>>()
+            .await?;
+
+        debug!(group_id, deleted = deleted.len());
+
+        Ok(())
     }
 
     async fn update_consumer_group(

@@ -47,7 +47,7 @@ use tansu_sans_io::{
 use tansu_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
 use tansu_storage::{
     AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
-    BrokerRegistrationRequest, CommittedOffset, ConsumerGroupDoc, GenerationDoc,
+    BrokerRegistrationRequest, CommittedOffset, ConsumerGroupDoc, ContactStamps, GenerationDoc,
     ListOffsetResponse, MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
     OffsetStage, ProducerIdResponse, QuotaAlteration, QuotaEntity, QuotaFilterComponent,
     QuotaLimits, Quotas, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
@@ -1075,6 +1075,30 @@ impl Storage for Engine {
         _group: ConsumerGroupDoc,
         _version: Option<Version>,
     ) -> tansu_storage::Result<Version, UpdateError<ConsumerGroupDoc>> {
+        unimplemented!()
+    }
+
+    async fn renew_consumer_member(
+        &self,
+        _group_id: &str,
+        _member_id: &str,
+        _last_contact_ms: i64,
+    ) -> tansu_storage::Result<()> {
+        unimplemented!()
+    }
+
+    async fn list_consumer_member_stamps(
+        &self,
+        _group_id: &str,
+    ) -> tansu_storage::Result<ContactStamps> {
+        unimplemented!()
+    }
+
+    async fn delete_consumer_member_stamps(
+        &self,
+        _group_id: &str,
+        _stamps: &[(String, i64)],
+    ) -> tansu_storage::Result<()> {
         unimplemented!()
     }
 

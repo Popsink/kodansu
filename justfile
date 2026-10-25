@@ -510,6 +510,11 @@ fmt:
 # ConsumerGroupHeartbeat v1 and its SubscribedTopicRegex, resolved against the
 # topic list, and Metadata answering a topic asked for by id. No `//` block was
 # added; the reasoning is in `///`, and the rest is code and tests.
+#   #627  +1100 lines, consumer liveness stamps  3176 -> 3176  2.7427 -> 2.7255 (stacked on #625)
+#
+# A KIP-848 member renews its liveness with an object of its own instead of
+# the group document. Every `//` block added cites #627; most of the lines are
+# the storage methods, their four implementations, and the tests.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -520,7 +525,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7428" top="12":
+comments ceiling="2.7256" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

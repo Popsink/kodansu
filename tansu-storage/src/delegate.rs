@@ -105,6 +105,9 @@ macro_rules! storage_methods {
             fn delete_group_assignments_before(&self, group_id: &str, generation_id: i32) -> Result<u64>;
             fn read_consumer_group(&self, group_id: &str) -> Result<Option<(ConsumerGroupDoc, Version)>>;
             fn update_consumer_group(&self, group_id: &str, group: ConsumerGroupDoc, version: Option<Version>) -> Result<Version, UpdateError<ConsumerGroupDoc>>;
+            fn renew_consumer_member(&self, group_id: &str, member_id: &str, last_contact_ms: i64) -> Result<()>;
+            fn list_consumer_member_stamps(&self, group_id: &str) -> Result<ContactStamps>;
+            fn delete_consumer_member_stamps(&self, group_id: &str, stamps: &[(String, i64)]) -> Result<()>;
             fn create_acls(&self, bindings: &[AclBinding]) -> Result<Vec<ErrorCode>>;
             fn describe_acls(&self, filter: &AclFilter) -> Result<Vec<AclBinding>>;
             fn delete_acls(&self, filters: &[AclFilter]) -> Result<Vec<Vec<AclBinding>>>;

@@ -44,12 +44,12 @@ use uuid::Uuid;
 
 use crate::{
     Ack, AclBinding, AclFilter, Acls, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
-    BrokerRegistrationRequest, CommittedOffset, ConsumerGroupDoc, DEFAULT_FETCH_MAX_BYTES, Error,
-    GenerationDoc, GroupDetailResponse, ListOffsetResponse, MemberDoc, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, QuotaAlteration,
-    QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas, Result, ScramCredential, Storage,
-    TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest,
-    UpdateError, Version,
+    BrokerRegistrationRequest, CommittedOffset, ConsumerGroupDoc, ContactStamps,
+    DEFAULT_FETCH_MAX_BYTES, Error, GenerationDoc, GroupDetailResponse, ListOffsetResponse,
+    MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
+    ProducerIdResponse, QuotaAlteration, QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas,
+    Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
+    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
 };
 
 /// A stored document with the version identifying it, as the object store
@@ -69,6 +69,9 @@ type AssignmentDocs = BTreeMap<(String, i32), AssignmentDoc>;
 /// KIP-848 consumer group documents keyed by group (#612).
 type ConsumerGroupDocs = BTreeMap<String, Held<ConsumerGroupDoc>>;
 
+/// KIP-848 liveness stamps keyed by group (#627).
+type ConsumerStamps = BTreeMap<String, ContactStamps>;
+
 #[derive(Clone, Debug)]
 pub(crate) struct Engine {
     cluster: String,
@@ -85,6 +88,7 @@ pub(crate) struct Engine {
     generations: Arc<Mutex<GenerationDocs>>,
     assignments: Arc<Mutex<AssignmentDocs>>,
     consumer_groups: Arc<Mutex<ConsumerGroupDocs>>,
+    consumer_stamps: Arc<Mutex<ConsumerStamps>>,
 }
 
 impl Engine {
@@ -100,6 +104,7 @@ impl Engine {
             generations: Arc::new(Mutex::new(BTreeMap::new())),
             assignments: Arc::new(Mutex::new(BTreeMap::new())),
             consumer_groups: Arc::new(Mutex::new(BTreeMap::new())),
+            consumer_stamps: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -685,6 +690,56 @@ impl Storage for Engine {
             .lock()
             .map_err(Into::into)
             .map(|groups| groups.get(group_id).cloned())
+    }
+
+    #[instrument(skip_all)]
+    async fn renew_consumer_member(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        last_contact_ms: i64,
+    ) -> Result<()> {
+        self.consumer_stamps
+            .lock()
+            .map_err(Into::into)
+            .map(|mut stamps| {
+                _ = stamps
+                    .entry(group_id.to_owned())
+                    .or_default()
+                    .entry(member_id.to_owned())
+                    .or_default()
+                    .insert(last_contact_ms);
+            })
+    }
+
+    #[instrument(skip_all)]
+    async fn list_consumer_member_stamps(&self, group_id: &str) -> Result<ContactStamps> {
+        self.consumer_stamps
+            .lock()
+            .map_err(Into::into)
+            .map(|stamps| stamps.get(group_id).cloned().unwrap_or_default())
+    }
+
+    #[instrument(skip_all)]
+    async fn delete_consumer_member_stamps(
+        &self,
+        group_id: &str,
+        stamps: &[(String, i64)],
+    ) -> Result<()> {
+        self.consumer_stamps
+            .lock()
+            .map_err(Into::into)
+            .map(|mut held| {
+                if let Some(group) = held.get_mut(group_id) {
+                    for (member_id, stamp) in stamps {
+                        if let Some(member) = group.get_mut(member_id) {
+                            _ = member.remove(stamp);
+                        }
+                    }
+
+                    group.retain(|_, member| !member.is_empty());
+                }
+            })
     }
 
     #[instrument(skip_all)]
