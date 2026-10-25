@@ -476,3 +476,39 @@ async fn a_window_queued_behind_a_failed_flush_is_refused_past_the_gap() -> Resu
 
     Ok(())
 }
+
+/// **A linger timer flushes only its own window.**
+///
+/// The first window closes on size and leaves its timer running. The next
+/// window opens before that timer fires and is still part-filled when it does.
+/// The stale timer must leave it alone, so it closes on size too: two windows
+/// of two batches, two segments. Taking it — what the timer did before the
+/// window carried a number — cuts it to one batch and writes a third segment
+/// for the batch after. The linger is jittered by ±20%, so the admissions sit
+/// a quarter linger clear of either timer on a paused clock.
+#[tokio::test(start_paused = true)]
+async fn a_stale_linger_timer_leaves_the_next_window_alone() -> Result<()> {
+    const LINGER: Duration = Duration::from_secs(1);
+
+    let _guard = init_tracing()?;
+
+    let bucket = Gated::new(First::Slow);
+    let (store, topition) = store(bucket.clone(), 2, LINGER).await?;
+
+    let mut acks = vec![admitted(&store, &topition, batch(None)?).await?];
+    acks.push(admitted(&store, &topition, batch(None)?).await?);
+    bucket.in_flight(1).await;
+
+    sleep(LINGER * 9 / 10).await;
+    acks.push(admitted(&store, &topition, batch(None)?).await?);
+
+    sleep(LINGER * 55 / 100).await;
+    acks.push(admitted(&store, &topition, batch(None)?).await?);
+
+    assert_eq!(vec![0, 2, 4, 6], offsets(acks).await?);
+
+    sleep(LINGER * 3).await;
+    assert_eq!(2, bucket.segments().await, "two windows closed on size");
+
+    Ok(())
+}

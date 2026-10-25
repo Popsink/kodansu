@@ -263,6 +263,12 @@ struct PrefixCoalesceBuffer {
     /// backfill floors so a folded-in snapshot (#90) coalesces into a few large
     /// segments instead of one per batch. Reset with the buffer on flush.
     backfill: bool,
+    /// Which window this is, drawn from [`COALESCE_WINDOW`] by the batch that
+    /// opens it. The linger timer that window starts flushes the prefix's
+    /// buffer only while it still carries this number (#590): once a window
+    /// closes on size, the next one is usually already filling when the old
+    /// timer fires, and taking it would cut it short.
+    window: u64,
 }
 
 /// The closed windows of one prefix, waiting for their segment PUT in the order
@@ -820,6 +826,11 @@ pub struct CoalesceTuning {
 /// two stores in one process (or two brokers) are distinguishable holders in a
 /// prefix lease.
 static WRITER_INSTANCE: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide counter numbering coalescing windows (#590), so a linger timer
+/// can tell its own window from the one that replaced it. Zero is never drawn:
+/// it is what an emptied buffer carries.
+static COALESCE_WINDOW: AtomicU64 = AtomicU64::new(0);
 
 /// Why a listing was issued (#165). A per-method LIST total says the tier-1
 /// plane is large; it does not say which of the ~20 scan sites is spending it,

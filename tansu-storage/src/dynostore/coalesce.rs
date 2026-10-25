@@ -249,7 +249,7 @@ impl DynoStore {
 
         enum Action {
             Closed(Option<(u64, watch::Receiver<u64>)>),
-            StartTimer,
+            StartTimer(u64),
             Wait,
         }
 
@@ -261,6 +261,9 @@ impl DynoStore {
             let buffer = buffers.entry(prefix.clone()).or_default();
 
             let first = buffer.pending.is_empty();
+            if first {
+                buffer.window = COALESCE_WINDOW.fetch_add(1, atomic::Ordering::Relaxed) + 1;
+            }
             buffer.pending.push(PrefixPending {
                 topition: topition.to_owned(),
                 substream,
@@ -279,7 +282,7 @@ impl DynoStore {
             {
                 Action::Closed(self.enqueue_prefix_flush(&prefix, std::mem::take(buffer)))
             } else if first {
-                Action::StartTimer
+                Action::StartTimer(buffer.window)
             } else {
                 Action::Wait
             }
@@ -296,7 +299,7 @@ impl DynoStore {
 
             Action::Closed(None) | Action::Wait => {}
 
-            Action::StartTimer => {
+            Action::StartTimer(window) => {
                 let store = self.clone();
                 let prefix = prefix.clone();
                 let linger = self.jittered_linger();
@@ -308,10 +311,15 @@ impl DynoStore {
                     // threshold path: before #590 the timer took the buffer and
                     // only then queued for the flush lock, which a window closed
                     // after it could reach first.
+                    // Only the window this timer was started for (#590): a
+                    // window that closed on size left its timer running, and
+                    // with the flush off the admitting task the next window is
+                    // usually part-filled by the time that timer fires.
                     if let Ok(mut buffers) = store.prefix_coalesce_buffers.lock()
-                        && let Some(buffer) = buffers
-                            .remove(&prefix)
-                            .filter(|buffer| !buffer.pending.is_empty())
+                        && buffers.get(&prefix).is_some_and(|buffer| {
+                            buffer.window == window && !buffer.pending.is_empty()
+                        })
+                        && let Some(buffer) = buffers.remove(&prefix)
                     {
                         _ = store.enqueue_prefix_flush(&prefix, buffer);
                     }
