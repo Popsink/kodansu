@@ -180,6 +180,7 @@ impl Coordinator for AlwaysNotCoordinator {
     async fn consumer_group_heartbeat(
         &self,
         _client_id: Option<&str>,
+        _client_host: Option<&str>,
         _request: &ConsumerGroupHeartbeatRequest,
     ) -> Result<Body, Error> {
         Err(Error::Api(ErrorCode::NotCoordinator))
@@ -466,6 +467,7 @@ async fn a_non_api_error_still_ends_the_connection() -> Result<()> {
         async fn consumer_group_heartbeat(
             &self,
             _client_id: Option<&str>,
+            _client_host: Option<&str>,
             _request: &ConsumerGroupHeartbeatRequest,
         ) -> Result<Body, Error> {
             unreachable!()
@@ -617,6 +619,7 @@ async fn a_failed_offsets_read_is_answered_retriably() -> Result<()> {
         async fn consumer_group_heartbeat(
             &self,
             _client_id: Option<&str>,
+            _client_host: Option<&str>,
             _request: &ConsumerGroupHeartbeatRequest,
         ) -> Result<Body, Error> {
             unreachable!()

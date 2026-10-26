@@ -109,7 +109,7 @@ use crate::{Error, METER, Result};
 
 use super::{
     Coordinator, OffsetCommit,
-    consumer::{self, Resolved},
+    consumer::{self, Client, ConsumerGroupConfig, Resolved},
 };
 
 /// How long a static member with nothing to act on is damped on the **sync**
@@ -182,9 +182,16 @@ const MAX_GENERATION_CAS_ATTEMPTS: u32 = 64;
 /// subscribed topic metadata it last resolved for that group (#612).
 ///
 /// A join or a change of subscription always resolves afresh. This bounds how
-/// late a partition added to a subscribed topic is noticed, without putting a
-/// `Metadata` read on every heartbeat of every member.
-const CONSUMER_METADATA_REFRESH: Duration = Duration::from_secs(30);
+/// late a subscribed topic created, deleted or recreated with another
+/// partition count is noticed, without putting a `Metadata` read on every
+/// heartbeat of every member.
+///
+/// One default heartbeat interval rather than the 30 s it was (#628): the read
+/// is served from the storage's in-memory topic index, so a shorter window
+/// costs no request, only a lookup per group per interval. What it cannot
+/// shorten is that index's own refresh, which still bounds how late a change
+/// made through *another* replica is seen.
+const CONSUMER_METADATA_REFRESH: Duration = Duration::from_secs(5);
 
 /// Groups whose metadata this replica resolved recently, at most. As
 /// [`LIVENESS_STAMPS_HELD`], a bound on memory and nothing else.
@@ -1079,6 +1086,9 @@ pub struct Controller<O> {
     /// not this — holds the metadata the target assignment was computed from.
     consumer_metadata_checks: Arc<Mutex<ExpiringSizedCache<String, ()>>>,
 
+    /// The broker's policy for consumer-protocol groups (#628).
+    consumer_group_config: ConsumerGroupConfig,
+
     /// Cancelled when this process has been asked to stop (#361).
     ///
     /// Only the long polls read it, and only to stop *waiting*: a cancelled
@@ -1132,9 +1142,19 @@ where
             liveness_stamps: Arc::new(Mutex::new(liveness_stamps())),
             sweep_attempts: Arc::new(Mutex::new(sweep_attempts())),
             consumer_metadata_checks: Arc::new(Mutex::new(consumer_metadata_checks())),
+            consumer_group_config: ConsumerGroupConfig::default(),
             cancellation: CancellationToken::new(),
             now: SystemTime::now,
         })
+    }
+
+    /// Hold consumer-protocol groups to `consumer_group_config` (#628).
+    #[must_use]
+    pub fn with_consumer_group_config(self, consumer_group_config: ConsumerGroupConfig) -> Self {
+        Self {
+            consumer_group_config,
+            ..self
+        }
     }
 
     /// Watch `cancellation` for this process being asked to stop, so an
@@ -3308,12 +3328,17 @@ where
     async fn consumer_group_heartbeat(
         &self,
         client_id: Option<&str>,
+        client_host: Option<&str>,
         request: &ConsumerGroupHeartbeatRequest,
     ) -> Result<Body> {
         COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "consumer_group_heartbeat")]);
 
-        self.consumer_heartbeat(client_id.unwrap_or_default(), request)
-            .await
+        let client = Client {
+            id: client_id.unwrap_or_default(),
+            host: client_host.unwrap_or_default(),
+        };
+
+        self.consumer_heartbeat(client, request).await
     }
 
     #[instrument(skip(self, group_instance_id))]
@@ -3667,7 +3692,7 @@ where
 
     async fn consumer_heartbeat(
         &self,
-        client_id: &str,
+        client: Client<'_>,
         request: &ConsumerGroupHeartbeatRequest,
     ) -> Result<Body> {
         let group_id = request.group_id.as_str();
@@ -3705,15 +3730,21 @@ where
                 None
             };
 
-            let transition =
-                match consumer::apply(group, request, client_id, resolved.as_ref(), now_ms) {
-                    Ok(transition) => transition,
+            let transition = match consumer::apply(
+                group,
+                request,
+                client,
+                resolved.as_ref(),
+                &self.consumer_group_config,
+                now_ms,
+            ) {
+                Ok(transition) => transition,
 
-                    Err(error_code) => {
-                        debug!(group_id, member_id = request.member_id, ?error_code);
-                        return Ok(consumer::error_response(error_code).into());
-                    }
-                };
+                Err(error_code) => {
+                    debug!(group_id, member_id = request.member_id, ?error_code);
+                    return Ok(consumer::error_response(error_code).into());
+                }
+            };
 
             if resolved.is_some() {
                 self.consumer_metadata_noted(group_id);

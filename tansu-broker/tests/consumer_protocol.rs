@@ -46,7 +46,7 @@ use tansu_sans_io::{
     offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
     offset_fetch_request::{OffsetFetchRequestGroup, OffsetFetchRequestTopics},
 };
-use tansu_service::{FrameBytesLayer, TcpContext};
+use tansu_service::{FrameBytesLayer, Peer, TcpContext};
 use tansu_storage::{
     ConsumerGroupDescribeService, DeleteGroupsService, DescribeGroupsService, ListGroupsService,
     Storage, StorageContainer,
@@ -137,7 +137,7 @@ impl Member {
 
         let Body::ConsumerGroupHeartbeatResponse(response) = fixture
             .coordinator
-            .consumer_group_heartbeat(Some("consumer-protocol"), &request)
+            .consumer_group_heartbeat(Some("consumer-protocol"), Some("/10.0.0.1"), &request)
             .await?
         else {
             return Err(anyhow!("not a heartbeat response"));
@@ -167,7 +167,7 @@ impl Member {
 
         let Body::ConsumerGroupHeartbeatResponse(response) = fixture
             .coordinator
-            .consumer_group_heartbeat(None, &request)
+            .consumer_group_heartbeat(None, None, &request)
             .await?
         else {
             return Err(anyhow!("not a heartbeat response"));
@@ -462,6 +462,8 @@ async fn a_consumer_group_is_described_listed_and_kept() -> Result<()> {
 
     for member in &members_described {
         assert_eq!(group.assignment_epoch, member.member_epoch);
+        assert_eq!("consumer-protocol", member.client_id);
+        assert_eq!("/10.0.0.1", member.client_host);
         assert_eq!(
             Some(TOPIC.to_owned()),
             member
@@ -625,7 +627,7 @@ async fn consumer_group_heartbeat_is_advertised_and_answered() -> Result<()> {
     let served = fixture.storage.clone();
 
     _ = tokio::spawn(async move {
-        while let Ok((stream, _)) = listener.accept().await {
+        while let Ok((stream, peer)) = listener.accept().await {
             let Ok(coordinator) = Controller::with_storage(served.clone()) else {
                 return;
             };
@@ -641,8 +643,11 @@ async fn consumer_group_heartbeat_is_advertised_and_answered() -> Result<()> {
                 return;
             };
 
+            let mut ctx = Context::default();
+            _ = ctx.insert(Peer(peer));
+
             _ = tokio::spawn(async move {
-                _ = service.serve(Context::default(), stream).await;
+                _ = service.serve(ctx, stream).await;
             });
         }
     });
@@ -699,6 +704,17 @@ async fn consumer_group_heartbeat_is_advertised_and_answered() -> Result<()> {
             .iter()
             .map(|topic| topic.partitions.as_ref().map_or(0, Vec::len))
             .sum::<usize>()
+    );
+
+    let member = fixture
+        .storage
+        .read_consumer_group("wire")
+        .await?
+        .and_then(|(group, _)| group.members.into_values().next())
+        .ok_or_else(|| anyhow!("no member"))?;
+    assert_eq!(
+        "/127.0.0.1", member.client_host,
+        "the peer, as Kafka prints it"
     );
 
     Ok(())

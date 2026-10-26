@@ -19,7 +19,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{EnvVarExp, Result, cli::storage_engines};
+use crate::{EnvVarExp, Error, Result, cli::storage_engines};
 
 use super::DEFAULT_BROKER;
 use clap::Parser;
@@ -32,11 +32,15 @@ use rustls::{
     },
 };
 use tansu_broker::{
-    Keepalive, NODE_ID, SOCKET_REQUEST_MAX_BYTES, broker::Broker,
-    coordinator::group::administrator::Controller,
+    Keepalive, NODE_ID, SOCKET_REQUEST_MAX_BYTES,
+    broker::Broker,
+    coordinator::group::{ConsumerGroupConfig, administrator::Controller},
 };
 use tansu_sans_io::ErrorCode;
-use tansu_storage::{ArcDynStorage, DEFAULT_CLEANUP_POLICY, QuotaLimits, TopicDefaults};
+use tansu_storage::{
+    ArcDynStorage, CONSUMER_HEARTBEAT_INTERVAL_MS, CONSUMER_SESSION_TIMEOUT_MS,
+    DEFAULT_CLEANUP_POLICY, QuotaLimits, TopicDefaults,
+};
 use tokio::time::Instant;
 use tracing::debug;
 use url::Url;
@@ -148,6 +152,18 @@ pub(super) struct Arg {
     #[arg(long, env = "TCP_KEEPALIVE_RETRIES", value_parser = clap::value_parser!(u32).range(1..=127), default_value_t = 3)]
     tcp_keepalive_retries: u32,
 
+    /// The session a `group.protocol=consumer` member is held to, Kafka's `group.consumer.session.timeout.ms`. A member silent for longer is fenced and its partitions handed on.
+    #[arg(long, env = "GROUP_CONSUMER_SESSION_TIMEOUT_MS", value_parser = clap::value_parser!(i32).range(1..), default_value_t = CONSUMER_SESSION_TIMEOUT_MS)]
+    group_consumer_session_timeout_ms: i32,
+
+    /// How often a `group.protocol=consumer` member is told to heartbeat, Kafka's `group.consumer.heartbeat.interval.ms`. Must be less than the session timeout.
+    #[arg(long, env = "GROUP_CONSUMER_HEARTBEAT_INTERVAL_MS", value_parser = clap::value_parser!(i32).range(1..), default_value_t = CONSUMER_HEARTBEAT_INTERVAL_MS)]
+    group_consumer_heartbeat_interval_ms: i32,
+
+    /// The most members a `group.protocol=consumer` group admits, Kafka's `group.consumer.max.size`; a member joining past it is refused with GROUP_MAX_SIZE_REACHED. 0, the default, is unbounded.
+    #[arg(long, env = "GROUP_CONSUMER_MAX_SIZE", default_value_t = 0)]
+    group_consumer_max_size: u32,
+
     /// Silent
     #[arg(long)]
     silent: bool,
@@ -159,6 +175,28 @@ impl Arg {
     fn connections_max_idle(&self) -> Option<Duration> {
         (self.connections_max_idle_ms > 0)
             .then(|| Duration::from_millis(self.connections_max_idle_ms))
+    }
+
+    /// The consumer-protocol group policy (#628), refusing a heartbeat interval
+    /// a member could not keep its session alive with.
+    fn consumer_group_config(&self) -> Result<ConsumerGroupConfig> {
+        if self.group_consumer_heartbeat_interval_ms >= self.group_consumer_session_timeout_ms {
+            return Err(Error::Box(
+                format!(
+                    "--group-consumer-heartbeat-interval-ms ({}) must be less than --group-consumer-session-timeout-ms ({})",
+                    self.group_consumer_heartbeat_interval_ms,
+                    self.group_consumer_session_timeout_ms
+                )
+                .into(),
+            ));
+        }
+
+        Ok(ConsumerGroupConfig {
+            session_timeout_ms: self.group_consumer_session_timeout_ms,
+            heartbeat_interval_ms: self.group_consumer_heartbeat_interval_ms,
+            max_size: (self.group_consumer_max_size > 0)
+                .then(|| usize::try_from(self.group_consumer_max_size).unwrap_or(usize::MAX)),
+        })
     }
 
     /// `None` when `--tcp-keepalive-secs` is zero.
@@ -299,6 +337,7 @@ impl Arg {
     async fn build(self) -> Result<Broker<Controller<ArcDynStorage>, ArcDynStorage>> {
         let connections_max_idle = self.connections_max_idle();
         let keepalive = self.keepalive();
+        let consumer_group_config = self.consumer_group_config()?;
         let cluster_id = self.cluster_id;
         let incarnation_id = Uuid::now_v7();
         let otlp_endpoint_url = self
@@ -353,6 +392,7 @@ impl Arg {
             .pipeline_depth(usize::from(self.pipeline_depth))
             .connections_max_idle(connections_max_idle)
             .keepalive(keepalive)
+            .consumer_group_config(consumer_group_config)
             .silent(self.silent);
 
         if !self.silent {
@@ -430,6 +470,41 @@ mod tests {
             Arg::try_parse_from(["tansu"])
                 .expect("no arguments")
                 .socket_request_max_bytes,
+        );
+    }
+
+    /// A broker started with no flag holds consumer-protocol groups to Kafka's
+    /// defaults, and one asked for a heartbeat interval its members could not
+    /// keep their session alive with refuses to start (#628).
+    #[test]
+    fn the_consumer_group_policy_defaults_to_kafkas() {
+        let config = |args: &[&str]| {
+            Arg::try_parse_from(args)
+                .map_err(|error| Error::Box(error.into()))
+                .and_then(|arg| arg.consumer_group_config())
+        };
+
+        let defaults = config(&["tansu"]).expect("defaults");
+        assert_eq!(ConsumerGroupConfig::default(), defaults);
+        assert_eq!(45_000, defaults.session_timeout_ms);
+        assert_eq!(None, defaults.max_size);
+
+        assert_eq!(
+            Some(Some(200)),
+            config(&["tansu", "--group-consumer-max-size", "200"])
+                .ok()
+                .map(|config| config.max_size)
+        );
+
+        assert!(
+            config(&[
+                "tansu",
+                "--group-consumer-session-timeout-ms",
+                "5000",
+                "--group-consumer-heartbeat-interval-ms",
+                "5000",
+            ])
+            .is_err()
         );
     }
 

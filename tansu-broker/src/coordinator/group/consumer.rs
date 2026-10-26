@@ -57,6 +57,41 @@ const DEFAULT_REBALANCE_TIMEOUT_MS: i32 = 300_000;
 /// the topic metadata before applying.
 pub(crate) type Resolved = BTreeMap<String, (Uuid, i32)>;
 
+/// The broker's policy for consumer-protocol groups (#628): Kafka's
+/// `group.consumer.session.timeout.ms`, `group.consumer.heartbeat.interval.ms`
+/// and `group.consumer.max.size`.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ConsumerGroupConfig {
+    /// The session every member is held to.
+    pub session_timeout_ms: i32,
+
+    /// How often every member is told to heartbeat.
+    pub heartbeat_interval_ms: i32,
+
+    /// The most members a group admits, `None` for no bound. A member joining
+    /// past it is refused with `GROUP_MAX_SIZE_REACHED`.
+    pub max_size: Option<usize>,
+}
+
+impl Default for ConsumerGroupConfig {
+    fn default() -> Self {
+        Self {
+            session_timeout_ms: CONSUMER_SESSION_TIMEOUT_MS,
+            heartbeat_interval_ms: CONSUMER_HEARTBEAT_INTERVAL_MS,
+            max_size: None,
+        }
+    }
+}
+
+/// Who sent a heartbeat: what `ConsumerGroupDescribe` reports for its member.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct Client<'a> {
+    pub(crate) id: &'a str,
+
+    /// The peer's address as Kafka prints it, `/10.0.0.1`.
+    pub(crate) host: &'a str,
+}
+
 /// What [`apply`] decided.
 #[derive(Clone, Debug)]
 pub(crate) struct Transition {
@@ -306,14 +341,19 @@ fn reconcile(
     }
 }
 
-fn new_member(request: &ConsumerGroupHeartbeatRequest, client_id: &str) -> ConsumerMember {
+fn new_member(
+    request: &ConsumerGroupHeartbeatRequest,
+    client: Client<'_>,
+    config: &ConsumerGroupConfig,
+) -> ConsumerMember {
     ConsumerMember {
         member_epoch: 0,
         previous_member_epoch: -1,
         instance_id: request.instance_id.clone(),
-        client_id: client_id.to_owned(),
+        client_id: client.id.to_owned(),
+        client_host: client.host.to_owned(),
         rebalance_timeout_ms: DEFAULT_REBALANCE_TIMEOUT_MS,
-        session_timeout_ms: CONSUMER_SESSION_TIMEOUT_MS,
+        session_timeout_ms: config.session_timeout_ms,
         ..Default::default()
     }
 }
@@ -323,7 +363,8 @@ fn new_member(request: &ConsumerGroupHeartbeatRequest, client_id: &str) -> Consu
 fn join(
     group: &mut ConsumerGroupDoc,
     request: &ConsumerGroupHeartbeatRequest,
-    client_id: &str,
+    client: Client<'_>,
+    config: &ConsumerGroupConfig,
 ) -> Result<(String, bool), ErrorCode> {
     let member_id = if request.member_id.is_empty() {
         Uuid::new_v4().to_string()
@@ -355,7 +396,8 @@ fn join(
         replaced.state = MemberState::Stable;
         replaced.pending_revocation = Partitions::new();
         replaced.revocation_deadline_ms = None;
-        replaced.client_id = client_id.to_owned();
+        replaced.client_id = client.id.to_owned();
+        replaced.client_host = client.host.to_owned();
         _ = group.members.insert(member_id.clone(), replaced);
 
         return Ok((member_id, false));
@@ -375,9 +417,16 @@ fn join(
         return Err(ErrorCode::InvalidRequest);
     }
 
+    if config
+        .max_size
+        .is_some_and(|max_size| group.members.len() >= max_size)
+    {
+        return Err(ErrorCode::GroupMaxSizeReached);
+    }
+
     _ = group
         .members
-        .insert(member_id.clone(), new_member(request, client_id));
+        .insert(member_id.clone(), new_member(request, client, config));
 
     Ok((member_id, true))
 }
@@ -414,8 +463,19 @@ fn validate_epoch(
 fn update_member(
     member: &mut ConsumerMember,
     request: &ConsumerGroupHeartbeatRequest,
+    client: Client<'_>,
+    config: &ConsumerGroupConfig,
 ) -> Result<bool, ErrorCode> {
     let mut resubscribed = false;
+
+    // Folded in on every heartbeat, so a broker restarted with another session
+    // timeout, or a client that reconnected from elsewhere, is reflected
+    // after one write rather than only on the member's next join (#628).
+    member.session_timeout_ms = config.session_timeout_ms;
+
+    if !client.host.is_empty() {
+        client.host.clone_into(&mut member.client_host);
+    }
 
     if let Some(rack_id) = request.rack_id.as_ref() {
         member.rack_id = Some(rack_id.clone());
@@ -494,8 +554,9 @@ fn response_partitions(partitions: &Partitions) -> Vec<TopicPartitions> {
 pub(crate) fn apply(
     held: Option<&ConsumerGroupDoc>,
     request: &ConsumerGroupHeartbeatRequest,
-    client_id: &str,
+    client: Client<'_>,
     resolved: Option<&Resolved>,
+    config: &ConsumerGroupConfig,
     now_ms: i64,
 ) -> Result<Transition, ErrorCode> {
     let before = held.cloned().unwrap_or_else(|| ConsumerGroupDoc {
@@ -532,7 +593,7 @@ pub(crate) fn apply(
         }
 
         0 => {
-            let (member_id, joined) = join(&mut group, request, client_id)?;
+            let (member_id, joined) = join(&mut group, request, client, config)?;
             rebalance |= joined;
             member_id
         }
@@ -549,7 +610,7 @@ pub(crate) fn apply(
         .map(|member| member.assigned.clone());
 
     if let Some(member) = group.members.get_mut(&member_id) {
-        rebalance |= update_member(member, request)?;
+        rebalance |= update_member(member, request, client, config)?;
     }
 
     if let Some(resolved) = resolved {
@@ -580,7 +641,7 @@ pub(crate) fn apply(
         .error_code(ErrorCode::None.into())
         .member_id(Some(member_id.clone()))
         .member_epoch(member.member_epoch)
-        .heartbeat_interval_ms(CONSUMER_HEARTBEAT_INTERVAL_MS)
+        .heartbeat_interval_ms(config.heartbeat_interval_ms)
         .assignment(send_assignment.then(|| {
             Assignment::default().topic_partitions(Some(response_partitions(&member.assigned)))
         }));
@@ -606,6 +667,11 @@ mod tests {
     use tansu_sans_io::consumer_group_heartbeat_request;
 
     const T: Uuid = Uuid::from_u128(0x7);
+
+    const CLIENT: Client<'static> = Client {
+        id: "c",
+        host: "/10.0.0.1",
+    };
 
     fn resolved(partitions: i32) -> Resolved {
         BTreeMap::from([("t".to_owned(), (T, partitions))])
@@ -653,7 +719,14 @@ mod tests {
 
     #[test]
     fn a_member_joins_and_is_given_every_partition() -> Result<(), ErrorCode> {
-        let joined = apply(None, &joining("a"), "c", Some(&resolved(3)), 0)?;
+        let joined = apply(
+            None,
+            &joining("a"),
+            CLIENT,
+            Some(&resolved(3)),
+            &ConsumerGroupConfig::default(),
+            0,
+        )?;
 
         assert!(joined.changed);
         assert_eq!(1, joined.response.member_epoch);
@@ -664,8 +737,9 @@ mod tests {
         let steady = apply(
             Some(&joined.group),
             &beating("a", 1, None),
-            "c",
+            CLIENT,
             None,
+            &ConsumerGroupConfig::default(),
             1_000,
         )?;
 
@@ -677,8 +751,22 @@ mod tests {
 
     #[test]
     fn a_partition_is_revoked_before_it_is_reassigned() -> Result<(), ErrorCode> {
-        let a = apply(None, &joining("a"), "c", Some(&resolved(2)), 0)?;
-        let b = apply(Some(&a.group), &joining("b"), "c", Some(&resolved(2)), 0)?;
+        let a = apply(
+            None,
+            &joining("a"),
+            CLIENT,
+            Some(&resolved(2)),
+            &ConsumerGroupConfig::default(),
+            0,
+        )?;
+        let b = apply(
+            Some(&a.group),
+            &joining("b"),
+            CLIENT,
+            Some(&resolved(2)),
+            &ConsumerGroupConfig::default(),
+            0,
+        )?;
 
         assert_eq!(2, b.group.group_epoch);
         assert_eq!(2, b.response.member_epoch);
@@ -691,8 +779,9 @@ mod tests {
         let a_revoking = apply(
             Some(&b.group),
             &beating("a", 1, Some(&[0, 1])),
-            "c",
+            CLIENT,
             None,
+            &ConsumerGroupConfig::default(),
             0,
         )?;
         assert_eq!(
@@ -710,8 +799,9 @@ mod tests {
         let b_waiting = apply(
             Some(&a_revoking.group),
             &beating("b", 2, Some(&[])),
-            "c",
+            CLIENT,
             None,
+            &ConsumerGroupConfig::default(),
             0,
         )?;
         assert_eq!(None, assigned(&b_waiting.response));
@@ -720,8 +810,9 @@ mod tests {
         let a_acked = apply(
             Some(&b_waiting.group),
             &beating("a", 1, Some(&owned)),
-            "c",
+            CLIENT,
             None,
+            &ConsumerGroupConfig::default(),
             0,
         )?;
         assert_eq!(2, a_acked.response.member_epoch);
@@ -729,8 +820,9 @@ mod tests {
         let b_assigned = apply(
             Some(&a_acked.group),
             &beating("b", 2, Some(&[])),
-            "c",
+            CLIENT,
             None,
+            &ConsumerGroupConfig::default(),
             0,
         )?;
         assert_eq!(
@@ -743,16 +835,39 @@ mod tests {
 
     #[test]
     fn epochs_are_fenced() -> Result<(), ErrorCode> {
-        let a = apply(None, &joining("a"), "c", Some(&resolved(1)), 0)?;
+        let a = apply(
+            None,
+            &joining("a"),
+            CLIENT,
+            Some(&resolved(1)),
+            &ConsumerGroupConfig::default(),
+            0,
+        )?;
 
         assert_eq!(
             Some(ErrorCode::FencedMemberEpoch),
-            apply(Some(&a.group), &beating("a", 7, None), "c", None, 0).err()
+            apply(
+                Some(&a.group),
+                &beating("a", 7, None),
+                CLIENT,
+                None,
+                &ConsumerGroupConfig::default(),
+                0
+            )
+            .err()
         );
 
         assert_eq!(
             Some(ErrorCode::UnknownMemberId),
-            apply(Some(&a.group), &beating("z", 1, None), "c", None, 0).err()
+            apply(
+                Some(&a.group),
+                &beating("z", 1, None),
+                CLIENT,
+                None,
+                &ConsumerGroupConfig::default(),
+                0
+            )
+            .err()
         );
 
         Ok(())
@@ -760,24 +875,40 @@ mod tests {
 
     #[test]
     fn a_lapsed_member_is_swept() -> Result<(), ErrorCode> {
-        let a = apply(None, &joining("a"), "c", Some(&resolved(2)), 0)?;
-        let b = apply(Some(&a.group), &joining("b"), "c", Some(&resolved(2)), 0)?;
+        let a = apply(
+            None,
+            &joining("a"),
+            CLIENT,
+            Some(&resolved(2)),
+            &ConsumerGroupConfig::default(),
+            0,
+        )?;
+        let b = apply(
+            Some(&a.group),
+            &joining("b"),
+            CLIENT,
+            Some(&resolved(2)),
+            &ConsumerGroupConfig::default(),
+            0,
+        )?;
 
         let lapsed = i64::from(CONSUMER_SESSION_TIMEOUT_MS) * 2;
 
         let renewed = apply(
             Some(&b.group),
             &beating("b", 2, Some(&[])),
-            "c",
+            CLIENT,
             None,
+            &ConsumerGroupConfig::default(),
             lapsed - i64::from(CONSUMER_SESSION_TIMEOUT_MS),
         )?;
 
         let swept = apply(
             Some(&renewed.group),
             &beating("b", 2, Some(&[])),
-            "c",
+            CLIENT,
             None,
+            &ConsumerGroupConfig::default(),
             lapsed,
         )?;
 
@@ -792,15 +923,23 @@ mod tests {
     fn a_static_member_is_replaced_only_after_it_leaves() -> Result<(), ErrorCode> {
         let static_join = |member_id: &str| joining(member_id).instance_id(Some("i-1".into()));
 
-        let a = apply(None, &static_join("a"), "c", Some(&resolved(2)), 0)?;
+        let a = apply(
+            None,
+            &static_join("a"),
+            CLIENT,
+            Some(&resolved(2)),
+            &ConsumerGroupConfig::default(),
+            0,
+        )?;
 
         assert_eq!(
             Some(ErrorCode::UnreleasedInstanceId),
             apply(
                 Some(&a.group),
                 &static_join("b"),
-                "c",
+                CLIENT,
                 Some(&resolved(2)),
+                &ConsumerGroupConfig::default(),
                 0
             )
             .err()
@@ -809,8 +948,9 @@ mod tests {
         let left = apply(
             Some(&a.group),
             &beating("a", LEAVING_STATIC_MEMBER_EPOCH, None),
-            "c",
+            CLIENT,
             None,
+            &ConsumerGroupConfig::default(),
             0,
         )?;
         assert_eq!(
@@ -821,13 +961,122 @@ mod tests {
         let b = apply(
             Some(&left.group),
             &static_join("b"),
-            "c",
+            CLIENT,
             Some(&resolved(2)),
+            &ConsumerGroupConfig::default(),
             0,
         )?;
         assert_eq!(1, b.group.group_epoch);
         assert_eq!(Some(BTreeSet::from([0, 1])), assigned(&b.response));
         assert!(!b.group.members.contains_key("a"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_member_is_described_from_the_host_it_heartbeats_from() -> Result<(), ErrorCode> {
+        let a = apply(
+            None,
+            &joining("a"),
+            CLIENT,
+            Some(&resolved(1)),
+            &ConsumerGroupConfig::default(),
+            0,
+        )?;
+        assert_eq!("/10.0.0.1", a.group.members["a"].client_host);
+
+        let moved = Client {
+            id: "c",
+            host: "/10.0.0.2",
+        };
+
+        let reconnected = apply(
+            Some(&a.group),
+            &beating("a", 1, None),
+            moved,
+            None,
+            &ConsumerGroupConfig::default(),
+            0,
+        )?;
+        assert!(reconnected.changed);
+        assert_eq!("/10.0.0.2", reconnected.group.members["a"].client_host);
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_member_past_the_maximum_size_is_refused() -> Result<(), ErrorCode> {
+        let config = ConsumerGroupConfig {
+            max_size: Some(1),
+            ..Default::default()
+        };
+
+        let a = apply(None, &joining("a"), CLIENT, Some(&resolved(2)), &config, 0)?;
+
+        assert_eq!(
+            Some(ErrorCode::GroupMaxSizeReached),
+            apply(
+                Some(&a.group),
+                &joining("b"),
+                CLIENT,
+                Some(&resolved(2)),
+                &config,
+                0
+            )
+            .err()
+        );
+
+        let rejoined = apply(
+            Some(&a.group),
+            &joining("a"),
+            CLIENT,
+            Some(&resolved(2)),
+            &config,
+            0,
+        )?;
+        assert_eq!(
+            1,
+            rejoined.group.members.len(),
+            "a member rejoining is not refused"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn the_session_and_heartbeat_interval_are_the_brokers() -> Result<(), ErrorCode> {
+        let config = ConsumerGroupConfig {
+            session_timeout_ms: 10_000,
+            heartbeat_interval_ms: 1_000,
+            max_size: None,
+        };
+
+        let a = apply(None, &joining("a"), CLIENT, Some(&resolved(1)), &config, 0)?;
+        assert_eq!(1_000, a.response.heartbeat_interval_ms);
+        assert_eq!(10_000, a.group.members["a"].session_timeout_ms);
+
+        let lapsed = apply(
+            Some(&a.group),
+            &beating("a", 1, None),
+            CLIENT,
+            None,
+            &config,
+            16_000,
+        );
+        assert_eq!(Some(ErrorCode::UnknownMemberId), lapsed.err());
+
+        let shortened = apply(
+            Some(&a.group),
+            &beating("a", 1, None),
+            CLIENT,
+            None,
+            &ConsumerGroupConfig {
+                session_timeout_ms: 6_000,
+                ..config
+            },
+            1_000,
+        )?;
+        assert_eq!(6_000, shortened.group.members["a"].session_timeout_ms);
 
         Ok(())
     }
