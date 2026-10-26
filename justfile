@@ -515,6 +515,10 @@ fmt:
 # A KIP-848 member renews its liveness with an object of its own instead of
 # the group document. Every `//` block added cites #627; most of the lines are
 # the storage methods, their four implementations, and the tests.
+#   #627  -4 lines, clippy after merge  3176 -> 3176  2.7255 -> 2.7256
+#
+# `useless_conversion` and `nonminimal_bool` in `consumer.rs`. The fixes fold
+# four lines of code into one; nothing counted moved, so the ratio rises.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -525,7 +529,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7256" top="12":
+comments ceiling="2.7257" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
