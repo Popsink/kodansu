@@ -201,11 +201,7 @@ pub(crate) fn subscriptions(
 
     let names = others
         .clone()
-        .chain(
-            sender
-                .filter(|_| request.subscribed_topic_names.is_none())
-                .into_iter(),
-        )
+        .chain(sender.filter(|_| request.subscribed_topic_names.is_none()))
         .flat_map(|member| member.subscribed_topic_names.iter().cloned())
         .chain(request.subscribed_topic_names.iter().flatten().cloned())
         .collect();
@@ -244,8 +240,8 @@ fn sweep(group: &mut ConsumerGroupDoc, liveness: &Liveness, now_ms: i64) -> bool
     let before = group.members.len();
 
     group.members.retain(|member_id, member| {
-        !member.is_revocation_overdue(now_ms)
-            && !(liveness.listed && liveness.is_expired(member_id, member, now_ms))
+        !(member.is_revocation_overdue(now_ms)
+            || liveness.listed && liveness.is_expired(member_id, member, now_ms))
     });
 
     group.members.len() != before
