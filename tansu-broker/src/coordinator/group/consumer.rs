@@ -58,6 +58,21 @@ const DEFAULT_REBALANCE_TIMEOUT_MS: i32 = 300_000;
 /// the topic metadata before applying.
 pub(crate) type Resolved = BTreeMap<String, (Uuid, i32)>;
 
+/// Whether a classic group with members may become a consumer group (#626),
+/// Kafka's `group.consumer.migration.policy`.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum MigrationPolicy {
+    /// A consumer-protocol member may only take over a classic group whose
+    /// members have all gone: a rolling upgrade stops at its first member.
+    Disabled,
+
+    /// The first consumer-protocol member to join a classic group converts
+    /// it, and its classic members carry on inside the consumer group until
+    /// they too come back speaking the consumer protocol.
+    #[default]
+    Upgrade,
+}
+
 /// The broker's policy for consumer-protocol groups (#628): Kafka's
 /// `group.consumer.session.timeout.ms`, `group.consumer.heartbeat.interval.ms`
 /// and `group.consumer.max.size`.
@@ -72,6 +87,9 @@ pub struct ConsumerGroupConfig {
     /// The most members a group admits, `None` for no bound. A member joining
     /// past it is refused with `GROUP_MAX_SIZE_REACHED`.
     pub max_size: Option<usize>,
+
+    /// Whether a running classic group may be converted (#626).
+    pub migration: MigrationPolicy,
 }
 
 impl Default for ConsumerGroupConfig {
@@ -80,6 +98,7 @@ impl Default for ConsumerGroupConfig {
             session_timeout_ms: CONSUMER_SESSION_TIMEOUT_MS,
             heartbeat_interval_ms: CONSUMER_HEARTBEAT_INTERVAL_MS,
             max_size: None,
+            migration: MigrationPolicy::default(),
         }
     }
 }
@@ -108,7 +127,7 @@ pub(crate) struct Liveness {
 
 impl Liveness {
     /// The newest contact known for `member_id`.
-    fn last_contact_ms(&self, member_id: &str, member: &ConsumerMember) -> i64 {
+    pub(super) fn last_contact_ms(&self, member_id: &str, member: &ConsumerMember) -> i64 {
         self.contacts
             .get(member_id)
             .map_or(member.last_contact_ms, |contact| {
@@ -121,9 +140,10 @@ impl Liveness {
     }
 }
 
-/// What [`apply`] decided.
+/// What [`apply`] decided, or one of the classic requests a consumer group
+/// serves (#626), with `R` its response.
 #[derive(Clone, Debug)]
-pub(crate) struct Transition {
+pub(crate) struct Transition<R = ConsumerGroupHeartbeatResponse> {
     /// The group as it must be written back.
     pub(crate) group: ConsumerGroupDoc,
 
@@ -134,7 +154,11 @@ pub(crate) struct Transition {
     /// carry, because it is not being written (#627).
     pub(crate) renew: bool,
 
-    pub(crate) response: ConsumerGroupHeartbeatResponse,
+    /// Who sent the request, as the group knows it: whose liveness `renew`
+    /// is about. Empty when the request named nobody the group keeps.
+    pub(crate) member_id: String,
+
+    pub(crate) response: R,
 }
 
 /// The heartbeat answered with `error_code` alone.
@@ -236,7 +260,7 @@ fn owned_from_request(request: &ConsumerGroupHeartbeatRequest) -> Option<Partiti
 /// Drop every member who was told to revoke and ran out its rebalance
 /// timeout, and — when `liveness` was listed — every member whose session
 /// lapsed. Answers whether anyone was dropped.
-fn sweep(group: &mut ConsumerGroupDoc, liveness: &Liveness, now_ms: i64) -> bool {
+pub(super) fn sweep(group: &mut ConsumerGroupDoc, liveness: &Liveness, now_ms: i64) -> bool {
     let before = group.members.len();
 
     group.members.retain(|member_id, member| {
@@ -264,7 +288,7 @@ fn preferred_assignor(group: &ConsumerGroupDoc) -> String {
 }
 
 /// Recompute every member's target at a new group epoch.
-fn retarget(group: &mut ConsumerGroupDoc) {
+pub(super) fn retarget(group: &mut ConsumerGroupDoc) {
     group.group_epoch = group.group_epoch.saturating_add(1);
 
     let by_name = group
@@ -322,7 +346,7 @@ fn retarget(group: &mut ConsumerGroupDoc) {
 
 /// Replace the subscribed topic metadata with `resolved`, answering whether it
 /// moved — a topic created, deleted, recreated or repartitioned.
-fn refresh_topics(group: &mut ConsumerGroupDoc, resolved: &Resolved) -> bool {
+pub(super) fn refresh_topics(group: &mut ConsumerGroupDoc, resolved: &Resolved) -> bool {
     let topics = resolved
         .iter()
         .map(|(name, (topic_id, partitions))| {
@@ -346,7 +370,7 @@ fn refresh_topics(group: &mut ConsumerGroupDoc, resolved: &Resolved) -> bool {
 
 /// Every partition owned, or pending revocation, by a member other than
 /// `member_id`.
-fn owned_by_others(group: &ConsumerGroupDoc, member_id: &str) -> BTreeSet<(Uuid, i32)> {
+pub(super) fn owned_by_others(group: &ConsumerGroupDoc, member_id: &str) -> BTreeSet<(Uuid, i32)> {
     group
         .members
         .iter()
@@ -418,7 +442,7 @@ fn next_assignment(
 
 /// Kafka's `CurrentAssignmentBuilder.build` for the member that sent the
 /// heartbeat.
-fn reconcile(
+pub(super) fn reconcile(
     group: &mut ConsumerGroupDoc,
     member_id: &str,
     owned: Option<&Partitions>,
@@ -495,6 +519,7 @@ fn join(
         replaced.member_epoch = 0;
         replaced.previous_member_epoch = 0;
         replaced.state = MemberState::Stable;
+        replaced.classic = None;
         replaced.pending_revocation = Partitions::new();
         replaced.revocation_deadline_ms = None;
         replaced.client_id = client.id.to_owned();
@@ -508,6 +533,7 @@ fn join(
         member.member_epoch = 0;
         member.previous_member_epoch = 0;
         member.state = MemberState::Stable;
+        member.classic = None;
         member.assigned = Partitions::new();
         member.pending_revocation = Partitions::new();
         member.revocation_deadline_ms = None;
@@ -696,6 +722,7 @@ pub(crate) fn apply(
                 group,
                 changed,
                 renew: false,
+                member_id: String::new(),
                 response: ConsumerGroupHeartbeatResponse::default()
                     .throttle_time_ms(0)
                     .error_code(ErrorCode::None.into())
@@ -770,6 +797,7 @@ pub(crate) fn apply(
         group,
         changed,
         renew: renewal_due && !changed,
+        member_id,
         response,
     })
 }
@@ -1226,7 +1254,7 @@ mod tests {
         let config = ConsumerGroupConfig {
             session_timeout_ms: 10_000,
             heartbeat_interval_ms: 1_000,
-            max_size: None,
+            ..Default::default()
         };
 
         let a = apply(

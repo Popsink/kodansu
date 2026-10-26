@@ -15,8 +15,9 @@
 pub mod administrator;
 mod assignor;
 mod consumer;
+mod migration;
 
-pub use consumer::ConsumerGroupConfig;
+pub use consumer::{ConsumerGroupConfig, MigrationPolicy};
 
 use crate::Result;
 use async_trait::async_trait;

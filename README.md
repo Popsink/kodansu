@@ -223,6 +223,7 @@ The options that matter in a deployment, each with its environment variable:
 | `--group-consumer-session-timeout-ms` | `GROUP_CONSUMER_SESSION_TIMEOUT_MS` | `45000` | The session a `group.protocol=consumer` member is held to, Kafka's `group.consumer.session.timeout.ms`. |
 | `--group-consumer-heartbeat-interval-ms` | `GROUP_CONSUMER_HEARTBEAT_INTERVAL_MS` | `5000` | How often such a member is told to heartbeat, Kafka's `group.consumer.heartbeat.interval.ms`. Must be less than the session timeout. |
 | `--group-consumer-max-size` | `GROUP_CONSUMER_MAX_SIZE` | `0` | The most members a consumer-protocol group admits, Kafka's `group.consumer.max.size`; one joining past it is refused with `GROUP_MAX_SIZE_REACHED`. `0` is unbounded. |
+| `--group-consumer-migration-policy` | `GROUP_CONSUMER_MIGRATION_POLICY` | `upgrade` | Kafka's `group.consumer.migration.policy`. With `upgrade`, the first `group.protocol=consumer` member to join a running classic group converts it, and the classic members keep consuming inside the consumer group until they too restart with the consumer protocol, so a rolling restart adopts KIP-848 without stopping the group. `disabled` refuses that member until every classic member has gone. A consumer group serves classic members either way, so rolling back member by member needs no conversion. |
 
 The URL and address options accept `${VAR}` references, expanded when the argument is
 parsed.

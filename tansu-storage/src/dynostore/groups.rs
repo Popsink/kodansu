@@ -315,7 +315,13 @@ impl DynoStore {
         /// group is tens of members.
         const MEMBER_FETCH_CONCURRENCY: usize = 32;
 
-        let Some((generation, _)) = self.read_group_generation(group_id).await? else {
+        // A converted group is the consumer group's to describe (#626): its
+        // members are a frozen snapshot, not anyone the classic group has.
+        let Some((generation, _)) = self
+            .read_group_generation(group_id)
+            .await?
+            .filter(|(generation, _)| !generation.is_converted())
+        else {
             return Ok(None);
         };
 
@@ -455,7 +461,11 @@ impl DynoStore {
         &self,
         group_id: &str,
     ) -> Result<(&'static str, ConsumerGroupState)> {
-        let Some((generation, _)) = self.read_group_generation(group_id).await? else {
+        let Some((generation, _)) = self
+            .read_group_generation(group_id)
+            .await?
+            .filter(|(generation, _)| !generation.is_converted())
+        else {
             return Ok(match self.read_consumer_group(group_id).await? {
                 Some((group, _)) => {
                     let stamps = self.list_consumer_member_stamps(group_id).await?;

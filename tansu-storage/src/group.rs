@@ -233,11 +233,28 @@ pub struct GenerationDoc {
 
     pub inception_ms: i64,
 
+    /// When this classic group was converted to a consumer group (#626).
+    ///
+    /// The conversion's commit point: one CAS of this document sets it, so two
+    /// replicas cannot convert the same group twice, and every classic request
+    /// that reads it from then on is served by the consumer group instead.
+    /// `members` is left as it was, the snapshot `consumer.json` is built
+    /// from, which is what lets any replica complete a conversion another one
+    /// committed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumer_since_ms: Option<i64>,
+
     #[serde(flatten)]
     pub rest: BTreeMap<String, serde_json::Value>,
 }
 
 impl GenerationDoc {
+    /// Whether this group was converted to a consumer group (#626).
+    #[must_use]
+    pub fn is_converted(&self) -> bool {
+        self.consumer_since_ms.is_some()
+    }
+
     /// This document with its ABA discriminator advanced. See
     /// [`MemberDoc::bumped`].
     #[must_use]

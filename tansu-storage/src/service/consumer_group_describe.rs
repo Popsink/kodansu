@@ -101,11 +101,16 @@ where
             match storage.read_consumer_group(group_id).await? {
                 Some((group, _)) => {
                     let stamps = storage.list_consumer_member_stamps(group_id).await?;
+                    let described = group.with_contacts(&stamps).described(group_id, now_ms);
 
-                    _ = consumer.insert(
-                        group_id.clone(),
-                        group.with_contacts(&stamps).described(group_id, now_ms),
-                    );
+                    // A consumer group nobody is in may have been taken back
+                    // by classic consumers since (#626), so ask the classic
+                    // side too and let whichever has members answer.
+                    if described.members.as_ref().is_none_or(Vec::is_empty) {
+                        classic.push(group_id.clone());
+                    }
+
+                    _ = consumer.insert(group_id.clone(), described);
                 }
 
                 None => classic.push(group_id.clone()),
@@ -125,11 +130,17 @@ where
                 .collect()
         };
 
+        let has_members =
+            |described: &&DescribedGroup| described.members.as_ref().is_some_and(|m| !m.is_empty());
+
         let groups = group_ids
             .iter()
             .filter_map(|group_id| {
                 consumer
                     .get(group_id)
+                    .filter(has_members)
+                    .or_else(|| classic.get(group_id).filter(has_members))
+                    .or_else(|| consumer.get(group_id))
                     .or_else(|| classic.get(group_id))
                     .cloned()
             })

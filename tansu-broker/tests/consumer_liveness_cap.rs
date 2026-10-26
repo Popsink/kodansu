@@ -43,7 +43,9 @@ use std::{
 use object_store::{ObjectStore, memory::InMemory};
 use tansu_broker::{
     Result,
-    coordinator::group::{ConsumerGroupConfig, Coordinator as _, administrator::Controller},
+    coordinator::group::{
+        ConsumerGroupConfig, Coordinator as _, MigrationPolicy, administrator::Controller,
+    },
 };
 use tansu_sans_io::{
     Body, ConsumerGroupHeartbeatRequest, ConsumerGroupHeartbeatResponse, ErrorCode,
@@ -71,6 +73,7 @@ const CONFIG: ConsumerGroupConfig = ConsumerGroupConfig {
     session_timeout_ms: 30_000,
     heartbeat_interval_ms: 1_000,
     max_size: None,
+    migration: MigrationPolicy::Upgrade,
 };
 
 /// How long the steady phase heartbeats: past every member's renewal.

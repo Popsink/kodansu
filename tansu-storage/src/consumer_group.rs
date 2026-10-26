@@ -51,6 +51,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use tansu_sans_io::consumer_group_describe_response::{
     Assignment, DescribedGroup, Member, TopicPartitions,
@@ -69,8 +70,12 @@ pub const CONSUMER_SESSION_TIMEOUT_MS: i32 = 45_000;
 pub const CONSUMER_HEARTBEAT_INTERVAL_MS: i32 = 5_000;
 
 /// `ConsumerGroupDescribe`'s `MemberType` for a member that speaks the
-/// consumer protocol (KIP-1099), as opposed to `0` for a classic one.
+/// consumer protocol (KIP-1099).
 const CONSUMER_MEMBER_TYPE: i8 = 1;
+
+/// `ConsumerGroupDescribe`'s `MemberType` for a member that speaks the classic
+/// protocol inside a consumer group (#626).
+const CLASSIC_MEMBER_TYPE: i8 = 0;
 
 /// The epoch a static member sends, and is recorded with, when it leaves
 /// intending to come back under the same `instance_id`.
@@ -106,6 +111,30 @@ pub enum MemberState {
 pub struct SubscribedTopic {
     pub name: String,
     pub partitions: i32,
+}
+
+/// What a member that speaks the classic protocol inside a consumer group
+/// joined with (#626): a member of the classic group the group was converted
+/// from, or a classic consumer that joined it since.
+///
+/// It is served `JoinGroup`, `SyncGroup` and `Heartbeat` from the consumer
+/// group's state, as Kafka serves one, and assigned by the group's server-side
+/// assignor like any other member.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct ClassicMember {
+    /// The session the member asked for at its `JoinGroup`.
+    pub session_timeout_ms: i32,
+
+    /// The protocol the member was answered with: the first of its own that
+    /// every other classic member supports too.
+    pub protocol_name: String,
+
+    /// Every protocol the member offered, by name.
+    pub protocols: Vec<String>,
+
+    /// The member's subscription under `protocol_name`, whose version is the
+    /// one its assignment is encoded at.
+    pub metadata: Bytes,
 }
 
 /// One member of a consumer-protocol group.
@@ -167,6 +196,10 @@ pub struct ConsumerMember {
     #[serde(default)]
     pub target: Partitions,
 
+    /// `Some` for a member that speaks the classic protocol (#626).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classic: Option<ClassicMember>,
+
     #[serde(flatten)]
     pub rest: BTreeMap<String, serde_json::Value>,
 }
@@ -227,6 +260,12 @@ pub struct ConsumerGroupDoc {
     /// The subscribed topics the target assignment was computed against.
     #[serde(default)]
     pub topics: BTreeMap<Uuid, SubscribedTopic>,
+
+    /// The generation of the classic group this group was converted from,
+    /// when it was (#626). Completing a conversion is idempotent because it
+    /// compares this with the generation the classic group was frozen at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classic_generation: Option<i32>,
 
     pub created_ms: i64,
 
@@ -325,7 +364,11 @@ impl ConsumerGroupDoc {
                     .client_host(member.client_host.clone())
                     .subscribed_topic_names(Some(member.subscribed_topic_names.clone()))
                     .subscribed_topic_regex(member.subscribed_topic_regex.clone())
-                    .member_type(Some(CONSUMER_MEMBER_TYPE))
+                    .member_type(Some(if member.classic.is_some() {
+                        CLASSIC_MEMBER_TYPE
+                    } else {
+                        CONSUMER_MEMBER_TYPE
+                    }))
                     .assignment(self.described_partitions(&member.assigned))
                     .target_assignment(self.described_partitions(&member.target))
             })
