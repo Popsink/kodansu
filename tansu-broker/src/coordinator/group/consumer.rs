@@ -35,6 +35,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use regex::Regex;
 use tansu_sans_io::{
     ConsumerGroupHeartbeatRequest, ErrorCode,
     consumer_group_heartbeat_response::{
@@ -116,21 +117,79 @@ pub(crate) fn error_response(error_code: ErrorCode) -> ConsumerGroupHeartbeatRes
         .assignment(None)
 }
 
-/// Every topic name any member of `group` subscribes to, with `request`'s
-/// subscription in place of its sender's: what [`apply`] needs resolved.
-pub(crate) fn subscribed_names(
+/// A subscription pattern as Kafka applies it (#625): matched against the
+/// whole topic name, never a part of it.
+///
+/// Kafka compiles it with RE2J; the `regex` crate is the same RE2 dialect, so
+/// a pattern one accepts the other matches alike. What RE2J has and this does
+/// not (`\Q…\E` quoting) is refused as `INVALID_REGULAR_EXPRESSION` rather
+/// than matched differently.
+pub(crate) fn topic_pattern(regex: &str) -> Result<Regex, ErrorCode> {
+    Regex::new(&format!("^(?:{regex})$")).map_err(|_| ErrorCode::InvalidRegularExpression)
+}
+
+/// What the members of a group subscribe to, by name and by pattern.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Subscriptions {
+    pub(crate) names: BTreeSet<String>,
+    pub(crate) patterns: Vec<Regex>,
+}
+
+impl Subscriptions {
+    /// Whether any member subscribes to `name`.
+    pub(crate) fn includes(&self, name: &str) -> bool {
+        self.names.contains(name) || self.patterns.iter().any(|pattern| pattern.is_match(name))
+    }
+}
+
+/// A regex in a request: `None` when it did not say, `Some(None)` when it
+/// dropped its pattern (an empty string, as Kafka reads it).
+fn requested_regex(request: &ConsumerGroupHeartbeatRequest) -> Option<Option<&str>> {
+    request
+        .subscribed_topic_regex
+        .as_deref()
+        .map(|regex| Some(regex).filter(|regex| !regex.is_empty()))
+}
+
+/// Every topic name and pattern any member of `group` subscribes to, with
+/// `request`'s subscription in place of its sender's: what [`apply`] needs
+/// resolved. A pattern that does not compile resolves nothing; [`apply`]
+/// refuses the request that carries it.
+pub(crate) fn subscriptions(
     group: Option<&ConsumerGroupDoc>,
     request: &ConsumerGroupHeartbeatRequest,
-) -> BTreeSet<String> {
-    group
+) -> Subscriptions {
+    let others = group
         .into_iter()
         .flat_map(|group| group.members.iter())
-        .filter(|(member_id, _)| {
-            request.subscribed_topic_names.is_none() || **member_id != request.member_id
-        })
-        .flat_map(|(_, member)| member.subscribed_topic_names.iter().cloned())
+        .filter(|(member_id, _)| **member_id != request.member_id)
+        .map(|(_, member)| member);
+
+    let sender = group.and_then(|group| group.members.get(&request.member_id));
+
+    let names = others
+        .clone()
+        .chain(
+            sender
+                .filter(|_| request.subscribed_topic_names.is_none())
+                .into_iter(),
+        )
+        .flat_map(|member| member.subscribed_topic_names.iter().cloned())
         .chain(request.subscribed_topic_names.iter().flatten().cloned())
-        .collect()
+        .collect();
+
+    let sender_regex = requested_regex(request)
+        .unwrap_or_else(|| sender.and_then(|member| member.subscribed_topic_regex.as_deref()));
+
+    let patterns = others
+        .filter_map(|member| member.subscribed_topic_regex.as_deref())
+        .chain(sender_regex)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter_map(|regex| topic_pattern(regex).ok())
+        .collect();
+
+    Subscriptions { names, patterns }
 }
 
 fn owned_from_request(request: &ConsumerGroupHeartbeatRequest) -> Option<Partitions> {
@@ -188,6 +247,17 @@ fn retarget(group: &mut ConsumerGroupDoc) {
         .members
         .iter()
         .map(|(member_id, member)| {
+            let pattern = member
+                .subscribed_topic_regex
+                .as_deref()
+                .and_then(|regex| topic_pattern(regex).ok());
+
+            let by_pattern = by_name.iter().filter(|(name, _)| {
+                pattern
+                    .as_ref()
+                    .is_some_and(|pattern| pattern.is_match(name))
+            });
+
             (
                 member_id.clone(),
                 MemberSpec {
@@ -195,6 +265,7 @@ fn retarget(group: &mut ConsumerGroupDoc) {
                         .subscribed_topic_names
                         .iter()
                         .filter_map(|name| by_name.get(name.as_str()).copied())
+                        .chain(by_pattern.map(|(_, topic_id)| *topic_id))
                         .collect(),
                     previous: member.target.clone(),
                 },
@@ -413,7 +484,7 @@ fn join(
         return Ok((member_id, false));
     }
 
-    if request.subscribed_topic_names.is_none() {
+    if request.subscribed_topic_names.is_none() && requested_regex(request).flatten().is_none() {
         return Err(ErrorCode::InvalidRequest);
     }
 
@@ -499,6 +570,17 @@ fn update_member(
         }
     }
 
+    if let Some(regex) = requested_regex(request) {
+        if let Some(regex) = regex {
+            _ = topic_pattern(regex)?;
+        }
+
+        if member.subscribed_topic_regex.as_deref() != regex {
+            member.subscribed_topic_regex = regex.map(str::to_owned);
+            resubscribed = true;
+        }
+    }
+
     if let Some(assignor) = request.server_assignor.as_deref() {
         if !assignor::is_supported(assignor) {
             return Err(ErrorCode::UnsupportedAssignor);
@@ -548,7 +630,7 @@ fn response_partitions(partitions: &Partitions) -> Vec<TopicPartitions> {
 /// Apply one heartbeat to the group as read — `None` for a group with no
 /// document yet — at `now_ms`.
 ///
-/// `resolved` is the metadata of [`subscribed_names`], or `None` when the
+/// `resolved` is the metadata of [`subscriptions`], or `None` when the
 /// caller did not refresh it for this request, in which case the topics the
 /// group already holds stand.
 pub(crate) fn apply(
@@ -1077,6 +1159,184 @@ mod tests {
             1_000,
         )?;
         assert_eq!(6_000, shortened.group.members["a"].session_timeout_ms);
+
+        Ok(())
+    }
+
+    fn by_pattern(member_id: &str, regex: &str) -> ConsumerGroupHeartbeatRequest {
+        joining(member_id)
+            .subscribed_topic_names(Some(vec![]))
+            .subscribed_topic_regex(Some(regex.into()))
+    }
+
+    fn topics(topics: &[(&str, u128, i32)]) -> Resolved {
+        topics
+            .iter()
+            .map(|(name, id, partitions)| ((*name).to_owned(), (Uuid::from_u128(*id), *partitions)))
+            .collect()
+    }
+
+    fn assigned_topics(response: &ConsumerGroupHeartbeatResponse) -> BTreeMap<Uuid, usize> {
+        response
+            .assignment
+            .iter()
+            .flat_map(|assignment| assignment.topic_partitions.iter().flatten())
+            .map(|topic| {
+                (
+                    Uuid::from_bytes(topic.topic_id),
+                    topic.partitions.as_ref().map_or(0, Vec::len),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_pattern_is_matched_against_the_whole_name() -> Result<(), ErrorCode> {
+        let pattern = topic_pattern("orders-.*")?;
+
+        assert!(pattern.is_match("orders-eu"));
+        assert!(!pattern.is_match("old-orders-eu"), "a match is anchored");
+        assert!(!topic_pattern("orders")?.is_match("orders-eu"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_member_subscribed_by_pattern_is_assigned_every_matching_topic() -> Result<(), ErrorCode> {
+        let resolved = topics(&[("orders-eu", 1, 2), ("orders-us", 2, 3), ("audit", 3, 4)]);
+
+        let a = apply(
+            None,
+            &by_pattern("a", "orders-.*"),
+            CLIENT,
+            Some(&resolved),
+            &ConsumerGroupConfig::default(),
+            0,
+        )?;
+
+        assert_eq!(
+            BTreeMap::from([(Uuid::from_u128(1), 2), (Uuid::from_u128(2), 3)]),
+            assigned_topics(&a.response)
+        );
+        assert_eq!(
+            Some("orders-.*"),
+            a.group.members["a"].subscribed_topic_regex.as_deref()
+        );
+
+        let described = a.group.described("g", 0);
+        assert_eq!(
+            Some("orders-.*".to_owned()),
+            described.members.unwrap_or_default()[0].subscribed_topic_regex
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn an_invalid_pattern_is_refused() {
+        assert_eq!(
+            Some(ErrorCode::InvalidRegularExpression),
+            apply(
+                None,
+                &by_pattern("a", "orders-(.*"),
+                CLIENT,
+                Some(&Resolved::new()),
+                &ConsumerGroupConfig::default(),
+                0,
+            )
+            .err()
+        );
+    }
+
+    #[test]
+    fn a_topic_created_after_the_member_joined_is_assigned() -> Result<(), ErrorCode> {
+        let before = topics(&[("orders-eu", 1, 2)]);
+        let after = topics(&[("orders-eu", 1, 2), ("orders-us", 2, 3)]);
+
+        let a = apply(
+            None,
+            &by_pattern("a", "orders-.*"),
+            CLIENT,
+            Some(&before),
+            &ConsumerGroupConfig::default(),
+            0,
+        )?;
+        assert_eq!(1, a.group.group_epoch);
+
+        let refreshed = apply(
+            Some(&a.group),
+            &beating("a", 1, None),
+            CLIENT,
+            Some(&after),
+            &ConsumerGroupConfig::default(),
+            1_000,
+        )?;
+
+        assert_eq!(2, refreshed.group.group_epoch);
+        assert_eq!(2, refreshed.response.member_epoch);
+        assert_eq!(
+            BTreeMap::from([(Uuid::from_u128(1), 2), (Uuid::from_u128(2), 3)]),
+            assigned_topics(&refreshed.response)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn dropping_the_pattern_drops_its_topics() -> Result<(), ErrorCode> {
+        let resolved = topics(&[("orders-eu", 1, 2), ("t", 7, 1)]);
+
+        let a = apply(
+            None,
+            &by_pattern("a", "orders-.*").subscribed_topic_names(Some(vec!["t".into()])),
+            CLIENT,
+            Some(&resolved),
+            &ConsumerGroupConfig::default(),
+            0,
+        )?;
+        assert_eq!(2, assigned_topics(&a.response).len());
+
+        let dropped = apply(
+            Some(&a.group),
+            &beating("a", 1, Some(&[0])).subscribed_topic_regex(Some(String::new())),
+            CLIENT,
+            Some(&topics(&[("t", 7, 1)])),
+            &ConsumerGroupConfig::default(),
+            0,
+        )?;
+
+        assert_eq!(None, dropped.group.members["a"].subscribed_topic_regex);
+        assert_eq!(BTreeMap::from([(T, 1)]), assigned_topics(&dropped.response));
+
+        Ok(())
+    }
+
+    #[test]
+    fn subscriptions_take_in_every_members_pattern() -> Result<(), ErrorCode> {
+        let a = apply(
+            None,
+            &by_pattern("a", "orders-.*"),
+            CLIENT,
+            Some(&Resolved::new()),
+            &ConsumerGroupConfig::default(),
+            0,
+        )?;
+
+        let joined = subscriptions(Some(&a.group), &joining("b"));
+
+        assert!(joined.includes("orders-eu"), "a's pattern");
+        assert!(joined.includes("t"), "b's name");
+        assert!(!joined.includes("audit"));
+
+        let replaced = subscriptions(
+            Some(&a.group),
+            &beating("a", 1, None).subscribed_topic_regex(Some("audit".into())),
+        );
+        assert!(
+            !replaced.includes("orders-eu"),
+            "a's request replaces its pattern"
+        );
+        assert!(replaced.includes("audit"));
 
         Ok(())
     }

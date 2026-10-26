@@ -63,6 +63,10 @@ pub const CONSUMER_SESSION_TIMEOUT_MS: i32 = 45_000;
 /// `group.consumer.heartbeat.interval.ms`.
 pub const CONSUMER_HEARTBEAT_INTERVAL_MS: i32 = 5_000;
 
+/// `ConsumerGroupDescribe`'s `MemberType` for a member that speaks the
+/// consumer protocol (KIP-1099), as opposed to `0` for a classic one.
+const CONSUMER_MEMBER_TYPE: i8 = 1;
+
 /// The epoch a static member sends, and is recorded with, when it leaves
 /// intending to come back under the same `instance_id`.
 pub const LEAVING_STATIC_MEMBER_EPOCH: i32 = -2;
@@ -115,6 +119,11 @@ pub struct ConsumerMember {
     pub client_host: String,
 
     pub subscribed_topic_names: Vec<String>,
+
+    /// The pattern the member subscribes by (#625), RE2 syntax matched against
+    /// the whole topic name, beside or instead of its topic names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscribed_topic_regex: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_assignor: Option<String>,
@@ -283,7 +292,8 @@ impl ConsumerGroupDoc {
                     .client_id(member.client_id.clone())
                     .client_host(member.client_host.clone())
                     .subscribed_topic_names(Some(member.subscribed_topic_names.clone()))
-                    .subscribed_topic_regex(None)
+                    .subscribed_topic_regex(member.subscribed_topic_regex.clone())
+                    .member_type(Some(CONSUMER_MEMBER_TYPE))
                     .assignment(self.described_partitions(&member.assigned))
                     .target_assignment(self.described_partitions(&member.target))
             })

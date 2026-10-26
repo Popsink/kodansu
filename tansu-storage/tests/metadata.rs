@@ -160,3 +160,55 @@ async fn an_empty_list_at_v0_asks_for_every_topic() -> Result<(), Error> {
 
     Ok(())
 }
+
+/// A topic asked for by id is answered by id, with its name, although the Java
+/// client sends `name` at its non-null default `""` beside the id (#625). That
+/// is how a KIP-848 consumer names the topics it was assigned.
+#[tokio::test]
+async fn a_topic_asked_for_by_id_is_answered_with_its_name() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = StorageContainer::builder()
+        .cluster_id(cluster_id())
+        .node_id(111)
+        .advertised_listener(Url::parse("tcp://localhost:9092")?)
+        .storage(storage_url()?)
+        .build()
+        .await?;
+
+    let topic_id = storage
+        .create_topic(
+            CreatableTopic::default()
+                .name("orders".into())
+                .num_partitions(3)
+                .replication_factor(1)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    let mut ctx = Context::default();
+    _ = ctx.insert(RequestApiVersion(12));
+
+    let response = MapStateLayer::new(|_| storage)
+        .into_layer(MetadataService)
+        .serve(
+            ctx,
+            MetadataRequest::default().topics(Some(vec![
+                MetadataRequestTopic::default()
+                    .topic_id(Some(topic_id.into_bytes()))
+                    .name(Some(String::new())),
+            ])),
+        )
+        .await?;
+
+    let topics = response.topics.unwrap_or_default();
+    assert_eq!(1, topics.len());
+    assert_eq!(0, topics[0].error_code);
+    assert_eq!(Some("orders".to_owned()), topics[0].name);
+    assert_eq!(Some(topic_id.into_bytes()), topics[0].topic_id);
+    assert_eq!(3, topics[0].partitions.as_ref().map_or(0, Vec::len));
+
+    Ok(())
+}
