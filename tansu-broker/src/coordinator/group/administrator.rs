@@ -97,8 +97,9 @@ use tansu_sans_io::{
 };
 use tansu_service::Parked;
 use tansu_storage::{
-    AssignmentDoc, AssignmentOutcome, ConsumerGroupState, GenerationDoc, MemberDoc, MemberRef,
-    OffsetCommitRequest, Storage, TopicId, Topition, UpdateError, Version,
+    AssignmentDoc, AssignmentOutcome, ConsumerGroupDoc, ConsumerGroupState, ContactStamps,
+    GenerationDoc, MemberDoc, MemberRef, OffsetCommitRequest, Storage, TopicId, Topition,
+    UpdateError, Version,
 };
 use tokio::time::{Duration, Instant, sleep};
 use tokio_util::sync::CancellationToken;
@@ -109,7 +110,7 @@ use crate::{Error, METER, Result};
 
 use super::{
     Coordinator, OffsetCommit,
-    consumer::{self, Client, ConsumerGroupConfig, Resolved, Subscriptions},
+    consumer::{self, Client, ConsumerGroupConfig, Liveness, Resolved, Subscriptions},
 };
 
 /// How long a static member with nothing to act on is damped on the **sync**
@@ -394,7 +395,7 @@ fn sweep_attempts() -> ExpiringSizedCache<String, i64> {
 }
 
 /// The memo behind [`Controller::consumer_metadata_checks`] (#612).
-fn consumer_metadata_checks() -> ExpiringSizedCache<String, ()> {
+fn consumer_metadata_checks() -> ExpiringSizedCache<String, i64> {
     let mut checks = ExpiringSizedCache::new(CONSUMER_METADATA_REFRESH);
     _ = checks.size_limit(CONSUMER_METADATA_CHECKS_HELD);
     checks
@@ -1084,7 +1085,12 @@ pub struct Controller<O> {
     /// Like every other memo here it can only suppress work: a cold replica
     /// resolves on the first heartbeat it serves, and the group's document —
     /// not this — holds the metadata the target assignment was computed from.
-    consumer_metadata_checks: Arc<Mutex<ExpiringSizedCache<String, ()>>>,
+    ///
+    /// The value is when, by the coordinator's clock, and that is what the
+    /// window is judged by (#627): the expiry is the memo's own `Instant` and
+    /// only bounds memory, so a clock the tests pause still lets the window,
+    /// and the liveness sweep that shares it, come round.
+    consumer_metadata_checks: Arc<Mutex<ExpiringSizedCache<String, i64>>>,
 
     /// The broker's policy for consumer-protocol groups (#628).
     consumer_group_config: ConsumerGroupConfig,
@@ -1350,6 +1356,15 @@ where
         if let Ok(mut stamps) = self.liveness_stamps.lock() {
             _ = stamps.insert_evict((group_id.to_owned(), member_id.to_owned()), stamp_ms, true);
         }
+    }
+
+    /// The stamp [`Self::note_liveness`] last held for `member_id`, if any.
+    fn noted_liveness(&self, group_id: &str, member_id: &str) -> Option<i64> {
+        self.liveness_stamps.lock().ok().and_then(|stamps| {
+            stamps
+                .get(&(group_id.to_owned(), member_id.to_owned()))
+                .copied()
+        })
     }
 
     /// Refresh this member's liveness, if it is due.
@@ -3606,22 +3621,26 @@ impl<O> Controller<O>
 where
     O: Storage + Clone,
 {
-    /// Whether this heartbeat should resolve the subscribed topics afresh: on
-    /// a join or a change of subscription always, otherwise once per
-    /// [`CONSUMER_METADATA_REFRESH`] per group on this replica.
-    fn consumer_metadata_due(&self, request: &ConsumerGroupHeartbeatRequest) -> bool {
+    /// Whether this heartbeat should resolve the subscribed topics and list
+    /// the members' liveness stamps afresh (#627): on a join or a change of
+    /// subscription always, otherwise once per [`CONSUMER_METADATA_REFRESH`]
+    /// per group on this replica.
+    fn consumer_metadata_due(&self, request: &ConsumerGroupHeartbeatRequest, now_ms: i64) -> bool {
+        let window_ms = i64::try_from(CONSUMER_METADATA_REFRESH.as_millis()).unwrap_or(i64::MAX);
+
         request.member_epoch == 0
             || request.subscribed_topic_names.is_some()
             || request.subscribed_topic_regex.is_some()
-            || self
-                .consumer_metadata_checks
-                .lock()
-                .map_or(true, |checks| checks.get(&request.group_id).is_none())
+            || self.consumer_metadata_checks.lock().map_or(true, |checks| {
+                checks
+                    .get(&request.group_id)
+                    .is_none_or(|noted_ms| now_ms.saturating_sub(*noted_ms) >= window_ms)
+            })
     }
 
-    fn consumer_metadata_noted(&self, group_id: &str) {
+    fn consumer_metadata_noted(&self, group_id: &str, now_ms: i64) {
         if let Ok(mut checks) = self.consumer_metadata_checks.lock() {
-            _ = checks.insert_evict(group_id.to_owned(), (), true);
+            _ = checks.insert_evict(group_id.to_owned(), now_ms, true);
         }
     }
 
@@ -3705,11 +3724,79 @@ where
     /// Whether `group_id` is a consumer-protocol group with a live member, which
     /// a classic `JoinGroup` may not take over.
     async fn is_live_consumer(&self, group_id: &str, now_ms: i64) -> Result<bool> {
-        Ok(self
+        let Some((group, _)) = self.storage.read_consumer_group(group_id).await? else {
+            return Ok(false);
+        };
+
+        let stamps = self.storage.list_consumer_member_stamps(group_id).await?;
+        Ok(group.with_contacts(&stamps).has_live_members(now_ms))
+    }
+
+    /// What this heartbeat knows of each member's liveness: the newest stamp
+    /// of each when `stamps` were listed, and in any case the sender's own
+    /// renewal as this replica last saw it (#627).
+    fn consumer_liveness(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        stamps: Option<&ContactStamps>,
+    ) -> Liveness {
+        let mut contacts = stamps
+            .into_iter()
+            .flatten()
+            .filter_map(|(member_id, stamps)| Some((member_id.clone(), *stamps.last()?)))
+            .collect::<BTreeMap<_, _>>();
+
+        if let Some(noted) = self.noted_liveness(group_id, member_id) {
+            _ = contacts
+                .entry(member_id.to_owned())
+                .and_modify(|contact| *contact = (*contact).max(noted))
+                .or_insert(noted);
+        }
+
+        Liveness {
+            contacts,
+            listed: stamps.is_some(),
+        }
+    }
+
+    /// Remove the stamps `stamps` holds that no reader will ask about again:
+    /// every one but the newest of each member, and all of a member `group`
+    /// no longer has (#627). Best-effort: a stamp left behind is one more key
+    /// in the next listing.
+    async fn forget_stale_stamps(
+        &self,
+        group_id: &str,
+        group: &ConsumerGroupDoc,
+        stamps: &ContactStamps,
+    ) {
+        let stale = stamps
+            .iter()
+            .flat_map(|(member_id, stamps)| {
+                let kept = group
+                    .members
+                    .contains_key(member_id)
+                    .then(|| stamps.last().copied())
+                    .flatten();
+
+                stamps
+                    .iter()
+                    .filter(move |stamp| Some(**stamp) != kept)
+                    .map(move |stamp| (member_id.clone(), *stamp))
+            })
+            .collect::<Vec<_>>();
+
+        if stale.is_empty() {
+            return;
+        }
+
+        if let Err(error) = self
             .storage
-            .read_consumer_group(group_id)
-            .await?
-            .is_some_and(|(group, _)| group.has_live_members(now_ms)))
+            .delete_consumer_member_stamps(group_id, &stale)
+            .await
+        {
+            debug!(group_id, ?error, "liveness stamps left for the next sweep");
+        }
     }
 
     async fn consumer_heartbeat(
@@ -3720,9 +3807,21 @@ where
         let group_id = request.group_id.as_str();
         let mut conflicts = 0u32;
 
+        let refresh = self.consumer_metadata_due(request, epoch_ms((self.now)()));
+
+        // Listed before the document is read, so a member the document no
+        // longer names was gone before the listing was taken, and its stamps
+        // are safe to forget (#627).
+        let stamps = if refresh {
+            Some(self.storage.list_consumer_member_stamps(group_id).await?)
+        } else {
+            None
+        };
+
         loop {
             let now_ms = epoch_ms((self.now)());
             let held = self.storage.read_consumer_group(group_id).await?;
+            let liveness = self.consumer_liveness(group_id, &request.member_id, stamps.as_ref());
 
             // A heartbeat for a group with no document is a member whose
             // group is gone, and `UNKNOWN_MEMBER_ID` is what makes the client
@@ -3732,9 +3831,12 @@ where
             }
 
             if request.member_epoch == 0
-                && held
-                    .as_ref()
-                    .is_none_or(|(group, _)| !group.has_live_members(now_ms))
+                && held.as_ref().is_none_or(|(group, _)| {
+                    !group
+                        .clone()
+                        .with_contacts(stamps.as_ref().unwrap_or(&ContactStamps::new()))
+                        .has_live_members(now_ms)
+                })
                 && self.is_live_classic(group_id, now_ms).await?
             {
                 debug!(group_id, "a consumer-protocol join of a classic group");
@@ -3743,7 +3845,7 @@ where
 
             let group = held.as_ref().map(|(group, _)| group);
 
-            let resolved = if self.consumer_metadata_due(request) {
+            let resolved = if refresh {
                 Some(
                     self.resolve_topics(&consumer::subscriptions(group, request))
                         .await?,
@@ -3757,6 +3859,7 @@ where
                 request,
                 client,
                 resolved.as_ref(),
+                &liveness,
                 &self.consumer_group_config,
                 now_ms,
             ) {
@@ -3769,10 +3872,24 @@ where
             };
 
             if resolved.is_some() {
-                self.consumer_metadata_noted(group_id);
+                self.consumer_metadata_noted(group_id, now_ms);
             }
 
+            let member_id = transition.response.member_id.clone().unwrap_or_default();
+
             if !transition.changed {
+                if transition.renew {
+                    self.storage
+                        .renew_consumer_member(group_id, &member_id, now_ms)
+                        .await?;
+                    self.note_liveness(group_id, &member_id, now_ms);
+                }
+
+                if let Some(stamps) = stamps.as_ref() {
+                    self.forget_stale_stamps(group_id, &transition.group, stamps)
+                        .await;
+                }
+
                 return Ok(transition.response.into());
             }
 
@@ -3780,12 +3897,23 @@ where
                 .storage
                 .update_consumer_group(
                     group_id,
-                    transition.group.bumped(),
+                    transition.group.clone().bumped(),
                     held.map(|(_, version)| version),
                 )
                 .await
             {
-                Ok(_) => return Ok(transition.response.into()),
+                Ok(_) => {
+                    if transition.group.members.contains_key(&member_id) {
+                        self.note_liveness(group_id, &member_id, now_ms);
+                    }
+
+                    if let Some(stamps) = stamps.as_ref() {
+                        self.forget_stale_stamps(group_id, &transition.group, stamps)
+                            .await;
+                    }
+
+                    return Ok(transition.response.into());
+                }
 
                 Err(UpdateError::Outdated { .. } | UpdateError::Vanished) => {
                     if conflicts >= MAX_GENERATION_CAS_ATTEMPTS {
@@ -3814,14 +3942,17 @@ where
     /// commits at exactly its current epoch, and anything else is
     /// `STALE_MEMBER_EPOCH`. A member no group of either kind names is
     /// `UNKNOWN_MEMBER_ID`, as it always was.
+    ///
+    /// Membership is the document's, without a clock (#627), as Kafka judges
+    /// it: the document no longer carries a stable member's renewals, so its
+    /// stamp says nothing about whether the member is alive, and a member whose
+    /// session lapsed is removed from it by the next heartbeat's sweep.
     async fn consumer_commit_verdict(
         &self,
         group_id: &str,
         member_id: &str,
         member_epoch: i32,
     ) -> Result<Option<ErrorCode>> {
-        let now_ms = epoch_ms((self.now)());
-
         let current = self
             .storage
             .read_consumer_group(group_id)
@@ -3830,7 +3961,6 @@ where
                 group
                     .members
                     .get(member_id)
-                    .filter(|member| !member.is_expired(now_ms))
                     .map(|member| member.member_epoch)
             });
 
@@ -3878,23 +4008,15 @@ where
             return Ok(None);
         };
 
-        let now_ms = epoch_ms((self.now)());
-
         let Some((held, _)) = self.storage.read_consumer_group(&group.group_id).await? else {
             return Ok(None);
         };
 
-        Ok(
-            match held
-                .members
-                .get(member_id)
-                .filter(|member| !member.is_expired(now_ms))
-            {
-                None => Some(ErrorCode::UnknownMemberId),
-                Some(member) if member.member_epoch == member_epoch => None,
-                Some(_) => Some(ErrorCode::StaleMemberEpoch),
-            },
-        )
+        Ok(match held.members.get(member_id) {
+            None => Some(ErrorCode::UnknownMemberId),
+            Some(member) if member.member_epoch == member_epoch => None,
+            Some(_) => Some(ErrorCode::StaleMemberEpoch),
+        })
     }
 }
 

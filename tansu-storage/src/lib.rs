@@ -192,7 +192,8 @@ pub use quota::{
 
 pub use consumer_group::{
     CONSUMER_HEARTBEAT_INTERVAL_MS, CONSUMER_SESSION_TIMEOUT_MS, ConsumerGroupDoc, ConsumerMember,
-    LEAVING_STATIC_MEMBER_EPOCH, MemberState, Partitions, SubscribedTopic, flatten, grouped,
+    ContactStamps, LEAVING_STATIC_MEMBER_EPOCH, MemberState, Partitions, SubscribedTopic, flatten,
+    grouped,
 };
 
 pub use group::{
@@ -1840,6 +1841,35 @@ pub trait Storage: Debug + Send + Sync + 'static {
         group: ConsumerGroupDoc,
         version: Option<Version>,
     ) -> Result<Version, UpdateError<ConsumerGroupDoc>>;
+
+    /// Record that a KIP-848 member was heard from at `last_contact_ms` (#627).
+    ///
+    /// A new object for every renewal, keyed by the member and the stamp, so no
+    /// two members — and no two renewals — ever write the same key: there is
+    /// no etag to contend on, which is the point. The stamps a renewal
+    /// supersedes are removed by [`Self::delete_consumer_member_stamps`].
+    async fn renew_consumer_member(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        last_contact_ms: i64,
+    ) -> Result<()>;
+
+    /// Every liveness stamp of a KIP-848 group, by member (#627).
+    ///
+    /// One LIST and no GETs: the stamp is in the key. The broker's clock wrote
+    /// it, not the store's, so it is compared with the clock that judges it.
+    async fn list_consumer_member_stamps(&self, group_id: &str) -> Result<ContactStamps>;
+
+    /// Remove liveness stamps: superseded ones, and those of members the group
+    /// no longer has (#627). Best-effort by contract — a stamp left behind is
+    /// one more key in the next listing, never a wrong answer, because only the
+    /// newest stamp of a member the document names is ever read.
+    async fn delete_consumer_member_stamps(
+        &self,
+        group_id: &str,
+        stamps: &[(String, i64)],
+    ) -> Result<()>;
 
     /// Create each ACL, answering one error code per creation **in request
     /// order** (#363).

@@ -49,10 +49,10 @@ use uuid::Uuid;
 use crate::delegate::storage_methods;
 use crate::{
     Ack, AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
-    BrokerRegistrationRequest, CommittedOffset, ConsumerGroupDoc, Error, GenerationDoc,
-    ListOffsetResponse, METER, MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProducerIdResponse, QuotaAlteration, QuotaEntity, QuotaFilterComponent,
-    QuotaLimits, Quotas, Result, ScramCredential, Storage, TopicId, Topition,
+    BrokerRegistrationRequest, CommittedOffset, ConsumerGroupDoc, ContactStamps, Error,
+    GenerationDoc, ListOffsetResponse, METER, MemberDoc, MetadataResponse, NamedGroupDetail,
+    OffsetCommitRequest, OffsetStage, ProducerIdResponse, QuotaAlteration, QuotaEntity,
+    QuotaFilterComponent, QuotaLimits, Quotas, Result, ScramCredential, Storage, TopicId, Topition,
     TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
     Version,
 };

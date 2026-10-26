@@ -144,6 +144,58 @@ impl DynoStore {
             .map(|prefix| Path::from(format!("{prefix}/consumer.json")))
     }
 
+    /// `liveness/` under a group's prefix: one object per KIP-848 member
+    /// renewal (#627).
+    pub(super) fn consumer_liveness_prefix(&self, group_id: &str) -> Option<Path> {
+        self.group_prefix(group_id)
+            .map(|prefix| Path::from(format!("{prefix}/liveness")))
+    }
+
+    /// One renewal of a KIP-848 member's liveness (#627),
+    /// `liveness/{member}-{stamp}`, empty.
+    ///
+    /// The member id is hex-encoded: a client chooses it (KIP-1082), and
+    /// encoded it is always exactly one path component that
+    /// [`Self::listed_consumer_stamp`] can give back unchanged. The stamp is
+    /// zero-padded so a member's renewals list in order. `None` for a negative
+    /// stamp, which neither sorts nor parses back.
+    pub(super) fn consumer_liveness_location(
+        &self,
+        group_id: &str,
+        member_id: &str,
+        stamp: i64,
+    ) -> Option<Path> {
+        if stamp < 0 {
+            return None;
+        }
+
+        let member = member_id
+            .bytes()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+
+        self.consumer_liveness_prefix(group_id)
+            .map(|prefix| Path::from(format!("{prefix}/{member}-{stamp:0>20}")))
+    }
+
+    /// The member and stamp a listed `liveness/` object names, or `None` for
+    /// anything under that prefix which is not one.
+    pub(super) fn listed_consumer_stamp(location: &Path) -> Option<(String, i64)> {
+        let name = location.parts().next_back()?;
+        let (member, stamp) = name.as_ref().rsplit_once('-')?;
+
+        if member.len() % 2 != 0 {
+            return None;
+        }
+
+        let bytes = (0..member.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(member.get(at..at + 2)?, 16).ok())
+            .collect::<Option<Vec<u8>>>()?;
+
+        Some((String::from_utf8(bytes).ok()?, stamp.parse().ok()?))
+    }
+
     /// `assignment/` under a group's prefix (#359).
     pub(super) fn group_assignments_prefix(&self, group_id: &str) -> Option<Path> {
         self.group_prefix(group_id)
@@ -405,7 +457,15 @@ impl DynoStore {
     ) -> Result<(&'static str, ConsumerGroupState)> {
         let Some((generation, _)) = self.read_group_generation(group_id).await? else {
             return Ok(match self.read_consumer_group(group_id).await? {
-                Some((group, _)) => (CONSUMER_GROUP_TYPE, group.state(Self::now_ms())),
+                Some((group, _)) => {
+                    let stamps = self.list_consumer_member_stamps(group_id).await?;
+
+                    (
+                        CONSUMER_GROUP_TYPE,
+                        group.with_contacts(&stamps).state(Self::now_ms()),
+                    )
+                }
+
                 None => (CLASSIC_GROUP_TYPE, ConsumerGroupState::Empty),
             });
         };

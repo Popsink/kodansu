@@ -93,6 +93,34 @@ pub(crate) struct Client<'a> {
     pub(crate) host: &'a str,
 }
 
+/// What a heartbeat knows of how recently each member was heard from (#627).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Liveness {
+    /// The newest contact known per member, beyond what the document says:
+    /// the stamps listed, and what this replica renewed itself.
+    pub(crate) contacts: BTreeMap<String, i64>,
+
+    /// Whether `contacts` holds the newest stamp of *every* member, from a
+    /// listing. Only then can a member be judged lapsed: without it, a member
+    /// another replica renewed would look as old as its document says.
+    pub(crate) listed: bool,
+}
+
+impl Liveness {
+    /// The newest contact known for `member_id`.
+    fn last_contact_ms(&self, member_id: &str, member: &ConsumerMember) -> i64 {
+        self.contacts
+            .get(member_id)
+            .map_or(member.last_contact_ms, |contact| {
+                member.last_contact_ms.max(*contact)
+            })
+    }
+
+    fn is_expired(&self, member_id: &str, member: &ConsumerMember, now_ms: i64) -> bool {
+        now_ms.saturating_sub(self.last_contact_ms(member_id, member)) > member.lapses_after_ms()
+    }
+}
+
 /// What [`apply`] decided.
 #[derive(Clone, Debug)]
 pub(crate) struct Transition {
@@ -101,6 +129,10 @@ pub(crate) struct Transition {
 
     /// Whether `group` differs from what was read, and so must be written.
     pub(crate) changed: bool,
+
+    /// Whether the sender's liveness is due a renewal the document will not
+    /// carry, because it is not being written (#627).
+    pub(crate) renew: bool,
 
     pub(crate) response: ConsumerGroupHeartbeatResponse,
 }
@@ -205,14 +237,16 @@ fn owned_from_request(request: &ConsumerGroupHeartbeatRequest) -> Option<Partiti
     })
 }
 
-/// Drop every member whose session lapsed, or who was told to revoke and ran
-/// out its rebalance timeout. Answers whether anyone was dropped.
-fn sweep(group: &mut ConsumerGroupDoc, now_ms: i64) -> bool {
+/// Drop every member who was told to revoke and ran out its rebalance
+/// timeout, and — when `liveness` was listed — every member whose session
+/// lapsed. Answers whether anyone was dropped.
+fn sweep(group: &mut ConsumerGroupDoc, liveness: &Liveness, now_ms: i64) -> bool {
     let before = group.members.len();
 
-    group
-        .members
-        .retain(|_, member| !member.is_expired(now_ms) && !member.is_revocation_overdue(now_ms));
+    group.members.retain(|member_id, member| {
+        !member.is_revocation_overdue(now_ms)
+            && !(liveness.listed && liveness.is_expired(member_id, member, now_ms))
+    });
 
     group.members.len() != before
 }
@@ -638,6 +672,7 @@ pub(crate) fn apply(
     request: &ConsumerGroupHeartbeatRequest,
     client: Client<'_>,
     resolved: Option<&Resolved>,
+    liveness: &Liveness,
     config: &ConsumerGroupConfig,
     now_ms: i64,
 ) -> Result<Transition, ErrorCode> {
@@ -649,7 +684,7 @@ pub(crate) fn apply(
     let mut group = before.clone();
     let owned = owned_from_request(request);
 
-    let mut rebalance = sweep(&mut group, now_ms);
+    let mut rebalance = sweep(&mut group, liveness, now_ms);
 
     let member_id = match request.member_epoch {
         -1 | LEAVING_STATIC_MEMBER_EPOCH => {
@@ -664,6 +699,7 @@ pub(crate) fn apply(
             return Ok(Transition {
                 group,
                 changed,
+                renew: false,
                 response: ConsumerGroupHeartbeatResponse::default()
                     .throttle_time_ms(0)
                     .error_code(ErrorCode::None.into())
@@ -709,8 +745,8 @@ pub(crate) fn apply(
         return Err(ErrorCode::UnknownMemberId);
     };
 
-    let renewal_due =
-        now_ms.saturating_sub(member.last_contact_ms) >= i64::from(member.session_timeout_ms / 2);
+    let renewal_due = now_ms.saturating_sub(liveness.last_contact_ms(&member_id, member))
+        >= i64::from(member.session_timeout_ms / 2);
 
     let send_assignment = request.member_epoch != member.member_epoch
         || previous_assigned.as_ref() != Some(&member.assigned)
@@ -728,17 +764,16 @@ pub(crate) fn apply(
             Assignment::default().topic_partitions(Some(response_partitions(&member.assigned)))
         }));
 
-    if (renewal_due || group != before)
-        && let Some(member) = group.members.get_mut(&member_id)
-    {
+    let changed = group != before;
+
+    if changed && let Some(member) = group.members.get_mut(&member_id) {
         member.last_contact_ms = now_ms;
     }
-
-    let changed = group != before;
 
     Ok(Transition {
         group,
         changed,
+        renew: renewal_due && !changed,
         response,
     })
 }
@@ -749,6 +784,14 @@ mod tests {
     use tansu_sans_io::consumer_group_heartbeat_request;
 
     const T: Uuid = Uuid::from_u128(0x7);
+
+    /// A listing that found no stamp: liveness is what the documents say.
+    fn listed() -> Liveness {
+        Liveness {
+            contacts: BTreeMap::new(),
+            listed: true,
+        }
+    }
 
     const CLIENT: Client<'static> = Client {
         id: "c",
@@ -806,6 +849,7 @@ mod tests {
             &joining("a"),
             CLIENT,
             Some(&resolved(3)),
+            &listed(),
             &ConsumerGroupConfig::default(),
             0,
         )?;
@@ -821,6 +865,7 @@ mod tests {
             &beating("a", 1, None),
             CLIENT,
             None,
+            &listed(),
             &ConsumerGroupConfig::default(),
             1_000,
         )?;
@@ -838,6 +883,7 @@ mod tests {
             &joining("a"),
             CLIENT,
             Some(&resolved(2)),
+            &listed(),
             &ConsumerGroupConfig::default(),
             0,
         )?;
@@ -846,6 +892,7 @@ mod tests {
             &joining("b"),
             CLIENT,
             Some(&resolved(2)),
+            &listed(),
             &ConsumerGroupConfig::default(),
             0,
         )?;
@@ -863,6 +910,7 @@ mod tests {
             &beating("a", 1, Some(&[0, 1])),
             CLIENT,
             None,
+            &listed(),
             &ConsumerGroupConfig::default(),
             0,
         )?;
@@ -883,6 +931,7 @@ mod tests {
             &beating("b", 2, Some(&[])),
             CLIENT,
             None,
+            &listed(),
             &ConsumerGroupConfig::default(),
             0,
         )?;
@@ -894,6 +943,7 @@ mod tests {
             &beating("a", 1, Some(&owned)),
             CLIENT,
             None,
+            &listed(),
             &ConsumerGroupConfig::default(),
             0,
         )?;
@@ -904,6 +954,7 @@ mod tests {
             &beating("b", 2, Some(&[])),
             CLIENT,
             None,
+            &listed(),
             &ConsumerGroupConfig::default(),
             0,
         )?;
@@ -922,6 +973,7 @@ mod tests {
             &joining("a"),
             CLIENT,
             Some(&resolved(1)),
+            &listed(),
             &ConsumerGroupConfig::default(),
             0,
         )?;
@@ -933,6 +985,7 @@ mod tests {
                 &beating("a", 7, None),
                 CLIENT,
                 None,
+                &listed(),
                 &ConsumerGroupConfig::default(),
                 0
             )
@@ -946,6 +999,7 @@ mod tests {
                 &beating("z", 1, None),
                 CLIENT,
                 None,
+                &listed(),
                 &ConsumerGroupConfig::default(),
                 0
             )
@@ -957,12 +1011,14 @@ mod tests {
 
     #[test]
     fn a_lapsed_member_is_swept() -> Result<(), ErrorCode> {
+        let config = ConsumerGroupConfig::default();
         let a = apply(
             None,
             &joining("a"),
             CLIENT,
             Some(&resolved(2)),
-            &ConsumerGroupConfig::default(),
+            &listed(),
+            &config,
             0,
         )?;
         let b = apply(
@@ -970,31 +1026,59 @@ mod tests {
             &joining("b"),
             CLIENT,
             Some(&resolved(2)),
-            &ConsumerGroupConfig::default(),
+            &listed(),
+            &config,
             0,
         )?;
 
         let lapsed = i64::from(CONSUMER_SESSION_TIMEOUT_MS) * 2;
+        let renewal = lapsed - i64::from(CONSUMER_SESSION_TIMEOUT_MS);
 
         let renewed = apply(
             Some(&b.group),
             &beating("b", 2, Some(&[])),
             CLIENT,
             None,
-            &ConsumerGroupConfig::default(),
-            lapsed - i64::from(CONSUMER_SESSION_TIMEOUT_MS),
+            &listed(),
+            &config,
+            renewal,
         )?;
+
+        assert!(renewed.renew, "b is due a renewal");
+        assert!(
+            !renewed.changed,
+            "which is a stamp, not a write of the group (#627)"
+        );
+
+        let unlisted = apply(
+            Some(&renewed.group),
+            &beating("b", 2, Some(&[])),
+            CLIENT,
+            None,
+            &Liveness::default(),
+            &config,
+            lapsed,
+        )?;
+        assert!(
+            unlisted.group.members.contains_key("a"),
+            "without a listing nobody can be judged lapsed"
+        );
 
         let swept = apply(
             Some(&renewed.group),
             &beating("b", 2, Some(&[])),
             CLIENT,
             None,
-            &ConsumerGroupConfig::default(),
+            &Liveness {
+                contacts: BTreeMap::from([("b".to_owned(), renewal)]),
+                listed: true,
+            },
+            &config,
             lapsed,
         )?;
 
         assert!(!swept.group.members.contains_key("a"));
+        assert!(swept.group.members.contains_key("b"), "b's stamp keeps it");
         assert_eq!(3, swept.response.member_epoch);
         assert_eq!(Some(BTreeSet::from([0, 1])), assigned(&swept.response));
 
@@ -1010,6 +1094,7 @@ mod tests {
             &static_join("a"),
             CLIENT,
             Some(&resolved(2)),
+            &listed(),
             &ConsumerGroupConfig::default(),
             0,
         )?;
@@ -1021,6 +1106,7 @@ mod tests {
                 &static_join("b"),
                 CLIENT,
                 Some(&resolved(2)),
+                &listed(),
                 &ConsumerGroupConfig::default(),
                 0
             )
@@ -1032,6 +1118,7 @@ mod tests {
             &beating("a", LEAVING_STATIC_MEMBER_EPOCH, None),
             CLIENT,
             None,
+            &listed(),
             &ConsumerGroupConfig::default(),
             0,
         )?;
@@ -1045,6 +1132,7 @@ mod tests {
             &static_join("b"),
             CLIENT,
             Some(&resolved(2)),
+            &listed(),
             &ConsumerGroupConfig::default(),
             0,
         )?;
@@ -1062,6 +1150,7 @@ mod tests {
             &joining("a"),
             CLIENT,
             Some(&resolved(1)),
+            &listed(),
             &ConsumerGroupConfig::default(),
             0,
         )?;
@@ -1077,6 +1166,7 @@ mod tests {
             &beating("a", 1, None),
             moved,
             None,
+            &listed(),
             &ConsumerGroupConfig::default(),
             0,
         )?;
@@ -1093,7 +1183,15 @@ mod tests {
             ..Default::default()
         };
 
-        let a = apply(None, &joining("a"), CLIENT, Some(&resolved(2)), &config, 0)?;
+        let a = apply(
+            None,
+            &joining("a"),
+            CLIENT,
+            Some(&resolved(2)),
+            &listed(),
+            &config,
+            0,
+        )?;
 
         assert_eq!(
             Some(ErrorCode::GroupMaxSizeReached),
@@ -1102,6 +1200,7 @@ mod tests {
                 &joining("b"),
                 CLIENT,
                 Some(&resolved(2)),
+                &listed(),
                 &config,
                 0
             )
@@ -1113,6 +1212,7 @@ mod tests {
             &joining("a"),
             CLIENT,
             Some(&resolved(2)),
+            &listed(),
             &config,
             0,
         )?;
@@ -1133,7 +1233,15 @@ mod tests {
             max_size: None,
         };
 
-        let a = apply(None, &joining("a"), CLIENT, Some(&resolved(1)), &config, 0)?;
+        let a = apply(
+            None,
+            &joining("a"),
+            CLIENT,
+            Some(&resolved(1)),
+            &listed(),
+            &config,
+            0,
+        )?;
         assert_eq!(1_000, a.response.heartbeat_interval_ms);
         assert_eq!(10_000, a.group.members["a"].session_timeout_ms);
 
@@ -1142,6 +1250,7 @@ mod tests {
             &beating("a", 1, None),
             CLIENT,
             None,
+            &listed(),
             &config,
             16_000,
         );
@@ -1152,6 +1261,7 @@ mod tests {
             &beating("a", 1, None),
             CLIENT,
             None,
+            &listed(),
             &ConsumerGroupConfig {
                 session_timeout_ms: 6_000,
                 ..config
@@ -1210,6 +1320,7 @@ mod tests {
             &by_pattern("a", "orders-.*"),
             CLIENT,
             Some(&resolved),
+            &listed(),
             &ConsumerGroupConfig::default(),
             0,
         )?;
@@ -1241,8 +1352,9 @@ mod tests {
                 &by_pattern("a", "orders-(.*"),
                 CLIENT,
                 Some(&Resolved::new()),
+                &listed(),
                 &ConsumerGroupConfig::default(),
-                0,
+                0
             )
             .err()
         );
@@ -1258,6 +1370,7 @@ mod tests {
             &by_pattern("a", "orders-.*"),
             CLIENT,
             Some(&before),
+            &listed(),
             &ConsumerGroupConfig::default(),
             0,
         )?;
@@ -1268,6 +1381,7 @@ mod tests {
             &beating("a", 1, None),
             CLIENT,
             Some(&after),
+            &listed(),
             &ConsumerGroupConfig::default(),
             1_000,
         )?;
@@ -1291,6 +1405,7 @@ mod tests {
             &by_pattern("a", "orders-.*").subscribed_topic_names(Some(vec!["t".into()])),
             CLIENT,
             Some(&resolved),
+            &listed(),
             &ConsumerGroupConfig::default(),
             0,
         )?;
@@ -1301,6 +1416,7 @@ mod tests {
             &beating("a", 1, Some(&[0])).subscribed_topic_regex(Some(String::new())),
             CLIENT,
             Some(&topics(&[("t", 7, 1)])),
+            &listed(),
             &ConsumerGroupConfig::default(),
             0,
         )?;
@@ -1318,6 +1434,7 @@ mod tests {
             &by_pattern("a", "orders-.*"),
             CLIENT,
             Some(&Resolved::new()),
+            &listed(),
             &ConsumerGroupConfig::default(),
             0,
         )?;

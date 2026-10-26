@@ -44,7 +44,7 @@ use uuid::Uuid;
 use crate::delegate::storage_methods;
 use crate::{
     Ack, AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
-    BrokerRegistrationRequest, CommittedOffset, ConsumerGroupDoc, GenerationDoc,
+    BrokerRegistrationRequest, CommittedOffset, ConsumerGroupDoc, ContactStamps, GenerationDoc,
     ListOffsetResponse, MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
     OffsetStage, ProducerIdResponse, QuotaAlteration, QuotaEntity, QuotaFilterComponent,
     QuotaLimits, Quotas, Result, ScramCredential, Storage, TopicId, Topition,
@@ -81,6 +81,13 @@ pub struct LatencyIntroducingStorage<S> {
     member_lists: Arc<AtomicU64>,
     member_reads: Arc<AtomicU64>,
 
+    /// The KIP-848 counterpart of `generation_updates` and `member_puts`
+    /// (#627): writes of a group's `consumer.json`, won or lost, which a
+    /// stable group should not make at all, and renewals of a member's own
+    /// liveness stamp, which carry the liveness instead.
+    consumer_group_updates: Arc<AtomicU64>,
+    consumer_renewals: Arc<AtomicU64>,
+
     /// Generation updates still to be refused as a lost CAS before the real one
     /// is attempted (#486).
     ///
@@ -108,6 +115,8 @@ where
             generation_cas_conflicts: Arc::new(AtomicU64::new(0)),
             member_lists: Arc::new(AtomicU64::new(0)),
             member_reads: Arc::new(AtomicU64::new(0)),
+            consumer_group_updates: Arc::new(AtomicU64::new(0)),
+            consumer_renewals: Arc::new(AtomicU64::new(0)),
             outdate_generation_updates: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -140,6 +149,18 @@ where
     /// before the read rather than after it.
     pub fn member_reads_handle(&self) -> Arc<AtomicU64> {
         self.member_reads.clone()
+    }
+
+    /// A shared handle to this store's count of `consumer.json` writes, won or
+    /// lost (#627).
+    pub fn consumer_group_updates_handle(&self) -> Arc<AtomicU64> {
+        self.consumer_group_updates.clone()
+    }
+
+    /// A shared handle to this store's count of KIP-848 liveness renewals
+    /// (#627).
+    pub fn consumer_renewals_handle(&self) -> Arc<AtomicU64> {
+        self.consumer_renewals.clone()
     }
 
     /// Refuse the next `updates` generation writes as a lost CAS, whatever the
@@ -251,6 +272,22 @@ macro_rules! latency_body {
         $s.storage.list_group_member_stamps($($arg),*).await
     }};
 
+    ($s:ident, update_consumer_group, ($($arg:ident),*)) => {{
+        $s.introduce_latency().await?;
+
+        _ = $s.consumer_group_updates.fetch_add(1, Ordering::Relaxed);
+
+        $s.storage.update_consumer_group($($arg),*).await
+    }};
+
+    ($s:ident, renew_consumer_member, ($($arg:ident),*)) => {{
+        $s.introduce_latency().await?;
+
+        _ = $s.consumer_renewals.fetch_add(1, Ordering::Relaxed);
+
+        $s.storage.renew_consumer_member($($arg),*).await
+    }};
+
     ($s:ident, update_group_generation, ($group_id:ident, $generation:ident, $version:ident)) => {{
         $s.introduce_latency().await?;
 
@@ -306,8 +343,8 @@ macro_rules! latency_body {
 /// `Storage` for the latency-injecting wrapper, generated from
 /// [`storage_methods`](crate::delegate::storage_methods).
 ///
-/// Forty-five of the fifty are `introduce_latency` then forward; five count
-/// something on the way past. All fifty were written out by hand until #551.
+/// Most are `introduce_latency` then forward; seven count something on the
+/// way past. All of them were written out by hand until #551.
 macro_rules! latency_delegation {
     (
         $(fn $name:ident(&$s:ident $(, $arg:ident : $ty:ty)* $(,)?) -> $ret:ty;)*

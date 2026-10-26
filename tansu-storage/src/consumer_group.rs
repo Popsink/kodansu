@@ -35,8 +35,13 @@
 //! to its new owner only once its previous owner has acknowledged revoking it.
 //! That is a read of the whole group, so splitting members into objects of
 //! their own would turn each step into a multi-object read with no atomicity.
-//! Liveness is folded in at most once per `session/2` per member, the bound the
-//! classic coordinator holds its member documents to.
+//! Liveness is the exception (#627). A member renews it at most once per
+//! `session/2`, which on one object meant a write rate that grew with the
+//! group — every one of them a CAS on the same etag. So a member renews with an
+//! object of its own instead, `liveness/{member}-{stamp}`, which no other
+//! member writes; the document is written only when membership, subscription
+//! or assignment moves, and one listing of the stamps answers how recently
+//! every member was heard from.
 //!
 //! # Schema evolution
 //!
@@ -70,6 +75,10 @@ const CONSUMER_MEMBER_TYPE: i8 = 1;
 /// The epoch a static member sends, and is recorded with, when it leaves
 /// intending to come back under the same `instance_id`.
 pub const LEAVING_STATIC_MEMBER_EPOCH: i32 = -2;
+
+/// Every liveness stamp a group's members have written, by member id (#627):
+/// the epoch milliseconds of each renewal not yet cleaned up.
+pub type ContactStamps = BTreeMap<String, BTreeSet<i64>>;
 
 /// Partitions by topic id: what a member owns, is losing, or should own.
 pub type Partitions = BTreeMap<Uuid, BTreeSet<i32>>;
@@ -131,9 +140,14 @@ pub struct ConsumerMember {
     pub rebalance_timeout_ms: i32,
     pub session_timeout_ms: i32,
 
-    /// Epoch milliseconds of the last contact that was persisted. Renewed at
-    /// most once per `session/2`, so it lags the member's real last contact by
-    /// up to that much — which [`Self::lapses_after_ms`] gives back.
+    /// Epoch milliseconds of the last contact this document recorded: when the
+    /// member joined, or the document was last written while it heartbeated.
+    ///
+    /// Not renewed for its own sake any more (#627): a member renews its
+    /// liveness with a stamp beside the document, at most once per
+    /// `session/2`, and [`ConsumerGroupDoc::with_contacts`] folds the newest
+    /// back in. What it lags the real last contact by is what
+    /// [`Self::lapses_after_ms`] gives back.
     pub last_contact_ms: i64,
 
     /// When a member told to revoke partitions is fenced for not having done
@@ -225,6 +239,24 @@ impl ConsumerGroupDoc {
     #[must_use]
     pub fn bumped(mut self) -> Self {
         self.seq = self.seq.wrapping_add(1);
+        self
+    }
+
+    /// This group with each member's last contact the later of the document's
+    /// and its newest stamp in `stamps` (#627).
+    ///
+    /// The document's own `last_contact_ms` is only written when the document
+    /// is, which a stable group no longer does; a member renews its liveness
+    /// with a stamp of its own. Every reader that judges liveness — describe,
+    /// list, delete — reads the group through this.
+    #[must_use]
+    pub fn with_contacts(mut self, stamps: &ContactStamps) -> Self {
+        for (member_id, member) in &mut self.members {
+            if let Some(latest) = stamps.get(member_id).and_then(|stamps| stamps.last()) {
+                member.last_contact_ms = member.last_contact_ms.max(*latest);
+            }
+        }
+
         self
     }
 

@@ -33,6 +33,7 @@ mod compact_segments;
 mod compacted_region_reads;
 mod compaction_cursor;
 mod conditional_put_probe;
+mod consumer_liveness;
 mod corrupt_region;
 mod delete_fan_out;
 mod delete_groups;
