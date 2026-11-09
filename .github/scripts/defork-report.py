@@ -22,6 +22,11 @@ it, or one of the post-fork upstream ports listed in `copyright.toml` under
 file are not counted: they are identical everywhere and are replaced, not
 rewritten, when a file leaves `inherited`.
 
+Nor is a line of syntax alone: blank, punctuation only (`}`, `)]`), or an
+attribute opener such as `#[derive(`. A rewrite that keeps a type's shape keeps
+those lines, and blame matches them back to upstream however the code around
+them changes; there is nothing in them to rewrite.
+
 Two measures:
 
   plain  `git blame -w -M`: lines whose last change is upstream's.
@@ -50,6 +55,14 @@ from pathlib import Path
 
 HEADER = re.compile(r"^([0-9a-f]{40}) \d+ \d+")
 GRANT_LINES = 12
+ATTRIBUTE_OPENER = re.compile(r"^#!?\[[\w:]+\($")
+
+
+def syntax_only(text: str) -> bool:
+    stripped = text.strip()
+    return not any(c.isalnum() for c in stripped) or bool(
+        ATTRIBUTE_OPENER.match(stripped)
+    )
 
 
 def git(root: Path, *args: str) -> str:
@@ -75,7 +88,11 @@ def upstream_lines(
             text = line[1:]
             if lineno == notice + 1 and text.startswith("// Copyright"):
                 notice += 1
-            elif lineno > notice + GRANT_LINES and (boundary or commit in ports):
+            elif (
+                lineno > notice + GRANT_LINES
+                and (boundary or commit in ports)
+                and not syntax_only(text)
+            ):
                 count += 1
             commit, boundary = None, False
         elif commit is None and (m := HEADER.match(line)):
