@@ -25,7 +25,9 @@ rewritten, when a file leaves `inherited`.
 Nor is a line of syntax alone: blank, punctuation only (`}`, `)]`), or an
 attribute opener such as `#[derive(`. A rewrite that keeps a type's shape keeps
 those lines, and blame matches them back to upstream however the code around
-them changes; there is nothing in them to rewrite.
+them changes; there is nothing in them to rewrite. The same holds for a bare
+module declaration (`pub mod join;`): it names a file, and only renaming the
+file changes it.
 
 Two measures:
 
@@ -56,12 +58,15 @@ from pathlib import Path
 HEADER = re.compile(r"^([0-9a-f]{40}) \d+ \d+")
 GRANT_LINES = 12
 ATTRIBUTE_OPENER = re.compile(r"^#!?\[[\w:]+\($")
+MODULE_DECLARATION = re.compile(r"^(pub(\([\w: ]+\))? )?mod \w+;$")
 
 
 def syntax_only(text: str) -> bool:
     stripped = text.strip()
-    return not any(c.isalnum() for c in stripped) or bool(
-        ATTRIBUTE_OPENER.match(stripped)
+    return (
+        not any(c.isalnum() for c in stripped)
+        or bool(ATTRIBUTE_OPENER.match(stripped))
+        or bool(MODULE_DECLARATION.match(stripped))
     )
 
 
