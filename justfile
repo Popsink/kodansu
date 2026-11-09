@@ -18,6 +18,15 @@ copyright:
 copyright-fix:
     python3 .github/scripts/check-copyright.py --fix
 
+# Lines git blame still attributes to upstream tansu, per inherited file and per
+# crate (Popsink/data-plane#5878). Needs full history. See docs/copyright.md.
+defork-report:
+    python3 .github/scripts/defork-report.py
+
+# Fail if a file outside copyright.toml `inherited` holds an upstream line.
+defork-check:
+    python3 .github/scripts/defork-report.py --check
+
 build profile="dev" features="dynostore" bin="tansu": (cargo-build "--profile" profile "--timings" "--bin" bin "--no-default-features" "--features" features)
 
 build-storage: clean-workspace (build "dev" "dynostore")

@@ -36,6 +36,21 @@ upstream = [
     "// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>",
 ]
 
+[blame]
+# Measured by `.github/scripts/defork-report.py` (`just defork-report`, and
+# `just defork-check` in CI). A line `git blame` attributes to `fork_point` or
+# an ancestor of it, or to one of `ports`, is upstream's. See docs/copyright.md.
+#
+# The merge-base of Popsink's main and tansu-io/main, as derived under
+# "Reproducing the classification" in docs/copyright.md.
+fork_point = "ae28fa7e4659ce19772e1c17aad21e33615e61a8"
+# Post-fork commits that brought upstream code in. Blame calls their lines new,
+# so they have to be named: 27df1fb is the tansu-io#680 consumer-group port. The
+# epic (Popsink/data-plane#5878) stopped ports, so this list only shrinks.
+ports = [
+    "27df1fbd36dc32365e33d999b3e17596c34c7036",
+]
+
 [files]
 # Files derived from tansu: they carry an `upstream` notice and nothing else.
 #
