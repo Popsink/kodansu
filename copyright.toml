@@ -140,7 +140,6 @@ inherited = [
     "tansu-sans-io/src/primitive/tagged.rs",
     "tansu-sans-io/src/primitive/tagged/de.rs",
     "tansu-sans-io/src/primitive/tagged/ser.rs",
-    "tansu-sans-io/src/primitive/uuid.rs",
     "tansu-sans-io/src/primitive/varint.rs",
     "tansu-sans-io/src/record.rs",
     "tansu-sans-io/src/record/codec.rs",
