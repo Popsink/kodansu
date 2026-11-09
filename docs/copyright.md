@@ -169,6 +169,14 @@ the type has the same shape, and identical behaviour is the point of the rewrite
 Counting them would make the exit criterion unreachable, or reachable only by
 fighting rustfmt.
 
+A bare module declaration (`mod tagged;`, `pub(crate) mod limit;`) is skipped on
+the same grounds. It names a file, so the only way to rewrite it is to rename the
+file. Four facade files had nothing else left from upstream —
+`tansu-sans-io/src/primitive.rs`, `tansu-storage/src/gcs.rs`,
+`tansu-storage/src/service/txn.rs` and `tansu-broker/src/broker/group.rs` — and
+left `inherited` with this rule. A `mod` with a body (`mod tests {`) is still
+counted.
+
 The report gives two numbers per file, because one blame mode is not enough:
 
 | measure | `git blame` | catches | misses |
