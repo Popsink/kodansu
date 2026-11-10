@@ -205,10 +205,8 @@ inherited = [
     "tansu-storage/tests/create_topics.rs",
     "tansu-storage/tests/delete_topics.rs",
     "tansu-storage/tests/fetch.rs",
-    "tansu-storage/tests/get_telemetry_subscriptions.rs",
     "tansu-storage/tests/incremental_alter_configs.rs",
     "tansu-storage/tests/list_offsets.rs",
-    "tansu-storage/tests/metadata.rs",
     "tansu-storage/tests/produce.rs",
     "tansu-storage/tests/topic_lifecycle.rs",
     "tansu-topic/src/create.rs",
@@ -248,6 +246,5 @@ joint = [
     "tansu-storage/src/service/fetch.rs",
     "tansu-storage/tests/create_topics.rs",
     "tansu-storage/tests/fetch.rs",
-    "tansu-storage/tests/get_telemetry_subscriptions.rs",
     "tansu-storage/tests/list_offsets.rs",
 ]
