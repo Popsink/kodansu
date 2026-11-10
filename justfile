@@ -553,6 +553,11 @@ fmt:
 #
 # CreateAcls and DescribeAcls swap their scaffolding for the macro. Their
 # cited `//` blocks (#363, #578) stay as they were.
+#   defork  -125 lines, shared test setup  3176 -> 3176  2.6850 -> 2.6881
+#
+# `tansu-storage/tests/common` gains `storage`, `serve` and `topic`, and four
+# tests drop the container builder and the `MapStateLayer` wrapping they each
+# spelled out. Their cited `//` blocks stay; none was added or removed.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -563,7 +568,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6850" top="12":
+comments ceiling="2.6881" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

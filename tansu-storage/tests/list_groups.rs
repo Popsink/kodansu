@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,46 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{Error, cluster_id, init_tracing, storage_url};
-use rama::{Context, Layer as _, Service, layer::MapStateLayer};
-use tansu_sans_io::{ErrorCode, ListGroupsRequest, create_topics_request::CreatableTopic};
-use tansu_storage::{
-    ListGroupsService, OffsetCommitRequest, Storage as _, StorageContainer, Topition,
-};
-use url::Url;
+//! `ListGroups` with no groups, and with a group that only committed offsets.
+
+use tansu_sans_io::{ErrorCode, ListGroupsRequest};
+use tansu_storage::{ListGroupsService, OffsetCommitRequest, Topition};
+
+use crate::common::{Error, init_tracing, serve, storage, topic};
 
 mod common;
-
-#[tokio::test]
-async fn req() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    const HOST: &str = "localhost";
-    const PORT: i32 = 9092;
-    const NODE_ID: i32 = 111;
-
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
-
-    let service = MapStateLayer::new(|_| storage).into_layer(ListGroupsService);
-
-    let response = service
-        .serve(
-            Context::default(),
-            ListGroupsRequest::default().states_filter(Some(["Empty".into()].into())),
-        )
-        .await?;
-
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
-    assert_eq!(Some([].into()), response.groups);
-
-    Ok(())
-}
 
 /// A group that committed an offset and never joined is listed, in the state a
 /// describe of it reports — and an empty `states_filter` is not a filter (#475).
@@ -64,31 +32,11 @@ async fn req() -> Result<(), Error> {
 async fn a_committed_only_group_is_listed() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    const HOST: &str = "localhost";
-    const PORT: i32 = 9092;
-    const NODE_ID: i32 = 111;
     const GROUP: &str = "committed-only";
     const TOPIC: &str = "pqr";
 
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
-
-    _ = storage
-        .create_topic(
-            CreatableTopic::default()
-                .name(TOPIC.into())
-                .num_partitions(1)
-                .replication_factor(1)
-                .assignments(Some([].into()))
-                .configs(Some([].into())),
-            false,
-        )
-        .await?;
+    let storage = storage().await?;
+    topic(&storage, TOPIC).await?;
 
     for (_, error_code) in storage
         .offset_commit(
@@ -104,21 +52,14 @@ async fn a_committed_only_group_is_listed() -> Result<(), Error> {
         assert_eq!(ErrorCode::None, error_code);
     }
 
-    let service = MapStateLayer::new(|_| storage).into_layer(ListGroupsService);
-
     for states_filter in [None, Some(vec![]), Some(vec!["Empty".to_owned()])] {
-        let response = service
-            .serve(
-                Context::default(),
-                ListGroupsRequest::default().states_filter(states_filter.clone()),
-            )
-            .await?;
-
-        assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
+        let request = ListGroupsRequest::default().states_filter(states_filter.clone());
+        let listed = serve(&storage, ListGroupsService, request).await?;
+        assert_eq!(ErrorCode::None, ErrorCode::try_from(listed.error_code)?);
 
         assert_eq!(
             vec![(GROUP.to_owned(), Some("Empty".to_owned()))],
-            response
+            listed
                 .groups
                 .unwrap_or_default()
                 .into_iter()
@@ -127,6 +68,20 @@ async fn a_committed_only_group_is_listed() -> Result<(), Error> {
             "states_filter: {states_filter:?}",
         );
     }
+
+    Ok(())
+}
+
+/// With no group in the store, a filtered list is empty and not an error.
+#[tokio::test]
+async fn no_group_matches_an_empty_store() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let empty_only = ListGroupsRequest::default().states_filter(Some(vec!["Empty".to_owned()]));
+    let listed = serve(&storage().await?, ListGroupsService, empty_only).await?;
+
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(listed.error_code)?);
+    assert_eq!(Some(Vec::new()), listed.groups);
 
     Ok(())
 }

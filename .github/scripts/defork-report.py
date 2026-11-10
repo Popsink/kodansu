@@ -28,7 +28,8 @@ those lines, and blame matches them back to upstream however the code around
 them changes; there is nothing in them to rewrite. The same holds for a bare
 module declaration (`pub mod join;`): it names a file, and only renaming the
 file changes it. And for a bare crate flag (`#![no_main]`), which a fuzz target
-cannot do without and cannot spell any other way.
+cannot do without and cannot spell any other way. And for a bare `Ok(())`, the
+last line of every fallible test and unit-returning function.
 
 Two measures:
 
@@ -61,6 +62,7 @@ GRANT_LINES = 12
 ATTRIBUTE_OPENER = re.compile(r"^#!?\[[\w:]+\($")
 MODULE_DECLARATION = re.compile(r"^(pub(\([\w: ]+\))? )?mod \w+;$")
 CRATE_FLAG = re.compile(r"^#!\[\w+\]$")
+UNIT_OK = "Ok(())"
 
 
 def syntax_only(text: str) -> bool:
@@ -70,6 +72,7 @@ def syntax_only(text: str) -> bool:
         or bool(ATTRIBUTE_OPENER.match(stripped))
         or bool(MODULE_DECLARATION.match(stripped))
         or bool(CRATE_FLAG.match(stripped))
+        or stripped == UNIT_OK
     )
 
 

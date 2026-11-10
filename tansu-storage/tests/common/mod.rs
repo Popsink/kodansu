@@ -130,6 +130,52 @@ pub(crate) fn cluster_id() -> String {
     Uuid::now_v7().to_string()
 }
 
+/// A storage engine over [`storage_url`], under a fresh [`cluster_id`], for node
+/// 111 advertising `tcp://localhost:9092`: the setup a test needs when nothing
+/// about the broker itself is under test.
+#[allow(dead_code)]
+pub(crate) async fn storage() -> Result<Arc<dyn tansu_storage::Storage>, Error> {
+    let advertised = Url::parse("tcp://localhost:9092")?;
+    let engine = tansu_storage::StorageContainer::builder()
+        .cluster_id(cluster_id())
+        .node_id(111)
+        .advertised_listener(advertised)
+        .storage(storage_url()?);
+    Ok(engine.build().await?)
+}
+
+/// Sends `request` to `service` with `storage` as its state, the way the broker
+/// routes a decoded frame.
+#[allow(dead_code)]
+pub(crate) async fn serve<S, Request>(
+    storage: &Arc<dyn tansu_storage::Storage>,
+    service: S,
+    request: Request,
+) -> Result<S::Response, Error>
+where
+    S: rama::Service<Arc<dyn tansu_storage::Storage>, Request>,
+    Error: From<S::Error>,
+{
+    let state = rama::Context::with_state(Arc::clone(storage));
+    Ok(service.serve(state, request).await?)
+}
+
+/// Creates `name` with one partition, one replica and the broker defaults.
+#[allow(dead_code)]
+pub(crate) async fn topic(
+    storage: &Arc<dyn tansu_storage::Storage>,
+    name: &str,
+) -> Result<(), Error> {
+    let creatable = tansu_sans_io::create_topics_request::CreatableTopic::default()
+        .name(name.to_owned())
+        .num_partitions(1)
+        .replication_factor(1)
+        .assignments(Some(Vec::new()))
+        .configs(Some(Vec::new()));
+    _ = storage.create_topic(creatable, false).await?;
+    Ok(())
+}
+
 pub(crate) fn init_tracing() -> Result<DefaultGuard, Error> {
     use std::{fs::File, sync::Arc, thread};
 
