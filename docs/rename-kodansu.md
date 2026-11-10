@@ -33,7 +33,7 @@ production without producing a compile error, a failing test or a red CI job.
 ## 1. Cargo / crate identity
 
 - [ ] `Cargo.toml` workspace `members` — 10 directory names.
-- [ ] `Cargo.toml` `[workspace.dependencies]` — 10 `tansu-* = { path = … }` entries.
+- [ ] `Cargo.toml` `[workspace.dependencies]` — 9 `tansu-* = { path = … }` entries (the binary crate `tansu` has none: nothing depends on it).
 - [ ] Each `*/Cargo.toml`: `name`, and every `tansu-*.workspace = true` dependency line.
 - [ ] Rename the 10 crate directories themselves.
 - [ ] Rust module paths: `use tansu_storage::…` → `use kodansu_storage::…` across ~180 files.
