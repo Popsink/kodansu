@@ -1,4 +1,3 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
 // Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,49 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{Error, cluster_id, init_tracing, storage_url};
-use bytes::Bytes;
-use rama::{Context, Layer as _, Service, layer::MapStateLayer};
+//! `DeleteRecords`: which offsets truncate a partition and which are refused.
+
 use std::sync::Arc;
-use tansu_sans_io::{
-    DeleteRecordsRequest, DeleteRecordsResponse, ErrorCode,
-    create_topics_request::CreatableTopic,
-    delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic},
-    record::{Record, deflated, inflated},
-};
-use tansu_storage::{DeleteRecordsService, Storage, StorageContainer, Topition};
-use tracing::debug;
-use url::Url;
+
+use bytes::Bytes;
+use tansu_sans_io::delete_records_request::{DeleteRecordsPartition, DeleteRecordsTopic};
+use tansu_sans_io::record::{Record, deflated, inflated};
+use tansu_sans_io::{DeleteRecordsRequest, DeleteRecordsResponse, ErrorCode};
+use tansu_storage::{DeleteRecordsService, Storage, Topition};
+
+use crate::common::{Error, init_tracing, storage, topic};
 
 mod common;
 
 const PARTITION: i32 = 0;
 
-async fn storage() -> Result<Arc<dyn Storage>, Error> {
-    StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(111)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(storage_url()?)
-        .build()
-        .await
-        .map_err(Into::into)
-}
-
 /// A topic with `records` single-record batches on partition 0, so the high
 /// watermark is exactly `records`.
 async fn topic_with(storage: &Arc<dyn Storage>, name: &str, records: i32) -> Result<(), Error> {
-    _ = storage
-        .create_topic(
-            CreatableTopic::default()
-                .name(name.into())
-                .num_partitions(1)
-                .replication_factor(1)
-                .assignments(Some([].into()))
-                .configs(Some([].into())),
-            false,
-        )
-        .await?;
+    topic(storage, name).await?;
 
     let topition = Topition::new(name, PARTITION);
 
@@ -71,44 +47,31 @@ async fn topic_with(storage: &Arc<dyn Storage>, name: &str, records: i32) -> Res
     Ok(())
 }
 
+/// Truncates partition 0 of `name` below `offset`.
 async fn delete_records(
     storage: Arc<dyn Storage>,
     name: &str,
     offset: i64,
 ) -> Result<DeleteRecordsResponse, Error> {
-    MapStateLayer::new(|_| storage)
-        .into_layer(DeleteRecordsService)
-        .serve(
-            Context::default(),
-            DeleteRecordsRequest::default().topics(Some(
-                [DeleteRecordsTopic::default()
-                    .name(name.into())
-                    .partitions(Some(
-                        [DeleteRecordsPartition::default()
-                            .offset(offset)
-                            .partition_index(PARTITION)]
-                        .into(),
-                    ))]
-                .into(),
-            )),
-        )
-        .await
-        .inspect(|response| debug!(?response))
-        .map_err(Into::into)
+    let partition = DeleteRecordsPartition::default()
+        .partition_index(PARTITION)
+        .offset(offset);
+    let topic = DeleteRecordsTopic::default()
+        .name(name.to_owned())
+        .partitions(Some(vec![partition]));
+    let request = DeleteRecordsRequest::default().topics(Some(vec![topic]));
+    let response = common::serve(&storage, DeleteRecordsService, request).await?;
+    tracing::debug!(?response);
+    Ok(response)
 }
 
 /// The one partition result of a single-partition request.
 fn only(response: DeleteRecordsResponse) -> Result<(ErrorCode, i64), Error> {
-    let topics = response.topics.unwrap_or_default();
-    assert_eq!(1, topics.len());
-
-    let partitions = topics[0].partitions.clone().unwrap_or_default();
-    assert_eq!(1, partitions.len());
-
-    Ok((
-        ErrorCode::try_from(partitions[0].error_code)?,
-        partitions[0].low_watermark,
-    ))
+    let [topic] = <[_; 1]>::try_from(response.topics.unwrap_or_default()).expect("one topic");
+    let [partition] =
+        <[_; 1]>::try_from(topic.partitions.unwrap_or_default()).expect("one partition");
+    let error_code = ErrorCode::try_from(partition.error_code)?;
+    Ok((error_code, partition.low_watermark))
 }
 
 /// A truncation inside the log moves the floor to exactly the offset asked for.

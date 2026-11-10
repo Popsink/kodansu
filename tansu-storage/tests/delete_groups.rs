@@ -1,4 +1,3 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
 // Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,57 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{Error, cluster_id, init_tracing, storage_url};
-use rama::{Context, Layer as _, Service, layer::MapStateLayer};
-use tansu_sans_io::{
-    CreateTopicsRequest, DeleteGroupsRequest, ErrorCode, create_topics_request::CreatableTopic,
-};
-use tansu_storage::{
-    CreateTopicsService, DeleteGroupsService, OffsetCommitRequest, Storage, StorageContainer,
-    Topition,
-};
-use url::Url;
+//! `DeleteGroups` of a group that does not exist, and of ids that would
+//! widen the deletion to every group.
+
+use tansu_sans_io::create_topics_request::CreatableTopic;
+use tansu_sans_io::{CreateTopicsRequest, DeleteGroupsRequest, ErrorCode};
+use tansu_storage::{CreateTopicsService, DeleteGroupsService, OffsetCommitRequest, Topition};
+
+use crate::common::{Error, init_tracing, serve, storage};
 
 mod common;
-
-#[tokio::test]
-async fn delete_non_existent() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(111)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
-
-    let service = MapStateLayer::new(|_| storage).into_layer(DeleteGroupsService);
-
-    let group_id = "abcba";
-
-    let response = service
-        .serve(
-            Context::default(),
-            DeleteGroupsRequest::default().groups_names(Some([group_id.into()].into())),
-        )
-        .await?;
-
-    let results = response.results.unwrap_or_default();
-    assert_eq!(1, results.len());
-    assert_eq!(group_id, results[0].group_id.as_str());
-
-    // This test's own name is the assertion: deleting a group that does not
-    // exist reports that it does not exist (#445). It answered `NONE` until
-    // then, because existence was inferred from a delete — and a delete of an
-    // absent key succeeds, on S3 and on `InMemory` alike.
-    assert_eq!(
-        ErrorCode::GroupIdNotFound,
-        ErrorCode::try_from(results[0].error_code)?
-    );
-
-    Ok(())
-}
 
 /// A `DeleteGroups` carrying a group id that resolves to the root of the
 /// consumer tree is refused, and the committed offsets of every other group
@@ -81,35 +39,20 @@ async fn delete_non_existent() -> Result<(), Error> {
 async fn empty_group_id_is_refused_and_keeps_committed_offsets() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(111)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
+    let storage = storage().await?;
 
     let topic = "bystander";
 
-    let created = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage)
-            .into_layer(CreateTopicsService)
-            .serve(
-                Context::default(),
-                CreateTopicsRequest::default()
-                    .topics(Some(vec![
-                        CreatableTopic::default()
-                            .name(topic.into())
-                            .num_partitions(1)
-                            .replication_factor(1)
-                            .assignments(Some([].into()))
-                            .configs(Some([].into())),
-                    ]))
-                    .validate_only(Some(false)),
-            )
-            .await?
-    };
+    let bystander = CreatableTopic::default()
+        .name(topic.to_owned())
+        .num_partitions(1)
+        .replication_factor(1)
+        .assignments(Some(Vec::new()))
+        .configs(Some(Vec::new()));
+    let create = CreateTopicsRequest::default()
+        .topics(Some(vec![bystander]))
+        .validate_only(Some(false));
+    let created = serve(&storage, CreateTopicsService, create).await?;
     assert_eq!(
         i16::from(ErrorCode::None),
         created.topics.unwrap_or_default()[0].error_code
@@ -138,17 +81,9 @@ async fn empty_group_id_is_refused_and_keeps_committed_offsets() -> Result<(), E
     }
 
     let refused = ["", "/", "///"];
-    let response = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage)
-            .into_layer(DeleteGroupsService)
-            .serve(
-                Context::default(),
-                DeleteGroupsRequest::default()
-                    .groups_names(Some(refused.iter().map(|group| (*group).into()).collect())),
-            )
-            .await?
-    };
+    let names = refused.iter().map(|group| (*group).to_owned()).collect();
+    let delete = DeleteGroupsRequest::default().groups_names(Some(names));
+    let response = serve(&storage, DeleteGroupsService, delete).await?;
 
     let results = response.results.unwrap_or_default();
     assert_eq!(refused.len(), results.len());
@@ -176,6 +111,33 @@ async fn empty_group_id_is_refused_and_keeps_committed_offsets() -> Result<(), E
             "{group} lost its committed offset to a refused group id"
         );
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn deleting_a_missing_group_reports_it_not_found() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let missing = "abcba";
+    let request = DeleteGroupsRequest::default().groups_names(Some(vec![missing.to_owned()]));
+    let response = serve(&storage().await?, DeleteGroupsService, request).await?;
+
+    let [result] = response
+        .results
+        .unwrap_or_default()
+        .try_into()
+        .expect("one result");
+    assert_eq!(missing, result.group_id);
+
+    // This test's own name is the assertion: deleting a group that does not
+    // exist reports that it does not exist (#445). It answered `NONE` until
+    // then, because existence was inferred from a delete — and a delete of an
+    // absent key succeeds, on S3 and on `InMemory` alike.
+    assert_eq!(
+        ErrorCode::GroupIdNotFound,
+        ErrorCode::try_from(result.error_code)?
+    );
 
     Ok(())
 }

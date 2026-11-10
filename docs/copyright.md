@@ -183,6 +183,11 @@ it. An attribute with arguments (`#![cfg_attr(…)]`, `#![doc = …]`) is still
 counted. The five small fuzz targets were rewritten and left `inherited` with
 this rule; `generate_seeds.rs` stays.
 
+So is a bare `Ok(())` on its own line. It ends every test that returns a
+`Result`, and the four small `tansu-storage` tests rewritten in the same change
+kept nothing else from upstream. `Ok(value)` with anything inside the brackets
+is still counted.
+
 The report gives two numbers per file, because one blame mode is not enough:
 
 | measure | `git blame` | catches | misses |
