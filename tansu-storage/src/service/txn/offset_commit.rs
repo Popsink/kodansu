@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,49 +12,38 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rama::{Context, Service};
-use tansu_sans_io::{ApiKey, TxnOffsetCommitResponse};
-use tracing::instrument;
+//! `TxnOffsetCommit`: stages a group's offsets inside a transaction.
 
-use crate::{Error, Result, Storage};
+use tansu_sans_io::{TxnOffsetCommitRequest, TxnOffsetCommitResponse};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`tansu_sans_io::TxnOffsetCommitRequest`] returning [`TxnOffsetCommitResponse`].
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct OffsetCommitService;
-
-impl ApiKey for OffsetCommitService {
-    const KEY: i16 = tansu_sans_io::TxnOffsetCommitRequest::KEY;
-}
-
-impl<G> Service<G, tansu_sans_io::TxnOffsetCommitRequest> for OffsetCommitService
-where
-    G: Storage,
-{
-    type Response = TxnOffsetCommitResponse;
-    type Error = Error;
-
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: tansu_sans_io::TxnOffsetCommitRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        let responses = ctx
-            .state()
-            .txn_offset_commit(crate::TxnOffsetCommitRequest {
-                transaction_id: req.transactional_id.to_owned(),
-                group_id: req.group_id.to_owned(),
-                producer_id: req.producer_id,
-                producer_epoch: req.producer_epoch,
-                generation_id: req.generation_id,
-                member_id: req.member_id,
-                group_instance_id: req.group_instance_id,
-                topics: req.topics.unwrap_or_default(),
-            })
-            .await?;
-
-        Ok(TxnOffsetCommitResponse::default()
-            .throttle_time_ms(0)
-            .topics(Some(responses)))
+storage_service! {
+    /// Passes the commit to [`Storage::txn_offset_commit`](crate::Storage::txn_offset_commit),
+    /// which holds the offsets until the transaction ends, and returns its
+    /// per-partition results.
+    OffsetCommitService: TxnOffsetCommitRequest => TxnOffsetCommitResponse,
+    |ctx, req| {
+        let TxnOffsetCommitRequest {
+            transactional_id,
+            group_id,
+            producer_id,
+            producer_epoch,
+            generation_id,
+            member_id,
+            group_instance_id,
+            topics,
+            ..
+        } = req;
+        let commit = crate::TxnOffsetCommitRequest {
+            transaction_id: transactional_id,
+            group_id,
+            producer_id,
+            producer_epoch,
+            generation_id,
+            member_id,
+            group_instance_id,
+            topics: topics.unwrap_or_default(),
+        };
+        let staged = ctx.state().txn_offset_commit(commit).await?;
+        Ok(TxnOffsetCommitResponse::default().topics(Some(staged)))
     }
 }
