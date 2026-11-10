@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,73 +12,55 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Error, Result, Storage, TopicId};
-use rama::{Context, Service};
-use tansu_sans_io::{
-    ApiKey, ErrorCode, ListPartitionReassignmentsRequest, ListPartitionReassignmentsResponse,
-    list_partition_reassignments_response::{
-        OngoingPartitionReassignment, OngoingTopicReassignment,
-    },
-};
-use tracing::instrument;
+//! `ListPartitionReassignments`: always nothing in flight.
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`ListPartitionReassignmentsRequest`] returning [`ListPartitionReassignmentsResponse`].
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ListPartitionReassignmentsService;
+use tansu_sans_io::list_partition_reassignments_response::OngoingPartitionReassignment;
+use tansu_sans_io::list_partition_reassignments_response::OngoingTopicReassignment;
+use tansu_sans_io::metadata_response::{MetadataResponsePartition, MetadataResponseTopic};
+use tansu_sans_io::{ListPartitionReassignmentsRequest, ListPartitionReassignmentsResponse};
 
-impl ApiKey for ListPartitionReassignmentsService {
-    const KEY: i16 = ListPartitionReassignmentsRequest::KEY;
+use crate::TopicId;
+
+storage_service! {
+    /// Reports each requested topic (all of them if none are named) with its
+    /// current replicas and empty adding and removing lists. Replicas never
+    /// move, so a reassignment is never in progress, but a client polling for
+    /// one still needs to see the topic.
+    ListPartitionReassignmentsService:
+        ListPartitionReassignmentsRequest => ListPartitionReassignmentsResponse,
+    |ctx, req| {
+        let wanted: Option<Vec<TopicId>> = req
+            .topics
+            .map(|requested| requested.into_iter().map(|topic| topic.name.into()).collect());
+        let metadata = ctx.state().metadata(wanted.as_deref()).await?;
+        let topics: Vec<_> = metadata.topics().iter().filter_map(settled).collect();
+        Ok(ListPartitionReassignmentsResponse::default().topics(topics.into()))
+    }
 }
 
-impl<G> Service<G, ListPartitionReassignmentsRequest> for ListPartitionReassignmentsService
-where
-    G: Storage,
-{
-    type Response = ListPartitionReassignmentsResponse;
-    type Error = Error;
+/// A named topic with no reassignment under way; `None` for a topic without
+/// a name, which the response has no way to identify.
+fn settled(topic: &MetadataResponseTopic) -> Option<OngoingTopicReassignment> {
+    let name = topic.name.clone()?;
+    let partitions = topic
+        .partitions
+        .as_deref()
+        .map(|partitions| partitions.iter().map(unmoved).collect());
+    let settled = OngoingTopicReassignment::default().name(name);
+    Some(settled.partitions(partitions))
+}
 
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: ListPartitionReassignmentsRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        let topics = req.topics.map(|topics| {
-            topics
-                .iter()
-                .map(|topic| TopicId::Name(topic.name.as_str().into()))
-                .collect::<Vec<_>>()
-        });
-
-        let metadata = ctx.state().metadata(topics.as_deref()).await?;
-
-        let mut ongoing = vec![];
-
-        for topic in metadata.topics() {
-            let Some(ref name) = topic.name else { continue };
-
-            ongoing.push(
-                OngoingTopicReassignment::default()
-                    .name(name.into())
-                    .partitions(topic.partitions.as_ref().map(|partitions| {
-                        partitions
-                            .iter()
-                            .map(|partition| {
-                                OngoingPartitionReassignment::default()
-                                    .partition_index(partition.partition_index)
-                                    .replicas(partition.replica_nodes.clone())
-                                    .adding_replicas(Some(vec![]))
-                                    .removing_replicas(Some(vec![]))
-                            })
-                            .collect::<Vec<_>>()
-                    })),
-            );
-        }
-
-        Ok(ListPartitionReassignmentsResponse::default()
-            .throttle_time_ms(0)
-            .error_code(ErrorCode::None.into())
-            .error_message(None)
-            .topics(Some(ongoing)))
-    }
+/// A partition staying on the replicas it has.
+fn unmoved(partition: &MetadataResponsePartition) -> OngoingPartitionReassignment {
+    let MetadataResponsePartition {
+        partition_index,
+        replica_nodes,
+        ..
+    } = partition;
+    let reassignment = OngoingPartitionReassignment::default();
+    reassignment
+        .partition_index(*partition_index)
+        .replicas(replica_nodes.clone())
+        .adding_replicas(Some(Vec::new()))
+        .removing_replicas(Some(Vec::new()))
 }
