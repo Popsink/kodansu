@@ -177,6 +177,12 @@ file. Four facade files had nothing else left from upstream —
 left `inherited` with this rule. A `mod` with a body (`mod tests {`) is still
 counted.
 
+So is a bare crate flag (`#![no_main]`). libfuzzer supplies `main`, so every fuzz
+target has to start with exactly that line, and there is no other way to write
+it. An attribute with arguments (`#![cfg_attr(…)]`, `#![doc = …]`) is still
+counted. The five small fuzz targets were rewritten and left `inherited` with
+this rule; `generate_seeds.rs` stays.
+
 The report gives two numbers per file, because one blame mode is not enough:
 
 | measure | `git blame` | catches | misses |
