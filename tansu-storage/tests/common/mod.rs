@@ -130,15 +130,27 @@ pub(crate) fn cluster_id() -> String {
     Uuid::now_v7().to_string()
 }
 
-/// A storage engine over [`storage_url`], under a fresh [`cluster_id`], for node
-/// 111 advertising `tcp://localhost:9092`: the setup a test needs when nothing
-/// about the broker itself is under test.
+/// The node id [`storage`] runs as.
+#[allow(dead_code)]
+pub(crate) const NODE_ID: i32 = 111;
+
+/// The host [`storage`] advertises.
+#[allow(dead_code)]
+pub(crate) const HOST: &str = "localhost";
+
+/// The port [`storage`] advertises.
+#[allow(dead_code)]
+pub(crate) const PORT: i32 = 9092;
+
+/// A storage engine over [`storage_url`], under a fresh [`cluster_id`], for
+/// [`NODE_ID`] advertising [`HOST`] and [`PORT`]: the setup a test needs when
+/// nothing about the broker itself is under test.
 #[allow(dead_code)]
 pub(crate) async fn storage() -> Result<Arc<dyn tansu_storage::Storage>, Error> {
-    let advertised = Url::parse("tcp://localhost:9092")?;
+    let advertised = Url::parse(&format!("tcp://{HOST}:{PORT}"))?;
     let engine = tansu_storage::StorageContainer::builder()
         .cluster_id(cluster_id())
-        .node_id(111)
+        .node_id(NODE_ID)
         .advertised_listener(advertised)
         .storage(storage_url()?);
     Ok(engine.build().await?)

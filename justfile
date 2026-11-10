@@ -558,6 +558,12 @@ fmt:
 # `tansu-storage/tests/common` gains `storage`, `serve` and `topic`, and four
 # tests drop the container builder and the `MapStateLayer` wrapping they each
 # spelled out. Their cited `//` blocks stay; none was added or removed.
+#   defork  -121 lines, six tests merged into fresh_store  3178 -> 3178  2.6880 -> 2.6909
+#
+# Six one-test files become one, `tests/fresh_store.rs`, and drop the container
+# builder and the `MapStateLayer` wrapping for `storage` and `serve`; `common`
+# names the node id, host and port they assert against. Their `//` blocks move
+# unchanged.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -568,7 +574,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6881" top="12":
+comments ceiling="2.6909" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
