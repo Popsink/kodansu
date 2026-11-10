@@ -534,6 +534,11 @@ fmt:
 # rejoins with the consumer protocol, and a consumer group serves classic
 # members. Every `//` block added cites #626; the reasoning is in `///` on the
 # new `migration` module, and most of the lines are it and its tests.
+#   defork  -88 lines, storage_service!  3176 -> 3176  2.6795 -> 2.6809
+#
+# Five storage services lose the struct-and-impl scaffolding every service
+# repeats to a `storage_service!` macro (Popsink/data-plane#5878). No `//` line
+# was added or removed; code shrank, so the ratio rose.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -544,7 +549,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6804" top="12":
+comments ceiling="2.6809" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
