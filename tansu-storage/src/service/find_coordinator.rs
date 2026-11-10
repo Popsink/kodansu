@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,108 +12,41 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rama::{Context, Service};
-use tansu_sans_io::{
-    ApiKey, ErrorCode, FindCoordinatorRequest, FindCoordinatorResponse,
-    find_coordinator_response::Coordinator,
-};
-use tracing::instrument;
+//! `FindCoordinator`: every group and transaction is coordinated here.
 
-use crate::{Error, Result, Storage};
+use tansu_sans_io::find_coordinator_response::Coordinator;
+use tansu_sans_io::{ErrorCode, FindCoordinatorRequest, FindCoordinatorResponse};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`FindCoordinatorRequest`] returning [`FindCoordinatorResponse`].
-/// ```
-/// use rama::{Context, Layer as _, Service, layer::MapStateLayer};
-/// use tansu_sans_io::{ErrorCode, FindCoordinatorRequest};
-/// use tansu_storage::{Error, FindCoordinatorService, StorageContainer};
-/// use url::Url;
-///
-/// # #[tokio::main]
-/// # async fn main() -> Result<(), Error> {
-/// const HOST: &str = "localhost";
-/// const PORT: i32 = 9092;
-/// const NODE_ID: i32 = 111;
-///
-/// let storage = StorageContainer::builder()
-///     .cluster_id("tansu")
-///     .node_id(NODE_ID)
-///     .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-///     .storage(Url::parse("memory://tansu/")?)
-///     .build()
-///     .await?;
-///
-/// let service = MapStateLayer::new(|_| storage).into_layer(FindCoordinatorService);
-///
-/// let response = service
-///     .serve(
-///         Context::default(),
-///         FindCoordinatorRequest::default()
-///             .key(Some("abcba".into()))
-///             .key_type(Some(0))
-///             .coordinator_keys(Some(["xyzyx".into()].into())),
-///     )
-///     .await?;
-///
-/// assert_eq!(
-///     Some(ErrorCode::None.into()),
-///     if let Some(error_code) = response.error_code {
-///         ErrorCode::try_from(error_code).map(Some)?
-///     } else {
-///         None
-///     }
-/// );
-///
-/// assert_eq!(Some(NODE_ID), response.node_id);
-/// assert_eq!(Some(HOST), response.host.as_deref());
-/// assert_eq!(Some(PORT), response.port);
-/// # Ok(())
-/// # }
-/// ```
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct FindCoordinatorService;
+use super::handler::UNTHROTTLED;
 
-impl ApiKey for FindCoordinatorService {
-    const KEY: i16 = FindCoordinatorRequest::KEY;
-}
+storage_service! {
+    /// Names this broker, at its advertised listener, as the coordinator for
+    /// whatever the client asked about. Up to v3 the answer is the top-level
+    /// node, host and port, for the one key in the request; from v4 it is one
+    /// [`Coordinator`] per batched key. Both carry the same broker.
+    ///
+    /// `tests/find_coordinator.rs` serves a request end to end.
+    FindCoordinatorService: FindCoordinatorRequest => FindCoordinatorResponse,
+    |ctx, req| {
+        let storage = ctx.state();
+        let node = storage.node().await?;
+        let listener = storage.advertised_listener().await?;
+        let this = Coordinator::default()
+            .node_id(node)
+            .host(listener.host_str().unwrap_or("localhost").to_owned())
+            .port(listener.port().map_or(9092, i32::from));
 
-impl<G> Service<G, FindCoordinatorRequest> for FindCoordinatorService
-where
-    G: Storage,
-{
-    type Response = FindCoordinatorResponse;
-    type Error = Error;
-
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: FindCoordinatorRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        let node_id = ctx.state().node().await?;
-
-        let listener = ctx.state().advertised_listener().await?;
-        let host = listener.host_str().unwrap_or("localhost");
-        let port = i32::from(listener.port().unwrap_or(9092));
-
-        Ok(FindCoordinatorResponse::default()
-            .throttle_time_ms(Some(0))
-            .error_code(Some(ErrorCode::None.into()))
-            .error_message(Some("NONE".into()))
-            .node_id(Some(node_id))
-            .host(Some(host.into()))
-            .port(Some(port))
-            .coordinators(req.coordinator_keys.map(|keys| {
-                keys.iter()
-                    .map(|key| {
-                        Coordinator::default()
-                            .key(key.to_string())
-                            .node_id(node_id)
-                            .host(host.into())
-                            .port(port)
-                            .error_code(ErrorCode::None.into())
-                            .error_message(None)
-                    })
-                    .collect()
-            })))
+        let coordinators = req
+            .coordinator_keys
+            .map(|keys| keys.into_iter().map(|key| this.clone().key(key)).collect());
+        let response = FindCoordinatorResponse::default()
+            .throttle_time_ms(UNTHROTTLED)
+            .error_code(Some(i16::from(ErrorCode::None)))
+            .error_message(Some(String::from("NONE")))
+            .node_id(Some(this.node_id))
+            .host(Some(this.host))
+            .port(Some(this.port))
+            .coordinators(coordinators);
+        Ok(response)
     }
 }

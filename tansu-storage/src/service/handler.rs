@@ -28,6 +28,10 @@
 /// `serve` carries `#[instrument]` with both arguments skipped: the span names
 /// the service, and neither the context nor the request has a useful `Debug`
 /// at that level.
+/// The `throttle_time_ms` of a response that was not held back, for the APIs
+/// that made the field optional: no quota delays a request here.
+pub(crate) const UNTHROTTLED: Option<i32> = Some(0);
+
 macro_rules! storage_service {
     (
         $(#[$doc:meta])*
