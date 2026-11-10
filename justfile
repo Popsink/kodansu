@@ -544,6 +544,11 @@ fmt:
 # Four describe services and ListPartitionReassignments move to the macro and
 # lose doc examples that repeated their `tests/` file line for line. Again no
 # `//` line moved; only code went.
+#   defork  -190 lines, three more on storage_service!  3176 -> 3176  2.6829 -> 2.6843
+#
+# FindCoordinator, InitProducerId and ListGroups move to the macro and drop
+# doc examples their `tests/` files already hold. ListGroups keeps its two
+# cited `//` blocks; none was added or removed.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -554,7 +559,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6829" top="12":
+comments ceiling="2.6843" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

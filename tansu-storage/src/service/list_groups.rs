@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,73 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rama::{Context, Service};
-use tansu_sans_io::{ApiKey, ErrorCode, ListGroupsRequest, ListGroupsResponse};
-use tracing::instrument;
+//! `ListGroups`: the groups this principal may see, filtered by state and type.
 
 use tansu_sans_io::acl::{Operation, Resource};
+use tansu_sans_io::{ListGroupsRequest, ListGroupsResponse};
 
-use crate::{Error, Result, Storage, authorized};
+use super::handler::UNTHROTTLED;
+use crate::authorized;
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`ListGroupsRequest`] returning [`ListGroupsResponse`].
-/// ```
-/// use rama::{Context, Layer as _, Service, layer::MapStateLayer};
-/// use tansu_sans_io::{ErrorCode, ListGroupsRequest};
-/// use tansu_storage::{Error, ListGroupsService, StorageContainer};
-/// use url::Url;
-///
-/// # #[tokio::main]
-/// # async fn main() -> Result<(), Error> {
-/// const HOST: &str = "localhost";
-/// const PORT: i32 = 9092;
-/// const NODE_ID: i32 = 111;
-///
-/// let storage = StorageContainer::builder()
-///     .cluster_id("tansu")
-///     .node_id(NODE_ID)
-///     .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-///     .storage(Url::parse("memory://tansu/")?)
-///     .build()
-///     .await?;
-///
-/// let service = MapStateLayer::new(|_| storage).into_layer(ListGroupsService);
-///
-/// let response = service
-///     .serve(
-///         Context::default(),
-///         ListGroupsRequest::default().states_filter(Some(["Empty".into()].into())),
-///     )
-///     .await?;
-///
-/// assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
-/// assert_eq!(Some([].into()), response.groups);
-/// # Ok(())
-/// # }
-/// ```
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ListGroupsService;
-
-impl ApiKey for ListGroupsService {
-    const KEY: i16 = ListGroupsRequest::KEY;
-}
-
-impl<G> Service<G, ListGroupsRequest> for ListGroupsService
-where
-    G: Storage,
-{
-    type Response = ListGroupsResponse;
-    type Error = Error;
-
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: ListGroupsRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        let listed = ctx
-            .state()
-            .list_groups(req.states_filter.as_deref())
-            .await?;
+storage_service! {
+    /// Lists the groups [`Storage::list_groups`](crate::Storage::list_groups)
+    /// returns for the state filter, keeps those matching the type filter, and
+    /// drops any the principal may not `Describe`.
+    ///
+    /// `tests/list_groups.rs` covers the filters, including an empty one.
+    ListGroupsService: ListGroupsRequest => ListGroupsResponse,
+    |ctx, req| {
+        let ListGroupsRequest {
+            states_filter,
+            types_filter,
+            ..
+        } = req;
+        let listed = ctx.state().list_groups(states_filter.as_deref()).await?;
 
         // Omitted rather than reported, unlike a named `Metadata` topic: this
         // request names nothing, so there is no client expectation to answer,
@@ -89,8 +44,7 @@ where
 
         // KIP-848's `TypesFilter` (#612): as with states, an empty filter is
         // no filter, and Kafka matches the type names case-insensitively.
-        let types = req
-            .types_filter
+        let types = types_filter
             .filter(|types| !types.is_empty())
             .map(|types| {
                 types
@@ -109,21 +63,14 @@ where
                 continue;
             }
 
-            if authorized(
-                &ctx,
-                Resource::Group,
-                group.group_id.as_str(),
-                Operation::Describe,
-            )
-            .await
-            {
+            let id = group.group_id.as_str();
+            if authorized(&ctx, Resource::Group, id, Operation::Describe).await {
                 groups.push(group);
             }
         }
 
         Ok(ListGroupsResponse::default()
-            .throttle_time_ms(Some(0))
-            .error_code(ErrorCode::None.into())
+            .throttle_time_ms(UNTHROTTLED)
             .groups(Some(groups)))
     }
 }

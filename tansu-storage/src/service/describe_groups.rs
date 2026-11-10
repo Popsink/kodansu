@@ -36,9 +36,8 @@ storage_service! {
             .describe_groups(groups.as_deref(), with_operations)
             .await?;
         let groups: Vec<_> = described.iter().map(DescribedGroup::from).collect();
-        let no_throttle = Some(0);
         Ok(DescribeGroupsResponse::default()
-            .throttle_time_ms(no_throttle)
+            .throttle_time_ms(super::handler::UNTHROTTLED)
             .groups(groups.into()))
     }
 }
