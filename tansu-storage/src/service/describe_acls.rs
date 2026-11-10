@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,37 +15,21 @@
 //! `DescribeAcls`, which used to answer an empty list whatever was stored
 //! (#363).
 
-use rama::{Context, Service};
 use tansu_sans_io::{
-    ApiKey, DescribeAclsRequest, DescribeAclsResponse, ErrorCode,
+    DescribeAclsRequest, DescribeAclsResponse, ErrorCode,
     describe_acls_response::{AclDescription, DescribeAclsResource},
 };
 
 use tansu_sans_io::acl::Operation;
 
-use crate::{
-    AclBinding, AclFilter, Error, NO_AUTHORIZER_DESCRIBE, Storage, authorized_cluster, enforcing,
-};
+use crate::{AclBinding, AclFilter, NO_AUTHORIZER_DESCRIBE, authorized_cluster, enforcing};
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct DescribeAclsService;
-
-impl ApiKey for DescribeAclsService {
-    const KEY: i16 = DescribeAclsRequest::KEY;
-}
-
-impl<G> Service<G, DescribeAclsRequest> for DescribeAclsService
-where
-    G: Storage,
-{
-    type Response = DescribeAclsResponse;
-    type Error = Error;
-
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: DescribeAclsRequest,
-    ) -> Result<Self::Response, Self::Error> {
+storage_service! {
+    /// Reads back the stored ACL bindings matching the filter, once an
+    /// authorizer is enforcing them and the principal may `Describe` the
+    /// cluster.
+    DescribeAclsService: DescribeAclsRequest => DescribeAclsResponse,
+    |ctx, req| {
         // Kafka refuses this one too, and refusing is what makes an audit
         // honest: reading an empty list off a broker that has no authorizer
         // says "no rules", when the truth is "no rules are possible" — and a
