@@ -67,11 +67,6 @@ ports = [
 # upstream-authored, which is why classification keys off the authorship of the
 # commit that added a file, never off `git diff --diff-filter=A` alone.)
 inherited = [
-    "fuzz/fuzz_targets/fuzz_deflated_batch.rs",
-    "fuzz/fuzz_targets/fuzz_member_metadata.rs",
-    "fuzz/fuzz_targets/fuzz_request_decode.rs",
-    "fuzz/fuzz_targets/fuzz_response_decode.rs",
-    "fuzz/fuzz_targets/fuzz_varint.rs",
     "fuzz/fuzz_targets/generate_seeds.rs",
     "tansu-auth/src/authenticate.rs",
     "tansu-auth/src/handshake.rs",

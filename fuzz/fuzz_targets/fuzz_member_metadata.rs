@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,12 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//! The consumer protocol's member metadata, which a group member sends as an
+//! opaque blob inside `JoinGroup` and the broker decodes.
 
 #![no_main]
-use bytes::Bytes;
-use libfuzzer_sys::fuzz_target;
-use tansu_sans_io::consumer::MemberMetadata;
 
-fuzz_target!(|data: &[u8]| {
-    let _ = MemberMetadata::try_from(Bytes::copy_from_slice(data));
+libfuzzer_sys::fuzz_target!(|input: &[u8]| {
+    _ = tansu_sans_io::consumer::MemberMetadata::try_from(bytes::Bytes::from(input.to_vec()));
 });
