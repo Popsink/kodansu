@@ -178,14 +178,25 @@ pub(crate) async fn topic(
     storage: &Arc<dyn tansu_storage::Storage>,
     name: &str,
 ) -> Result<(), Error> {
+    _ = topic_partitioned(storage, name, 1).await?;
+    Ok(())
+}
+
+/// Creates `name` with `partitions` partitions, one replica and the broker
+/// defaults, answering the id the store gave it.
+#[allow(dead_code)]
+pub(crate) async fn topic_partitioned(
+    storage: &Arc<dyn tansu_storage::Storage>,
+    name: &str,
+    partitions: i32,
+) -> Result<Uuid, Error> {
     let creatable = tansu_sans_io::create_topics_request::CreatableTopic::default()
         .name(name.to_owned())
-        .num_partitions(1)
+        .num_partitions(partitions)
         .replication_factor(1)
         .assignments(Some(Vec::new()))
         .configs(Some(Vec::new()));
-    _ = storage.create_topic(creatable, false).await?;
-    Ok(())
+    Ok(storage.create_topic(creatable, false).await?)
 }
 
 pub(crate) fn init_tracing() -> Result<DefaultGuard, Error> {

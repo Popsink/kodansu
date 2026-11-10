@@ -1,4 +1,3 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
 // Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,48 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{Error, cluster_id, init_tracing, storage_url};
-use rama::{Context, Layer as _, Service, layer::MapStateLayer};
-use tansu_sans_io::{ErrorCode, GetTelemetrySubscriptionsRequest};
-use tansu_storage::{GetTelemetrySubscriptionsService, StorageContainer};
-use url::Url;
+//! `GetTelemetrySubscriptions`: the instance id a client is given and keeps,
+//! and how long it is told to wait.
+
+use tansu_sans_io::{
+    ErrorCode, GetTelemetrySubscriptionsRequest, GetTelemetrySubscriptionsResponse,
+};
+use tansu_storage::GetTelemetrySubscriptionsService;
+
+use crate::common::{Error, init_tracing, serve, storage};
 
 mod common;
 
-#[tokio::test]
-async fn req() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    const HOST: &str = "localhost";
-    const PORT: i32 = 9092;
-    const NODE_ID: i32 = 111;
-
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
-
-    let service = MapStateLayer::new(|_| storage).into_layer(GetTelemetrySubscriptionsService);
-
-    let client_instance_id = [0; 16];
-
-    let response = service
-        .serve(
-            Context::default(),
-            GetTelemetrySubscriptionsRequest::default().client_instance_id(client_instance_id),
-        )
-        .await?;
-
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
-
-    // "must be set to 0 on the first request" — so this one is assigned an id.
-    assert_ne!([0; 16], response.client_instance_id);
-
-    Ok(())
-}
+/// The id a client presents before it has been given one.
+const UNASSIGNED: [u8; 16] = [0; 16];
 
 /// A client is answered with the id it presents (#515).
 ///
@@ -76,34 +47,16 @@ async fn req() -> Result<(), Error> {
 async fn an_already_assigned_instance_id_is_not_reassigned() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(111)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
+    let storage = storage().await?;
+    let ask = |id| GetTelemetrySubscriptionsRequest::default().client_instance_id(id);
 
-    let service = MapStateLayer::new(|_| storage).into_layer(GetTelemetrySubscriptionsService);
-
-    let assigned = service
-        .serve(
-            Context::default(),
-            GetTelemetrySubscriptionsRequest::default().client_instance_id([0; 16]),
-        )
-        .await?
-        .client_instance_id;
-
-    assert_ne!([0; 16], assigned, "a zero id is assigned one");
+    let first = serve(&storage, GetTelemetrySubscriptionsService, ask(UNASSIGNED)).await?;
+    let assigned = first.client_instance_id;
+    assert_ne!(UNASSIGNED, assigned, "a zero id is assigned one");
 
     // The client comes back carrying it. It is already identified, so there is
     // nothing to assign.
-    let returning = service
-        .serve(
-            Context::default(),
-            GetTelemetrySubscriptionsRequest::default().client_instance_id(assigned),
-        )
-        .await?;
+    let returning = serve(&storage, GetTelemetrySubscriptionsService, ask(assigned)).await?;
 
     assert_eq!(ErrorCode::None, ErrorCode::try_from(returning.error_code)?);
     assert_eq!(
@@ -111,7 +64,7 @@ async fn an_already_assigned_instance_id_is_not_reassigned() -> Result<(), Error
         "an id the client already holds must be echoed, not reassigned",
     );
     assert_ne!(
-        [0; 16], returning.client_instance_id,
+        UNASSIGNED, returning.client_instance_id,
         "a zero id in a response is rejected by the reference client on sight",
     );
 
@@ -132,22 +85,8 @@ async fn an_already_assigned_instance_id_is_not_reassigned() -> Result<(), Error
 async fn a_client_with_no_subscription_is_told_to_wait_minutes_not_seconds() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(111)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
-
-    let service = MapStateLayer::new(|_| storage).into_layer(GetTelemetrySubscriptionsService);
-
-    let response = service
-        .serve(
-            Context::default(),
-            GetTelemetrySubscriptionsRequest::default().client_instance_id([0; 16]),
-        )
-        .await?;
+    let request = GetTelemetrySubscriptionsRequest::default().client_instance_id(UNASSIGNED);
+    let response = serve(&storage().await?, GetTelemetrySubscriptionsService, request).await?;
 
     assert_eq!(
         Some(0),
@@ -163,6 +102,25 @@ async fn a_client_with_no_subscription_is_told_to_wait_minutes_not_seconds() -> 
          traffic",
         response.push_interval_ms,
     );
+
+    Ok(())
+}
+
+/// A client asking without an id is given one.
+#[tokio::test]
+async fn an_unassigned_client_is_given_an_instance_id() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let request = GetTelemetrySubscriptionsRequest::default().client_instance_id(UNASSIGNED);
+    let GetTelemetrySubscriptionsResponse {
+        error_code,
+        client_instance_id,
+        ..
+    } = serve(&storage().await?, GetTelemetrySubscriptionsService, request).await?;
+
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(error_code)?);
+    // "must be set to 0 on the first request" — so this one is assigned an id.
+    assert_ne!(UNASSIGNED, client_instance_id);
 
     Ok(())
 }
