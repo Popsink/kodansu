@@ -179,7 +179,6 @@ inherited = [
     "tansu-storage/src/dynostore/metadata.rs",
     "tansu-storage/src/dynostore/opticon.rs",
     "tansu-storage/src/dynostore/tests.rs",
-    "tansu-storage/src/dynostore/tests/latency.rs",
     "tansu-storage/src/gcs/limit.rs",
     "tansu-storage/src/latency.rs",
     "tansu-storage/src/lib.rs",

@@ -621,6 +621,14 @@ fmt:
 # `group_service!` macro and `respond`/`answered` in `group/handler.rs` carry
 # them once. The fallback's cited #300 block, repeated five times, becomes
 # `answered`'s doc comment; no uncited `//` line was added or removed.
+#   defork  -1119 lines, the dynostore latency tests on ThrottledStore  3169 -> 3168  2.7222 -> 2.7478
+#
+# `dynostore/tests/latency.rs` carried its own latency-introducing
+# `ObjectStore` and spelled out CreateTopics, seven Produce calls, a Fetch
+# and seven per-batch checks in each of nine tests. `object_store`'s
+# `ThrottledStore` delays the same calls, and `engine`, `produce_all`,
+# `fetch` and `assert_took` carry the rest. The cited #428 note went with the
+# wrapper it described; one uncited line became a test's doc comment.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -631,7 +639,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7223" top="12":
+comments ceiling="2.7478" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
