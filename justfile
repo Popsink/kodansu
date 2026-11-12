@@ -569,6 +569,12 @@ fmt:
 # `tests/metadata.rs` and `tests/get_telemetry_subscriptions.rs` drop their
 # container builders for `storage`, `serve` and a new `topic_partitioned`.
 # Their cited `//` lines stay as they were.
+#   defork  -128 lines, the Fetch tests on the shared setup  3178 -> 3178  2.6926 -> 2.6957
+#
+# `tests/fetch.rs` drops two container builders for `storage`, `serve` and
+# `topic`, and the module left from a doc example whose two assertions
+# `produce.rs` and `a_fetch_at_zero_on_an_empty_log_is_in_range` already make.
+# The `//` block in `fetch_at` moves unchanged.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -579,7 +585,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6927" top="12":
+comments ceiling="2.6957" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
