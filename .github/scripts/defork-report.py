@@ -29,7 +29,10 @@ them changes; there is nothing in them to rewrite. The same holds for a bare
 module declaration (`pub mod join;`): it names a file, and only renaming the
 file changes it. And for a bare crate flag (`#![no_main]`), which a fuzz target
 cannot do without and cannot spell any other way. And for a bare `Ok(())`, the
-last line of every fallible test and unit-returning function.
+last line of every fallible test and unit-returning function. And for a bare
+macro or `use` opener (`assert_eq!(`, `vec![`, `use std::{`, `sync::{`), the
+line rustfmt opens a call or an import with when its contents do not fit on
+one: the contents follow on lines that are counted.
 
 Two measures:
 
@@ -62,6 +65,7 @@ GRANT_LINES = 12
 ATTRIBUTE_OPENER = re.compile(r"^#!?\[[\w:]+\($")
 MODULE_DECLARATION = re.compile(r"^(pub(\([\w: ]+\))? )?mod \w+;$")
 CRATE_FLAG = re.compile(r"^#!\[\w+\]$")
+OPENER = re.compile(r"^(?:(?:use )?[\w:]+::\{|\w+![(\[{])$")
 UNIT_OK = "Ok(())"
 
 
@@ -72,6 +76,7 @@ def syntax_only(text: str) -> bool:
         or bool(ATTRIBUTE_OPENER.match(stripped))
         or bool(MODULE_DECLARATION.match(stripped))
         or bool(CRATE_FLAG.match(stripped))
+        or bool(OPENER.match(stripped))
         or stripped == UNIT_OK
     )
 

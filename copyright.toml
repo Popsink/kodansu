@@ -204,7 +204,6 @@ inherited = [
     "tansu-storage/tests/common/mod.rs",
     "tansu-storage/tests/create_topics.rs",
     "tansu-storage/tests/delete_topics.rs",
-    "tansu-storage/tests/incremental_alter_configs.rs",
     "tansu-storage/tests/list_offsets.rs",
     "tansu-storage/tests/produce.rs",
     "tansu-storage/tests/topic_lifecycle.rs",

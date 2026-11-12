@@ -575,6 +575,11 @@ fmt:
 # `topic`, and the module left from a doc example whose two assertions
 # `produce.rs` and `a_fetch_at_zero_on_an_empty_log_is_in_range` already make.
 # The `//` block in `fetch_at` moves unchanged.
+#   defork  -39 lines, IncrementalAlterConfigs tests on the shared setup  3178 -> 3178  2.6956 -> 2.6966
+#
+# `tests/incremental_alter_configs.rs` drops its container builder and three
+# `MapStateLayer` wrappings for `storage`, `serve` and `topic_partitioned`, and
+# gains a `Delete` test on the same helpers. Its one `//` block stays.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -585,7 +590,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6957" top="12":
+comments ceiling="2.6966" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

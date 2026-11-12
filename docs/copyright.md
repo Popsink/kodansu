@@ -188,6 +188,16 @@ So is a bare `Ok(())` on its own line. It ends every test that returns a
 kept nothing else from upstream. `Ok(value)` with anything inside the brackets
 is still counted.
 
+So is a bare macro or `use` opener: `assert_eq!(`, `assert!(`, `vec![`,
+`use tansu_sans_io::{`, or a nested `sync::{` inside an import. rustfmt writes
+one whenever a macro call or an import list does not fit on a line, and the
+contents follow on lines that are counted. Like `#[derive(`, the line itself
+only says that the contents are too long: `assert_eq!(` alone is 1,259 lines in
+this tree. A function call opener (`round_trip_request(`, `Frame::request(`)
+is still counted, because it names what is called. The rule took 710 lines
+off the plain total, and `tansu-storage/tests/incremental_alter_configs.rs`
+left `inherited` with it.
+
 The report gives two numbers per file, because one blame mode is not enough:
 
 | measure | `git blame` | catches | misses |
