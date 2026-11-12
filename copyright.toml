@@ -202,7 +202,6 @@ inherited = [
     "tansu-storage/src/service/metadata.rs",
     "tansu-storage/src/service/produce.rs",
     "tansu-storage/tests/common/mod.rs",
-    "tansu-storage/tests/produce.rs",
     "tansu-topic/src/create.rs",
     "tansu-topic/src/delete.rs",
     "tansu-topic/src/lib.rs",

@@ -607,6 +607,13 @@ fmt:
 # request in each of its three first tests, and again in the #443 module. One
 # `create` serves all of them, with `outcome`, `shape`, `exists` and
 # `described` beside it. No `//` line was added or removed.
+#   defork  -676 lines, the Produce tests on the shared setup  3169 -> 3169  2.7031 -> 2.7189
+#
+# `tests/produce.rs` spelled out a container builder, an InitProducerId call,
+# a Produce request and the whole expected response in every test, and four
+# ListOffsets requests in one. They become `produce`, `only`, `init_producer`,
+# `offset_at`, `batch_of` and `sequenced`, and the module left from a doc
+# example goes. Every `//` block moves unchanged.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -617,7 +624,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7032" top="12":
+comments ceiling="2.7189" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

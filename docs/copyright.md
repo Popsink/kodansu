@@ -207,6 +207,13 @@ diff lands on. An attribute that records a decision (`#[must_use]`,
 the plain total, and `tansu-storage/tests/delete_topics.rs` left `inherited`
 with it.
 
+So is the tracing guard a test opens with, `let _guard = init_tracing()?;`
+(or `common::`, `super::`, `.unwrap()`). It is the first line of the 699 tests
+that log, as `Ok(())` is their last, and it lines up with whichever upstream
+test the diff lands on. Any other `let _guard = …` is still counted. The rule
+took 221 lines off the plain total, and `tansu-storage/tests/produce.rs` left
+`inherited` with it.
+
 The report gives two numbers per file, because one blame mode is not enough:
 
 | measure | `git blame` | catches | misses |

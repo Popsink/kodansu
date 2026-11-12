@@ -35,6 +35,8 @@ line rustfmt opens a call or an import with when its contents do not fit on
 one: the contents follow on lines that are counted.
 And for a bare test marker (`#[test]`, `#[tokio::test]`), which every test
 carries and cannot spell any other way.
+And for the tracing guard a test opens with (`let _guard = init_tracing()?;`),
+the first line of every test as `Ok(())` is the last.
 
 Two measures:
 
@@ -70,6 +72,7 @@ CRATE_FLAG = re.compile(r"^#!\[\w+\]$")
 TEST_MARKER = re.compile(r"^#\[(?:tokio::)?test\]$")
 OPENER = re.compile(r"^(?:(?:use )?[\w:]+::\{|\w+![(\[{])$")
 UNIT_OK = "Ok(())"
+TRACING_GUARD = re.compile(r"^let _guard = (?:(?:common|super)::)?init_tracing\(\)(?:\?|\.unwrap\(\));$")
 
 
 def syntax_only(text: str) -> bool:
@@ -82,6 +85,7 @@ def syntax_only(text: str) -> bool:
         or bool(TEST_MARKER.match(stripped))
         or bool(OPENER.match(stripped))
         or stripped == UNIT_OK
+        or bool(TRACING_GUARD.match(stripped))
     )
 
 

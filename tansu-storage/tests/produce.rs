@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,835 +12,153 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{Error, cluster_id, init_tracing, storage_url, storage_url_with_query};
-use bytes::Bytes;
-use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
-use rand::{distr::Alphanumeric, prelude::*, rng};
+//! `Produce`: idempotent sequencing for a producer without a transaction, the
+//! offsets a produce moves, and the coalesced layout a storage URL selects.
+
+use std::sync::Arc;
 use std::time::Duration;
+
+use bytes::Bytes;
+use rand::{RngExt as _, rng};
+use tansu_sans_io::list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic};
+use tansu_sans_io::produce_request::{PartitionProduceData, TopicProduceData};
+use tansu_sans_io::produce_response::PartitionProduceResponse;
+use tansu_sans_io::record::{Builder as RecordBuilder, Record, deflated, inflated};
 use tansu_sans_io::{
-    CreateTopicsRequest, DeleteTopicsRequest, ErrorCode, InitProducerIdRequest, IsolationLevel,
-    ListOffset, ListOffsetsRequest, ProduceRequest, ProduceResponse,
-    create_topics_request::CreatableTopic,
-    list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
-    produce_request::{PartitionProduceData, TopicProduceData},
-    produce_response::{PartitionProduceResponse, TopicProduceResponse},
-    record::{
-        Record,
-        deflated::{self, Frame},
-        inflated,
-    },
+    DeleteTopicsRequest, ErrorCode, InitProducerIdRequest, IsolationLevel, ListOffset,
+    ListOffsetsRequest, ProduceRequest, ProduceResponse,
 };
 use tansu_storage::{
-    CreateTopicsService, DeleteTopicsService, InitProducerIdService, ListOffsetsService,
-    ProduceService, Storage as _, StorageContainer, Topition,
+    DeleteTopicsService, InitProducerIdService, ListOffsetsService, ProduceService, Storage,
+    Topition,
 };
-use tracing::debug;
-use url::Url;
+
+use crate::common::{
+    Error, init_tracing, serve, storage, storage_with_query, topic, topic_partitioned,
+};
 
 mod common;
 
-fn topic_data(
-    topic: &str,
-    index: i32,
-    builder: inflated::Builder,
-) -> Result<Option<Vec<TopicProduceData>>, Error> {
-    builder
-        .build()
-        .and_then(deflated::Batch::try_from)
-        .map(|deflated| {
-            let partition_data =
-                PartitionProduceData::default()
-                    .index(index)
-                    .records(Some(Frame {
-                        batches: vec![deflated],
-                    }));
+const TOPIC: &str = "pqr";
 
-            Some(vec![
-                TopicProduceData::default()
-                    .name(topic.into())
-                    .partition_data(Some(vec![partition_data])),
-            ])
-        })
-        .map_err(Into::into)
+/// The producer id and epoch a client sends before it has been given either:
+/// the only pair that allocates a producer without a transaction.
+const UNASSIGNED: (i64, i16) = (-1, -1);
+
+/// Produces the batch `builder` makes to `partition` of `name` through
+/// `Produce`.
+async fn produce(
+    storage: &Arc<dyn Storage>,
+    name: &str,
+    partition: i32,
+    batch: inflated::Builder,
+) -> Result<ProduceResponse, Error> {
+    let frame = deflated::Frame {
+        batches: vec![deflate(batch)?],
+    };
+    let data = PartitionProduceData::default()
+        .index(partition)
+        .records(Some(frame));
+    let topic = TopicProduceData::default()
+        .name(name.to_owned())
+        .partition_data(Some(vec![data]));
+    let request = ProduceRequest::default().topic_data(Some(vec![topic]));
+    serve(storage, ProduceService, request).await
 }
 
-/// A producer with no coordinate in the log is admitted as new (#88), not
-/// answered with `UnknownProducerId` — the per-pod registry that used to reject
-/// it is gone. A deliberate Kafka divergence, recorded in
-/// `dynostore::tests::idempotent::an_unknown_producer_is_admitted_as_new`.
-#[tokio::test]
-async fn non_txn_idempotent_unknown_producer_is_admitted() -> Result<(), Error> {
-    let _guard = init_tracing()?;
+/// The error and base offset of the one partition a produce to partition 0 of
+/// `TOPIC` answers, once everything else in the answer is checked to be what
+/// every such answer carries: unthrottled, no endpoints, no record errors, no
+/// message, no leader change, no append time, and a log that starts at 0.
+fn only(response: ProduceResponse) -> Result<(ErrorCode, i64), Error> {
+    let ProduceResponse {
+        responses,
+        throttle_time_ms,
+        node_endpoints,
+        ..
+    } = response;
+    assert_eq!((Some(0), None), (throttle_time_ms, node_endpoints));
 
-    const HOST: &str = "localhost";
-    const PORT: i32 = 9092;
-    const NODE_ID: i32 = 111;
+    let [topic] = <[_; 1]>::try_from(responses.unwrap_or_default()).expect("one topic");
+    assert_eq!(TOPIC, topic.name);
+    let [partition] =
+        <[_; 1]>::try_from(topic.partition_responses.unwrap_or_default()).expect("one partition");
 
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
-
-    let topic = "pqr";
-    let index = 0;
-
-    let transactional_id = None;
-    let acks = 0;
-    let timeout_ms = 0;
-
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
-    };
-
-    let response = produce
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
-                .transactional_id(transactional_id)
-                .acks(acks)
-                .timeout_ms(timeout_ms)
-                .topic_data(topic_data(
-                    topic,
-                    index,
-                    inflated::Batch::builder()
-                        .record(Record::builder().value(Bytes::from_static(b"lorem").into()))
-                        .producer_id(54345),
-                )?),
-        )
-        .await?;
-
-    assert_eq!(
-        ProduceResponse::default()
-            .responses(Some(vec![
-                TopicProduceResponse::default()
-                    .name(topic.into())
-                    .partition_responses(Some(vec![
-                        PartitionProduceResponse::default()
-                            .index(index)
-                            .error_code(ErrorCode::None.into())
-                            .base_offset(0)
-                            .log_append_time_ms(Some(-1))
-                            .log_start_offset(Some(0))
-                            .record_errors(Some(vec![]))
-                            .error_message(None)
-                            .current_leader(None)
-                    ]))
-            ]))
-            .throttle_time_ms(Some(0))
-            .node_endpoints(None),
-        response
-    );
-
-    Ok(())
+    assert_eq!(0, partition.index);
+    let PartitionProduceResponse {
+        error_code,
+        base_offset,
+        log_append_time_ms,
+        log_start_offset,
+        record_errors,
+        error_message,
+        current_leader,
+        ..
+    } = partition;
+    assert_eq!((Some(-1), Some(0)), (log_append_time_ms, log_start_offset));
+    assert_eq!(Some(vec![]), record_errors);
+    assert_eq!((None, None), (error_message, current_leader));
+    Ok((ErrorCode::try_from(error_code)?, base_offset))
 }
 
-#[tokio::test]
-async fn non_txn_idempotent() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    const HOST: &str = "localhost";
-    const PORT: i32 = 9092;
-    const NODE_ID: i32 = 111;
-
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
-
-    let topic = "pqr";
-    let index = 0;
-
-    let init_producer_id = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(InitProducerIdService)
-    };
-
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
-    };
-
-    let producer = init_producer_id
-        .serve(
-            Context::default(),
-            InitProducerIdRequest::default()
-                .transactional_id(None)
-                .transaction_timeout_ms(0)
-                .producer_id(Some(-1))
-                .producer_epoch(Some(-1)),
-        )
-        .await?;
-
-    let transactional_id = None;
-    let acks = 0;
-    let timeout_ms = 0;
-
-    let response = produce
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
-                .transactional_id(transactional_id.clone())
-                .acks(acks)
-                .timeout_ms(timeout_ms)
-                .topic_data(topic_data(
-                    topic,
-                    index,
-                    inflated::Batch::builder()
-                        .record(
-                            Record::builder()
-                                .value(Bytes::from_static(b"Lorem ipsum dolor sit amet").into()),
-                        )
-                        .producer_id(producer.producer_id),
-                )?),
-        )
-        .await?;
-
-    assert_eq!(
-        ProduceResponse::default()
-            .responses(Some(vec![
-                TopicProduceResponse::default()
-                    .name(topic.into())
-                    .partition_responses(Some(vec![
-                        PartitionProduceResponse::default()
-                            .index(index)
-                            .error_code(ErrorCode::None.into())
-                            .base_offset(0)
-                            .log_append_time_ms(Some(-1))
-                            .log_start_offset(Some(0))
-                            .record_errors(Some(vec![]))
-                            .error_message(None)
-                            .current_leader(None)
-                    ]))
-            ]))
-            .throttle_time_ms(Some(0))
-            .node_endpoints(None),
-        response
-    );
-
-    let response = produce
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
-                .transactional_id(transactional_id.clone())
-                .acks(acks)
-                .timeout_ms(timeout_ms)
-                .topic_data(topic_data(
-                    topic,
-                    index,
-                    inflated::Batch::builder()
-                        .record(
-                            Record::builder()
-                                .value(Bytes::from_static(b"consectetur adipiscing elit").into()),
-                        )
-                        .record(
-                            Record::builder()
-                                .value(Bytes::from_static(b"sed do eiusmod tempor").into()),
-                        )
-                        .base_sequence(1)
-                        .last_offset_delta(1)
-                        .producer_id(producer.producer_id),
-                )?),
-        )
-        .await?;
-
-    assert_eq!(
-        ProduceResponse::default()
-            .responses(Some(vec![
-                TopicProduceResponse::default()
-                    .name(topic.into())
-                    .partition_responses(Some(vec![
-                        PartitionProduceResponse::default()
-                            .index(index)
-                            .error_code(ErrorCode::None.into())
-                            .base_offset(1)
-                            .log_append_time_ms(Some(-1))
-                            .log_start_offset(Some(0))
-                            .record_errors(Some(vec![]))
-                            .error_message(None)
-                            .current_leader(None)
-                    ]))
-            ]))
-            .throttle_time_ms(Some(0))
-            .node_endpoints(None),
-        response
-    );
-
-    let response = produce
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
-                .transactional_id(transactional_id.clone())
-                .acks(acks)
-                .timeout_ms(timeout_ms)
-                .topic_data(topic_data(
-                    topic,
-                    index,
-                    inflated::Batch::builder()
-                        .record(
-                            Record::builder()
-                                .value(Bytes::from_static(b"incididunt ut labore").into()),
-                        )
-                        .base_sequence(3)
-                        .producer_id(producer.producer_id),
-                )?),
-        )
-        .await?;
-
-    assert_eq!(
-        ProduceResponse::default()
-            .responses(Some(vec![
-                TopicProduceResponse::default()
-                    .name(topic.into())
-                    .partition_responses(Some(vec![
-                        PartitionProduceResponse::default()
-                            .index(index)
-                            .error_code(ErrorCode::None.into())
-                            .base_offset(3)
-                            .log_append_time_ms(Some(-1))
-                            .log_start_offset(Some(0))
-                            .record_errors(Some(vec![]))
-                            .error_message(None)
-                            .current_leader(None)
-                    ]))
-            ]))
-            .throttle_time_ms(Some(0))
-            .node_endpoints(None),
-        response
-    );
-
-    Ok(())
+/// A producer id from `InitProducerId`, without a transaction.
+async fn init_producer(storage: &Arc<dyn Storage>) -> Result<i64, Error> {
+    let (id, epoch) = UNASSIGNED;
+    let request = InitProducerIdRequest::default()
+        .producer_id(Some(id))
+        .producer_epoch(Some(epoch));
+    let response = serve(storage, InitProducerIdService, request).await?;
+    Ok(response.producer_id)
 }
 
-/// A duplicate is acked with the offset the original landed at (#88), rather
-/// than raising `DuplicateSequenceNumber`: a retry after an ack the client never
-/// saw is idempotent, not fatal.
-#[tokio::test]
-async fn non_txn_idempotent_duplicate_is_acked_with_the_original_offset() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    const HOST: &str = "localhost";
-    const PORT: i32 = 9092;
-    const NODE_ID: i32 = 111;
-
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
-
-    let topic = "pqr";
-    let index = 0;
-
-    let init_producer_id = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(InitProducerIdService)
-    };
-
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
-    };
-
-    let producer = init_producer_id
-        .serve(
-            Context::default(),
-            InitProducerIdRequest::default()
-                .transactional_id(None)
-                .transaction_timeout_ms(0)
-                .producer_id(Some(-1))
-                .producer_epoch(Some(-1)),
-        )
-        .await?;
-
-    let transactional_id = None;
-    let acks = 0;
-    let timeout_ms = 0;
-
-    let response = produce
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
-                .transactional_id(transactional_id.clone())
-                .acks(acks)
-                .timeout_ms(timeout_ms)
-                .topic_data(topic_data(
-                    topic,
-                    index,
-                    inflated::Batch::builder()
-                        .record(
-                            Record::builder()
-                                .value(Bytes::from_static(b"Lorem ipsum dolor sit amet").into()),
-                        )
-                        .producer_id(producer.producer_id),
-                )?),
-        )
-        .await?;
-
-    assert_eq!(
-        ProduceResponse::default()
-            .responses(Some(vec![
-                TopicProduceResponse::default()
-                    .name(topic.into())
-                    .partition_responses(Some(vec![
-                        PartitionProduceResponse::default()
-                            .index(index)
-                            .error_code(ErrorCode::None.into())
-                            .base_offset(0)
-                            .log_append_time_ms(Some(-1))
-                            .log_start_offset(Some(0))
-                            .record_errors(Some(vec![]))
-                            .error_message(None)
-                            .current_leader(None)
-                    ]))
-            ]))
-            .throttle_time_ms(Some(0))
-            .node_endpoints(None),
-        response
-    );
-
-    let response = produce
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
-                .transactional_id(transactional_id)
-                .acks(acks)
-                .timeout_ms(timeout_ms)
-                .topic_data(topic_data(
-                    topic,
-                    index,
-                    inflated::Batch::builder()
-                        .record(
-                            Record::builder()
-                                .value(Bytes::from_static(b"Lorem ipsum dolor sit amet").into()),
-                        )
-                        .producer_id(producer.producer_id),
-                )?),
-        )
-        .await?;
-
-    assert_eq!(
-        ProduceResponse::default()
-            .responses(Some(vec![
-                TopicProduceResponse::default()
-                    .name(topic.into())
-                    .partition_responses(Some(vec![
-                        PartitionProduceResponse::default()
-                            .index(index)
-                            .error_code(ErrorCode::None.into())
-                            .base_offset(0)
-                            .log_append_time_ms(Some(-1))
-                            .log_start_offset(Some(0))
-                            .record_errors(Some(vec![]))
-                            .error_message(None)
-                            .current_leader(None)
-                    ]))
-            ]))
-            .throttle_time_ms(Some(0))
-            .node_endpoints(None),
-        response
-    );
-
-    Ok(())
+/// A record carrying `value`.
+fn record(value: &'static [u8]) -> RecordBuilder {
+    Record::builder().value(Some(Bytes::from_static(value)))
 }
 
-#[tokio::test]
-async fn non_txn_idempotent_sequence_out_of_order() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    const HOST: &str = "localhost";
-    const PORT: i32 = 9092;
-    const NODE_ID: i32 = 111;
-
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
-
-    let init_producer_id = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(InitProducerIdService)
-    };
-
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
-    };
-
-    let topic = "pqr";
-    let index = 0;
-
-    let producer = init_producer_id
-        .serve(
-            Context::default(),
-            InitProducerIdRequest::default()
-                .transactional_id(None)
-                .transaction_timeout_ms(0)
-                .producer_id(Some(-1))
-                .producer_epoch(Some(-1)),
-        )
-        .await?;
-
-    let transactional_id = None;
-    let acks = 0;
-    let timeout_ms = 0;
-
-    let response = produce
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
-                .transactional_id(transactional_id.clone())
-                .acks(acks)
-                .timeout_ms(timeout_ms)
-                .topic_data(topic_data(
-                    topic,
-                    index,
-                    inflated::Batch::builder()
-                        .record(
-                            Record::builder()
-                                .value(Bytes::from_static(b"Lorem ipsum dolor sit amet").into()),
-                        )
-                        .producer_id(producer.producer_id),
-                )?),
-        )
-        .await?;
-
-    assert_eq!(
-        ProduceResponse::default()
-            .responses(Some(vec![
-                TopicProduceResponse::default()
-                    .name(topic.into())
-                    .partition_responses(Some(vec![
-                        PartitionProduceResponse::default()
-                            .index(index)
-                            .error_code(ErrorCode::None.into())
-                            .base_offset(0)
-                            .log_append_time_ms(Some(-1))
-                            .log_start_offset(Some(0))
-                            .record_errors(Some(vec![]))
-                            .error_message(None)
-                            .current_leader(None)
-                    ]))
-            ]))
-            .throttle_time_ms(Some(0))
-            .node_endpoints(None),
-        response
-    );
-
-    let response = produce
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
-                .transactional_id(transactional_id)
-                .acks(acks)
-                .timeout_ms(timeout_ms)
-                .topic_data(topic_data(
-                    topic,
-                    index,
-                    inflated::Batch::builder()
-                        .record(
-                            Record::builder()
-                                .value(Bytes::from_static(b"Lorem ipsum dolor sit amet").into()),
-                        )
-                        .base_sequence(2)
-                        .producer_id(producer.producer_id),
-                )?),
-        )
-        .await?;
-
-    assert_eq!(
-        ProduceResponse::default()
-            .responses(Some(vec![
-                TopicProduceResponse::default()
-                    .name(topic.into())
-                    .partition_responses(Some(vec![
-                        PartitionProduceResponse::default()
-                            .index(index)
-                            .error_code(ErrorCode::OutOfOrderSequenceNumber.into())
-                            .base_offset(-1)
-                            .log_append_time_ms(Some(-1))
-                            .log_start_offset(Some(0))
-                            .record_errors(Some(vec![]))
-                            .error_message(None)
-                            .current_leader(None)
-                    ]))
-            ]))
-            .throttle_time_ms(Some(0))
-            .node_endpoints(None),
-        response
-    );
-
-    Ok(())
+/// A batch of one record per value, at offset deltas `0..values.len()`.
+fn batch_of(values: &[&'static [u8]]) -> inflated::Builder {
+    let records = values
+        .iter()
+        .fold(inflated::Batch::builder(), |batch, value| {
+            batch.record(record(value))
+        });
+    records.last_offset_delta(values.len() as i32 - 1)
 }
 
-#[tokio::test]
-async fn list_offsets() -> Result<(), Error> {
-    let _guard = init_tracing()?;
+/// The batch `batch` builds, encoded as it goes on the wire.
+fn deflate(batch: inflated::Builder) -> Result<deflated::Batch, Error> {
+    Ok(batch.build().and_then(deflated::Batch::try_from)?)
+}
 
-    let node_id = rng().random_range(0..i32::MAX);
+/// [`batch_of`], from `producer` starting at `sequence`.
+fn sequenced(producer: i64, sequence: i32, values: &[&'static [u8]]) -> inflated::Builder {
+    batch_of(values)
+        .base_sequence(sequence)
+        .producer_id(producer)
+}
 
-    const HOST: &str = "localhost";
-    const PORT: i32 = 9092;
+/// What `ListOffsets` answers for `position` on `topition`, which must not be
+/// an error.
+async fn offset_at(
+    storage: &Arc<dyn Storage>,
+    topition: &Topition,
+    position: ListOffset,
+) -> Result<Option<i64>, Error> {
+    let wanted = ListOffsetsPartition::default()
+        .partition_index(topition.partition())
+        .timestamp(position.try_into()?);
+    let topic = ListOffsetsTopic::default()
+        .name(topition.topic().to_owned())
+        .partitions(Some(vec![wanted]));
+    let request = ListOffsetsRequest::default().topics(Some(vec![topic]));
+    let response = serve(storage, ListOffsetsService, request).await?;
 
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(node_id)
-        .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
-
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
-    };
-
-    let delete_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(DeleteTopicsService)
-    };
-
-    let list_offsets = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ListOffsetsService)
-    };
-
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
-    };
-
-    let name = &rng()
-        .sample_iter(&Alphanumeric)
-        .take(15)
-        .map(char::from)
-        .collect::<String>()[..];
-
-    let num_partitions = rng().random_range(1..64);
-    let replication_factor = rng().random_range(0..64);
-
-    {
-        let response = create_topic
-            .serve(
-                Context::default(),
-                CreateTopicsRequest::default()
-                    .validate_only(Some(false))
-                    .topics(Some(
-                        [CreatableTopic::default()
-                            .name(name.into())
-                            .num_partitions(num_partitions)
-                            .replication_factor(replication_factor)
-                            .assignments(Some([].into()))
-                            .configs(Some([].into()))]
-                        .into(),
-                    )),
-            )
-            .await?;
-
-        let topics = response.topics.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-    }
-
-    let partition = rng().random_range(0..num_partitions);
-
-    let before_produce_earliest = {
-        let response = list_offsets
-            .serve(
-                Context::default(),
-                ListOffsetsRequest::default()
-                    .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
-                    .topics(Some(
-                        [ListOffsetsTopic::default()
-                            .name(name.into())
-                            .partitions(Some(
-                                [ListOffsetsPartition::default()
-                                    .partition_index(partition)
-                                    .timestamp(ListOffset::Earliest.try_into()?)]
-                                .into(),
-                            ))]
-                        .into(),
-                    )),
-            )
-            .await?;
-
-        let topics = response.topics.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-
-        let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-        assert_eq!(1, partitions.len());
-        assert_eq!(
-            ErrorCode::None,
-            ErrorCode::try_from(partitions[0].error_code)?
-        );
-
-        partitions[0].offset
-    };
-
-    let before_produce_latest = {
-        let response = list_offsets
-            .serve(
-                Context::default(),
-                ListOffsetsRequest::default()
-                    .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
-                    .topics(Some(
-                        [ListOffsetsTopic::default()
-                            .name(name.into())
-                            .partitions(Some(
-                                [ListOffsetsPartition::default()
-                                    .partition_index(partition)
-                                    .timestamp(ListOffset::Latest.try_into()?)]
-                                .into(),
-                            ))]
-                        .into(),
-                    )),
-            )
-            .await?;
-
-        let topics = response.topics.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-
-        let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-        assert_eq!(1, partitions.len());
-        assert_eq!(
-            ErrorCode::None,
-            ErrorCode::try_from(partitions[0].error_code)?
-        );
-
-        partitions[0].offset
-    };
-
-    let offset = {
-        let deflated = inflated::Batch::builder()
-            .record(
-                Record::builder().value(Bytes::from_static(b"Lorem ipsum dolor sit amet").into()),
-            )
-            .build()
-            .and_then(TryInto::try_into)
-            .inspect(|deflated| debug!(?deflated))?;
-
-        let response = produce
-            .serve(
-                Context::default(),
-                ProduceRequest::default().topic_data(Some(
-                    [TopicProduceData::default()
-                        .name(name.into())
-                        .partition_data(Some(
-                            [PartitionProduceData::default()
-                                .index(partition)
-                                .records(Some(Frame {
-                                    batches: vec![deflated],
-                                }))]
-                            .into(),
-                        ))]
-                    .into(),
-                )),
-            )
-            .await?;
-
-        let topics = response.responses.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-
-        let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
-        assert_eq!(1, partitions.len());
-        partitions[0].base_offset
-    };
-
-    assert_eq!(before_produce_latest, Some(offset));
-
-    let after_produce_earliest = {
-        let response = list_offsets
-            .serve(
-                Context::default(),
-                ListOffsetsRequest::default()
-                    .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
-                    .topics(Some(
-                        [ListOffsetsTopic::default()
-                            .name(name.into())
-                            .partitions(Some(
-                                [ListOffsetsPartition::default()
-                                    .partition_index(partition)
-                                    .timestamp(ListOffset::Earliest.try_into()?)]
-                                .into(),
-                            ))]
-                        .into(),
-                    )),
-            )
-            .await?;
-
-        let topics = response.topics.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-
-        let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-        assert_eq!(1, partitions.len());
-        assert_eq!(
-            ErrorCode::None,
-            ErrorCode::try_from(partitions[0].error_code)?
-        );
-
-        partitions[0].offset
-    };
-
-    assert_eq!(before_produce_earliest, after_produce_earliest);
-
-    let after_produce_latest = {
-        let response = list_offsets
-            .serve(
-                Context::default(),
-                ListOffsetsRequest::default()
-                    .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
-                    .topics(Some(
-                        [ListOffsetsTopic::default()
-                            .name(name.into())
-                            .partitions(Some(
-                                [ListOffsetsPartition::default()
-                                    .partition_index(partition)
-                                    .timestamp(ListOffset::Latest.try_into()?)]
-                                .into(),
-                            ))]
-                        .into(),
-                    )),
-            )
-            .await?;
-
-        let topics = response.topics.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-
-        let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-        assert_eq!(1, partitions.len());
-        assert_eq!(
-            ErrorCode::None,
-            ErrorCode::try_from(partitions[0].error_code)?
-        );
-
-        partitions[0].offset
-    };
-
-    assert_eq!(Some(offset + 1), after_produce_latest);
-
-    let response = delete_topic
-        .serve(
-            Context::default(),
-            DeleteTopicsRequest::default().topic_names(Some([name.into()].into())),
-        )
-        .await?;
-
-    let topics = response.responses.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-
-    Ok(())
+    let [topic] = <[_; 1]>::try_from(response.topics.unwrap_or_default()).expect("one topic");
+    let [answer] = <[_; 1]>::try_from(topic.partitions.unwrap_or_default()).expect("one partition");
+    let error_code = ErrorCode::try_from(answer.error_code)?;
+    assert_eq!(ErrorCode::None, error_code, "{position:?} on {topition:?}");
+    Ok(answer.offset)
 }
 
 /// A `coalesce_batches` threshold supplied in the **storage URL** reaches the
@@ -864,44 +182,17 @@ async fn list_offsets() -> Result<(), Error> {
 async fn url_coalesce_batches_reaches_the_leaseless_flush() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    const HOST: &str = "localhost";
-    const PORT: i32 = 9092;
-    const NODE_ID: i32 = 111;
-
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(storage_url_with_query(
-            "prefix_coalesce=true&prefix_leaseless=true\
-             &coalesce_linger=1h&coalesce_batches=3",
-        )?)
-        .build()
-        .await?;
+    let storage = storage_with_query(
+        "prefix_coalesce=true&prefix_leaseless=true&coalesce_linger=1h&coalesce_batches=3",
+    )
+    .await?;
 
     // Dotted name: `prefix_of` coalesces on the first three components.
-    let topic = "org.env.conn.tuned";
-    _ = storage
-        .create_topic(
-            CreatableTopic::default()
-                .name(topic.into())
-                .num_partitions(1)
-                .replication_factor(1)
-                .assignments(Some([].into()))
-                .configs(Some([].into())),
-            false,
-        )
-        .await?;
-    let topition = Topition::new(topic, 0);
+    let name = "org.env.conn.tuned";
+    topic(&storage, name).await?;
+    let topition = Topition::new(name, 0);
 
-    let batch = || {
-        inflated::Batch::builder()
-            .record(Record::builder().value(Some(Bytes::from_static(b"a"))))
-            .record(Record::builder().value(Some(Bytes::from_static(b"b"))))
-            .last_offset_delta(1)
-            .build()
-            .and_then(deflated::Batch::try_from)
-    };
+    let batch = || deflate(batch_of(&[b"a", b"b"]));
 
     let (a, b, c) = tokio::join!(
         storage.produce(None, &topition, batch()?),
@@ -932,33 +223,12 @@ async fn url_coalesce_batches_reaches_the_leaseless_flush() -> Result<(), Error>
 async fn a_plain_url_produces_segments_and_no_legacy_object() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(111)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
+    let storage = storage().await?;
+    let name = "org.env.conn.plain";
+    topic(&storage, name).await?;
+    let topition = Topition::new(name, 0);
 
-    let topic = "org.env.conn.plain";
-    _ = storage
-        .create_topic(
-            CreatableTopic::default()
-                .name(topic.into())
-                .num_partitions(1)
-                .replication_factor(1)
-                .assignments(Some([].into()))
-                .configs(Some([].into())),
-            false,
-        )
-        .await?;
-    let topition = Topition::new(topic, 0);
-
-    let batch = inflated::Batch::builder()
-        .record(Record::builder().value(Some(Bytes::from_static(b"plain"))))
-        .last_offset_delta(0)
-        .build()
-        .and_then(deflated::Batch::try_from)?;
+    let batch = deflate(batch_of(&[b"plain"]))?;
 
     assert_eq!(0, storage.produce(None, &topition, batch).await?);
 
@@ -993,109 +263,119 @@ async fn a_plain_url_produces_segments_and_no_legacy_object() -> Result<(), Erro
     Ok(())
 }
 
-mod doctest_template {
-    use bytes::Bytes;
-    use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
-    use tansu_sans_io::{
-        CreateTopicsRequest, ErrorCode, ProduceRequest,
-        create_topics_request::CreatableTopic,
-        produce_request::{PartitionProduceData, TopicProduceData},
-        record::{Record, deflated::Frame, inflated},
-    };
-    use tansu_storage::{CreateTopicsService, ProduceService, StorageContainer};
-    use url::Url;
+/// A producer with no coordinate in the log is admitted as new (#88), not
+/// answered with `UnknownProducerId` — the per-pod registry that used to reject
+/// it is gone. A deliberate Kafka divergence, recorded in
+/// `dynostore::tests::idempotent::an_unknown_producer_is_admitted_as_new`.
+#[tokio::test]
+async fn non_txn_idempotent_unknown_producer_is_admitted() -> Result<(), Error> {
+    let _guard = init_tracing()?;
 
-    use crate::common::{Error, cluster_id, init_tracing, storage_url};
+    let storage = storage().await?;
+    let batch = sequenced(54345, 0, &[b"lorem"]);
+    let answer = only(produce(&storage, TOPIC, 0, batch).await?)?;
+    assert_eq!((ErrorCode::None, 0), answer);
 
-    #[tokio::test]
-    async fn req() -> Result<(), Error> {
-        let _guard = init_tracing()?;
-        const NODE_ID: i32 = 111;
-        const HOST: &str = "localhost";
-        const PORT: i32 = 9092;
+    Ok(())
+}
 
-        let storage = StorageContainer::builder()
-            .cluster_id(cluster_id())
-            .node_id(NODE_ID)
-            .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-            .storage(storage_url()?)
-            .build()
-            .await?;
+/// Each batch in sequence lands at the next offset: one record at 0, two at 1,
+/// and one more at 3.
+#[tokio::test]
+async fn non_txn_sequenced_batches_land_at_consecutive_offsets() -> Result<(), Error> {
+    let _guard = init_tracing()?;
 
-        let create_topic = {
-            let storage = storage.clone();
-            MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
-        };
+    let storage = storage().await?;
+    let producer = init_producer(&storage).await?;
 
-        let name = "abcba";
+    let first = sequenced(producer, 0, &[b"Lorem ipsum dolor sit amet"]);
+    let second = sequenced(
+        producer,
+        1,
+        &[b"consectetur adipiscing elit", b"sed do eiusmod tempor"],
+    );
+    let third = sequenced(producer, 3, &[b"incididunt ut labore"]);
 
-        let response = create_topic
-            .serve(
-                Context::default(),
-                CreateTopicsRequest::default()
-                    .topics(Some(vec![
-                        CreatableTopic::default()
-                            .name(name.into())
-                            .num_partitions(5)
-                            .replication_factor(3)
-                            .assignments(Some([].into()))
-                            .configs(Some([].into())),
-                    ]))
-                    .validate_only(Some(false)),
-            )
-            .await?;
-
-        let topics = response.topics.unwrap_or_default();
-        assert_eq!(1, topics.len());
-        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-
-        let produce = {
-            let storage = storage.clone();
-            MapStateLayer::new(|_| storage).into_layer(ProduceService)
-        };
-
-        let partition = 0;
-
-        let response = produce
-            .serve(
-                Context::default(),
-                ProduceRequest::default().topic_data(Some(
-                    [TopicProduceData::default()
-                        .name(name.into())
-                        .partition_data(Some(
-                            [PartitionProduceData::default()
-                                .index(partition)
-                                .records(Some(Frame {
-                                    batches: vec![
-                                        inflated::Batch::builder()
-                                            .record(
-                                                Record::builder().value(
-                                                    Bytes::from_static(
-                                                        b"Lorem ipsum dolor sit amet",
-                                                    )
-                                                    .into(),
-                                                ),
-                                            )
-                                            .build()
-                                            .and_then(TryInto::try_into)?,
-                                    ],
-                                }))]
-                            .into(),
-                        ))]
-                    .into(),
-                )),
-            )
-            .await?;
-
-        let topics = response.responses.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-        let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
-        assert_eq!(1, partitions.len());
-        assert_eq!(
-            ErrorCode::None,
-            ErrorCode::try_from(partitions[0].error_code)?
-        );
-
-        Ok(())
+    let mut answers = Vec::new();
+    for batch in [first, second, third] {
+        answers.push(only(produce(&storage, TOPIC, 0, batch).await?)?);
     }
+    let none = |offset| (ErrorCode::None, offset);
+    assert_eq!(vec![none(0), none(1), none(3)], answers);
+
+    Ok(())
+}
+
+/// A duplicate is acked with the offset the original landed at (#88), rather
+/// than raising `DuplicateSequenceNumber`: a retry after an ack the client never
+/// saw is idempotent, not fatal.
+#[tokio::test]
+async fn non_txn_idempotent_duplicate_is_acked_with_the_original_offset() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = storage().await?;
+    let producer = init_producer(&storage).await?;
+    let batch = || sequenced(producer, 0, &[b"Lorem ipsum dolor sit amet"]);
+
+    let original = only(produce(&storage, TOPIC, 0, batch()).await?)?;
+    let retry = only(produce(&storage, TOPIC, 0, batch()).await?)?;
+    assert_eq!([(ErrorCode::None, 0); 2], [original, retry]);
+
+    Ok(())
+}
+
+/// A batch that skips a sequence number is refused, and takes no offset.
+#[tokio::test]
+async fn non_txn_idempotent_skipped_sequence_is_refused() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = storage().await?;
+    let producer = init_producer(&storage).await?;
+    let batch = |sequence| sequenced(producer, sequence, &[b"Lorem ipsum dolor sit amet"]);
+
+    let first = only(produce(&storage, TOPIC, 0, batch(0)).await?)?;
+    let skipped = only(produce(&storage, TOPIC, 0, batch(2)).await?)?;
+    assert_eq!((ErrorCode::None, 0), first);
+    assert_eq!((ErrorCode::OutOfOrderSequenceNumber, -1), skipped);
+
+    Ok(())
+}
+
+/// A produce lands at the partition's LATEST offset and moves it on by one,
+/// and leaves EARLIEST where it was. The topic's name, its partition count and
+/// the partition produced to are random.
+#[tokio::test]
+async fn a_produce_moves_latest_and_not_earliest() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = storage().await?;
+    let name = format!("produce-{:08x}", rng().random::<u32>());
+    let partitions = rng().random_range(1..64);
+    _ = topic_partitioned(&storage, &name, partitions).await?;
+    let partition = rng().random_range(0..partitions);
+    let topition = Topition::new(name.as_str(), partition);
+
+    let earliest = offset_at(&storage, &topition, ListOffset::Earliest).await?;
+    let latest = offset_at(&storage, &topition, ListOffset::Latest).await?;
+
+    let batch = batch_of(&[b"Lorem ipsum dolor sit amet"]);
+    let response = produce(&storage, &name, partition, batch).await?;
+    let [data] = <[_; 1]>::try_from(response.responses.unwrap_or_default()).expect("one topic");
+    let [landed] =
+        <[_; 1]>::try_from(data.partition_responses.unwrap_or_default()).expect("one partition");
+    let offset = landed.base_offset;
+    assert_eq!(latest, Some(offset));
+
+    let after = (
+        offset_at(&storage, &topition, ListOffset::Earliest).await?,
+        offset_at(&storage, &topition, ListOffset::Latest).await?,
+    );
+    assert_eq!((earliest, Some(offset + 1)), after);
+
+    let request = DeleteTopicsRequest::default().topic_names(Some(vec![name]));
+    let response = serve(&storage, DeleteTopicsService, request).await?;
+    let [deleted] = <[_; 1]>::try_from(response.responses.unwrap_or_default()).expect("one topic");
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(deleted.error_code)?);
+
+    Ok(())
 }
