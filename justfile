@@ -580,6 +580,13 @@ fmt:
 # `tests/incremental_alter_configs.rs` drops its container builder and three
 # `MapStateLayer` wrappings for `storage`, `serve` and `topic_partitioned`, and
 # gains a `Delete` test on the same helpers. Its one `//` block stays.
+#   defork  -76 lines, the topic lifecycle test on the shared setup  3178 -> 3172  2.6965 -> 2.6933
+#
+# `tests/topic_lifecycle.rs` drops its container builder and three
+# `MapStateLayer` wrappings for `storage` and `serve`, and with them the six
+# uncited `//` lines that narrated each step ("metadata via topic uuid"); the
+# helpers `create`, `described` and `delete` are named for what they ask. The
+# ceiling comes down.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -590,7 +597,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6966" top="12":
+comments ceiling="2.6933" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
