@@ -206,7 +206,6 @@ inherited = [
     "tansu-storage/tests/delete_topics.rs",
     "tansu-storage/tests/list_offsets.rs",
     "tansu-storage/tests/produce.rs",
-    "tansu-storage/tests/topic_lifecycle.rs",
     "tansu-topic/src/create.rs",
     "tansu-topic/src/delete.rs",
     "tansu-topic/src/lib.rs",
