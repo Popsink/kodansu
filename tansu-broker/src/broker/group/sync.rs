@@ -12,72 +12,48 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rama::{Context, Service};
-use tansu_sans_io::{ApiKey, Frame, Header, SyncGroupRequest};
-use tracing::instrument;
+//! `SyncGroup`: the leader hands out the assignment and every member collects
+//! its own.
 
-use super::answer;
-use tansu_sans_io::{
-    ErrorCode,
-    acl::{Operation, Resource},
-};
+use tansu_sans_io::acl::{Operation, Resource};
+use tansu_sans_io::{ErrorCode, SyncGroupRequest};
 use tansu_storage::authorized;
 
-use crate::{Error, Result, coordinator::group::Coordinator};
+use super::answer;
+use super::handler::{answered, respond};
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct SyncGroupService;
+group_service! {
+    SyncGroupService: SyncGroupRequest,
+    |ctx, frame| {
+        let correlation_id = frame.correlation_id()?;
+        let SyncGroupRequest {
+            group_id,
+            generation_id,
+            member_id,
+            group_instance_id,
+            protocol_type,
+            protocol_name,
+            assignments,
+            ..
+        } = SyncGroupRequest::try_from(frame.body)?;
 
-impl ApiKey for SyncGroupService {
-    const KEY: i16 = SyncGroupRequest::KEY;
-}
-
-impl<C> Service<C, Frame> for SyncGroupService
-where
-    C: Coordinator,
-{
-    type Response = Frame;
-    type Error = Error;
-
-    #[instrument(skip(ctx, req))]
-    async fn serve(&self, mut ctx: Context<C>, req: Frame) -> Result<Self::Response, Self::Error> {
-        let correlation_id = req.correlation_id()?;
-        let sync_group = SyncGroupRequest::try_from(req.body)?;
-
-        if !authorized(&ctx, Resource::Group, &sync_group.group_id, Operation::Read).await {
-            return Ok(Frame {
-                size: 0,
-                header: Header::Response { correlation_id },
-                body: answer::sync_group(ErrorCode::GroupAuthorizationFailed),
-            });
+        if !authorized(&ctx, Resource::Group, &group_id, Operation::Read).await {
+            let refused = answer::sync_group(ErrorCode::GroupAuthorizationFailed);
+            return Ok(respond(correlation_id, refused));
         }
 
-        let coordinator = ctx.state_mut();
-
-        coordinator
+        let synced = ctx
+            .state_mut()
             .sync(
-                sync_group.group_id.as_str(),
-                sync_group.generation_id,
-                sync_group.member_id.as_str(),
-                sync_group.group_instance_id.as_deref(),
-                sync_group.protocol_type.as_deref(),
-                sync_group.protocol_name.as_deref(),
-                sync_group.assignments.as_deref(),
+                &group_id,
+                generation_id,
+                &member_id,
+                group_instance_id.as_deref(),
+                protocol_type.as_deref(),
+                protocol_name.as_deref(),
+                assignments.as_deref(),
             )
-            .await
-            .or_else(|error| match error {
-                // An `Error::Api` is an answer the broker chose, not a failure.
-                // Answering it here is what stops it from ending the connection
-                // with no response written — `early eof` to the caller (#300). See
-                // [`super::answer`].
-                Error::Api(error_code) => Ok(answer::sync_group(error_code)),
-
-                otherwise => Err(otherwise),
-            })
-            .map(|body| Frame {
-                size: 0,
-                header: Header::Response { correlation_id },
-                body,
-            })
+            .await;
+        answered(synced, answer::sync_group).map(|body| respond(correlation_id, body))
     }
 }

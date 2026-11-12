@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,68 +12,31 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rama::{Context, Service};
-use tansu_sans_io::{ApiKey, Frame, Header, LeaveGroupRequest};
-use tracing::instrument;
+//! `LeaveGroup`: a member leaves a classic group.
 
-use super::answer;
-use tansu_sans_io::{
-    ErrorCode,
-    acl::{Operation, Resource},
-};
+use tansu_sans_io::acl::{Operation, Resource};
+use tansu_sans_io::{ErrorCode, LeaveGroupRequest};
 use tansu_storage::authorized;
 
-use crate::{Error, Result, coordinator::group::Coordinator};
+use super::answer;
+use super::handler::{answered, respond};
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct LeaveGroupService;
+group_service! {
+    LeaveGroupService: LeaveGroupRequest,
+    |ctx, frame| {
+        let correlation_id = frame.correlation_id()?;
+        let LeaveGroupRequest { group_id, member_id, members, .. } =
+            LeaveGroupRequest::try_from(frame.body)?;
 
-impl ApiKey for LeaveGroupService {
-    const KEY: i16 = LeaveGroupRequest::KEY;
-}
-
-impl<C> Service<C, Frame> for LeaveGroupService
-where
-    C: Coordinator,
-{
-    type Response = Frame;
-    type Error = Error;
-
-    #[instrument(skip(ctx, req))]
-    async fn serve(&self, mut ctx: Context<C>, req: Frame) -> Result<Self::Response, Self::Error> {
-        let correlation_id = req.correlation_id()?;
-        let leave = LeaveGroupRequest::try_from(req.body)?;
-
-        if !authorized(&ctx, Resource::Group, &leave.group_id, Operation::Read).await {
-            return Ok(Frame {
-                size: 0,
-                header: Header::Response { correlation_id },
-                body: answer::leave_group(ErrorCode::GroupAuthorizationFailed),
-            });
+        if !authorized(&ctx, Resource::Group, &group_id, Operation::Read).await {
+            let refused = answer::leave_group(ErrorCode::GroupAuthorizationFailed);
+            return Ok(respond(correlation_id, refused));
         }
 
-        let coordinator = ctx.state_mut();
-
-        coordinator
-            .leave(
-                leave.group_id.as_str(),
-                leave.member_id.as_deref(),
-                leave.members.as_deref(),
-            )
-            .await
-            .or_else(|error| match error {
-                // An `Error::Api` is an answer the broker chose, not a failure.
-                // Answering it here is what stops it from ending the connection
-                // with no response written — `early eof` to the caller (#300). See
-                // [`super::answer`].
-                Error::Api(error_code) => Ok(answer::leave_group(error_code)),
-
-                otherwise => Err(otherwise),
-            })
-            .map(|body| Frame {
-                size: 0,
-                header: Header::Response { correlation_id },
-                body,
-            })
+        let left = ctx
+            .state_mut()
+            .leave(&group_id, member_id.as_deref(), members.as_deref())
+            .await;
+        answered(left, answer::leave_group).map(|body| respond(correlation_id, body))
     }
 }

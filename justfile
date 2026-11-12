@@ -614,6 +614,13 @@ fmt:
 # ListOffsets requests in one. They become `produce`, `only`, `init_producer`,
 # `offset_at`, `batch_of` and `sequenced`, and the module left from a doc
 # example goes. Every `//` block moves unchanged.
+#   defork  -144 lines, the group services on group_service!  3169 -> 3169  2.7188 -> 2.7223
+#
+# The seven classic and KIP-848 group services each spelled out their struct,
+# `ApiKey`, `Service` impl, response frame and `Error::Api` fallback. A
+# `group_service!` macro and `respond`/`answered` in `group/handler.rs` carry
+# them once. The fallback's cited #300 block, repeated five times, becomes
+# `answered`'s doc comment; no uncited `//` line was added or removed.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -624,7 +631,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7189" top="12":
+comments ceiling="2.7223" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
