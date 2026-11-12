@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,921 +12,245 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    fmt::{Debug, Display},
-    time::{Duration, SystemTime},
-};
+//! The engine's `Fetch` against an object store where every round trip takes
+//! [`LATENCY`]: how `max_wait`, `min_bytes` and `max_bytes` bound what one
+//! fetch returns and how long it takes.
 
-use async_trait::async_trait;
-use bytes::Bytes;
-use futures::stream::BoxStream;
-use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory, path::Path,
-};
-use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
-use tansu_sans_io::{
-    CreateTopicsRequest, ErrorCode, FetchRequest, NULL_TOPIC_ID, ProduceRequest,
-    create_topics_request::CreatableTopic,
-    fetch_request::{FetchPartition, FetchTopic},
-    produce_request::{PartitionProduceData, TopicProduceData},
-    record::{
-        Record,
-        deflated::{self, Frame},
-        inflated,
-    },
-};
-use tokio::time::sleep;
-use tracing::{debug, instrument};
-use url::Url;
+use std::time::{Duration, Instant};
 
-use crate::{
-    CreateTopicsService, Error, FetchService, ProduceService,
-    dynostore::{DynoStore, tests::init_tracing},
-};
+use object_store::memory::InMemory;
+use object_store::throttle::{ThrottleConfig, ThrottledStore};
+use rama::{Context, Service};
+use tansu_sans_io::create_topics_request::CreatableTopic;
+use tansu_sans_io::fetch_request::{FetchPartition, FetchTopic};
+use tansu_sans_io::produce_request::{PartitionProduceData, TopicProduceData};
+use tansu_sans_io::record::{Record, deflated, inflated};
+use tansu_sans_io::{CreateTopicsRequest, ErrorCode, FetchRequest, NULL_TOPIC_ID, ProduceRequest};
 
-const LOREM_IPSUM: Bytes =
-    Bytes::from_static(b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do");
+use crate::dynostore::{DynoStore, tests::init_tracing};
+use crate::{CreateTopicsService, Error, FetchService, ProduceService};
 
-const EIUSMOD_TEMPOR: Bytes =
-    Bytes::from_static(b"eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad");
+/// One value per batch, in the order [`produce_all`] produces them. Their
+/// lengths differ, so a `max_bytes` sized to the first one or two does not fit
+/// a third by accident.
+const VALUES: [&[u8]; 7] = [
+    b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do",
+    b"eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad",
+    b"minim veniam, quis nostrud exercitation ullamco laboris nisi ut",
+    b"aliquip ex ea commodo consequat. Duis aute irure dolor in",
+    b"reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla",
+    b"pariatur. Excepteur sint occaecat cupidatat non proident, sunt in",
+    b"culpa qui officia deserunt mollit anim id est laborum.",
+];
 
-const MINIM_VENIAM: Bytes =
-    Bytes::from_static(b"minim veniam, quis nostrud exercitation ullamco laboris nisi ut");
+/// The time each put, get, copy and delimited listing takes before it reaches
+/// the store. Deletes and plain listings are not delayed.
+const LATENCY: Duration = Duration::from_millis(100);
 
-const ALIQUIP_EX: Bytes =
-    Bytes::from_static(b"aliquip ex ea commodo consequat. Duis aute irure dolor in");
+const TOPIC: &str = "pqr";
+const PARTITION: i32 = 0;
 
-const REPREHENDERIT_IN: Bytes =
-    Bytes::from_static(b"reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla");
-
-const PARIATUR_EXCEPTEUR: Bytes =
-    Bytes::from_static(b"pariatur. Excepteur sint occaecat cupidatat non proident, sunt in");
-
-const CULPA_QUI: Bytes =
-    Bytes::from_static(b"culpa qui officia deserunt mollit anim id est laborum.");
-
-#[derive(Clone)]
-pub(crate) struct LatencyIntroducingObjectStore<O> {
-    object_store: O,
-    latency: Option<Duration>,
-}
-
-impl<O> LatencyIntroducingObjectStore<O>
-where
-    O: ObjectStore,
-{
-    fn new(object_store: O) -> Self {
-        Self {
-            object_store,
-            latency: Default::default(),
-        }
-    }
-
-    fn with_latency(self, latency: Option<Duration>) -> Self {
-        Self { latency, ..self }
-    }
-
-    async fn latency(&self) {
-        if let Some(duration) = self.latency {
-            debug!(?duration);
-            sleep(duration).await;
-        }
-    }
-}
-
-impl<O> Debug for LatencyIntroducingObjectStore<O> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LatencyObjectStore").finish()
-    }
-}
-
-impl<O> Display for LatencyIntroducingObjectStore<O> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LatencyObjectStore").finish()
-    }
-}
-
-#[async_trait]
-impl<O> ObjectStore for LatencyIntroducingObjectStore<O>
-where
-    O: ObjectStore,
-{
-    #[instrument(skip_all, fields(location = %location))]
-    async fn put_opts(
-        &self,
-        location: &Path,
-        payload: PutPayload,
-        opts: PutOptions,
-    ) -> Result<PutResult, object_store::Error> {
-        self.latency().await;
-        self.object_store.put_opts(location, payload, opts).await
-    }
-
-    #[instrument(skip_all, fields(location = %location))]
-    async fn put_multipart_opts(
-        &self,
-        location: &Path,
-        opts: PutMultipartOptions,
-    ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
-        self.latency().await;
-        self.object_store.put_multipart_opts(location, opts).await
-    }
-
-    // Copied from `gcs/limit.rs`, and fixed with it (#428) so the pattern stops
-    // propagating out of a test helper.
-    #[instrument(level = "debug", skip_all, fields(%location, if_none_match = options.if_none_match))]
-    async fn get_opts(
-        &self,
-        location: &Path,
-        options: GetOptions,
-    ) -> Result<GetResult, object_store::Error> {
-        self.latency().await;
-        self.object_store.get_opts(location, options.clone()).await
-    }
-
-    fn delete_stream(
-        &self,
-        locations: BoxStream<'static, Result<Path, object_store::Error>>,
-    ) -> BoxStream<'static, Result<Path, object_store::Error>> {
-        self.object_store.delete_stream(locations)
-    }
-
-    #[instrument(skip_all, fields(prefix))]
-    fn list(
-        &self,
-        prefix: Option<&Path>,
-    ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
-        self.object_store.list(prefix)
-    }
-
-    #[instrument(skip_all, fields(prefix))]
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&Path>,
-    ) -> Result<ListResult, object_store::Error> {
-        self.latency().await;
-        self.object_store.list_with_delimiter(prefix).await
-    }
-
-    #[instrument(skip_all, fields(from = %from, to = %to))]
-    async fn copy_opts(
-        &self,
-        from: &Path,
-        to: &Path,
-        opts: CopyOptions,
-    ) -> Result<(), object_store::Error> {
-        self.latency().await;
-        self.object_store.copy_opts(from, to, opts).await
-    }
-}
-
-fn topic_data(
-    topic: &str,
-    index: i32,
-    builder: inflated::Builder,
-) -> Result<Option<Vec<TopicProduceData>>, Error> {
-    builder
-        .build()
-        .and_then(deflated::Batch::try_from)
-        .map(|deflated| {
-            let partition_data =
-                PartitionProduceData::default()
-                    .index(index)
-                    .records(Some(Frame {
-                        batches: vec![deflated],
-                    }));
-
-            Some(vec![
-                TopicProduceData::default()
-                    .name(topic.into())
-                    .partition_data(Some(vec![partition_data])),
-            ])
-        })
-        .map_err(Into::into)
-}
-
-#[tokio::test]
-async fn empty_topic_5_000ms_max_wait() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let advertised_listener = Url::parse("tcp://localhost:9092")?;
-
-    const LATENCY_INTRODUCED: u64 = 100;
-    const MAX_WAIT_MS: i32 = 5_000;
-
-    let object_store = LatencyIntroducingObjectStore::new(InMemory::new())
-        .with_latency(Some(Duration::from_millis(LATENCY_INTRODUCED)));
-
-    let storage =
-        DynoStore::new("tansu", 12321, object_store).advertised_listener(advertised_listener);
-
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+/// An engine over an in-memory store slowed by [`LATENCY`], with `TOPIC` created
+/// through `CreateTopics` as five partitions of three replicas.
+async fn engine() -> Result<DynoStore, Error> {
+    let config = ThrottleConfig {
+        wait_put_per_call: LATENCY,
+        wait_get_per_call: LATENCY,
+        wait_list_with_delimiter_per_call: LATENCY,
+        ..ThrottleConfig::default()
     };
+    let store = ThrottledStore::new(InMemory::new(), config);
+    let engine =
+        DynoStore::new("tansu", 12321, store).advertised_listener("tcp://localhost:9092".parse()?);
 
-    let name = "pqr";
-    let num_partitions = 5;
-    let replication_factor = 3;
-    let assignments = Some([].into());
-    let configs = Some([].into());
+    let creatable = CreatableTopic::default()
+        .name(TOPIC.to_owned())
+        .num_partitions(5)
+        .replication_factor(3)
+        .assignments(Some(Vec::new()))
+        .configs(Some(Vec::new()));
+    let request = CreateTopicsRequest::default()
+        .topics(Some(vec![creatable]))
+        .validate_only(Some(false));
+    let response = serve(&engine, CreateTopicsService, request).await?;
 
-    let response = create_topic
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
-                .topics(Some(vec![
-                    CreatableTopic::default()
-                        .name(name.into())
-                        .num_partitions(num_partitions)
-                        .replication_factor(replication_factor)
-                        .assignments(assignments)
-                        .configs(configs),
-                ]))
-                .validate_only(Some(false)),
-        )
-        .await?;
-
-    let topics = response.topics.unwrap_or_default();
-
-    assert_eq!(1, topics.len());
-    assert_eq!(name, topics[0].name.as_str());
-    assert_ne!(Some(NULL_TOPIC_ID), topics[0].topic_id);
-    assert_eq!(Some(5), topics[0].num_partitions);
-    assert_eq!(Some(3), topics[0].replication_factor);
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-
-    let fetch = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(FetchService)
-    };
-
-    let partition = 0;
-
-    let response = fetch
-        .serve(
-            Context::default(),
-            FetchRequest::default()
-                .topics(Some(
-                    [FetchTopic::default()
-                        .topic(Some(name.into()))
-                        .partitions(Some(
-                            [FetchPartition::default().partition(partition)].into(),
-                        ))]
-                    .into(),
-                ))
-                .max_bytes(Some(1))
-                .max_wait_ms(MAX_WAIT_MS),
-        )
-        .await?;
-
-    let topics = response.responses.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-    assert_eq!(1, partitions.len());
+    let [created] = <[_; 1]>::try_from(response.topics.unwrap_or_default()).expect("one topic");
+    assert_eq!(TOPIC, created.name);
+    assert_ne!(Some(NULL_TOPIC_ID), created.topic_id);
     assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(partitions[0].error_code)?
+        (Some(5), Some(3)),
+        (created.num_partitions, created.replication_factor)
     );
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(created.error_code)?);
 
+    Ok(engine)
+}
+
+/// Sends `request` to `service` with `engine` as its state.
+async fn serve<S: Service<DynoStore, Request, Error = Error>, Request>(
+    engine: &DynoStore,
+    service: S,
+    request: Request,
+) -> Result<S::Response, Error> {
+    service
+        .serve(Context::with_state(engine.clone()), request)
+        .await
+}
+
+/// Produces each of [`VALUES`] to `PARTITION`, one single-record batch each.
+async fn produce_all(engine: &DynoStore) -> Result<(), Error> {
+    for value in VALUES {
+        let batch = inflated::Batch::builder()
+            .record(Record::builder().value(Some(value.into())))
+            .build()
+            .and_then(deflated::Batch::try_from)?;
+        let frame = deflated::Frame {
+            batches: vec![batch],
+        };
+        let data = PartitionProduceData::default()
+            .index(PARTITION)
+            .records(Some(frame));
+        let topic = TopicProduceData::default()
+            .name(TOPIC.to_owned())
+            .partition_data(Some(vec![data]));
+        let request = ProduceRequest::default().topic_data(Some(vec![topic]));
+        let response = serve(engine, ProduceService, request).await?;
+
+        let [topic] =
+            <[_; 1]>::try_from(response.responses.unwrap_or_default()).expect("one topic");
+        let [produced] = <[_; 1]>::try_from(topic.partition_responses.unwrap_or_default())
+            .expect("one partition");
+        assert_eq!(ErrorCode::None, ErrorCode::try_from(produced.error_code)?);
+    }
     Ok(())
 }
 
-#[tokio::test]
-async fn empty_topic_50ms_max_wait() -> Result<(), Error> {
-    let _guard = init_tracing()?;
+/// How long one fetch of `PARTITION` from offset 0 took, and the value of the
+/// one record in each batch it returned, in order.
+async fn fetch(
+    engine: &DynoStore,
+    min_bytes: i32,
+    max_bytes: usize,
+    max_wait: Duration,
+) -> Result<(Duration, Vec<Vec<u8>>), Error> {
+    let wanted = FetchTopic::default()
+        .topic(Some(TOPIC.to_owned()))
+        .partitions(Some(vec![FetchPartition::default().partition(PARTITION)]));
+    let request = FetchRequest::default()
+        .topics(Some(vec![wanted]))
+        .min_bytes(min_bytes)
+        .max_bytes(Some(max_bytes as i32))
+        .max_wait_ms(max_wait.as_millis() as i32);
 
-    let advertised_listener = Url::parse("tcp://localhost:9092")?;
+    let started = Instant::now();
+    let response = serve(engine, FetchService, request).await?;
+    let elapsed = started.elapsed();
 
-    const LATENCY_INTRODUCED: Option<Duration> = Some(Duration::from_millis(100));
-    const MAX_WAIT_MS: i32 = 50;
+    let [topic] = <[_; 1]>::try_from(response.responses.unwrap_or_default()).expect("one topic");
+    let [partition] =
+        <[_; 1]>::try_from(topic.partitions.unwrap_or_default()).expect("one partition");
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(partition.error_code)?);
 
-    let object_store =
-        LatencyIntroducingObjectStore::new(InMemory::new()).with_latency(LATENCY_INTRODUCED);
-
-    let storage =
-        DynoStore::new("tansu", 12321, object_store).advertised_listener(advertised_listener);
-
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
-    };
-
-    let name = "pqr";
-    let num_partitions = 5;
-    let replication_factor = 3;
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let response = create_topic
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
-                .topics(Some(vec![
-                    CreatableTopic::default()
-                        .name(name.into())
-                        .num_partitions(num_partitions)
-                        .replication_factor(replication_factor)
-                        .assignments(assignments)
-                        .configs(configs),
-                ]))
-                .validate_only(Some(false)),
-        )
-        .await?;
-
-    let topics = response.topics.unwrap_or_default();
-
-    assert_eq!(1, topics.len());
-    assert_eq!(name, topics[0].name.as_str());
-    assert_ne!(Some(NULL_TOPIC_ID), topics[0].topic_id);
-    assert_eq!(Some(5), topics[0].num_partitions);
-    assert_eq!(Some(3), topics[0].replication_factor);
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-
-    let fetch = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(FetchService)
-    };
-
-    let partition = 0;
-
-    let response = fetch
-        .serve(
-            Context::default(),
-            FetchRequest::default()
-                .topics(Some(
-                    [FetchTopic::default()
-                        .topic(Some(name.into()))
-                        .partitions(Some(
-                            [FetchPartition::default().partition(partition)].into(),
-                        ))]
-                    .into(),
-                ))
-                .max_bytes(Some(1))
-                .max_wait_ms(MAX_WAIT_MS),
-        )
-        .await?;
-
-    let topics = response.responses.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-    assert_eq!(1, partitions.len());
-    assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(partitions[0].error_code)?
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn fetch_1_min_bytes_5_000ms_max_wait() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let advertised_listener = Url::parse("tcp://localhost:9092")?;
-
-    const LATENCY_INTRODUCED: Duration = Duration::from_millis(100);
-    const MAX_WAIT: Duration = Duration::from_secs(5);
-
-    let object_store =
-        LatencyIntroducingObjectStore::new(InMemory::new()).with_latency(Some(LATENCY_INTRODUCED));
-
-    let storage =
-        DynoStore::new("tansu", 12321, object_store).advertised_listener(advertised_listener);
-
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
-    };
-
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
-    };
-
-    let fetch = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(FetchService)
-    };
-
-    let name = "pqr";
-    let num_partitions = 5;
-    let replication_factor = 3;
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let response = create_topic
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
-                .topics(Some(vec![
-                    CreatableTopic::default()
-                        .name(name.into())
-                        .num_partitions(num_partitions)
-                        .replication_factor(replication_factor)
-                        .assignments(assignments)
-                        .configs(configs),
-                ]))
-                .validate_only(Some(false)),
-        )
-        .await?;
-
-    let topics = response.topics.unwrap_or_default();
-
-    assert_eq!(1, topics.len());
-    assert_eq!(name, topics[0].name.as_str());
-    assert_ne!(Some(NULL_TOPIC_ID), topics[0].topic_id);
-    assert_eq!(Some(5), topics[0].num_partitions);
-    assert_eq!(Some(3), topics[0].replication_factor);
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-
-    const PARTITION: i32 = 0;
-
-    for value in [
-        LOREM_IPSUM,
-        EIUSMOD_TEMPOR,
-        MINIM_VENIAM,
-        ALIQUIP_EX,
-        REPREHENDERIT_IN,
-        PARIATUR_EXCEPTEUR,
-        CULPA_QUI,
-    ] {
-        let response = produce
-            .serve(
-                Context::default(),
-                ProduceRequest::default().topic_data(topic_data(
-                    name,
-                    PARTITION,
-                    inflated::Batch::builder().record(Record::builder().value(value.into())),
-                )?),
-            )
-            .await?;
-
-        let topics = response.responses.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-
-        let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
-        assert_eq!(1, partitions.len());
-        assert_eq!(ErrorCode::None, partitions[0].error_code.try_into()?);
-    }
-
-    let started_at = SystemTime::now();
-    let response = fetch
-        .serve(
-            Context::default(),
-            FetchRequest::default()
-                .topics(Some(
-                    [FetchTopic::default()
-                        .topic(Some(name.into()))
-                        .partitions(Some(
-                            [FetchPartition::default().partition(PARTITION)].into(),
-                        ))]
-                    .into(),
-                ))
-                .min_bytes(1)
-                .max_bytes(Some(52_428_800))
-                .max_wait_ms(MAX_WAIT.as_millis() as i32),
-        )
-        .await?;
-    let elapsed = started_at.elapsed()?;
-    assert!(
-        elapsed > LATENCY_INTRODUCED,
-        "elapsed: {elapsed:?}, with latency introduced of: {LATENCY_INTRODUCED:?}, and max wait: {MAX_WAIT:?}"
-    );
-    assert!(
-        elapsed < MAX_WAIT,
-        "elapsed: {elapsed:?}, with latency introduced of: {LATENCY_INTRODUCED:?}, and max wait: {MAX_WAIT:?}"
-    );
-
-    let topics = response.responses.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-    assert_eq!(1, partitions.len());
-    assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(partitions[0].error_code)?
-    );
-
-    let batches = partitions
-        .first()
-        .and_then(|partition_data| partition_data.records.as_ref())
-        .map(|frame| &frame.batches[..])
+    let batches = partition
+        .records
+        .map(|frame| frame.batches)
         .unwrap_or_default();
+    let mut values = Vec::with_capacity(batches.len());
+    for batch in &batches {
+        let inflated = inflated::Batch::try_from(batch)?;
+        let [record] = <[_; 1]>::try_from(inflated.records).expect("one record per batch");
+        values.push(record.value.expect("a value").to_vec());
+    }
+    Ok((elapsed, values))
+}
 
-    assert_eq!(7, batches.len());
+/// `elapsed` against the bounds a test sets, with every figure in the message.
+fn assert_took(
+    elapsed: Duration,
+    max_wait: Duration,
+    more_than: &[Duration],
+    less_than: Option<Duration>,
+) {
+    let context = format!("elapsed: {elapsed:?}, latency: {LATENCY:?}, max wait: {max_wait:?}");
+    for floor in more_than {
+        assert!(elapsed > *floor, "{context}");
+    }
+    if let Some(ceiling) = less_than {
+        assert!(elapsed < ceiling, "{context}");
+    }
+}
 
-    let inflated = batches
-        .first()
-        .map(inflated::Batch::try_from)
-        .transpose()?
-        .unwrap();
+/// Up to `max_bytes` that holds exactly the first `n` of [`VALUES`].
+fn bytes_of_first(n: usize) -> usize {
+    VALUES[..n].iter().map(|value| value.len()).sum()
+}
 
-    assert_eq!(1, inflated.records.len());
+/// A fetch that can never be satisfied — one byte from an empty partition —
+/// still answers cleanly when `max_wait` runs out, whether it is far longer
+/// than a round trip or shorter.
+#[tokio::test]
+async fn an_empty_partition_answers_when_a_long_max_wait_runs_out() -> Result<(), Error> {
+    let _guard = init_tracing()?;
 
-    assert_eq!(
-        Some(LOREM_IPSUM),
-        inflated
-            .records
-            .first()
-            .cloned()
-            .and_then(|record| record.value)
-    );
-
-    let inflated = batches
-        .get(1)
-        .map(inflated::Batch::try_from)
-        .transpose()?
-        .unwrap();
-
-    assert_eq!(1, inflated.records.len());
-
-    assert_eq!(
-        Some(EIUSMOD_TEMPOR),
-        inflated
-            .records
-            .first()
-            .cloned()
-            .and_then(|record| record.value)
-    );
-
-    let inflated = batches
-        .get(2)
-        .map(inflated::Batch::try_from)
-        .transpose()?
-        .unwrap();
-
-    assert_eq!(1, inflated.records.len());
-
-    assert_eq!(
-        Some(MINIM_VENIAM),
-        inflated
-            .records
-            .first()
-            .cloned()
-            .and_then(|record| record.value)
-    );
-
-    let inflated = batches
-        .get(3)
-        .map(inflated::Batch::try_from)
-        .transpose()?
-        .unwrap();
-
-    assert_eq!(1, inflated.records.len());
-
-    assert_eq!(
-        Some(ALIQUIP_EX),
-        inflated
-            .records
-            .first()
-            .cloned()
-            .and_then(|record| record.value)
-    );
-
-    let inflated = batches
-        .get(4)
-        .map(inflated::Batch::try_from)
-        .transpose()?
-        .unwrap();
-
-    assert_eq!(1, inflated.records.len());
-
-    assert_eq!(
-        Some(REPREHENDERIT_IN),
-        inflated
-            .records
-            .first()
-            .cloned()
-            .and_then(|record| record.value)
-    );
-
-    let inflated = batches
-        .get(5)
-        .map(inflated::Batch::try_from)
-        .transpose()?
-        .unwrap();
-
-    assert_eq!(1, inflated.records.len());
-
-    assert_eq!(
-        Some(PARIATUR_EXCEPTEUR),
-        inflated
-            .records
-            .first()
-            .cloned()
-            .and_then(|record| record.value)
-    );
-
-    let inflated = batches
-        .get(6)
-        .map(inflated::Batch::try_from)
-        .transpose()?
-        .unwrap();
-
-    assert_eq!(1, inflated.records.len());
-
-    assert_eq!(
-        Some(CULPA_QUI),
-        inflated
-            .records
-            .first()
-            .cloned()
-            .and_then(|record| record.value)
-    );
+    let engine = engine().await?;
+    _ = fetch(&engine, 0, 1, Duration::from_secs(5)).await?;
 
     Ok(())
 }
 
 #[tokio::test]
-async fn fetch_1_min_bytes_max_wait_of_1x_latency() -> Result<(), Error> {
+async fn an_empty_partition_answers_when_a_short_max_wait_runs_out() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let advertised_listener = Url::parse("tcp://localhost:9092")?;
+    let engine = engine().await?;
+    _ = fetch(&engine, 0, 1, Duration::from_millis(50)).await?;
 
-    const LATENCY_INTRODUCED: Duration = Duration::from_millis(100);
-    let max_wait = 1 * LATENCY_INTRODUCED;
+    Ok(())
+}
 
-    let object_store =
-        LatencyIntroducingObjectStore::new(InMemory::new()).with_latency(Some(LATENCY_INTRODUCED));
+/// With `min_bytes` 1 and a long `max_wait`, the first round trip returns the
+/// whole partition, well before `max_wait`.
+#[tokio::test]
+async fn one_round_trip_returns_the_whole_partition_within_a_long_max_wait() -> Result<(), Error> {
+    let _guard = init_tracing()?;
 
-    let storage =
-        DynoStore::new("tansu", 12321, object_store).advertised_listener(advertised_listener);
+    let engine = engine().await?;
+    produce_all(&engine).await?;
 
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
-    };
+    let max_wait = Duration::from_secs(5);
+    let (elapsed, values) = fetch(&engine, 1, 52_428_800, max_wait).await?;
+    assert_took(elapsed, max_wait, &[LATENCY], Some(max_wait));
+    assert_eq!(VALUES.to_vec(), values);
 
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
-    };
+    Ok(())
+}
 
-    let fetch = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(FetchService)
-    };
+/// A `max_wait` of exactly one round trip expires as the first result lands.
+#[tokio::test]
+async fn a_max_wait_of_one_round_trip_returns_the_first_batch() -> Result<(), Error> {
+    let _guard = init_tracing()?;
 
-    let name = "pqr";
-    let num_partitions = 5;
-    let replication_factor = 3;
-    let assignments = Some([].into());
-    let configs = Some([].into());
+    let engine = engine().await?;
+    produce_all(&engine).await?;
 
-    let response = create_topic
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
-                .topics(Some(vec![
-                    CreatableTopic::default()
-                        .name(name.into())
-                        .num_partitions(num_partitions)
-                        .replication_factor(replication_factor)
-                        .assignments(assignments)
-                        .configs(configs),
-                ]))
-                .validate_only(Some(false)),
-        )
-        .await?;
-
-    let topics = response.topics.unwrap_or_default();
-
-    assert_eq!(1, topics.len());
-    assert_eq!(name, topics[0].name.as_str());
-    assert_ne!(Some(NULL_TOPIC_ID), topics[0].topic_id);
-    assert_eq!(Some(5), topics[0].num_partitions);
-    assert_eq!(Some(3), topics[0].replication_factor);
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-
-    const PARTITION: i32 = 0;
-
-    for value in [
-        LOREM_IPSUM,
-        EIUSMOD_TEMPOR,
-        MINIM_VENIAM,
-        ALIQUIP_EX,
-        REPREHENDERIT_IN,
-        PARIATUR_EXCEPTEUR,
-        CULPA_QUI,
-    ] {
-        let response = produce
-            .serve(
-                Context::default(),
-                ProduceRequest::default().topic_data(topic_data(
-                    name,
-                    PARTITION,
-                    inflated::Batch::builder().record(Record::builder().value(value.into())),
-                )?),
-            )
-            .await?;
-
-        let topics = response.responses.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-
-        let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
-        assert_eq!(1, partitions.len());
-        assert_eq!(ErrorCode::None, partitions[0].error_code.try_into()?);
-    }
-
-    let started_at = SystemTime::now();
-    let response = fetch
-        .serve(
-            Context::default(),
-            FetchRequest::default()
-                .topics(Some(
-                    [FetchTopic::default()
-                        .topic(Some(name.into()))
-                        .partitions(Some(
-                            [FetchPartition::default().partition(PARTITION)].into(),
-                        ))]
-                    .into(),
-                ))
-                .min_bytes(1)
-                .max_bytes(Some(52_428_800))
-                .max_wait_ms(max_wait.as_millis() as i32),
-        )
-        .await?;
-    let elapsed = started_at.elapsed()?;
-    assert!(
-        elapsed > LATENCY_INTRODUCED,
-        "elapsed: {elapsed:?}, with latency introduced of: {LATENCY_INTRODUCED:?}, and max wait: {max_wait:?}"
-    );
-    assert!(
-        elapsed > max_wait,
-        "elapsed: {elapsed:?}, with latency introduced of: {LATENCY_INTRODUCED:?}, and max wait: {max_wait:?}"
-    );
-
-    let topics = response.responses.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-    assert_eq!(1, partitions.len());
-    assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(partitions[0].error_code)?
-    );
-
-    let batches = partitions
-        .first()
-        .and_then(|partition_data| partition_data.records.as_ref())
-        .map(|frame| &frame.batches[..])
-        .unwrap_or_default();
-
-    assert_eq!(1, batches.len());
-
-    let inflated = batches
-        .first()
-        .map(inflated::Batch::try_from)
-        .transpose()?
-        .unwrap();
-
-    assert_eq!(1, inflated.records.len());
-
-    assert_eq!(
-        Some(LOREM_IPSUM),
-        inflated
-            .records
-            .first()
-            .cloned()
-            .and_then(|record| record.value)
-    );
+    let max_wait = LATENCY;
+    let (elapsed, values) = fetch(&engine, 1, 52_428_800, max_wait).await?;
+    assert_took(elapsed, max_wait, &[LATENCY, max_wait], None);
+    assert_eq!(VALUES[..1].to_vec(), values);
 
     Ok(())
 }
 
 #[tokio::test]
-async fn fetch_1_min_bytes_max_wait_of_2x_latency() -> Result<(), Error> {
+async fn a_max_wait_of_two_round_trips_returns_the_whole_partition() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let advertised_listener = Url::parse("tcp://localhost:9092")?;
+    let engine = engine().await?;
+    produce_all(&engine).await?;
 
-    const LATENCY_INTRODUCED: Duration = Duration::from_millis(100);
-    let max_wait = 2 * LATENCY_INTRODUCED;
-
-    let object_store =
-        LatencyIntroducingObjectStore::new(InMemory::new()).with_latency(Some(LATENCY_INTRODUCED));
-
-    let storage =
-        DynoStore::new("tansu", 12321, object_store).advertised_listener(advertised_listener);
-
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
-    };
-
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
-    };
-
-    let fetch = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(FetchService)
-    };
-
-    let name = "pqr";
-    let num_partitions = 5;
-    let replication_factor = 3;
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let response = create_topic
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
-                .topics(Some(vec![
-                    CreatableTopic::default()
-                        .name(name.into())
-                        .num_partitions(num_partitions)
-                        .replication_factor(replication_factor)
-                        .assignments(assignments)
-                        .configs(configs),
-                ]))
-                .validate_only(Some(false)),
-        )
-        .await?;
-
-    let topics = response.topics.unwrap_or_default();
-
-    assert_eq!(1, topics.len());
-    assert_eq!(name, topics[0].name.as_str());
-    assert_ne!(Some(NULL_TOPIC_ID), topics[0].topic_id);
-    assert_eq!(Some(5), topics[0].num_partitions);
-    assert_eq!(Some(3), topics[0].replication_factor);
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-
-    const PARTITION: i32 = 0;
-
-    for value in [
-        LOREM_IPSUM,
-        EIUSMOD_TEMPOR,
-        MINIM_VENIAM,
-        ALIQUIP_EX,
-        REPREHENDERIT_IN,
-        PARIATUR_EXCEPTEUR,
-        CULPA_QUI,
-    ] {
-        let response = produce
-            .serve(
-                Context::default(),
-                ProduceRequest::default().topic_data(topic_data(
-                    name,
-                    PARTITION,
-                    inflated::Batch::builder().record(Record::builder().value(value.into())),
-                )?),
-            )
-            .await?;
-
-        let topics = response.responses.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-
-        let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
-        assert_eq!(1, partitions.len());
-        assert_eq!(ErrorCode::None, partitions[0].error_code.try_into()?);
-    }
-
-    let started_at = SystemTime::now();
-    let response = fetch
-        .serve(
-            Context::default(),
-            FetchRequest::default()
-                .topics(Some(
-                    [FetchTopic::default()
-                        .topic(Some(name.into()))
-                        .partitions(Some(
-                            [FetchPartition::default().partition(PARTITION)].into(),
-                        ))]
-                    .into(),
-                ))
-                .min_bytes(1)
-                .max_bytes(Some(52_428_800))
-                .max_wait_ms(max_wait.as_millis() as i32),
-        )
-        .await?;
-    let elapsed = started_at.elapsed()?;
-    assert!(
-        elapsed > LATENCY_INTRODUCED,
-        "elapsed: {elapsed:?}, with latency introduced of: {LATENCY_INTRODUCED:?}, and max wait: {max_wait:?}"
-    );
-    assert!(
-        elapsed > max_wait,
-        "elapsed: {elapsed:?}, with latency introduced of: {LATENCY_INTRODUCED:?}, and max wait: {max_wait:?}"
-    );
-
-    let topics = response.responses.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-    assert_eq!(1, partitions.len());
-    assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(partitions[0].error_code)?
-    );
-
-    let batches = partitions
-        .first()
-        .and_then(|partition_data| partition_data.records.as_ref())
-        .map(|frame| &frame.batches[..])
-        .unwrap_or_default();
+    let max_wait = 2 * LATENCY;
+    let (elapsed, values) = fetch(&engine, 1, 52_428_800, max_wait).await?;
+    assert_took(elapsed, max_wait, &[LATENCY, max_wait], None);
 
     // Seven segments, one per produce, and a `max_bytes` far above their total —
     // so what a fetch returns here is decided by `max_wait` against the per-GET
@@ -940,690 +264,78 @@ async fn fetch_1_min_bytes_max_wait_of_2x_latency() -> Result<(), Error> {
     // are unchanged and still hold — it no longer bounds how much of the
     // partition one round trip can carry.
     //
-    // `fetch_1_min_bytes_max_wait_of_1x_latency` is the other half and is
+    // `a_max_wait_of_one_round_trip_returns_the_first_batch` is the other half and is
     // unchanged at 1: a `max_wait` of exactly one round trip expires as the first
     // result lands, so the deadline check ends the loop after it. What moved is
     // the yield per round trip, not the meaning of `max_wait`.
-    assert_eq!(7, batches.len());
+    assert_eq!(VALUES.to_vec(), values);
 
-    let inflated = batches
-        .first()
-        .map(inflated::Batch::try_from)
-        .transpose()?
-        .unwrap();
+    Ok(())
+}
 
-    assert_eq!(1, inflated.records.len());
+/// A `max_bytes` that holds one record returns that record alone, well before a
+/// long `max_wait`.
+#[tokio::test]
+async fn max_bytes_for_one_record_returns_it_within_a_long_max_wait() -> Result<(), Error> {
+    let _guard = init_tracing()?;
 
-    assert_eq!(
-        Some(LOREM_IPSUM),
-        inflated
-            .records
-            .first()
-            .cloned()
-            .and_then(|record| record.value)
-    );
+    let engine = engine().await?;
+    produce_all(&engine).await?;
 
-    let inflated = batches
-        .get(1)
-        .map(inflated::Batch::try_from)
-        .transpose()?
-        .unwrap();
+    let max_wait = Duration::from_secs(5);
+    let (elapsed, values) = fetch(&engine, 0, bytes_of_first(1), max_wait).await?;
+    assert_took(elapsed, max_wait, &[LATENCY], Some(max_wait));
+    assert_eq!(VALUES[..1].to_vec(), values);
 
-    assert_eq!(1, inflated.records.len());
+    Ok(())
+}
 
-    assert_eq!(
-        Some(EIUSMOD_TEMPOR),
-        inflated
-            .records
-            .first()
-            .cloned()
-            .and_then(|record| record.value)
-    );
+/// A `max_wait` shorter than one round trip still returns the record that
+/// round trip brings.
+#[tokio::test]
+async fn max_bytes_for_one_record_returns_it_after_a_short_max_wait() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let engine = engine().await?;
+    produce_all(&engine).await?;
+
+    let max_wait = Duration::from_millis(50);
+    let (elapsed, values) = fetch(&engine, 0, bytes_of_first(1), max_wait).await?;
+    assert_took(elapsed, max_wait, &[max_wait, LATENCY], None);
+    assert_eq!(VALUES[..1].to_vec(), values);
 
     Ok(())
 }
 
 #[tokio::test]
-async fn fetch_max_bytes_for_1_message_5_000ms_max_wait() -> Result<(), Error> {
+async fn max_bytes_for_two_records_returns_both_within_a_long_max_wait() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let advertised_listener = Url::parse("tcp://localhost:9092")?;
+    let engine = engine().await?;
+    produce_all(&engine).await?;
 
-    const LATENCY_INTRODUCED: Duration = Duration::from_millis(100);
-    const MAX_WAIT: Duration = Duration::from_secs(5);
-
-    let object_store =
-        LatencyIntroducingObjectStore::new(InMemory::new()).with_latency(Some(LATENCY_INTRODUCED));
-
-    let storage =
-        DynoStore::new("tansu", 12321, object_store).advertised_listener(advertised_listener);
-
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
-    };
-
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
-    };
-
-    let fetch = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(FetchService)
-    };
-
-    let name = "pqr";
-    let num_partitions = 5;
-    let replication_factor = 3;
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let response = create_topic
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
-                .topics(Some(vec![
-                    CreatableTopic::default()
-                        .name(name.into())
-                        .num_partitions(num_partitions)
-                        .replication_factor(replication_factor)
-                        .assignments(assignments)
-                        .configs(configs),
-                ]))
-                .validate_only(Some(false)),
-        )
-        .await?;
-
-    let topics = response.topics.unwrap_or_default();
-
-    assert_eq!(1, topics.len());
-    assert_eq!(name, topics[0].name.as_str());
-    assert_ne!(Some(NULL_TOPIC_ID), topics[0].topic_id);
-    assert_eq!(Some(5), topics[0].num_partitions);
-    assert_eq!(Some(3), topics[0].replication_factor);
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-
-    const PARTITION: i32 = 0;
-
-    for value in [
-        LOREM_IPSUM,
-        EIUSMOD_TEMPOR,
-        MINIM_VENIAM,
-        ALIQUIP_EX,
-        REPREHENDERIT_IN,
-        PARIATUR_EXCEPTEUR,
-        CULPA_QUI,
-    ] {
-        let response = produce
-            .serve(
-                Context::default(),
-                ProduceRequest::default().topic_data(topic_data(
-                    name,
-                    PARTITION,
-                    inflated::Batch::builder().record(Record::builder().value(value.into())),
-                )?),
-            )
-            .await?;
-
-        let topics = response.responses.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-
-        let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
-        assert_eq!(1, partitions.len());
-        assert_eq!(ErrorCode::None, partitions[0].error_code.try_into()?);
-    }
-
-    let started_at = SystemTime::now();
-    let response = fetch
-        .serve(
-            Context::default(),
-            FetchRequest::default()
-                .topics(Some(
-                    [FetchTopic::default()
-                        .topic(Some(name.into()))
-                        .partitions(Some(
-                            [FetchPartition::default().partition(PARTITION)].into(),
-                        ))]
-                    .into(),
-                ))
-                .max_bytes(Some(LOREM_IPSUM.len() as i32))
-                .max_wait_ms(MAX_WAIT.as_millis() as i32),
-        )
-        .await?;
-    let elapsed = started_at.elapsed()?;
-    assert!(
-        elapsed > LATENCY_INTRODUCED,
-        "elapsed: {elapsed:?}, with latency introduced of: {LATENCY_INTRODUCED:?}, and max wait: {MAX_WAIT:?}"
-    );
-    assert!(
-        elapsed < MAX_WAIT,
-        "elapsed: {elapsed:?}, with latency introduced of: {LATENCY_INTRODUCED:?}, and max wait: {MAX_WAIT:?}"
-    );
-
-    let topics = response.responses.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-    assert_eq!(1, partitions.len());
-    assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(partitions[0].error_code)?
-    );
-    assert!(partitions[0].records.is_some());
-    assert_eq!(1, partitions[0].records.as_ref().unwrap().batches.len());
-
-    let batches = partitions
-        .first()
-        .and_then(|partition_data| partition_data.records.as_ref())
-        .map(|frame| &frame.batches[..])
-        .unwrap_or_default();
-
-    assert_eq!(1, batches.len());
-
-    let inflated = batches
-        .first()
-        .map(inflated::Batch::try_from)
-        .transpose()?
-        .unwrap();
-
-    assert_eq!(1, inflated.records.len());
-
-    assert_eq!(
-        Some(LOREM_IPSUM),
-        inflated
-            .records
-            .first()
-            .cloned()
-            .and_then(|record| record.value)
-    );
+    let max_wait = Duration::from_secs(5);
+    let (elapsed, values) = fetch(&engine, 0, bytes_of_first(2), max_wait).await?;
+    assert_took(elapsed, max_wait, &[LATENCY], Some(max_wait));
+    assert_eq!(VALUES[..2].to_vec(), values);
 
     Ok(())
 }
 
+/// Room for two records, but a `max_wait` shorter than a round trip: the fetch
+/// has to exceed `max_wait` to make progress at all, and returns after the
+/// first.
 #[tokio::test]
-async fn fetch_max_bytes_for_1_message_50ms_max_wait() -> Result<(), Error> {
+async fn max_bytes_for_two_records_returns_one_after_a_short_max_wait() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let advertised_listener = Url::parse("tcp://localhost:9092")?;
-
-    const LATENCY_INTRODUCED: Duration = Duration::from_millis(100);
-    const MAX_WAIT: Duration = Duration::from_millis(50);
-
-    let object_store =
-        LatencyIntroducingObjectStore::new(InMemory::new()).with_latency(Some(LATENCY_INTRODUCED));
-
-    let storage =
-        DynoStore::new("tansu", 12321, object_store).advertised_listener(advertised_listener);
-
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
-    };
-
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
-    };
-
-    let fetch = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(FetchService)
-    };
-
-    let name = "pqr";
-    let num_partitions = 5;
-    let replication_factor = 3;
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let response = create_topic
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
-                .topics(Some(vec![
-                    CreatableTopic::default()
-                        .name(name.into())
-                        .num_partitions(num_partitions)
-                        .replication_factor(replication_factor)
-                        .assignments(assignments)
-                        .configs(configs),
-                ]))
-                .validate_only(Some(false)),
-        )
-        .await?;
-
-    let topics = response.topics.unwrap_or_default();
-
-    assert_eq!(1, topics.len());
-    assert_eq!(name, topics[0].name.as_str());
-    assert_ne!(Some(NULL_TOPIC_ID), topics[0].topic_id);
-    assert_eq!(Some(5), topics[0].num_partitions);
-    assert_eq!(Some(3), topics[0].replication_factor);
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-
-    const PARTITION: i32 = 0;
-
-    for value in [
-        LOREM_IPSUM,
-        EIUSMOD_TEMPOR,
-        MINIM_VENIAM,
-        ALIQUIP_EX,
-        REPREHENDERIT_IN,
-        PARIATUR_EXCEPTEUR,
-        CULPA_QUI,
-    ] {
-        let response = produce
-            .serve(
-                Context::default(),
-                ProduceRequest::default().topic_data(topic_data(
-                    name,
-                    PARTITION,
-                    inflated::Batch::builder().record(Record::builder().value(value.into())),
-                )?),
-            )
-            .await?;
-
-        let topics = response.responses.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-
-        let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
-        assert_eq!(1, partitions.len());
-        assert_eq!(ErrorCode::None, partitions[0].error_code.try_into()?);
-    }
-
-    let started_at = SystemTime::now();
-    let response = fetch
-        .serve(
-            Context::default(),
-            FetchRequest::default()
-                .topics(Some(
-                    [FetchTopic::default()
-                        .topic(Some(name.into()))
-                        .partitions(Some(
-                            [FetchPartition::default().partition(PARTITION)].into(),
-                        ))]
-                    .into(),
-                ))
-                .max_bytes(Some(LOREM_IPSUM.len() as i32))
-                .max_wait_ms(MAX_WAIT.as_millis() as i32),
-        )
-        .await?;
-
-    let elapsed = started_at.elapsed()?;
-    assert!(
-        elapsed > MAX_WAIT,
-        "elapsed: {elapsed:?}, with latency introduced of: {LATENCY_INTRODUCED:?}, and max wait: {MAX_WAIT:?}"
-    );
-    assert!(
-        elapsed > LATENCY_INTRODUCED,
-        "elapsed: {elapsed:?}, with latency introduced of: {LATENCY_INTRODUCED:?}, and max wait: {MAX_WAIT:?}"
-    );
-
-    let topics = response.responses.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-    assert_eq!(1, partitions.len());
-    assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(partitions[0].error_code)?
-    );
-    assert!(partitions[0].records.is_some());
-    assert_eq!(1, partitions[0].records.as_ref().unwrap().batches.len());
-
-    let batches = partitions
-        .first()
-        .and_then(|partition_data| partition_data.records.as_ref())
-        .map(|frame| &frame.batches[..])
-        .unwrap_or_default();
-
-    assert_eq!(1, batches.len());
-
-    let inflated = batches
-        .first()
-        .map(inflated::Batch::try_from)
-        .transpose()?
-        .unwrap();
-
-    assert_eq!(1, inflated.records.len());
-
-    assert_eq!(
-        Some(LOREM_IPSUM),
-        inflated
-            .records
-            .first()
-            .cloned()
-            .and_then(|record| record.value)
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn fetch_max_bytes_for_2_messages_5_000ms_max_wait() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let advertised_listener = Url::parse("tcp://localhost:9092")?;
-
-    const LATENCY_INTRODUCED: Duration = Duration::from_millis(100);
-    const MAX_WAIT: Duration = Duration::from_secs(5);
-
-    let object_store =
-        LatencyIntroducingObjectStore::new(InMemory::new()).with_latency(Some(LATENCY_INTRODUCED));
-
-    let storage =
-        DynoStore::new("tansu", 12321, object_store).advertised_listener(advertised_listener);
-
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
-    };
-
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
-    };
-
-    let fetch = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(FetchService)
-    };
-
-    let name = "pqr";
-    let num_partitions = 5;
-    let replication_factor = 3;
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let response = create_topic
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
-                .topics(Some(vec![
-                    CreatableTopic::default()
-                        .name(name.into())
-                        .num_partitions(num_partitions)
-                        .replication_factor(replication_factor)
-                        .assignments(assignments)
-                        .configs(configs),
-                ]))
-                .validate_only(Some(false)),
-        )
-        .await?;
-
-    let topics = response.topics.unwrap_or_default();
-
-    assert_eq!(1, topics.len());
-    assert_eq!(name, topics[0].name.as_str());
-    assert_ne!(Some(NULL_TOPIC_ID), topics[0].topic_id);
-    assert_eq!(Some(5), topics[0].num_partitions);
-    assert_eq!(Some(3), topics[0].replication_factor);
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-
-    const PARTITION: i32 = 0;
-
-    for value in [
-        LOREM_IPSUM,
-        EIUSMOD_TEMPOR,
-        MINIM_VENIAM,
-        ALIQUIP_EX,
-        REPREHENDERIT_IN,
-        PARIATUR_EXCEPTEUR,
-        CULPA_QUI,
-    ] {
-        let response = produce
-            .serve(
-                Context::default(),
-                ProduceRequest::default().topic_data(topic_data(
-                    name,
-                    PARTITION,
-                    inflated::Batch::builder().record(Record::builder().value(value.into())),
-                )?),
-            )
-            .await?;
-
-        let topics = response.responses.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-
-        let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
-        assert_eq!(1, partitions.len());
-        assert_eq!(ErrorCode::None, partitions[0].error_code.try_into()?);
-    }
-
-    let started_at = SystemTime::now();
-    let response = fetch
-        .serve(
-            Context::default(),
-            FetchRequest::default()
-                .topics(Some(
-                    [FetchTopic::default()
-                        .topic(Some(name.into()))
-                        .partitions(Some(
-                            [FetchPartition::default().partition(PARTITION)].into(),
-                        ))]
-                    .into(),
-                ))
-                .max_bytes(Some((LOREM_IPSUM.len() + EIUSMOD_TEMPOR.len()) as i32))
-                .max_wait_ms(MAX_WAIT.as_millis() as i32),
-        )
-        .await?;
-    let elapsed = started_at.elapsed()?;
-    assert!(
-        elapsed > LATENCY_INTRODUCED,
-        "elapsed: {elapsed:?}, with latency introduced of: {LATENCY_INTRODUCED:?}, and max wait: {MAX_WAIT:?}"
-    );
-    assert!(
-        elapsed < MAX_WAIT,
-        "elapsed: {elapsed:?}, with latency introduced of: {LATENCY_INTRODUCED:?}, and max wait: {MAX_WAIT:?}"
-    );
-
-    let topics = response.responses.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-    assert_eq!(1, partitions.len());
-    assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(partitions[0].error_code)?
-    );
-
-    let batches = partitions
-        .first()
-        .and_then(|partition_data| partition_data.records.as_ref())
-        .map(|frame| &frame.batches[..])
-        .unwrap_or_default();
-
-    assert_eq!(2, batches.len());
-
-    let inflated = batches
-        .first()
-        .map(inflated::Batch::try_from)
-        .transpose()?
-        .unwrap();
-
-    assert_eq!(1, inflated.records.len());
-
-    assert_eq!(
-        Some(LOREM_IPSUM),
-        inflated
-            .records
-            .first()
-            .cloned()
-            .and_then(|record| record.value)
-    );
-
-    let inflated = batches
-        .get(1)
-        .map(inflated::Batch::try_from)
-        .transpose()?
-        .unwrap();
-
-    assert_eq!(1, inflated.records.len());
-
-    assert_eq!(
-        Some(EIUSMOD_TEMPOR),
-        inflated
-            .records
-            .first()
-            .cloned()
-            .and_then(|record| record.value)
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn fetch_max_bytes_for_2_messages_50ms_max_wait() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let advertised_listener = Url::parse("tcp://localhost:9092")?;
-
-    const LATENCY_INTRODUCED: Duration = Duration::from_millis(100);
-    const MAX_WAIT: Duration = Duration::from_millis(50);
-
-    let object_store =
-        LatencyIntroducingObjectStore::new(InMemory::new()).with_latency(Some(LATENCY_INTRODUCED));
-
-    let storage =
-        DynoStore::new("tansu", 12321, object_store).advertised_listener(advertised_listener);
-
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
-    };
-
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
-    };
-
-    let fetch = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(FetchService)
-    };
-
-    let name = "pqr";
-    let num_partitions = 5;
-    let replication_factor = 3;
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let response = create_topic
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
-                .topics(Some(vec![
-                    CreatableTopic::default()
-                        .name(name.into())
-                        .num_partitions(num_partitions)
-                        .replication_factor(replication_factor)
-                        .assignments(assignments)
-                        .configs(configs),
-                ]))
-                .validate_only(Some(false)),
-        )
-        .await?;
-
-    let topics = response.topics.unwrap_or_default();
-
-    assert_eq!(1, topics.len());
-    assert_eq!(name, topics[0].name.as_str());
-    assert_ne!(Some(NULL_TOPIC_ID), topics[0].topic_id);
-    assert_eq!(Some(5), topics[0].num_partitions);
-    assert_eq!(Some(3), topics[0].replication_factor);
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-
-    const PARTITION: i32 = 0;
-
-    for value in [
-        LOREM_IPSUM,
-        EIUSMOD_TEMPOR,
-        MINIM_VENIAM,
-        ALIQUIP_EX,
-        REPREHENDERIT_IN,
-        PARIATUR_EXCEPTEUR,
-        CULPA_QUI,
-    ] {
-        let response = produce
-            .serve(
-                Context::default(),
-                ProduceRequest::default().topic_data(topic_data(
-                    name,
-                    PARTITION,
-                    inflated::Batch::builder().record(Record::builder().value(value.into())),
-                )?),
-            )
-            .await?;
-
-        let topics = response.responses.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-
-        let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
-        assert_eq!(1, partitions.len());
-        assert_eq!(ErrorCode::None, partitions[0].error_code.try_into()?);
-    }
-
-    let started_at = SystemTime::now();
-    let response = fetch
-        .serve(
-            Context::default(),
-            FetchRequest::default()
-                .topics(Some(
-                    [FetchTopic::default()
-                        .topic(Some(name.into()))
-                        .partitions(Some(
-                            [FetchPartition::default().partition(PARTITION)].into(),
-                        ))]
-                    .into(),
-                ))
-                .max_bytes(Some((LOREM_IPSUM.len() + EIUSMOD_TEMPOR.len()) as i32))
-                .max_wait_ms(MAX_WAIT.as_millis() as i32),
-        )
-        .await?;
-    let elapsed = started_at.elapsed()?;
-
-    assert!(
-        elapsed > LATENCY_INTRODUCED,
-        "elapsed: {elapsed:?}, with latency introduced of: {LATENCY_INTRODUCED:?}, and max wait: {MAX_WAIT:?}"
-    );
-
-    // exceed the maximum wait in order to progress the fetcher:
-    assert!(
-        elapsed > MAX_WAIT,
-        "elapsed: {elapsed:?}, with latency introduced of: {LATENCY_INTRODUCED:?}, and max wait: {MAX_WAIT:?}"
-    );
-
-    let topics = response.responses.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-    assert_eq!(1, partitions.len());
-    assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(partitions[0].error_code)?
-    );
-
-    let batches = partitions
-        .first()
-        .and_then(|partition_data| partition_data.records.as_ref())
-        .map(|frame| &frame.batches[..])
-        .unwrap_or_default();
-
-    assert_eq!(1, batches.len());
-
-    let inflated = batches
-        .first()
-        .map(inflated::Batch::try_from)
-        .transpose()?
-        .unwrap();
-
-    assert_eq!(1, inflated.records.len());
-
-    assert_eq!(
-        Some(LOREM_IPSUM),
-        inflated
-            .records
-            .first()
-            .cloned()
-            .and_then(|record| record.value)
-    );
+    let engine = engine().await?;
+    produce_all(&engine).await?;
+
+    let max_wait = Duration::from_millis(50);
+    let (elapsed, values) = fetch(&engine, 0, bytes_of_first(2), max_wait).await?;
+    assert_took(elapsed, max_wait, &[LATENCY, max_wait], None);
+    assert_eq!(VALUES[..1].to_vec(), values);
 
     Ok(())
 }
