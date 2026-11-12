@@ -593,6 +593,14 @@ fmt:
 # `MapStateLayer` wrappings for `storage` and `serve`, and the two copies of
 # the CreateTopics call and its seven assertions for `create` and
 # `assert_created`. No `//` line was added or removed.
+#   defork  -318 lines, the ListOffsets tests on the shared setup  3172 -> 3169  2.6951 -> 2.7000
+#
+# `tests/list_offsets.rs` wrote out its container builder, CreateTopics,
+# Produce and ListOffsets calls once per test, five times over. They become
+# `populate`, `produce`, `offsets`, `ask` and `assert_own_offsets`, and the
+# two wide-assignment tests share one body. The three-line `//` note on
+# `records_in` becomes its doc comment; every other `//` block moves
+# unchanged.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -603,7 +611,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6952" top="12":
+comments ceiling="2.7000" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

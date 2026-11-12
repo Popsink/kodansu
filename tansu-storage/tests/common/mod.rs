@@ -147,12 +147,21 @@ pub(crate) const PORT: i32 = 9092;
 /// nothing about the broker itself is under test.
 #[allow(dead_code)]
 pub(crate) async fn storage() -> Result<Arc<dyn tansu_storage::Storage>, Error> {
+    storage_with_query("").await
+}
+
+/// [`storage`], over [`storage_url_with_query`] with `query`: for a test that
+/// sets an engine option through the URL.
+#[allow(dead_code)]
+pub(crate) async fn storage_with_query(
+    query: &str,
+) -> Result<Arc<dyn tansu_storage::Storage>, Error> {
     let advertised = Url::parse(&format!("tcp://{HOST}:{PORT}"))?;
     let engine = tansu_storage::StorageContainer::builder()
         .cluster_id(cluster_id())
         .node_id(NODE_ID)
         .advertised_listener(advertised)
-        .storage(storage_url()?);
+        .storage(storage_url_with_query(query)?);
     Ok(engine.build().await?)
 }
 
