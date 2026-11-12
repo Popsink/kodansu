@@ -33,6 +33,8 @@ last line of every fallible test and unit-returning function. And for a bare
 macro or `use` opener (`assert_eq!(`, `vec![`, `use std::{`, `sync::{`), the
 line rustfmt opens a call or an import with when its contents do not fit on
 one: the contents follow on lines that are counted.
+And for a bare test marker (`#[test]`, `#[tokio::test]`), which every test
+carries and cannot spell any other way.
 
 Two measures:
 
@@ -65,6 +67,7 @@ GRANT_LINES = 12
 ATTRIBUTE_OPENER = re.compile(r"^#!?\[[\w:]+\($")
 MODULE_DECLARATION = re.compile(r"^(pub(\([\w: ]+\))? )?mod \w+;$")
 CRATE_FLAG = re.compile(r"^#!\[\w+\]$")
+TEST_MARKER = re.compile(r"^#\[(?:tokio::)?test\]$")
 OPENER = re.compile(r"^(?:(?:use )?[\w:]+::\{|\w+![(\[{])$")
 UNIT_OK = "Ok(())"
 
@@ -76,6 +79,7 @@ def syntax_only(text: str) -> bool:
         or bool(ATTRIBUTE_OPENER.match(stripped))
         or bool(MODULE_DECLARATION.match(stripped))
         or bool(CRATE_FLAG.match(stripped))
+        or bool(TEST_MARKER.match(stripped))
         or bool(OPENER.match(stripped))
         or stripped == UNIT_OK
     )

@@ -198,6 +198,15 @@ is still counted, because it names what is called. The rule took 710 lines
 off the plain total, and `tansu-storage/tests/incremental_alter_configs.rs`
 left `inherited` with it.
 
+So is a bare test marker, `#[test]` or `#[tokio::test]`, on the grounds of the
+crate flag above: every test carries one, and there is no other way to write
+it. Blame lines a rewritten test's marker up with whichever upstream marker the
+diff lands on. An attribute that records a decision (`#[must_use]`,
+`#[non_exhaustive]`, `#[default]`) or takes arguments
+(`#[tokio::test(flavor = …)]`) is still counted. The rule took 358 lines off
+the plain total, and `tansu-storage/tests/delete_topics.rs` left `inherited`
+with it.
+
 The report gives two numbers per file, because one blame mode is not enough:
 
 | measure | `git blame` | catches | misses |
