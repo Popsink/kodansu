@@ -12,86 +12,54 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rama::{Context, Service};
-use tansu_sans_io::{ApiKey, Frame, Header, JoinGroupRequest};
-use tracing::instrument;
+//! `JoinGroup`: a member joins a classic group, or rejoins it.
 
-use super::answer;
-use tansu_sans_io::{
-    ErrorCode,
-    acl::{Operation, Resource},
-};
+use tansu_sans_io::acl::{Operation, Resource};
+use tansu_sans_io::{ErrorCode, JoinGroupRequest};
 use tansu_storage::authorized;
 
-use crate::{Error, Result, coordinator::group::Coordinator};
+use super::answer;
+use super::handler::{answered, respond};
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct JoinGroupService;
+group_service! {
+    JoinGroupService: JoinGroupRequest,
+    |ctx, frame| {
+        let correlation_id = frame.correlation_id()?;
+        let client_id = frame.client_id()?.map(str::to_owned);
+        let JoinGroupRequest {
+            group_id,
+            session_timeout_ms,
+            rebalance_timeout_ms,
+            member_id,
+            group_instance_id,
+            protocol_type,
+            protocols,
+            reason,
+            ..
+        } = JoinGroupRequest::try_from(frame.body)?;
 
-impl ApiKey for JoinGroupService {
-    const KEY: i16 = JoinGroupRequest::KEY;
-}
+        // The member id is echoed back in every answer, because the client
+        // matches the answer to its own attempt by it, whatever the outcome.
+        let refused = |error_code| answer::join_group(error_code, &member_id);
 
-impl<C> Service<C, Frame> for JoinGroupService
-where
-    C: Coordinator,
-{
-    type Response = Frame;
-    type Error = Error;
-
-    #[instrument(skip(ctx, req))]
-    async fn serve(&self, mut ctx: Context<C>, req: Frame) -> Result<Self::Response, Self::Error> {
-        let correlation_id = req.correlation_id()?;
-        let client_id = req
-            .client_id()
-            .map(|client_id| client_id.map(|client_id| client_id.to_owned()))?;
-
-        let join_group = JoinGroupRequest::try_from(req.body)?;
-
-        if !authorized(&ctx, Resource::Group, &join_group.group_id, Operation::Read).await {
-            // The member id is echoed back because the client matches the
-            // answer to its own attempt by it, whatever the outcome.
-            return Ok(Frame {
-                size: 0,
-                header: Header::Response { correlation_id },
-                body: answer::join_group(
-                    ErrorCode::GroupAuthorizationFailed,
-                    join_group.member_id.as_str(),
-                ),
-            });
+        if !authorized(&ctx, Resource::Group, &group_id, Operation::Read).await {
+            return Ok(respond(correlation_id, refused(ErrorCode::GroupAuthorizationFailed)));
         }
 
-        let coordinator = ctx.state_mut();
-
-        coordinator
+        let joined = ctx
+            .state_mut()
             .join(
                 client_id.as_deref(),
-                join_group.group_id.as_str(),
-                join_group.session_timeout_ms,
-                join_group.rebalance_timeout_ms,
-                join_group.member_id.as_str(),
-                join_group.group_instance_id.as_deref(),
-                join_group.protocol_type.as_str(),
-                join_group.protocols.as_deref(),
-                join_group.reason.as_deref(),
+                &group_id,
+                session_timeout_ms,
+                rebalance_timeout_ms,
+                &member_id,
+                group_instance_id.as_deref(),
+                &protocol_type,
+                protocols.as_deref(),
+                reason.as_deref(),
             )
-            .await
-            .or_else(|error| match error {
-                // An `Error::Api` is an answer the broker chose, not a failure.
-                // Answering it here is what stops it from ending the connection
-                // with no response written — `early eof` to the caller (#300). See
-                // [`super::answer`].
-                Error::Api(error_code) => Ok(answer::join_group(
-                    error_code,
-                    join_group.member_id.as_str(),
-                )),
-
-                otherwise => Err(otherwise),
-            })
-            .map(|body| Frame {
-                size: 0,
-                header: Header::Response { correlation_id },
-                body,
-            })
+            .await;
+        answered(joined, refused).map(|body| respond(correlation_id, body))
     }
 }
