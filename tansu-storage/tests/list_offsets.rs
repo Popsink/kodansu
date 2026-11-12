@@ -1,4 +1,3 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
 // Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,81 +12,206 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! `ListOffsets`: the named positions, a consumer's whole assignment in one
+//! request, and `offsetsForTimes`.
+
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::common::{Error, cluster_id, init_tracing, storage_url, storage_url_with_query};
 use bytes::Bytes;
-use rama::{Context, Layer as _, Service, layer::MapStateLayer};
-use tansu_sans_io::{
-    CreateTopicsRequest, ErrorCode, IsolationLevel, ListOffset, ListOffsetsRequest, ProduceRequest,
-    create_topics_request::CreatableTopic,
-    list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
-    list_offsets_response::ListOffsetsPartitionResponse,
-    produce_request::{PartitionProduceData, TopicProduceData},
-    record::{Record, deflated, inflated::Batch},
+use tansu_sans_io::list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic};
+use tansu_sans_io::list_offsets_response::{
+    ListOffsetsPartitionResponse, ListOffsetsTopicResponse,
 };
-use tansu_storage::{CreateTopicsService, ListOffsetsService, ProduceService, StorageContainer};
-use url::Url;
+use tansu_sans_io::produce_request::{PartitionProduceData, TopicProduceData};
+use tansu_sans_io::record::{Record, deflated, inflated::Batch};
+use tansu_sans_io::{ErrorCode, ListOffset, ListOffsetsRequest, ProduceRequest};
+use tansu_storage::{ListOffsetsService, ProduceService, Storage};
+
+use crate::common::{Error, init_tracing, serve, storage, storage_with_query, topic};
 
 mod common;
 
+/// The topics in a wide assignment.
+const TOPICS: usize = 64;
+
+/// The number of records produced to topic `i`: distinct per topic (mod a
+/// small prime) so a response attributed to the wrong partition cannot
+/// accidentally carry the right high watermark.
+fn records_in(i: usize) -> i64 {
+    (i % 5) as i64 + 1
+}
+
+/// One batch of `count` records valued `{prefix}-{n}`, at offset deltas
+/// `0..count`.
+fn batch_of(prefix: &str, count: i64) -> Result<deflated::Batch, Error> {
+    let mut builder = Batch::builder().last_offset_delta(count as i32 - 1);
+    for record in 0..count {
+        let value = Bytes::from(format!("{prefix}-{record}"));
+        builder = builder.record(
+            Record::builder()
+                .offset_delta(record as i32)
+                .value(Some(value)),
+        );
+    }
+    Ok(builder.build().and_then(deflated::Batch::try_from)?)
+}
+
+/// Produces `batch` to partition 0 of `name` through `Produce`, answering that
+/// partition's error and base offset.
+async fn produce(
+    storage: &Arc<dyn Storage>,
+    name: &str,
+    batch: deflated::Batch,
+) -> Result<(ErrorCode, i64), Error> {
+    let frame = deflated::Frame {
+        batches: vec![batch],
+    };
+    let partition = PartitionProduceData::default()
+        .index(0)
+        .records(Some(frame));
+    let data = TopicProduceData::default()
+        .name(name.to_owned())
+        .partition_data(Some(vec![partition]));
+    let request = ProduceRequest::default().topic_data(Some(vec![data]));
+    let response = serve(storage, ProduceService, request).await?;
+
+    let [data] = <[_; 1]>::try_from(response.responses.unwrap_or_default()).expect("one topic");
+    let [partition] =
+        <[_; 1]>::try_from(data.partition_responses.unwrap_or_default()).expect("one partition");
+    Ok((
+        ErrorCode::try_from(partition.error_code)?,
+        partition.base_offset,
+    ))
+}
+
+/// What one `ListOffsets` answers for partition 0 of each of `names`, all at
+/// `timestamp`.
+async fn offsets(
+    storage: &Arc<dyn Storage>,
+    names: impl IntoIterator<Item = String>,
+    timestamp: i64,
+) -> Result<Vec<ListOffsetsTopicResponse>, Error> {
+    let wanted = names.into_iter().map(|name| {
+        let partition = ListOffsetsPartition::default()
+            .partition_index(0)
+            .timestamp(timestamp);
+        ListOffsetsTopic::default()
+            .name(name)
+            .partitions(Some(vec![partition]))
+    });
+    let request = ListOffsetsRequest::default().topics(Some(wanted.collect()));
+    let response = serve(storage, ListOffsetsService, request).await?;
+    Ok(response.topics.unwrap_or_default())
+}
+
+/// The one partition `ListOffsets` answers for `name` at `timestamp`.
+async fn ask(
+    storage: &Arc<dyn Storage>,
+    name: &str,
+    timestamp: i64,
+) -> Result<ListOffsetsPartitionResponse, Error> {
+    let topics = offsets(storage, [name.to_owned()], timestamp).await?;
+    let [topic] = <[_; 1]>::try_from(topics).expect("one topic");
+    let [partition] =
+        <[_; 1]>::try_from(topic.partitions.unwrap_or_default()).expect("one partition");
+    Ok(partition)
+}
+
+/// Creates `TOPICS` one-partition topics named by `name`, and produces
+/// `records_in(i)` records to topic `i` in one batch.
+async fn populate(storage: &Arc<dyn Storage>, name: impl Fn(usize) -> String) -> Result<(), Error> {
+    for i in 0..TOPICS {
+        let name = name(i);
+        topic(storage, &name).await?;
+        let produced = produce(storage, &name, batch_of(&name, records_in(i))?).await?;
+        assert_eq!((ErrorCode::None, 0), produced, "{name}");
+    }
+    Ok(())
+}
+
+/// Asks EARLIEST and then LATEST for every topic of the assignment in one
+/// request each, and checks that each topic gets its own offsets back.
+async fn assert_own_offsets(
+    storage: &Arc<dyn Storage>,
+    name: impl Fn(usize) -> String,
+    sweep: &str,
+) -> Result<(), Error> {
+    for position in [ListOffset::Earliest, ListOffset::Latest] {
+        let topics = offsets(storage, (0..TOPICS).map(&name), position.try_into()?).await?;
+        assert_eq!(TOPICS, topics.len(), "{sweep}: {position:?}");
+
+        for i in 0..TOPICS {
+            let name = name(i);
+            let label = format!("{sweep}: {position:?}: {name}");
+            let topic = topics
+                .iter()
+                .find(|topic| topic.name == name)
+                .unwrap_or_else(|| panic!("{label}: no response"));
+            let partitions = topic.partitions.as_deref().unwrap_or_default();
+            let [partition] = partitions else {
+                panic!("{label}: {} partitions", partitions.len())
+            };
+
+            let expected = match position {
+                // The log start: nothing has been deleted, so 0 for every topic.
+                ListOffset::Earliest => 0,
+                // The high watermark: the record count produced to THIS topic.
+                _ => records_in(i),
+            };
+            let error_code = ErrorCode::try_from(partition.error_code)?;
+            assert_eq!(
+                (0, ErrorCode::None, Some(expected)),
+                (partition.partition_index, error_code, partition.offset),
+                "{label}"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Milliseconds since the epoch, `ahead` from now.
+fn millis_from_now(ahead: Duration) -> i64 {
+    let then = SystemTime::now() + ahead;
+    let since = then.duration_since(UNIX_EPOCH).expect("after the epoch");
+    since.as_millis() as i64
+}
+
+/// EARLIEST on a partition nothing was produced to is offset 0, with no
+/// timestamp.
 #[tokio::test]
-async fn req() -> Result<(), Error> {
+async fn earliest_on_an_empty_partition_is_zero() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    const HOST: &str = "localhost";
-    const PORT: i32 = 9092;
-    const NODE_ID: i32 = 111;
+    let name = "abcba";
+    let topics = offsets(
+        &storage().await?,
+        [name.to_owned()],
+        ListOffset::Earliest.try_into()?,
+    )
+    .await?;
 
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
-
-    let service = MapStateLayer::new(|_| storage).into_layer(ListOffsetsService);
-
-    let topic = "abcba";
-
-    let response = service
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
-                .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
-                .replica_id(NODE_ID)
-                .topics(Some(
-                    [ListOffsetsTopic::default()
-                        .name(topic.into())
-                        .partitions(Some(
-                            [ListOffsetsPartition::default()
-                                .current_leader_epoch(Some(-1))
-                                .max_num_offsets(Some(3))
-                                .partition_index(0)
-                                .timestamp(ListOffset::Earliest.try_into()?)]
-                            .into(),
-                        ))]
-                    .into(),
-                )),
-        )
-        .await?;
-
-    let topics = response.topics.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    assert_eq!(topic, topics[0].name);
-
-    let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-    assert_eq!(1, partitions.len());
-    assert_eq!(0, partitions[0].partition_index);
-    assert!(partitions[0].old_style_offsets.is_none());
+    let [topic] = <[_; 1]>::try_from(topics).expect("one topic");
+    assert_eq!(name, topic.name);
+    let [partition] =
+        <[_; 1]>::try_from(topic.partitions.unwrap_or_default()).expect("one partition");
+    let error_code = ErrorCode::try_from(partition.error_code)?;
     assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(partitions[0].error_code)?
+        (0, None, ErrorCode::None),
+        (
+            partition.partition_index,
+            partition.old_style_offsets,
+            error_code
+        )
     );
-    assert_eq!(Some(-1), partitions[0].timestamp);
-    assert_eq!(Some(0), partitions[0].offset);
-    assert_eq!(Some(0), partitions[0].leader_epoch);
+    assert_eq!(
+        (Some(-1), Some(0), Some(0)),
+        (
+            partition.timestamp,
+            partition.offset,
+            partition.leader_epoch
+        )
+    );
 
     Ok(())
 }
@@ -104,160 +228,11 @@ async fn req() -> Result<(), Error> {
 async fn wide_assignment_earliest_and_latest() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    const HOST: &str = "localhost";
-    const PORT: i32 = 9092;
-    const NODE_ID: i32 = 111;
-    const TOPICS: usize = 64;
+    let storage = storage().await?;
+    let name = |i: usize| format!("assignment-{i:04}");
 
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
-
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
-    };
-
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
-    };
-
-    let list_offsets = MapStateLayer::new(|_| storage).into_layer(ListOffsetsService);
-
-    // The number of records produced to topic `i`: distinct per topic (mod a
-    // small prime) so a response attributed to the wrong partition cannot
-    // accidentally carry the right high watermark.
-    let records_in = |i: usize| (i % 5) as i64 + 1;
-    let topic_name = |i: usize| format!("assignment-{i:04}");
-
-    for i in 0..TOPICS {
-        let name = topic_name(i);
-
-        let response = create_topic
-            .serve(
-                Context::default(),
-                CreateTopicsRequest::default()
-                    .validate_only(Some(false))
-                    .topics(Some(
-                        [CreatableTopic::default()
-                            .name(name.clone())
-                            .num_partitions(1)
-                            .replication_factor(1)
-                            .assignments(Some([].into()))
-                            .configs(Some([].into()))]
-                        .into(),
-                    )),
-            )
-            .await?;
-
-        let topics = response.topics.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-
-        let mut builder = Batch::builder().last_offset_delta(records_in(i) as i32 - 1);
-        for record in 0..records_in(i) {
-            builder = builder.record(
-                Record::builder()
-                    .offset_delta(record as i32)
-                    .value(Bytes::from(format!("{name}-{record}").into_bytes()).into()),
-            );
-        }
-        let deflated = builder.build().and_then(deflated::Batch::try_from)?;
-
-        let response = produce
-            .serve(
-                Context::default(),
-                ProduceRequest::default().topic_data(Some(
-                    [TopicProduceData::default()
-                        .name(name.clone())
-                        .partition_data(Some(
-                            [PartitionProduceData::default().index(0).records(Some(
-                                deflated::Frame {
-                                    batches: vec![deflated],
-                                },
-                            ))]
-                            .into(),
-                        ))]
-                    .into(),
-                )),
-            )
-            .await?;
-
-        let topics = response.responses.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-        let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
-        assert_eq!(1, partitions.len());
-        assert_eq!(
-            ErrorCode::None,
-            ErrorCode::try_from(partitions[0].error_code)?
-        );
-        assert_eq!(0, partitions[0].base_offset);
-    }
-
-    for offset_request in [ListOffset::Earliest, ListOffset::Latest] {
-        let response = list_offsets
-            .serve(
-                Context::default(),
-                ListOffsetsRequest::default()
-                    .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
-                    .replica_id(-1)
-                    .topics(Some(
-                        (0..TOPICS)
-                            .map(|i| {
-                                Ok(ListOffsetsTopic::default().name(topic_name(i)).partitions(
-                                    Some(
-                                        [ListOffsetsPartition::default()
-                                            .current_leader_epoch(Some(-1))
-                                            .partition_index(0)
-                                            .timestamp(offset_request.try_into()?)]
-                                        .into(),
-                                    ),
-                                ))
-                            })
-                            .collect::<Result<Vec<_>, Error>>()?,
-                    )),
-            )
-            .await?;
-
-        let topics = response.topics.as_deref().unwrap_or_default();
-        assert_eq!(TOPICS, topics.len(), "{offset_request:?}");
-
-        for i in 0..TOPICS {
-            let name = topic_name(i);
-            let topic = topics
-                .iter()
-                .find(|topic| topic.name == name)
-                .unwrap_or_else(|| panic!("{offset_request:?}: no response for {name}"));
-
-            let partitions = topic.partitions.as_deref().unwrap_or_default();
-            assert_eq!(1, partitions.len(), "{offset_request:?}: {name}");
-            assert_eq!(0, partitions[0].partition_index, "{name}");
-            assert_eq!(
-                ErrorCode::None,
-                ErrorCode::try_from(partitions[0].error_code)?,
-                "{offset_request:?}: {name}"
-            );
-
-            let expected = match offset_request {
-                // The log start: nothing has been deleted, so 0 for every topic.
-                ListOffset::Earliest => 0,
-                // The high watermark: the record count produced to THIS topic.
-                _ => records_in(i),
-            };
-            assert_eq!(
-                Some(expected),
-                partitions[0].offset,
-                "{offset_request:?}: {name}"
-            );
-        }
-    }
-
-    Ok(())
+    populate(&storage, name).await?;
+    assert_own_offsets(&storage, name, "once").await
 }
 
 /// The wide-assignment shape again, under PREFIX COALESCING — the layout the
@@ -272,159 +247,17 @@ async fn wide_assignment_earliest_and_latest() -> Result<(), Error> {
 async fn wide_assignment_earliest_and_latest_prefix_coalesced() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    const HOST: &str = "localhost";
-    const PORT: i32 = 9092;
-    const NODE_ID: i32 = 111;
-    const TOPICS: usize = 64;
     const PREFIXES: usize = 4;
 
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(storage_url_with_query("prefix_coalesce=true")?)
-        .build()
-        .await?;
+    let storage = storage_with_query("prefix_coalesce=true").await?;
 
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
-    };
-
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
-    };
-
-    let list_offsets = MapStateLayer::new(|_| storage).into_layer(ListOffsetsService);
-
-    let records_in = |i: usize| (i % 5) as i64 + 1;
     // Dotted names: `prefix_of` coalesces on the first three components, so
     // the 64 topics share PREFIXES connector prefixes.
-    let topic_name = |i: usize| format!("org.env.conn{}.assignment-{i:04}", i % PREFIXES);
+    let name = |i: usize| format!("org.env.conn{}.assignment-{i:04}", i % PREFIXES);
 
-    for i in 0..TOPICS {
-        let name = topic_name(i);
-
-        let response = create_topic
-            .serve(
-                Context::default(),
-                CreateTopicsRequest::default()
-                    .validate_only(Some(false))
-                    .topics(Some(
-                        [CreatableTopic::default()
-                            .name(name.clone())
-                            .num_partitions(1)
-                            .replication_factor(1)
-                            .assignments(Some([].into()))
-                            .configs(Some([].into()))]
-                        .into(),
-                    )),
-            )
-            .await?;
-
-        let topics = response.topics.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-
-        let mut builder = Batch::builder().last_offset_delta(records_in(i) as i32 - 1);
-        for record in 0..records_in(i) {
-            builder = builder.record(
-                Record::builder()
-                    .offset_delta(record as i32)
-                    .value(Bytes::from(format!("{name}-{record}").into_bytes()).into()),
-            );
-        }
-        let deflated = builder.build().and_then(deflated::Batch::try_from)?;
-
-        let response = produce
-            .serve(
-                Context::default(),
-                ProduceRequest::default().topic_data(Some(
-                    [TopicProduceData::default()
-                        .name(name.clone())
-                        .partition_data(Some(
-                            [PartitionProduceData::default().index(0).records(Some(
-                                deflated::Frame {
-                                    batches: vec![deflated],
-                                },
-                            ))]
-                            .into(),
-                        ))]
-                    .into(),
-                )),
-            )
-            .await?;
-
-        let topics = response.responses.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-        let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
-        assert_eq!(1, partitions.len());
-        assert_eq!(
-            ErrorCode::None,
-            ErrorCode::try_from(partitions[0].error_code)?
-        );
-        assert_eq!(0, partitions[0].base_offset);
-    }
-
+    populate(&storage, name).await?;
     for sweep in ["cold", "warm"] {
-        for offset_request in [ListOffset::Earliest, ListOffset::Latest] {
-            let response = list_offsets
-                .serve(
-                    Context::default(),
-                    ListOffsetsRequest::default()
-                        .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
-                        .replica_id(-1)
-                        .topics(Some(
-                            (0..TOPICS)
-                                .map(|i| {
-                                    Ok(ListOffsetsTopic::default().name(topic_name(i)).partitions(
-                                        Some(
-                                            [ListOffsetsPartition::default()
-                                                .current_leader_epoch(Some(-1))
-                                                .partition_index(0)
-                                                .timestamp(offset_request.try_into()?)]
-                                            .into(),
-                                        ),
-                                    ))
-                                })
-                                .collect::<Result<Vec<_>, Error>>()?,
-                        )),
-                )
-                .await?;
-
-            let topics = response.topics.as_deref().unwrap_or_default();
-            assert_eq!(TOPICS, topics.len(), "{sweep}: {offset_request:?}");
-
-            for i in 0..TOPICS {
-                let name = topic_name(i);
-                let topic = topics
-                    .iter()
-                    .find(|topic| topic.name == name)
-                    .unwrap_or_else(|| {
-                        panic!("{sweep}: {offset_request:?}: no response for {name}")
-                    });
-
-                let partitions = topic.partitions.as_deref().unwrap_or_default();
-                assert_eq!(1, partitions.len(), "{sweep}: {offset_request:?}: {name}");
-                assert_eq!(0, partitions[0].partition_index, "{name}");
-                assert_eq!(
-                    ErrorCode::None,
-                    ErrorCode::try_from(partitions[0].error_code)?,
-                    "{sweep}: {offset_request:?}: {name}"
-                );
-
-                let expected = match offset_request {
-                    ListOffset::Earliest => 0,
-                    _ => records_in(i),
-                };
-                assert_eq!(
-                    Some(expected),
-                    partitions[0].offset,
-                    "{sweep}: {offset_request:?}: {name}"
-                );
-            }
-        }
+        assert_own_offsets(&storage, name, sweep).await?;
     }
 
     Ok(())
@@ -447,137 +280,38 @@ async fn wide_assignment_earliest_and_latest_prefix_coalesced() -> Result<(), Er
 async fn a_timestamp_no_record_reaches_has_no_offset() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    const NODE_ID: i32 = 111;
     const TOPIC: &str = "offsets-for-times";
-    const RECORDS: i32 = 5;
+    const RECORDS: i64 = 5;
 
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
-
-    _ = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
+    let storage = storage().await?;
+    topic(&storage, TOPIC).await?;
+    for _ in 0..RECORDS {
+        _ = produce(&storage, TOPIC, batch_of("record", 1)?).await?;
     }
-    .serve(
-        Context::default(),
-        CreateTopicsRequest::default()
-            .topics(Some(
-                [CreatableTopic::default()
-                    .name(TOPIC.into())
-                    .num_partitions(1)
-                    .replication_factor(1)
-                    .assignments(Some([].into()))
-                    .configs(Some([].into()))]
-                .into(),
-            ))
-            .validate_only(Some(false)),
-    )
-    .await?;
-
-    let produce = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
-    };
-
-    for i in 0..RECORDS {
-        let batch = Batch::builder()
-            .record(Record::builder().value(Some(Bytes::copy_from_slice(
-                format!("record-{i}").as_bytes(),
-            ))))
-            .build()
-            .and_then(deflated::Batch::try_from)?;
-
-        _ = produce
-            .serve(
-                Context::default(),
-                ProduceRequest::default()
-                    .acks(-1)
-                    .timeout_ms(30_000)
-                    .topic_data(Some(
-                        [TopicProduceData::default()
-                            .name(TOPIC.into())
-                            .partition_data(Some(
-                                [PartitionProduceData::default().index(0).records(Some(
-                                    deflated::Frame {
-                                        batches: [batch].into(),
-                                    },
-                                ))]
-                                .into(),
-                            ))]
-                        .into(),
-                    )),
-            )
-            .await?;
-    }
-
-    let list_offsets = MapStateLayer::new(|_| storage).into_layer(ListOffsetsService);
-
-    let ask = async |timestamp: i64| -> Result<ListOffsetsPartitionResponse, Error> {
-        let response = list_offsets
-            .serve(
-                Context::default(),
-                ListOffsetsRequest::default()
-                    .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
-                    .replica_id(NODE_ID)
-                    .topics(Some(
-                        [ListOffsetsTopic::default()
-                            .name(TOPIC.into())
-                            .partitions(Some(
-                                [ListOffsetsPartition::default()
-                                    .current_leader_epoch(Some(-1))
-                                    .partition_index(0)
-                                    .timestamp(timestamp)]
-                                .into(),
-                            ))]
-                        .into(),
-                    )),
-            )
-            .await?;
-
-        let topics = response.topics.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-
-        let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-        assert_eq!(1, partitions.len());
-
-        Ok(partitions[0].clone())
-    };
 
     // An hour from now: no record is at or after it, and none ever will be in
     // this test.
-    let future = (SystemTime::now() + Duration::from_secs(3_600))
-        .duration_since(UNIX_EPOCH)
-        .expect("an hour from now is after the epoch")
-        .as_millis() as i64;
+    let future = millis_from_now(Duration::from_secs(3_600));
 
-    let answered = ask(future).await?;
-
+    let answered = ask(&storage, TOPIC, future).await?;
+    let error_code = ErrorCode::try_from(answered.error_code)?;
     assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(answered.error_code)?,
-        "no matching record is an answer, not an error",
+        (ErrorCode::None, Some(-1), Some(-1)),
+        (error_code, answered.offset, answered.timestamp),
+        "no matching record is an answer, not an error, and it has no offset",
     );
-    assert_eq!(Some(-1), answered.offset);
-    assert_eq!(Some(-1), answered.timestamp);
 
     // A timestamp every record is at or after still resolves to a real offset,
     // so the sentinel has not swallowed the working case.
-    let matched = ask(0).await?;
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(matched.error_code)?);
-    assert_eq!(Some(0), matched.offset);
+    let matched = ask(&storage, TOPIC, 0).await?;
+    let error_code = ErrorCode::try_from(matched.error_code)?;
+    assert_eq!((ErrorCode::None, Some(0)), (error_code, matched.offset));
 
     // And the two named positions are unaffected: they never answer `None`, so
     // nothing about them goes through the sentinel.
-    let earliest = ask(ListOffset::Earliest.try_into()?).await?;
-    assert_eq!(Some(0), earliest.offset);
-
-    let latest = ask(ListOffset::Latest.try_into()?).await?;
-    assert_eq!(Some(i64::from(RECORDS)), latest.offset);
+    let earliest = ask(&storage, TOPIC, ListOffset::Earliest.try_into()?).await?;
+    let latest = ask(&storage, TOPIC, ListOffset::Latest.try_into()?).await?;
+    assert_eq!((Some(0), Some(RECORDS)), (earliest.offset, latest.offset));
 
     Ok(())
 }
@@ -594,144 +328,62 @@ async fn a_timestamp_no_record_reaches_has_no_offset() -> Result<(), Error> {
 async fn a_timestamp_resolves_inside_the_batch_holding_it() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    const NODE_ID: i32 = 111;
     const TOPIC: &str = "offsets-for-times-in-batch";
     const RECORDS: i32 = 10;
 
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
-
-    _ = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
-    }
-    .serve(
-        Context::default(),
-        CreateTopicsRequest::default()
-            .topics(Some(
-                [CreatableTopic::default()
-                    .name(TOPIC.into())
-                    .num_partitions(1)
-                    .replication_factor(1)
-                    .assignments(Some([].into()))
-                    .configs(Some([].into()))]
-                .into(),
-            ))
-            .validate_only(Some(false)),
-    )
-    .await?;
+    let storage = storage().await?;
+    topic(&storage, TOPIC).await?;
 
     // One second between records (#577), so a target between two of them is
     // unambiguous.
-    let base_timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("now is after the epoch")
-        .as_millis() as i64;
+    let base_timestamp = millis_from_now(Duration::ZERO);
     let at = |record: i32| base_timestamp + i64::from(record) * 1_000;
 
     let mut builder = Batch::builder()
         .base_timestamp(base_timestamp)
         .max_timestamp(at(RECORDS - 1))
         .last_offset_delta(RECORDS - 1);
-
     for record in 0..RECORDS {
+        let value = Bytes::from(format!("record-{record}"));
         builder = builder.record(
             Record::builder()
                 .offset_delta(record)
                 .timestamp_delta(i64::from(record) * 1_000)
-                .value(Some(Bytes::copy_from_slice(
-                    format!("record-{record}").as_bytes(),
-                ))),
+                .value(Some(value)),
         );
     }
-
-    let batch = builder.build().and_then(deflated::Batch::try_from)?;
-
-    _ = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(ProduceService)
-    }
-    .serve(
-        Context::default(),
-        ProduceRequest::default()
-            .acks(-1)
-            .timeout_ms(30_000)
-            .topic_data(Some(
-                [TopicProduceData::default()
-                    .name(TOPIC.into())
-                    .partition_data(Some(
-                        [PartitionProduceData::default()
-                            .index(0)
-                            .records(Some(deflated::Frame {
-                                batches: [batch].into(),
-                            }))]
-                        .into(),
-                    ))]
-                .into(),
-            )),
+    _ = produce(
+        &storage,
+        TOPIC,
+        builder.build().and_then(deflated::Batch::try_from)?,
     )
     .await?;
 
-    let list_offsets = MapStateLayer::new(|_| storage).into_layer(ListOffsetsService);
-
-    let ask = async |timestamp: i64| -> Result<ListOffsetsPartitionResponse, Error> {
-        let response = list_offsets
-            .serve(
-                Context::default(),
-                ListOffsetsRequest::default()
-                    .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
-                    .replica_id(NODE_ID)
-                    .topics(Some(
-                        [ListOffsetsTopic::default()
-                            .name(TOPIC.into())
-                            .partitions(Some(
-                                [ListOffsetsPartition::default()
-                                    .current_leader_epoch(Some(-1))
-                                    .partition_index(0)
-                                    .timestamp(timestamp)]
-                                .into(),
-                            ))]
-                        .into(),
-                    )),
-            )
-            .await?;
-
-        let topics = response.topics.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
-
-        let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-        assert_eq!(1, partitions.len());
-
-        Ok(partitions[0].clone())
-    };
-
-    let mid = ask(at(4) + 500).await?;
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(mid.error_code)?);
-    assert_eq!(Some(5), mid.offset);
-    assert_eq!(Some(at(5)), mid.timestamp);
+    let mid = ask(&storage, TOPIC, at(4) + 500).await?;
+    let error_code = ErrorCode::try_from(mid.error_code)?;
+    assert_eq!(
+        (ErrorCode::None, Some(5), Some(at(5))),
+        (error_code, mid.offset, mid.timestamp)
+    );
 
     for record in 0..RECORDS {
-        let answered = ask(at(record)).await?;
+        let answered = ask(&storage, TOPIC, at(record)).await?;
+        let expected = (Some(i64::from(record)), Some(at(record)));
         assert_eq!(
-            Some(i64::from(record)),
-            answered.offset,
+            expected,
+            (answered.offset, answered.timestamp),
             "at record {record}"
         );
-        assert_eq!(Some(at(record)), answered.timestamp, "at record {record}");
     }
 
-    let before = ask(base_timestamp - 1).await?;
-    assert_eq!(Some(0), before.offset);
-    assert_eq!(Some(base_timestamp), before.timestamp);
+    let before = ask(&storage, TOPIC, base_timestamp - 1).await?;
+    assert_eq!(
+        (Some(0), Some(base_timestamp)),
+        (before.offset, before.timestamp)
+    );
 
-    let after = ask(at(RECORDS - 1) + 1).await?;
-    assert_eq!(Some(-1), after.offset);
-    assert_eq!(Some(-1), after.timestamp);
+    let after = ask(&storage, TOPIC, at(RECORDS - 1) + 1).await?;
+    assert_eq!((Some(-1), Some(-1)), (after.offset, after.timestamp));
 
     Ok(())
 }

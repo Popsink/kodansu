@@ -203,7 +203,6 @@ inherited = [
     "tansu-storage/src/service/produce.rs",
     "tansu-storage/tests/common/mod.rs",
     "tansu-storage/tests/create_topics.rs",
-    "tansu-storage/tests/list_offsets.rs",
     "tansu-storage/tests/produce.rs",
     "tansu-topic/src/create.rs",
     "tansu-topic/src/delete.rs",
@@ -241,5 +240,4 @@ joint = [
     "tansu-storage/src/lib.rs",
     "tansu-storage/src/service/fetch.rs",
     "tansu-storage/tests/create_topics.rs",
-    "tansu-storage/tests/list_offsets.rs",
 ]
