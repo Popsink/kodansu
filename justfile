@@ -629,6 +629,15 @@ fmt:
 # `ThrottledStore` delays the same calls, and `engine`, `produce_all`,
 # `fetch` and `assert_took` carry the rest. The cited #428 note went with the
 # wrapper it described; one uncited line became a test's doc comment.
+#   defork  -1015 lines, the transaction tests on a shared partition  3168 -> 3126  2.7477 -> 2.7365
+#
+# `tests/txn.rs` spelled out a broker, a topic, InitProducerId,
+# AddPartitionsToTxn, six Produce calls and a dozen ListOffsets checks in each
+# of six tests. A `Partition` fixture with `begin`, `end`, `latest`,
+# `commit_offset` and `fetch` carries them. The uncited narration (`// commit
+# transaction 1`, `// end txn marker is now present`) goes, two of its
+# explanations becoming assertion messages, and the cited #555 allow goes
+# with the length that needed it.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -639,7 +648,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7478" top="12":
+comments ceiling="2.7365" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

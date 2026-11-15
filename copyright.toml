@@ -99,7 +99,6 @@ inherited = [
     "tansu-broker/tests/policy_compact_delete.rs",
     "tansu-broker/tests/produce_fetch.rs",
     "tansu-broker/tests/topic.rs",
-    "tansu-broker/tests/txn.rs",
     "tansu-cli/src/cli.rs",
     "tansu-cli/src/cli/broker.rs",
     "tansu-cli/src/cli/topic.rs",
