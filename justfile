@@ -638,6 +638,14 @@ fmt:
 # transaction 1`, `// end txn marker is now present`) goes, two of its
 # explanations becoming assertion messages, and the cited #555 allow goes
 # with the length that needed it.
+#   defork  -585 lines, the consumer group simulations on shared members  3126 -> 3097  2.7364 -> 2.7257
+#
+# `tests/new_cg.rs` spelled out a storage container, a route, a four-layer
+# member and a JoinGroup/SyncGroup/Heartbeat exchange in every test, with the
+# step narrated (`// c0: sync`) above each. `coordinator`, `member`,
+# `first_join`, `lead_alone`, `Script` and `settled` carry them. The cited
+# #195 stability notes and the KIP-394 interleave notes move unchanged; the
+# narration goes.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -648,7 +656,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7365" top="12":
+comments ceiling="2.7257" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

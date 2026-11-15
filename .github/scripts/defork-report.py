@@ -33,7 +33,8 @@ last line of every fallible test and unit-returning function. And for a bare
 macro or `use` opener (`assert_eq!(`, `vec![`, `use std::{`, `sync::{`), the
 line rustfmt opens a call or an import with when its contents do not fit on
 one: the contents follow on lines that are counted.
-And for a bare test marker (`#[test]`, `#[tokio::test]`), which every test
+And for a test marker (`#[test]`, `#[tokio::test]`, or `#[tokio::test(..)]`
+with runtime arguments such as `start_paused = true`), which every test
 carries and cannot spell any other way.
 And for the tracing guard a test opens with (`let _guard = init_tracing()?;`),
 the first line of every test as `Ok(())` is the last.
@@ -69,7 +70,7 @@ GRANT_LINES = 12
 ATTRIBUTE_OPENER = re.compile(r"^#!?\[[\w:]+\($")
 MODULE_DECLARATION = re.compile(r"^(pub(\([\w: ]+\))? )?mod \w+;$")
 CRATE_FLAG = re.compile(r"^#!\[\w+\]$")
-TEST_MARKER = re.compile(r"^#\[(?:tokio::)?test\]$")
+TEST_MARKER = re.compile(r"^#\[(?:tokio::)?test(?:\([^()]*\))?\]$")
 OPENER = re.compile(r"^(?:(?:use )?[\w:]+::\{|\w+![(\[{])$")
 UNIT_OK = "Ok(())"
 TRACING_GUARD = re.compile(r"^let _guard = (?:(?:common|super)::)?init_tracing\(\)(?:\?|\.unwrap\(\));$")
