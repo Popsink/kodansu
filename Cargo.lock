@@ -3735,6 +3735,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "tansu-auth",
  "tansu-client",
  "tansu-sans-io",
