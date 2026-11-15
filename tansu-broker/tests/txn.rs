@@ -143,10 +143,10 @@ impl Partition {
                 .build()
                 .and_then(TryInto::try_into)?;
 
-            let offset = self
+            let producing = self
                 .storage
-                .produce(Some(&txn), &self.topition, transactional_batch)
-                .await?;
+                .produce(Some(&txn), &self.topition, transactional_batch);
+            let offset = producing.await?;
             assert!(self.produced.insert(offset), "{offset} handed out twice");
         }
 
@@ -154,11 +154,8 @@ impl Partition {
     }
 
     async fn end(&self, (txn, owner): &Txn, commit: bool) -> Result<()> {
-        let ended = self
-            .storage
-            .txn_end(txn, owner.id, owner.epoch, commit)
-            .await?;
-        assert_eq!(ErrorCode::None, ended);
+        let ending = self.storage.txn_end(txn, owner.id, owner.epoch, commit);
+        assert_eq!(ErrorCode::None, ending.await?);
         Ok(())
     }
 
