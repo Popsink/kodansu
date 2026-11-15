@@ -666,10 +666,11 @@ The nextest phase is already close to its floor: the slowest single test is 58s,
 so the 813 tests cost 64s wall. Sharding across runners would buy at most ~35s
 and cost a full compile per shard.
 
-That 58s floor is four tests — `new_cg::consumer_next_action_{08,16,24,32}c` —
+That 58s floor is four tests — `new_cg::churn_of_{08,16,24,32}_members` (then named
+`consumer_next_action_{08,16,24,32}c`) —
 which drive a consumer group simulation through `LatencyIntroducingLayer`, i.e.
 real `tokio::time::sleep` calls. `#[tokio::test(start_paused = true)]` takes
-`consumer_next_action_08c` from 48s to 0.14s, but it then fails: the group
+`churn_of_08_members` from 48s to 0.14s, but it then fails: the group
 coordinator ages member sessions off `SystemTime::now()`, which does not advance
 under a paused clock, so transient members are never evicted and the assertion on
 a settled generation fails. Wall-clock is load-bearing there until session expiry

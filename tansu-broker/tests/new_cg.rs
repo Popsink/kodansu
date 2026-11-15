@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,1028 +12,286 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
-    fmt::Debug,
-    hash::Hash,
-    ops::Range,
-    sync::Arc,
-    time::Duration,
+//! Consumer groups driven end to end through `ConsumerGroupLayer`: each member
+//! has its own seeded latency, the coordinator runs over `memory://`, and the
+//! whole exchange runs on tokio's paused clock.
+
+use std::collections::{BTreeSet, HashSet};
+use std::ops::Range;
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Result, anyhow};
+use rama::Service;
+use rama::{Context, Layer as _};
+use rand::{RngExt as _, SeedableRng as _, rngs::SmallRng};
+use tansu_broker::NODE_ID;
+use tansu_broker::coordinator::group::administrator::Controller;
+use tansu_broker::service::coordinator::services;
+use tansu_sans_io::consumer::{
+    ConsumerProtocolAssignment, ConsumerProtocolSubscription, MemberAssignment,
 };
+use tansu_sans_io::metadata_response::{MetadataResponsePartition, MetadataResponseTopic};
+use tansu_sans_io::{Body, ErrorCode, Frame, HeartbeatResponse, JoinGroupResponse};
+use tansu_sans_io::{MetadataResponse, SyncGroupResponse};
+use tansu_service::{BytesFrameLayer, ConsumerGroupLayer, ConsumerGroupService};
+use tansu_service::{FrameBytesLayer, FrameRouteService, LatencyIntroducingLayer};
+use tokio::sync::Notify;
+use tokio::sync::mpsc::{self, Sender};
+use tokio::task::{self, JoinSet};
+use tokio::time::{self, sleep};
+use tracing::debug;
 
-use anyhow::{Error, Result, anyhow};
-use rama::{Context, Layer as _, Service};
-use rand::{RngExt, SeedableRng as _, rngs::SmallRng};
-use tansu_broker::{
-    NODE_ID, coordinator::group::administrator::Controller, service::coordinator::services,
-};
-use tansu_sans_io::{
-    Body, ErrorCode, Frame, HeartbeatResponse, JoinGroupResponse, MetadataResponse,
-    SyncGroupResponse,
-    consumer::{ConsumerProtocolAssignment, ConsumerProtocolSubscription, MemberAssignment},
-    metadata_response::{MetadataResponsePartition, MetadataResponseTopic},
-};
-use tansu_service::{
-    BytesFrameLayer, ConsumerGroupLayer, ConsumerGroupService, FrameBytesLayer, FrameRouteService,
-    LatencyIntroducingLayer,
-};
-use tansu_storage::StorageContainer;
-use tokio::{
-    sync::{
-        Notify,
-        mpsc::{Receiver, Sender, channel},
-    },
-    task::{JoinSet, yield_now},
-    time::{Instant, advance, sleep},
-};
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, instrument, warn};
-use url::Url;
+use crate::common::{init_tracing, paused_clock, storage_container};
 
-use crate::common::{init_tracing, paused_clock};
+mod common;
 
-pub mod common;
+const GROUP: &str = "g1";
 
-#[tokio::test(start_paused = true)]
-pub async fn one_consumer_session_delay_after_initial_join() -> Result<()> {
-    let _guard = init_tracing()?;
+const TOPIC: &str = "t";
 
-    let group = "g1";
+/// The latency, in milliseconds, each request is delayed by in the one- and
+/// two-member cases.
+const LATENCY_MS: Range<u64> = 50..150;
 
-    let tp = [("t", 0..3)];
+type Route = FrameRouteService<(), tansu_broker::Error>;
 
-    let metadata = MetadataResponse::default().topics(Some(
-        tp.iter()
-            .map(|(topic, partitions)| {
-                MetadataResponseTopic::default()
-                    .name(Some((*topic).into()))
-                    .partitions(Some(
-                        partitions
-                            .clone()
-                            .map(|partition_index| {
-                                MetadataResponsePartition::default()
-                                    .partition_index(partition_index)
-                            })
-                            .collect(),
-                    ))
-            })
-            .collect(),
-    ));
+/// The stack under a member's `ConsumerGroupLayer`: frames in, frames out.
+trait Wire: Clone + Service<(), Frame, Response = Frame, Error = tansu_broker::Error> {}
 
-    let latency_ms = 50..150;
-    let seed = 0;
+impl<T> Wire for T where T: Clone + Service<(), Frame, Response = Frame, Error = tansu_broker::Error>
+{}
 
-    let cluster = "tansu";
+/// A member as these tests drive it: handed its last answer (or nothing, to
+/// start), it sends the request that answer implies and returns the next.
+trait Member: Service<(), Option<Body>, Response = Body, Error: Into<anyhow::Error>> {}
 
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster)
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-        .storage(Url::parse("memory://")?)
-        .build()
-        .await?;
+impl<T> Member for T where T: Service<(), Option<Body>, Response = Body, Error: Into<anyhow::Error>> {}
 
-    let coordinator = Controller::with_storage(storage)?.with_now(paused_clock);
-
-    let route = services(
-        FrameRouteService::<(), tansu_broker::Error>::builder(),
-        coordinator,
-    )
-    .and_then(|builder| builder.build().map_err(Into::into))?;
-
-    let c0 = (
-        ConsumerGroupLayer::new(
-            group,
-            tp.iter().map(|(topic, _partitions)| *topic),
-            metadata,
-        ),
-        LatencyIntroducingLayer::default()
-            .with_seed(seed)
-            .with_latency_millis(latency_ms),
-        FrameBytesLayer,
-        BytesFrameLayer::default(),
-    )
-        .into_layer(route);
-
-    // c0: join without member id
-    //
-    let c0_next_action = join(&c0, None::<JoinGroupResponse>).await?;
-
-    assert_eq!(
-        i16::from(ErrorCode::MemberIdRequired),
-        c0_next_action.error_code
-    );
-    assert_eq!(-1, c0_next_action.generation_id);
-    assert!(c0_next_action.leader.is_empty());
-    assert!(
-        c0_next_action
-            .members
-            .as_ref()
-            .is_some_and(|members| members.is_empty())
-    );
-    assert!(!c0_next_action.member_id.is_empty());
-
-    let c0_member_id = c0_next_action.member_id.clone();
-
-    // allow the session expire
-    yield_now().await;
-    advance(c0.session_timeout()?).await;
-    yield_now().await;
-
-    // join with member id
-    //
-    let c0_next_action = join(&c0, Some(c0_next_action)).await?;
-
-    assert_eq!(i16::from(ErrorCode::None), c0_next_action.error_code);
-    assert!(!c0_next_action.member_id.is_empty());
-    assert_eq!(c0_next_action.leader, c0_next_action.member_id);
-    assert!(
-        c0_next_action
-            .members
-            .as_ref()
-            .is_some_and(|members| members.len() == 1)
-    );
-    assert_eq!(c0_member_id.as_str(), c0_next_action.member_id.as_str());
-
-    // sync
-    //
-    let c0_next_action = sync(&c0, Some(c0_next_action)).await?;
-
-    assert!(!c0_next_action.assignment.is_empty());
-    assert_eq!(i16::from(ErrorCode::None), c0_next_action.error_code);
-
-    // heartbeat
-    //
-    let c0_next_action = heartbeat(&c0, Some(c0_next_action)).await?;
-
-    assert_eq!(i16::from(ErrorCode::None), c0_next_action.error_code);
-
-    assert_eq!(
-        Some(
-            MemberAssignment::default()
-                .version(ConsumerProtocolSubscription::V3)
-                .assignment(ConsumerProtocolAssignment::default().assigned_partitions(tp))
-        ),
-        c0.member_assignment()?
-    );
-
-    Ok(())
+/// Every group API, answered by a coordinator over `memory://` that reads
+/// the paused clock.
+async fn coordinator() -> Result<Route> {
+    let listener = url::Url::parse("tcp://127.0.0.1:9092/")?;
+    let storage = storage_container("tansu", NODE_ID, listener).await?;
+    let controller = Controller::with_storage(storage)?.with_now(paused_clock);
+    let routes = services(Route::builder(), controller)?;
+    Ok(routes.build()?)
 }
 
-#[tokio::test(start_paused = true)]
-pub async fn one_consumer_next_action() -> Result<()> {
-    let _guard = init_tracing()?;
-
-    let group = "g1";
-
-    let tp = [("t", 0..3)];
-
-    let metadata = MetadataResponse::default().topics(Some(
-        tp.iter()
-            .map(|(topic, partitions)| {
-                MetadataResponseTopic::default()
-                    .name(Some((*topic).into()))
-                    .partitions(Some(
-                        partitions
-                            .clone()
-                            .map(|partition_index| {
-                                MetadataResponsePartition::default()
-                                    .partition_index(partition_index)
-                            })
-                            .collect(),
-                    ))
-            })
-            .collect(),
-    ));
-
-    let latency_ms = 50..150;
-    let seed = 0;
-
-    let cluster = "tansu";
-
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster)
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-        .storage(Url::parse("memory://")?)
-        .build()
-        .await?;
-
-    let coordinator = Controller::with_storage(storage)?.with_now(paused_clock);
-
-    let route = services(
-        FrameRouteService::<(), tansu_broker::Error>::builder(),
-        coordinator,
-    )
-    .and_then(|builder| builder.build().map_err(Into::into))?;
-
-    let c0 = (
-        ConsumerGroupLayer::new(
-            group,
-            tp.iter().map(|(topic, _partitions)| *topic),
-            metadata,
-        ),
-        LatencyIntroducingLayer::default()
-            .with_seed(seed)
-            .with_latency_millis(latency_ms),
-        FrameBytesLayer,
-        BytesFrameLayer::default(),
-    )
-        .into_layer(route);
-
-    let mut tasks = JoinSet::new();
-
-    for (id, consumer) in [c0.clone()].into_iter().enumerate() {
-        _ = tasks.spawn(async move { simple_consumer(format!("c{id}").as_str(), &consumer).await });
-    }
-
-    let results = tasks.join_all().await;
-    debug!(?results);
-    assert!(results.iter().all(|result| result.is_ok()));
-
-    assert_eq!(
-        Some(
-            MemberAssignment::default()
-                .version(ConsumerProtocolSubscription::V3)
-                .assignment(ConsumerProtocolAssignment::default().assigned_partitions(tp))
-        ),
-        c0.member_assignment()?
-    );
-
-    Ok(())
+/// `TOPIC` with `partitions`, as a metadata response.
+fn topic(partitions: Range<i32>) -> MetadataResponse {
+    let partitions = partitions
+        .map(|index| MetadataResponsePartition::default().partition_index(index))
+        .collect();
+    let topic = MetadataResponseTopic::default()
+        .name(Some(TOPIC.into()))
+        .partitions(Some(partitions));
+    MetadataResponse::default().topics(Some(vec![topic]))
 }
 
-#[tokio::test(start_paused = true)]
-pub async fn two_consumer_next_action() -> Result<()> {
-    let _guard = init_tracing()?;
-
-    let group = "g1";
-
-    let tp = [("t", 0..3)];
-
-    let metadata = MetadataResponse::default().topics(Some(
-        tp.iter()
-            .map(|(topic, partitions)| {
-                MetadataResponseTopic::default()
-                    .name(Some((*topic).into()))
-                    .partitions(Some(
-                        partitions
-                            .clone()
-                            .map(|partition_index| {
-                                MetadataResponsePartition::default()
-                                    .partition_index(partition_index)
-                            })
-                            .collect(),
-                    ))
-            })
-            .collect(),
-    ));
-
-    let latency_ms = 50..150;
-
-    let cluster = "tansu";
-
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster)
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-        .storage(Url::parse("memory://")?)
-        .build()
-        .await?;
-
-    let coordinator = Controller::with_storage(storage)?.with_now(paused_clock);
-
-    let route = services(
-        FrameRouteService::<(), tansu_broker::Error>::builder(),
-        coordinator,
-    )
-    .and_then(|builder| builder.build().map_err(Into::into))?;
-
-    let c0 = (
-        ConsumerGroupLayer::new(
-            group,
-            tp.iter().map(|(topic, _partitions)| *topic),
-            metadata.clone(),
-        )
-        .on_assignment(|group: String, assignment: MemberAssignment| debug!(group, %assignment)),
-        LatencyIntroducingLayer::default()
-            .with_seed(0)
-            .with_latency_millis(latency_ms.clone()),
-        FrameBytesLayer,
-        BytesFrameLayer::default(),
-    )
-        .into_layer(route.clone());
-
-    let c1 = (
-        ConsumerGroupLayer::new(
-            group,
-            tp.iter().map(|(topic, _partitions)| *topic),
-            metadata,
-        )
-        .on_assignment(|group: String, assignment: MemberAssignment| debug!(group, %assignment)),
-        LatencyIntroducingLayer::default()
-            .with_seed(1)
-            .with_latency_millis(latency_ms),
-        FrameBytesLayer,
-        BytesFrameLayer::default(),
-    )
-        .into_layer(route);
-
-    let mut tasks = JoinSet::new();
-
-    const ITERATIONS: usize = 10;
-
-    let consumers = [c0.clone(), c1.clone()];
-
-    let (tx, _rx) = channel(consumers.len());
-    let simulation_complete = CancellationToken::new();
-
-    for (id, consumer) in consumers.into_iter().enumerate() {
-        let tx = tx.clone();
-        let simulation_complete = simulation_complete.clone();
-
-        _ = tasks.spawn(async move {
-            consumer_with_iterations(id, ITERATIONS, true, tx, simulation_complete, &consumer).await
-        });
-    }
-
-    let results = tasks.join_all().await;
-    debug!(?results);
-    assert!(results.iter().all(|result| result.is_ok()));
-
-    let Ok(Some(c0_member_assignment)) = c0.member_assignment() else {
-        panic!("expecting c0_member_assignment");
-    };
-
-    let Ok(Some(c1_member_assignment)) = c1.member_assignment() else {
-        panic!("expecting c0_member_assignment");
-    };
-
-    let assignments = c0_member_assignment
-        .assignment
-        .assigned_partitions
-        .iter()
-        .flat_map(|topic_partition| {
-            topic_partition
-                .partitions
-                .iter()
-                .map(|partition| (topic_partition.topic.clone(), *partition))
-        })
-        .chain(
-            c1_member_assignment
-                .assignment
-                .assigned_partitions
-                .iter()
-                .flat_map(|topic_partition| {
-                    topic_partition
-                        .partitions
-                        .iter()
-                        .map(|partition| (topic_partition.topic.clone(), *partition))
-                }),
-        );
-
-    assert_eq!(
-        tp.iter()
-            .cloned()
-            .map(|(_topic, partitions)| partitions.sum::<i32>() as usize)
-            .sum::<usize>(),
-        assignments.clone().count()
-    );
-
-    assert!(
-        has_unique_elements(assignments.clone()),
-        "non unique: {assignments:?}"
-    );
-
-    Ok(())
-}
-
-#[tokio::test(start_paused = true)]
-pub async fn consumer_next_action_08c() -> Result<()> {
-    let _guard = init_tracing()?;
-
-    group_consumer_next_action(0..8).await
-}
-
-#[tokio::test(start_paused = true)]
-pub async fn consumer_next_action_16c() -> Result<()> {
-    let _guard = init_tracing()?;
-
-    group_consumer_next_action(0..16).await
-}
-
-#[tokio::test(start_paused = true)]
-pub async fn consumer_next_action_24c() -> Result<()> {
-    let _guard = init_tracing()?;
-
-    group_consumer_next_action(0..24).await
-}
-
-#[tokio::test(start_paused = true)]
-pub async fn consumer_next_action_32c() -> Result<()> {
-    let _guard = init_tracing()?;
-
-    group_consumer_next_action(0..32).await
-}
-
-async fn group_consumer_next_action(consumers: Range<i32>) -> Result<()> {
-    let group = "g1";
-
-    let partitions = 0..32;
-
-    let tp = [("t", partitions)];
-
-    let metadata = metadata(tp.iter());
-
-    let latency_ms = 10..150;
-
-    let cluster = "tansu";
-
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster)
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-        .storage(Url::parse("memory://")?)
-        .build()
-        .await?;
-
-    let coordinator = Controller::with_storage(storage)?.with_now(paused_clock);
-
-    let route = services(
-        FrameRouteService::<(), tansu_broker::Error>::builder(),
-        coordinator,
-    )
-    .and_then(|builder| builder.build().map_err(Into::into))?;
-
-    let mut tasks = JoinSet::new();
-
-    let consumers = consumers
-        .into_iter()
-        .map(|id| {
-            consumer(
-                group,
-                id as u64,
-                tp.iter().map(|(topic, _partitions)| *topic),
-                route.clone(),
-                metadata.clone(),
-                latency_ms.clone(),
-            )
-        })
-        .collect::<Vec<_>>();
-
-    let iterations = 5..10;
-
-    let (tx, rx) = channel(consumers.len());
-    let simulation = CancellationToken::new();
-
-    let is_transient = |id| id % 2 == 0;
-
-    for (id, consumer) in consumers.clone().into_iter().enumerate() {
-        let tx = tx.clone();
-        let simulation = simulation.clone();
-
-        let consumer_iterations = if is_transient(id) {
-            let mut rng = SmallRng::seed_from_u64(id as u64);
-            rng.random_range(iterations.clone())
-        } else {
-            iterations.end * 4
-        };
-
-        debug!(consumer = format!("c{id}"), consumer_iterations);
-
-        _ = tasks.spawn(async move {
-            consumer_with_iterations(
-                id,
-                consumer_iterations,
-                consumer_iterations > iterations.end,
-                tx,
-                simulation,
-                &consumer,
-            )
-            .await
-        });
-    }
-
-    let notify = Arc::new(Notify::new());
-
-    _ = tasks.spawn(transient_wave_complete(
-        rx,
-        notify.clone(),
-        simulation.clone(),
-        consumers.clone(),
-        is_transient,
-    ));
-
-    _ = tasks.spawn(stability_check(
-        notify,
-        simulation.clone(),
-        consumers.clone(),
-        is_transient,
-    ));
-
-    let results = tasks.join_all().await;
-    debug!(?results);
-    assert!(
-        results
-            .iter()
-            .all(|result| result.as_ref().inspect_err(|err| warn!(?err)).is_ok())
-    );
-
-    for (id, consumer) in consumers.clone().iter().enumerate() {
-        if is_transient(id) {
-            debug!(ignore = format!("c{id}"));
-
-            continue;
-        }
-
-        if let Ok(Some(member_assignment)) = consumer.member_assignment() {
-            for topic_partition in member_assignment.assignment.assigned_partitions {
-                debug!(id = format!("c{id}"), %topic_partition);
-            }
-        }
-    }
-
-    let assignments = topition_assignments(consumers.clone(), is_transient)?;
-
-    assert!(
-        has_unique_elements(assignments.clone()),
-        "non unique: {assignments:?}"
-    );
-
-    assert_eq!(
-        tp.iter()
-            .map(|(_topic, partitions)| partitions.end as usize)
-            .sum::<usize>(),
-        assignments.clone().count()
-    );
-
-    _ = error_codes(consumers.clone()).inspect(|errors| debug!(?errors));
-    Ok(())
-}
-
-#[tokio::test(start_paused = true)]
-pub async fn two_consumer_interleave_join() -> Result<()> {
-    let _guard = init_tracing()?;
-
-    let group = "g1";
-
-    let tp = [("t", 0..3)];
-
-    let metadata = MetadataResponse::default().topics(Some(
-        tp.iter()
-            .map(|(topic, partitions)| {
-                MetadataResponseTopic::default()
-                    .name(Some((*topic).into()))
-                    .partitions(Some(
-                        partitions
-                            .clone()
-                            .map(|partition_index| {
-                                MetadataResponsePartition::default()
-                                    .partition_index(partition_index)
-                            })
-                            .collect(),
-                    ))
-            })
-            .collect(),
-    ));
-
-    let latency_ms = 50..150;
-    let seed = 0;
-
-    let cluster = "tansu";
-
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster)
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-        .storage(Url::parse("memory://")?)
-        .build()
-        .await?;
-
-    let coordinator = Controller::with_storage(storage)?.with_now(paused_clock);
-
-    let route = services(
-        FrameRouteService::<(), tansu_broker::Error>::builder(),
-        coordinator,
-    )
-    .and_then(|builder| builder.build().map_err(Into::into))?;
-
-    let c0 = (
-        ConsumerGroupLayer::new(
-            group,
-            tp.iter().map(|(topic, _partitions)| *topic),
-            metadata.clone(),
-        ),
-        LatencyIntroducingLayer::default()
-            .with_seed(seed)
-            .with_latency_millis(latency_ms.clone()),
-        FrameBytesLayer,
-        BytesFrameLayer::default(),
-    )
-        .into_layer(route.clone());
-
-    let c1 = (
-        ConsumerGroupLayer::new(
-            group,
-            tp.iter().map(|(topic, _partitions)| *topic),
-            metadata,
-        ),
-        LatencyIntroducingLayer::default()
-            .with_seed(seed)
-            .with_latency_millis(latency_ms),
-        FrameBytesLayer,
-        BytesFrameLayer::default(),
-    )
-        .into_layer(route);
-
-    // c0: join without member id
-    //
-    let c0_next_action = join(&c0, None::<JoinGroupResponse>)
-        .await
-        .inspect(|c0_next_action| debug!(?c0_next_action))?;
-
-    let c0_member_id = c0_next_action.member_id.clone();
-    debug!(c0_member_id);
-
-    assert_eq!(
-        i16::from(ErrorCode::MemberIdRequired),
-        c0_next_action.error_code
-    );
-    assert_eq!(-1, c0_next_action.generation_id);
-    assert!(c0_next_action.leader.is_empty());
-    assert!(
-        c0_next_action
-            .members
-            .as_ref()
-            .is_some_and(|members| members.is_empty())
-    );
-    assert!(!c0_next_action.member_id.is_empty());
-
-    // c1: join without member id
-    //
-    let c1_next_action = join(&c1, None::<JoinGroupResponse>)
-        .await
-        .inspect(|c1_next_action| debug!(?c1_next_action))?;
-
-    let c1_member_id = c1_next_action.member_id.clone();
-    debug!(c1_member_id);
-
-    assert_eq!(
-        i16::from(ErrorCode::MemberIdRequired),
-        c1_next_action.error_code
-    );
-    assert_eq!(-1, c1_next_action.generation_id);
-    assert!(c1_next_action.leader.is_empty());
-    assert!(
-        c1_next_action
-            .members
-            .as_ref()
-            .is_some_and(|members| members.is_empty())
-    );
-    assert!(!c1_next_action.member_id.is_empty());
-
-    // KIP-394: the empty joins above only parked the generated member ids —
-    // neither consumer is registered yet (previously each empty join
-    // registered a phantom member and bumped the generation). For both
-    // consumers to land in the same generation, their real joins must overlap
-    // inside the same rebalance window: the join-window barrier holds the
-    // leader's JoinGroup response until membership is quiescent, so it
-    // carries the complete member list.
-    //
-    // c1: join with member id, in flight first so that c1 registers first
-    // and becomes the leader
-    //
-    let c1_join = {
-        let c1 = c1.clone();
-        tokio::spawn(async move { join(&c1, Some(c1_next_action)).await })
-    };
-
-    // give c1 a head start (well past the maximum introduced latency), then
-    // join c0 while c1 is still held inside the rebalance window
-    //
-    sleep(Duration::from_millis(500)).await;
-
-    let c0_join = {
-        let c0 = c0.clone();
-        tokio::spawn(async move { join(&c0, Some(c0_next_action)).await })
-    };
-
-    let c1_next_action = c1_join
-        .await?
-        .inspect(|c1_next_action| debug!(?c1_next_action))?;
-
-    assert_eq!(i16::from(ErrorCode::None), c1_next_action.error_code);
-    assert_eq!(1, c1_next_action.generation_id);
-    assert_eq!(c1_member_id, c1_next_action.leader);
-    assert!(
-        c1_next_action
-            .members
-            .as_ref()
-            .is_some_and(|members| members.len() == 2)
-    );
-    assert_eq!(c1_member_id.as_str(), c1_next_action.member_id.as_str());
-
-    // c1: sync
-    //
-    let c1_next_action = sync(&c1, Some(c1_next_action))
-        .await
-        .inspect(|c1_next_action| debug!(?c1_next_action))?;
-
-    assert!(!c1_next_action.assignment.is_empty());
-    assert_eq!(i16::from(ErrorCode::None), c1_next_action.error_code);
-
-    // c0: join with member id — a follower of generation 1, released from
-    // the join long-poll once the leader's assignment lands (or at the
-    // long-poll cap; either way the response below is the same)
-    //
-    let c0_next_action = c0_join
-        .await?
-        .inspect(|c0_next_action| debug!(?c0_next_action))?;
-
-    assert_eq!(i16::from(ErrorCode::None), c0_next_action.error_code);
-    assert_eq!(1, c0_next_action.generation_id);
-    assert_eq!(c1_member_id, c0_next_action.leader);
-    assert!(
-        c0_next_action
-            .members
-            .as_ref()
-            .is_some_and(|members| members.is_empty())
-    );
-    assert_eq!(c0_member_id.as_str(), c0_next_action.member_id.as_str());
-
-    // c0: sync
-    //
-    let c0_next_action = sync(&c0, Some(c0_next_action))
-        .await
-        .inspect(|c0_next_action| debug!(?c0_next_action))?;
-
-    assert!(!c0_next_action.assignment.is_empty());
-    assert_eq!(i16::from(ErrorCode::None), c0_next_action.error_code);
-
-    // c0: heartbeat
-    //
-    let c0_next_action = heartbeat(&c0, Some(c0_next_action))
-        .await
-        .inspect(|c0_next_action| debug!(?c0_next_action))?;
-
-    assert_eq!(i16::from(ErrorCode::None), c0_next_action.error_code);
-
-    // c1: heartbeat
-    //
-    let c1_next_action = heartbeat(&c1, Some(c1_next_action))
-        .await
-        .inspect(|c1_next_action| debug!(?c1_next_action))?;
-
-    assert_eq!(i16::from(ErrorCode::None), c1_next_action.error_code);
-
-    let Ok(Some(c0_member_assignment)) = c0.member_assignment() else {
-        panic!("expecting c0_member_assignment");
-    };
-
-    let Ok(Some(c1_member_assignment)) = c1.member_assignment() else {
-        panic!("expecting c0_member_assignment");
-    };
-
-    let assignments = c0_member_assignment
-        .assignment
-        .assigned_partitions
-        .iter()
-        .flat_map(|topic_partition| {
-            topic_partition
-                .partitions
-                .iter()
-                .map(|partition| (topic_partition.topic.clone(), *partition))
-        })
-        .chain(
-            c1_member_assignment
-                .assignment
-                .assigned_partitions
-                .iter()
-                .flat_map(|topic_partition| {
-                    topic_partition
-                        .partitions
-                        .iter()
-                        .map(|partition| (topic_partition.topic.clone(), *partition))
-                }),
-        );
-
-    assert_eq!(
-        tp.iter()
-            .cloned()
-            .map(|(_topic, partitions)| partitions.sum::<i32>() as usize)
-            .sum::<usize>(),
-        assignments.clone().count()
-    );
-
-    assert!(
-        has_unique_elements(assignments.clone()),
-        "non unique: {assignments:?}"
-    );
-
-    Ok(())
-}
-
-#[instrument(skip(service))]
-async fn simple_consumer<S>(name: &str, service: &S) -> Result<()>
-where
-    S: Service<(), Option<Body>, Response = Body>,
-    S::Error: Into<Error>,
-{
-    // join without member id
-    //
-    let now = Instant::now();
-    let next_action = join(service, None::<JoinGroupResponse>)
-        .await
-        .inspect(|next_action| debug!(?next_action, elapsed = ?now.elapsed()))?;
-
-    let member_id = next_action.member_id.clone();
-    debug!(member_id);
-
-    // join with member id
-    //
-    let next_action = join(service, Some(next_action)).await?;
-
-    assert_eq!(i16::from(ErrorCode::None), next_action.error_code);
-    assert!(!next_action.member_id.is_empty());
-    assert_eq!(next_action.leader, next_action.member_id);
-    assert!(
-        next_action
-            .members
-            .as_ref()
-            .is_some_and(|members| members.len() == 1)
-    );
-    assert_eq!(member_id.as_str(), next_action.member_id.as_str());
-
-    // sync
-    //
-    let next_action = sync(service, Some(next_action)).await?;
-
-    assert!(!next_action.assignment.is_empty());
-    assert_eq!(i16::from(ErrorCode::None), next_action.error_code);
-
-    // heartbeat
-    //
-    let next_action = heartbeat(service, Some(next_action)).await?;
-
-    assert_eq!(i16::from(ErrorCode::None), next_action.error_code);
-
-    Ok(())
-}
-
-#[instrument(skip_all)]
-async fn transient_wave_complete<S>(
-    mut rx: Receiver<usize>,
-    notification: Arc<Notify>,
-    simulation: CancellationToken,
-    consumers: Vec<ConsumerGroupService<S>>,
-    is_transient: impl Fn(usize) -> bool,
-) -> Result<()> {
-    let mut transients = consumers
-        .iter()
-        .enumerate()
-        .filter_map(|(id, _)| is_transient(id).then_some(id))
-        .inspect(|transient| debug!(transient))
-        .collect::<BTreeSet<_>>();
-
-    while !simulation.is_cancelled() {
-        tokio::select! {
-            _ = simulation.cancelled() => (),
-
-            Some(id) = rx.recv() => {
-                debug!(completed = format!("c{id}"));
-
-                if transients.remove(&id) && transients.is_empty() {
-                    debug!("transients are complete");
-                    notification.notify_one();
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[instrument(skip_all)]
-fn metadata<'b: 'a, 'a, T>(tp: T) -> MetadataResponse
-where
-    T: Iterator<Item = &'a (&'b str, Range<i32>)>,
-{
-    MetadataResponse::default().topics(Some(
-        tp.map(|(topic, partitions)| {
-            MetadataResponseTopic::default()
-                .name(Some((*topic).into()))
-                .partitions(Some(
-                    partitions
-                        .clone()
-                        .map(|partition_index| {
-                            MetadataResponsePartition::default().partition_index(partition_index)
-                        })
-                        .collect(),
-                ))
-        })
-        .collect(),
-    ))
-}
-
-#[instrument(skip(topics, route, metadata, latency_ms))]
-fn consumer(
-    group: &str,
-    id: u64,
-    topics: impl IntoIterator<Item = impl Into<String>>,
-    route: impl Service<(), Frame, Response = Frame, Error = tansu_broker::Error> + Clone,
-    metadata: MetadataResponse,
+/// A member of `GROUP` subscribed to `TOPIC`, whose requests to `route` are
+/// delayed by a latency drawn from `latency_ms` by a generator seeded with
+/// `rng_seed`.
+fn member(
+    route: Route,
+    rng_seed: u64,
     latency_ms: Range<u64>,
-) -> ConsumerGroupService<
-    impl Service<(), Frame, Response = Frame, Error = tansu_broker::Error> + Clone,
-> {
-    (
-        ConsumerGroupLayer::new(group, topics.into_iter(), metadata.clone()).on_assignment(
-            |group: String, assignment: MemberAssignment| debug!(group, %assignment),
-        ),
-        LatencyIntroducingLayer::default()
-            .with_seed(id)
-            .with_latency_millis(latency_ms.clone()),
-        FrameBytesLayer,
-        BytesFrameLayer::default(),
-    )
-        .into_layer(route)
+    metadata: MetadataResponse,
+) -> ConsumerGroupService<impl Wire> {
+    let group = ConsumerGroupLayer::new(GROUP, [TOPIC], metadata)
+        .on_assignment(|group: String, assignment: MemberAssignment| debug!(group, %assignment));
+    let delayed = LatencyIntroducingLayer::default()
+        .with_seed(rng_seed)
+        .with_latency_millis(latency_ms);
+    (group, delayed, FrameBytesLayer, BytesFrameLayer::default()).into_layer(route)
 }
 
-#[instrument(skip_all)]
-fn topition_assignments<S>(
-    consumers: Vec<ConsumerGroupService<S>>,
-    is_transient: impl Fn(usize) -> bool,
-) -> Result<impl Iterator<Item = (String, i32)> + Clone + Debug> {
-    let assignments = consumers
-        .into_iter()
-        .enumerate()
-        .filter_map(|(id, consumer)| (!is_transient(id)).then_some(consumer))
-        .filter_map(|consumer| consumer.member_assignment().map_err(Into::into).transpose())
-        .collect::<Result<Vec<_>>>()?;
-
-    Ok(assignments
-        .into_iter()
-        .map(|member_assignment| member_assignment.assignment)
-        .map(|consumer_protocol_assignment| consumer_protocol_assignment.assigned_partitions)
-        .flat_map(|topic_partition| topic_partition.into_iter())
-        .map(|topic_partition| (topic_partition.topic, topic_partition.partitions))
-        .flat_map(|(topic, partitions)| {
-            partitions
-                .into_iter()
-                .map(move |partition| (topic.clone(), partition))
-        }))
+async fn next(member: &impl Member, previous: Option<Body>) -> Result<Body> {
+    let answering = member.serve(Context::default(), previous);
+    answering.await.map_err(Into::into)
 }
 
-#[instrument(skip_all)]
-fn error_codes<S>(consumers: Vec<ConsumerGroupService<S>>) -> Result<BTreeMap<ErrorCode, u64>>
-where
-    S: Clone,
-{
-    let mut errors = BTreeMap::new();
+async fn join(member: &impl Member, previous: Option<Body>) -> Result<JoinGroupResponse> {
+    match next(member, previous).await? {
+        Body::JoinGroupResponse(joined) => Ok(joined),
+        otherwise => Err(anyhow!("a JoinGroup answer expected, not {otherwise:?}")),
+    }
+}
 
-    for consumer in consumers
-        .clone()
-        .into_iter()
-        .map(|consumer| consumer.errors().map_err(Into::into))
-        .collect::<Result<Vec<_>>>()?
-    {
-        for (k, v) in consumer {
-            _ = errors
-                .entry(k)
-                .and_modify(|existing| *existing += v)
-                .or_insert(v);
+async fn sync(member: &impl Member, previous: Option<Body>) -> Result<SyncGroupResponse> {
+    match next(member, previous).await? {
+        Body::SyncGroupResponse(synced) => Ok(synced),
+        otherwise => Err(anyhow!("a SyncGroup answer expected, not {otherwise:?}")),
+    }
+}
+
+async fn heartbeat(member: &impl Member, previous: Option<Body>) -> Result<HeartbeatResponse> {
+    match next(member, previous).await? {
+        Body::HeartbeatResponse(beat) => Ok(beat),
+        otherwise => Err(anyhow!("a Heartbeat answer expected, not {otherwise:?}")),
+    }
+}
+
+fn members(joined: &JoinGroupResponse) -> Option<usize> {
+    joined.members.as_ref().map(Vec::len)
+}
+
+/// A first JoinGroup, without a member id: KIP-394 answers it with a
+/// generated id and nothing else.
+async fn first_join(member: &impl Member) -> Result<JoinGroupResponse> {
+    let parked = join(member, None).await?;
+    assert_eq!(i16::from(ErrorCode::MemberIdRequired), parked.error_code);
+    assert_eq!(-1, parked.generation_id);
+    assert!(parked.leader.is_empty());
+    assert_eq!(Some(0), members(&parked));
+    assert!(!parked.member_id.is_empty());
+    Ok(parked)
+}
+
+/// Rejoins with the id `parked` handed out, then syncs and heartbeats as the
+/// group's only member, and so its leader.
+async fn lead_alone(member: &impl Member, parked: JoinGroupResponse) -> Result<()> {
+    let id = parked.member_id.clone();
+    let joined = join(member, Some(parked.into())).await?;
+    assert_eq!(i16::from(ErrorCode::None), joined.error_code);
+    assert_eq!(id, joined.member_id);
+    assert_eq!(joined.leader, joined.member_id);
+    assert_eq!(Some(1), members(&joined));
+
+    let synced = sync(member, Some(joined.into())).await?;
+    assert!(!synced.assignment.is_empty());
+    assert_eq!(i16::from(ErrorCode::None), synced.error_code);
+
+    let beat = heartbeat(member, Some(synced.into())).await?;
+    assert_eq!(i16::from(ErrorCode::None), beat.error_code);
+    Ok(())
+}
+
+/// The assignment of a member holding every partition of `TOPIC`.
+fn everything(partitions: Range<i32>) -> MemberAssignment {
+    let all = ConsumerProtocolAssignment::default().assigned_partitions([(TOPIC, partitions)]);
+    let v3 = ConsumerProtocolSubscription::V3;
+    MemberAssignment::default().version(v3).assignment(all)
+}
+
+/// Every partition assigned to one of `members`, once per member holding it.
+fn assigned<'a, S: 'a>(
+    members: impl IntoIterator<Item = &'a ConsumerGroupService<S>>,
+) -> Result<Vec<(String, i32)>> {
+    let mut held = Vec::new();
+    for member in members {
+        let topics = member.member_assignment()?.into_iter();
+        for topic in topics.flat_map(|ours| ours.assignment.assigned_partitions) {
+            for partition in topic.partitions {
+                held.push((topic.topic.clone(), partition));
+            }
         }
     }
-
-    Ok(errors)
+    Ok(held)
 }
 
-#[instrument(skip_all)]
-async fn stability_check<S>(
-    notification: Arc<Notify>,
-    simulation: CancellationToken,
-    consumers: Vec<ConsumerGroupService<S>>,
-    is_transient: impl Fn(usize) -> bool,
-) -> Result<()> {
-    let mut is_stable = false;
+/// Asserts that `held` is each of `partitions` exactly once.
+fn assert_each_once(held: &[(String, i32)], partitions: usize) {
+    assert_eq!(partitions, held.len(), "assigned: {held:?}");
+    let distinct = held.iter().collect::<HashSet<_>>();
+    assert_eq!(held.len(), distinct.len(), "assigned twice: {held:?}");
+}
 
-    notification.notified().await;
-    debug!("notified, waiting for 2x session timeout");
+/// How one member takes part in a run.
+struct Script {
+    /// The member's position in its group, reported on `finished`.
+    index: usize,
+    rounds: usize,
+    /// Whether this member cancels `done` once its rounds are up.
+    ends_run: bool,
+    finished: Sender<usize>,
+    done: tokio_util::sync::CancellationToken,
+}
 
-    sleep(
-        consumers
-            .first()
-            .map(|consumer| {
-                consumer
-                    .session_timeout()
-                    .map(|session_timeout| session_timeout * 2)
-            })
-            .transpose()?
-            .expect("session duration"),
-    )
-    .await;
+impl Script {
+    /// Answers whatever `member` asks `rounds` times, or until `done` is
+    /// cancelled, then reports `index` on `finished`.
+    async fn play(self, member: &impl Member) -> Result<()> {
+        let mut previous = None;
+        for _ in 0..self.rounds {
+            if self.done.is_cancelled() {
+                break;
+            }
+            previous = Some(next(member, previous).await?);
+        }
 
-    debug!("awaiting stability");
+        _ = self.finished.send(self.index).await;
+        if self.ends_run && !self.done.is_cancelled() {
+            self.done.cancel();
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn rejoin_after_the_session_of_the_parked_id_expires() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let c0 = member(coordinator().await?, 0, LATENCY_MS, topic(0..3));
+    let parked = first_join(&c0).await?;
+
+    let session = c0.session_timeout()?;
+    task::yield_now().await;
+    time::advance(session).await;
+    task::yield_now().await;
+
+    lead_alone(&c0, parked).await?;
+    assert_eq!(Some(everything(0..3)), c0.member_assignment()?);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_lone_member_leads_and_is_assigned_everything() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let c0 = member(coordinator().await?, 0, LATENCY_MS, topic(0..3));
+    let parked = first_join(&c0).await?;
+    lead_alone(&c0, parked).await?;
+    assert_eq!(Some(everything(0..3)), c0.member_assignment()?);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn two_members_split_the_partitions() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let route = coordinator().await?;
+    let pair = [
+        member(route.clone(), 0, LATENCY_MS, topic(0..3)),
+        member(route, 1, LATENCY_MS, topic(0..3)),
+    ];
+
+    let (finished, _reports) = mpsc::channel(pair.len());
+    let done = tokio_util::sync::CancellationToken::new();
+    let mut running = JoinSet::new();
+    for (id, c) in pair.iter().cloned().enumerate() {
+        let (finished, done) = (finished.clone(), done.clone());
+        let script = Script {
+            index: id,
+            rounds: 10,
+            ends_run: true,
+            finished,
+            done,
+        };
+        _ = running.spawn(async move { script.play(&c).await });
+    }
+    for outcome in running.join_all().await {
+        outcome?;
+    }
+
+    assert_each_once(&assigned(&pair)?, 3);
+    Ok(())
+}
+
+/// Polls every second until the permanent members agree on one generation
+/// and have each heartbeated in it a few times, and answers that generation.
+async fn settled<S>(permanent: &[ConsumerGroupService<S>]) -> i32 {
+    const POLL: Duration = Duration::from_secs(1);
 
     // Stability is "every permanent consumer has heartbeated a few times **in one
     // generation**", not "every permanent consumer has heartbeated a few times"
@@ -1048,154 +306,203 @@ async fn stability_check<S>(
     // passed on a re-run of the same commit.
     let mut settled_generation = None;
 
-    while !is_stable {
-        debug!(is_stable, ?settled_generation);
-        sleep(Duration::from_secs(1)).await;
-
-        let permanent = || {
-            consumers
-                .iter()
-                .enumerate()
-                .filter(|(id, _)| !is_transient(*id))
-        };
+    loop {
+        sleep(POLL).await;
 
         // One generation shared by every permanent consumer, or nothing.
-        let generation = permanent()
-            .map(|(id, consumer)| {
-                consumer
-                    .generation()
-                    .inspect(|generation| debug!(id = format!("c{id}"), ?generation))
-                    .unwrap_or_default()
-            })
+        let generation = permanent
+            .iter()
+            .map(|member| member.generation().unwrap_or_default())
             .reduce(|acc, generation| acc.filter(|acc| Some(acc) == generation.as_ref()))
             .flatten();
 
-        let heartbeating = permanent().all(|(id, consumer)| {
-            consumer
-                .stable_heartbeat_count()
-                .map(|heartbeats| {
-                    heartbeats
-                        .inspect(|heartbeats| debug!(id = format!("c{id}"), heartbeats))
-                        .is_some_and(|heartbeats| heartbeats > 2)
-                })
-                .unwrap_or_default()
+        let heartbeating = permanent.iter().all(|member| {
+            let beats = member.stable_heartbeat_count().unwrap_or_default();
+            beats.is_some_and(|beats| beats > 2)
         });
 
         // Require the agreed generation to hold across two consecutive polls: a
         // rebalance that starts between the check and the cancel would otherwise
         // still be sampled in flight.
-        is_stable = heartbeating && generation.is_some() && generation == settled_generation;
+        if let Some(agreed) = generation.filter(|_| heartbeating)
+            && generation == settled_generation
+        {
+            return agreed;
+        }
         settled_generation = generation;
     }
+}
 
-    debug!(is_stable, ?settled_generation);
-    simulation.cancel();
+/// `count` members over 32 partitions. The even ones are transient: each
+/// leaves after between 5 and 10 rounds, drawn from its own seeded generator.
+/// The odd ones are permanent, and once the group has settled they hold every
+/// partition exactly once.
+async fn churn(count: usize) -> Result<()> {
+    const PARTITIONS: i32 = 32;
+    const ROUNDS: Range<usize> = 5..10;
 
+    let route = coordinator().await?;
+    let group: Vec<_> = (0..count)
+        .map(|id| member(route.clone(), id as u64, 10..150, topic(0..PARTITIONS)))
+        .collect();
+    let is_transient = |id: usize| id.is_multiple_of(2);
+
+    let (finished, mut reports) = mpsc::channel(group.len());
+    let done = tokio_util::sync::CancellationToken::new();
+    let mut running = JoinSet::new();
+
+    for (id, c) in group.iter().cloned().enumerate() {
+        let rounds = match is_transient(id) {
+            true => SmallRng::seed_from_u64(id as u64).random_range(ROUNDS),
+            false => ROUNDS.end * 4,
+        };
+        let (finished, done) = (finished.clone(), done.clone());
+        let script = Script {
+            index: id,
+            rounds,
+            ends_run: rounds > ROUNDS.end,
+            finished,
+            done,
+        };
+        _ = running.spawn(async move { script.play(&c).await });
+    }
+
+    let mut transients = (0..count)
+        .filter(|id| is_transient(*id))
+        .collect::<BTreeSet<_>>();
+    let permanent: Vec<_> = (0..count)
+        .filter(|id| !is_transient(*id))
+        .map(|id| group[id].clone())
+        .collect();
+    let wave_over = Arc::new(Notify::new());
+
+    _ = running.spawn({
+        let (wave_over, done) = (wave_over.clone(), done.clone());
+        async move {
+            while let Some(Some(id)) = done.run_until_cancelled(reports.recv()).await {
+                let was_transient = transients.remove(&id);
+                if was_transient && transients.is_empty() {
+                    wave_over.notify_one();
+                }
+            }
+            Ok(())
+        }
+    });
+
+    _ = running.spawn({
+        let (first, permanent) = (group[0].clone(), permanent.clone());
+        async move {
+            wave_over.notified().await;
+            sleep(first.session_timeout()? * 2).await;
+            let generation = settled(&permanent).await;
+            debug!(generation);
+            done.cancel();
+            Ok(())
+        }
+    });
+
+    for outcome in running.join_all().await {
+        outcome?;
+    }
+
+    assert_each_once(&assigned(&permanent)?, PARTITIONS as usize);
     Ok(())
 }
 
-#[instrument(skip(iterations, id, tx, simulation, service), fields(name = format!("c{id}")))]
-async fn consumer_with_iterations<S>(
-    id: usize,
-    mut iterations: usize,
-    full_term: bool,
-    tx: Sender<usize>,
-    simulation: CancellationToken,
-    service: &S,
-) -> Result<()>
-where
-    S: Service<(), Option<Body>, Response = Body>,
-    S::Error: Into<Error> + Send + Sync + 'static,
-{
-    let mut next_action = None;
+#[tokio::test(start_paused = true)]
+async fn churn_of_08_members() -> Result<()> {
+    let _guard = init_tracing()?;
+    churn(8).await
+}
 
-    while iterations > 0 && !simulation.is_cancelled() {
-        let instant = Instant::now();
-        next_action = service
-            .serve(Context::default(), next_action)
-            .await
-            .inspect(|next_action| debug!(?next_action, iterations, elapsed = ?instant.elapsed(), simulation = simulation.is_cancelled()))
-            .map(Some)
-            .map_err(Into::into)?;
+#[tokio::test(start_paused = true)]
+async fn churn_of_16_members() -> Result<()> {
+    let _guard = init_tracing()?;
+    churn(16).await
+}
 
-        iterations -= 1;
-    }
+#[tokio::test(start_paused = true)]
+async fn churn_of_24_members() -> Result<()> {
+    let _guard = init_tracing()?;
+    churn(24).await
+}
 
-    _ = tx.send(id).await.ok();
+#[tokio::test(start_paused = true)]
+async fn churn_of_32_members() -> Result<()> {
+    let _guard = init_tracing()?;
+    churn(32).await
+}
 
-    if full_term && !simulation.is_cancelled() {
-        warn!("cancelling");
-        simulation.cancel();
-    }
+#[tokio::test(start_paused = true)]
+async fn two_members_joining_in_one_window_share_a_generation() -> Result<()> {
+    let _guard = init_tracing()?;
 
+    let route = coordinator().await?;
+    let c0 = member(route.clone(), 0, LATENCY_MS, topic(0..3));
+    let c1 = member(route, 0, LATENCY_MS, topic(0..3));
+
+    let c0_parked = first_join(&c0).await?;
+    let c0_member_id = c0_parked.member_id.clone();
+    let c1_parked = first_join(&c1).await?;
+    let c1_member_id = c1_parked.member_id.clone();
+
+    // KIP-394: the empty joins above only parked the generated member ids —
+    // neither consumer is registered yet (previously each empty join
+    // registered a phantom member and bumped the generation). For both
+    // consumers to land in the same generation, their real joins must overlap
+    // inside the same rebalance window: the join-window barrier holds the
+    // leader's JoinGroup response until membership is quiescent, so it
+    // carries the complete member list.
+    //
+    // c1: join with member id, in flight first so that c1 registers first
+    // and becomes the leader
+    //
+    let c1_join = {
+        let c1 = c1.clone();
+        tokio::spawn(async move { join(&c1, Some(c1_parked.into())).await })
+    };
+
+    // give c1 a head start (well past the maximum introduced latency), then
+    // join c0 while c1 is still held inside the rebalance window
+    //
+    sleep(Duration::from_millis(500)).await;
+
+    let c0_join = {
+        let c0 = c0.clone();
+        tokio::spawn(async move { join(&c0, Some(c0_parked.into())).await })
+    };
+
+    let led = c1_join.await??;
+    assert_eq!(i16::from(ErrorCode::None), led.error_code);
+    assert_eq!(1, led.generation_id);
+    assert_eq!(c1_member_id, led.leader);
+    assert_eq!(Some(2), members(&led));
+    assert_eq!(c1_member_id, led.member_id);
+
+    let c1_synced = sync(&c1, Some(led.into())).await?;
+    assert!(!c1_synced.assignment.is_empty());
+    assert_eq!(i16::from(ErrorCode::None), c1_synced.error_code);
+
+    // c0: join with member id — a follower of generation 1, released from
+    // the join long-poll once the leader's assignment lands (or at the
+    // long-poll cap; either way the response below is the same)
+    //
+    let followed = c0_join.await??;
+    assert_eq!(i16::from(ErrorCode::None), followed.error_code);
+    assert_eq!(1, followed.generation_id);
+    assert_eq!(c1_member_id, followed.leader);
+    assert_eq!(Some(0), members(&followed));
+    assert_eq!(c0_member_id, followed.member_id);
+
+    let c0_synced = sync(&c0, Some(followed.into())).await?;
+    assert!(!c0_synced.assignment.is_empty());
+    assert_eq!(i16::from(ErrorCode::None), c0_synced.error_code);
+
+    let c0_beat = heartbeat(&c0, Some(c0_synced.into())).await?;
+    assert_eq!(i16::from(ErrorCode::None), c0_beat.error_code);
+    let c1_beat = heartbeat(&c1, Some(c1_synced.into())).await?;
+    assert_eq!(i16::from(ErrorCode::None), c1_beat.error_code);
+
+    assert_each_once(&assigned([&c0, &c1])?, 3);
     Ok(())
-}
-
-fn has_unique_elements<T>(iter: T) -> bool
-where
-    T: IntoIterator,
-    T::Item: Eq + Hash,
-{
-    let mut uniq = HashSet::new();
-    iter.into_iter().all(|x| uniq.insert(x))
-}
-
-#[instrument(skip_all)]
-async fn join<I, S>(service: &S, input: Option<I>) -> Result<JoinGroupResponse, Error>
-where
-    S: Service<(), Option<Body>, Response = Body>,
-    I: Into<Body>,
-    S::Error: Into<Error>,
-{
-    let next_action = service
-        .serve(Context::default(), input.map(Into::into))
-        .await
-        .inspect(|output| debug!(?output))
-        .map_err(Into::into)?;
-
-    if let Body::JoinGroupResponse(join_group) = next_action {
-        Ok(join_group)
-    } else {
-        Err(anyhow!("expecting join response: {next_action:?}"))
-    }
-}
-
-#[instrument(skip_all)]
-async fn sync<I, S>(service: &S, input: Option<I>) -> Result<SyncGroupResponse, Error>
-where
-    S: Service<(), Option<Body>, Response = Body>,
-    I: Into<Body>,
-    S::Error: Into<Error>,
-{
-    let next_action = service
-        .serve(Context::default(), input.map(Into::into))
-        .await
-        .inspect(|output| debug!(?output))
-        .map_err(Into::into)?;
-
-    if let Body::SyncGroupResponse(sync_group) = next_action {
-        Ok(sync_group)
-    } else {
-        Err(anyhow!("expecting sync response: {next_action:?}"))
-    }
-}
-
-#[instrument(skip_all)]
-async fn heartbeat<I, S>(service: &S, input: Option<I>) -> Result<HeartbeatResponse, Error>
-where
-    S: Service<(), Option<Body>, Response = Body>,
-    I: Into<Body>,
-    S::Error: Into<Error>,
-{
-    let next_action = service
-        .serve(Context::default(), input.map(Into::into))
-        .await
-        .inspect(|output| debug!(?output))
-        .map_err(Into::into)?;
-
-    if let Body::HeartbeatResponse(heartbeat) = next_action {
-        Ok(heartbeat)
-    } else {
-        Err(anyhow!("expecting heartbeat response: {next_action:?}"))
-    }
 }

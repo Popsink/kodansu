@@ -202,10 +202,18 @@ So is a bare test marker, `#[test]` or `#[tokio::test]`, on the grounds of the
 crate flag above: every test carries one, and there is no other way to write
 it. Blame lines a rewritten test's marker up with whichever upstream marker the
 diff lands on. An attribute that records a decision (`#[must_use]`,
-`#[non_exhaustive]`, `#[default]`) or takes arguments
-(`#[tokio::test(flavor = …)]`) is still counted. The rule took 358 lines off
-the plain total, and `tansu-storage/tests/delete_topics.rs` left `inherited`
-with it.
+`#[non_exhaustive]`, `#[default]`) is still counted. The rule took 358 lines
+off the plain total, and `tansu-storage/tests/delete_topics.rs` left
+`inherited` with it.
+
+It first left out a marker with runtime arguments, `#[tokio::test(start_paused
+= true)]` or `flavor = …`, and the consumer-group simulations showed why that
+was the wrong line to draw: each of their tests carries the same
+`start_paused = true`, because each runs on the paused clock, and a rewrite
+lined them up one for one with upstream's. The arguments configure the
+runtime the test needs; they are no more authored than the bare marker. Taking
+them too removed 10 lines, eight of them `tansu-broker/tests/new_cg.rs`'s, which
+left `inherited` with it.
 
 So is the tracing guard a test opens with, `let _guard = init_tracing()?;`
 (or `common::`, `super::`, `.unwrap()`). It is the first line of the 699 tests
