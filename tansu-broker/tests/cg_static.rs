@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,181 +17,122 @@
 // it; with the module gone it belongs to the file.
 #![cfg(feature = "dynostore")]
 
-use std::sync::Arc;
+//! A static member, one with a `group.instance.id`, joining without a member
+//! id: it leads its own generation, and joining again changes nothing.
 
-use bytes::Bytes;
-use common::{CLIENT_ID, COOPERATIVE_STICKY, PROTOCOL_TYPE, RANGE, register_broker};
-use rand::{prelude::*, rng};
-use tansu_broker::{Result, coordinator::group::administrator::Controller};
-use tansu_sans_io::{ErrorCode, join_group_request::JoinGroupRequestProtocol};
-use tansu_storage::Storage;
-use tracing::debug;
-use url::Url;
-use uuid::Uuid;
+use common::{CLIENT_ID, COOPERATIVE_STICKY, PROTOCOL_TYPE, RANGE};
+use rand::RngExt as _;
+use tansu_broker::coordinator::group::administrator::Controller;
+use tansu_sans_io::join_group_request::JoinGroupRequestProtocol;
+use tansu_sans_io::join_group_response::JoinGroupResponse;
 
 mod common;
 
-async fn storage_container(cluster: impl Into<String>, node: i32) -> Result<Arc<dyn Storage>> {
-    common::storage_container(cluster, node, Url::parse("tcp://127.0.0.1/")?).await
+type Engine = std::sync::Arc<dyn tansu_storage::Storage>;
+
+/// A `memory://` engine with one broker, at a random node id, registered.
+async fn registered() -> tansu_broker::Result<Engine> {
+    let cluster = uuid::Uuid::now_v7();
+    let node = rand::rng().random_range(0..i32::MAX);
+    let listener = url::Url::parse("tcp://127.0.0.1/")?;
+    let engine = common::storage_container(cluster, node, listener).await?;
+    common::register_broker(cluster, node, engine.clone()).await?;
+    Ok(engine)
 }
 
-#[tokio::test(start_paused = true)]
-async fn join_with_empty_member_id() -> Result<()> {
-    let _guard = common::init_tracing()?;
-
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let sc = storage_container(cluster_id, broker_id).await?;
-
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let mut controller = Controller::with_storage(sc)?.with_now(common::paused_clock);
-
-    let session_timeout_ms = 45_000;
-    let rebalance_timeout_ms = Some(300_000);
-    let group_instance_id = common::alphanumeric_string(6);
-    let reason = None;
-
-    let group_id: String = common::alphanumeric_string(15);
-    debug!(?group_id);
-
-    const CLIENT_ID: &str = "console-consumer";
-    const RANGE: &str = "range";
-    const COOPERATIVE_STICKY: &str = "cooperative-sticky";
-
-    const PROTOCOL_TYPE: &str = "consumer";
-
-    let first_member_range_meta = Bytes::from_static(b"first_member_range_meta_01");
-    let first_member_sticky_meta = Bytes::from_static(b"first_member_sticky_meta_01");
-
-    let protocols = [
-        JoinGroupRequestProtocol::default()
-            .name(RANGE.into())
-            .metadata(first_member_range_meta.clone()),
-        JoinGroupRequestProtocol::default()
-            .name(COOPERATIVE_STICKY.into())
-            .metadata(first_member_sticky_meta),
+/// Joins `group` as the static member `instance` with an empty member id,
+/// offering range and then cooperative-sticky.
+async fn join_static(
+    controller: &mut Controller<Engine>,
+    group: &str,
+    instance: &str,
+) -> tansu_broker::Result<JoinGroupResponse> {
+    let offer = |name: &str, metadata| {
+        let protocol = JoinGroupRequestProtocol::default().name(name.into());
+        protocol.metadata(bytes::Bytes::from_static(metadata))
+    };
+    let range = offer(RANGE, b"first_member_range_meta_01");
+    let offers = [
+        range,
+        offer(COOPERATIVE_STICKY, b"first_member_sticky_meta_01"),
     ];
-
-    // join static group without a member id
-    //
-    let join_response = common::join_group(
-        &mut controller,
-        Some(CLIENT_ID),
-        group_id.as_str(),
-        session_timeout_ms,
-        rebalance_timeout_ms,
+    let (session_ms, rebalance_ms) = (45_000, Some(300_000));
+    let (instance, consumer) = (Some(instance), PROTOCOL_TYPE);
+    let (client, offered) = (Some(CLIENT_ID), Some(&offers[..]));
+    let joining = common::join_group(
+        controller,
+        client,
+        group,
+        session_ms,
+        rebalance_ms,
         "",
-        Some(group_instance_id.as_str()),
-        PROTOCOL_TYPE,
-        Some(&protocols[..]),
-        reason,
-    )
-    .await?;
-
-    assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(join_response.error_code)?
+        instance,
+        consumer,
+        offered,
+        None,
     );
-    assert_eq!(Some(PROTOCOL_TYPE.into()), join_response.protocol_type);
-    assert_eq!(Some(RANGE.into()), join_response.protocol_name);
-    assert_eq!(join_response.member_id, join_response.leader);
+    joining.await
+}
+
+/// What a static member alone in its group is told: it leads, under range,
+/// with an id that starts with its instance id.
+fn assert_leads_alone(joined: &JoinGroupResponse, instance: &str) -> tansu_broker::Result<()> {
+    let outcome = tansu_sans_io::ErrorCode::try_from(joined.error_code)?;
+    assert_eq!(tansu_sans_io::ErrorCode::None, outcome);
+    let protocol = (
+        joined.protocol_type.as_deref(),
+        joined.protocol_name.as_deref(),
+    );
+    assert_eq!((Some(PROTOCOL_TYPE), Some(RANGE)), protocol);
+    assert_eq!(joined.leader, joined.member_id);
     assert!(
-        join_response
-            .member_id
-            .starts_with(group_instance_id.as_str())
+        joined.member_id.starts_with(instance),
+        "{}",
+        joined.member_id
     );
-    assert_eq!(1, join_response.members.unwrap().len());
-
+    assert_eq!(Some(1), joined.members.as_ref().map(Vec::len));
     Ok(())
 }
 
 #[tokio::test(start_paused = true)]
-async fn rejoin_with_empty_member_id() -> Result<()> {
+async fn a_static_member_without_an_id_leads_alone() -> tansu_broker::Result<()> {
     let _guard = common::init_tracing()?;
+    let controller = Controller::with_storage(registered().await?)?;
+    let mut controller = controller.with_now(common::paused_clock);
 
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let sc = storage_container(cluster_id, broker_id).await?;
+    let instance = common::alphanumeric_string(6);
+    let group = common::alphanumeric_string(15);
+    tracing::debug!(group_id = ?group);
 
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
+    let joined = join_static(&mut controller, &group, &instance).await?;
+    assert_leads_alone(&joined, &instance)
+}
 
-    let mut controller = Controller::with_storage(sc.clone())?;
+#[tokio::test(start_paused = true)]
+async fn a_static_member_joining_again_keeps_its_id_and_generation() -> tansu_broker::Result<()> {
+    let _guard = common::init_tracing()?;
+    let mut controller = Controller::with_storage(registered().await?)?;
 
-    let session_timeout_ms = 45_000;
-    let rebalance_timeout_ms = Some(300_000);
-    let group_instance_id = common::alphanumeric_string(6);
-    let reason = None;
+    let instance = common::alphanumeric_string(6);
+    let group = common::alphanumeric_string(15);
+    tracing::debug!(group_id = ?group);
 
-    let group_id: String = common::alphanumeric_string(15);
-    debug!(?group_id);
+    let joined = join_static(&mut controller, &group, &instance).await?;
+    assert_leads_alone(&joined, &instance)?;
 
-    let first_member_range_meta = Bytes::from_static(b"first_member_range_meta_01");
-    let first_member_sticky_meta = Bytes::from_static(b"first_member_sticky_meta_01");
-
-    let protocols = [
-        JoinGroupRequestProtocol::default()
-            .name(RANGE.into())
-            .metadata(first_member_range_meta.clone()),
-        JoinGroupRequestProtocol::default()
-            .name(COOPERATIVE_STICKY.into())
-            .metadata(first_member_sticky_meta),
-    ];
-
-    // join static group without a member id
-    //
-    let join_response = common::join_group(
-        &mut controller,
-        Some(CLIENT_ID),
-        group_id.as_str(),
-        session_timeout_ms,
-        rebalance_timeout_ms,
-        "",
-        Some(group_instance_id.as_str()),
-        PROTOCOL_TYPE,
-        Some(&protocols[..]),
-        reason,
-    )
-    .await?;
-
+    let again = join_static(&mut controller, &group, &instance).await?;
+    let outcome = tansu_sans_io::ErrorCode::try_from(again.error_code)?;
+    assert_eq!(tansu_sans_io::ErrorCode::None, outcome);
+    let protocol = (
+        again.protocol_type.as_deref(),
+        again.protocol_name.as_deref(),
+    );
+    assert_eq!((Some(PROTOCOL_TYPE), Some(RANGE)), protocol);
+    let identity = (&again.leader, &again.member_id, again.generation_id);
     assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(join_response.error_code)?
+        (&joined.leader, &joined.member_id, joined.generation_id),
+        identity
     );
-    assert_eq!(Some(PROTOCOL_TYPE.into()), join_response.protocol_type);
-    assert_eq!(Some(RANGE.into()), join_response.protocol_name);
-    assert_eq!(join_response.member_id, join_response.leader);
-    assert!(
-        join_response
-            .member_id
-            .starts_with(group_instance_id.as_str())
-    );
-    assert_eq!(1, join_response.members.unwrap().len());
-
-    let rejoin_response = common::join_group(
-        &mut controller,
-        Some(CLIENT_ID),
-        group_id.as_str(),
-        session_timeout_ms,
-        rebalance_timeout_ms,
-        "",
-        Some(group_instance_id.as_str()),
-        PROTOCOL_TYPE,
-        Some(&protocols[..]),
-        reason,
-    )
-    .await?;
-
-    assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(rejoin_response.error_code)?
-    );
-    assert_eq!(Some(PROTOCOL_TYPE.into()), rejoin_response.protocol_type);
-    assert_eq!(Some(RANGE.into()), rejoin_response.protocol_name);
-    assert_eq!(rejoin_response.leader, join_response.leader);
-    assert_eq!(rejoin_response.member_id, join_response.member_id);
-    assert_eq!(rejoin_response.generation_id, join_response.generation_id);
-    assert_eq!(1, rejoin_response.members.unwrap().len());
-
+    assert_eq!(Some(1), again.members.as_ref().map(Vec::len));
     Ok(())
 }
