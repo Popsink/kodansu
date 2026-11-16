@@ -694,6 +694,12 @@ fmt:
 # fields the version predates cleared. `tests/doctest.rs` holds its fetch
 # response as hex and builds its records and batches in short `let` steps.
 # The ceiling rises because only code went: the comment count did not move.
+#   defork  -60 lines, the static member tests on shared helpers  3091 -> 3087  2.7565 -> 2.7542
+#
+# `tests/cg_static.rs` spelled out the broker registration, the protocols
+# and a ten-argument JoinGroup in both tests, with the step narrated
+# (`// join static group without a member id`) above each. `registered`,
+# `join_static` and `assert_leads_alone` carry them, and the narration goes.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -704,7 +710,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7565" top="12":
+comments ceiling="2.7542" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
