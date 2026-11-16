@@ -106,7 +106,7 @@ async fn joined_at(
             None,
         )
         .await
-        .map_err(|error| Error::Message(format!("{error:?}")))?;
+        .map_err(|error| Error::Failed(format!("{error:?}")))?;
 
     _ = storage
         .update_group_generation(
@@ -120,7 +120,7 @@ async fn joined_at(
             None,
         )
         .await
-        .map_err(|error| Error::Message(format!("{error:?}")))?;
+        .map_err(|error| Error::Failed(format!("{error:?}")))?;
 
     Ok(())
 }
@@ -257,7 +257,7 @@ async fn a_group_whose_members_have_gone_is_deleted() -> Result<(), Error> {
             Some(version),
         )
         .await
-        .map_err(|error| Error::Message(format!("{error:?}")))?;
+        .map_err(|error| Error::Failed(format!("{error:?}")))?;
 
     let deleted = storage.delete_groups(Some(&[group_id.into()])).await?;
     assert_eq!(ErrorCode::None, ErrorCode::try_from(deleted[0].error_code)?);
@@ -358,7 +358,7 @@ async fn a_group_with_no_members_is_empty_not_dead() -> Result<(), Error> {
             None,
         )
         .await
-        .map_err(|error| Error::Message(format!("{error:?}")))?;
+        .map_err(|error| Error::Failed(format!("{error:?}")))?;
 
     let described = describe(&storage, group_id).await?;
 
