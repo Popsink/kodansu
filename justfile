@@ -756,6 +756,13 @@ fmt:
 # `assert_unknown`, carry them; the cited #593 note moves, naming the renamed
 # test. The ceiling rises because only code went: the comment count did not
 # move.
+#   defork  -208 lines, the dynamic member tests on a group fixture  3004 -> 2964  2.7134 -> 2.6819
+#
+# `tests/cg_dynamic.rs` spelled out every JoinGroup, SyncGroup, Heartbeat and
+# LeaveGroup of a rebalance in full, each under a narrating `// 2nd member
+# joins` comment. A `Group` fixture carries the exchanges, the narration goes,
+# and so does the cited #555 `cognitive_complexity` allow the script length
+# needed. The cited #195 session-timeout note moves unchanged.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -766,7 +773,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7134" top="12":
+comments ceiling="2.6819" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
