@@ -727,6 +727,13 @@ fmt:
 # `registered`, `topic`, `create` and `assert_described` carry them, and a
 # commented-out assertion goes. The ceiling rises because code went faster
 # than comments: one line of each kind for every hundred and thirty-five.
+#   defork  -179 lines, the DescribeConfigs tests on a topic fixture  3004 -> 3004  2.6959 -> 2.6998
+#
+# `tansu-broker/tests/describe_configs.rs` spelled out three
+# `IncrementalAlterConfigs` and four `DescribeConfigs` requests in full. A
+# `Topic` fixture with `described` and `alter_policy` carries them, and the
+# cited #225 notes move unchanged. The ceiling rises because only code went:
+# the comment count did not move.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -737,7 +744,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6959" top="12":
+comments ceiling="2.6998" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
