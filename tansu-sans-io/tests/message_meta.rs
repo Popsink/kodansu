@@ -186,6 +186,62 @@ fn fetch_request() {
     assert_eq!(Some(true), element.map(|kind| kind.is_primitive()));
 }
 
+/// Where each `FetchResponse` field starts, and whether its parent requires
+/// it: a field at `a.b` is checked against the versions of `a`.
+#[test]
+fn fetch_response() {
+    let _guard = common::init_tracing().unwrap();
+    let response = message("FetchResponse");
+    assert_eq!(
+        (1, MessageKind::Response),
+        (response.api_key, response.message_kind)
+    );
+    assert_eq!(VersionRange { start: 0, end: 17 }, response.version.valid);
+    assert_eq!(since(12), response.version.flexible);
+    assert_eq!(since(16), field(response, "node_endpoints").version);
+
+    let until_v12 = VersionRange { start: 0, end: 12 };
+    let expected = [
+        ("throttle_time_ms", since(1), false),
+        ("responses", since(0), true),
+        ("responses.topic", until_v12, false),
+        ("responses.partitions", since(0), true),
+        ("responses.partitions.partition_index", since(0), true),
+        ("responses.partitions.error_code", since(0), true),
+        ("responses.partitions.high_watermark", since(0), true),
+        ("responses.partitions.last_stable_offset", since(4), false),
+        ("responses.partitions.diverging_epoch", since(12), false),
+        (
+            "responses.partitions.diverging_epoch.epoch",
+            since(12),
+            true,
+        ),
+        (
+            "responses.partitions.diverging_epoch.end_offset",
+            since(12),
+            true,
+        ),
+        ("responses.partitions.snapshot_id", since(12), false),
+        (
+            "responses.partitions.snapshot_id.end_offset",
+            since(0),
+            true,
+        ),
+        ("responses.partitions.snapshot_id.epoch", since(0), true),
+    ];
+    for (path, versions, mandatory) in expected {
+        let meta = field(response, path);
+        let parent = path
+            .rsplit_once('.')
+            .map(|(up, _)| field(response, up).version);
+        assert_eq!(
+            (versions, mandatory),
+            (meta.version, meta.is_mandatory(parent)),
+            "{path}"
+        );
+    }
+}
+
 #[test]
 fn find_coordinator_request() {
     let _guard = common::init_tracing().unwrap();

@@ -700,6 +700,13 @@ fmt:
 # and a ten-argument JoinGroup in both tests, with the step narrated
 # (`// join static group without a member id`) above each. `registered`,
 # `join_static` and `assert_leads_alone` carry them, and the narration goes.
+#   defork  -242 lines, the FetchResponse metadata checks into `message_meta`  3087 -> 3087  2.7542 -> 2.7590
+#
+# `tansu-sans-io/tests/fetch_response.rs` looked `FetchResponse` up in
+# `MESSAGE_META` again in each of thirteen tests to check one field's
+# versions and whether its parent requires it. It becomes one table-driven
+# test in `tests/message_meta.rs`. The ceiling rises because only code went:
+# the comment count did not move.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -710,7 +717,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7542" top="12":
+comments ceiling="2.7590" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

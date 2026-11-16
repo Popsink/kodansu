@@ -127,7 +127,6 @@ inherited = [
     "tansu-sans-io/src/ser.rs",
     "tansu-sans-io/tests/api.rs",
     "tansu-sans-io/tests/consumer.rs",
-    "tansu-sans-io/tests/fetch_response.rs",
     "tansu-sans-io/tests/gap6.rs",
     "tansu-sans-io/tests/golden.rs",
     "tansu-sans-io/tests/proptest.rs",
