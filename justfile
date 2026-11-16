@@ -660,6 +660,12 @@ fmt:
 # `common::storage_container` and flat `use` lines. The uncited note above the
 # `LatencyIntroducingStorage` wrapper becomes a shorter one citing #111, and
 # the DescribeCluster `matches!` becomes one assertion per field.
+#   defork  -38 lines, the group consumer example rewritten  3091 -> 3091  2.7420 -> 2.7429
+#
+# `tansu-client/examples/group_consumer.rs` builds its subscriber, requests
+# and layers in short `let` steps, and `--heartbeat-interval` parses with
+# `humantime::parse_duration` directly. The ceiling rises because only code
+# went: the comment count did not move.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -670,7 +676,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7420" top="12":
+comments ceiling="2.7429" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
