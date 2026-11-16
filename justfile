@@ -770,6 +770,13 @@ fmt:
 # Fetch requests behind `produce_keyed`, `list_offset` and `fetched` are
 # rebuilt in short `let` steps. The ceiling rises because only code went:
 # the comment count did not move.
+#   defork  -389 lines, the produce/fetch tests on shared helpers  2964 -> 2954  2.6835 -> 2.6827
+#
+# `tansu-broker/tests/produce_fetch.rs` spelled out an idempotent produce
+# loop and, twice over, a transactional one with its AddPartitionsToTxn,
+# commit and end marker, plus the same fetch and comparison, under
+# narrating comments. `a_partition`, `committed_transactions`, `fetched`,
+# `placed` and `assert_as_produced` carry them, and the narration goes.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -780,7 +787,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6835" top="12":
+comments ceiling="2.6827" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
