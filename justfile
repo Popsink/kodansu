@@ -666,6 +666,13 @@ fmt:
 # and layers in short `let` steps, and `--heartbeat-interval` parses with
 # `humantime::parse_duration` directly. The ceiling rises because only code
 # went: the comment count did not move.
+#   defork  -315 lines, the sans-io message metadata tests in one binary  3091 -> 3091  2.7429 -> 2.7480
+#
+# Six `tansu-sans-io` test binaries each checked one message in
+# `MESSAGE_META`, through the same lookup and `.map(..).unwrap()` chains.
+# `tests/message_meta.rs` holds the six tests over `message`, `field`,
+# `structure_names` and `sequence_of`. The ceiling rises because only code
+# went: the comment count did not move.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -676,7 +683,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7429" top="12":
+comments ceiling="2.7480" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
