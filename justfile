@@ -777,6 +777,14 @@ fmt:
 # commit and end marker, plus the same fetch and comparison, under
 # narrating comments. `a_partition`, `committed_transactions`, `fetched`,
 # `placed` and `assert_as_produced` carry them, and the narration goes.
+#   defork  -453 lines, the ListOffsets tests on shared helpers  2954 -> 2954  2.6827 -> 2.6922
+#
+# `tansu-broker/tests/list_offsets.rs` spelled out eight ListOffsets and
+# three Produce requests in full in one 500-line body, with the cited #444
+# note repeated three times. `listed`, `produced`, `listed_on` and the
+# assertions carry them; the #444 note stays once and the #177 notes move
+# unchanged, and the cited #555 allow the body's length needed goes. The
+# ceiling rises because code went faster than the comments that counted.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -787,7 +795,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6827" top="12":
+comments ceiling="2.6922" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

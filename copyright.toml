@@ -83,7 +83,6 @@ inherited = [
     "tansu-broker/src/service/coordinator.rs",
     "tansu-broker/src/service/storage.rs",
     "tansu-broker/tests/common/mod.rs",
-    "tansu-broker/tests/list_offsets.rs",
     "tansu-cli/src/cli.rs",
     "tansu-cli/src/cli/broker.rs",
     "tansu-cli/src/cli/topic.rs",
