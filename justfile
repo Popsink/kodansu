@@ -646,6 +646,14 @@ fmt:
 # `first_join`, `lead_alone`, `Script` and `settled` carry them. The cited
 # #195 stability notes and the KIP-394 interleave notes move unchanged; the
 # narration goes.
+#   defork  -838 lines, the SASL tests on the memory engine  3097 -> 3095  2.7256 -> 2.7443
+#
+# `tests/auth.rs` carried a 480-line `Storage` stub, every method but one
+# `unimplemented!()`, and spelled out a SaslHandshake/SaslAuthenticate loop
+# and hard-coded SCRAM key bytes in each test. The tests now store derived
+# credentials in a `memory://` engine and share a `Connection`. The ceiling
+# rises because the code went: two uncited lines left with it, and the cited
+# #551 note left with the stub it described.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -656,7 +664,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7257" top="12":
+comments ceiling="2.7443" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
