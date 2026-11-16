@@ -1,4 +1,3 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
 // Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,12 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use dotenv::dotenv;
 use object_store::{ObjectStoreExt, PutPayload, memory::InMemory, path::Path};
-use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, fs::File, sync::Arc, thread};
-use tracing::subscriber::DefaultGuard;
-use tracing_subscriber::EnvFilter;
 
 use bytes::Bytes;
 use tansu_sans_io::record::{Record, deflated, inflated};
@@ -142,73 +136,62 @@ pub(crate) async fn legacy_group_exists(bucket: &InMemory, cluster: &str, group_
         .is_ok()
 }
 
-pub(crate) fn init_tracing() -> Result<DefaultGuard, Error> {
-    _ = dotenv().ok();
+/// Loads `.env`, then logs this test at `debug` for this crate, on top of
+/// `RUST_LOG`, into `../logs/<package>/<thread>.log`: one file per test.
+pub(crate) fn init_tracing() -> Result<tracing::subscriber::DefaultGuard, Error> {
+    _ = dotenv::dotenv();
+    let directive = format!("{}=debug", env!("CARGO_CRATE_NAME")).parse()?;
+    let filter = tracing_subscriber::EnvFilter::from_default_env().add_directive(directive);
 
-    Ok(tracing::subscriber::set_default(
-        tracing_subscriber::fmt()
-            .with_level(true)
-            .with_line_number(true)
-            .with_thread_names(false)
-            .with_env_filter(
-                EnvFilter::from_default_env()
-                    .add_directive(format!("{}=debug", env!("CARGO_CRATE_NAME")).parse()?),
-            )
-            .with_writer(
-                thread::current()
-                    .name()
-                    .ok_or(Error::Message(String::from("unnamed thread")))
-                    .and_then(|name| {
-                        File::create(format!("../logs/{}/{name}.log", env!("CARGO_PKG_NAME"),))
-                            .map_err(Into::into)
-                    })
-                    .map(Arc::new)?,
-            )
-            .finish(),
-    ))
+    let unnamed = || Error::Message(String::from("unnamed thread"));
+    let current = std::thread::current();
+    let test = current.name().ok_or_else(unnamed)?;
+    let log = std::fs::File::create(format!("../logs/{}/{test}.log", env!("CARGO_PKG_NAME")))?;
+
+    let subscriber = tracing_subscriber::fmt().with_level(true);
+    let subscriber = subscriber.with_line_number(true).with_thread_names(false);
+    let subscriber = subscriber.with_env_filter(filter);
+    let subscriber = subscriber.with_writer(std::sync::Arc::new(log));
+    Ok(tracing::subscriber::set_default(subscriber.finish()))
 }
 
+/// `BTreeMap::range` from a key not in the map starts at the next one, the
+/// lookup the offset index relies on.
 #[test]
-fn range_check() {
-    let map = BTreeMap::from([(3, "a"), (5, "b"), (8, "c")]);
-
-    assert_eq!(Some((&3, &"a")), map.range(2..).next());
-    assert_eq!(Some((&5, &"b")), map.range(4..).next());
-    assert_eq!(None, map.range(9..).next());
+fn a_range_from_an_absent_key_starts_at_the_next() {
+    let keyed = std::collections::BTreeMap::from([(3, "a"), (5, "b"), (8, "c")]);
+    let first_from = |start| keyed.range(start..).next();
+    let firsts = (first_from(2), first_from(4), first_from(9));
+    assert_eq!((Some((&3, &"a")), Some((&5, &"b")), None), firsts);
 }
 
+/// A bound as the stored JSON carried it before the map was added.
+type Bound = Option<i64>;
+
+/// Timestamps by offset: the field added after documents without it shipped.
+type Stamps = std::collections::BTreeMap<i64, i64>;
+
+/// JSON written without a since-added optional field still reads, with that
+/// field absent.
 #[test]
-fn schema_change() -> Result<()> {
-    #[derive(
-        Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-    )]
-    struct X0 {
-        low: Option<i64>,
-        high: Option<i64>,
+fn an_added_optional_field_reads_from_older_json() -> Result<()> {
+    #[derive(serde::Serialize)]
+    struct Before {
+        low: Bound,
+        high: Bound,
     }
 
-    let low = Some(6);
-    let high = Some(66);
-
-    let x0 = X0 { low, high };
-
-    let encoded = serde_json::to_string(&x0)?;
-
-    #[derive(
-        Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
-    )]
-    struct X1 {
-        low: Option<i64>,
-        high: Option<i64>,
-        timestamps: Option<BTreeMap<i64, i64>>,
+    #[derive(serde::Deserialize)]
+    struct After {
+        low: Bound,
+        high: Bound,
+        timestamps: Option<Stamps>,
     }
 
-    let x1: X1 = serde_json::from_str(&encoded[..])?;
-
-    assert_eq!(low, x1.low);
-    assert_eq!(high, x1.high);
-    assert!(x1.timestamps.is_none());
-
+    let (low, high) = (Some(6), Some(66));
+    let older = serde_json::to_string(&Before { low, high })?;
+    let read: After = serde_json::from_str(&older)?;
+    assert_eq!((low, high, None), (read.low, read.high, read.timestamps));
     Ok(())
 }
 
