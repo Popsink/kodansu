@@ -707,6 +707,12 @@ fmt:
 # versions and whether its parent requires it. It becomes one table-driven
 # test in `tests/message_meta.rs`. The ceiling rises because only code went:
 # the comment count did not move.
+#   defork  -264 lines, the sans-io malformed-input tests as tables  3087 -> 3036  2.7590 -> 2.7191
+#
+# `tansu-sans-io/tests/gap6.rs` was twenty-five one-assertion tests under
+# `// ====` section banners, each byte annotated with a narrating comment.
+# The same inputs are now four table-driven tests whose case labels say what
+# each input is, and the banners and narration go.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -717,7 +723,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7590" top="12":
+comments ceiling="2.7191" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
