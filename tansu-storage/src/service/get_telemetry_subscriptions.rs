@@ -12,52 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rama::{Context, Service};
-use tansu_sans_io::{
-    ApiKey, ErrorCode, GetTelemetrySubscriptionsRequest, GetTelemetrySubscriptionsResponse,
-};
-use tracing::instrument;
-use uuid::Uuid;
+use rama::Context;
+use rama::Service;
+use tansu_sans_io::{ApiKey, ErrorCode};
+use tansu_sans_io::{GetTelemetrySubscriptionsRequest, GetTelemetrySubscriptionsResponse};
 
-use crate::{Error, Result, Storage};
+use crate::Storage;
+use crate::{Error, Result};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`GetTelemetrySubscriptionsRequest`] returning [`GetTelemetrySubscriptionsResponse`].
-/// ```
-/// use rama::{Context, Layer as _, Service, layer::MapStateLayer};
-/// use tansu_sans_io::{ErrorCode, GetTelemetrySubscriptionsRequest};
-/// use tansu_storage::{Error, GetTelemetrySubscriptionsService, StorageContainer};
-/// use url::Url;
-///
-/// # #[tokio::main]
-/// # async fn main() -> Result<(), Error> {
-///
-/// const HOST: &str = "localhost";
-/// const PORT: i32 = 9092;
-/// const NODE_ID: i32 = 111;
-///
-/// let storage = StorageContainer::builder()
-///     .cluster_id("tansu")
-///     .node_id(NODE_ID)
-///     .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-///     .storage(Url::parse("memory://tansu/")?)
-///     .build()
-///     .await?;
-///
-/// let service = MapStateLayer::new(|_| storage).into_layer(GetTelemetrySubscriptionsService);
-///
-/// let client_instance_id = [0; 16];
-///
-/// let response = service
-///     .serve(
-///         Context::default(),
-///         GetTelemetrySubscriptionsRequest::default().client_instance_id(client_instance_id),
-///     )
-///     .await?;
-///
-/// assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
-/// # Ok(())
-/// # }
-/// ```
 /// The `ClientInstanceId` a client sends before it has been assigned one.
 ///
 /// It is only ever a *request* value. A response carrying it is rejected by the
@@ -91,6 +53,32 @@ const UNASSIGNED_CLIENT_INSTANCE_ID: [u8; 16] = [0; 16];
 /// the instruction is wrong.
 const NO_SUBSCRIPTION_PUSH_INTERVAL_MS: i32 = 300_000;
 
+/// Answers `GetTelemetrySubscriptions` with no subscription: a client
+/// instance id (the one asked with, or a fresh one in place of the unassigned
+/// zero), no metrics, and [`NO_SUBSCRIPTION_PUSH_INTERVAL_MS`] to come back in.
+/// ```
+/// use rama::layer::MapStateLayer;
+/// use rama::{Context, Layer as _, Service as _};
+/// use tansu_sans_io::ErrorCode;
+/// use tansu_sans_io::GetTelemetrySubscriptionsRequest;
+/// use tansu_storage::{GetTelemetrySubscriptionsService, StorageContainer};
+///
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> Result<(), tansu_storage::Error> {
+/// let listener = url::Url::parse("tcp://localhost:9092")?;
+/// let engine = StorageContainer::builder().cluster_id("tansu").node_id(111);
+/// let engine = engine.advertised_listener(listener);
+/// let engine = engine.storage(url::Url::parse("memory://tansu/")?).build().await?;
+/// let subscriptions =
+///     MapStateLayer::new(|_| engine).into_layer(GetTelemetrySubscriptionsService);
+///
+/// let unassigned = GetTelemetrySubscriptionsRequest::default().client_instance_id([0; 16]);
+/// let answered = subscriptions.serve(Context::default(), unassigned).await?;
+/// assert_eq!(ErrorCode::None, ErrorCode::try_from(answered.error_code)?);
+/// assert_ne!([0; 16], answered.client_instance_id);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct GetTelemetrySubscriptionsService;
 
@@ -105,14 +93,12 @@ where
     type Response = GetTelemetrySubscriptionsResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
+    #[tracing::instrument(skip(_state, request))]
     async fn serve(
         &self,
-        ctx: Context<G>,
-        req: GetTelemetrySubscriptionsRequest,
+        _state: Context<G>,
+        request: GetTelemetrySubscriptionsRequest,
     ) -> Result<Self::Response, Self::Error> {
-        let _ = ctx;
-
         // The request's field is documented "must be set to 0 on the first
         // request", so a non-zero one is the id this broker already handed out
         // and the client is identifying itself with it. Mint one only in the
@@ -133,24 +119,20 @@ where
         // Before that, this minted a fresh `Uuid::new_v4()` on *every* request,
         // so a client was told its instance id had changed each time it asked —
         // which is the one thing the field exists to prevent.
-        let client_instance_id = if req.client_instance_id == UNASSIGNED_CLIENT_INSTANCE_ID {
-            *Uuid::new_v4().as_bytes()
-        } else {
-            req.client_instance_id
-        };
+        let asked = request.client_instance_id;
+        let unassigned = asked == UNASSIGNED_CLIENT_INSTANCE_ID;
+        let minted = || *uuid::Uuid::new_v4().as_bytes();
+        let instance = if unassigned { minted() } else { asked };
 
-        Ok(GetTelemetrySubscriptionsResponse::default()
-            .throttle_time_ms(0)
-            .error_code(ErrorCode::None.into())
-            .client_instance_id(client_instance_id)
-            .subscription_id(0)
-            .accepted_compression_types(Some([0].into()))
-            .push_interval_ms(NO_SUBSCRIPTION_PUSH_INTERVAL_MS)
-            .telemetry_max_bytes(1_024)
-            .delta_temporality(false)
-            // "Empty array: No metrics subscribed." Nothing here configures a
-            // subscription, so this is the only answer, and it is why the
-            // interval above is a back-off rather than a push cadence.
-            .requested_metrics(Some([].into())))
+        let answer = GetTelemetrySubscriptionsResponse::default().throttle_time_ms(0);
+        let answer = answer.error_code(i16::from(ErrorCode::None));
+        let answer = answer.client_instance_id(instance).subscription_id(0);
+        let answer = answer.accepted_compression_types(Some(vec![0]));
+        let answer = answer.push_interval_ms(NO_SUBSCRIPTION_PUSH_INTERVAL_MS);
+        let answer = answer.telemetry_max_bytes(1_024).delta_temporality(false);
+        // "Empty array: No metrics subscribed." Nothing here configures a
+        // subscription, so this is the only answer, and it is why the
+        // interval above is a back-off rather than a push cadence (#410).
+        Ok(answer.requested_metrics(Some(vec![])))
     }
 }
