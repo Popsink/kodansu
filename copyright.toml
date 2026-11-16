@@ -114,7 +114,6 @@ inherited = [
     "tansu-sans-io/src/resource.rs",
     "tansu-sans-io/src/ser.rs",
     "tansu-sans-io/tests/golden.rs",
-    "tansu-sans-io/tests/snappy.rs",
     "tansu-service/src/api.rs",
     "tansu-service/src/channel.rs",
     "tansu-service/src/consumer.rs",
