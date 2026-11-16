@@ -713,6 +713,13 @@ fmt:
 # `// ====` section banners, each byte annotated with a narrating comment.
 # The same inputs are now four table-driven tests whose case labels say what
 # each input is, and the banners and narration go.
+#   defork  -132 lines, the sans-io round-trip properties on shared helpers  3036 -> 3005  2.7191 -> 2.6942
+#
+# `tansu-sans-io/tests/proptest.rs` checked each varint's round trip, zigzag
+# identity and reported size in separate properties under `// ----`
+# banners, and compared the batches field by field. The properties now share
+# `through_codec` and `through_serde`, keep their strategies and case counts,
+# and the banners and a commented-out assertion go.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -723,7 +730,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7191" top="12":
+comments ceiling="2.6942" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
