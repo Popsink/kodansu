@@ -829,6 +829,14 @@ fmt:
 # `Failed` in the three tests that raise it, its `Arc` conversions come from
 # one macro, and `init_tracing` is rebuilt in short `let` steps. The ceiling
 # rises because only code went: the comment count did not move.
+#   defork  -1367 lines, the snappy captures as hex behind one assertion  2926 -> 2926  2.6865 -> 2.7202
+#
+# `tansu-sans-io/tests/snappy.rs` wrote its three produce captures as decimal
+# byte tables, each followed by the same twenty lines of assertions. They are
+# hex constants of the same bytes behind `assert_one_record_of`, the 1 000
+# record case stays ignored, now saying why, and the cited #553 file-level
+# `too_many_lines` allow goes with the tables. The ceiling rises because only
+# code went: the comment count did not move.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -839,7 +847,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6865" top="12":
+comments ceiling="2.7202" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
