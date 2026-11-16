@@ -654,6 +654,12 @@ fmt:
 # credentials in a `memory://` engine and share a `Connection`. The ceiling
 # rises because the code went: two uncited lines left with it, and the cited
 # #551 note left with the stub it described.
+#   defork  -53 lines, the latency and DescribeCluster tests rewritten  3095 -> 3091  2.7443 -> 2.7420
+#
+# `tests/cg_latency.rs` and `tests/describe_cluster.rs` are rewritten on
+# `common::storage_container` and flat `use` lines. The uncited note above the
+# `LatencyIntroducingStorage` wrapper becomes a shorter one citing #111, and
+# the DescribeCluster `matches!` becomes one assertion per field.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -664,7 +670,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7443" top="12":
+comments ceiling="2.7420" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
