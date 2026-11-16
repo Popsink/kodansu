@@ -85,7 +85,6 @@ inherited = [
     "tansu-broker/tests/cg.rs",
     "tansu-broker/tests/cg_dynamic.rs",
     "tansu-broker/tests/common/mod.rs",
-    "tansu-broker/tests/fetch.rs",
     "tansu-broker/tests/list_offsets.rs",
     "tansu-broker/tests/metadata.rs",
     "tansu-broker/tests/policy_compact_delete.rs",
