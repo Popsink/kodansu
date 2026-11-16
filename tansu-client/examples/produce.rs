@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,97 +12,55 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use bytes::Bytes;
-use clap::Parser;
-use dotenv::dotenv;
-use tansu_client::{Client, ConnectionManager, Error};
-use tansu_sans_io::{
-    Ack, ProduceRequest,
-    produce_request::{PartitionProduceData, TopicProduceData},
-    record::{Record, deflated, inflated},
-};
-use tracing_subscriber::{
-    EnvFilter, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt,
-};
-use url::Url;
+//! Produces one record, with the key and value given, to a topic partition.
 
-type Result<T> = std::result::Result<T, Error>;
+use clap::Parser as _;
+use tansu_client::Error;
+use tansu_sans_io::produce_request::{PartitionProduceData, TopicProduceData};
+use tansu_sans_io::record::{Record, deflated, inflated};
+use tansu_sans_io::{Ack, ProduceRequest};
 
-#[derive(Clone, Debug, Parser)]
-#[command(
-    version,
-    about = "Produce",
-    long_about = None,
-)]
-struct Arg {
-    #[arg(long, default_value = "tcp://localhost:9092")]
-    broker: Url,
+mod common;
 
-    topic: String,
+/// Produce
+#[derive(Clone, Debug, clap::Parser)]
+#[command(version, long_about = None)]
+struct Options {
+    #[arg(long, default_value = common::BROKER)]
+    broker: url::Url,
 
-    #[arg(long, default_value = "0")]
-    partition: i32,
+    #[arg(id = "topic", value_name = "TOPIC")]
+    name: String,
 
-    #[arg(long)]
-    key: Option<String>,
+    #[arg(long = "partition", value_name = "PARTITION", default_value = "0")]
+    index: i32,
 
-    #[arg(long)]
-    value: Option<String>,
+    #[arg(long = "key", value_name = "KEY")]
+    record_key: Option<String>,
+
+    #[arg(long = "value", value_name = "VALUE")]
+    record_value: Option<String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    _ = dotenv().ok();
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<(), Error> {
+    common::start();
+    let options = Options::parse();
+    let client = common::connect(options.broker).await?;
 
-    tracing_subscriber::registry()
-        .with(EnvFilter::from_default_env())
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_level(true)
-                .with_line_number(true)
-                .with_thread_ids(false)
-                .with_span_events(FmtSpan::NONE),
-        )
-        .init();
+    let bytes = |text: String| bytes::Bytes::from(text.into_bytes());
+    let record = Record::builder().key(options.record_key.map(bytes));
+    let record = record.value(options.record_value.map(bytes));
+    let batches = vec![inflated::Batch::builder().record(record).build()?];
+    let records = deflated::Frame::try_from(inflated::Frame { batches })?;
 
-    let arg = Arg::parse();
-
-    let origin = ConnectionManager::builder(arg.broker)
-        .client_id(Some(env!("CARGO_PKG_NAME").into()))
-        .build()
-        .await
-        .map(Client::new)?;
-
-    let frame = inflated::Batch::builder()
-        .record(
-            Record::builder()
-                .key(arg.key.map(|key| Bytes::from(key.into_bytes())))
-                .value(arg.value.map(|value| Bytes::from(value.into_bytes()))),
-        )
-        .build()
-        .map(|batch| inflated::Frame {
-            batches: vec![batch],
-        })
-        .and_then(deflated::Frame::try_from)?;
-
-    origin
-        .call(
-            ProduceRequest::default()
-                .timeout_ms(5_000)
-                .acks(Ack::Leader.into())
-                .topic_data(Some(
-                    [TopicProduceData::default()
-                        .name(arg.topic)
-                        .partition_data(Some(
-                            [PartitionProduceData::default()
-                                .index(arg.partition)
-                                .records(Some(frame))]
-                            .into(),
-                        ))]
-                    .into(),
-                )),
-        )
-        .await
-        .inspect(|response| println!("{response:?}"))
-        .and(Ok(()))
+    let partition = PartitionProduceData::default().index(options.index);
+    let partition = partition.records(Some(records));
+    let topic = TopicProduceData::default().name(options.name);
+    let topic = topic.partition_data(Some(vec![partition]));
+    let request = ProduceRequest::default().timeout_ms(5_000);
+    let request = request.acks(Ack::Leader.into());
+    let response = client.call(request.topic_data(Some(vec![topic]))).await?;
+    println!("{response:?}");
+    Ok(())
 }
