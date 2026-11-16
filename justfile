@@ -792,6 +792,12 @@ fmt:
 # steps, the unused `offset_fetch` goes, and `JoinResponse` becomes a
 # `Joined` struct whose two users, `cg_dynamic` and `cg_static`, follow.
 # A commented-out `debug!` and a narrating comment go.
+#   defork  -194 lines, the sans-io API tests as round trips  2951 -> 2931  2.6921 -> 2.6777
+#
+# `tansu-sans-io/tests/api.rs` spelled out every wire value of every enum as
+# a named constant and its own assertion, under narrating comments
+# (`// compression round-trip`). One `round_trip` helper takes the values,
+# eleven tests take the nineteen, and the narration goes.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -802,7 +808,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6921" top="12":
+comments ceiling="2.6777" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
