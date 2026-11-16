@@ -814,6 +814,13 @@ fmt:
 # frames are hex constants of the same bytes, benched by name from one
 # table, and the cited #555 `too_many_lines` allow the tables needed goes.
 # The ceiling rises because only code went: the comment count did not move.
+#   defork  -19 lines, the dynostore test helpers rewritten  2926 -> 2926  2.6856 -> 2.6861
+#
+# `tansu-storage/src/dynostore/tests.rs` keeps every helper its test
+# modules share; `init_tracing` is rebuilt in short `let` steps, and its two
+# own tests, a `BTreeMap::range` check and a serde widening check, are
+# rewritten to assert the same. The ceiling rises because only code went:
+# the comment count did not move.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -824,7 +831,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6856" top="12":
+comments ceiling="2.6861" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
