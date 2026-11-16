@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,295 +17,161 @@
 // it; with the module gone it belongs to the file.
 #![cfg(feature = "dynostore")]
 
-use std::sync::Arc;
+//! Creating, describing and deleting topics straight on the storage engine,
+//! with and without a config, by id and by name.
 
-use common::{alphanumeric_string, register_broker};
-use tansu_broker::Result;
-use tansu_sans_io::{
-    ErrorCode, NULL_TOPIC_ID,
-    create_topics_request::{CreatableTopic, CreatableTopicConfig},
-};
-use tansu_storage::{Storage, TopicId};
-use tracing::debug;
-use uuid::Uuid;
+use rand::RngExt as _;
+use tansu_sans_io::create_topics_request::{CreatableTopic, CreatableTopicConfig};
+use tansu_sans_io::describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic;
+use tansu_sans_io::{ErrorCode, NULL_TOPIC_ID};
+use tansu_storage::TopicId;
 
-use common::init_tracing;
-use rand::{prelude::*, rng};
-use url::Url;
 pub mod common;
 
-async fn storage_container(cluster: impl Into<String>, node: i32) -> Result<Arc<dyn Storage>> {
-    common::storage_container(cluster, node, Url::parse("tcp://127.0.0.1/")?).await
+type Engine = std::sync::Arc<dyn tansu_storage::Storage>;
+
+const PARTITIONS: i32 = 6;
+
+/// The page size every describe here asks for, larger than any answer.
+const PARTITION_LIMIT: i32 = 32123;
+
+/// A `memory://` engine with one broker registered, and that broker's id.
+async fn registered() -> tansu_broker::Result<(Engine, i32)> {
+    let cluster = uuid::Uuid::now_v7();
+    let node = rand::rng().random_range(0..i32::MAX);
+    let listener = url::Url::parse("tcp://127.0.0.1/")?;
+    let engine = common::storage_container(cluster, node, listener).await?;
+    common::register_broker(cluster, node, engine.clone()).await?;
+    Ok((engine, node))
 }
 
-#[tokio::test]
-async fn create_delete() -> Result<()> {
-    let _guard = init_tracing()?;
-
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let sc = storage_container(cluster_id, broker_id).await?;
-
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let num_partitions = 6;
-    let replication_factor = 0;
-
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let topic_id = sc
-        .create_topic(
-            CreatableTopic::default()
-                .name(topic_name.clone())
-                .num_partitions(num_partitions)
-                .replication_factor(replication_factor)
-                .assignments(assignments.clone())
-                .configs(configs.clone()),
-            false,
-        )
-        .await?;
-    debug!(?topic_id);
-
-    assert_eq!(
-        ErrorCode::None,
-        sc.delete_topic(&TopicId::from(topic_id)).await?
-    );
-
-    Ok(())
+/// A topic with a random name, its six partitions held `replicas` times.
+fn topic(replicas: i16, configs: Vec<CreatableTopicConfig>) -> CreatableTopic {
+    let name = common::alphanumeric_string(15);
+    tracing::debug!(topic_name = ?name);
+    let topic = CreatableTopic::default()
+        .name(name)
+        .num_partitions(PARTITIONS);
+    let topic = topic.replication_factor(replicas).assignments(Some(vec![]));
+    topic.configs(Some(configs))
 }
 
-#[tokio::test]
-async fn create_describe_topic_partitions_by_id() -> Result<()> {
-    let _guard = init_tracing()?;
+async fn create(engine: &Engine, topic: CreatableTopic) -> tansu_broker::Result<uuid::Uuid> {
+    let creating = engine.create_topic(topic, false);
+    let id = creating.await?;
+    tracing::debug!(topic_id = ?id);
+    Ok(id)
+}
 
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let sc = storage_container(cluster_id, broker_id).await?;
-
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let num_partitions = 6;
-    let replication_factor = 3;
-
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let topic_id = sc
-        .create_topic(
-            CreatableTopic::default()
-                .name(topic_name.clone())
-                .num_partitions(num_partitions)
-                .replication_factor(replication_factor)
-                .assignments(assignments.clone())
-                .configs(configs.clone()),
-            false,
-        )
-        .await?;
-    debug!(?topic_id);
-
-    let responses = sc
-        .describe_topic_partitions(Some(&[topic_id.into()]), 32123, None)
-        .await
-        .inspect(|responses| debug!(?responses))?;
-
-    assert_eq!(1, responses.len());
-
+/// Asserts that `described` is `name`, uninternal and error-free, with six
+/// partitions led by `node` at epoch 0 and replicated on it `replicas` times.
+fn assert_described(
+    described: &DescribeTopicPartitionsResponseTopic,
+    name: &str,
+    (node, replicas): (i32, i16),
+) -> tansu_broker::Result<()> {
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(described.error_code)?);
     assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(responses[0].error_code)?
+        (Some(name), false),
+        (described.name.as_deref(), described.is_internal)
     );
-    assert_eq!(Some(topic_name), responses[0].name);
-    assert_eq!(topic_id.as_bytes(), &responses[0].topic_id);
-    assert!(!responses[0].is_internal);
-    assert_eq!(
-        num_partitions as usize,
-        responses[0]
-            .partitions
-            .as_ref()
-            .map(|partitions| partitions.len())
-            .unwrap_or_default()
-    );
+    let partitions = described.partitions.as_deref().unwrap_or_default();
+    assert_eq!(PARTITIONS as usize, partitions.len());
 
-    for partition in responses[0].partitions.as_deref().unwrap_or_default() {
-        assert_eq!(ErrorCode::None, ErrorCode::try_from(partition.error_code)?);
-        assert_eq!(broker_id, partition.leader_id);
-        assert_eq!(0, partition.leader_epoch);
-        assert_eq!(
-            Some(vec![broker_id; replication_factor as usize]),
-            partition.replica_nodes
-        );
-        assert_eq!(
-            Some(vec![broker_id; replication_factor as usize]),
-            partition.isr_nodes
-        );
-        assert_eq!(Some(vec![]), partition.eligible_leader_replicas);
-        assert_eq!(Some(vec![]), partition.last_known_elr);
-        assert_eq!(Some(vec![]), partition.offline_replicas);
+    let everywhere = Some(vec![node; replicas as usize]);
+    for partition in partitions {
+        let outcome = ErrorCode::try_from(partition.error_code)?;
+        assert_eq!(ErrorCode::None, outcome);
+        assert_eq!((node, 0), (partition.leader_id, partition.leader_epoch));
+        assert_eq!(everywhere, partition.replica_nodes);
+        assert_eq!(everywhere, partition.isr_nodes);
+        let none = Some(vec![]);
+        assert_eq!(none, partition.eligible_leader_replicas);
+        assert_eq!(none, partition.last_known_elr);
+        assert_eq!(none, partition.offline_replicas);
     }
-
     Ok(())
 }
 
 #[tokio::test]
-async fn create_describe_topic_partitions_by_name() -> Result<()> {
-    let _guard = init_tracing()?;
-
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let sc = storage_container(cluster_id, broker_id).await?;
-
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let num_partitions = 6;
-    let replication_factor = 3;
-
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let topic_id = sc
-        .create_topic(
-            CreatableTopic::default()
-                .name(topic_name.clone())
-                .num_partitions(num_partitions)
-                .replication_factor(replication_factor)
-                .assignments(assignments.clone())
-                .configs(configs.clone()),
-            false,
-        )
-        .await?;
-    debug!(?topic_id);
-
-    let responses = sc
-        .describe_topic_partitions(Some(&[topic_name.clone().into()]), 32123, None)
-        .await?;
-
-    assert_eq!(1, responses.len());
-
-    assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(responses[0].error_code)?
-    );
-    assert_eq!(Some(topic_name), responses[0].name);
-    // assert_eq!(topic_id.as_bytes(), &responses[0].topic_id);
-    assert!(!responses[0].is_internal);
-    assert_eq!(
-        num_partitions as usize,
-        responses[0]
-            .partitions
-            .as_ref()
-            .map(|partitions| partitions.len())
-            .unwrap_or_default()
-    );
-
-    for partition in responses[0].partitions.as_deref().unwrap_or_default() {
-        assert_eq!(ErrorCode::None, ErrorCode::try_from(partition.error_code)?);
-        assert_eq!(broker_id, partition.leader_id);
-        assert_eq!(0, partition.leader_epoch);
-        assert_eq!(
-            Some(vec![broker_id; replication_factor as usize]),
-            partition.replica_nodes
-        );
-        assert_eq!(
-            Some(vec![broker_id; replication_factor as usize]),
-            partition.isr_nodes
-        );
-        assert_eq!(Some(vec![]), partition.eligible_leader_replicas);
-        assert_eq!(Some(vec![]), partition.last_known_elr);
-        assert_eq!(Some(vec![]), partition.offline_replicas);
-    }
-
+async fn a_created_topic_deletes() -> tansu_broker::Result<()> {
+    let _guard = common::init_tracing()?;
+    let (engine, _) = registered().await?;
+    let id = create(&engine, topic(0, vec![])).await?;
+    let created = TopicId::from(id);
+    let deleting = engine.delete_topic(&created);
+    assert_eq!(ErrorCode::None, deleting.await?);
     Ok(())
 }
 
 #[tokio::test]
-async fn describe_non_existing_topic_partitions_by_name() -> Result<()> {
-    let _guard = init_tracing()?;
+async fn a_created_topic_describes_by_id() -> tansu_broker::Result<()> {
+    let _guard = common::init_tracing()?;
+    let (engine, node) = registered().await?;
+    let created = topic(3, vec![]);
+    let name = created.name.clone();
+    let id = create(&engine, created).await?;
 
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let sc = storage_container(cluster_id, broker_id).await?;
+    let wanted = [TopicId::from(id)];
+    let describing = engine.describe_topic_partitions(Some(&wanted), PARTITION_LIMIT, None);
+    let described = describing.await?;
+    tracing::debug!(responses = ?described);
 
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let responses = sc
-        .describe_topic_partitions(Some(&[topic_name.clone().into()]), 32123, None)
-        .await?;
-
-    assert_eq!(1, responses.len());
-
-    assert_eq!(
-        ErrorCode::UnknownTopicOrPartition,
-        ErrorCode::try_from(responses[0].error_code)?
-    );
-    assert_eq!(Some(topic_name), responses[0].name);
-    assert_eq!(&NULL_TOPIC_ID, &responses[0].topic_id);
-    assert!(!responses[0].is_internal);
-    assert_eq!(
-        0,
-        responses[0]
-            .partitions
-            .as_ref()
-            .map(|partitions| partitions.len())
-            .unwrap_or_default()
-    );
-
+    assert_eq!(1, described.len());
+    assert_described(&described[0], &name, (node, 3))?;
+    assert_eq!(id.as_bytes(), &described[0].topic_id);
     Ok(())
 }
 
 #[tokio::test]
-async fn create_with_config_delete() -> Result<()> {
-    let _guard = init_tracing()?;
+async fn a_created_topic_describes_by_name() -> tansu_broker::Result<()> {
+    let _guard = common::init_tracing()?;
+    let (engine, node) = registered().await?;
+    let created = topic(3, vec![]);
+    let name = created.name.clone();
+    let _id = create(&engine, created).await?;
 
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let sc = storage_container(cluster_id, broker_id).await?;
+    let wanted = [TopicId::from(name.clone())];
+    let describing = engine.describe_topic_partitions(Some(&wanted), PARTITION_LIMIT, None);
+    let described = describing.await?;
 
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
+    assert_eq!(1, described.len());
+    assert_described(&described[0], &name, (node, 3))
+}
 
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
+#[tokio::test]
+async fn an_unknown_topic_describes_as_unknown() -> tansu_broker::Result<()> {
+    let _guard = common::init_tracing()?;
+    let (engine, _) = registered().await?;
+    let name = common::alphanumeric_string(15);
+    tracing::debug!(topic_name = ?name);
 
-    let num_partitions = 6;
-    let replication_factor = 0;
+    let wanted = [TopicId::from(name.clone())];
+    let describing = engine.describe_topic_partitions(Some(&wanted), PARTITION_LIMIT, None);
+    let described = describing.await?;
 
-    let assignments = Some([].into());
-    let configs = Some(
-        [CreatableTopicConfig::default()
-            .name("xyz".into())
-            .value(Some("12321".into()))]
-        .into(),
-    );
-
-    let topic_id = sc
-        .create_topic(
-            CreatableTopic::default()
-                .name(topic_name.clone())
-                .num_partitions(num_partitions)
-                .replication_factor(replication_factor)
-                .assignments(assignments.clone())
-                .configs(configs.clone()),
-            false,
-        )
-        .await?;
-    debug!(?topic_id);
-
+    assert_eq!(1, described.len());
+    let unknown = &described[0];
+    let outcome = ErrorCode::try_from(unknown.error_code)?;
+    assert_eq!(ErrorCode::UnknownTopicOrPartition, outcome);
     assert_eq!(
-        ErrorCode::None,
-        sc.delete_topic(&TopicId::from(topic_id)).await?
+        (Some(name.as_str()), false),
+        (unknown.name.as_deref(), unknown.is_internal)
     );
+    assert_eq!(&NULL_TOPIC_ID, &unknown.topic_id);
+    assert_eq!(0, unknown.partitions.as_ref().map_or(0, Vec::len));
+    Ok(())
+}
 
+#[tokio::test]
+async fn a_topic_created_with_a_config_deletes() -> tansu_broker::Result<()> {
+    let _guard = common::init_tracing()?;
+    let (engine, _) = registered().await?;
+    let config = CreatableTopicConfig::default().name("xyz".into());
+    let config = config.value(Some("12321".into()));
+    let id = create(&engine, topic(0, vec![config])).await?;
+    let created = TopicId::from(id);
+    let deleting = engine.delete_topic(&created);
+    assert_eq!(ErrorCode::None, deleting.await?);
     Ok(())
 }

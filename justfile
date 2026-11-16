@@ -720,6 +720,13 @@ fmt:
 # banners, and compared the batches field by field. The properties now share
 # `through_codec` and `through_serde`, keep their strategies and case counts,
 # and the banners and a commented-out assertion go.
+#   defork  -135 lines, the topic storage tests on shared helpers  3005 -> 3004  2.6942 -> 2.6959
+#
+# `tansu-broker/tests/topic.rs` registered a broker, built a topic and
+# checked every partition of a description inline in each of five tests.
+# `registered`, `topic`, `create` and `assert_described` carry them, and a
+# commented-out assertion goes. The ceiling rises because code went faster
+# than comments: one line of each kind for every hundred and thirty-five.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -730,7 +737,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6942" top="12":
+comments ceiling="2.6959" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
