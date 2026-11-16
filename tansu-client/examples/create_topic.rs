@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,78 +12,52 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use clap::Parser;
-use dotenv::dotenv;
-use tansu_client::{Client, ConnectionManager, Error};
-use tansu_sans_io::{CreateTopicsRequest, create_topics_request::CreatableTopic};
-use tracing_subscriber::{
-    EnvFilter, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt,
-};
-use url::Url;
+//! Creates a topic with the partitions and replication factor given.
 
-type Result<T> = std::result::Result<T, Error>;
+use clap::Parser as _;
+use tansu_client::Error;
+use tansu_sans_io::CreateTopicsRequest;
+use tansu_sans_io::create_topics_request::CreatableTopic;
 
-#[derive(Clone, Debug, Parser)]
-#[command(
-    version,
-    about = "Create Topic",
-    long_about = None,
-)]
-struct Arg {
-    #[arg(long, default_value = "tcp://localhost:9092")]
-    broker: Url,
+mod common;
 
-    topic: String,
+/// Create Topic
+#[derive(Clone, Debug, clap::Parser)]
+#[command(version, long_about = None)]
+struct Options {
+    #[arg(long, default_value = common::BROKER)]
+    broker: url::Url,
 
-    #[arg(long, default_value = "3")]
-    num_partitions: i32,
+    #[arg(id = "topic", value_name = "TOPIC")]
+    name: String,
 
-    #[arg(long, default_value = "1")]
-    replication_factor: i16,
+    #[arg(long = "num-partitions", value_name = "NUM_PARTITIONS")]
+    #[arg(default_value = "3")]
+    partitions: i32,
 
-    #[arg(long, default_value = "5000")]
-    timeout: i32,
+    #[arg(long = "replication-factor", value_name = "REPLICATION_FACTOR")]
+    #[arg(default_value = "1")]
+    replicas: i16,
+
+    #[arg(long = "timeout", value_name = "TIMEOUT", default_value = "5000")]
+    timeout_ms: i32,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    _ = dotenv().ok();
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<(), Error> {
+    common::start();
+    let options = Options::parse();
+    let client = common::connect(options.broker).await?;
 
-    tracing_subscriber::registry()
-        .with(EnvFilter::from_default_env())
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_level(true)
-                .with_line_number(true)
-                .with_thread_ids(false)
-                .with_span_events(FmtSpan::NONE),
-        )
-        .init();
-
-    let arg = Arg::parse();
-
-    let origin = ConnectionManager::builder(arg.broker)
-        .client_id(Some(env!("CARGO_PKG_NAME").into()))
-        .build()
-        .await
-        .map(Client::new)?;
-
-    origin
-        .call(
-            CreateTopicsRequest::default()
-                .timeout_ms(arg.timeout)
-                .validate_only(Some(false))
-                .topics(Some(
-                    [CreatableTopic::default()
-                        .num_partitions(arg.num_partitions)
-                        .configs(Some([].into()))
-                        .assignments(Some([].into()))
-                        .replication_factor(arg.replication_factor)
-                        .name(arg.topic)]
-                    .into(),
-                )),
-        )
-        .await
-        .inspect(|response| println!("{response:?}"))
-        .and(Ok(()))
+    let topic = CreatableTopic::default().name(options.name);
+    let topic = topic.num_partitions(options.partitions);
+    let topic = topic.replication_factor(options.replicas);
+    let topic = topic.configs(Some(vec![])).assignments(Some(vec![]));
+    let request = CreateTopicsRequest::default().topics(Some(vec![topic]));
+    let request = request
+        .timeout_ms(options.timeout_ms)
+        .validate_only(Some(false));
+    let response = client.call(request).await?;
+    println!("{response:?}");
+    Ok(())
 }

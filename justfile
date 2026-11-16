@@ -673,6 +673,13 @@ fmt:
 # `tests/message_meta.rs` holds the six tests over `message`, `field`,
 # `structure_names` and `sequence_of`. The ceiling rises because only code
 # went: the comment count did not move.
+#   defork  -144 lines, the request examples on a shared module  3091 -> 3091  2.7480 -> 2.7519
+#
+# `tansu-client`'s metadata, create_topic, produce, fetch and list_offsets
+# examples each set up the same subscriber and client and built the same
+# `Metadata` request. `examples/common/mod.rs` holds those, and each example
+# builds its request in short `let` steps. The ceiling rises because only
+# code went: the comment count did not move.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -683,7 +690,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7480" top="12":
+comments ceiling="2.7519" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

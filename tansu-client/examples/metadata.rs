@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,71 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use clap::Parser;
-use dotenv::dotenv;
-use tansu_client::{Client, ConnectionManager, Error};
-use tansu_sans_io::{MetadataRequest, NULL_TOPIC_ID, metadata_request::MetadataRequestTopic};
-use tracing_subscriber::{
-    EnvFilter, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt,
-};
-use url::Url;
+//! Prints the broker's `Metadata` for the topics named, or for all of them.
 
-type Result<T> = std::result::Result<T, Error>;
+use clap::Parser as _;
+use tansu_client::Error;
 
-#[derive(Clone, Debug, Parser)]
-#[command(
-    version,
-    about = "Metadata",
-    long_about = None,
-)]
-struct Arg {
-    #[arg(long, default_value = "tcp://localhost:9092")]
-    broker: Url,
+mod common;
 
-    topics: Option<Vec<String>>,
+/// Metadata
+#[derive(Clone, Debug, clap::Parser)]
+#[command(version, long_about = None)]
+struct Options {
+    #[arg(long, default_value = common::BROKER)]
+    broker: url::Url,
+
+    #[arg(id = "topics", value_name = "TOPICS")]
+    names: Option<Vec<String>>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    _ = dotenv().ok();
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<(), Error> {
+    common::start();
+    let options = Options::parse();
+    let client = common::connect(options.broker).await?;
 
-    tracing_subscriber::registry()
-        .with(EnvFilter::from_default_env())
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_level(true)
-                .with_line_number(true)
-                .with_thread_ids(false)
-                .with_span_events(FmtSpan::NONE),
-        )
-        .init();
-
-    let arg = Arg::parse();
-
-    let origin = ConnectionManager::builder(arg.broker)
-        .client_id(Some(env!("CARGO_PKG_NAME").into()))
-        .build()
-        .await
-        .map(Client::new)?;
-
-    origin
-        .call(
-            MetadataRequest::default()
-                .allow_auto_topic_creation(Some(false))
-                .include_cluster_authorized_operations(Some(false))
-                .include_topic_authorized_operations(Some(false))
-                .topics(arg.topics.map(|topics| {
-                    topics
-                        .into_iter()
-                        .map(|topic| {
-                            MetadataRequestTopic::default()
-                                .name(Some(topic))
-                                .topic_id(Some(NULL_TOPIC_ID))
-                        })
-                        .collect::<Vec<_>>()
-                })),
-        )
-        .await
-        .inspect(|response| println!("{response:?}"))
-        .and(Ok(()))
+    let topics = options
+        .names
+        .map(|names| names.into_iter().map(common::named).collect());
+    let response = client.call(common::metadata(topics)).await?;
+    println!("{response:?}");
+    Ok(())
 }

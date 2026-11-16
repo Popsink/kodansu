@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,138 +12,89 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use clap::Parser;
-use dotenv::dotenv;
-use tansu_client::{Client, ConnectionManager, Error};
-use tansu_sans_io::{
-    FetchRequest, MetadataRequest, NULL_TOPIC_ID,
-    fetch_request::{FetchPartition, FetchTopic},
-    metadata_request::MetadataRequestTopic,
-};
-use tracing_subscriber::{
-    EnvFilter, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt,
-};
-use url::Url;
+//! Fetches from one topic partition, from the offset given.
 
-type Result<T> = std::result::Result<T, Error>;
+use clap::Parser as _;
+use tansu_client::Error;
+use tansu_sans_io::FetchRequest;
+use tansu_sans_io::fetch_request::{FetchPartition, FetchTopic};
 
-#[derive(Clone, Debug, Parser)]
-#[command(
-    version,
-    about = "Fetch",
-    long_about = None,
-)]
-struct Arg {
-    /// The URL of the broker to fetch messages from
-    #[arg(long, default_value = "tcp://localhost:9092")]
-    broker: Url,
+mod common;
 
-    /// The topic to fetch messages from
-    topic: String,
+/// Fetch
+#[derive(Clone, Debug, clap::Parser)]
+#[command(version, long_about = None)]
+struct Options {
+    #[arg(long, default_value = common::BROKER)]
+    #[arg(help = "The URL of the broker to fetch messages from")]
+    broker: url::Url,
 
-    /// The partition to fetch messages from
-    #[arg(long, default_value = "0")]
-    partition: i32,
+    #[arg(id = "topic", value_name = "TOPIC")]
+    #[arg(help = "The topic to fetch messages from")]
+    name: String,
 
-    /// The maximum time in milliseconds to wait for a message
-    #[arg(long, default_value = "5000")]
-    max_wait_time_ms: i32,
+    #[arg(long = "partition", value_name = "PARTITION", default_value = "0")]
+    #[arg(help = "The partition to fetch messages from")]
+    index: i32,
 
-    /// The minimum number of bytes to wait for
-    #[arg(long, default_value = "1")]
-    min_bytes: i32,
+    #[arg(long = "max-wait-time-ms", value_name = "MAX_WAIT_TIME_MS")]
+    #[arg(help = "The maximum time in milliseconds to wait for a message")]
+    #[arg(default_value = "5000")]
+    wait_ms: i32,
 
-    /// The maximum bytes to wait for
-    #[arg(long, default_value = "52428800")]
-    max_bytes: Option<i32>,
+    #[arg(long = "min-bytes", value_name = "MIN_BYTES", default_value = "1")]
+    #[arg(help = "The minimum number of bytes to wait for")]
+    least: i32,
 
-    /// The fetch offset to start from
-    #[arg(long, default_value = "0")]
-    fetch_offset: i64,
+    #[arg(
+        long = "max-bytes",
+        value_name = "MAX_BYTES",
+        default_value = "52428800"
+    )]
+    #[arg(help = "The maximum bytes to wait for")]
+    most: Option<i32>,
 
-    /// The partition to consume from
-    #[arg(long, default_value = "1048576")]
-    partition_max_bytes: i32,
+    #[arg(
+        long = "fetch-offset",
+        value_name = "FETCH_OFFSET",
+        default_value = "0"
+    )]
+    #[arg(help = "The fetch offset to start from")]
+    from: i64,
+
+    #[arg(long = "partition-max-bytes", value_name = "PARTITION_MAX_BYTES")]
+    #[arg(help = "The partition to consume from", default_value = "1048576")]
+    partition_limit: i32,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    _ = dotenv().ok();
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<(), Error> {
+    common::start();
+    let options = Options::parse();
+    let client = common::connect(options.broker).await?;
 
-    tracing_subscriber::registry()
-        .with(EnvFilter::from_default_env())
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_level(true)
-                .with_line_number(true)
-                .with_thread_ids(false)
-                .with_span_events(FmtSpan::NONE),
-        )
-        .init();
+    let lookup = common::metadata(Some(vec![common::named(options.name.clone())]));
+    let topics = client.call(lookup).await?.topics.unwrap_or_default();
+    let wanted = common::called(&topics, &options.name).next();
+    let topic_id = wanted.and_then(|topic| topic.topic_id).expect("topic id");
 
-    let arg = Arg::parse();
+    let partition = FetchPartition::default().partition(options.index);
+    let partition = partition.fetch_offset(options.from);
+    let partition = partition.current_leader_epoch(Some(0));
+    let partition = partition.log_start_offset(Some(-1));
+    let partition = partition.last_fetched_epoch(Some(-1));
+    let partition = partition.partition_max_bytes(options.partition_limit);
+    let partition = partition.replica_directory_id(None);
+    let topic = FetchTopic::default().topic(None).topic_id(Some(topic_id));
+    let topic = topic.partitions(Some(vec![partition]));
 
-    let origin = ConnectionManager::builder(arg.broker)
-        .client_id(Some(env!("CARGO_PKG_NAME").into()))
-        .build()
-        .await
-        .map(Client::new)?;
-
-    let metadata = origin
-        .call(
-            MetadataRequest::default()
-                .allow_auto_topic_creation(Some(false))
-                .include_cluster_authorized_operations(Some(false))
-                .include_topic_authorized_operations(Some(false))
-                .topics(Some(
-                    [MetadataRequestTopic::default()
-                        .name(Some(arg.topic.clone()))
-                        .topic_id(Some(NULL_TOPIC_ID))]
-                    .into(),
-                )),
-        )
-        .await?;
-
-    let topic_id = metadata
-        .topics
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .find(|topic| topic.name.as_deref().is_some_and(|name| name == arg.topic))
-        .and_then(|topic| topic.topic_id)
-        .expect("topic id");
-
-    origin
-        .call(
-            FetchRequest::default()
-                .cluster_id(None)
-                .replica_id(None)
-                .replica_state(None)
-                .max_wait_ms(arg.max_wait_time_ms)
-                .min_bytes(arg.min_bytes)
-                .max_bytes(arg.max_bytes)
-                .isolation_level(Some(0))
-                .session_id(Some(-1))
-                .session_epoch(Some(-1))
-                .topics(Some(vec![
-                    FetchTopic::default()
-                        .topic(None)
-                        .topic_id(Some(topic_id))
-                        .partitions(Some(vec![
-                            FetchPartition::default()
-                                .partition(arg.partition)
-                                .current_leader_epoch(Some(0))
-                                .fetch_offset(arg.fetch_offset)
-                                .last_fetched_epoch(Some(-1))
-                                .log_start_offset(Some(-1))
-                                .partition_max_bytes(arg.partition_max_bytes)
-                                .replica_directory_id(None),
-                        ])),
-                ]))
-                .forgotten_topics_data(Some([].into()))
-                .rack_id(Some("".into())),
-        )
-        .await
-        .inspect(|response| println!("{response:?}"))
-        .and(Ok(()))
+    let request = FetchRequest::default().cluster_id(None).replica_id(None);
+    let request = request.replica_state(None).max_wait_ms(options.wait_ms);
+    let request = request.min_bytes(options.least).max_bytes(options.most);
+    let request = request.isolation_level(Some(0)).session_id(Some(-1));
+    let request = request.session_epoch(Some(-1)).topics(Some(vec![topic]));
+    let request = request.forgotten_topics_data(Some(vec![]));
+    let response = client.call(request.rack_id(Some(String::new()))).await?;
+    println!("{response:?}");
+    Ok(())
 }

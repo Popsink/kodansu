@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,170 +12,112 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use clap::{Parser, ValueEnum};
-use dotenv::dotenv;
-use tansu_client::{Client, ConnectionManager, Error};
-use tansu_sans_io::{
-    IsolationLevel, ListOffset, ListOffsetsRequest, MetadataRequest, NULL_TOPIC_ID,
-    list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
-    metadata_request::MetadataRequestTopic,
-};
-use tracing_subscriber::{
-    EnvFilter, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt,
-};
-use url::Url;
+//! Lists the earliest or latest offset of every partition of a topic.
 
-type Result<T> = std::result::Result<T, Error>;
+use clap::Parser as _;
+use tansu_client::Error;
+use tansu_sans_io::list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic};
+use tansu_sans_io::metadata_response::MetadataResponseTopic;
+use tansu_sans_io::{IsolationLevel, ListOffset, ListOffsetsRequest};
 
-#[derive(Clone, Debug, Parser)]
-#[command(
-    version,
-    about = "List Offsets",
-    long_about = None,
-)]
-struct Arg {
-    #[arg(long, default_value = "tcp://localhost:9092")]
-    broker: Url,
+mod common;
 
-    topic: String,
+/// List Offsets
+#[derive(Clone, Debug, clap::Parser)]
+#[command(version, long_about = None)]
+struct Options {
+    #[arg(long, default_value = common::BROKER)]
+    broker: url::Url,
 
-    #[arg(long, default_value = "read-uncommitted")]
-    isolation: Isolation,
+    #[arg(id = "topic", value_name = "TOPIC")]
+    name: String,
 
-    #[arg(long, default_value = "earliest")]
-    offset: Offset,
+    #[arg(long = "isolation", value_name = "ISOLATION")]
+    #[arg(default_value = "read-uncommitted")]
+    level: Level,
 
-    #[arg(long, default_value = "-1")]
-    replica_id: i32,
+    #[arg(long = "offset", value_name = "OFFSET", default_value = "earliest")]
+    from: Start,
 
-    #[arg(long)]
-    max_num_offsets: Option<i32>,
+    #[arg(long = "replica-id", value_name = "REPLICA_ID", default_value = "-1")]
+    replica: i32,
 
-    #[arg(long, default_value = "-1")]
-    current_leader_epoch: i32,
+    #[arg(long = "max-num-offsets", value_name = "MAX_NUM_OFFSETS")]
+    most: Option<i32>,
+
+    #[arg(long = "current-leader-epoch", value_name = "CURRENT_LEADER_EPOCH")]
+    #[arg(default_value = "-1")]
+    leader_epoch: i32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, ValueEnum)]
-enum Isolation {
-    ReadUncommitted,
-    ReadCommitted,
+/// `--isolation`: whether offsets past the last stable one are listed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
+enum Level {
+    #[value(name = "read-uncommitted")]
+    Uncommitted,
+    #[value(name = "read-committed")]
+    Committed,
 }
 
-impl From<Isolation> for Option<i8> {
-    fn from(value: Isolation) -> Self {
-        match value {
-            Isolation::ReadCommitted => Some(IsolationLevel::ReadCommitted.into()),
-            Isolation::ReadUncommitted => Some(IsolationLevel::ReadUncommitted.into()),
+impl Level {
+    fn isolation(self) -> IsolationLevel {
+        match self {
+            Self::Uncommitted => IsolationLevel::ReadUncommitted,
+            Self::Committed => IsolationLevel::ReadCommitted,
         }
     }
 }
 
-impl From<Isolation> for IsolationLevel {
-    fn from(value: Isolation) -> Self {
-        match value {
-            Isolation::ReadCommitted => Self::ReadCommitted,
-            Isolation::ReadUncommitted => Self::ReadUncommitted,
-        }
+/// `--offset`: which end of each partition to list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, clap::ValueEnum)]
+enum Start {
+    #[value(name = "earliest")]
+    First,
+    #[value(name = "latest")]
+    Last,
+}
+
+impl Start {
+    /// The sentinel timestamp `ListOffsets` reads as this end.
+    fn timestamp(self) -> Result<i64, Error> {
+        let end = match self {
+            Self::First => ListOffset::Earliest,
+            Self::Last => ListOffset::Latest,
+        };
+        i64::try_from(end).map_err(Into::into)
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, ValueEnum)]
-enum Offset {
-    Earliest,
-    Latest,
-}
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<(), Error> {
+    common::start();
+    let options = Options::parse();
+    let client = common::connect(options.broker).await?;
 
-impl TryFrom<Offset> for i64 {
-    type Error = Error;
+    let lookup = common::metadata(Some(vec![common::named(options.name.clone())]));
+    let topics = client.call(lookup).await?.topics.unwrap_or_default();
+    let max_index = |t: &MetadataResponseTopic| {
+        let partitions = t.partitions.as_deref()?;
+        partitions.iter().map(|p| p.partition_index).max()
+    };
+    let highest = common::called(&topics, &options.name).find_map(max_index);
+    let highest = highest.expect("topic not found in metadata");
+    let timestamp = options.from.timestamp()?;
 
-    fn try_from(value: Offset) -> std::result::Result<Self, Self::Error> {
-        match value {
-            Offset::Earliest => i64::try_from(ListOffset::Earliest).map_err(Into::into),
-            Offset::Latest => i64::try_from(ListOffset::Latest).map_err(Into::into),
-        }
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<()> {
-    _ = dotenv().ok();
-
-    tracing_subscriber::registry()
-        .with(EnvFilter::from_default_env())
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_level(true)
-                .with_line_number(true)
-                .with_thread_ids(false)
-                .with_span_events(FmtSpan::NONE),
-        )
-        .init();
-
-    let arg = Arg::parse();
-
-    let origin = ConnectionManager::builder(arg.broker)
-        .client_id(Some(env!("CARGO_PKG_NAME").into()))
-        .build()
-        .await
-        .map(Client::new)?;
-
-    let metadata = origin
-        .call(
-            MetadataRequest::default()
-                .allow_auto_topic_creation(Some(false))
-                .include_cluster_authorized_operations(Some(false))
-                .include_topic_authorized_operations(Some(false))
-                .topics(Some(
-                    [MetadataRequestTopic::default()
-                        .name(Some(arg.topic.clone()))
-                        .topic_id(Some(NULL_TOPIC_ID))]
-                    .into(),
-                )),
-        )
-        .await?;
-
-    let partitions = metadata
-        .topics
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .find_map(|topic| {
-            if topic.name.as_deref().is_some_and(|name| name == arg.topic) {
-                topic.partitions.as_deref().and_then(|partitions| {
-                    partitions
-                        .iter()
-                        .map(|partition| partition.partition_index)
-                        .max()
-                })
-            } else {
-                None
-            }
-        })
-        .expect("topic not found in metadata");
-
-    let timestamp = arg.offset.try_into()?;
-
-    origin
-        .call(
-            ListOffsetsRequest::default()
-                .isolation_level(arg.isolation.into())
-                .replica_id(arg.replica_id)
-                .topics(Some(
-                    [ListOffsetsTopic::default().name(arg.topic).partitions(Some(
-                        (0..partitions)
-                            .map(|partition_index| {
-                                ListOffsetsPartition::default()
-                                    .partition_index(partition_index)
-                                    .max_num_offsets(arg.max_num_offsets)
-                                    .timestamp(timestamp)
-                                    .current_leader_epoch(Some(arg.current_leader_epoch))
-                            })
-                            .collect::<Vec<_>>(),
-                    ))]
-                    .into(),
-                )),
-        )
-        .await
-        .inspect(|response| println!("{response:?}"))
-        .and(Ok(()))
+    let partition = |index| {
+        let partition = ListOffsetsPartition::default().partition_index(index);
+        let partition = partition.max_num_offsets(options.most).timestamp(timestamp);
+        partition.current_leader_epoch(Some(options.leader_epoch))
+    };
+    let partitions = (0..highest).map(partition).collect();
+    let topic = ListOffsetsTopic::default().name(options.name);
+    let topic = topic.partitions(Some(partitions));
+    let isolation = Some(options.level.isolation().into());
+    let request = ListOffsetsRequest::default().isolation_level(isolation);
+    let request = request
+        .replica_id(options.replica)
+        .topics(Some(vec![topic]));
+    let response = client.call(request).await?;
+    println!("{response:?}");
+    Ok(())
 }
