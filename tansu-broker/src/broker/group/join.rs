@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -46,20 +46,20 @@ group_service! {
             return Ok(respond(correlation_id, refused(ErrorCode::GroupAuthorizationFailed)));
         }
 
-        let joined = ctx
-            .state_mut()
-            .join(
-                client_id.as_deref(),
-                &group_id,
-                session_timeout_ms,
-                rebalance_timeout_ms,
-                &member_id,
-                group_instance_id.as_deref(),
-                &protocol_type,
-                protocols.as_deref(),
-                reason.as_deref(),
-            )
-            .await;
+        let client = client_id.as_deref();
+        let coordinator = ctx.state_mut();
+        let joining = coordinator.join(
+            client,
+            &group_id,
+            session_timeout_ms,
+            rebalance_timeout_ms,
+            &member_id,
+            group_instance_id.as_deref(),
+            &protocol_type,
+            protocols.as_deref(),
+            reason.as_deref(),
+        );
+        let joined = joining.await;
         answered(joined, refused).map(|body| respond(correlation_id, body))
     }
 }

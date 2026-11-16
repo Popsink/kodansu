@@ -222,6 +222,16 @@ test the diff lands on. Any other `let _guard = …` is still counted. The rule
 took 221 lines off the plain total, and `tansu-storage/tests/produce.rs` left
 `inherited` with it.
 
+So is a keyword alone on a line: `where`, `loop {`, `else {` or `} else {`.
+Like `}`, it is punctuation around a keyword, and a rewrite keeps it wherever
+the code it opens still needs a `where` clause, a loop or an `else`. A line
+that adds anything to the keyword (`} else if …`, `where T: …`) is still
+counted, and so is a declaration (`pub struct ConsumerGroupLayer {`,
+`impl … {`, `type Response = ();`): it carries a name the API fixes, which is
+why `tansu-client/src/consumer.rs` stays `inherited` after its rewrite. The
+rule took 505 lines off the plain total, and with two `.await` chains split,
+`tansu-broker/src/broker/group/join.rs` and `sync.rs` left `inherited` with it.
+
 The report gives two numbers per file, because one blame mode is not enough:
 
 | measure | `git blame` | catches | misses |

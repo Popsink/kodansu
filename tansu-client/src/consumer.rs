@@ -13,122 +13,132 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    fmt,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
-};
+//! A consumer group member as a [`rama`] service: a [`GroupConsumer`] picks
+//! each request, and the inner frame service carries it to the broker.
 
-use rama::{Context, Layer, Service};
-use tansu_sans_io::{
-    Frame, Header, MetadataResponse, RootMessageMeta,
-    consumer::{GroupConsumer, MemberAssignment},
-};
-use tracing::debug;
+use std::fmt;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-#[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+use rama::Context;
+use tansu_sans_io::consumer::{DynConsumerAssignment, GroupConsumer};
+use tansu_sans_io::{Body, Frame, Header, MetadataResponse, RootMessageMeta};
+
+/// What a request frame carries in `size` and `correlation_id` when it leaves
+/// here. The layers below fill both in: [`FrameConnectionService`] takes the
+/// correlation id from its connection, and the size is written on encoding.
+///
+/// [`FrameConnectionService`]: crate::FrameConnectionService
+const UNSET: i32 = 0;
+
+/// Wraps a frame service in a [`ConsumerGroupService`] that joins `group_id`
+/// and subscribes to `topics`, as `metadata` describes them.
+#[derive(Clone, Default, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ConsumerGroupLayer {
-    group_id: String,
-    topics: Vec<String>,
-    metadata: MetadataResponse,
+    group_id: Box<str>,
+    topics: Box<[String]>,
+    metadata: Arc<MetadataResponse>,
 }
 
 impl ConsumerGroupLayer {
-    pub fn new(
-        group_id: impl Into<String>,
-        topics: impl IntoIterator<Item = impl Into<String>>,
-        metadata: MetadataResponse,
-    ) -> Self {
+    pub fn new<G, T>(group_id: G, topics: T, metadata: MetadataResponse) -> Self
+    where
+        G: Into<String>,
+        T: IntoIterator<Item: Into<String>>,
+    {
+        let group_id = group_id.into().into_boxed_str();
+        let topics = topics.into_iter().map(Into::into).collect();
+        let metadata = Arc::new(metadata);
         Self {
-            group_id: group_id.into(),
-            topics: topics.into_iter().map(Into::into).collect(),
+            group_id,
+            topics,
             metadata,
         }
     }
 }
 
-impl<S> Layer<S> for ConsumerGroupLayer {
-    type Service = ConsumerGroupService<S>;
+impl<Inner> rama::Layer<Inner> for ConsumerGroupLayer {
+    type Service = ConsumerGroupService<Inner>;
 
-    fn layer(&self, inner: S) -> Self::Service {
-        let consumer = Arc::new(Mutex::new(
-            GroupConsumer::builder(self.group_id.clone())
-                .topics(self.topics.clone())
-                .metadata(self.metadata.clone())
-                .on_assignment(Some(Arc::new(
-                    |group: String, assignment: MemberAssignment| debug!(group, %assignment),
-                )))
-                .build(),
-        ));
-
-        Self::Service { inner, consumer }
+    fn layer(&self, inner: Inner) -> ConsumerGroupService<Inner> {
+        let hook: Arc<DynConsumerAssignment> =
+            Arc::new(|group, assignment| tracing::debug!(group, %assignment));
+        let builder = GroupConsumer::builder(self.group_id.clone());
+        let builder = builder.topics(self.topics.clone());
+        let builder = builder.metadata(MetadataResponse::clone(&self.metadata));
+        let member = Arc::new(Mutex::new(builder.on_assignment(Some(hook)).build()));
+        ConsumerGroupService { inner, member }
     }
 }
 
-#[derive(Clone)]
-pub struct ConsumerGroupService<S> {
-    inner: S,
-    consumer: Arc<Mutex<GroupConsumer>>,
+/// A member of the group [`ConsumerGroupLayer`] names. Serving it plays the
+/// group protocol through the inner service until that service fails.
+pub struct ConsumerGroupService<Inner> {
+    inner: Inner,
+    member: Arc<Mutex<GroupConsumer>>,
 }
 
-impl<S> fmt::Debug for ConsumerGroupService<S> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct(stringify!(ConsumerGroupService)).finish()
+impl<Inner: Clone> Clone for ConsumerGroupService<Inner> {
+    fn clone(&self) -> Self {
+        let inner = self.inner.clone();
+        let member = Arc::clone(&self.member);
+        Self { inner, member }
     }
 }
 
-impl<State, S> Service<State, ()> for ConsumerGroupService<S>
+impl<Inner> fmt::Debug for ConsumerGroupService<Inner> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ConsumerGroupService")
+    }
+}
+
+impl<Inner> ConsumerGroupService<Inner> {
+    /// The member's answer to `input`, framed at the newest version of its
+    /// API that this crate knows.
+    fn next_request<E>(&self, input: Option<Body>) -> Result<Frame, E>
+    where
+        E: From<tansu_sans_io::Error>,
+        E: for<'a> From<PoisonError<MutexGuard<'a, GroupConsumer>>>,
+    {
+        let next_action = self.member.lock()?.next_action(input)?;
+        tracing::debug!(?next_action);
+
+        let key = next_action.api_key();
+        let known = RootMessageMeta::messages().requests().get(&key);
+        let version = known.map_or(0, |meta| meta.version.valid().end);
+        let header = Header::Request {
+            api_key: key,
+            api_version: version,
+            correlation_id: UNSET,
+            client_id: Some(String::from(env!("CARGO_PKG_NAME"))),
+        };
+        let body = next_action;
+        Ok(Frame {
+            size: UNSET,
+            header,
+            body,
+        })
+    }
+}
+
+impl<State, Inner> rama::Service<State, ()> for ConsumerGroupService<Inner>
 where
-    S: Service<State, Frame, Response = Frame>,
-    S::Error: From<tansu_sans_io::Error> + for<'a> From<PoisonError<MutexGuard<'a, GroupConsumer>>>,
     State: Clone + Send + Sync + 'static,
+    Inner: rama::Service<State, Frame, Response = Frame>,
+    Inner::Error: From<tansu_sans_io::Error>,
+    Inner::Error: for<'a> From<PoisonError<MutexGuard<'a, GroupConsumer>>>,
 {
     type Response = ();
+    type Error = Inner::Error;
 
-    type Error = S::Error;
-
-    async fn serve(&self, ctx: Context<State>, _: ()) -> Result<Self::Response, Self::Error> {
-        let mut input = None;
-
+    async fn serve(&self, ctx: Context<State>, (): ()) -> Result<(), Inner::Error> {
+        let mut input: Option<Body> = None;
         loop {
-            debug!(?input);
-
-            let next_action = self
-                .consumer
-                .lock()
-                .map_err(Self::Error::from)
-                .and_then(|mut consumer| {
-                    consumer
-                        .next_action(input)
-                        .inspect(|next_action| debug!(?next_action))
-                        .map_err(Into::into)
-                })
-                .map(|next_action| {
-                    let api_key = next_action.api_key();
-                    let api_version = RootMessageMeta::messages()
-                        .requests()
-                        .get(&api_key)
-                        .map(|message_meta| message_meta.version.valid().end)
-                        .unwrap_or_default();
-
-                    Frame {
-                        size: 0,
-                        header: Header::Request {
-                            api_key,
-                            api_version,
-                            correlation_id: 0,
-                            client_id: Some(env!("CARGO_PKG_NAME").into()),
-                        },
-                        body: next_action,
-                    }
-                })?;
-
-            input = self
-                .inner
-                .serve(ctx.clone(), next_action)
-                .await
-                .map(|frame| frame.body)
-                .inspect(|input| debug!(input.api_name = input.api_name()))
-                .map(Some)?;
+            tracing::debug!(?input);
+            let request = self.next_request::<Inner::Error>(input)?;
+            let answered = self.inner.serve(ctx.clone(), request);
+            let body = answered.await?.body;
+            tracing::debug!(input.api_name = body.api_name());
+            input = Some(body);
         }
     }
 }

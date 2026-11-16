@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -42,18 +42,17 @@ group_service! {
             return Ok(respond(correlation_id, refused));
         }
 
-        let synced = ctx
-            .state_mut()
-            .sync(
-                &group_id,
-                generation_id,
-                &member_id,
-                group_instance_id.as_deref(),
-                protocol_type.as_deref(),
-                protocol_name.as_deref(),
-                assignments.as_deref(),
-            )
-            .await;
+        let coordinator = ctx.state_mut();
+        let syncing = coordinator.sync(
+            &group_id,
+            generation_id,
+            &member_id,
+            group_instance_id.as_deref(),
+            protocol_type.as_deref(),
+            protocol_name.as_deref(),
+            assignments.as_deref(),
+        );
+        let synced = syncing.await;
         answered(synced, answer::sync_group).map(|body| respond(correlation_id, body))
     }
 }
