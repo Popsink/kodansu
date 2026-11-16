@@ -748,6 +748,14 @@ fmt:
 # `registered`, `a_partition`, `commit`, `fetched` and `deleted_alone` carry
 # them. The ceiling rises because only code went: the comment count did not
 # move.
+#   defork  -307 lines, the metadata tests on a cluster fixture  3004 -> 3004  2.7071 -> 2.7134
+#
+# `tansu-broker/tests/metadata.rs` registered a broker, created a topic and
+# checked the broker and every partition inline in each of six tests. A
+# `Cluster` fixture with `created`, `metadata` and `assert_found`, and
+# `assert_unknown`, carry them; the cited #593 note moves, naming the renamed
+# test. The ceiling rises because only code went: the comment count did not
+# move.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -758,7 +766,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7071" top="12":
+comments ceiling="2.7134" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
