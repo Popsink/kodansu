@@ -763,6 +763,13 @@ fmt:
 # joins` comment. A `Group` fixture carries the exchanges, the narration goes,
 # and so does the cited #555 `cognitive_complexity` allow the script length
 # needed. The cited #195 session-timeout note moves unchanged.
+#   defork  -75 lines, the compact/delete policy helpers rewritten  2964 -> 2964  2.6819 -> 2.6835
+#
+# `tansu-broker/tests/policy_compact_delete.rs` keeps its cases and their
+# notes; its broker stack, topic creation and the Produce, ListOffsets and
+# Fetch requests behind `produce_keyed`, `list_offset` and `fetched` are
+# rebuilt in short `let` steps. The ceiling rises because only code went:
+# the comment count did not move.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -773,7 +780,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6819" top="12":
+comments ceiling="2.6835" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
