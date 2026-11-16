@@ -821,6 +821,14 @@ fmt:
 # own tests, a `BTreeMap::range` check and a serde widening check, are
 # rewritten to assert the same. The ceiling rises because only code went:
 # the comment count did not move.
+#   defork  -6 lines, the storage test helpers rewritten  2926 -> 2926  2.6861 -> 2.6865
+#
+# `tansu-storage/tests/common/mod.rs` keeps its store, cluster and topic
+# helpers and their cited #357 docs; the error type is a `Failure` enum
+# behind the `Error` alias every test names, its `Message` variant is
+# `Failed` in the three tests that raise it, its `Arc` conversions come from
+# one macro, and `init_tracing` is rebuilt in short `let` steps. The ceiling
+# rises because only code went: the comment count did not move.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -831,7 +839,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6861" top="12":
+comments ceiling="2.6865" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
