@@ -20,7 +20,7 @@
 //! A static member, one with a `group.instance.id`, joining without a member
 //! id: it leads its own generation, and joining again changes nothing.
 
-use common::{CLIENT_ID, COOPERATIVE_STICKY, PROTOCOL_TYPE, RANGE};
+use common::{CONSOLE_CLIENT, CONSUMER_PROTOCOL, RANGE_ASSIGNOR, STICKY_ASSIGNOR};
 use rand::RngExt as _;
 use tansu_broker::coordinator::group::administrator::Controller;
 use tansu_sans_io::join_group_request::JoinGroupRequestProtocol;
@@ -51,14 +51,14 @@ async fn join_static(
         let protocol = JoinGroupRequestProtocol::default().name(name.into());
         protocol.metadata(bytes::Bytes::from_static(metadata))
     };
-    let range = offer(RANGE, b"first_member_range_meta_01");
+    let range = offer(RANGE_ASSIGNOR, b"first_member_range_meta_01");
     let offers = [
         range,
-        offer(COOPERATIVE_STICKY, b"first_member_sticky_meta_01"),
+        offer(STICKY_ASSIGNOR, b"first_member_sticky_meta_01"),
     ];
     let (session_ms, rebalance_ms) = (45_000, Some(300_000));
-    let (instance, consumer) = (Some(instance), PROTOCOL_TYPE);
-    let (client, offered) = (Some(CLIENT_ID), Some(&offers[..]));
+    let (instance, consumer) = (Some(instance), CONSUMER_PROTOCOL);
+    let (client, offered) = (Some(CONSOLE_CLIENT), Some(&offers[..]));
     let joining = common::join_group(
         controller,
         client,
@@ -83,7 +83,7 @@ fn assert_leads_alone(joined: &JoinGroupResponse, instance: &str) -> tansu_broke
         joined.protocol_type.as_deref(),
         joined.protocol_name.as_deref(),
     );
-    assert_eq!((Some(PROTOCOL_TYPE), Some(RANGE)), protocol);
+    assert_eq!((Some(CONSUMER_PROTOCOL), Some(RANGE_ASSIGNOR)), protocol);
     assert_eq!(joined.leader, joined.member_id);
     assert!(
         joined.member_id.starts_with(instance),
@@ -127,7 +127,7 @@ async fn a_static_member_joining_again_keeps_its_id_and_generation() -> tansu_br
         again.protocol_type.as_deref(),
         again.protocol_name.as_deref(),
     );
-    assert_eq!((Some(PROTOCOL_TYPE), Some(RANGE)), protocol);
+    assert_eq!((Some(CONSUMER_PROTOCOL), Some(RANGE_ASSIGNOR)), protocol);
     let identity = (&again.leader, &again.member_id, again.generation_id);
     assert_eq!(
         (&joined.leader, &joined.member_id, joined.generation_id),

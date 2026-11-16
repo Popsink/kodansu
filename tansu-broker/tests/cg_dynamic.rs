@@ -20,7 +20,7 @@
 //! member id is told to come back with one, and two members form, rebalance,
 //! lose a member and reform a group.
 
-use common::{CLIENT_ID, COOPERATIVE_STICKY, JoinResponse, PROTOCOL_TYPE, RANGE};
+use common::{CONSOLE_CLIENT, CONSUMER_PROTOCOL, Joined, RANGE_ASSIGNOR, STICKY_ASSIGNOR};
 use rand::RngExt as _;
 use tansu_broker::coordinator::group::administrator::Controller;
 use tansu_sans_io::ErrorCode;
@@ -47,8 +47,8 @@ fn code(error_code: i16) -> tansu_broker::Result<ErrorCode> {
 }
 
 /// `assignment` handed to `member` by the leader.
-fn handed(member: &JoinResponse, assignment: &Bytes) -> SyncGroupRequestAssignment {
-    let handed = SyncGroupRequestAssignment::default().member_id(member.id().into());
+fn handed(member: &Joined, assignment: &Bytes) -> SyncGroupRequestAssignment {
+    let handed = SyncGroupRequestAssignment::default().member_id(member.id.clone());
     handed.assignment(assignment.clone())
 }
 
@@ -62,9 +62,9 @@ struct Group {
 
 impl Group {
     /// Joins as a new member, or rejoins as `member` with its protocols.
-    async fn join(&mut self, member: Option<&JoinResponse>) -> tansu_broker::Result<JoinResponse> {
-        let id = member.map(JoinResponse::id);
-        let protocols = member.map(|member| member.protocols().to_vec());
+    async fn join(&mut self, member: Option<&Joined>) -> tansu_broker::Result<Joined> {
+        let id = member.map(|member| member.id.as_str());
+        let protocols = member.map(|member| member.protocols.clone());
         let joining = common::join(
             &mut self.controller,
             &self.id,
@@ -83,18 +83,18 @@ impl Group {
     /// returns its error code and assignment.
     async fn sync(
         &mut self,
-        member: &JoinResponse,
+        member: &Joined,
         assignments: &[SyncGroupRequestAssignment],
     ) -> tansu_broker::Result<(ErrorCode, Bytes)> {
-        let (generation, id) = (member.generation(), member.id());
+        let (generation, id) = (member.generation, member.id.as_str());
         let syncing = common::sync_group(
             &mut self.controller,
             &self.id,
             generation,
             id,
             None,
-            PROTOCOL_TYPE,
-            RANGE,
+            CONSUMER_PROTOCOL,
+            RANGE_ASSIGNOR,
             assignments,
         );
         let synced = syncing.await?;
@@ -102,18 +102,18 @@ impl Group {
             synced.protocol_type.as_deref(),
             synced.protocol_name.as_deref(),
         );
-        assert_eq!((Some(PROTOCOL_TYPE), Some(RANGE)), protocol);
+        assert_eq!((Some(CONSUMER_PROTOCOL), Some(RANGE_ASSIGNOR)), protocol);
         Ok((code(synced.error_code)?, synced.assignment))
     }
 
-    async fn heartbeat(&mut self, member: &JoinResponse) -> tansu_broker::Result<ErrorCode> {
-        let (generation, id) = (member.generation(), member.id());
+    async fn heartbeat(&mut self, member: &Joined) -> tansu_broker::Result<ErrorCode> {
+        let (generation, id) = (member.generation, member.id.as_str());
         let beating = common::heartbeat(&mut self.controller, &self.id, generation, id, None);
         code(beating.await?.error_code)
     }
 
-    async fn leave(&mut self, member: &JoinResponse) -> tansu_broker::Result<ErrorCode> {
-        let leaving = common::leave(&mut self.controller, &self.id, member.id(), None);
+    async fn leave(&mut self, member: &Joined) -> tansu_broker::Result<ErrorCode> {
+        let leaving = common::leave(&mut self.controller, &self.id, member.id.as_str(), None);
         code(leaving.await?.error_code)
     }
 }
@@ -129,13 +129,13 @@ async fn a_join_without_a_member_id_is_told_to_bring_one() -> tansu_broker::Resu
         let protocol = JoinGroupRequestProtocol::default().name(name.into());
         protocol.metadata(Bytes::from_static(metadata))
     };
-    let range = offer(RANGE, b"first_member_range_meta_01");
+    let range = offer(RANGE_ASSIGNOR, b"first_member_range_meta_01");
     let offers = [
         range,
-        offer(COOPERATIVE_STICKY, b"first_member_sticky_meta_01"),
+        offer(STICKY_ASSIGNOR, b"first_member_sticky_meta_01"),
     ];
-    let (client, offered) = (Some(CLIENT_ID), Some(&offers[..]));
-    let (session_ms, rebalance_ms, consumer) = (45_000, Some(300_000), PROTOCOL_TYPE);
+    let (client, offered) = (Some(CONSOLE_CLIENT), Some(&offers[..]));
+    let (session_ms, rebalance_ms, consumer) = (45_000, Some(300_000), CONSUMER_PROTOCOL);
     let coordinating = &mut controller;
     let joining = common::join_group(
         coordinating,
@@ -156,10 +156,10 @@ async fn a_join_without_a_member_id_is_told_to_bring_one() -> tansu_broker::Resu
         refused.protocol_type.as_deref(),
         refused.protocol_name.as_deref(),
     );
-    assert_eq!((Some(PROTOCOL_TYPE), Some("")), protocol);
+    assert_eq!((Some(CONSUMER_PROTOCOL), Some("")), protocol);
     assert_eq!("", refused.leader);
     assert!(
-        refused.member_id.starts_with(CLIENT_ID),
+        refused.member_id.starts_with(CONSOLE_CLIENT),
         "{}",
         refused.member_id
     );
@@ -204,10 +204,10 @@ async fn two_members_form_rebalance_and_reform_after_a_leave() -> tansu_broker::
     assert_eq!(ErrorCode::RebalanceInProgress, stale);
 
     let second = group.join(Some(&second)).await?;
-    assert_eq!(first.id(), second.leader());
+    assert_eq!(first.id, second.leader);
     let first = group.join(Some(&first)).await?;
-    assert!(first.is_leader());
-    assert_eq!(first.generation(), second.generation());
+    assert!(first.leads());
+    assert_eq!(first.generation, second.generation);
 
     let (to_first, to_second) = (common::random_bytes(15), common::random_bytes(15));
     let shared = [handed(&first, &to_first), handed(&second, &to_second)];
@@ -223,7 +223,7 @@ async fn two_members_form_rebalance_and_reform_after_a_leave() -> tansu_broker::
     assert_eq!(ErrorCode::RebalanceInProgress, left_behind);
 
     let second = group.join(Some(&second)).await?;
-    assert!(second.is_leader());
+    assert!(second.leads());
     let alone = common::random_bytes(15);
     let reformed = group.sync(&second, &[handed(&second, &alone)]).await?;
     assert_eq!((ErrorCode::None, alone), reformed);
