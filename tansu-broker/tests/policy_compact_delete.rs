@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,37 +18,34 @@
 #![cfg(feature = "dynostore")]
 
 use std::fmt::Debug;
-use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use bytes::Bytes;
-use common::{alphanumeric_string, init_tracing, register_broker};
-use rama::{Context, Layer as _, Service};
-use rand::{prelude::*, rng};
-use tansu_broker::{Error, Result, service::storage};
-use tansu_sans_io::{
-    Ack, CreateTopicsRequest, ErrorCode, FetchRequest, IsolationLevel, ListOffset,
-    ListOffsetsRequest, NULL_TOPIC_ID, ProduceRequest,
-    create_topics_request::{CreatableTopic, CreatableTopicConfig},
-    fetch_request::{FetchPartition, FetchTopic, ReplicaState},
-    list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic},
-    produce_request::{PartitionProduceData, TopicProduceData},
-    record::{Header, Record, deflated, inflated},
-};
-use tansu_service::{
-    BytesFrameLayer, BytesFrameService, BytesLayer, BytesService, FrameBytesLayer,
-    FrameBytesService, FrameRouteService, RequestFrameLayer, RequestFrameService,
-};
-use tansu_storage::Storage;
-use tracing::debug;
-use url::Url;
-use uuid::Uuid;
+use common::init_tracing;
+use rama::Context;
+use rama::Layer as _;
+use rama::Service as _;
+use rand::RngExt as _;
+use tansu_broker::Error;
+use tansu_sans_io::create_topics_request::{CreatableTopic, CreatableTopicConfig};
+use tansu_sans_io::fetch_request::{FetchPartition, FetchTopic, ReplicaState};
+use tansu_sans_io::list_offsets_request::{ListOffsetsPartition, ListOffsetsTopic};
+use tansu_sans_io::produce_request::{PartitionProduceData, TopicProduceData};
+use tansu_sans_io::record::{Header, Record, deflated, inflated};
+use tansu_sans_io::{Ack, CreateTopicsRequest, ErrorCode, FetchRequest, IsolationLevel};
+use tansu_sans_io::{ListOffset, ListOffsetsRequest, NULL_TOPIC_ID, ProduceRequest};
+use tansu_service::{BytesFrameLayer, BytesFrameService, BytesLayer, BytesService};
+use tansu_service::{FrameBytesLayer, FrameBytesService, FrameRouteService};
+use tansu_service::{RequestFrameLayer, RequestFrameService};
+
+type Octets = bytes::Bytes;
+type Engine = std::sync::Arc<dyn tansu_storage::Storage>;
+type Route = FrameRouteService<(), Error>;
 
 pub mod common;
 
-const CLEANUP_POLICY: &str = "cleanup.policy";
-const COMPACT: &str = "compact";
-const DELETE: &str = "delete";
+const POLICY_KEY: &str = "cleanup.policy";
+const COMPACT_POLICY: &str = "compact";
+const DELETE_POLICY: &str = "delete";
 const RETENTION_MS: &str = "retention.ms";
 
 /// Wider than the one partition these cases produce into, so every
@@ -84,93 +81,67 @@ const TWO: &[u8] = b"two";
 const THREE: &[u8] = b"three";
 
 /// One record as [`fetched`] yields it: key, value, and absolute offset.
-type Fetched = (Option<Bytes>, Option<Bytes>, i64);
+type Fetched = (Option<Octets>, Option<Octets>, i64);
 
-type Broker = RequestFrameService<
-    FrameBytesService<BytesService<BytesFrameService<FrameRouteService<(), Error>>>>,
->;
+type Broker = RequestFrameService<FrameBytesService<BytesService<BytesFrameService<Route>>>>;
 
-fn broker<S>(storage: S) -> Result<Broker>
-where
-    S: Storage + Clone,
-{
-    storage::services(FrameRouteService::<(), Error>::builder(), storage)
-        .inspect(|builder| debug!(?builder))
-        .and_then(|builder| builder.build().map_err(Into::into))
-        .map(|frame_route| {
-            (
-                RequestFrameLayer,
-                FrameBytesLayer,
-                BytesLayer,
-                BytesFrameLayer::default(),
-            )
-                .into_layer(frame_route)
-        })
-}
-
-async fn storage_container(cluster: impl Into<String>, node: i32) -> Result<Arc<dyn Storage>> {
-    common::storage_container(cluster, node, Url::parse("tcp://127.0.0.1/")?).await
+/// `engine`'s storage services behind the frame, bytes and request layers a
+/// client's request goes through.
+fn broker(engine: Engine) -> tansu_broker::Result<Broker> {
+    let routes = tansu_broker::service::storage::services(Route::builder(), engine)?;
+    tracing::debug!(builder = ?routes);
+    let framed = (BytesLayer, BytesFrameLayer::default()).into_layer(routes.build()?);
+    Ok((RequestFrameLayer, FrameBytesLayer).into_layer(framed))
 }
 
 /// A broker over its own `memory://` container, a topic name nothing else
 /// uses, and that topic's id.
 async fn broker_with_topic<V>(
     configs: &[(&str, V)],
-) -> Result<(Arc<dyn Storage>, Broker, String, [u8; 16])>
+) -> tansu_broker::Result<(Engine, Broker, String, [u8; 16])>
 where
     V: AsRef<str> + Debug,
 {
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
+    let cluster = uuid::Uuid::now_v7();
+    let node = rand::rng().random_range(0..i32::MAX);
+    let listener = url::Url::parse("tcp://127.0.0.1/")?;
+    let engine = common::storage_container(cluster, node, listener).await?;
+    common::register_broker(cluster, node, engine.clone()).await?;
+    let serving = broker(engine.clone())?;
 
-    let sc = storage_container(cluster_id, broker_id).await?;
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let broker = broker(sc.clone())?;
-
-    let topic_name = alphanumeric_string(15);
-    debug!(?topic_name, ?configs);
-
-    let topic_id = create_topic(&broker, &topic_name, configs).await?;
-
-    Ok((sc, broker, topic_name, topic_id))
+    let name = common::alphanumeric_string(15);
+    tracing::debug!(topic_name = ?name, ?configs);
+    let id = create_topic(&serving, &name, configs).await?;
+    Ok((engine, serving, name, id))
 }
 
-async fn create_topic<V>(broker: &Broker, name: &str, configs: &[(&str, V)]) -> Result<[u8; 16]>
+async fn create_topic<V>(
+    broker: &Broker,
+    name: &str,
+    configs: &[(&str, V)],
+) -> tansu_broker::Result<[u8; 16]>
 where
     V: AsRef<str>,
 {
-    let response = broker
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
-                .timeout_ms(TIMEOUT_MS)
-                .validate_only(Some(false))
-                .topics(Some(vec![
-                    CreatableTopic::default()
-                        .name(name.into())
-                        .num_partitions(NUM_PARTITIONS)
-                        .replication_factor(0)
-                        .assignments(Some([].into()))
-                        .configs(Some(
-                            configs
-                                .iter()
-                                .map(|(name, value)| {
-                                    CreatableTopicConfig::default()
-                                        .name((*name).into())
-                                        .value(Some(value.as_ref().into()))
-                                })
-                                .collect(),
-                        )),
-                ])),
-        )
-        .await?;
+    let config = |(key, value): &(&str, V)| {
+        let config = CreatableTopicConfig::default().name((*key).into());
+        config.value(Some(value.as_ref().into()))
+    };
+    let topic = CreatableTopic::default()
+        .name(name.into())
+        .num_partitions(NUM_PARTITIONS);
+    let topic = topic.replication_factor(0).assignments(Some(vec![]));
+    let topic = topic.configs(Some(configs.iter().map(config).collect()));
+    let request = CreateTopicsRequest::default().topics(Some(vec![topic]));
+    let request = request.timeout_ms(TIMEOUT_MS).validate_only(Some(false));
+    let creating = broker.serve(Context::default(), request);
+    let created = creating.await?;
 
-    let topics = response.topics.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    assert_eq!(i16::from(ErrorCode::None), topics[0].error_code);
-
-    Ok(topics[0].topic_id.unwrap_or(NULL_TOPIC_ID))
+    let [topic] = created.topics.as_deref().unwrap_or_default() else {
+        panic!("one topic in {created:?}")
+    };
+    assert_eq!(i16::from(ErrorCode::None), topic.error_code);
+    Ok(topic.topic_id.unwrap_or(NULL_TOPIC_ID))
 }
 
 /// One keyed record through `Produce`, stamped `at`, answering the offset it
@@ -186,62 +157,47 @@ async fn produce_keyed(
     key: &'static [u8],
     value: &'static [u8],
     at: SystemTime,
-) -> Result<i64> {
-    let timestamp = at
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| Error::Message(String::from("a timestamp before the epoch")))
-        .and_then(|since| {
-            i64::try_from(since.as_millis())
-                .map_err(|_| Error::Message(String::from("a timestamp past i64 milliseconds")))
-        })?;
+) -> tansu_broker::Result<i64> {
+    let since = at.duration_since(UNIX_EPOCH);
+    let since = since.map_err(|_| Error::Message(String::from("a timestamp before the epoch")))?;
+    let millis = i64::try_from(since.as_millis());
+    let millis =
+        millis.map_err(|_| Error::Message(String::from("a timestamp past i64 milliseconds")))?;
 
-    let frame = inflated::Batch::builder()
-        .base_timestamp(timestamp)
-        .max_timestamp(timestamp)
-        .record(
-            Record::builder()
-                .key(Some(Bytes::from_static(key)))
-                .value(Some(Bytes::from_static(value)))
-                .header(
-                    Header::builder()
-                        .key(Bytes::from_static(HEADER_KEY))
-                        .value(Bytes::from_static(HEADER_VALUE)),
-                ),
-        )
-        .build()
-        .map(|batch| inflated::Frame {
-            batches: vec![batch],
-        })
-        .and_then(deflated::Frame::try_from)?;
+    let header = Header::builder().key(Octets::from_static(HEADER_KEY));
+    let header = header.value(Octets::from_static(HEADER_VALUE));
+    let record = Record::builder().key(Some(Octets::from_static(key)));
+    let record = record
+        .value(Some(Octets::from_static(value)))
+        .header(header);
+    let batch = inflated::Batch::builder()
+        .base_timestamp(millis)
+        .max_timestamp(millis);
+    let batches = vec![batch.record(record).build()?];
+    let records = deflated::Frame::try_from(inflated::Frame { batches })?;
 
-    let response = broker
-        .serve(
-            Context::default(),
-            ProduceRequest::default()
-                .timeout_ms(TIMEOUT_MS)
-                .acks(Ack::Leader.into())
-                .topic_data(Some(vec![
-                    TopicProduceData::default()
-                        .name(name.into())
-                        .partition_data(Some(vec![
-                            PartitionProduceData::default()
-                                .index(PARTITION)
-                                .records(Some(frame)),
-                        ])),
-                ])),
-        )
-        .await
-        .inspect(|response| debug!("{response:?}"))?;
+    let partition = PartitionProduceData::default()
+        .index(PARTITION)
+        .records(Some(records));
+    let topic = TopicProduceData::default().name(name.into());
+    let topic = topic.partition_data(Some(vec![partition]));
+    let request = ProduceRequest::default()
+        .timeout_ms(TIMEOUT_MS)
+        .acks(Ack::Leader.into());
+    let producing = broker.serve(Context::default(), request.topic_data(Some(vec![topic])));
+    let produced = producing.await?;
+    tracing::debug!("{produced:?}");
 
-    let topics = response.responses.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    assert_eq!(name, topics[0].name);
-    let partitions = topics[0].partition_responses.as_deref().unwrap_or_default();
-    assert_eq!(1, partitions.len());
-    assert_eq!(PARTITION, partitions[0].index);
-    assert_eq!(i16::from(ErrorCode::None), partitions[0].error_code);
-
-    Ok(partitions[0].base_offset)
+    let [topic] = produced.responses.as_deref().unwrap_or_default() else {
+        panic!("one topic in {produced:?}")
+    };
+    assert_eq!(name, topic.name);
+    let [partition] = topic.partition_responses.as_deref().unwrap_or_default() else {
+        panic!("one partition in {produced:?}")
+    };
+    let none = i16::from(ErrorCode::None);
+    assert_eq!((PARTITION, none), (partition.index, partition.error_code));
+    Ok(partition.base_offset)
 }
 
 /// `(error code, offset, timestamp)` of the one partition with records, having
@@ -250,50 +206,37 @@ async fn list_offset(
     broker: &Broker,
     name: &str,
     offset: ListOffset,
-) -> Result<(i16, Option<i64>, Option<i64>)> {
-    let timestamp = offset.try_into()?;
+) -> tansu_broker::Result<(i16, Option<i64>, Option<i64>)> {
+    let timestamp = i64::try_from(offset)?;
+    let partition = |index| {
+        let partition = ListOffsetsPartition::default().partition_index(index);
+        let partition = partition
+            .max_num_offsets(Some(NUM_PARTITIONS))
+            .timestamp(timestamp);
+        partition.current_leader_epoch(Some(-1))
+    };
+    let topic = ListOffsetsTopic::default().name(name.into());
+    let topic = topic.partitions(Some((0..NUM_PARTITIONS).map(partition).collect()));
+    let uncommitted = Some(IsolationLevel::ReadUncommitted.into());
+    let request = ListOffsetsRequest::default()
+        .isolation_level(uncommitted)
+        .replica_id(-1);
+    let listing = broker.serve(Context::default(), request.topics(Some(vec![topic])));
+    let listed = listing.await?;
 
-    let response = broker
-        .serve(
-            Context::default(),
-            ListOffsetsRequest::default()
-                .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
-                .replica_id(-1)
-                .topics(Some(vec![
-                    ListOffsetsTopic::default()
-                        .name(name.into())
-                        .partitions(Some(
-                            (0..NUM_PARTITIONS)
-                                .map(|partition_index| {
-                                    ListOffsetsPartition::default()
-                                        .partition_index(partition_index)
-                                        .max_num_offsets(Some(NUM_PARTITIONS))
-                                        .timestamp(timestamp)
-                                        .current_leader_epoch(Some(-1))
-                                })
-                                .collect::<Vec<_>>(),
-                        )),
-                ])),
-        )
-        .await?;
-
-    let topics = response.topics.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    assert_eq!(name, topics[0].name);
-    let partitions = topics[0].partitions.as_deref().unwrap_or_default();
+    let [topic] = listed.topics.as_deref().unwrap_or_default() else {
+        panic!("one topic in {listed:?}")
+    };
+    assert_eq!(name, topic.name);
+    let partitions = topic.partitions.as_deref().unwrap_or_default();
     assert_eq!(NUM_PARTITIONS as usize, partitions.len());
 
-    for partition in &partitions[1..] {
-        assert_eq!(i16::from(ErrorCode::None), partition.error_code);
-        assert_eq!(Some(0), partition.offset);
-        assert_eq!(Some(-1), partition.timestamp);
+    let empty = (i16::from(ErrorCode::None), Some(0), Some(-1));
+    for others in &partitions[1..] {
+        assert_eq!(empty, (others.error_code, others.offset, others.timestamp));
     }
-
-    Ok((
-        partitions[0].error_code,
-        partitions[0].offset,
-        partitions[0].timestamp,
-    ))
+    let first = &partitions[0];
+    Ok((first.error_code, first.offset, first.timestamp))
 }
 
 /// `(error code, [(key, value, absolute offset)])` for a `Fetch` from
@@ -311,72 +254,51 @@ async fn fetched(
     name: &str,
     topic_id: [u8; 16],
     fetch_offset: i64,
-) -> Result<(i16, Vec<Fetched>)> {
-    let response = broker
-        .serve(
-            Context::default(),
-            FetchRequest::default()
-                .cluster_id(Some("".into()))
-                .replica_id(Some(-1))
-                .replica_state(Some(ReplicaState::default()))
-                .max_wait_ms(500)
-                .max_bytes(Some(MAX_BYTES))
-                .min_bytes(1)
-                .isolation_level(Some(IsolationLevel::ReadUncommitted.into()))
-                .session_id(Some(-1))
-                .session_epoch(Some(-1))
-                .topics(Some(vec![
-                    FetchTopic::default()
-                        .topic(Some(name.into()))
-                        .topic_id(Some(topic_id))
-                        .partitions(Some(vec![
-                            FetchPartition::default()
-                                .partition(PARTITION)
-                                .current_leader_epoch(Some(-1))
-                                .fetch_offset(fetch_offset)
-                                .last_fetched_epoch(Some(-1))
-                                .log_start_offset(Some(0))
-                                .partition_max_bytes(MAX_BYTES),
-                        ])),
-                ]))
-                .forgotten_topics_data(Some([].into()))
-                .rack_id(Some("".into())),
-        )
-        .await?;
+) -> tansu_broker::Result<(i16, Vec<Fetched>)> {
+    let partition = FetchPartition::default().partition(PARTITION);
+    let partition = partition.fetch_offset(fetch_offset);
+    let partition = partition.current_leader_epoch(Some(-1));
+    let partition = partition.last_fetched_epoch(Some(-1));
+    let partition = partition.log_start_offset(Some(0));
+    let partition = partition.partition_max_bytes(MAX_BYTES);
+    let topic = FetchTopic::default().topic(Some(name.into()));
+    let topic = topic.topic_id(Some(topic_id));
+    let topic = topic.partitions(Some(vec![partition]));
 
-    let topics = response.responses.as_deref().unwrap_or_default();
-    assert_eq!(1, topics.len());
-    let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-    assert_eq!(1, partitions.len());
-    assert_eq!(PARTITION, partitions[0].partition_index);
+    let uncommitted = Some(IsolationLevel::ReadUncommitted.into());
+    let follower = Some(ReplicaState::default());
+    let request = FetchRequest::default().cluster_id(Some(String::new()));
+    let request = request.replica_id(Some(-1)).replica_state(follower);
+    let request = request.max_wait_ms(500).max_bytes(Some(MAX_BYTES));
+    let request = request.min_bytes(1).isolation_level(uncommitted);
+    let request = request.session_id(Some(-1)).session_epoch(Some(-1));
+    let request = request.topics(Some(vec![topic]));
+    let request = request.forgotten_topics_data(Some(vec![]));
+    let fetching = broker.serve(Context::default(), request.rack_id(Some(String::new())));
+    let response = fetching.await?;
 
+    let [topic] = response.responses.as_deref().unwrap_or_default() else {
+        panic!("one topic in {response:?}")
+    };
+    let [partition] = topic.partitions.as_deref().unwrap_or_default() else {
+        panic!("one partition in {response:?}")
+    };
+    assert_eq!(PARTITION, partition.partition_index);
+
+    let carried = Header {
+        key: Some(Octets::from_static(HEADER_KEY)),
+        value: Some(Octets::from_static(HEADER_VALUE)),
+    };
     let mut records = vec![];
-
-    for deflated in partitions[0]
-        .records
-        .iter()
-        .flat_map(|frame| frame.batches.iter())
-    {
-        let batch = inflated::Batch::try_from(deflated)?;
-
+    for compressed in partition.records.iter().flat_map(|frame| &frame.batches) {
+        let batch = inflated::Batch::try_from(compressed)?;
         for record in &batch.records {
-            assert_eq!(
-                vec![Header {
-                    key: Some(Bytes::from_static(HEADER_KEY)),
-                    value: Some(Bytes::from_static(HEADER_VALUE)),
-                }],
-                record.headers,
-            );
-
-            records.push((
-                record.key.clone(),
-                record.value.clone(),
-                batch.base_offset + i64::from(record.offset_delta),
-            ));
+            assert_eq!(std::slice::from_ref(&carried), &record.headers[..]);
+            let offset = batch.base_offset + i64::from(record.offset_delta);
+            records.push((record.key.clone(), record.value.clone(), offset));
         }
     }
-
-    Ok((partitions[0].error_code, records))
+    Ok((partition.error_code, records))
 }
 
 /// The shape `fetched` answers, from `(key, value, absolute offset)` triples.
@@ -387,8 +309,8 @@ fn survivors(expected: &[(&'static [u8], &'static [u8], i64)]) -> (i16, Vec<Fetc
             .iter()
             .map(|(key, value, offset)| {
                 (
-                    Some(Bytes::from_static(key)),
-                    Some(Bytes::from_static(value)),
+                    Some(Octets::from_static(key)),
+                    Some(Octets::from_static(value)),
                     *offset,
                 )
             })
@@ -405,7 +327,10 @@ fn survivors(expected: &[(&'static [u8], &'static [u8], i64)]) -> (i16, Vec<Fetc
 ///
 /// An emptied log answers `LATEST` with `-1` too, so the one case that empties
 /// a log asserts both queries itself.
-async fn log_bounds(broker: &Broker, name: &str) -> Result<(Option<i64>, Option<i64>)> {
+async fn log_bounds(
+    broker: &Broker,
+    name: &str,
+) -> tansu_broker::Result<(Option<i64>, Option<i64>)> {
     let (error_code, earliest, timestamp) = list_offset(broker, name, ListOffset::Earliest).await?;
     assert_eq!(i16::from(ErrorCode::None), error_code);
     assert_eq!(Some(-1), timestamp);
@@ -421,7 +346,7 @@ async fn log_bounds(broker: &Broker, name: &str) -> Result<(Option<i64>, Option<
 /// its configs.
 fn compact_delete(retention: Duration) -> [(&'static str, String); 2] {
     [
-        (CLEANUP_POLICY, [COMPACT, DELETE].join(",")),
+        (POLICY_KEY, [COMPACT_POLICY, DELETE_POLICY].join(",")),
         (RETENTION_MS, retention.as_millis().to_string()),
     ]
 }
@@ -442,10 +367,10 @@ fn compact_delete(retention: Duration) -> [(&'static str, String); 2] {
 /// segments does not, and is the conformant one, so the expectation moved
 /// rather than the engine.
 #[tokio::test]
-async fn compact_only() -> Result<()> {
+async fn compact_only() -> tansu_broker::Result<()> {
     let _guard = init_tracing()?;
 
-    let (sc, broker, topic, topic_id) = broker_with_topic(&[(CLEANUP_POLICY, COMPACT)]).await?;
+    let (sc, broker, topic, topic_id) = broker_with_topic(&[(POLICY_KEY, COMPACT_POLICY)]).await?;
 
     let now = SystemTime::now();
 
@@ -481,7 +406,7 @@ async fn compact_only() -> Result<()> {
 /// identified by its absolute offset rather than by a delta within whichever
 /// batch happened to be last.
 #[tokio::test]
-async fn compact_delete_within_retention_keeps_the_latest_value() -> Result<()> {
+async fn compact_delete_within_retention_keeps_the_latest_value() -> tansu_broker::Result<()> {
     let _guard = init_tracing()?;
 
     let (sc, broker, topic, topic_id) =
@@ -536,14 +461,15 @@ async fn compact_delete_within_retention_keeps_the_latest_value() -> Result<()> 
 /// reads from the `EARLIEST` the broker reports — what a consumer resetting to
 /// earliest does.
 #[tokio::test]
-async fn compact_delete_expires_past_the_threshold_and_compacts_within_it() -> Result<()> {
+async fn compact_delete_expires_past_the_threshold_and_compacts_within_it()
+-> tansu_broker::Result<()> {
     let _guard = init_tracing()?;
 
     let retention = Duration::from_mins(30);
 
     let (sc, broker, expiring, expiring_id) = broker_with_topic(&compact_delete(retention)).await?;
-    let control = alphanumeric_string(15);
-    let control_id = create_topic(&broker, &control, &[(CLEANUP_POLICY, COMPACT)]).await?;
+    let control = common::alphanumeric_string(15);
+    let control_id = create_topic(&broker, &control, &[(POLICY_KEY, COMPACT_POLICY)]).await?;
 
     let now = SystemTime::now();
     let stale = now
@@ -597,7 +523,7 @@ async fn compact_delete_expires_past_the_threshold_and_compacts_within_it() -> R
 /// So a consumer parked at 0 is told it is out of range, and one resetting to
 /// the reported earliest reads an empty log rather than an error.
 #[tokio::test]
-async fn compact_delete_expires_the_whole_log() -> Result<()> {
+async fn compact_delete_expires_the_whole_log() -> tansu_broker::Result<()> {
     let _guard = init_tracing()?;
 
     let retention = Duration::from_mins(30);
