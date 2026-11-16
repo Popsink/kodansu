@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,316 +17,150 @@
 // it; with the module gone it belongs to the file.
 #![cfg(feature = "dynostore")]
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
+//! Fetching one partition through `FetchService`: empty, and after six
+//! records from six idempotent producers.
 
-use bytes::Bytes;
-use common::{alphanumeric_string, init_tracing, register_broker};
-use rama::{Context, Service};
-use rand::{prelude::*, rng};
-use tansu_broker::Result;
-use tansu_sans_io::{
-    ErrorCode, FetchRequest, IsolationLevel, ListOffset, NULL_TOPIC_ID,
-    create_topics_request::CreatableTopic,
-    fetch_request::{FetchPartition, FetchTopic},
-    record::{Record, inflated},
-};
-use tansu_storage::{FetchService, ListOffsetResponse, Storage, Topition};
-use tracing::{debug, error};
-use url::Url;
-use uuid::Uuid;
+use rama::Context;
+use rama::Service as _;
+use rand::RngExt as _;
+use tansu_sans_io::create_topics_request::CreatableTopic;
+use tansu_sans_io::fetch_request::{FetchPartition, FetchTopic};
+use tansu_sans_io::record::{Record, deflated, inflated};
+use tansu_sans_io::{ErrorCode, FetchRequest, FetchResponse, IsolationLevel, ListOffset};
+use tansu_storage::Topition;
 
 pub mod common;
 
-async fn storage_container(cluster: impl Into<String>, node: i32) -> Result<Arc<dyn Storage>> {
-    common::storage_container(cluster, node, Url::parse("tcp://127.0.0.1/")?).await
+type Engine = std::sync::Arc<dyn tansu_storage::Storage>;
+
+const PARTITIONS: i32 = 6;
+
+/// The byte budget of a fetch here, overall and per partition: 50 KiB.
+const BUDGET: i32 = 50 * 1024;
+
+/// A registered `memory://` engine and one random partition of a fresh
+/// six-partition topic on it.
+async fn a_partition() -> tansu_broker::Result<(Engine, Topition)> {
+    let cluster = uuid::Uuid::now_v7();
+    let node = rand::rng().random_range(0..i32::MAX);
+    let listener = url::Url::parse("tcp://127.0.0.1/")?;
+    let engine = common::storage_container(cluster, node, listener).await?;
+    common::register_broker(cluster, node, engine.clone()).await?;
+
+    let name = common::alphanumeric_string(15);
+    tracing::debug!(topic_name = ?name);
+    let topic = CreatableTopic::default()
+        .name(name.clone())
+        .num_partitions(PARTITIONS);
+    let topic = topic
+        .replication_factor(0)
+        .assignments(Some(vec![]))
+        .configs(Some(vec![]));
+    let creating = engine.create_topic(topic, false);
+    let id = creating.await?;
+    tracing::debug!(topic_id = ?id);
+
+    let index = rand::rng().random_range(0..PARTITIONS);
+    Ok((engine, Topition::new(name, index)))
+}
+
+/// The latest offset of `topition`, read uncommitted.
+async fn latest(engine: &Engine, topition: &Topition) -> tansu_broker::Result<Option<i64>> {
+    let wanted = [(topition.clone(), ListOffset::Latest)];
+    let listing = engine.list_offsets(IsolationLevel::ReadUncommitted, &wanted);
+    let listed = listing.await.inspect_err(|err| tracing::error!(?err))?;
+    tracing::debug!(list_offsets = ?listed);
+    assert_eq!(1, listed.len());
+    Ok(listed[0].1.offset)
+}
+
+/// `topition` fetched from offset 0, read uncommitted, waiting up to 500ms
+/// for a byte.
+async fn fetched(engine: Engine, topition: &Topition) -> tansu_broker::Result<FetchResponse> {
+    let partition = FetchPartition::default().partition(topition.partition());
+    let partition = partition.current_leader_epoch(Some(-1)).fetch_offset(0);
+    let partition = partition.log_start_offset(Some(-1));
+    let partition = partition.last_fetched_epoch(Some(-1));
+    let partition = partition.partition_max_bytes(BUDGET);
+    let partition = partition.replica_directory_id(None);
+    let topic = FetchTopic::default().topic(Some(topition.topic().to_string()));
+    let topic = topic.topic_id(Some(tansu_sans_io::NULL_TOPIC_ID));
+    let topic = topic.partitions(Some(vec![partition]));
+
+    let uncommitted = i8::from(&IsolationLevel::ReadUncommitted);
+    let request = FetchRequest::default().max_wait_ms(500).min_bytes(1);
+    let request = request
+        .max_bytes(Some(BUDGET))
+        .isolation_level(Some(uncommitted));
+    let request = request.topics(Some(vec![topic]));
+    let fetching = tansu_storage::FetchService.serve(Context::with_state(engine), request);
+    let response = fetching.await?;
+
+    let outcome = response.error_code.map(ErrorCode::try_from).transpose()?;
+    assert_eq!(Some(ErrorCode::None), outcome);
+    Ok(response)
+}
+
+/// Every batch of every partition in `response`.
+fn batches(response: &FetchResponse) -> impl Iterator<Item = &deflated::Batch> {
+    let topics = response.responses.iter().flatten();
+    let partitions = topics.flat_map(|topic| topic.partitions.iter().flatten());
+    partitions.flat_map(|partition| partition.records.iter().flat_map(|frame| &frame.batches))
+}
+
+/// Every record counted by [`batches`].
+fn records(response: &FetchResponse) -> i64 {
+    batches(response)
+        .map(|batch| i64::from(batch.record_count))
+        .sum()
 }
 
 #[tokio::test]
-async fn empty_topic() -> Result<()> {
-    let _guard = init_tracing()?;
-
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let sc = storage_container(cluster_id, broker_id).await?;
-
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let num_partitions = 6;
-    let replication_factor = 0;
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let topic_id = sc
-        .create_topic(
-            CreatableTopic::default()
-                .name(topic_name.clone())
-                .num_partitions(num_partitions)
-                .replication_factor(replication_factor)
-                .assignments(assignments.clone())
-                .configs(configs.clone()),
-            false,
-        )
-        .await?;
-    debug!(?topic_id);
-
-    let record_count = 0;
-
-    let partition_index = rng().random_range(0..num_partitions);
-    let topition = Topition::new(topic_name.clone(), partition_index);
-
-    let max_wait_ms = 500;
-    let min_bytes = 1;
-    let max_bytes = Some(50 * 1024);
-    let isolation_level = &IsolationLevel::ReadUncommitted;
-    let topics = [FetchTopic::default()
-        .topic(Some(topition.topic().to_string()))
-        .topic_id(Some(NULL_TOPIC_ID))
-        .partitions(Some(vec![
-            FetchPartition::default()
-                .partition(topition.partition())
-                .current_leader_epoch(Some(-1))
-                .fetch_offset(0)
-                .last_fetched_epoch(Some(-1))
-                .log_start_offset(Some(-1))
-                .partition_max_bytes(50 * 1024)
-                .replica_directory_id(None),
-        ]))];
-
-    let ctx = Context::with_state(sc);
-
-    let fetch = FetchService
-        .serve(
-            ctx,
-            FetchRequest::default()
-                .max_wait_ms(max_wait_ms)
-                .min_bytes(min_bytes)
-                .max_bytes(max_bytes)
-                .isolation_level(Some(isolation_level.into()))
-                .topics(Some(topics.into())),
-        )
-        .await?;
-
-    assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(fetch.error_code.unwrap())?
-    );
+async fn an_empty_partition_fetches_no_records() -> tansu_broker::Result<()> {
+    let _guard = common::init_tracing()?;
+    let (engine, topition) = a_partition().await?;
+    let fetch = fetched(engine, &topition).await?;
 
     // `.iter().flatten()` over an `Option`, not `.unwrap()`: an empty partition
     // answers `records: None`, and this body is the one case that has one. It
     // unwrapped because it had never run — its `mod in_memory` wrapper called
     // `simple_non_txn`, the neighbouring body, so `empty_topic` compiled and
     // was never executed (#552).
-    for response in fetch.responses.iter().flatten() {
-        for partition in response.partitions.iter().flatten() {
-            for batch in partition.records.iter().flat_map(|frame| &frame.batches) {
-                assert_eq!(-1, batch.producer_id);
-                assert_eq!(-1, batch.producer_epoch);
-            }
-        }
+    for batch in batches(&fetch) {
+        assert_eq!((-1, -1), (batch.producer_id, batch.producer_epoch));
     }
-
-    assert_eq!(
-        record_count,
-        fetch
-            .responses
-            .unwrap_or_default()
-            .iter()
-            .map(|response| {
-                response
-                    .partitions
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .map(|partition| {
-                        partition
-                            .records
-                            .iter()
-                            .flat_map(|frame| &frame.batches)
-                            .map(|batch| batch.record_count as i64)
-                            .sum::<i64>()
-                    })
-                    .sum::<i64>()
-            })
-            .sum::<i64>()
-    );
-
+    assert_eq!(0, records(&fetch));
     Ok(())
 }
 
 #[tokio::test]
-async fn simple_non_txn() -> Result<()> {
-    let _guard = init_tracing()?;
+async fn six_idempotent_records_fetch_back() -> tansu_broker::Result<()> {
+    let _guard = common::init_tracing()?;
+    let (engine, topition) = a_partition().await?;
+    assert_eq!(Some(0), latest(&engine, &topition).await?);
 
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let sc = storage_container(cluster_id, broker_id).await?;
+    let produced = 6;
+    let mut offsets = std::collections::BTreeMap::new();
+    let mut total = 0;
+    for n in 0..produced {
+        let initialising = engine.init_producer(None, 10_000, Some(-1), Some(-1));
+        let producer = initialising.await?;
+        let value = bytes::Bytes::copy_from_slice(common::alphanumeric_string(15).as_bytes());
+        total += value.len();
 
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
+        let batch = inflated::Batch::builder().record(Record::builder().value(Some(value.clone())));
+        let batch = batch.producer_id(producer.id);
+        let batch = batch.producer_epoch(producer.epoch).build()?;
+        let deflated = deflated::Batch::try_from(batch)?;
+        tracing::debug!(n, bytes = total, batch = ?deflated);
 
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let num_partitions = 6;
-    let replication_factor = 0;
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let topic_id = sc
-        .create_topic(
-            CreatableTopic::default()
-                .name(topic_name.clone())
-                .num_partitions(num_partitions)
-                .replication_factor(replication_factor)
-                .assignments(assignments.clone())
-                .configs(configs.clone()),
-            false,
-        )
-        .await?;
-    debug!(?topic_id);
-
-    let transaction_timeout_ms = 10_000;
-
-    let partition_index = rng().random_range(0..num_partitions);
-    let topition = Topition::new(topic_name.clone(), partition_index);
-
-    let list_offsets = sc
-        .list_offsets(
-            IsolationLevel::ReadUncommitted,
-            &[(topition.clone(), ListOffset::Latest)],
-        )
-        .await
-        .inspect_err(|err| error!(?err))
-        .inspect(|list_offsets| debug!(?list_offsets))?;
-
-    assert_eq!(1, list_offsets.len());
-
-    assert!(matches!(
-        list_offsets[0].1,
-        ListOffsetResponse {
-            offset: Some(0),
-            ..
-        }
-    ));
-
-    let record_count = 6;
-
-    let mut offset_producer = BTreeMap::new();
-    let mut bytes = 0;
-
-    for n in 0..record_count {
-        let producer = sc
-            .init_producer(None, transaction_timeout_ms, Some(-1), Some(-1))
-            .await?;
-
-        let value = Bytes::copy_from_slice(alphanumeric_string(15).as_bytes());
-        bytes += value.len();
-
-        let batch = inflated::Batch::builder()
-            .record(Record::builder().value(value.clone().into()))
-            .producer_id(producer.id)
-            .producer_epoch(producer.epoch)
-            .build()
-            .and_then(TryInto::try_into)
-            .inspect(|deflated| debug!(?deflated))?;
-
-        debug!(n, bytes, ?batch);
-
-        let offset = sc
-            .produce(None, &topition, batch)
-            .await
-            .inspect(|offset| debug!(?offset))?;
-
-        debug!(offset);
-
-        assert_eq!(None, offset_producer.insert(offset, (producer, value)));
+        let producing = engine.produce(None, &topition, deflated);
+        let offset = producing.await?;
+        tracing::debug!(offset);
+        assert_eq!(None, offsets.insert(offset, (producer, value)));
     }
 
-    let list_offsets = sc
-        .list_offsets(
-            IsolationLevel::ReadUncommitted,
-            &[(topition.clone(), ListOffset::Latest)],
-        )
-        .await
-        .inspect_err(|err| error!(?err))
-        .inspect(|list_offsets| debug!(?list_offsets))?;
-
-    assert_eq!(1, list_offsets.len());
-
-    assert!(matches!(
-        list_offsets[0].1,
-        ListOffsetResponse {
-            offset: Some(records),
-            ..
-            } if records == record_count
-    ));
-
-    let max_wait_ms = 500;
-    let min_bytes = 1;
-    let max_bytes = Some(50 * 1024);
-    let isolation_level = &IsolationLevel::ReadUncommitted;
-    let topics = [FetchTopic::default()
-        .topic(Some(topition.topic().to_string()))
-        .topic_id(Some(NULL_TOPIC_ID))
-        .partitions(Some(vec![
-            FetchPartition::default()
-                .partition(topition.partition())
-                .current_leader_epoch(Some(-1))
-                .fetch_offset(0)
-                .last_fetched_epoch(Some(-1))
-                .log_start_offset(Some(-1))
-                .partition_max_bytes(50 * 1024)
-                .replica_directory_id(None),
-        ]))];
-
-    let ctx = Context::with_state(sc);
-
-    let fetch = FetchService
-        .serve(
-            ctx,
-            FetchRequest::default()
-                .max_wait_ms(max_wait_ms)
-                .min_bytes(min_bytes)
-                .max_bytes(max_bytes)
-                .isolation_level(Some(isolation_level.into()))
-                .topics(Some(topics.into())),
-        )
-        .await?;
-
-    assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(fetch.error_code.unwrap())?
-    );
-
-    assert_eq!(
-        record_count,
-        fetch
-            .responses
-            .unwrap_or_default()
-            .iter()
-            .map(|response| {
-                response
-                    .partitions
-                    .as_deref()
-                    .unwrap_or(&[])
-                    .iter()
-                    .map(|partition| {
-                        partition
-                            .records
-                            .as_ref()
-                            .unwrap()
-                            .batches
-                            .iter()
-                            .map(|batch| batch.record_count as i64)
-                            .sum::<i64>()
-                    })
-                    .sum::<i64>()
-            })
-            .sum::<i64>()
-    );
-
+    assert_eq!(Some(produced), latest(&engine, &topition).await?);
+    assert_eq!(produced, records(&fetched(engine, &topition).await?));
     Ok(())
 }

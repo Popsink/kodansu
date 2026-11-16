@@ -734,6 +734,13 @@ fmt:
 # `Topic` fixture with `described` and `alter_policy` carries them, and the
 # cited #225 notes move unchanged. The ceiling rises because only code went:
 # the comment count did not move.
+#   defork  -167 lines, the fetch tests on shared helpers  3004 -> 3004  2.6998 -> 2.7034
+#
+# `tansu-broker/tests/fetch.rs` created a topic, listed its latest offset,
+# built a fetch and summed the fetched records inline in both tests.
+# `a_partition`, `latest`, `fetched`, `batches` and `records` carry them, and
+# the cited #552 note moves unchanged. The ceiling rises because only code
+# went: the comment count did not move.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -744,7 +751,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6998" top="12":
+comments ceiling="2.7034" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
