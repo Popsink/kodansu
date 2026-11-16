@@ -807,6 +807,13 @@ fmt:
 # `joined`, `members` and `handed_to` carry the rest, and a narrating comment
 # becomes a test's doc. The ceiling rises because code went faster than the
 # comments that counted.
+#   defork  -223 lines, the decode bench over hex fixtures  2926 -> 2926  2.6800 -> 2.6856
+#
+# `tansu-sans-io/benches/decode_bench.rs` wrote each of its three captured
+# request frames as a decimal byte table inside its own bench function. The
+# frames are hex constants of the same bytes, benched by name from one
+# table, and the cited #555 `too_many_lines` allow the tables needed goes.
+# The ceiling rises because only code went: the comment count did not move.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -817,7 +824,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6800" top="12":
+comments ceiling="2.6856" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

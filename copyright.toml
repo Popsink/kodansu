@@ -92,7 +92,6 @@ inherited = [
     "tansu-model/src/error.rs",
     "tansu-model/src/lib.rs",
     "tansu-model/src/wv.rs",
-    "tansu-sans-io/benches/decode_bench.rs",
     "tansu-sans-io/build.rs",
     "tansu-sans-io/src/acl.rs",
     "tansu-sans-io/src/consumer.rs",
