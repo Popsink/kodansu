@@ -798,6 +798,15 @@ fmt:
 # a named constant and its own assertion, under narrating comments
 # (`// compression round-trip`). One `round_trip` helper takes the values,
 # eleven tests take the nineteen, and the narration goes.
+#   defork  -347 lines, the sans-io consumer tests on shared helpers  2931 -> 2926  2.6777 -> 2.6800
+#
+# `tansu-sans-io/tests/consumer.rs` repeated the same decode, assert and
+# re-encode body around each wire fixture, and the same builder and
+# JoinGroupResponse around each `GroupConsumer` step. The fixtures are hex
+# constants of the same bytes, `assert_subscribed`, `assert_assigned`,
+# `joined`, `members` and `handed_to` carry the rest, and a narrating comment
+# becomes a test's doc. The ceiling rises because code went faster than the
+# comments that counted.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -808,7 +817,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6777" top="12":
+comments ceiling="2.6800" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
