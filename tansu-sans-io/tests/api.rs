@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,415 +12,222 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::process::{ExitCode, Termination as _};
-use std::time::{Duration, SystemTime};
+//! The crate's small public types: a frame's header accessors, and each
+//! enum and flag set carried on the wire as an integer, round-tripped.
 
-use bytes::Bytes;
-use tansu_sans_io::{
-    Ack, ApiKey as _, BatchAttribute, Body, Compression, ConfigResource, ConfigSource, ConfigType,
-    ControlBatch, CoordinatorType, EndTransactionMarker, EndpointType, ErrorCode, FetchRequest,
-    FetchResponse, Frame, Header, IsolationLevel, ListOffset, MaximumAllocationSize, OpType,
-    Result, TimestampType, to_system_time, to_timestamp,
-};
+use std::fmt::Debug;
+use std::process::ExitCode;
+use std::process::Termination as _;
+use std::time::Duration;
+use std::time::SystemTime;
+
+use tansu_sans_io::{Ack, ApiKey as _, BatchAttribute, Body, Compression, ConfigResource};
+use tansu_sans_io::{ConfigSource, ConfigType, ControlBatch, CoordinatorType};
+use tansu_sans_io::{EndTransactionMarker, EndpointType, ErrorCode, FetchRequest, FetchResponse};
+use tansu_sans_io::{Frame, Header, IsolationLevel, ListOffset, MaximumAllocationSize as _};
+use tansu_sans_io::{OpType, TimestampType, to_system_time, to_timestamp};
+
+type Octets = bytes::Bytes;
+
+/// Asserts that each of `wire` converts to `T` and back unchanged.
+fn round_trip<W, T>(wire: impl IntoIterator<Item = W>)
+where
+    W: Copy + Debug + PartialEq + From<T>,
+    T: TryFrom<W, Error: Debug>,
+{
+    for value in wire {
+        let typed = T::try_from(value).unwrap_or_else(|error| panic!("{value:?}: {error:?}"));
+        assert_eq!(value, W::from(typed));
+    }
+}
+
+/// `1.7e12` milliseconds after the epoch, as a `SystemTime`.
+fn november_2023() -> (i64, SystemTime) {
+    let millis = 1_700_000_000_000_i64;
+    (
+        millis,
+        SystemTime::UNIX_EPOCH + Duration::from_millis(millis.unsigned_abs()),
+    )
+}
+
+/// `body` under `header`, its size left for the encoder.
+fn framed(header: Header, body: Body) -> Frame {
+    let size = i32::default();
+    Frame { size, header, body }
+}
 
 #[test]
-fn frame() -> Result<()> {
-    let api_version = 6;
-    let correlation_id = 32123;
-    let client_id = "client";
-
-    let request = Frame {
-        size: Default::default(),
-        header: Header::Request {
-            api_key: FetchRequest::KEY,
-            api_version,
-            correlation_id,
-            client_id: Some(client_id.into()),
-        },
-        body: Body::FetchRequest(FetchRequest::default()),
+fn a_request_frame_has_header_fields_a_response_frame_does_not() -> tansu_sans_io::Result<()> {
+    let (key, version, correlation, client) = (FetchRequest::KEY, 6, 32123, "client");
+    let header = Header::Request {
+        api_key: key,
+        api_version: version,
+        correlation_id: correlation,
+        client_id: Some(String::from(client)),
     };
+    let request = framed(header, FetchRequest::default().into());
+    let key_and_version = (request.api_key()?, request.api_version()?);
+    assert_eq!((key, version), key_and_version);
+    assert_eq!(correlation, request.correlation_id()?);
+    let named = (request.api_name(), request.client_id()?);
+    assert_eq!(("FetchRequest", Some(client)), named);
 
-    assert_eq!(FetchRequest::KEY, request.api_key()?);
-    assert_eq!(api_version, request.api_version()?);
-    assert_eq!("FetchRequest", request.api_name());
-    assert_eq!(correlation_id, request.correlation_id()?);
-    assert_eq!(Some(client_id), request.client_id()?);
-
-    let response = Frame {
-        size: Default::default(),
-        header: Header::Response { correlation_id },
-        body: Body::FetchResponse(FetchResponse::default()),
+    let header = Header::Response {
+        correlation_id: correlation,
     };
-
-    assert!(response.api_key().is_err());
-    assert!(response.api_version().is_err());
-    assert_eq!("FetchResponse", response.api_name());
-    assert_eq!(correlation_id, response.correlation_id()?);
-    assert!(response.client_id().is_err());
-
+    let answer = framed(header, FetchResponse::default().into());
+    assert_eq!("FetchResponse", answer.api_name());
+    assert_eq!(correlation, answer.correlation_id()?);
+    let missing = (answer.api_key().is_err(), answer.api_version().is_err());
+    assert_eq!(
+        (true, true, true),
+        (missing.0, missing.1, answer.client_id().is_err())
+    );
     Ok(())
 }
 
 #[test]
-fn error_code() -> Result<()> {
-    for error_code in -1..120 {
-        assert_eq!(error_code, ErrorCode::try_from(error_code).map(i16::from)?);
+fn error_codes_round_trip_and_report_as_exit_codes() {
+    round_trip::<i16, ErrorCode>(-1..120);
+    let reported = (
+        ErrorCode::None.report(),
+        ErrorCode::UnknownMemberId.report(),
+    );
+    assert_eq!((ExitCode::SUCCESS, ExitCode::FAILURE), reported);
+}
+
+#[test]
+fn small_enums_round_trip() {
+    round_trip::<i8, IsolationLevel>([0, 1]);
+    round_trip::<i16, Ack>([-1, 0, 1]);
+    round_trip::<i16, Compression>(0..=4);
+    round_trip::<i8, CoordinatorType>([0, 1, 2]);
+    round_trip::<i8, OpType>(0..=3);
+}
+
+#[test]
+fn small_enums_refuse_the_next_value() {
+    assert!(Compression::try_from(5_i16).is_err());
+    assert!(CoordinatorType::try_from(3_i8).is_err());
+    assert!(OpType::try_from(4_i8).is_err());
+}
+
+#[test]
+fn timestamp_types_are_create_time_and_log_append_time() {
+    round_trip::<i16, TimestampType>([0, 8]);
+    assert_eq!(TimestampType::CreateTime, TimestampType::from(0));
+    assert_eq!(TimestampType::LogAppendTime, TimestampType::from(8));
+}
+
+/// Values outside each enum read as `Unknown`, which is 0 on the wire.
+#[test]
+fn open_enums_round_trip_and_read_anything_else_as_unknown() {
+    round_trip::<i8, EndpointType>(0..=2);
+    round_trip::<i8, ConfigResource>([2, 4, 8, 16, 32]);
+    round_trip::<i8, ConfigSource>(1..=8);
+    round_trip::<i8, ConfigType>(1..=9);
+
+    assert_eq!(0, i8::from(EndpointType::from(99)));
+    assert_eq!(0, i8::from(ConfigResource::from(99)));
+    assert_eq!(0, i8::from(ConfigSource::from(99)));
+    assert_eq!(
+        (0, 0),
+        (
+            i8::from(ConfigType::from(99)),
+            i8::from(ConfigType::from(0))
+        )
+    );
+
+    let as_i32 = (
+        i32::from(ConfigResource::Topic),
+        i32::from(ConfigResource::Broker),
+    );
+    assert_eq!((2, 4), as_i32);
+}
+
+#[test]
+fn batch_attributes_round_trip_bit_by_bit() -> tansu_sans_io::Result<()> {
+    let unset = i16::from(BatchAttribute::default());
+    let back = BatchAttribute::try_from(unset)?;
+    assert_eq!(BatchAttribute::default(), back);
+    round_trip::<i16, BatchAttribute>(0..=4);
+
+    let timestamped = BatchAttribute::try_from(8_i16)?;
+    assert_eq!(TimestampType::LogAppendTime, timestamped.timestamp);
+    assert!(BatchAttribute::try_from(16_i16)?.transaction);
+    assert!(BatchAttribute::try_from(32_i16)?.control);
+    assert!(BatchAttribute::try_from(64_i16)?.delete_horizon);
+
+    let gzip_log_append_txn_control_horizon = 1 | 8 | 16 | 32 | 64;
+    round_trip::<i16, BatchAttribute>([gzip_log_append_txn_control_horizon]);
+    Ok(())
+}
+
+#[test]
+fn control_batches_and_end_markers_round_trip_through_bytes() -> tansu_sans_io::Result<()> {
+    let committed = ControlBatch::default().commit();
+    assert_eq!((true, false), (committed.is_commit(), committed.is_abort()));
+    let aborted = ControlBatch::default().abort();
+    assert_eq!((false, true), (aborted.is_commit(), aborted.is_abort()));
+
+    for control in [
+        ControlBatch::default().version(1).commit(),
+        ControlBatch::default().version(1).abort(),
+    ] {
+        let encoded = Octets::try_from(control.clone())?;
+        assert_eq!(control, ControlBatch::try_from(encoded)?);
     }
 
+    let (version, coordinator_epoch) = (1, 42);
+    let ended = EndTransactionMarker {
+        version,
+        coordinator_epoch,
+    };
+    let encoded = Octets::try_from(ended.clone())?;
+    assert_eq!(ended, EndTransactionMarker::try_from(encoded)?);
     Ok(())
 }
 
 #[test]
-fn termination() {
-    assert_eq!(ExitCode::SUCCESS, ErrorCode::None.report());
-    assert_eq!(ExitCode::FAILURE, ErrorCode::UnknownMemberId.report());
-}
+fn milliseconds_convert_to_system_time_and_back() -> tansu_sans_io::Result<()> {
+    let epoch = to_system_time(0)?;
+    assert_eq!((SystemTime::UNIX_EPOCH, 0), (epoch, to_timestamp(&epoch)?));
 
-#[test]
-fn isolation_level() -> Result<()> {
-    const READ_UNCOMMITTED: i8 = 0;
+    let (millis, expected) = november_2023();
+    let converted = to_system_time(millis)?;
+    assert_eq!((expected, millis), (converted, to_timestamp(&converted)?));
 
-    assert_eq!(
-        READ_UNCOMMITTED,
-        IsolationLevel::try_from(READ_UNCOMMITTED).map(i8::from)?
+    assert!(
+        to_system_time(-1).is_err(),
+        "a millisecond before the epoch"
     );
-
-    const READ_COMMITTED: i8 = 1;
-
-    assert_eq!(
-        READ_COMMITTED,
-        IsolationLevel::try_from(READ_COMMITTED).map(i8::from)?
-    );
-
     Ok(())
 }
 
+/// -2 and -1 are the earliest and latest offsets; anything else below zero
+/// is not a time.
 #[test]
-fn ack() -> Result<()> {
-    const FULL_ISR: i16 = -1;
-    const NONE: i16 = 0;
-    const LEADER: i16 = 1;
-
-    assert_eq!(FULL_ISR, Ack::try_from(FULL_ISR).map(i16::from)?);
-    assert_eq!(NONE, Ack::try_from(NONE).map(i16::from)?);
-    assert_eq!(LEADER, Ack::try_from(LEADER).map(i16::from)?);
-
-    Ok(())
-}
-
-#[test]
-fn timestamp_type() {
-    const CREATE_TIME: i16 = 0;
-    const LOG_APPEND_TIME: i16 = 8;
-
-    assert_eq!(CREATE_TIME, i16::from(TimestampType::from(CREATE_TIME)));
-    assert_eq!(
-        LOG_APPEND_TIME,
-        i16::from(TimestampType::from(LOG_APPEND_TIME))
-    );
-
-    assert_eq!(TimestampType::CreateTime, TimestampType::from(CREATE_TIME));
-    assert_eq!(
-        TimestampType::LogAppendTime,
-        TimestampType::from(LOG_APPEND_TIME)
-    );
-}
-
-#[test]
-fn compression() -> Result<()> {
-    const NONE: i16 = 0;
-    const GZIP: i16 = 1;
-    const SNAPPY: i16 = 2;
-    const LZ4: i16 = 3;
-    const ZSTD: i16 = 4;
-
-    assert_eq!(NONE, Compression::try_from(NONE).map(i16::from)?);
-    assert_eq!(GZIP, Compression::try_from(GZIP).map(i16::from)?);
-    assert_eq!(SNAPPY, Compression::try_from(SNAPPY).map(i16::from)?);
-    assert_eq!(LZ4, Compression::try_from(LZ4).map(i16::from)?);
-    assert_eq!(ZSTD, Compression::try_from(ZSTD).map(i16::from)?);
-
-    assert!(Compression::try_from(5i16).is_err());
-
-    Ok(())
-}
-
-#[test]
-fn batch_attribute() -> Result<()> {
-    // default round-trips to 0
-    assert_eq!(
-        BatchAttribute::default(),
-        BatchAttribute::try_from(i16::from(BatchAttribute::default()))?
-    );
-
-    // compression round-trip
-    for value in 0i16..=4 {
-        let attr = BatchAttribute::try_from(value)?;
-        assert_eq!(value, i16::from(attr));
+fn list_offsets_round_trip_through_their_wire_timestamps() -> tansu_sans_io::Result<()> {
+    for sentinel in [-2_i64, -1] {
+        assert_eq!(sentinel, i64::try_from(ListOffset::try_from(sentinel)?)?);
     }
 
-    // timestamp bit
-    let attr = BatchAttribute::try_from(8i16)?;
-    assert_eq!(TimestampType::LogAppendTime, attr.timestamp);
+    let (millis, at) = november_2023();
+    let listed = ListOffset::try_from(millis)?;
+    assert_eq!(ListOffset::Timestamp(at), listed);
+    assert_eq!(millis, i64::try_from(listed)?);
 
-    // transaction bit
-    let attr = BatchAttribute::try_from(16i16)?;
-    assert!(attr.transaction);
-
-    // control bit
-    let attr = BatchAttribute::try_from(32i16)?;
-    assert!(attr.control);
-
-    // delete horizon bit
-    let attr = BatchAttribute::try_from(64i16)?;
-    assert!(attr.delete_horizon);
-
-    // combined: gzip + log_append_time + transaction + control + delete_horizon
-    let combined: i16 = 1 | 8 | 16 | 32 | 64;
-    let attr = BatchAttribute::try_from(combined)?;
-    assert_eq!(combined, i16::from(attr));
-
+    assert!(ListOffset::try_from(-3_i64).is_err());
     Ok(())
 }
 
+/// A string's prefix, a `u16` length, plus its bytes; a missing string, the
+/// `u32` the absent case reserves.
 #[test]
-fn control_batch() -> Result<()> {
-    let commit = ControlBatch::default().commit();
-    assert!(commit.is_commit());
-    assert!(!commit.is_abort());
-
-    let abort = ControlBatch::default().abort();
-    assert!(abort.is_abort());
-    assert!(!abort.is_commit());
-
-    // round-trip through Bytes
-    let commit = ControlBatch::default().version(1).commit();
-    let encoded = Bytes::try_from(commit.clone())?;
-    let decoded = ControlBatch::try_from(encoded)?;
-    assert_eq!(commit, decoded);
-
-    let abort = ControlBatch::default().version(1).abort();
-    let encoded = Bytes::try_from(abort.clone())?;
-    let decoded = ControlBatch::try_from(encoded)?;
-    assert_eq!(abort, decoded);
-
-    Ok(())
-}
-
-#[test]
-fn end_transaction_marker() -> Result<()> {
-    let marker = EndTransactionMarker {
-        version: 1,
-        coordinator_epoch: 42,
-    };
-
-    let encoded = Bytes::try_from(marker.clone())?;
-    let decoded = EndTransactionMarker::try_from(encoded)?;
-    assert_eq!(marker, decoded);
-
-    Ok(())
-}
-
-#[test]
-fn endpoint_type() {
-    const UNKNOWN: i8 = 0;
-    const BROKER: i8 = 1;
-    const CONTROLLER: i8 = 2;
-
-    assert_eq!(UNKNOWN, i8::from(EndpointType::from(UNKNOWN)));
-    assert_eq!(BROKER, i8::from(EndpointType::from(BROKER)));
-    assert_eq!(CONTROLLER, i8::from(EndpointType::from(CONTROLLER)));
-
-    // unrecognized values map to Unknown
-    assert_eq!(UNKNOWN, i8::from(EndpointType::from(99)));
-}
-
-#[test]
-fn coordinator_type() -> Result<()> {
-    const GROUP: i8 = 0;
-    const TRANSACTION: i8 = 1;
-    const SHARE: i8 = 2;
-
-    assert_eq!(GROUP, CoordinatorType::try_from(GROUP).map(i8::from)?);
-    assert_eq!(
-        TRANSACTION,
-        CoordinatorType::try_from(TRANSACTION).map(i8::from)?
-    );
-    assert_eq!(SHARE, CoordinatorType::try_from(SHARE).map(i8::from)?);
-
-    assert!(CoordinatorType::try_from(3i8).is_err());
-
-    Ok(())
-}
-
-#[test]
-fn config_resource() {
-    const TOPIC: i8 = 2;
-    const BROKER: i8 = 4;
-    const BROKER_LOGGER: i8 = 8;
-    const CLIENT_METRIC: i8 = 16;
-    const GROUP: i8 = 32;
-
-    assert_eq!(TOPIC, i8::from(ConfigResource::from(TOPIC)));
-    assert_eq!(BROKER, i8::from(ConfigResource::from(BROKER)));
-    assert_eq!(BROKER_LOGGER, i8::from(ConfigResource::from(BROKER_LOGGER)));
-    assert_eq!(CLIENT_METRIC, i8::from(ConfigResource::from(CLIENT_METRIC)));
-    assert_eq!(GROUP, i8::from(ConfigResource::from(GROUP)));
-
-    // unrecognized values map to Unknown
-    assert_eq!(0i8, i8::from(ConfigResource::from(99)));
-
-    // i32 conversion
-    assert_eq!(2i32, i32::from(ConfigResource::Topic));
-    assert_eq!(4i32, i32::from(ConfigResource::Broker));
-}
-
-#[test]
-fn config_source() {
-    const DYNAMIC_TOPIC_CONFIG: i8 = 1;
-    const DYNAMIC_BROKER_CONFIG: i8 = 2;
-    const DYNAMIC_DEFAULT_BROKER_CONFIG: i8 = 3;
-    const STATIC_BROKER_CONFIG: i8 = 4;
-    const DEFAULT_CONFIG: i8 = 5;
-    const DYNAMIC_BROKER_LOGGER_CONFIG: i8 = 6;
-    const DYNAMIC_CLIENT_METRICS_CONFIG: i8 = 7;
-    const DYNAMIC_GROUP_CONFIG: i8 = 8;
-
-    assert_eq!(
-        DYNAMIC_TOPIC_CONFIG,
-        i8::from(ConfigSource::from(DYNAMIC_TOPIC_CONFIG))
-    );
-    assert_eq!(
-        DYNAMIC_BROKER_CONFIG,
-        i8::from(ConfigSource::from(DYNAMIC_BROKER_CONFIG))
-    );
-    assert_eq!(
-        DYNAMIC_DEFAULT_BROKER_CONFIG,
-        i8::from(ConfigSource::from(DYNAMIC_DEFAULT_BROKER_CONFIG))
-    );
-    assert_eq!(
-        STATIC_BROKER_CONFIG,
-        i8::from(ConfigSource::from(STATIC_BROKER_CONFIG))
-    );
-    assert_eq!(DEFAULT_CONFIG, i8::from(ConfigSource::from(DEFAULT_CONFIG)));
-    assert_eq!(
-        DYNAMIC_BROKER_LOGGER_CONFIG,
-        i8::from(ConfigSource::from(DYNAMIC_BROKER_LOGGER_CONFIG))
-    );
-    assert_eq!(
-        DYNAMIC_CLIENT_METRICS_CONFIG,
-        i8::from(ConfigSource::from(DYNAMIC_CLIENT_METRICS_CONFIG))
-    );
-    assert_eq!(
-        DYNAMIC_GROUP_CONFIG,
-        i8::from(ConfigSource::from(DYNAMIC_GROUP_CONFIG))
-    );
-
-    // unrecognized values map to Unknown
-    assert_eq!(0i8, i8::from(ConfigSource::from(99)));
-}
-
-#[test]
-fn op_type() -> Result<()> {
-    const SET: i8 = 0;
-    const DELETE: i8 = 1;
-    const APPEND: i8 = 2;
-    const SUBTRACT: i8 = 3;
-
-    assert_eq!(SET, OpType::try_from(SET).map(i8::from)?);
-    assert_eq!(DELETE, OpType::try_from(DELETE).map(i8::from)?);
-    assert_eq!(APPEND, OpType::try_from(APPEND).map(i8::from)?);
-    assert_eq!(SUBTRACT, OpType::try_from(SUBTRACT).map(i8::from)?);
-
-    assert!(OpType::try_from(4i8).is_err());
-
-    Ok(())
-}
-
-#[test]
-fn system_time_and_timestamp() -> Result<()> {
-    // epoch converts to 0 and back
-    let epoch_millis: i64 = 0;
-    let system_time = to_system_time(epoch_millis)?;
-    assert_eq!(SystemTime::UNIX_EPOCH, system_time);
-    assert_eq!(epoch_millis, to_timestamp(&system_time)?);
-
-    // a known timestamp round-trips
-    let millis: i64 = 1_700_000_000_000;
-    let system_time = to_system_time(millis)?;
-    assert_eq!(
-        SystemTime::UNIX_EPOCH + Duration::from_millis(millis as u64),
-        system_time
-    );
-    assert_eq!(millis, to_timestamp(&system_time)?);
-
-    // negative timestamp is an error
-    assert!(to_system_time(-1).is_err());
-
-    Ok(())
-}
-
-#[test]
-fn list_offset() -> Result<()> {
-    const EARLIEST: i64 = -2;
-    const LATEST: i64 = -1;
-
-    // Earliest round-trips
-    assert_eq!(EARLIEST, i64::try_from(ListOffset::try_from(EARLIEST)?)?);
-
-    // Latest round-trips
-    assert_eq!(LATEST, i64::try_from(ListOffset::try_from(LATEST)?)?);
-
-    // Timestamp round-trips
-    let millis: i64 = 1_700_000_000_000;
-    let offset = ListOffset::try_from(millis)?;
-    assert_eq!(
-        ListOffset::Timestamp(SystemTime::UNIX_EPOCH + Duration::from_millis(millis as u64)),
-        offset
-    );
-    assert_eq!(millis, i64::try_from(offset)?);
-
-    // negative values other than -1 and -2 are errors (can't convert to SystemTime)
-    assert!(ListOffset::try_from(-3i64).is_err());
-
-    Ok(())
-}
-
-#[test]
-fn config_type() {
-    const BOOLEAN: i8 = 1;
-    const STRING: i8 = 2;
-    const INT: i8 = 3;
-    const SHORT: i8 = 4;
-    const LONG: i8 = 5;
-    const DOUBLE: i8 = 6;
-    const LIST: i8 = 7;
-    const CLASS: i8 = 8;
-    const PASSWORD: i8 = 9;
-
-    assert_eq!(BOOLEAN, i8::from(ConfigType::from(BOOLEAN)));
-    assert_eq!(STRING, i8::from(ConfigType::from(STRING)));
-    assert_eq!(INT, i8::from(ConfigType::from(INT)));
-    assert_eq!(SHORT, i8::from(ConfigType::from(SHORT)));
-    assert_eq!(LONG, i8::from(ConfigType::from(LONG)));
-    assert_eq!(DOUBLE, i8::from(ConfigType::from(DOUBLE)));
-    assert_eq!(LIST, i8::from(ConfigType::from(LIST)));
-    assert_eq!(CLASS, i8::from(ConfigType::from(CLASS)));
-    assert_eq!(PASSWORD, i8::from(ConfigType::from(PASSWORD)));
-
-    // unrecognized values map to Unknown
-    assert_eq!(0i8, i8::from(ConfigType::from(99)));
-    assert_eq!(0i8, i8::from(ConfigType::from(0)));
-}
-
-#[test]
-fn allocation_size() -> Result<()> {
-    let mut q: Option<String> = Some("hey".into());
-
-    assert_eq!(size_of::<u16>() + 3, q.maximum_allocation_size()?);
-
-    q = None;
-    assert_eq!(size_of::<u32>(), q.maximum_allocation_size()?);
-
+fn an_optional_string_reports_its_maximum_allocation() -> tansu_sans_io::Result<()> {
+    let present = Some(String::from("hey"));
+    assert_eq!(size_of::<u16>() + 3, present.maximum_allocation_size()?);
+    let absent: Option<String> = None;
+    assert_eq!(size_of::<u32>(), absent.maximum_allocation_size()?);
     Ok(())
 }
