@@ -785,6 +785,13 @@ fmt:
 # assertions carry them; the #444 note stays once and the #177 notes move
 # unchanged, and the cited #555 allow the body's length needed goes. The
 # ceiling rises because code went faster than the comments that counted.
+#   defork  -94 lines, the broker test helpers rewritten  2954 -> 2951  2.6922 -> 2.6921
+#
+# `tansu-broker/tests/common/mod.rs` keeps every helper the test binaries
+# call, with the same arguments; the bodies are rebuilt in short `let`
+# steps, the unused `offset_fetch` goes, and `JoinResponse` becomes a
+# `Joined` struct whose two users, `cg_dynamic` and `cg_static`, follow.
+# A commented-out `debug!` and a narrating comment go.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -795,7 +802,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6922" top="12":
+comments ceiling="2.6921" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
