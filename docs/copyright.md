@@ -181,7 +181,8 @@ So is a bare crate flag (`#![no_main]`). libfuzzer supplies `main`, so every fuz
 target has to start with exactly that line, and there is no other way to write
 it. An attribute with arguments (`#![cfg_attr(…)]`, `#![doc = …]`) is still
 counted. The five small fuzz targets were rewritten and left `inherited` with
-this rule; `generate_seeds.rs` stays.
+this rule. `generate_seeds.rs` followed once its seeds became a table of hex
+strings, written to the same files with the same bytes.
 
 So is a bare `Ok(())` on its own line. It ends every test that returns a
 `Result`, and the four small `tansu-storage` tests rewritten in the same change
