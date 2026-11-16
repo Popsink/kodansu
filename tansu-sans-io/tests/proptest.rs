@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,329 +12,198 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Property-based tests for encode→decode round-trips (Gap 4.1).
-//!
-//! Verifies that arbitrary valid values of core types survive
-//! encode→decode without data loss or corruption.
+//! Encoding then decoding an arbitrary value gives the value back, for the
+//! varints, record headers, records and batches, and the size a varint
+//! reports is the size it encodes to.
 
-use bytes::{Buf as _, Bytes, BytesMut};
-use proptest::prelude::*;
-use serde::{Deserialize, Serialize};
-use tansu_sans_io::{
-    BatchAttribute, ByteSize, Compression, Decode, Decoder, Encode, Encoder,
-    primitive::varint::{LongVarInt, UnsignedVarInt, VarInt},
-    record::{self, Header, Record, deflated, inflated},
-};
+use bytes::Buf as _;
+use proptest::collection::vec;
+use proptest::prelude::{Just, ProptestConfig, Strategy, any};
+use proptest::{prop_assert_eq, prop_oneof};
+use tansu_sans_io::primitive::varint::{LongVarInt, UnsignedVarInt, VarInt};
+use tansu_sans_io::record::{Header, Record, deflated, inflated};
+use tansu_sans_io::{BatchAttribute, ByteSize as _, Compression};
+use tansu_sans_io::{Decode, Decoder, Encode as _, Encoder};
 
-// ---------------------------------------------------------------------------
-// Strategies
-// ---------------------------------------------------------------------------
+type Octets = bytes::Bytes;
 
-fn arb_optional_bytes(max_len: usize) -> impl Strategy<Value = Option<Bytes>> {
-    prop_oneof![
-        1 => Just(None),
-        3 => prop::collection::vec(any::<u8>(), 0..=max_len)
-                .prop_map(|v| Some(Bytes::from(v))),
-    ]
+/// Cases per record property, in place of proptest's default 256.
+const RECORD_CASES: u32 = 200;
+
+/// Cases per batch property.
+const BATCH_CASES: u32 = 50;
+
+/// The top of the batch timestamps generated: half of `i64::MAX`.
+const HALF_TIME: i64 = i64::MAX / 2;
+
+/// Up to `most` arbitrary bytes, as one time in four nothing at all.
+fn maybe_octets(most: usize) -> impl Strategy<Value = Option<Octets>> {
+    let some = vec(any::<u8>(), 0..=most).prop_map(|raw| Some(Octets::from(raw)));
+    prop_oneof![1 => Just(None), 3 => some]
 }
 
-fn arb_bytes(max_len: usize) -> impl Strategy<Value = Bytes> {
-    prop::collection::vec(any::<u8>(), 0..=max_len).prop_map(Bytes::from)
+fn octets(most: usize) -> impl Strategy<Value = Octets> {
+    vec(any::<u8>(), 0..=most).prop_map(Octets::from)
 }
 
-fn arb_record_header() -> impl Strategy<Value = Header> {
-    (arb_optional_bytes(64), arb_optional_bytes(64)).prop_map(|(key, value)| Header { key, value })
+fn record_header() -> impl Strategy<Value = Header> {
+    let pair = (maybe_octets(64), maybe_octets(64));
+    pair.prop_map(|(key, value)| Header { key, value })
 }
 
-// Compression codecs that support both inflate and deflate.
-// Snappy is excluded because `into_record_data` does not implement
-// snappy encoding (only decoding is supported).
-fn arb_compression() -> impl Strategy<Value = Compression> {
-    prop_oneof![
-        Just(Compression::None),
-        Just(Compression::Gzip),
-        Just(Compression::Lz4),
-        Just(Compression::Zstd),
-    ]
+/// The codecs that compress as well as decompress: snappy is left out, as
+/// `into_record_data` only decodes it.
+fn codec() -> impl Strategy<Value = Compression> {
+    let both_ways = [
+        Compression::None,
+        Compression::Gzip,
+        Compression::Lz4,
+        Compression::Zstd,
+    ];
+    proptest::sample::select(both_ways.to_vec())
 }
 
-/// Serde round-trip helper: serialize with Encoder, deserialize with Decoder.
-fn serde_roundtrip<T>(value: &T) -> tansu_sans_io::Result<T>
+/// `value` through [`Encoder`] and back through [`Decoder`].
+fn through_serde<T>(value: &T) -> tansu_sans_io::Result<T>
 where
-    T: Serialize + for<'de> Deserialize<'de>,
+    T: serde::Serialize + for<'de> serde::Deserialize<'de>,
 {
-    let mut encoder = Encoder::new(BytesMut::new());
-    value.serialize(&mut encoder)?;
-
-    let mut encoded = Bytes::from(encoder).reader();
-
-    let mut decoder = Decoder::new(&mut encoded);
-    T::deserialize(&mut decoder)
+    let mut encoder = Encoder::new(bytes::BytesMut::new());
+    serde::Serialize::serialize(value, &mut encoder)?;
+    let mut wire = Octets::from(encoder).reader();
+    T::deserialize(&mut Decoder::new(&mut wire))
 }
 
-// ---------------------------------------------------------------------------
-// VarInt round-trip
-// ---------------------------------------------------------------------------
-
-proptest! {
-    #[test]
-    fn varint_encode_decode_roundtrip(value in any::<i32>()) {
-        let original = VarInt(value);
-        let mut encoded = original.encode()?;
-        let decoded = VarInt::decode(&mut encoded)?;
-
-        prop_assert_eq!(original, decoded);
-        prop_assert_eq!(0, encoded.len(), "all bytes consumed");
-    }
-
-    #[test]
-    fn varint_zigzag_identity(value in any::<i32>()) {
-        let original = VarInt(value);
-        let mut encoded = original.encode()?;
-        let decoded = VarInt::decode(&mut encoded)?;
-        prop_assert_eq!(value, decoded.0);
-    }
-
-    #[test]
-    fn varint_size_matches_encoding(value in any::<i32>()) {
-        let v = VarInt(value);
-        let encoded = v.encode()?;
-        let reported = v.size_in_bytes()?;
-        prop_assert_eq!(reported, encoded.len(),
-            "size_in_bytes must match actual encoded length");
-    }
+/// `value` through [`Encode`](tansu_sans_io::Encode) and back through
+/// [`Decode`], with the bytes left over.
+fn through_codec<T: tansu_sans_io::Encode + Decode>(
+    value: &T,
+) -> tansu_sans_io::Result<(T, usize)> {
+    let mut wire = value.encode()?;
+    let decoded = T::decode(&mut wire)?;
+    Ok((decoded, wire.len()))
 }
 
-// ---------------------------------------------------------------------------
-// UnsignedVarInt round-trip (serde-based, no Encode/Decode trait)
-// ---------------------------------------------------------------------------
-
-proptest! {
+proptest::proptest! {
     #[test]
-    fn unsigned_varint_serde_roundtrip(value in any::<u32>()) {
-        let original = UnsignedVarInt(value);
-        let decoded = serde_roundtrip(&original)?;
-        prop_assert_eq!(original, decoded);
+    fn a_varint_round_trips_at_its_reported_size(n in any::<i32>()) {
+        let varint = VarInt(n);
+        prop_assert_eq!((varint, 0), through_codec(&varint)?, "all bytes consumed");
+        prop_assert_eq!(varint.size_in_bytes()?, varint.encode()?.len(), "size_in_bytes");
     }
 
     #[test]
-    fn unsigned_varint_size_consistency(value in any::<u32>()) {
-        let v = UnsignedVarInt(value);
-        let mut encoder = Encoder::new(BytesMut::new());
-        v.serialize(&mut encoder)?;
+    fn an_unsigned_varint_round_trips_at_its_reported_size(n in any::<u32>()) {
+        let varint = UnsignedVarInt(n);
+        prop_assert_eq!(varint, through_serde(&varint)?);
+        let mut encoder = Encoder::new(bytes::BytesMut::new());
+        serde::Serialize::serialize(&varint, &mut encoder)?;
+        prop_assert_eq!(varint.size_in_bytes()?, Octets::from(encoder).len(), "size_in_bytes");
+    }
 
-        let encoded = Bytes::from(encoder);
+    #[test]
+    fn a_long_varint_round_trips_at_its_reported_size(n in any::<i64>()) {
+        let varint = LongVarInt(n);
+        prop_assert_eq!((varint, 0), through_codec(&varint)?, "all bytes consumed");
+        prop_assert_eq!(varint.size_in_bytes()?, varint.encode()?.len(), "size_in_bytes");
+    }
 
-        let reported = v.size_in_bytes()?;
-        prop_assert_eq!(reported, encoded.len(),
-            "size_in_bytes must match actual serialized length");
+    #[test]
+    fn a_record_header_round_trips(key in maybe_octets(128), value in maybe_octets(128)) {
+        let header = Header { key, value };
+        prop_assert_eq!((header.clone(), 0), through_codec(&header)?, "all bytes consumed");
     }
 }
 
-// ---------------------------------------------------------------------------
-// LongVarInt round-trip
-// ---------------------------------------------------------------------------
-
-proptest! {
-    #[test]
-    fn long_varint_encode_decode_roundtrip(value in any::<i64>()) {
-        let original = LongVarInt(value);
-        let mut encoded = original.encode()?;
-        let decoded = LongVarInt::decode(&mut encoded)?;
-
-        prop_assert_eq!(original, decoded);
-        prop_assert_eq!(0, encoded.len(), "all bytes consumed");
-    }
+proptest::proptest! {
+    #![proptest_config(ProptestConfig::with_cases(RECORD_CASES))]
 
     #[test]
-    fn long_varint_size_matches_encoding(value in any::<i64>()) {
-        let v = LongVarInt(value);
-        let encoded = v.encode()?;
-        let reported = v.size_in_bytes()?;
-        prop_assert_eq!(reported, encoded.len(),
-            "size_in_bytes must match actual encoded length");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Record Header round-trip (Encode/Decode trait)
-// ---------------------------------------------------------------------------
-
-proptest! {
-    #[test]
-    fn record_header_encode_decode_roundtrip(
-        key in arb_optional_bytes(128),
-        value in arb_optional_bytes(128),
+    fn a_record_round_trips(
+        since_base in any::<i64>(),
+        nth in any::<i32>(),
+        key in maybe_octets(256),
+        value in maybe_octets(512),
+        headers in vec(record_header(), 0..=4),
     ) {
-        let original = Header { key, value };
-        let mut encoded = original.encode()?;
-        let decoded = Header::decode(&mut encoded)?;
+        let record = Record::builder().timestamp_delta(since_base);
+        let record = record.offset_delta(nth).key(key).value(value);
+        let record = headers.into_iter().fold(record, |record, Header { key, value }| {
+            let header = tansu_sans_io::record::Header::builder();
+            let header = if let Some(key) = key { header.key(key) } else { header };
+            let header = if let Some(value) = value { header.value(value) } else { header };
+            record.header(header)
+        });
 
-        prop_assert_eq!(&original, &decoded);
-        prop_assert_eq!(0, encoded.len(), "all bytes consumed");
+        let record = record.build()?;
+        prop_assert_eq!((record.clone(), 0), through_codec(&record)?, "all bytes consumed");
     }
 }
 
-// ---------------------------------------------------------------------------
-// Record round-trip (Encode/Decode trait)
-// ---------------------------------------------------------------------------
+proptest::proptest! {
+    #![proptest_config(ProptestConfig::with_cases(BATCH_CASES))]
 
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(200))]
-
+    /// Every field of the batch header but `attributes` survives deflating
+    /// and inflating again, and so do each record's key, value, deltas and
+    /// header count.
     #[test]
-    fn record_encode_decode_roundtrip(
-        timestamp_delta in any::<i64>(),
-        offset_delta in any::<i32>(),
-        key in arb_optional_bytes(256),
-        value in arb_optional_bytes(512),
-        headers in prop::collection::vec(arb_record_header(), 0..=4),
+    fn a_batch_deflates_and_inflates_back(
+        first in any::<i64>(),
+        leader_epoch in any::<i32>(),
+        earliest in 0..=HALF_TIME,
+        latest in 0..=HALF_TIME,
+        producer in any::<i64>(),
+        bump in any::<i16>(),
+        sequence in any::<i32>(),
+        compression in codec(),
+        keys in vec(maybe_octets(64), 1..=3),
+        values in vec(maybe_octets(64), 1..=3),
     ) {
-        let mut builder = Record::builder()
-            .timestamp_delta(timestamp_delta)
-            .offset_delta(offset_delta)
-            .key(key)
-            .value(value);
+        let attributes = BatchAttribute::default().compression(compression).into();
+        let batch = inflated::Batch::builder().base_offset(first).magic(2);
+        let batch = batch.partition_leader_epoch(leader_epoch).attributes(attributes);
+        let batch = batch.last_offset_delta(0).base_timestamp(earliest);
+        let batch = batch.max_timestamp(latest).producer_id(producer);
+        let batch = batch.producer_epoch(bump).base_sequence(sequence);
+        let pairs = keys.into_iter().zip(values);
+        let batch = pairs.fold(batch, |batch, (key, value)| {
+            batch.record(Record::builder().key(key).value(value))
+        });
+        let sent = batch.build()?;
 
-        for h in headers {
-            let hb = record::Header::builder();
-            let hb = match h.key {
-                Some(k) => hb.key(k),
-                None => hb,
-            };
-            let hb = match h.value {
-                Some(v) => hb.value(v),
-                None => hb,
-            };
-            builder = builder.header(hb);
-        }
+        let compressed = deflated::Batch::try_from(sent.clone())?;
+        prop_assert_eq!(sent.records.len(), compressed.record_count as usize);
+        let back = inflated::Batch::try_from(compressed)?;
 
-        let original = builder.build()?;
-        let mut encoded = original.encode()?;
-        let decoded = Record::decode(&mut encoded)?;
+        let header = |b: &inflated::Batch| {
+            let ids = (b.base_offset, b.partition_leader_epoch, b.magic, b.last_offset_delta);
+            let times = (b.base_timestamp, b.max_timestamp);
+            (ids, times, (b.producer_id, b.producer_epoch, b.base_sequence))
+        };
+        prop_assert_eq!(header(&sent), header(&back));
+        prop_assert_eq!(sent.records.len(), back.records.len());
 
-        prop_assert_eq!(&original, &decoded);
-        prop_assert_eq!(0, encoded.len(), "all bytes consumed");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// inflated::Batch → deflated::Batch → inflated::Batch round-trip
-// ---------------------------------------------------------------------------
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(50))]
-
-    #[test]
-    fn batch_inflate_deflate_roundtrip(
-        base_offset in any::<i64>(),
-        partition_leader_epoch in any::<i32>(),
-        base_timestamp in 0i64..=i64::MAX / 2,
-        max_timestamp in 0i64..=i64::MAX / 2,
-        producer_id in any::<i64>(),
-        producer_epoch in any::<i16>(),
-        base_sequence in any::<i32>(),
-        compression in arb_compression(),
-        rec_keys in prop::collection::vec(arb_optional_bytes(64), 1..=3),
-        rec_values in prop::collection::vec(arb_optional_bytes(64), 1..=3),
-    ) {
-        let attributes: i16 = BatchAttribute::default()
-            .compression(compression)
-            .into();
-
-        let mut builder = inflated::Batch::builder()
-            .base_offset(base_offset)
-            .partition_leader_epoch(partition_leader_epoch)
-            .magic(2)
-            .attributes(attributes)
-            .last_offset_delta(0)
-            .base_timestamp(base_timestamp)
-            .max_timestamp(max_timestamp)
-            .producer_id(producer_id)
-            .producer_epoch(producer_epoch)
-            .base_sequence(base_sequence);
-
-        let record_count = rec_keys.len().min(rec_values.len());
-        for i in 0..record_count {
-            builder = builder.record(
-                Record::builder()
-                    .key(rec_keys[i].clone())
-                    .value(rec_values[i].clone()),
-            );
-        }
-
-        let original = builder.build()?;
-
-        // inflated → deflated
-        let deflated = deflated::Batch::try_from(original.clone())?;
-        prop_assert_eq!(record_count as u32, deflated.record_count);
-
-        // deflated → inflated
-        let roundtripped = inflated::Batch::try_from(deflated)?;
-
-        prop_assert_eq!(original.base_offset, roundtripped.base_offset);
-        prop_assert_eq!(original.partition_leader_epoch, roundtripped.partition_leader_epoch);
-        prop_assert_eq!(original.magic, roundtripped.magic);
-        // prop_assert_eq!(original.attributes, roundtripped.attributes);
-        prop_assert_eq!(original.last_offset_delta, roundtripped.last_offset_delta);
-        prop_assert_eq!(original.base_timestamp, roundtripped.base_timestamp);
-        prop_assert_eq!(original.max_timestamp, roundtripped.max_timestamp);
-        prop_assert_eq!(original.producer_id, roundtripped.producer_id);
-        prop_assert_eq!(original.producer_epoch, roundtripped.producer_epoch);
-        prop_assert_eq!(original.base_sequence, roundtripped.base_sequence);
-        prop_assert_eq!(original.records.len(), roundtripped.records.len());
-
-        for (orig_rec, rt_rec) in original.records.iter().zip(roundtripped.records.iter()) {
-            prop_assert_eq!(&orig_rec.key, &rt_rec.key);
-            prop_assert_eq!(&orig_rec.value, &rt_rec.value);
-            prop_assert_eq!(orig_rec.timestamp_delta, rt_rec.timestamp_delta);
-            prop_assert_eq!(orig_rec.offset_delta, rt_rec.offset_delta);
-            prop_assert_eq!(orig_rec.headers.len(), rt_rec.headers.len());
+        let content = |r: &Record| {
+            (r.key.clone(), r.value.clone(), r.timestamp_delta, r.offset_delta, r.headers.len())
+        };
+        for (sent, back) in sent.records.iter().zip(&back.records) {
+            prop_assert_eq!(content(sent), content(back));
         }
     }
-}
-
-// ---------------------------------------------------------------------------
-// deflated::Batch encode→decode round-trip (Bytes conversion)
-// ---------------------------------------------------------------------------
-
-proptest! {
-    #![proptest_config(ProptestConfig::with_cases(50))]
 
     #[test]
-    fn deflated_batch_bytes_roundtrip(
-        base_offset in any::<i64>(),
-        base_timestamp in 0i64..=i64::MAX / 2,
-        producer_id in any::<i64>(),
-        value in arb_bytes(128),
+    fn a_deflated_batch_round_trips_through_bytes(
+        first in any::<i64>(),
+        at in 0..=HALF_TIME,
+        producer in any::<i64>(),
+        value in octets(128),
     ) {
-        let batch = inflated::Batch::builder()
-            .base_offset(base_offset)
-            .base_timestamp(base_timestamp)
-            .max_timestamp(base_timestamp)
-            .producer_id(producer_id)
-            .record(Record::builder().value(Some(value)))
-            .build()?;
+        let batch = inflated::Batch::builder().base_offset(first);
+        let batch = batch.base_timestamp(at).max_timestamp(at);
+        let batch = batch.producer_id(producer).record(Record::builder().value(Some(value)));
+        let compressed = deflated::Batch::try_from(batch.build()?)?;
 
-        let deflated = deflated::Batch::try_from(batch)?;
-
-        // deflated → Bytes → deflated
-        let encoded: Bytes = deflated.clone().into();
-        let decoded = deflated::Batch::try_from(encoded)?;
-
-        prop_assert_eq!(deflated.base_offset, decoded.base_offset);
-        prop_assert_eq!(deflated.batch_length, decoded.batch_length);
-        prop_assert_eq!(deflated.partition_leader_epoch, decoded.partition_leader_epoch);
-        prop_assert_eq!(deflated.magic, decoded.magic);
-        prop_assert_eq!(deflated.crc, decoded.crc);
-        prop_assert_eq!(deflated.attributes, decoded.attributes);
-        prop_assert_eq!(deflated.last_offset_delta, decoded.last_offset_delta);
-        prop_assert_eq!(deflated.base_timestamp, decoded.base_timestamp);
-        prop_assert_eq!(deflated.max_timestamp, decoded.max_timestamp);
-        prop_assert_eq!(deflated.producer_id, decoded.producer_id);
-        prop_assert_eq!(deflated.producer_epoch, decoded.producer_epoch);
-        prop_assert_eq!(deflated.base_sequence, decoded.base_sequence);
-        prop_assert_eq!(deflated.record_count, decoded.record_count);
-        prop_assert_eq!(deflated.record_data, decoded.record_data);
+        let wire: Octets = compressed.clone().into();
+        prop_assert_eq!(compressed, deflated::Batch::try_from(wire)?);
     }
 }
