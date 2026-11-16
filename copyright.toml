@@ -102,7 +102,6 @@ inherited = [
     "tansu-cli/src/lib.rs",
     "tansu-client/examples/create_topic.rs",
     "tansu-client/examples/fetch.rs",
-    "tansu-client/examples/group_consumer.rs",
     "tansu-client/examples/list_offsets.rs",
     "tansu-client/examples/metadata.rs",
     "tansu-client/examples/produce.rs",
