@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,386 +17,192 @@
 // it; with the module gone it belongs to the file.
 #![cfg(feature = "dynostore")]
 
-use std::{slice, sync::Arc};
+//! Committed offsets straight on the storage engine: committed, fetched, and
+//! gone once the topic or the group is deleted; and what an unknown topic,
+//! partition or group answers.
 
-use common::{alphanumeric_string, init_tracing, register_broker};
-use rand::{prelude::*, rng};
-use tansu_broker::Result;
-use tansu_sans_io::{ErrorCode, create_topics_request::CreatableTopic};
-use tansu_storage::{OffsetCommitRequest, Storage, Topition};
-use tracing::debug;
-use url::Url;
-use uuid::Uuid;
+use std::slice::from_ref;
+
+use rand::RngExt as _;
+use tansu_sans_io::ErrorCode;
+use tansu_sans_io::create_topics_request::CreatableTopic;
+use tansu_storage::{OffsetCommitRequest, Topition};
 
 pub mod common;
 
-async fn storage_container(cluster: impl Into<String>, node: i32) -> Result<Arc<dyn Storage>> {
-    common::storage_container(cluster, node, Url::parse("tcp://127.0.0.1/")?).await
+type Engine = std::sync::Arc<dyn tansu_storage::Storage>;
+
+const PARTITIONS: i32 = 6;
+
+/// A `memory://` engine with one broker, at a random node id, registered.
+async fn registered() -> tansu_broker::Result<Engine> {
+    let cluster = uuid::Uuid::now_v7();
+    let node = rand::rng().random_range(0..i32::MAX);
+    let listener = url::Url::parse("tcp://127.0.0.1/")?;
+    let engine = common::storage_container(cluster, node, listener).await?;
+    common::register_broker(cluster, node, engine.clone()).await?;
+    Ok(engine)
+}
+
+/// A random partition of a randomly named topic, which is created with
+/// six partitions only when `create` is set.
+async fn a_partition(engine: &Engine, create: bool) -> tansu_broker::Result<Topition> {
+    let name = common::alphanumeric_string(15);
+    tracing::debug!(topic_name = ?name);
+    if create {
+        let topic = CreatableTopic::default()
+            .name(name.clone())
+            .num_partitions(PARTITIONS);
+        let topic = topic
+            .replication_factor(0)
+            .assignments(Some(vec![]))
+            .configs(Some(vec![]));
+        let creating = engine.create_topic(topic, false);
+        let id = creating.await?;
+        tracing::debug!(topic_id = ?id);
+    }
+    Ok(Topition::new(name, rand::rng().random_range(0..PARTITIONS)))
+}
+
+/// Commits a random offset for `group` on `topition`, returning it with the
+/// one error code the commit answers.
+async fn commit(
+    engine: &Engine,
+    group: &str,
+    topition: &Topition,
+) -> tansu_broker::Result<(i64, ErrorCode)> {
+    let offset = rand::rng().random_range(0..i64::MAX);
+    let at = OffsetCommitRequest::default().offset(offset);
+    let request = [(topition.clone(), at)];
+    let committing = engine.offset_commit(group, None, &request);
+    let outcomes = committing.await?;
+    assert_eq!(1, outcomes.len());
+    Ok((offset, outcomes[0].1))
+}
+
+/// The offset `group` has on `topition`, as `OffsetFetch` answers it: -1
+/// when there is none. The answer always names the partition.
+async fn fetched(engine: &Engine, group: &str, topition: &Topition) -> tansu_broker::Result<i64> {
+    let fetching = engine.offset_fetch(Some(group), from_ref(topition), None);
+    let offsets = fetching.await?;
+    let offset = offsets.get(topition).map(|committed| committed.offset);
+    Ok(offset.expect("the fetched partition is always answered"))
+}
+
+/// Deletes `group` alone, returning the error code of its one answer.
+async fn deleted_alone(engine: &Engine, group: &str) -> tansu_broker::Result<ErrorCode> {
+    let wanted = [group.to_owned()];
+    let answers = engine.delete_groups(Some(&wanted)).await?;
+    let answered: Vec<_> = answers
+        .iter()
+        .map(|answer| answer.group_id.as_str())
+        .collect();
+    assert_eq!(vec![group], answered);
+    ErrorCode::try_from(answers[0].error_code).map_err(Into::into)
 }
 
 #[tokio::test]
-async fn offset_commit() -> Result<()> {
-    let _guard = init_tracing()?;
+async fn a_committed_offset_fetches_back_and_lists_its_group() -> tansu_broker::Result<()> {
+    let _guard = common::init_tracing()?;
+    let engine = registered().await?;
+    let topition = a_partition(&engine, true).await?;
+    let group = common::alphanumeric_string(15);
 
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let sc = storage_container(cluster_id, broker_id).await?;
+    let (offset, outcome) = commit(&engine, &group, &topition).await?;
+    assert_eq!(ErrorCode::None, outcome);
+    assert_eq!(offset, fetched(&engine, &group, &topition).await?);
 
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let num_partitions = 6;
-    let replication_factor = 0;
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let topic_id = sc
-        .create_topic(
-            CreatableTopic::default()
-                .name(topic_name.clone())
-                .num_partitions(num_partitions)
-                .replication_factor(replication_factor)
-                .assignments(assignments.clone())
-                .configs(configs.clone()),
-            false,
-        )
-        .await?;
-    debug!(?topic_id);
-
-    let partition_index = rng().random_range(0..num_partitions);
-    let topition = Topition::new(topic_name.clone(), partition_index);
-
-    let group_id: String = alphanumeric_string(15);
-
-    let offset = rng().random_range(0..i64::MAX);
-
-    let commit = sc
-        .offset_commit(
-            &group_id,
-            None,
-            &[(
-                topition.clone(),
-                OffsetCommitRequest::default().offset(offset),
-            )],
-        )
-        .await?;
-
-    assert_eq!(1, commit.len());
-    assert_eq!(ErrorCode::None, commit[0].1);
-
-    let offset_fetch = sc
-        .offset_fetch(Some(&group_id), slice::from_ref(&topition), None)
-        .await?;
-    assert!(offset_fetch.contains_key(&topition));
+    let by_group = engine.committed_offset_topitions(&group).await?;
     assert_eq!(
         Some(offset),
-        offset_fetch
-            .get(&topition)
-            .map(|committed| committed.offset)
+        by_group.get(&topition).map(|committed| committed.offset)
     );
 
-    let co_tps = sc.committed_offset_topitions(&group_id).await?;
-    assert!(co_tps.contains_key(&topition));
-    assert_eq!(
-        Some(offset),
-        co_tps.get(&topition).map(|committed| committed.offset)
-    );
-
-    let groups = sc.list_groups(None).await?;
-    assert_eq!(1, groups.len());
-    assert_eq!(group_id, groups[0].group_id);
-
+    let listed = engine.list_groups(None).await?;
+    let ids: Vec<_> = listed
+        .iter()
+        .map(|listing| listing.group_id.as_str())
+        .collect();
+    assert_eq!(vec![group.as_str()], ids);
     Ok(())
 }
 
 #[tokio::test]
-async fn topic_delete_cascade_to_offset_commit() -> Result<()> {
-    let _guard = init_tracing()?;
+async fn deleting_the_topic_forgets_its_committed_offsets() -> tansu_broker::Result<()> {
+    let _guard = common::init_tracing()?;
+    let engine = registered().await?;
+    let topition = a_partition(&engine, true).await?;
+    let group = common::alphanumeric_string(15);
 
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let sc = storage_container(cluster_id, broker_id).await?;
+    let (offset, outcome) = commit(&engine, &group, &topition).await?;
+    assert_eq!(ErrorCode::None, outcome);
+    assert_eq!(offset, fetched(&engine, &group, &topition).await?);
 
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let num_partitions = 6;
-    let replication_factor = 0;
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let topic_id = sc
-        .create_topic(
-            CreatableTopic::default()
-                .name(topic_name.clone())
-                .num_partitions(num_partitions)
-                .replication_factor(replication_factor)
-                .assignments(assignments.clone())
-                .configs(configs.clone()),
-            false,
-        )
-        .await?;
-    debug!(?topic_id);
-
-    let partition_index = rng().random_range(0..num_partitions);
-    let topition = Topition::new(topic_name.clone(), partition_index);
-
-    let group_id: String = alphanumeric_string(15);
-
-    let offset = rng().random_range(0..i64::MAX);
-
-    let commit = sc
-        .offset_commit(
-            &group_id,
-            None,
-            &[(
-                topition.clone(),
-                OffsetCommitRequest::default().offset(offset),
-            )],
-        )
-        .await?;
-
-    assert_eq!(1, commit.len());
-    assert_eq!(ErrorCode::None, commit[0].1);
-
-    let offset_fetch = sc
-        .offset_fetch(Some(&group_id), slice::from_ref(&topition), None)
-        .await?;
-    assert!(offset_fetch.contains_key(&topition));
-    assert_eq!(
-        Some(offset),
-        offset_fetch
-            .get(&topition)
-            .map(|committed| committed.offset)
-    );
-
-    assert_eq!(ErrorCode::None, sc.delete_topic(&topic_name.into()).await?);
-
-    let offset_fetch = sc
-        .offset_fetch(Some(&group_id), slice::from_ref(&topition), None)
-        .await?;
-    assert!(offset_fetch.contains_key(&topition));
-    assert_eq!(
-        Some(-1),
-        offset_fetch
-            .get(&topition)
-            .map(|committed| committed.offset)
-    );
-
+    let topic = tansu_storage::TopicId::from(topition.topic().to_string());
+    let deleting = engine.delete_topic(&topic);
+    assert_eq!(ErrorCode::None, deleting.await?);
+    assert_eq!(-1, fetched(&engine, &group, &topition).await?);
     Ok(())
 }
 
 #[tokio::test]
-async fn consumer_group_delete_cascade_to_offset_commit() -> Result<()> {
-    let _guard = init_tracing()?;
+async fn deleting_the_group_forgets_its_committed_offsets() -> tansu_broker::Result<()> {
+    let _guard = common::init_tracing()?;
+    let engine = registered().await?;
+    let topition = a_partition(&engine, true).await?;
+    let group = common::alphanumeric_string(15);
 
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let sc = storage_container(cluster_id, broker_id).await?;
+    let (offset, outcome) = commit(&engine, &group, &topition).await?;
+    assert_eq!(ErrorCode::None, outcome);
+    assert_eq!(offset, fetched(&engine, &group, &topition).await?);
 
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let num_partitions = 6;
-    let replication_factor = 0;
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let topic_id = sc
-        .create_topic(
-            CreatableTopic::default()
-                .name(topic_name.clone())
-                .num_partitions(num_partitions)
-                .replication_factor(replication_factor)
-                .assignments(assignments.clone())
-                .configs(configs.clone()),
-            false,
-        )
-        .await?;
-    debug!(?topic_id);
-
-    let partition_index = rng().random_range(0..num_partitions);
-    let topition = Topition::new(topic_name.clone(), partition_index);
-
-    let group_id: String = alphanumeric_string(15);
-
-    let offset = rng().random_range(0..i64::MAX);
-
-    let commit = sc
-        .offset_commit(
-            &group_id,
-            None,
-            &[(
-                topition.clone(),
-                OffsetCommitRequest::default().offset(offset),
-            )],
-        )
-        .await?;
-
-    assert_eq!(1, commit.len());
-    assert_eq!(ErrorCode::None, commit[0].1);
-
-    let offset_fetch = sc
-        .offset_fetch(Some(&group_id), slice::from_ref(&topition), None)
-        .await?;
-    assert!(offset_fetch.contains_key(&topition));
-    assert_eq!(
-        Some(offset),
-        offset_fetch
-            .get(&topition)
-            .map(|committed| committed.offset)
-    );
-
-    let deleted = sc.delete_groups(Some(slice::from_ref(&group_id))).await?;
-    assert_eq!(1, deleted.len());
-    assert_eq!(group_id, deleted[0].group_id);
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(deleted[0].error_code)?);
-
-    let offset_fetch = sc
-        .offset_fetch(Some(&group_id), slice::from_ref(&topition), None)
-        .await?;
-    assert!(offset_fetch.contains_key(&topition));
-    assert_eq!(
-        Some(-1),
-        offset_fetch
-            .get(&topition)
-            .map(|committed| committed.offset)
-    );
-
+    assert_eq!(ErrorCode::None, deleted_alone(&engine, &group).await?);
+    assert_eq!(-1, fetched(&engine, &group, &topition).await?);
     Ok(())
 }
 
 #[tokio::test]
-async fn delete_unknown_consumer_group() -> Result<()> {
-    let _guard = init_tracing()?;
+async fn deleting_an_unknown_group_is_group_id_not_found() -> tansu_broker::Result<()> {
+    let _guard = common::init_tracing()?;
+    let engine = registered().await?;
+    let group = common::alphanumeric_string(15);
 
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let sc = storage_container(cluster_id, broker_id).await?;
-
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let group_id: String = alphanumeric_string(15);
-
-    let deleted = sc.delete_groups(Some(slice::from_ref(&group_id))).await?;
-    assert_eq!(1, deleted.len());
-    assert_eq!(group_id, deleted[0].group_id);
-    assert_eq!(
-        ErrorCode::GroupIdNotFound,
-        ErrorCode::try_from(deleted[0].error_code)?
-    );
-
+    let outcome = deleted_alone(&engine, &group).await?;
+    assert_eq!(ErrorCode::GroupIdNotFound, outcome);
     Ok(())
 }
 
 #[tokio::test]
-async fn offset_commit_unknown_topition() -> Result<()> {
-    let _guard = init_tracing()?;
+async fn committing_to_an_unknown_topic_is_refused_and_lists_no_group() -> tansu_broker::Result<()>
+{
+    let _guard = common::init_tracing()?;
+    let engine = registered().await?;
+    let topition = a_partition(&engine, false).await?;
+    let group = common::alphanumeric_string(15);
 
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let sc = storage_container(cluster_id, broker_id).await?;
-
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let num_partitions = 6;
-
-    let partition_index = rng().random_range(0..num_partitions);
-    let topition = Topition::new(topic_name.clone(), partition_index);
-
-    let group_id: String = alphanumeric_string(15);
-
-    let offset = rng().random_range(0..i64::MAX);
-
-    let commit = sc
-        .offset_commit(
-            &group_id,
-            None,
-            &[(
-                topition.clone(),
-                OffsetCommitRequest::default().offset(offset),
-            )],
-        )
-        .await?;
-
-    assert_eq!(1, commit.len());
-    assert_eq!(ErrorCode::UnknownTopicOrPartition, commit[0].1);
-
-    let offset_fetch = sc
-        .offset_fetch(Some(&group_id), slice::from_ref(&topition), None)
-        .await?;
-    assert!(offset_fetch.contains_key(&topition));
-    assert_eq!(
-        Some(-1),
-        offset_fetch
-            .get(&topition)
-            .map(|committed| committed.offset)
-    );
-
-    let groups = sc.list_groups(None).await?;
-    assert_eq!(0, groups.len());
-
+    let (_, outcome) = commit(&engine, &group, &topition).await?;
+    assert_eq!(ErrorCode::UnknownTopicOrPartition, outcome);
+    assert_eq!(-1, fetched(&engine, &group, &topition).await?);
+    assert_eq!(0, engine.list_groups(None).await?.len());
     Ok(())
 }
 
 #[tokio::test]
-async fn offset_fetch_unknown_topition() -> Result<()> {
-    let _guard = init_tracing()?;
+async fn an_unknown_topic_fetches_no_offset_and_lists_no_group() -> tansu_broker::Result<()> {
+    let _guard = common::init_tracing()?;
+    let engine = registered().await?;
+    let topition = a_partition(&engine, false).await?;
+    let group = common::alphanumeric_string(15);
 
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let sc = storage_container(cluster_id, broker_id).await?;
-
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let num_partitions = 6;
-
-    let partition_index = rng().random_range(0..num_partitions);
-    let topition = Topition::new(topic_name.clone(), partition_index);
-
-    let group_id: String = alphanumeric_string(15);
-
-    let offset_fetch = sc
-        .offset_fetch(Some(&group_id), slice::from_ref(&topition), None)
-        .await?;
-    assert!(offset_fetch.contains_key(&topition));
-    assert_eq!(
-        Some(-1),
-        offset_fetch
-            .get(&topition)
-            .map(|committed| committed.offset)
-    );
-
-    let groups = sc.list_groups(None).await?;
-    assert_eq!(0, groups.len());
-
+    assert_eq!(-1, fetched(&engine, &group, &topition).await?);
+    assert_eq!(0, engine.list_groups(None).await?.len());
     Ok(())
 }
 
 #[tokio::test]
-async fn list_groups_none() -> Result<()> {
-    let _guard = init_tracing()?;
-
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let sc = storage_container(cluster_id, broker_id).await?;
-
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let groups = sc.list_groups(None).await?;
-    assert_eq!(0, groups.len());
-
+async fn a_fresh_engine_lists_no_group() -> tansu_broker::Result<()> {
+    let _guard = common::init_tracing()?;
+    let engine = registered().await?;
+    assert_eq!(0, engine.list_groups(None).await?.len());
     Ok(())
 }
