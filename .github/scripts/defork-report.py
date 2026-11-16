@@ -38,6 +38,8 @@ with runtime arguments such as `start_paused = true`), which every test
 carries and cannot spell any other way.
 And for the tracing guard a test opens with (`let _guard = init_tracing()?;`),
 the first line of every test as `Ok(())` is the last.
+And for a keyword alone on a line (`where`, `loop {`, `else {`, `} else {`):
+a keyword and punctuation, with nothing in them to rewrite.
 
 Two measures:
 
@@ -73,6 +75,7 @@ CRATE_FLAG = re.compile(r"^#!\[\w+\]$")
 TEST_MARKER = re.compile(r"^#\[(?:tokio::)?test(?:\([^()]*\))?\]$")
 OPENER = re.compile(r"^(?:(?:use )?[\w:]+::\{|\w+![(\[{])$")
 UNIT_OK = "Ok(())"
+BARE_KEYWORD = re.compile(r"^(?:\} )?(?:where|loop \{|else \{)$")
 TRACING_GUARD = re.compile(r"^let _guard = (?:(?:common|super)::)?init_tracing\(\)(?:\?|\.unwrap\(\));$")
 
 
@@ -87,6 +90,7 @@ def syntax_only(text: str) -> bool:
         or bool(OPENER.match(stripped))
         or stripped == UNIT_OK
         or bool(TRACING_GUARD.match(stripped))
+        or bool(BARE_KEYWORD.match(stripped))
     )
 
 

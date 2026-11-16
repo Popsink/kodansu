@@ -72,8 +72,6 @@ inherited = [
     "tansu-auth/src/handshake.rs",
     "tansu-auth/src/lib.rs",
     "tansu-broker/src/broker.rs",
-    "tansu-broker/src/broker/group/join.rs",
-    "tansu-broker/src/broker/group/sync.rs",
     "tansu-broker/src/coordinator.rs",
     "tansu-broker/src/coordinator/group.rs",
     "tansu-broker/src/coordinator/group/administrator.rs",
