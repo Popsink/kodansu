@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,100 +12,58 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rama::{Context, Layer as _, Service as _};
-use tansu_sans_io::{ApiKey as _, Frame, Header, MetadataRequest, MetadataResponse};
-use tansu_service::{
-    BytesFrameLayer, BytesTcpService, FrameBytesLayer, FrameService, TcpBytesLayer,
-    TcpContextLayer, TcpListenerLayer,
-};
-use tokio::{
-    net::{TcpListener, TcpStream},
-    task::JoinSet,
-};
-use tokio_util::sync::CancellationToken;
-use tracing::debug;
+//! A `Metadata` request over TCP to a listener served on a task, until the
+//! task is cancelled.
 
-use crate::common::{Error, init_tracing};
+use std::net::Ipv4Addr;
+
+use rama::Context;
+use rama::Layer as _;
+use rama::Service as _;
+use tansu_sans_io::{Frame, Header};
+use tansu_service::{BytesFrameLayer, BytesTcpService, FrameBytesLayer, FrameService};
+use tansu_service::{TcpBytesLayer, TcpContextLayer, TcpListenerLayer};
+use tokio::net::{TcpListener, TcpStream};
+
+use common::Error;
 
 mod common;
 
-async fn server(cancellation: CancellationToken, listener: TcpListener) -> Result<(), Error> {
-    let server = (
-        TcpListenerLayer::new(cancellation),
-        TcpContextLayer::default(),
-        TcpBytesLayer::<()>::default(),
-        BytesFrameLayer::default(),
-    )
-        .into_layer(FrameService::new(|_, req: Frame| {
-            debug!(?req);
-
-            req.correlation_id()
-                .map(|correlation_id| Frame {
-                    size: 0,
-                    header: Header::Response { correlation_id },
-                    body: MetadataResponse::default()
-                        .brokers(Some([].into()))
-                        .topics(Some([].into()))
-                        .cluster_id(Some("abc".into()))
-                        .controller_id(Some(111))
-                        .throttle_time_ms(Some(0))
-                        .cluster_authorized_operations(Some(-1))
-                        .into(),
-                })
-                .map_err(Error::from)
-        }));
-
-    server.serve(Context::default(), listener).await
+async fn serve(
+    stop: tokio_util::sync::CancellationToken,
+    listener: TcpListener,
+) -> Result<(), Error> {
+    let answer = FrameService::new(|_, req: Frame| {
+        tracing::debug!(?req);
+        let header = Header::Response {
+            correlation_id: req.correlation_id()?,
+        };
+        Ok::<_, Error>(common::frame(header, common::metadata_response().into()))
+    });
+    let framed = (TcpBytesLayer::<()>::default(), BytesFrameLayer::default()).into_layer(answer);
+    let accepting = TcpListenerLayer::new(stop);
+    let server = (accepting, TcpContextLayer::default()).into_layer(framed);
+    let serving = server.serve(Context::default(), listener);
+    serving.await
 }
 
 #[tokio::test]
-async fn tcp_client_server() -> Result<(), Error> {
-    let _guard = init_tracing()?;
+async fn a_metadata_request_round_trips_over_tcp() -> Result<(), Error> {
+    let _guard = common::init_tracing()?;
 
-    let cancellation = CancellationToken::new();
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let local_addr = listener.local_addr()?;
+    let stop = tokio_util::sync::CancellationToken::new();
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let address = listener.local_addr()?;
+    let mut tasks = tokio::task::JoinSet::new();
+    let _server = tasks.spawn(serve(stop.clone(), listener));
 
-    let mut join = JoinSet::new();
+    let stream = TcpStream::connect(address).await?;
+    let wire = FrameBytesLayer.into_layer(BytesTcpService);
+    let answered = wire.serve(Context::with_state(stream), common::metadata_request());
+    common::assert_answered(answered.await?)?;
 
-    let _server = {
-        let cancellation = cancellation.clone();
-        join.spawn(async move { server(cancellation, listener).await })
-    };
-
-    let stream = TcpStream::connect(local_addr).await?;
-
-    let client = FrameBytesLayer.into_layer(BytesTcpService);
-
-    let frame = client
-        .serve(
-            Context::with_state(stream),
-            Frame {
-                header: Header::Request {
-                    api_key: MetadataRequest::KEY,
-                    api_version: 12,
-                    correlation_id: 0,
-                    client_id: Some(env!("CARGO_PKG_NAME").into()),
-                },
-                body: MetadataRequest::default()
-                    .topics(Some([].into()))
-                    .allow_auto_topic_creation(Some(false))
-                    .include_cluster_authorized_operations(Some(false))
-                    .include_topic_authorized_operations(Some(false))
-                    .into(),
-                size: 0,
-            },
-        )
-        .await?;
-
-    let response = MetadataResponse::try_from(frame.body)?;
-    assert_eq!(Some("abc"), response.cluster_id.as_deref());
-    assert_eq!(Some(111), response.controller_id);
-
-    cancellation.cancel();
-
-    let joined = join.join_all().await;
-    debug!(?joined);
-
+    stop.cancel();
+    let joined = tasks.join_all().await;
+    tracing::debug!(?joined);
     Ok(())
 }
