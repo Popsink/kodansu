@@ -966,6 +966,16 @@ fmt:
 # `//` lines narrating them — the arithmetic of each case — became the tests'
 # doc comments. The new tests pass against the old body too. Fourteen comment
 # lines went, so the ceiling comes down.
+#   defork  -299 lines, the round robin and cooperative sticky assignors rewritten  2896 -> 2874  2.7124 -> 2.6990
+#
+# `RoundRobinAssignor` and `CooperativeStickyAssignor` keep their declarations
+# and `assign` signatures. The round robin deals with a turn counter that still
+# advances past a member not subscribed to the topic, as before; the cooperative
+# sticky one still delegates to it, and its KIP-429 TODO moved into the
+# struct's doc comment. Their tests keep every assignment on shared helpers,
+# with the narrating `//` lines turned into doc comments, and the new round
+# robin tests pass against the old body too. Twenty-two comment lines went, so
+# the ceiling comes down.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -976,7 +986,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7124" top="12":
+comments ceiling="2.6990" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
