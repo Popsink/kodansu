@@ -843,6 +843,11 @@ fmt:
 # declarations, which the de-fork count still holds against them; their
 # imports, docs, doctests and bodies are rewritten. The comment beside the
 # empty `requested_metrics` now cites #410, which exempts it.
+#   defork  -13 lines, the delete handlers' bodies rewritten  2923 -> 2923  2.7177 -> 2.7183
+#
+# `DeleteTopics` and `DeleteGroups` keep their declarations too. The
+# `DeleteGroups` unit test no longer opens a per-thread log file: it asserted
+# nothing about tracing, and its doctest twin never had one. Only code went.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -853,7 +858,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7177" top="12":
+comments ceiling="2.7183" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
