@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use ::tracing::debug;
-use opentelemetry::{KeyValue, global};
-use opentelemetry_otlp::{Protocol, WithExportConfig as _};
+use opentelemetry::KeyValue;
+use opentelemetry_otlp::Protocol;
+use opentelemetry_otlp::WithExportConfig as _;
 use opentelemetry_sdk::Resource;
 use url::Url;
 
@@ -30,30 +30,25 @@ pub struct Guard {
 }
 
 pub fn init(tracing_format: TracingFormat) -> Result<Guard> {
-    tracing::init_tracing_subscriber(tracing_format).map(|tracer| Guard { tracer })
+    let tracer = tracing::init_tracing_subscriber(tracing_format)?;
+    Ok(Guard { tracer })
 }
 
 pub fn metric_exporter(endpoint: Url) -> Result<()> {
-    let endpoint = endpoint
-        .join("v1/metrics")
-        .inspect(|endpoint| debug!(%endpoint))?;
+    let metrics = endpoint.join("v1/metrics")?;
+    ::tracing::debug!(endpoint = %metrics);
 
-    let exporter = opentelemetry_otlp::MetricExporter::builder()
-        .with_http()
-        .with_protocol(Protocol::HttpBinary)
-        .with_endpoint(endpoint.to_string())
-        .build()?;
+    let http = opentelemetry_otlp::MetricExporter::builder().with_http();
+    let http = http.with_protocol(Protocol::HttpBinary);
+    let exporter = http.with_endpoint(metrics.to_string()).build()?;
 
-    let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+    let service = KeyValue::new("service.name", env!("CARGO_PKG_NAME"));
+    let identity = Resource::builder_empty().with_attributes([service]).build();
+    let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder();
+    let provider = provider
         .with_periodic_exporter(exporter)
-        .with_resource(
-            Resource::builder_empty()
-                .with_attributes([KeyValue::new("service.name", env!("CARGO_PKG_NAME"))])
-                .build(),
-        )
-        .build();
-
-    global::set_meter_provider(meter_provider);
+        .with_resource(identity);
+    opentelemetry::global::set_meter_provider(provider.build());
 
     // After the provider, never before: an instrument built against the no-op
     // provider is silently never collected.
