@@ -837,6 +837,12 @@ fmt:
 # record case stays ignored, now saying why, and the cited #553 file-level
 # `too_many_lines` allow goes with the tables. The ceiling rises because only
 # code went: the comment count did not move.
+#   defork  -30 lines, two storage handlers' bodies rewritten  2926 -> 2923  2.7202 -> 2.7177
+#
+# `ConsumerGroupDescribe` and `GetTelemetrySubscriptions` keep their
+# declarations, which the de-fork count still holds against them; their
+# imports, docs, doctests and bodies are rewritten. The comment beside the
+# empty `requested_metrics` now cites #410, which exempts it.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -847,7 +853,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7202" top="12":
+comments ceiling="2.7177" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
