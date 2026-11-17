@@ -890,6 +890,13 @@ fmt:
 # `record::Header` and its `Builder` keep their declarations; the bodies are
 # rewritten with `?` in place of `and_then` chains. No comment moved, but the
 # measured ratio rose by a hair past the old ceiling, so the ceiling follows.
+#   defork  +4 lines, the user subcommand bodies rewritten  2920 -> 2917  2.7198 -> 2.7178
+#
+# `tansu user` keeps its declarations, and every `///` on the clap enum stays
+# word for word, because those lines are the `--help` text. Three bare `//`
+# labels on its fields (`// Iterations`, `// Mode` twice) went: they said what
+# the next line said. The two PBKDF2 vectors are hex now, so the ceiling comes
+# down.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -900,7 +907,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7198" top="12":
+comments ceiling="2.7178" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
