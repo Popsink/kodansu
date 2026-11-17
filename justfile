@@ -907,6 +907,12 @@ fmt:
 # `tansu topic` keeps its declarations and its clap help text. `parse_key_val`
 # splits with `split_once`, which is the first `=` that `find` found, and keeps
 # its error message word for word. Code grew, so the ceiling comes down.
+#   defork  -17 lines, otel setup, assignor topitions and resource patterns rewritten  2917 -> 2913  2.7180 -> 2.7148
+#
+# Four files keep their declarations. `otel/tracing.rs` carried four lines of
+# commented-out OpenTelemetry layer wiring from upstream — code, not comment,
+# that nothing had compiled since the fork. They went, so the ceiling comes
+# down.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -917,7 +923,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7180" top="12":
+comments ceiling="2.7148" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
