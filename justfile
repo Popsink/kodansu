@@ -952,6 +952,12 @@ fmt:
 # twice over became two helpers. Every rewritten method's `Debug` output was
 # diffed against the previous body before and after, and is identical. Only
 # code went.
+#   defork  -232 lines, the tansu-service route tests rewritten  2910 -> 2910  2.7159 -> 2.7211
+#
+# `tansu-service/tests/route.rs` is rewritten whole and leaves `inherited`. Its
+# seven tests built the same router and the same client stack seven times;
+# five tests on shared helpers keep every assertion. Only code went, a lot of
+# it, so the ceiling rises.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -962,7 +968,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7159" top="12":
+comments ceiling="2.7211" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
