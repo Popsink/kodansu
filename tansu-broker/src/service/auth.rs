@@ -12,48 +12,41 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use rama::Layer as _;
+use rama::Service as _;
+use rama::layer::MapErrLayer;
+use tansu_auth::SaslAuthenticateService;
+use tansu_auth::SaslHandshakeService;
+use tansu_sans_io::ApiKey as _;
+use tansu_sans_io::{SaslAuthenticateRequest, SaslHandshakeRequest};
+use tansu_service::FrameRequestLayer;
+use tansu_service::FrameRouteBuilder;
+
 use crate::Error;
-use rama::{Layer as _, Service as _, layer::MapErrLayer};
-use tansu_auth::{SaslAuthenticateService, SaslHandshakeService};
-use tansu_sans_io::{ApiKey as _, SaslAuthenticateRequest, SaslHandshakeRequest};
-use tansu_service::{FrameRequestLayer, FrameRouteBuilder};
 
 pub fn services(
     builder: FrameRouteBuilder<(), Error>,
 ) -> Result<FrameRouteBuilder<(), Error>, Error> {
-    [authenticate, handshake]
-        .iter()
-        .try_fold(builder, |builder, service| service(builder))
+    let with_authenticate = authenticate(builder)?;
+    handshake(with_authenticate)
 }
 
 pub fn authenticate(
     builder: FrameRouteBuilder<(), Error>,
 ) -> Result<FrameRouteBuilder<(), Error>, Error> {
-    builder
-        .with_route(
-            SaslAuthenticateRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                FrameRequestLayer::<SaslAuthenticateRequest>::new(),
-            )
-                .into_layer(SaslAuthenticateService::default())
-                .boxed(),
-        )
-        .map_err(Into::into)
+    let decoding = FrameRequestLayer::<SaslAuthenticateRequest>::new();
+    let layers = (MapErrLayer::new(Error::from), decoding);
+    let route = layers.into_layer(SaslAuthenticateService::default());
+    let routed = builder.with_route(SaslAuthenticateRequest::KEY, route.boxed());
+    routed.map_err(Error::from)
 }
 
 pub fn handshake(
     builder: FrameRouteBuilder<(), Error>,
 ) -> Result<FrameRouteBuilder<(), Error>, Error> {
-    builder
-        .with_route(
-            SaslHandshakeRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                FrameRequestLayer::<SaslHandshakeRequest>::new(),
-            )
-                .into_layer(SaslHandshakeService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    let decoding = FrameRequestLayer::<SaslHandshakeRequest>::new();
+    let layers = (MapErrLayer::new(Error::from), decoding);
+    let route = layers.into_layer(SaslHandshakeService);
+    let routed = builder.with_route(SaslHandshakeRequest::KEY, route.boxed());
+    routed.map_err(Error::from)
 }
