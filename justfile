@@ -863,6 +863,11 @@ fmt:
 # `ListOffsets` keeps its declarations. The #444 comment, cited and so exempt,
 # is reflowed from a 30-line column at the bottom of a builder chain to seven
 # lines at full width. Only code went.
+#   defork  -70 lines, the incremental_alter_configs handler body rewritten  2923 -> 2923  2.7189 -> 2.7188
+#
+# `IncrementalAlterConfigs` keeps its declarations. Most of what went is its
+# doctest, whose two identical `DescribeConfigs` requests are now one closure.
+# The measured ratio came down, so the ceiling follows it.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -873,7 +878,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7189" top="12":
+comments ceiling="2.7188" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
