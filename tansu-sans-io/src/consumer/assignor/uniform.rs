@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{
-    Error, MetadataResponse, consumer::ConsumerAssignor,
-    join_group_response::JoinGroupResponseMember, sync_group_request::SyncGroupRequestAssignment,
-};
+use crate::Error;
+use crate::MetadataResponse;
+use crate::consumer::ConsumerAssignor;
+use crate::join_group_response::JoinGroupResponseMember;
+use crate::sync_group_request::SyncGroupRequestAssignment;
 
 use super::RoundRobinAssignor;
 
+/// Kafka's `uniform` assignor, answered here with the round-robin assignment.
 #[derive(Clone, Default, Eq, Hash, Debug, Ord, PartialEq, PartialOrd)]
 pub struct UniformAssignor;
 
@@ -34,142 +36,84 @@ impl ConsumerAssignor for UniformAssignor {
 
 #[cfg(test)]
 mod tests {
-    use std::ops::Range;
-
     use bytes::Bytes;
 
-    use crate::{
-        Error, MetadataResponse,
-        consumer::{
-            ConsumerProtocolSubscription, MemberAssignment, MemberMetadata, TopicPartition,
-        },
-        join_group_response::JoinGroupResponseMember,
-        metadata_response::{MetadataResponsePartition, MetadataResponseTopic},
-    };
-
     use super::*;
+    use crate::consumer::TopicPartition;
+    use crate::consumer::{ConsumerProtocolSubscription, MemberAssignment, MemberMetadata};
+    use crate::metadata_response::{MetadataResponsePartition, MetadataResponseTopic};
 
-    fn metadata_response_topic(
-        topic: impl Into<String>,
-        partitions: Range<i32>,
-    ) -> MetadataResponseTopic {
-        MetadataResponseTopic::default()
-            .name(Some(topic.into()))
-            .partitions(Some(
-                partitions
-                    .into_iter()
-                    .map(|p| MetadataResponsePartition::default().partition_index(p))
-                    .collect(),
-            ))
+    type Assigned = Vec<(String, Vec<TopicPartition>)>;
+
+    /// A topic named `name` with partitions `0..count`.
+    fn topic(name: &str, count: i32) -> MetadataResponseTopic {
+        let partition = |index| MetadataResponsePartition::default().partition_index(index);
+        let named = MetadataResponseTopic::default().name(Some(name.to_owned()));
+        named.partitions(Some((0..count).map(partition).collect()))
     }
 
-    fn member_metadata(topics: &[&str]) -> Result<Bytes, Error> {
-        Bytes::try_from(&MemberMetadata::default().version(3).subscription(
-            ConsumerProtocolSubscription::default().topics(topics.iter().map(|t| t.to_string())),
-        ))
+    /// A group member called `id`, subscribed to `topics`.
+    fn member(id: &str, topics: &[&str]) -> Result<JoinGroupResponseMember, Error> {
+        let names = topics.iter().map(|name| (*name).to_owned());
+        let subscription = ConsumerProtocolSubscription::default().topics(names);
+        let metadata = MemberMetadata::default()
+            .version(3)
+            .subscription(subscription);
+        let encoded = Bytes::try_from(&metadata)?;
+        let joined = JoinGroupResponseMember::default().member_id(id.to_owned());
+        Ok(joined.metadata(encoded))
     }
 
-    // mirrors RoundRobinAssignor::even_single_topic
-    #[test]
-    fn even_single_topic() -> Result<(), Error> {
-        const C0: &str = "C0";
-        const C1: &str = "C1";
-        const C2: &str = "C2";
-        const T0: &str = "t0";
+    /// `topic`'s `indexes`, as an assignment lists them.
+    fn owned(topic: &str, indexes: &[i32]) -> TopicPartition {
+        let topic = topic.to_owned();
+        let partitions = indexes.to_vec();
+        TopicPartition { topic, partitions }
+    }
 
-        let md = member_metadata(&[T0])?;
-        let members = [
-            JoinGroupResponseMember::default()
-                .member_id(C0.into())
-                .metadata(md.clone()),
-            JoinGroupResponseMember::default()
-                .member_id(C1.into())
-                .metadata(md.clone()),
-            JoinGroupResponseMember::default()
-                .member_id(C2.into())
-                .metadata(md.clone()),
-        ];
-
-        let metadata =
-            MetadataResponse::default().topics(Some([metadata_response_topic(T0, 0..3)].into()));
-
-        let assignments = UniformAssignor.assign(&members, &metadata)?;
-        assert_eq!(3, assignments.len());
-
-        for (i, id) in [C0, C1, C2].into_iter().enumerate() {
-            assert_eq!(id, assignments[i].member_id);
-            assert_eq!(
-                vec![TopicPartition {
-                    topic: T0.into(),
-                    partitions: vec![i as i32],
-                }],
-                MemberAssignment::try_from(assignments[i].clone().assignment)?
-                    .assignment
-                    .assigned_partitions
-            );
+    /// Each member's id and decoded partitions, in the order assigned.
+    fn assigned(
+        joined: &[JoinGroupResponseMember],
+        cluster: Vec<MetadataResponseTopic>,
+    ) -> Result<Assigned, Error> {
+        let metadata = MetadataResponse::default().topics(Some(cluster));
+        let mut decoded = Vec::new();
+        for given in UniformAssignor.assign(joined, &metadata)? {
+            let assignment = MemberAssignment::try_from(given.assignment)?;
+            decoded.push((given.member_id, assignment.assignment.assigned_partitions));
         }
+        Ok(decoded)
+    }
 
+    /// Three members, one three-partition topic: a partition each, in order —
+    /// the round-robin assignor's own single-topic case.
+    #[test]
+    fn three_members_take_a_partition_each_of_one_topic() -> Result<(), Error> {
+        let joined = [
+            member("C0", &["t0"])?,
+            member("C1", &["t0"])?,
+            member("C2", &["t0"])?,
+        ];
+        let expected: Assigned = (0..3)
+            .map(|i| (format!("C{i}"), vec![owned("t0", &[i])]))
+            .collect();
+        assert_eq!(expected, assigned(&joined, vec![topic("t0", 3)])?);
         Ok(())
     }
 
-    // mirrors RoundRobinAssignor::different_subscriptions
+    /// A member subscribed to one topic of two is only ever given that one.
     #[test]
-    fn different_subscriptions() -> Result<(), Error> {
-        const C0: &str = "C0";
-        const C1: &str = "C1";
-        const T0: &str = "t0";
-        const T1: &str = "t1";
-
-        let md_both = member_metadata(&[T0, T1])?;
-        let md_t1 = member_metadata(&[T1])?;
-        let members = [
-            JoinGroupResponseMember::default()
-                .member_id(C0.into())
-                .metadata(md_both),
-            JoinGroupResponseMember::default()
-                .member_id(C1.into())
-                .metadata(md_t1),
+    fn a_member_is_given_only_what_it_subscribed_to() -> Result<(), Error> {
+        let joined = [member("C0", &["t0", "t1"])?, member("C1", &["t1"])?];
+        let both = vec![owned("t0", &[0, 1]), owned("t1", &[1])];
+        let expected: Assigned = vec![
+            (String::from("C0"), both),
+            (String::from("C1"), vec![owned("t1", &[0])]),
         ];
-
-        let metadata = MetadataResponse::default().topics(Some(
-            [
-                metadata_response_topic(T0, 0..2),
-                metadata_response_topic(T1, 0..2),
-            ]
-            .into(),
-        ));
-
-        let assignments = UniformAssignor.assign(&members, &metadata)?;
-        assert_eq!(2, assignments.len());
-
-        assert_eq!(C0, assignments[0].member_id);
         assert_eq!(
-            vec![
-                TopicPartition {
-                    topic: T0.into(),
-                    partitions: vec![0, 1],
-                },
-                TopicPartition {
-                    topic: T1.into(),
-                    partitions: vec![1],
-                },
-            ],
-            MemberAssignment::try_from(assignments[0].clone().assignment)?
-                .assignment
-                .assigned_partitions
+            expected,
+            assigned(&joined, vec![topic("t0", 2), topic("t1", 2)])?
         );
-
-        assert_eq!(C1, assignments[1].member_id);
-        assert_eq!(
-            vec![TopicPartition {
-                topic: T1.into(),
-                partitions: vec![0],
-            }],
-            MemberAssignment::try_from(assignments[1].clone().assignment)?
-                .assignment
-                .assigned_partitions
-        );
-
         Ok(())
     }
 }
