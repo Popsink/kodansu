@@ -231,3 +231,19 @@ fn an_optional_string_reports_its_maximum_allocation() -> tansu_sans_io::Result<
     assert_eq!(size_of::<u32>(), absent.maximum_allocation_size()?);
     Ok(())
 }
+
+/// Every wire value an ACL enum names converts to its variant and back;
+/// anything else reads as `Unknown`, which is 0 on the wire.
+#[test]
+fn acl_enums_round_trip_and_read_anything_else_as_unknown() {
+    use tansu_sans_io::acl::{Operation, Permission, Resource};
+
+    for value in -2..20_i8 {
+        let expected = |known: std::ops::RangeInclusive<i8>| {
+            if known.contains(&value) { value } else { 0 }
+        };
+        assert_eq!(expected(1..=3), i8::from(Permission::from(value)));
+        assert_eq!(expected(1..=15), i8::from(Operation::from(value)));
+        assert_eq!(expected(1..=7), i8::from(Resource::from(value)));
+    }
+}
