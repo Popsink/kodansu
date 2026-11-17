@@ -902,6 +902,11 @@ fmt:
 # `tansu broker` keeps its declarations and every `///` on its clap struct.
 # The startup banner was diffed against the previous binary, plain and under
 # `FORCE_COLOR`, and is byte for byte the same. Only code went.
+#   defork  +6 lines, the topic subcommand bodies rewritten  2917 -> 2917  2.7181 -> 2.7180
+#
+# `tansu topic` keeps its declarations and its clap help text. `parse_key_val`
+# splits with `split_once`, which is the first `=` that `find` found, and keeps
+# its error message word for word. Code grew, so the ceiling comes down.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -912,7 +917,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7181" top="12":
+comments ceiling="2.7180" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
