@@ -848,6 +848,12 @@ fmt:
 # `DeleteTopics` and `DeleteGroups` keep their declarations too. The
 # `DeleteGroups` unit test no longer opens a per-thread log file: it asserted
 # nothing about tracing, and its doctest twin never had one. Only code went.
+#   defork  +7 lines, the metadata and SCRAM handlers' bodies rewritten  2923 -> 2923  2.7183 -> 2.7178
+#
+# `Metadata` and `AlterUserScramCredentials` keep their declarations. The SCRAM
+# service had no test of its own; one now upserts a credential, reads the
+# derived keys back against `derive_keys`, and deletes it — and passes against
+# the body it replaces. Code grew, so the ceiling comes down.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -858,7 +864,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7183" top="12":
+comments ceiling="2.7178" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
