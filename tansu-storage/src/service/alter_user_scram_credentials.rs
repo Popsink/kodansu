@@ -12,17 +12,54 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Error, Result, ScramCredential, Storage};
-use bytes::Bytes;
-use rama::{Context, Service};
-use rsasl::mechanisms::scram::tools::derive_keys;
-use sha2::{Digest, Sha256, Sha512};
-use tansu_sans_io::{
-    AlterUserScramCredentialsRequest, AlterUserScramCredentialsResponse, ApiKey, ErrorCode,
-    ScramMechanism, alter_user_scram_credentials_response::AlterUserScramCredentialsResult,
-};
-use tracing::{debug, instrument};
+use rama::Context;
+use rama::Service;
+use rsasl::mechanisms::scram::tools as scram;
+use sha2::Digest as _;
+use sha2::{Sha256, Sha512};
+use tansu_sans_io::ScramMechanism;
+use tansu_sans_io::alter_user_scram_credentials_response::AlterUserScramCredentialsResult;
+use tansu_sans_io::{AlterUserScramCredentialsRequest, AlterUserScramCredentialsResponse};
+use tansu_sans_io::{ApiKey, ErrorCode};
 
+use crate::ScramCredential;
+use crate::Storage;
+use crate::{Error, Result};
+
+/// The stored and server keys SCRAM keeps in place of a salted password.
+type DerivedKeys = (bytes::Bytes, bytes::Bytes);
+
+/// Derives [`DerivedKeys`] from `salted` under the digest `mechanism` names.
+fn derived(mechanism: ScramMechanism, salted: &[u8]) -> DerivedKeys {
+    let (stored, server) = match mechanism {
+        ScramMechanism::Scram256 => {
+            let (client, server) = scram::derive_keys::<Sha256>(salted);
+            (Sha256::digest(client).to_vec(), server.to_vec())
+        }
+        ScramMechanism::Scram512 => {
+            let (client, server) = scram::derive_keys::<Sha512>(salted);
+            (Sha512::digest(client).to_vec(), server.to_vec())
+        }
+    };
+    (stored.into(), server.into())
+}
+
+/// One user's answer: [`ErrorCode::None`] when the engine accepted the change,
+/// [`ErrorCode::UnsupportedSaslMechanism`] otherwise, and an empty message either way.
+fn outcome(user: String, accepted: bool) -> AlterUserScramCredentialsResult {
+    let code = if accepted {
+        ErrorCode::None
+    } else {
+        ErrorCode::UnsupportedSaslMechanism
+    };
+    let result = AlterUserScramCredentialsResult::default().user(user);
+    result
+        .error_code(i16::from(code))
+        .error_message(Some(String::new()))
+}
+
+/// Deletes, then upserts, the SCRAM credentials a request names, answering one
+/// result per user in that order.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AlterUserScramCredentialsService;
 
@@ -37,98 +74,98 @@ where
     type Response = AlterUserScramCredentialsResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
+    #[tracing::instrument(skip(state, request))]
     async fn serve(
         &self,
-        ctx: Context<G>,
-        req: AlterUserScramCredentialsRequest,
+        state: Context<G>,
+        request: AlterUserScramCredentialsRequest,
     ) -> Result<Self::Response, Self::Error> {
-        let mut results = vec![];
+        let engine = state.state();
+        let mut answers = Vec::new();
 
-        if let Some(deletions) = req.deletions {
-            for deletion in deletions {
-                let mechanism = ScramMechanism::try_from(deletion.mechanism)?;
-
-                results.push(
-                    ctx.state()
-                        .delete_user_scram_credential(&deletion.name, mechanism)
-                        .await
-                        .map_or(
-                            AlterUserScramCredentialsResult::default()
-                                .user(deletion.name.clone())
-                                .error_code(ErrorCode::UnsupportedSaslMechanism.into())
-                                .error_message(Some("".into())),
-                            |()| {
-                                AlterUserScramCredentialsResult::default()
-                                    .user(deletion.name.clone())
-                                    .error_code(ErrorCode::None.into())
-                                    .error_message(Some("".into()))
-                            },
-                        ),
-                );
-            }
+        for removal in request.deletions.into_iter().flatten() {
+            let mechanism = ScramMechanism::try_from(removal.mechanism)?;
+            let deleting = engine.delete_user_scram_credential(&removal.name, mechanism);
+            let accepted = deleting.await.is_ok();
+            answers.push(outcome(removal.name, accepted));
         }
 
-        if let Some(upsertions) = req.upsertions {
-            for upsertion in upsertions {
-                let (mechanism, stored_key, server_key) =
-                    ScramMechanism::try_from(upsertion.mechanism)
-                        .inspect(|mechanism| debug!(?mechanism))
-                        .map(|mechanism| {
-                            if mechanism == ScramMechanism::Scram256 {
-                                let (client_key, server_key) =
-                                    derive_keys::<Sha256>(&upsertion.salted_password);
-
-                                (
-                                    mechanism,
-                                    Bytes::copy_from_slice(&Sha256::digest(client_key)[..]),
-                                    Bytes::copy_from_slice(&server_key[..]),
-                                )
-                            } else {
-                                let (client_key, server_key) =
-                                    derive_keys::<Sha512>(&upsertion.salted_password);
-
-                                (
-                                    mechanism,
-                                    Bytes::copy_from_slice(&Sha512::digest(client_key)[..]),
-                                    Bytes::copy_from_slice(&server_key[..]),
-                                )
-                            }
-                        })?;
-
-                let credential = ScramCredential {
-                    salt: upsertion.salt,
-                    iterations: upsertion.iterations,
-                    stored_key,
-                    server_key,
-                };
-
-                results.push(
-                    ctx.state()
-                        .upsert_user_scram_credential(
-                            upsertion.name.as_str(),
-                            mechanism,
-                            credential,
-                        )
-                        .await
-                        .map_or(
-                            AlterUserScramCredentialsResult::default()
-                                .user(upsertion.name.clone())
-                                .error_code(ErrorCode::UnsupportedSaslMechanism.into())
-                                .error_message(Some("".into())),
-                            |()| {
-                                AlterUserScramCredentialsResult::default()
-                                    .user(upsertion.name.clone())
-                                    .error_code(ErrorCode::None.into())
-                                    .error_message(Some("".into()))
-                            },
-                        ),
-                );
-            }
+        for change in request.upsertions.into_iter().flatten() {
+            let mechanism = ScramMechanism::try_from(change.mechanism)?;
+            tracing::debug!(?mechanism);
+            let (stored, server) = derived(mechanism, &change.salted_password);
+            let replacement = ScramCredential {
+                salt: change.salt,
+                iterations: change.iterations,
+                stored_key: stored,
+                server_key: server,
+            };
+            let upserting =
+                engine.upsert_user_scram_credential(&change.name, mechanism, replacement);
+            let accepted = upserting.await.is_ok();
+            answers.push(outcome(change.name, accepted));
         }
 
-        Ok(AlterUserScramCredentialsResponse::default()
-            .throttle_time_ms(0)
-            .results(Some(results)))
+        let unthrottled = AlterUserScramCredentialsResponse::default().throttle_time_ms(0);
+        Ok(unthrottled.results(Some(answers)))
+    }
+}
+
+#[cfg(all(feature = "dynostore", test))]
+mod tests {
+    use rama::Context;
+    use rama::Layer as _;
+    use rama::Service as _;
+    use rama::layer::MapStateLayer;
+    use sha2::Digest as _;
+    use tansu_sans_io::alter_user_scram_credentials_request::ScramCredentialDeletion;
+    use tansu_sans_io::alter_user_scram_credentials_request::ScramCredentialUpsertion;
+    use tansu_sans_io::{AlterUserScramCredentialsRequest, ErrorCode, ScramMechanism};
+
+    use super::AlterUserScramCredentialsService;
+    use crate::{Error, Storage as _, StorageContainer};
+
+    #[tokio::test]
+    async fn an_upsert_stores_the_derived_keys_and_a_deletion_removes_them() -> Result<(), Error> {
+        let listener = url::Url::parse("tcp://localhost:9092")?;
+        let engine = StorageContainer::builder().cluster_id("tansu").node_id(111);
+        let engine = engine.advertised_listener(listener);
+        let memory = url::Url::parse("memory://tansu/")?;
+        let engine = engine.storage(memory).build().await?;
+        let shared = engine.clone();
+        let layer = MapStateLayer::new(move |_| shared.clone());
+        let credentials = layer.into_layer(AlterUserScramCredentialsService);
+
+        let salted = bytes::Bytes::from_static(b"0123456789abcdef0123456789abcdef");
+        let change = ScramCredentialUpsertion::default().name("alice".into());
+        let change = change
+            .mechanism(ScramMechanism::Scram512.into())
+            .iterations(4096);
+        let change = change.salt(bytes::Bytes::from_static(b"salt"));
+        let change = change.salted_password(salted.clone());
+        let upsert = AlterUserScramCredentialsRequest::default().upsertions(Some(vec![change]));
+        let answered = credentials.serve(Context::default(), upsert).await?;
+        let codes: Vec<_> = answered.results.unwrap_or_default();
+        let codes: Vec<_> = codes
+            .iter()
+            .map(|r| (r.user.as_str(), r.error_code))
+            .collect();
+        assert_eq!(vec![("alice", i16::from(ErrorCode::None))], codes);
+
+        let derive = rsasl::mechanisms::scram::tools::derive_keys::<sha2::Sha512>;
+        let (client, server) = derive(&salted);
+        let reading = engine.user_scram_credential("alice", ScramMechanism::Scram512);
+        let stored = reading.await?.expect("alice was just upserted");
+        assert_eq!((&b"salt"[..], 4096), (&stored.salt[..], stored.iterations));
+        assert_eq!(&sha2::Sha512::digest(client)[..], &stored.stored_key[..]);
+        assert_eq!(&server[..], &stored.server_key[..]);
+
+        let removal = ScramCredentialDeletion::default().name("alice".into());
+        let removal = removal.mechanism(ScramMechanism::Scram512.into());
+        let delete = AlterUserScramCredentialsRequest::default().deletions(Some(vec![removal]));
+        let _answered = credentials.serve(Context::default(), delete).await?;
+        let reading = engine.user_scram_credential("alice", ScramMechanism::Scram512);
+        assert!(reading.await?.is_none());
+        Ok(())
     }
 }
