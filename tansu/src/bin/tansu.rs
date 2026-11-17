@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use dotenv::dotenv;
-use tansu_broker::{TracingFormat, otel};
-use tansu_cli::{Cli, Result};
+use tansu_broker::TracingFormat;
+use tansu_broker::otel;
+use tansu_cli::Cli;
+use tansu_cli::Result;
 use tansu_sans_io::ErrorCode;
-use tracing::{debug, error};
 
 // The docker image is a statically linked musl binary: without a custom
 // allocator it would use musl's malloc, which contends badly across threads.
@@ -46,21 +46,20 @@ Check your internet connection, verify the server address, and try again.";
 
 #[tokio::main]
 async fn main() -> Result<ErrorCode> {
-    _ = dotenv().ok();
-
+    _ = dotenv::dotenv();
     let _guard = otel::init(TracingFormat::Text)?;
 
-    Cli::main()
-        .await
-        .inspect(|error_code| match error_code {
-            ErrorCode::None => debug!("{}", error_code),
-            _ => error!("{}", error_code),
-        })
-        .inspect_err(|err| match err {
-            tansu_cli::Error::Topic(error) => match error {
-                tansu_topic::Error::Client(_) => error!("{}", CLIENT_ERROR_MESSAGE),
-                _ => error!("Unknown error occurred during command: {}", error),
-            },
-            _ => error!("Unknown error occurred during command: {}", err),
-        })
+    let outcome = Cli::main().await;
+    match &outcome {
+        Ok(ErrorCode::None) => tracing::debug!("{}", ErrorCode::None),
+        Ok(code) => tracing::error!("{code}"),
+        Err(tansu_cli::Error::Topic(tansu_topic::Error::Client(_))) => {
+            tracing::error!("{CLIENT_ERROR_MESSAGE}");
+        }
+        Err(tansu_cli::Error::Topic(failure)) => {
+            tracing::error!("Unknown error occurred during command: {failure}");
+        }
+        Err(failure) => tracing::error!("Unknown error occurred during command: {failure}"),
+    }
+    outcome
 }
