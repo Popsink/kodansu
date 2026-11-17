@@ -932,6 +932,12 @@ fmt:
 # floor with its tests. The `ApiVersions` answer is assembled in `let` steps
 # from the same messages and the same floor; routing and duplicate-route
 # refusal are unchanged. Only code went.
+#   defork  -0 lines, the consumer group service rewritten  2911 -> 2910  2.7141 -> 2.7140
+#
+# `tansu-service`'s `ConsumerGroupLayer`/`ConsumerGroupService` keep their
+# declarations. One uncited comment went — `// 1/3 of session timeout,
+# otherwise 3 seconds`, which said what the next line says — so the ceiling
+# comes down.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -942,7 +948,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7141" top="12":
+comments ceiling="2.7140" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

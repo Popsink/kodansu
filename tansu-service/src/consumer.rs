@@ -12,21 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    collections::BTreeMap,
-    fmt,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
-    time::Duration,
-};
+use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::{Arc, Mutex};
+use std::sync::{MutexGuard, PoisonError};
+use std::time::Duration;
 
-use rama::{Context, Layer, Service};
-use tansu_sans_io::{
-    ApiKey as _, Body, ErrorCode, Frame, Header, HeartbeatResponse, MetadataResponse,
-    RootMessageMeta,
-    consumer::{DynConsumerAssignment, GroupConsumer, MemberAssignment},
-};
-use tokio::time::sleep;
-use tracing::debug;
+use rama::Context;
+use rama::{Layer, Service};
+use tansu_sans_io::ApiKey as _;
+use tansu_sans_io::consumer::{DynConsumerAssignment, GroupConsumer, MemberAssignment};
+use tansu_sans_io::{Body, ErrorCode, Frame, Header, HeartbeatResponse};
+use tansu_sans_io::{MetadataResponse, RootMessageMeta};
 
 #[derive(Clone, Default)]
 pub struct ConsumerGroupLayer {
@@ -40,13 +37,14 @@ pub struct ConsumerGroupLayer {
 
 impl fmt::Debug for ConsumerGroupLayer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct(stringify!(ConsumerGroupLayer))
+        let mut shown = f.debug_struct("ConsumerGroupLayer");
+        let _ = shown
             .field("group_id", &self.group_id)
-            .field("topics", &self.topics)
-            .field("metadata", &self.metadata)
-            .field("rebalance_timeout", &self.rebalance_timeout)
-            .field("session_timeout", &self.session_timeout)
-            .finish_non_exhaustive()
+            .field("topics", &self.topics);
+        let _ = shown.field("metadata", &self.metadata);
+        let _ = shown.field("rebalance_timeout", &self.rebalance_timeout);
+        let _ = shown.field("session_timeout", &self.session_timeout);
+        shown.finish_non_exhaustive()
     }
 }
 
@@ -56,38 +54,39 @@ impl ConsumerGroupLayer {
         topics: impl IntoIterator<Item = impl Into<String>>,
         metadata: MetadataResponse,
     ) -> Self {
+        let (group_id, topics) = (
+            group_id.into(),
+            topics.into_iter().map(Into::into).collect(),
+        );
         Self {
-            group_id: group_id.into(),
-            topics: topics.into_iter().map(Into::into).collect(),
+            on_assignment: None,
+            session_timeout: None,
+            rebalance_timeout: None,
             metadata,
-            rebalance_timeout: Default::default(),
-            session_timeout: Default::default(),
-            on_assignment: Default::default(),
+            topics,
+            group_id,
         }
     }
 
     pub fn rebalance_timeout(self, rebalance_timeout: Option<Duration>) -> Self {
-        Self {
-            rebalance_timeout,
-            ..self
-        }
+        let mut adjusted = self;
+        adjusted.rebalance_timeout = rebalance_timeout;
+        adjusted
     }
 
     pub fn session_timeout(self, session_timeout: Option<Duration>) -> Self {
-        Self {
-            session_timeout,
-            ..self
-        }
+        let mut adjusted = self;
+        adjusted.session_timeout = session_timeout;
+        adjusted
     }
 
     pub fn on_assignment(
         self,
         on_assignment: impl Fn(String, MemberAssignment) + 'static + Send + Sync,
     ) -> Self {
-        Self {
-            on_assignment: Some(Arc::new(on_assignment)),
-            ..self
-        }
+        let mut adjusted = self;
+        adjusted.on_assignment = Some(Arc::new(on_assignment));
+        adjusted
     }
 }
 
@@ -95,18 +94,15 @@ impl<S> Layer<S> for ConsumerGroupLayer {
     type Service = ConsumerGroupService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        let consumer = Arc::new(Mutex::new(
-            GroupConsumer::builder(self.group_id.clone())
-                .topics(self.topics.clone())
-                .metadata(self.metadata.clone())
-                .on_assignment(self.on_assignment.clone())
-                .build(),
-        ));
-
-        Self::Service {
-            inner,
+        let consuming = GroupConsumer::builder(self.group_id.clone()).topics(self.topics.clone());
+        let consuming = consuming.metadata(self.metadata.clone());
+        let consuming = consuming.on_assignment(self.on_assignment.clone()).build();
+        let consumer = Arc::new(Mutex::new(consuming));
+        let heartbeats = Arc::default();
+        ConsumerGroupService {
+            heartbeats,
             consumer,
-            heartbeats: Default::default(),
+            inner,
         }
     }
 }
@@ -120,10 +116,8 @@ pub struct ConsumerGroupService<S> {
 
 impl<S> ConsumerGroupService<S> {
     pub fn is_leader(&self) -> Result<bool, crate::Error> {
-        self.consumer
-            .lock()
-            .map(|consumer| consumer.is_leader())
-            .map_err(Into::into)
+        let consumer = self.consumer.lock()?;
+        Ok(consumer.is_leader())
     }
 
     /// The generation this consumer last saw, or `None` before its first join.
@@ -133,51 +127,39 @@ impl<S> ConsumerGroupService<S> {
     /// the second is evidence that a rebalance has settled, and an assignment
     /// sampled without it can straddle two generations.
     pub fn generation(&self) -> Result<Option<i32>, crate::Error> {
-        self.consumer
-            .lock()
-            .map(|consumer| consumer.generation_id())
-            .map_err(Into::into)
+        let consumer = self.consumer.lock()?;
+        Ok(consumer.generation_id())
     }
 
     pub fn stable_heartbeat_count(&self) -> Result<Option<usize>, crate::Error> {
-        self.heartbeats
-            .lock()
-            .map(|heartbeats| heartbeats.as_ref().cloned())
-            .map_err(Into::into)
+        let counted = self.heartbeats.lock()?;
+        Ok(*counted)
     }
 
     pub fn member_assignment(&self) -> Result<Option<MemberAssignment>, crate::Error> {
-        self.consumer
-            .lock()
-            .map(|consumer| consumer.member_assignment().cloned())
-            .map_err(Into::into)
+        let consumer = self.consumer.lock()?;
+        Ok(consumer.member_assignment().cloned())
     }
 
     pub fn rebalance_timeout(&self) -> Result<Duration, crate::Error> {
-        self.consumer
-            .lock()
-            .map(|consumer| consumer.rebalance_timeout())
-            .map_err(Into::into)
+        let consumer = self.consumer.lock()?;
+        Ok(consumer.rebalance_timeout())
     }
 
     pub fn session_timeout(&self) -> Result<Duration, crate::Error> {
-        self.consumer
-            .lock()
-            .map(|consumer| consumer.session_timeout())
-            .map_err(Into::into)
+        let consumer = self.consumer.lock()?;
+        Ok(consumer.session_timeout())
     }
 
     pub fn errors(self) -> Result<BTreeMap<ErrorCode, u64>, crate::Error> {
-        self.consumer
-            .lock()
-            .map_err(Into::into)
-            .and_then(|consumer| consumer.errors().map_err(Into::into))
+        let consumer = self.consumer.lock()?;
+        Ok(consumer.errors()?)
     }
 }
 
 impl<S> fmt::Debug for ConsumerGroupService<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct(stringify!(ConsumerGroupService)).finish()
+        f.debug_struct("ConsumerGroupService").finish()
     }
 }
 
@@ -198,61 +180,42 @@ where
         ctx: Context<State>,
         input: Option<Body>,
     ) -> Result<Self::Response, Self::Error> {
-        let frame = self
-            .consumer
-            .lock()
-            .map_err(Self::Error::from)
-            .and_then(|mut consumer| {
-                consumer
-                    .next_action(input)
-                    .inspect(|next_action| debug!(?next_action))
-                    .map_err(Into::into)
-            })
-            .map(|body| {
-                let api_key = body.api_key();
-                let api_version = RootMessageMeta::messages()
-                    .requests()
-                    .get(&api_key)
-                    .map(|message_meta| message_meta.version.valid().end)
-                    .unwrap_or_default();
+        let body = {
+            let mut consumer = self.consumer.lock()?;
+            let next_action = consumer.next_action(input)?;
+            tracing::debug!(?next_action);
+            next_action
+        };
 
-                Frame {
-                    size: 0,
-                    header: Header::Request {
-                        api_key,
-                        api_version,
-                        correlation_id: 0,
-                        client_id: Some(env!("CARGO_PKG_NAME").into()),
-                    },
-                    body,
-                }
-            })?;
+        let key = body.api_key();
+        let declared = RootMessageMeta::messages().requests().get(&key);
+        let api_version = declared.map_or(0, |meta| meta.version.valid().end);
+        let client_id = Some(String::from(env!("CARGO_PKG_NAME")));
+        let header = Header::Request {
+            correlation_id: 0,
+            api_key: key,
+            api_version,
+            client_id,
+        };
+        let request = Frame {
+            size: 0,
+            header,
+            body,
+        };
 
-        let output = self
-            .inner
-            .serve(ctx.clone(), frame)
-            .await
-            .map(|frame| frame.body)
-            .inspect(|input| debug!(input.api_name = input.api_name()))?;
+        let answered = self.inner.serve(ctx.clone(), request).await?;
+        let output = answered.body;
+        tracing::debug!(input.api_name = output.api_name());
 
         if output.api_key() == HeartbeatResponse::KEY {
-            self.heartbeats
-                .lock()
-                .map(|mut heartbeats| *heartbeats.get_or_insert_default() += 1)?;
-
-            // 1/3 of session timeout, otherwise 3 seconds
-            sleep(
-                self.session_timeout()
-                    .ok()
-                    .and_then(|session_timeout| session_timeout.checked_div(3))
-                    .unwrap_or_else(|| Duration::from_secs(3)),
-            )
-            .await
+            *self.heartbeats.lock()?.get_or_insert_default() += 1;
+            let third = match self.session_timeout() {
+                Ok(timeout) => timeout.checked_div(3),
+                Err(_) => None,
+            };
+            tokio::time::sleep(third.unwrap_or(Duration::from_secs(3))).await;
         } else {
-            _ = self
-                .heartbeats
-                .lock()
-                .map(|mut heartbeats| heartbeats.take())?;
+            _ = self.heartbeats.lock()?.take();
         }
 
         Ok(output)
