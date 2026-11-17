@@ -920,6 +920,12 @@ fmt:
 # per variant, and a new test in `tests/api.rs` pins every wire value from -2
 # to 19 — against the old body as well as the new. The test's lines are code,
 # so the ceiling comes down.
+#   defork  -36 lines, the uniform assignor rewritten  2913 -> 2911  2.7143 -> 2.7138
+#
+# `UniformAssignor` keeps its declaration and its one-line delegation to the
+# round-robin assignor. Its two tests assert the same assignments through
+# shared helpers; their `// mirrors RoundRobinAssignor::…` labels became the
+# tests' doc comments. Two comment lines went, so the ceiling comes down.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -930,7 +936,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7143" top="12":
+comments ceiling="2.7138" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
