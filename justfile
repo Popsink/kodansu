@@ -858,6 +858,11 @@ fmt:
 #
 # `CreateTopics` keeps its declarations; the three outcomes now share one
 # `result_for` builder, and the comments are kept word for word. Only code went.
+#   defork  -23 lines, the list_offsets handler body rewritten  2923 -> 2923  2.7185 -> 2.7189
+#
+# `ListOffsets` keeps its declarations. The #444 comment, cited and so exempt,
+# is reflowed from a 30-line column at the bottom of a builder chain to seven
+# lines at full width. Only code went.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -868,7 +873,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7185" top="12":
+comments ceiling="2.7189" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
