@@ -12,13 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, error::Error, str::FromStr};
+use std::collections::HashMap;
+use std::error::Error;
+use std::str::FromStr;
 
-use crate::Result;
 use clap::Subcommand;
 use tansu_sans_io::ErrorCode;
 use tansu_topic::Topic;
 use url::Url;
+
+use crate::Result;
 
 use super::DEFAULT_BROKER;
 
@@ -65,31 +68,34 @@ impl From<Command> for Topic {
     fn from(value: Command) -> Self {
         match value {
             Command::Create {
-                broker,
-                name,
-                partitions,
-                config,
-            } => Topic::create()
-                .broker(broker)
-                .name(name)
-                .partitions(partitions)
-                .config(HashMap::from_iter(config))
-                .build(),
+                broker: at,
+                name: topic,
+                partitions: count,
+                config: pairs,
+            } => {
+                let overrides: HashMap<_, _> = pairs.into_iter().collect();
+                let creating = Topic::create().broker(at).name(topic).partitions(count);
+                creating.config(overrides).build()
+            }
 
-            Command::Delete { broker, name } => Topic::delete().broker(broker).name(name).build(),
+            Command::Delete {
+                broker: at,
+                name: topic,
+            } => Topic::delete().broker(at).name(topic).build(),
 
-            Command::List { broker } => Topic::list().broker(broker).build(),
+            Command::List { broker: at } => Topic::list().broker(at).build(),
         }
     }
 }
 
 impl Command {
     pub(super) async fn main(self) -> Result<ErrorCode> {
-        Topic::from(self).main().await.map_err(Into::into)
+        let request = Topic::from(self);
+        Ok(request.main().await?)
     }
 }
 
-/// Parse a single key-value pair
+/// Splits `KEY=value` at its first `=` and parses each side.
 fn parse_key_val<T, U>(s: &str) -> Result<(T, U), Box<dyn Error + Send + Sync + 'static>>
 where
     T: FromStr,
@@ -97,10 +103,10 @@ where
     U: FromStr,
     U::Err: Error + Send + Sync + 'static,
 {
-    let pos = s
-        .find('=')
-        .ok_or_else(|| format!("invalid KEY=value: no `=` found in `{s}`"))?;
-    Ok((s[..pos].parse()?, s[pos + 1..].parse()?))
+    let Some((key, value)) = s.split_once('=') else {
+        return Err(format!("invalid KEY=value: no `=` found in `{s}`").into());
+    };
+    Ok((key.parse()?, value.parse()?))
 }
 
 #[cfg(test)]
