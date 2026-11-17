@@ -880,6 +880,11 @@ fmt:
 # comment beside the handshake's fresh-server reset was upstream's, and is
 # reworded in five lines instead of eight; it still cites only a KIP, so it
 # still counts. Three comment lines went, so the ceiling comes down.
+#   defork  -43 lines, the tansu-topic subcommands rewritten  2920 -> 2920  2.7185 -> 2.7196
+#
+# `create`, `delete` and `list` keep their declarations. Each built the same
+# client the same way, and `create` and `delete` checked their one result the
+# same way; both now live once in `lib.rs`. Only code went.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -890,7 +895,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7185" top="12":
+comments ceiling="2.7196" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

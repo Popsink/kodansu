@@ -12,14 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{fmt, io, result};
+use std::fmt;
+use std::io;
+use std::marker::PhantomData;
+use std::result;
+use std::sync::Arc;
 
-use create::Create;
-use delete::Delete;
-use std::{marker::PhantomData, sync::Arc};
 use tansu_sans_io::ErrorCode;
 use url::Url;
 
+use crate::create::Create;
+use crate::delete::Delete;
 use crate::list::List;
 
 mod create;
@@ -38,6 +41,25 @@ pub enum Error {
     Io(Arc<io::Error>),
     Protocol(#[from] tansu_sans_io::Error),
     SerdeJson(Arc<serde_json::Error>),
+}
+
+/// A client of `broker`, identifying itself by this crate's name.
+pub(crate) async fn connected(broker: &Url) -> Result<tansu_client::Client> {
+    let manager = tansu_client::ConnectionManager::builder(broker.clone());
+    let manager = manager.client_id(Some(String::from(env!("CARGO_PKG_NAME"))));
+    let pool = manager.build().await?;
+    tracing::debug!(?pool);
+    Ok(tansu_client::Client::new(pool))
+}
+
+/// The code of the one result a single-topic request is answered with.
+///
+/// # Panics
+///
+/// When the broker answers with any other number of results.
+pub(crate) fn sole_code(codes: &[i16]) -> Result<ErrorCode> {
+    assert_eq!(1, codes.len());
+    ErrorCode::try_from(codes[0]).map_err(Error::from)
 }
 
 impl From<io::Error> for Error {
@@ -80,9 +102,9 @@ impl Topic {
 
     pub async fn main(self) -> Result<ErrorCode> {
         match self {
-            Self::Create(configuration) => Create::try_from(configuration)?.main().await,
-            Self::Delete(configuration) => Delete::try_from(configuration)?.main().await,
-            Self::List(configuration) => List::try_from(configuration)?.main().await,
+            Self::Create(wanted) => Create::try_from(wanted)?.main().await,
+            Self::Delete(named) => Delete::try_from(named)?.main().await,
+            Self::List(listing) => List::try_from(listing)?.main().await,
         }
     }
 }

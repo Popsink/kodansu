@@ -12,15 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use tansu_client::{Client, ConnectionManager};
-use tansu_sans_io::{
-    DeleteTopicsRequest, DeleteTopicsResponse, ErrorCode, NULL_TOPIC_ID,
-    delete_topics_request::DeleteTopicState, delete_topics_response::DeletableTopicResult,
-};
-use tracing::debug;
+use tansu_sans_io::delete_topics_request::DeleteTopicState;
+use tansu_sans_io::{DeleteTopicsRequest, ErrorCode, NULL_TOPIC_ID};
 use url::Url;
 
-use crate::{Error, Result, Topic};
+use crate::Topic;
+use crate::{Error, Result};
 
 #[derive(Clone, Debug, Default)]
 pub struct Builder<B, N> {
@@ -30,26 +27,20 @@ pub struct Builder<B, N> {
 
 impl<B, N> Builder<B, N> {
     pub fn broker(self, broker: Url) -> Builder<Url, N> {
-        Builder {
-            broker,
-            name: self.name,
-        }
+        let name = self.name;
+        Builder { broker, name }
     }
 
     pub fn name(self, name: impl Into<String>) -> Builder<B, String> {
-        Builder {
-            broker: self.broker,
-            name: name.into(),
-        }
+        let (broker, name) = (self.broker, name.into());
+        Builder { broker, name }
     }
 }
 
 impl Builder<Url, String> {
     pub fn build(self) -> Topic {
-        Topic::Delete(Configuration {
-            broker: self.broker,
-            name: self.name,
-        })
+        let Self { broker, name } = self;
+        Topic::Delete(Configuration { broker, name })
     }
 }
 
@@ -68,42 +59,25 @@ impl TryFrom<Configuration> for Delete {
     type Error = Error;
 
     fn try_from(configuration: Configuration) -> Result<Self, Self::Error> {
-        Ok(Delete { configuration })
+        Ok(Self { configuration })
     }
 }
 
 impl Delete {
     pub(crate) async fn main(self) -> Result<ErrorCode> {
-        let client = ConnectionManager::builder(self.configuration.broker.clone())
-            .client_id(Some(env!("CARGO_PKG_NAME").into()))
-            .build()
-            .await
-            .inspect(|pool| debug!(?pool))
-            .map(Client::new)?;
+        let client = crate::connected(&self.configuration.broker).await?;
 
-        let timeout_ms = 30_000;
+        let named = Some(self.configuration.name);
+        let topic = DeleteTopicState::default()
+            .name(named)
+            .topic_id(NULL_TOPIC_ID);
+        let request = DeleteTopicsRequest::default().topics(Some(vec![topic]));
+        let request = request.topic_names(None).timeout_ms(30_000);
 
-        let req = DeleteTopicsRequest::default()
-            .topics(Some(
-                [DeleteTopicState::default()
-                    .name(Some(self.configuration.name))
-                    .topic_id(NULL_TOPIC_ID)]
-                .into(),
-            ))
-            .topic_names(None)
-            .timeout_ms(timeout_ms);
-
-        let DeleteTopicsResponse { responses, .. } = client
-            .call(req)
-            .await
-            .inspect(|response| debug!(?response))?;
-
-        let responses = responses.unwrap_or_default();
-        assert_eq!(1, responses.len());
-
-        let DeletableTopicResult { error_code, .. } =
-            responses.first().expect("responses: {responses:?}");
-
-        ErrorCode::try_from(error_code).map_err(Into::into)
+        let answered = client.call(request).await?;
+        tracing::debug!(response = ?answered);
+        let results = answered.responses.unwrap_or_default();
+        let codes: Vec<i16> = results.iter().map(|result| result.error_code).collect();
+        crate::sole_code(&codes)
     }
 }

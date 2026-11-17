@@ -14,18 +14,13 @@
 
 use std::collections::HashMap;
 
-use tansu_client::{Client, ConnectionManager};
-use tansu_sans_io::{
-    CreateTopicsRequest, CreateTopicsResponse, ErrorCode,
-    create_topics_request::{CreatableTopic, CreatableTopicConfig},
-    create_topics_response::CreatableTopicResult,
-};
-use tracing::debug;
+use tansu_sans_io::CreateTopicsRequest;
+use tansu_sans_io::ErrorCode;
+use tansu_sans_io::create_topics_request::{CreatableTopic, CreatableTopicConfig};
 use url::Url;
 
-use crate::{Error, Result};
-
 use super::Topic;
+use crate::{Error, Result};
 
 #[derive(Clone, Debug, Default)]
 pub struct Builder<B, N, P> {
@@ -36,31 +31,26 @@ pub struct Builder<B, N, P> {
 }
 
 impl<B, N, P> Builder<B, N, P> {
-    pub fn broker(self, broker: Url) -> Builder<Url, N, P> {
-        Builder {
-            broker,
-            name: self.name,
-            partitions: self.partitions,
-            configs: self.configs,
+    /// A builder from its four parts, whatever stage each is at.
+    fn assembled(at: B, topic: N, count: P, overrides: HashMap<String, String>) -> Self {
+        Self {
+            configs: overrides,
+            partitions: count,
+            name: topic,
+            broker: at,
         }
+    }
+
+    pub fn broker(self, broker: Url) -> Builder<Url, N, P> {
+        Builder::assembled(broker, self.name, self.partitions, self.configs)
     }
 
     pub fn name(self, name: impl Into<String>) -> Builder<B, String, P> {
-        Builder {
-            broker: self.broker,
-            name: name.into(),
-            partitions: self.partitions,
-            configs: self.configs,
-        }
+        Builder::assembled(self.broker, name.into(), self.partitions, self.configs)
     }
 
     pub fn partitions(self, partitions: i32) -> Builder<B, N, i32> {
-        Builder {
-            broker: self.broker,
-            name: self.name,
-            partitions,
-            configs: self.configs,
-        }
+        Builder::assembled(self.broker, self.name, partitions, self.configs)
     }
 
     pub fn config(self, configs: HashMap<String, String>) -> Builder<B, N, P> {
@@ -70,12 +60,19 @@ impl<B, N, P> Builder<B, N, P> {
 
 impl Builder<Url, String, i32> {
     pub fn build(self) -> Topic {
-        Topic::Create(Configuration {
-            broker: self.broker,
-            name: self.name,
-            partitions: self.partitions,
-            configs: self.configs,
-        })
+        let Self {
+            configs,
+            partitions,
+            name,
+            broker,
+        } = self;
+        let configuration = Configuration {
+            configs,
+            partitions,
+            name,
+            broker,
+        };
+        Topic::Create(configuration)
     }
 }
 
@@ -96,55 +93,32 @@ impl TryFrom<Configuration> for Create {
     type Error = Error;
 
     fn try_from(configuration: Configuration) -> Result<Self, Self::Error> {
-        Ok(Create { configuration })
+        Ok(Self { configuration })
     }
 }
 
 impl Create {
     pub(crate) async fn main(self) -> Result<ErrorCode> {
-        let client = ConnectionManager::builder(self.configuration.broker.clone())
-            .client_id(Some(env!("CARGO_PKG_NAME").into()))
-            .build()
-            .await
-            .inspect(|pool| debug!(?pool))
-            .map(Client::new)?;
+        let Configuration {
+            broker,
+            name,
+            partitions: count,
+            configs: overrides,
+        } = self.configuration;
+        let client = crate::connected(&broker).await?;
 
-        let timeout_ms = 30_000;
-        let validate_only = Some(false);
+        let to_config = |(key, value)| CreatableTopicConfig::default().name(key).value(Some(value));
+        let overrides: Vec<_> = overrides.into_iter().map(to_config).collect();
+        let topic = CreatableTopic::default().name(name).num_partitions(count);
+        let topic = topic.replication_factor(-1).assignments(Some(vec![]));
+        let request =
+            CreateTopicsRequest::default().topics(Some(vec![topic.configs(Some(overrides))]));
+        let request = request.timeout_ms(30_000).validate_only(Some(false));
 
-        let req = CreateTopicsRequest::default()
-            .topics(Some(
-                [CreatableTopic::default()
-                    .name(self.configuration.name)
-                    .num_partitions(self.configuration.partitions)
-                    .replication_factor(-1)
-                    .assignments(Some([].into()))
-                    .configs(Some(
-                        self.configuration
-                            .configs
-                            .into_iter()
-                            .map(|(name, value)| {
-                                CreatableTopicConfig::default()
-                                    .name(name)
-                                    .value(Some(value))
-                            })
-                            .collect(),
-                    ))]
-                .into(),
-            ))
-            .timeout_ms(timeout_ms)
-            .validate_only(validate_only);
-
-        let CreateTopicsResponse { topics, .. } = client
-            .call(req)
-            .await
-            .inspect(|response| debug!(?response))?;
-
-        let topics = topics.unwrap_or_default();
-        assert_eq!(1, topics.len());
-
-        let CreatableTopicResult { error_code, .. } = topics.first().expect("topics: {topics:?}");
-
-        ErrorCode::try_from(error_code).map_err(Into::into)
+        let answered = client.call(request).await?;
+        tracing::debug!(response = ?answered);
+        let results = answered.topics.unwrap_or_default();
+        let codes: Vec<i16> = results.iter().map(|result| result.error_code).collect();
+        crate::sole_code(&codes)
     }
 }
