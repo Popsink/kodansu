@@ -944,6 +944,14 @@ fmt:
 # the imports, the `Debug` impls, the `layer` constructors, two setters,
 # `elapsed_millis`, the metric attributes and `BytesService::serve`. The accept
 # loop and the frame reading and writing are untouched. Only code went.
+#   defork  -56 lines, the null engine's bodies rewritten  2910 -> 2910  2.7144 -> 2.7159
+#
+# `null.rs` keeps its declarations and every method signature. Four copies of
+# the `FeatureNotEnabled` answer became one `undefined`; the host, port and
+# replica lists `brokers`, `metadata` and `describe_topic_partitions` built
+# twice over became two helpers. Every rewritten method's `Debug` output was
+# diffed against the previous body before and after, and is identical. Only
+# code went.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -954,7 +962,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7144" top="12":
+comments ceiling="2.7159" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
