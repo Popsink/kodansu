@@ -958,6 +958,14 @@ fmt:
 # seven tests built the same router and the same client stack seven times;
 # five tests on shared helpers keep every assertion. Only code went, a lot of
 # it, so the ceiling rises.
+#   defork  -13 lines, the range assignor rewritten  2910 -> 2896  2.7211 -> 2.7124
+#
+# `RangeAssignor` keeps its declaration and `assign` signature; the body is
+# loops in place of iterator chains, with the same order and the same logs.
+# Its four tests keep their assignments on shared helpers, and the fourteen
+# `//` lines narrating them — the arithmetic of each case — became the tests'
+# doc comments. The new tests pass against the old body too. Fourteen comment
+# lines went, so the ceiling comes down.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -968,7 +976,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7211" top="12":
+comments ceiling="2.7124" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
