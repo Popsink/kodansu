@@ -926,6 +926,12 @@ fmt:
 # round-robin assignor. Its two tests assert the same assignments through
 # shared helpers; their `// mirrors RoundRobinAssignor::…` labels became the
 # tests' doc comments. Two comment lines went, so the ceiling comes down.
+#   defork  -10 lines, the frame router and ApiVersions service rewritten  2911 -> 2911  2.7138 -> 2.7141
+#
+# `tansu-service`'s `api.rs` keeps its declarations and the #322 record-format
+# floor with its tests. The `ApiVersions` answer is assembled in `let` steps
+# from the same messages and the same floor; routing and duplicate-route
+# refusal are unchanged. Only code went.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -936,7 +942,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7138" top="12":
+comments ceiling="2.7141" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
