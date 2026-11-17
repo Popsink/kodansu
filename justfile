@@ -913,6 +913,13 @@ fmt:
 # commented-out OpenTelemetry layer wiring from upstream — code, not comment,
 # that nothing had compiled since the fork. They went, so the ceiling comes
 # down.
+#   defork  -7 lines, the ACL enum conversions rewritten  2913 -> 2913  2.7148 -> 2.7143
+#
+# `acl::{Permission, Operation, Resource}` keep their variants and
+# discriminants; `From<i8>` looks the value up among them instead of a guard
+# per variant, and a new test in `tests/api.rs` pins every wire value from -2
+# to 19 — against the old body as well as the new. The test's lines are code,
+# so the ceiling comes down.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -923,7 +930,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7148" top="12":
+comments ceiling="2.7143" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
