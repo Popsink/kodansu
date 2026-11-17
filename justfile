@@ -938,6 +938,12 @@ fmt:
 # declarations. One uncited comment went — `// 1/3 of session timeout,
 # otherwise 3 seconds`, which said what the next line says — so the ceiling
 # comes down.
+#   defork  -15 lines, the stream layers' small bodies rewritten  2910 -> 2910  2.7140 -> 2.7144
+#
+# `tansu-service`'s `stream.rs` is the TCP path, so only its small bodies moved:
+# the imports, the `Debug` impls, the `layer` constructors, two setters,
+# `elapsed_millis`, the metric attributes and `BytesService::serve`. The accept
+# loop and the frame reading and writing are untouched. Only code went.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -948,7 +954,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7140" top="12":
+comments ceiling="2.7144" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
