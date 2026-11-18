@@ -1022,6 +1022,16 @@ fmt:
 # one helper with every byte kept, the `ApiVersions` fixture is built from the
 # feature it carries, and the new tests pass against the old body too. Only
 # code went, so the ceiling rises.
+#   defork  -81 lines, the record codecs rewritten  2866 -> 2866  2.6988 -> 2.7006
+#
+# `record/codec.rs` keeps `Octets`, `VarIntSequence`, `Sequence` and every
+# impl and signature. The visitors read through `required` and `elements`,
+# with the same `length` and `item` errors and the same `debug` lines.
+# `Octets::serialize` still writes the data and ends the struct even when the
+# length failed, returning the first error, as the eager `.and(...)` chain
+# did; `decode` still casts a varint length with `as usize`. The five tests
+# became three on one `round_trip` helper with every size kept, and they pass
+# against the old body too. Only code went, so the ceiling rises.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -1032,7 +1042,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6988" top="12":
+comments ceiling="2.7006" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
