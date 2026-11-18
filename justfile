@@ -1043,6 +1043,15 @@ fmt:
 # the same. The four tests and the commented-out ones became five covering
 # every type's wire bytes, sizes and the overflow, passing against the old
 # body too. The commented-out tests went, so the ceiling falls.
+#   defork  -33 lines, the consumer protocol codecs rewritten  2834 -> 2834  2.6720 -> 2.6725
+#
+# `consumer/codec.rs` keeps every struct, enum, impl and signature. The
+# visitors read through `required` and `octets`, the serializers write a length
+# and its bytes through `written`, and the conversions destructure rather than
+# reach into fields, with the same version mapping, the same 1024 and 4096
+# bounds, the same error messages and the same `debug` lines. A new test pins
+# a v3 subscription's wire bytes and passes against the old body too. Only
+# code went, so the ceiling rises.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -1053,7 +1062,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6720" top="12":
+comments ceiling="2.6725" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
