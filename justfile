@@ -1012,6 +1012,16 @@ fmt:
 # bytes, the same varint overflow checks, the same size limit, the same
 # `UnexpectedType` messages and the same `debug` lines. Its tests, and the
 # golden wire fixtures, pass unchanged. Only code went, so the ceiling rises.
+#   defork  -146 lines, the tag buffer rewritten  2866 -> 2866  2.6963 -> 2.6988
+#
+# `primitive/tagged.rs` keeps `TagField`, `TagBuffer`, `TagBufferBuilder` and
+# every impl and signature. The bodies read through `required`, bound through
+# `bounded` and map length errors through `too_big`, with the same bytes, the
+# same 128 bound on both the field count and a field's length, the same error
+# messages and the same `debug` fields. Its seven payload tests became four on
+# one helper with every byte kept, the `ApiVersions` fixture is built from the
+# feature it carries, and the new tests pass against the old body too. Only
+# code went, so the ceiling rises.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -1022,7 +1032,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6963" top="12":
+comments ceiling="2.6988" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
