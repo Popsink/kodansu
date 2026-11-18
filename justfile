@@ -976,6 +976,15 @@ fmt:
 # with the narrating `//` lines turned into doc comments, and the new round
 # robin tests pass against the old body too. Twenty-two comment lines went, so
 # the ceiling comes down.
+#   defork  -83 lines, the GCS put rate limiter rewritten  2874 -> 2869  2.6990 -> 2.6961
+#
+# `gcs/limit.rs` keeps every declaration and `ObjectStore` signature, and every
+# doc comment. The bodies are rewritten with the same spans, the same fields and
+# the same events: `rate_limited_ms` at `debug`, `no_rate_limit` at `warn`. The
+# delegating methods go through one `inner()` accessor. The two tests keep their
+# timings on shared helpers, the one named `test` now says what it checks, and
+# five narrating `//` lines became the first test's doc comment. Both pass
+# against the old body too. Five comment lines went, so the ceiling comes down.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -986,7 +995,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6990" top="12":
+comments ceiling="2.6961" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

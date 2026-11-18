@@ -12,22 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    fmt::{Debug, Display},
-    num::{NonZero, NonZeroUsize},
-    sync::{Arc, Mutex},
-    time::{Duration, SystemTime},
-};
+use std::fmt::{Debug, Display};
+use std::num::{NonZero, NonZeroUsize};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
-use async_trait::async_trait;
 use cached::stores::ExpiringSizedCache;
 use futures::stream::{BoxStream, StreamExt as _};
-use governor::{DefaultDirectRateLimiter, Jitter, Quota, RateLimiter};
-use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    ObjectStoreExt as _, PutMultipartOptions, PutOptions, PutPayload, PutResult, path::Path,
-};
-use tracing::{debug, instrument, warn};
+use governor::{DefaultDirectRateLimiter, Jitter, Quota};
+use object_store::path::Path;
+use object_store::{CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload};
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt as _, PutMultipartOptions};
+use object_store::{PutOptions, PutPayload, PutResult};
+use tracing::debug;
 
 use crate::Result;
 
@@ -82,36 +79,38 @@ pub struct PutRateLimiter<O> {
 
 impl<O> Debug for PutRateLimiter<O> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PutRateLimiter").finish()
+        f.write_str("PutRateLimiter")
     }
 }
 
 impl<O> Display for PutRateLimiter<O> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PutRateLimiter").finish()
+        f.write_str("PutRateLimiter")
     }
 }
 
 impl<O> PutRateLimiter<O> {
     pub fn new(object_store: O, ttl: Duration) -> Self {
-        Self {
-            object_store: Arc::new(object_store),
-            entries: Arc::new(Mutex::new(ExpiringSizedCache::new(ttl))),
-            rate_per_second: Default::default(),
-            jitter: Default::default(),
+        let cache = ExpiringSizedCache::new(ttl);
+        PutRateLimiter {
             delete_concurrency: DEFAULT_DELETE_CONCURRENCY,
+            entries: Arc::new(Mutex::new(cache)),
+            jitter: None,
+            object_store: Arc::new(object_store),
+            rate_per_second: None,
         }
     }
 
     pub fn with_rate_per_second(self, rate_per_second: Option<NonZero<u32>>) -> Self {
-        Self {
-            rate_per_second,
-            ..self
-        }
+        let mut limited = self;
+        limited.rate_per_second = rate_per_second;
+        limited
     }
 
     pub fn with_jitter(self, jitter: Option<Duration>) -> Self {
-        Self { jitter, ..self }
+        let mut jittered = self;
+        jittered.jitter = jitter;
+        jittered
     }
 
     /// How many objects [`ObjectStore::delete_stream`] deletes at once, or
@@ -129,26 +128,26 @@ impl<O> PutRateLimiter<O> {
     }
 
     fn rate_limiter(&self) -> Option<Arc<DefaultDirectRateLimiter>> {
-        self.rate_per_second
-            .map(Quota::per_second)
-            .map(RateLimiter::direct)
-            .map(Arc::new)
+        let quota = Quota::per_second(self.rate_per_second?);
+        Some(Arc::new(governor::RateLimiter::direct(quota)))
     }
 
-    #[instrument(skip_all, fields(location = %location))]
+    /// The store this decorator wraps.
+    fn inner(&self) -> &O {
+        &self.object_store
+    }
+
+    #[tracing::instrument(skip_all, fields(location = %location))]
     fn location_rate_limiter(&self, location: &Path) -> Option<Arc<DefaultDirectRateLimiter>> {
-        self.entries.lock().ok().and_then(|mut entries| {
-            entries
-                .get(location)
-                .cloned()
-                .or_else(|| self.rate_limiter())
-                .and_then(|rate_limiter| {
-                    entries
-                        .insert_evict(location.to_owned(), rate_limiter.clone(), true)
-                        .ok()
-                        .map(|_| rate_limiter)
-                })
-        })
+        let mut entries = self.entries.lock().ok()?;
+        let cached = entries.get(location).cloned();
+        let limiter = match cached {
+            Some(known) => known,
+            None => self.rate_limiter()?,
+        };
+        let key = location.to_owned();
+        _ = entries.insert_evict(key, Arc::clone(&limiter), true).ok()?;
+        Some(limiter)
     }
 
     /// Wait for this location's budget to admit **one** put.
@@ -167,51 +166,50 @@ impl<O> PutRateLimiter<O> {
     /// `until_ready_with_jitter` rather than `until_n_ready_with_jitter(1)`:
     /// there is no count to get wrong, and no `InsufficientCapacity` to handle —
     /// a single cell cannot exceed a bucket that holds at least one.
-    #[instrument(skip_all, fields(location = %location))]
+    #[tracing::instrument(skip_all, fields(location = %location))]
     async fn rate_limit(&self, location: &Path) {
-        if self.rate_per_second.is_some()
-            && let Some(rate_limiter) = self.location_rate_limiter(location)
-        {
-            let rate_limit_start = SystemTime::now();
+        let limiter = match self.rate_per_second {
+            Some(_) => self.location_rate_limiter(location),
+            None => None,
+        };
+        let Some(limiter) = limiter else {
+            tracing::warn!("no_rate_limit");
+            return;
+        };
 
-            rate_limiter
-                .until_ready_with_jitter(Jitter::up_to(self.jitter.unwrap_or(DEFAULT_JITTER)))
-                .await;
-
-            let rate_limited_ms = rate_limit_start
-                .elapsed()
-                .map_or(0, |duration| duration.as_millis() as u64);
-            debug!(rate_limited_ms);
-        } else {
-            warn!("no_rate_limit");
-        }
+        let waiting_since = SystemTime::now();
+        let jitter = Jitter::up_to(self.jitter.unwrap_or(DEFAULT_JITTER));
+        limiter.until_ready_with_jitter(jitter).await;
+        let took = waiting_since.elapsed();
+        let waited = took.map_or(0, |took| took.as_millis() as u64);
+        debug!(rate_limited_ms = waited);
     }
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 impl<O> ObjectStore for PutRateLimiter<O>
 where
     O: ObjectStore,
 {
-    #[instrument(skip_all, fields(location = %location))]
+    #[tracing::instrument(skip_all, fields(location = %location))]
     async fn put_opts(
         &self,
         location: &Path,
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult, object_store::Error> {
-        self.rate_limit(location).await;
-        self.object_store.put_opts(location, payload, opts).await
+        Self::rate_limit(self, location).await;
+        self.inner().put_opts(location, payload, opts).await
     }
 
-    #[instrument(skip_all, fields(location = %location))]
+    #[tracing::instrument(skip_all, fields(location = %location))]
     async fn put_multipart_opts(
         &self,
         location: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
-        self.rate_limit(location).await;
-        self.object_store.put_multipart_opts(location, opts).await
+        Self::rate_limit(self, location).await;
+        self.inner().put_multipart_opts(location, opts).await
     }
 
     /// `debug`, and without `ret` (#428).
@@ -226,13 +224,13 @@ where
     /// This decorator does not rate-limit reads at all — it only delegates — so
     /// it has nothing to say about a GET that `Metron`'s own instrumentation
     /// does not already say better.
-    #[instrument(level = "debug", skip_all, fields(%location, if_none_match = options.if_none_match))]
+    #[tracing::instrument(level = "debug", skip_all, fields(%location, if_none_match = options.if_none_match))]
     async fn get_opts(
         &self,
         location: &Path,
         options: GetOptions,
     ) -> Result<GetResult, object_store::Error> {
-        self.object_store.get_opts(location, options.clone()).await
+        self.inner().get_opts(location, options.clone()).await
     }
 
     /// Delete at a width this fork chose, not at `object_store`'s (#518).
@@ -284,12 +282,12 @@ where
             .boxed()
     }
 
-    #[instrument(skip_all, fields(prefix))]
+    #[tracing::instrument(skip_all, fields(prefix))]
     fn list(
         &self,
         prefix: Option<&Path>,
     ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
-        self.object_store.list(prefix)
+        self.inner().list(prefix)
     }
 
     /// Forward `list_with_offset` rather than inherit the default (#512).
@@ -310,87 +308,80 @@ where
     /// (`b7c6846`); this decorator predates that fix and was not part of it.
     /// Reads are not rate-limited here at all, so there is nothing to add beyond
     /// the delegation.
-    #[instrument(skip_all, fields(prefix, offset = %offset))]
+    #[tracing::instrument(skip_all, fields(prefix, offset = %offset))]
     fn list_with_offset(
         &self,
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
-        self.object_store.list_with_offset(prefix, offset)
+        self.inner().list_with_offset(prefix, offset)
     }
 
-    #[instrument(skip_all, fields(prefix))]
+    #[tracing::instrument(skip_all, fields(prefix))]
     async fn list_with_delimiter(
         &self,
         prefix: Option<&Path>,
     ) -> Result<ListResult, object_store::Error> {
-        self.object_store.list_with_delimiter(prefix).await
+        self.inner().list_with_delimiter(prefix).await
     }
 
-    #[instrument(skip_all, fields(from = %from, to = %to))]
+    #[tracing::instrument(skip_all, fields(from = %from, to = %to))]
     async fn copy_opts(
         &self,
         from: &Path,
         to: &Path,
         opts: CopyOptions,
     ) -> Result<(), object_store::Error> {
-        self.object_store.copy_opts(from, to, opts).await
+        self.inner().copy_opts(from, to, opts).await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, SystemTime};
 
-    use std::num::NonZeroU32;
+    use object_store::path::Path;
+    use object_store::{ObjectStore as _, PutOptions, PutPayload, memory::InMemory};
 
-    use bytes::Bytes;
-    use object_store::memory::InMemory;
-    use tracing::subscriber::DefaultGuard;
-    use tracing_subscriber::EnvFilter;
+    use super::{PutRateLimiter, Result};
 
-    use crate::Error;
+    /// Logs this test at `debug` for this crate, on top of `RUST_LOG`, into
+    /// `../logs/<package>/<thread>.log`: one file per test.
+    fn init_tracing() -> Result<tracing::subscriber::DefaultGuard> {
+        let directive = format!("{}=debug", env!("CARGO_CRATE_NAME")).parse()?;
+        let filter = tracing_subscriber::EnvFilter::from_default_env().add_directive(directive);
 
-    use super::*;
+        let unnamed = || crate::Error::Message(String::from("unnamed thread"));
+        let current = std::thread::current();
+        let test = current.name().ok_or_else(unnamed)?;
+        let log = std::fs::File::create(format!("../logs/{}/{test}.log", env!("CARGO_PKG_NAME")))?;
 
-    fn init_tracing() -> Result<DefaultGuard> {
-        use std::{fs::File, sync::Arc, thread};
-
-        Ok(tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_level(true)
-                .with_line_number(true)
-                .with_thread_names(false)
-                .with_env_filter(EnvFilter::from_default_env().add_directive(
-                    format!("{}=debug", env!("CARGO_PKG_NAME").replace("-", "_")).parse()?,
-                ))
-                .with_writer(
-                    thread::current()
-                        .name()
-                        .ok_or(Error::Message(String::from("unnamed thread")))
-                        .and_then(|name| {
-                            File::create(format!("../logs/{}/{name}.log", env!("CARGO_PKG_NAME"),))
-                                .map_err(Into::into)
-                        })
-                        .map(Arc::new)?,
-                )
-                .finish(),
-        ))
+        let subscriber = tracing_subscriber::fmt().with_level(true);
+        let subscriber = subscriber.with_line_number(true).with_thread_names(false);
+        let subscriber = subscriber.with_env_filter(filter);
+        let subscriber = subscriber.with_writer(std::sync::Arc::new(log));
+        Ok(tracing::subscriber::set_default(subscriber.finish()))
     }
 
+    /// Whole milliseconds since `start`, or none if the clock went back.
+    fn millis_since(start: SystemTime) -> u64 {
+        start.elapsed().map_or(0, |took| took.as_millis() as u64)
+    }
+
+    /// A rate limiter over memory, admitting `rate` puts a second per key.
+    fn limited(rate: u32) -> PutRateLimiter<InMemory> {
+        let limiter = PutRateLimiter::new(InMemory::new(), Duration::from_mins(5));
+        limiter.with_rate_per_second(std::num::NonZeroU32::new(rate))
+    }
+
+    /// How long a put to `location` took, in milliseconds.
     async fn put(prl: &PutRateLimiter<InMemory>, location: &Path) -> Result<u64> {
-        let now = SystemTime::now();
-
+        let start = SystemTime::now();
+        let payload = PutPayload::from_static(b"12321");
         _ = prl
-            .put_opts(
-                location,
-                PutPayload::from(Bytes::from_static(b"12321")),
-                PutOptions::default(),
-            )
+            .put_opts(location, payload, PutOptions::default())
             .await?;
-
-        Ok(now
-            .elapsed()
-            .map_or(0, |duration| duration.as_millis() as u64))
+        Ok(millis_since(start))
     }
 
     /// A configured rate of N admits N puts per second to one key (#428).
@@ -402,129 +393,55 @@ mod tests {
     ///
     /// The test beside this one cannot see it — it only ever configures 1/s,
     /// where `n == 1` either way. That is why the defect survived having a test.
+    ///
+    /// The bucket starts full, so the first four puts are immediate and the
+    /// fifth waits out one cell's worth of refill: 1/4 s. The 500 ms allowed
+    /// for the burst is generous against a slow runner, and still an order of
+    /// magnitude below the ~3 000 ms the defect produced.
     #[tokio::test]
     async fn a_configured_rate_admits_that_many_puts_per_second() -> Result<()> {
         let _guard = init_tracing()?;
+        let rate = 4;
+        let prl = limited(rate);
+        let key = Path::from("a");
 
-        // The bucket starts full, so the first four puts are immediate and the
-        // fifth waits out one cell's worth of refill: 1/4 s.
-        const RATE: u32 = 4;
-
-        let prl = PutRateLimiter::new(InMemory::new(), Duration::from_mins(5))
-            .with_rate_per_second(NonZeroU32::new(RATE));
-
-        let location = Path::from("a");
-
-        let burst = {
-            let now = SystemTime::now();
-
-            for _ in 0..RATE {
-                _ = put(&prl, &location).await?;
-            }
-
-            now.elapsed()
-                .map_or(0, |duration| duration.as_millis() as u64)
-        };
-
-        // Generous against a slow runner, and still an order of magnitude below
-        // the ~3 000 ms the defect produced.
+        let start = SystemTime::now();
+        for _ in 0..rate {
+            _ = put(&prl, &key).await?;
+        }
+        let burst = millis_since(start);
         assert!(
             burst < 500,
-            "{RATE} puts at a configured {RATE}/s took {burst}ms; \
+            "{rate} puts at a configured {rate}/s took {burst}ms; \
              the whole per-second quota is being spent on each one",
         );
 
-        // And the rate is still enforced: the next one waits for a refill.
-        let fifth = put(&prl, &location).await?;
-
+        let fifth = put(&prl, &key).await?;
         assert!(
             fifth >= 150,
             "the {}th put must wait for its cell, waited {fifth}ms",
-            RATE + 1,
+            rate + 1,
         );
-
         Ok(())
     }
 
+    /// At one put a second, a second put to a key waits out the second, while
+    /// a put to another key does not wait at all.
     #[tokio::test]
-    async fn test() -> Result<()> {
+    async fn each_key_has_a_budget_of_its_own() -> Result<()> {
         let _guard = init_tracing()?;
+        let full_second = 900;
+        let prl = limited(1);
+        let (a, b) = (Path::from("a"), Path::from("b"));
 
-        const EXPECTED_DELAY: u64 = 900;
-
-        let prl = PutRateLimiter::new(InMemory::new(), Duration::from_mins(5))
-            .with_rate_per_second(NonZeroU32::new(1));
-
-        let location = Path::from("a");
-
-        let delay = {
-            let now = SystemTime::now();
-            _ = prl
-                .put_opts(
-                    &location,
-                    PutPayload::from(Bytes::from_static(b"12321")),
-                    PutOptions::default(),
-                )
-                .await?;
-
-            now.elapsed()
-                .map_or(0, |duration| duration.as_millis() as u64)
-        };
-
-        assert!(delay < EXPECTED_DELAY, "{delay}");
-
-        let delay = {
-            let now = SystemTime::now();
-            _ = prl
-                .put_opts(
-                    &location,
-                    PutPayload::from(Bytes::from_static(b"12321")),
-                    PutOptions::default(),
-                )
-                .await?;
-
-            now.elapsed()
-                .map_or(0, |duration| duration.as_millis() as u64)
-        };
-
-        assert!(delay >= EXPECTED_DELAY, "{delay}");
-
-        let location = Path::from("b");
-
-        let delay = {
-            let now = SystemTime::now();
-            _ = prl
-                .put_opts(
-                    &location,
-                    PutPayload::from(Bytes::from_static(b"12321")),
-                    PutOptions::default(),
-                )
-                .await?;
-
-            now.elapsed()
-                .map_or(0, |duration| duration.as_millis() as u64)
-        };
-
-        assert!(delay < EXPECTED_DELAY, "{delay}");
-
-        let location = Path::from("a");
-
-        let delay = {
-            let now = SystemTime::now();
-            _ = prl
-                .put_opts(
-                    &location,
-                    PutPayload::from(Bytes::from_static(b"12321")),
-                    PutOptions::default(),
-                )
-                .await?;
-
-            now.elapsed()
-                .map_or(0, |duration| duration.as_millis() as u64)
-        };
-
-        assert!(delay >= EXPECTED_DELAY, "{delay}");
-
+        let first = put(&prl, &a).await?;
+        assert!(first < full_second, "{first}");
+        let again = put(&prl, &a).await?;
+        assert!(again >= full_second, "{again}");
+        let other = put(&prl, &b).await?;
+        assert!(other < full_second, "{other}");
+        let back = put(&prl, &a).await?;
+        assert!(back >= full_second, "{back}");
         Ok(())
     }
 }
