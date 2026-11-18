@@ -1004,6 +1004,14 @@ fmt:
 # compounds through `opened`, with the same bytes, the same `UnexpectedType`
 # messages and the same spans. Its tests, and the golden wire fixtures, pass
 # unchanged. Only code went, so the ceiling rises.
+#   defork  -64 lines, the tagged field deserializer rewritten  2866 -> 2866  2.6950 -> 2.6963
+#
+# `primitive/tagged/de.rs` keeps `Decoder`, `Seq`, `Struct`, every
+# `Deserializer` and `SeqAccess` impl and signature. The bodies read through
+# `read`, `length` and `payload` helpers and log through `traced`, with the same
+# bytes, the same varint overflow checks, the same size limit, the same
+# `UnexpectedType` messages and the same `debug` lines. Its tests, and the
+# golden wire fixtures, pass unchanged. Only code went, so the ceiling rises.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -1014,7 +1022,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6950" top="12":
+comments ceiling="2.6963" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
