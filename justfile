@@ -1032,6 +1032,17 @@ fmt:
 # did; `decode` still casts a varint length with `as usize`. The five tests
 # became three on one `round_trip` helper with every size kept, and they pass
 # against the old body too. Only code went, so the ceiling rises.
+#   defork  -92 lines, the varints rewritten  2866 -> 2834  2.7006 -> 2.6720
+#
+# `primitive/varint.rs` keeps `VarInt`, `LongVarInt`, `UnsignedVarInt` and
+# every impl and signature. Encoding goes through one `groups` iterator, the
+# same 7-bit groups least significant first; `Decode` and the unsigned visitor
+# gather through `checked_u32`/`checked_u64` with the same `Overflow` and
+# `overflow` errors, and the signed visitors through `unchecked_u32`/
+# `unchecked_u64`, the plain arithmetic they always had. The `debug` lines say
+# the same. The four tests and the commented-out ones became five covering
+# every type's wire bytes, sizes and the overflow, passing against the old
+# body too. The commented-out tests went, so the ceiling falls.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -1042,7 +1053,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.7006" top="12":
+comments ceiling="2.6720" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
