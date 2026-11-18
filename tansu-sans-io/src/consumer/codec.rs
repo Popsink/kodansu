@@ -1,4 +1,5 @@
 // Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,31 +13,73 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    fmt::{self, Formatter},
-    marker::PhantomData,
-};
+use std::fmt::{self, Display, Formatter};
+use std::marker::PhantomData;
+use std::num::TryFromIntError;
 
 use bytes::Bytes;
-use serde::{
-    Deserialize, Deserializer, Serialize, Serializer,
-    de::{self, SeqAccess, Visitor},
-    ser::{self, SerializeSeq as _, SerializeStruct},
-};
-use tracing::debug;
+use serde::de::{self, SeqAccess, Visitor};
+use serde::ser::{self, SerializeSeq, SerializeStruct as _};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::Error;
+
+/// A decoding error saying `why`.
+fn refused<E: de::Error>(why: impl Display) -> E {
+    E::custom(why)
+}
+
+/// `found`, or an error saying `missing` when the sequence had run out.
+fn required<T, E: de::Error>(found: Option<T>, missing: &str) -> Result<T, E> {
+    found.ok_or_else(|| refused(missing))
+}
+
+/// The next `length` bytes of `seq`, none when `length` is negative.
+fn octets<'de, A>(seq: &mut A, length: i32) -> Result<Vec<u8>, A::Error>
+where
+    A: SeqAccess<'de>,
+{
+    let mut read = Vec::new();
+    for _ in 0..length {
+        read.push(required(seq.next_element::<u8>()?, "byte")?);
+    }
+    Ok(read)
+}
+
+/// `length` as the length prefix `P`, an error when it does not fit.
+fn prefix<P, E>(length: usize) -> Result<P, E>
+where
+    P: TryFrom<usize, Error = TryFromIntError>,
+    E: ser::Error,
+{
+    P::try_from(length).map_err(|overflow| E::custom(overflow.to_string()))
+}
+
+/// `bytes` written into `seq` one element each, after their `P` length.
+fn written<P, S>(seq: &mut S, bytes: &[u8]) -> Result<(), S::Error>
+where
+    P: Serialize + TryFrom<usize, Error = TryFromIntError>,
+    S: SerializeSeq,
+{
+    let length: P = prefix(bytes.len())?;
+    seq.serialize_element(&length)?;
+    for byte in bytes {
+        seq.serialize_element(byte)?;
+    }
+    Ok(())
+}
 
 #[derive(Clone, Eq, Hash, Debug, Ord, PartialEq, PartialOrd)]
 pub(crate) struct MemberMetadata(ConsumerProtocolSubscription);
 
 impl From<MemberMetadata> for super::MemberMetadata {
     fn from(value: MemberMetadata) -> Self {
-        let version = *value.0.as_ref();
-
-        Self {
-            version,
-            subscription: value.0.into(),
+        let MemberMetadata(subscription) = value;
+        let named = *AsRef::<i16>::as_ref(&subscription);
+        let subscription = super::ConsumerProtocolSubscription::from(subscription);
+        super::MemberMetadata {
+            subscription,
+            version: named,
         }
     }
 }
@@ -53,49 +96,58 @@ impl TryFrom<super::MemberMetadata> for MemberMetadata {
     type Error = Error;
 
     fn try_from(value: super::MemberMetadata) -> Result<Self, Self::Error> {
-        Ok(Self(match value.version {
-            0 => ConsumerProtocolSubscription::V0(ConsumerProtocolSubscriptionV0 {
-                topics: value.subscription.topics.into(),
-                user_data: value.subscription.user_data.into(),
-            }),
+        let super::MemberMetadata {
+            version,
+            subscription,
+        } = value;
+        let super::ConsumerProtocolSubscription {
+            topics,
+            user_data,
+            owned_partitions,
+            generation_id,
+            rack_id,
+        } = subscription;
 
-            1 => ConsumerProtocolSubscription::V1(ConsumerProtocolSubscriptionV1 {
-                topics: value.subscription.topics.into(),
-                user_data: value.subscription.user_data.into(),
-                owned_partitions: value
-                    .subscription
-                    .owned_partitions
-                    .unwrap_or_default()
-                    .into(),
-            }),
+        let topics = Sequence::from(topics);
+        let user_data = Octets::from(user_data);
+        let owned = || Sequence::from(owned_partitions.unwrap_or_default());
+        let generation = generation_id.unwrap_or(-1);
 
-            2 => ConsumerProtocolSubscription::V2(ConsumerProtocolSubscriptionV2 {
-                topics: value.subscription.topics.into(),
-                user_data: value.subscription.user_data.into(),
-                owned_partitions: value
-                    .subscription
-                    .owned_partitions
-                    .unwrap_or_default()
-                    .into(),
-                generation_id: value.subscription.generation_id.unwrap_or(-1),
-            }),
-
-            3 => ConsumerProtocolSubscription::V3(ConsumerProtocolSubscriptionV3 {
-                topics: value.subscription.topics.into(),
-                user_data: value.subscription.user_data.into(),
-                owned_partitions: value
-                    .subscription
-                    .owned_partitions
-                    .unwrap_or_default()
-                    .into(),
-                generation_id: value.subscription.generation_id.unwrap_or(-1),
-                rack_id: value.subscription.rack_id.into(),
-            }),
-
-            version => {
-                return Err(Error::InvalidConsumerProtocolSubscriptionVersion(version));
+        let chosen = match version {
+            0 => {
+                let v0 = ConsumerProtocolSubscriptionV0 { topics, user_data };
+                ConsumerProtocolSubscription::V0(v0)
             }
-        }))
+            1 => {
+                let v1 = ConsumerProtocolSubscriptionV1 {
+                    owned_partitions: owned(),
+                    topics,
+                    user_data,
+                };
+                ConsumerProtocolSubscription::V1(v1)
+            }
+            2 => {
+                let v2 = ConsumerProtocolSubscriptionV2 {
+                    generation_id: generation,
+                    owned_partitions: owned(),
+                    topics,
+                    user_data,
+                };
+                ConsumerProtocolSubscription::V2(v2)
+            }
+            3 => {
+                let v3 = ConsumerProtocolSubscriptionV3 {
+                    generation_id: generation,
+                    owned_partitions: owned(),
+                    rack_id: NullableU16String::from(rack_id),
+                    topics,
+                    user_data,
+                };
+                ConsumerProtocolSubscription::V3(v3)
+            }
+            unknown => return Err(Error::InvalidConsumerProtocolSubscriptionVersion(unknown)),
+        };
+        Ok(MemberMetadata(chosen))
     }
 }
 
@@ -110,45 +162,26 @@ impl<'de> Deserialize<'de> for MemberMetadata {
             type Value = MemberMetadata;
 
             fn expecting(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-                formatter.write_str(stringify!(Bytes))
+                formatter.write_str("Bytes")
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
             where
                 A: SeqAccess<'de>,
             {
-                seq.next_element::<i16>()
-                    .and_then(|version| version.ok_or_else(|| de::Error::custom("length")))
-                    .and_then(|version| {
-                        match version {
-                            0 => seq
-                                .next_element::<ConsumerProtocolSubscriptionV0>()
-                                .and_then(|version| version.ok_or_else(|| de::Error::custom("v0")))
-                                .map(ConsumerProtocolSubscription::V0),
-
-                            1 => seq
-                                .next_element::<ConsumerProtocolSubscriptionV1>()
-                                .and_then(|version| version.ok_or_else(|| de::Error::custom("v1")))
-                                .map(ConsumerProtocolSubscription::V1),
-
-                            2 => seq
-                                .next_element::<ConsumerProtocolSubscriptionV2>()
-                                .and_then(|version| version.ok_or_else(|| de::Error::custom("v2")))
-                                .map(ConsumerProtocolSubscription::V2),
-
-                            3 => seq
-                                .next_element::<ConsumerProtocolSubscriptionV3>()
-                                .and_then(|version| version.ok_or_else(|| de::Error::custom("v3")))
-                                .map(ConsumerProtocolSubscription::V3),
-
-                            version => Err(de::Error::custom(format!("unsupported: {version}"))),
-                        }
-                        .map(MemberMetadata)
-                    })
+                let version: i16 = required(seq.next_element()?, "length")?;
+                let chosen = match version {
+                    0 => ConsumerProtocolSubscription::V0(required(seq.next_element()?, "v0")?),
+                    1 => ConsumerProtocolSubscription::V1(required(seq.next_element()?, "v1")?),
+                    2 => ConsumerProtocolSubscription::V2(required(seq.next_element()?, "v2")?),
+                    3 => ConsumerProtocolSubscription::V3(required(seq.next_element()?, "v3")?),
+                    unknown => return Err(refused(format!("unsupported: {unknown}"))),
+                };
+                Ok(MemberMetadata(chosen))
             }
         }
 
-        deserializer.deserialize_seq(V)
+        Deserializer::deserialize_seq(deserializer, V)
     }
 }
 
@@ -157,37 +190,24 @@ impl Serialize for MemberMetadata {
     where
         S: Serializer,
     {
-        let mut s = serializer.serialize_struct("MemberMetadata", 2)?;
-
-        s.serialize_field(
-            "version",
-            match self.0 {
-                ConsumerProtocolSubscription::V0(_) => &0i16,
-                ConsumerProtocolSubscription::V1(_) => &1i16,
-                ConsumerProtocolSubscription::V2(_) => &2i16,
-                ConsumerProtocolSubscription::V3(_) => &3i16,
-            },
-        )?;
-
-        match self.0 {
-            ConsumerProtocolSubscription::V0(ref subscription) => {
-                s.serialize_field("subscription", subscription)?
+        let MemberMetadata(subscription) = self;
+        let mut fields = serializer.serialize_struct("MemberMetadata", 2)?;
+        fields.serialize_field("version", AsRef::<i16>::as_ref(subscription))?;
+        match subscription {
+            ConsumerProtocolSubscription::V0(inner) => {
+                fields.serialize_field("subscription", inner)
             }
-
-            ConsumerProtocolSubscription::V1(ref subscription) => {
-                s.serialize_field("subscription", subscription)?
+            ConsumerProtocolSubscription::V1(inner) => {
+                fields.serialize_field("subscription", inner)
             }
-
-            ConsumerProtocolSubscription::V2(ref subscription) => {
-                s.serialize_field("subscription", subscription)?
+            ConsumerProtocolSubscription::V2(inner) => {
+                fields.serialize_field("subscription", inner)
             }
-
-            ConsumerProtocolSubscription::V3(ref subscription) => {
-                s.serialize_field("subscription", subscription)?
+            ConsumerProtocolSubscription::V3(inner) => {
+                fields.serialize_field("subscription", inner)
             }
-        }
-
-        s.end()
+        }?;
+        fields.end()
     }
 }
 
@@ -202,48 +222,40 @@ pub(crate) enum ConsumerProtocolSubscription {
 impl AsRef<i16> for ConsumerProtocolSubscription {
     fn as_ref(&self) -> &i16 {
         match self {
-            ConsumerProtocolSubscription::V0(_) => &super::ConsumerProtocolSubscription::V0,
-            ConsumerProtocolSubscription::V1(_) => &super::ConsumerProtocolSubscription::V1,
-            ConsumerProtocolSubscription::V2(_) => &super::ConsumerProtocolSubscription::V2,
-            ConsumerProtocolSubscription::V3(_) => &super::ConsumerProtocolSubscription::V3,
+            Self::V0(_) => &super::ConsumerProtocolSubscription::V0,
+            Self::V1(_) => &super::ConsumerProtocolSubscription::V1,
+            Self::V2(_) => &super::ConsumerProtocolSubscription::V2,
+            Self::V3(_) => &super::ConsumerProtocolSubscription::V3,
         }
     }
 }
 
 impl From<ConsumerProtocolSubscription> for super::ConsumerProtocolSubscription {
     fn from(value: ConsumerProtocolSubscription) -> Self {
-        match value {
-            ConsumerProtocolSubscription::V0(subscription) => Self {
-                topics: subscription.topics.into(),
-                user_data: subscription.user_data.into(),
-                owned_partitions: None,
-                generation_id: None,
-                rack_id: None,
-            },
-
-            ConsumerProtocolSubscription::V1(subscription) => Self {
-                topics: subscription.topics.into(),
-                user_data: subscription.user_data.into(),
-                owned_partitions: Some(subscription.owned_partitions.into()),
-                generation_id: None,
-                rack_id: None,
-            },
-
-            ConsumerProtocolSubscription::V2(subscription) => Self {
-                topics: subscription.topics.into(),
-                user_data: subscription.user_data.into(),
-                owned_partitions: Some(subscription.owned_partitions.into()),
-                generation_id: Some(subscription.generation_id),
-                rack_id: None,
-            },
-
-            ConsumerProtocolSubscription::V3(subscription) => Self {
-                topics: subscription.topics.into(),
-                user_data: subscription.user_data.into(),
-                owned_partitions: Some(subscription.owned_partitions.into()),
-                generation_id: Some(subscription.generation_id),
-                rack_id: subscription.rack_id.into(),
-            },
+        let absent = NullableU16String::default;
+        let (topics, user_data, owned, generation, rack) = match value {
+            ConsumerProtocolSubscription::V0(v0) => (v0.topics, v0.user_data, None, None, absent()),
+            ConsumerProtocolSubscription::V1(v1) => {
+                let owned = Some(v1.owned_partitions);
+                (v1.topics, v1.user_data, owned, None, absent())
+            }
+            ConsumerProtocolSubscription::V2(v2) => {
+                let owned = Some(v2.owned_partitions);
+                let generation = Some(v2.generation_id);
+                (v2.topics, v2.user_data, owned, generation, absent())
+            }
+            ConsumerProtocolSubscription::V3(v3) => {
+                let owned = Some(v3.owned_partitions);
+                let generation = Some(v3.generation_id);
+                (v3.topics, v3.user_data, owned, generation, v3.rack_id)
+            }
+        };
+        super::ConsumerProtocolSubscription {
+            generation_id: generation,
+            owned_partitions: owned.map(Into::into),
+            rack_id: Option::from(rack),
+            topics: Vec::from(topics),
+            user_data: Option::from(user_data),
         }
     }
 }
@@ -286,19 +298,19 @@ pub(crate) struct TopicPartition {
 
 impl From<super::TopicPartition> for TopicPartition {
     fn from(value: super::TopicPartition) -> Self {
-        Self {
-            topic: value.topic.into(),
-            partitions: value.partitions.into(),
-        }
+        let super::TopicPartition { topic, partitions } = value;
+        let partitions = Sequence::from(partitions);
+        let topic = U16String::from(topic);
+        TopicPartition { topic, partitions }
     }
 }
 
 impl From<TopicPartition> for super::TopicPartition {
     fn from(value: TopicPartition) -> Self {
-        Self {
-            topic: value.topic.into(),
-            partitions: value.partitions.into(),
-        }
+        let TopicPartition { topic, partitions } = value;
+        let partitions = Vec::from(partitions);
+        let topic = String::from(topic);
+        super::TopicPartition { topic, partitions }
     }
 }
 
@@ -310,18 +322,28 @@ pub(crate) struct MemberAssignment {
 
 impl From<super::MemberAssignment> for MemberAssignment {
     fn from(value: super::MemberAssignment) -> Self {
-        Self {
-            version: value.version,
-            assignment: value.assignment.into(),
+        let super::MemberAssignment {
+            version,
+            assignment,
+        } = value;
+        let assignment = ConsumerProtocolAssignment::from(assignment);
+        MemberAssignment {
+            assignment,
+            version,
         }
     }
 }
 
 impl From<MemberAssignment> for super::MemberAssignment {
     fn from(value: MemberAssignment) -> Self {
-        Self {
-            version: value.version,
-            assignment: value.assignment.into(),
+        let MemberAssignment {
+            version,
+            assignment,
+        } = value;
+        let assignment = super::ConsumerProtocolAssignment::from(assignment);
+        super::MemberAssignment {
+            assignment,
+            version,
         }
     }
 }
@@ -334,18 +356,26 @@ struct ConsumerProtocolAssignment {
 
 impl From<super::ConsumerProtocolAssignment> for ConsumerProtocolAssignment {
     fn from(value: super::ConsumerProtocolAssignment) -> Self {
-        Self {
-            assigned_partitions: value.assigned_partitions.into(),
-            user_data: value.user_data.into(),
+        let super::ConsumerProtocolAssignment {
+            assigned_partitions,
+            user_data,
+        } = value;
+        ConsumerProtocolAssignment {
+            assigned_partitions: Sequence::from(assigned_partitions),
+            user_data: Octets::from(user_data),
         }
     }
 }
 
 impl From<ConsumerProtocolAssignment> for super::ConsumerProtocolAssignment {
     fn from(value: ConsumerProtocolAssignment) -> Self {
-        Self {
-            assigned_partitions: value.assigned_partitions.into(),
-            user_data: value.user_data.into(),
+        let ConsumerProtocolAssignment {
+            assigned_partitions,
+            user_data,
+        } = value;
+        super::ConsumerProtocolAssignment {
+            assigned_partitions: Vec::from(assigned_partitions),
+            user_data: Option::from(user_data),
         }
     }
 }
@@ -358,7 +388,8 @@ where
     T: Into<U>,
 {
     fn from(value: Vec<T>) -> Self {
-        Self(value.into_iter().map(Into::into).collect())
+        let converted = value.into_iter().map(T::into).collect();
+        Sequence(converted)
     }
 }
 
@@ -367,7 +398,8 @@ where
     T: Into<U>,
 {
     fn from(value: Sequence<T>) -> Self {
-        value.0.into_iter().map(Into::into).collect()
+        let Sequence(items) = value;
+        items.into_iter().map(T::into).collect()
     }
 }
 
@@ -379,16 +411,14 @@ where
     where
         S: Serializer,
     {
-        let mut s = serializer.serialize_seq(Some(self.0.len()))?;
-
-        u32::try_from(self.0.len())
-            .map_err(|e| ser::Error::custom(e.to_string()))
-            .and_then(|length| s.serialize_element(&length))?;
-
-        for i in self.0.iter() {
-            s.serialize_element(i)?;
+        let Sequence(items) = self;
+        let mut seq = serializer.serialize_seq(Some(items.len()))?;
+        let length: u32 = prefix(items.len())?;
+        seq.serialize_element(&length)?;
+        for item in items {
+            seq.serialize_element(item)?;
         }
-        s.end()
+        seq.end()
     }
 }
 
@@ -409,47 +439,31 @@ where
             type Value = Sequence<T>;
 
             fn expecting(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-                formatter.write_str(stringify!(Sequence))
+                formatter.write_str("Sequence")
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
             where
                 A: SeqAccess<'de>,
             {
-                seq.next_element::<i32>()?
-                    .ok_or_else(|| <A::Error as de::Error>::custom("length"))
-                    .inspect(|length| debug!("length: {length}"))
-                    .and_then(|length| {
-                        if length > 1024 {
-                            Err(<A::Error as de::Error>::custom(format!(
-                                "consumer maximum array length: {}",
-                                length
-                            )))
-                        } else {
-                            (0..length).try_fold(
-                                Vec::with_capacity(length.try_into().map_err(|e| {
-                                    <A::Error as de::Error>::custom(format!(
-                                        "length: {length}, caused: {e:?}"
-                                    ))
-                                })?),
-                                |mut acc, _| {
-                                    seq.next_element::<T>()?
-                                        .ok_or_else(|| <A::Error as de::Error>::custom("item"))
-                                        .map(|t| {
-                                            acc.push(t);
-                                            acc
-                                        })
-                                },
-                            )
-                        }
-                    })
-                    .map(Sequence)
+                let count: i32 = required(seq.next_element()?, "length")?;
+                tracing::debug!("length: {count}");
+                if count > 1024 {
+                    return Err(refused(format!("consumer maximum array length: {count}")));
+                }
+                let capacity = usize::try_from(count)
+                    .map_err(|e| refused(format!("length: {count}, caused: {e:?}")))?;
+                let mut items = Vec::with_capacity(capacity);
+                for _ in 0..count {
+                    items.push(required(seq.next_element::<T>()?, "item")?);
+                }
+                Ok(Sequence(items))
             }
         }
 
-        deserializer
-            .deserialize_seq(V(PhantomData))
-            .inspect_err(|err| debug!(?err))
+        let visitor = V(PhantomData);
+        let decoded = Deserializer::deserialize_seq(deserializer, visitor);
+        decoded.inspect_err(|error| tracing::debug!(err = ?error))
     }
 }
 
@@ -461,29 +475,23 @@ impl Serialize for U16String {
     where
         S: Serializer,
     {
-        let mut s = serializer.serialize_seq(Some(self.0.len()))?;
-
-        u16::try_from(self.0.len())
-            .map_err(|e| ser::Error::custom(e.to_string()))
-            .and_then(|length| s.serialize_element(&length))?;
-
-        for i in self.0.as_bytes() {
-            s.serialize_element(&i)?;
-        }
-
-        s.end()
+        let U16String(text) = self;
+        let mut seq = serializer.serialize_seq(Some(text.len()))?;
+        written::<u16, _>(&mut seq, text.as_bytes())?;
+        seq.end()
     }
 }
 
 impl From<String> for U16String {
     fn from(value: String) -> Self {
-        Self(value)
+        U16String(value)
     }
 }
 
 impl From<U16String> for String {
     fn from(value: U16String) -> Self {
-        value.0
+        let U16String(text) = value;
+        text
     }
 }
 
@@ -498,41 +506,25 @@ impl<'de> Deserialize<'de> for U16String {
             type Value = U16String;
 
             fn expecting(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-                formatter.write_str(stringify!(Bytes))
+                formatter.write_str("Bytes")
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
             where
                 A: SeqAccess<'de>,
             {
-                seq.next_element::<i16>()?
-                    .ok_or_else(|| de::Error::custom("length"))
-                    .inspect(|length| debug!(length))
-                    .and_then(|length| {
-                        if length > 4096 {
-                            Err(<A::Error as de::Error>::custom(format!(
-                                "maximum string size: {}",
-                                length
-                            )))
-                        } else {
-                            (0..length)
-                                .map(|_| {
-                                    seq.next_element::<u8>().and_then(|byte| {
-                                        byte.ok_or_else(|| <A::Error as de::Error>::custom("byte"))
-                                    })
-                                })
-                                .collect::<Result<Vec<_>, _>>()
-                        }
-                    })
-                    .and_then(|bytes| {
-                        String::from_utf8(bytes)
-                            .map_err(|_| <A::Error as de::Error>::custom("from_utf8"))
-                    })
-                    .map(U16String)
+                let size: i16 = required(seq.next_element()?, "length")?;
+                tracing::debug!(length = size);
+                if size > 4096 {
+                    return Err(refused(format!("maximum string size: {size}")));
+                }
+                let utf8 = octets(&mut seq, i32::from(size))?;
+                let text = String::from_utf8(utf8).map_err(|_| refused("from_utf8"))?;
+                Ok(U16String(text))
             }
         }
 
-        deserializer.deserialize_seq(V)
+        Deserializer::deserialize_seq(deserializer, V)
     }
 }
 
@@ -544,21 +536,13 @@ impl Serialize for NullableU16String {
     where
         S: Serializer,
     {
-        let mut s = serializer.serialize_seq(self.0.as_ref().map(|bytes| bytes.len()))?;
-
-        if let Some(bytes) = self.0.as_deref().map(|s| s.as_bytes()) {
-            u16::try_from(bytes.len())
-                .map_err(|e| ser::Error::custom(e.to_string()))
-                .and_then(|length| s.serialize_element(&length))?;
-
-            for i in bytes {
-                s.serialize_element(&i)?;
-            }
-        } else {
-            s.serialize_element(&-1i16)?;
+        let NullableU16String(text) = self;
+        let mut seq = serializer.serialize_seq(text.as_ref().map(String::len))?;
+        match text {
+            Some(present) => written::<u16, _>(&mut seq, present.as_bytes())?,
+            None => seq.serialize_element(&-1i16)?,
         }
-
-        s.end()
+        seq.end()
     }
 }
 
@@ -573,58 +557,41 @@ impl<'de> Deserialize<'de> for NullableU16String {
             type Value = NullableU16String;
 
             fn expecting(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-                formatter.write_str(stringify!(Bytes))
+                formatter.write_str("Bytes")
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
             where
                 A: SeqAccess<'de>,
             {
-                seq.next_element::<i16>()?
-                    .ok_or_else(|| de::Error::custom("length"))
-                    .inspect(|length| debug!(length))
-                    .and_then(|length| {
-                        let q = i16::MAX;
-
-                        if length == -1 {
-                            Ok(None)
-                        } else if length > 4096 {
-                            Err(<A::Error as de::Error>::custom(format!(
-                                "maximum string size: {}",
-                                length
-                            )))
-                        } else {
-                            (0..length)
-                                .map(|_| {
-                                    seq.next_element::<u8>().and_then(|byte| {
-                                        byte.ok_or_else(|| <A::Error as de::Error>::custom("byte"))
-                                    })
-                                })
-                                .collect::<Result<Vec<_>, _>>()
-                                .and_then(|bytes| {
-                                    String::from_utf8(bytes)
-                                        .map_err(|_| <A::Error as de::Error>::custom("from_utf8"))
-                                })
-                                .map(Some)
-                        }
-                    })
-                    .map(NullableU16String)
+                let size: i16 = required(seq.next_element()?, "length")?;
+                tracing::debug!(length = size);
+                if size == -1 {
+                    return Ok(NullableU16String(None));
+                }
+                if size > 4096 {
+                    return Err(refused(format!("maximum string size: {size}")));
+                }
+                let utf8 = octets(&mut seq, i32::from(size))?;
+                let text = String::from_utf8(utf8).map_err(|_| refused("from_utf8"))?;
+                Ok(NullableU16String(Some(text)))
             }
         }
 
-        deserializer.deserialize_seq(V)
+        Deserializer::deserialize_seq(deserializer, V)
     }
 }
 
 impl From<Option<String>> for NullableU16String {
     fn from(value: Option<String>) -> Self {
-        Self(value)
+        NullableU16String(value)
     }
 }
 
 impl From<NullableU16String> for Option<String> {
     fn from(value: NullableU16String) -> Self {
-        value.0
+        let NullableU16String(text) = value;
+        text
     }
 }
 
@@ -636,21 +603,13 @@ impl Serialize for Octets {
     where
         S: Serializer,
     {
-        let mut s = serializer.serialize_seq(self.0.as_ref().map(|bytes| bytes.len()))?;
-
-        if let Some(ref bytes) = self.0 {
-            u32::try_from(bytes.len())
-                .map_err(|e| ser::Error::custom(e.to_string()))
-                .and_then(|length| s.serialize_element(&length))?;
-
-            for i in bytes {
-                s.serialize_element(&i)?;
-            }
-        } else {
-            s.serialize_element(&-1i32)?;
+        let Octets(data) = self;
+        let mut seq = serializer.serialize_seq(data.as_ref().map(Bytes::len))?;
+        match data {
+            Some(present) => written::<u32, _>(&mut seq, present)?,
+            None => seq.serialize_element(&-1i32)?,
         }
-
-        s.end()
+        seq.end()
     }
 }
 
@@ -665,36 +624,24 @@ impl<'de> Deserialize<'de> for Octets {
             type Value = Octets;
 
             fn expecting(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-                formatter.write_str(stringify!(Bytes))
+                formatter.write_str("Bytes")
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
             where
                 A: SeqAccess<'de>,
             {
-                seq.next_element::<i32>()?
-                    .ok_or_else(|| de::Error::custom("length"))
-                    .inspect(|length| debug!(length))
-                    .and_then(|length| {
-                        if length == -1 {
-                            Ok(None)
-                        } else {
-                            (0..length)
-                                .map(|_| {
-                                    seq.next_element::<u8>().and_then(|byte| {
-                                        byte.ok_or_else(|| <A::Error as de::Error>::custom("byte"))
-                                    })
-                                })
-                                .collect::<Result<Vec<_>, _>>()
-                                .map(Bytes::from)
-                                .map(Some)
-                        }
-                    })
-                    .map(Octets)
+                let size: i32 = required(seq.next_element()?, "length")?;
+                tracing::debug!(length = size);
+                if size == -1 {
+                    return Ok(Octets(None));
+                }
+                let data = octets(&mut seq, size)?;
+                Ok(Octets(Some(Bytes::from(data))))
             }
         }
 
-        deserializer.deserialize_seq(V)
+        Deserializer::deserialize_seq(deserializer, V)
     }
 }
 
@@ -706,7 +653,8 @@ impl From<Option<Bytes>> for Octets {
 
 impl From<Octets> for Option<Bytes> {
     fn from(value: Octets) -> Self {
-        value.0
+        let Octets(data) = value;
+        data
     }
 }
 
@@ -750,6 +698,25 @@ mod tests {
         };
 
         Metadata::try_from(Bytes::try_from(&metadata)?)
+    }
+
+    /// The bytes a v3 subscription travels as, field by field: every length
+    /// big-endian ahead of what it counts, the rack last.
+    #[test]
+    fn a_v3_subscription_is_these_bytes_on_the_wire() -> Result<(), Error> {
+        let metadata = Metadata {
+            version: 3,
+            subscription: subscription(),
+        };
+        let version: &[u8] = &[0, 3];
+        let topics: &[u8] = &[0, 0, 0, 2, 0, 1, b'a', 0, 1, b'b'];
+        let user_data: &[u8] = &[0, 0, 0, 1, b'u'];
+        let owned: &[u8] = &[0, 0, 0, 1, 0, 1, b'a', 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1];
+        let generation: &[u8] = &[0, 0, 0, 9];
+        let rack: &[u8] = &[0, 1, b'r'];
+        let expected = [version, topics, user_data, owned, generation, rack].concat();
+        assert_eq!(&expected[..], &Bytes::try_from(&metadata)?[..]);
+        Ok(())
     }
 
     /// A v0 subscription carries topics and user data, and the fields later
