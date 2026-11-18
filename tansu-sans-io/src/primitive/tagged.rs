@@ -15,52 +15,71 @@
 mod de;
 mod ser;
 
-use super::varint::UnsignedVarInt;
-use crate::{ByteSize, Result};
-use serde::{
-    Deserialize, Deserializer, Serialize, Serializer,
-    de::{SeqAccess, Visitor},
-    ser::SerializeSeq,
-};
-use std::{
-    any::{type_name, type_name_of_val},
-    fmt::Formatter,
-    io::Cursor,
-    iter::{chain, once},
-    ops::Deref,
-};
-use tracing::{debug, instrument};
+use std::any::{type_name, type_name_of_val};
+use std::fmt::{self, Formatter};
+use std::io::Cursor;
+use std::ops::Deref;
+
+use serde::de::{SeqAccess, Visitor};
+use serde::ser::SerializeSeq;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::ByteSize;
+use crate::Result;
+use crate::primitive::varint::UnsignedVarInt;
 
 const MAXIMUM_TAGGED_FIELDS: usize = 128;
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TagField(pub u32, pub Vec<u8>);
 
+/// The error for a length too big for an unsigned varint.
+fn too_big<E: serde::ser::Error>(error: impl fmt::Debug) -> E {
+    E::custom(format!("length too big: {error:?}"))
+}
+
+/// The next element of `seq`, an error naming `what` where there is none.
+fn required<'de, A, T>(seq: &mut A, what: &'static str) -> Result<T, A::Error>
+where
+    A: SeqAccess<'de>,
+    T: Deserialize<'de>,
+{
+    seq.next_element()?
+        .ok_or_else(|| serde::de::Error::custom(what))
+}
+
+/// `count`, refused past [`MAXIMUM_TAGGED_FIELDS`].
+fn bounded<E: serde::de::Error>(count: usize) -> Result<usize, E> {
+    if count > MAXIMUM_TAGGED_FIELDS {
+        let exceeded = format!("maximum tagged fields exceeded {count}");
+        return Err(E::custom(exceeded));
+    }
+    Ok(count)
+}
+
 impl TagField {
     pub(crate) fn tag(&self) -> u32 {
-        self.0
+        let TagField(tag, _) = self;
+        *tag
     }
 
     pub(crate) fn data(&self) -> &[u8] {
-        &self.1[..]
+        self.1.as_slice()
     }
 
-    #[instrument(skip(field))]
+    #[tracing::instrument(skip(field))]
     pub fn encode(tag: u32, field: &impl Serialize) -> Result<Self> {
-        ser::Encoder::encode(field).map(|encoded| Self(tag, encoded))
+        let encoded = ser::Encoder::encode(field)?;
+        Ok(TagField(tag, encoded))
     }
 }
 
 impl ByteSize for TagField {
     fn size_in_bytes(&self) -> Result<usize> {
-        [
-            UnsignedVarInt(self.tag()),
-            UnsignedVarInt::try_from(self.data().len())?,
-        ]
-        .iter()
-        .try_fold(self.data().len(), |acc, uvi| {
-            uvi.size_in_bytes().map(|size_in_bytes| acc + size_in_bytes)
-        })
+        let payload = self.data().len();
+        let length = UnsignedVarInt::try_from(payload)?;
+        let tag = UnsignedVarInt(self.tag()).size_in_bytes()?;
+        Ok(payload + tag + length.size_in_bytes()?)
     }
 }
 
@@ -69,21 +88,15 @@ impl Serialize for TagField {
     where
         S: Serializer,
     {
-        debug!(?self);
-
-        let mut s = serializer.serialize_seq(None)?;
-
-        s.serialize_element(&UnsignedVarInt::from(self.tag()))?;
-
-        UnsignedVarInt::try_from(self.data().len())
-            .map_err(|e| serde::ser::Error::custom(format!("length too big: {e:?}")))
-            .and_then(|length| s.serialize_element(&length))?;
-
-        for byte in self.data() {
-            s.serialize_element(byte)?;
+        tracing::debug!(self = ?self);
+        let mut elements = serializer.serialize_seq(None)?;
+        elements.serialize_element(&UnsignedVarInt::from(self.tag()))?;
+        let length = UnsignedVarInt::try_from(self.data().len()).map_err(too_big)?;
+        elements.serialize_element(&length)?;
+        for octet in self.data() {
+            elements.serialize_element(octet)?;
         }
-
-        s.end()
+        elements.end()
     }
 }
 
@@ -98,53 +111,37 @@ impl<'de> Deserialize<'de> for TagField {
             type Value = TagField;
 
             fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str(stringify!(Tag))
+                formatter.write_str("Tag")
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
             where
                 A: SeqAccess<'de>,
             {
-                debug!("seq={}", type_name_of_val(&seq));
-
-                let tag: u32 = seq
-                    .next_element::<UnsignedVarInt>()?
-                    .ok_or_else(|| serde::de::Error::custom("tag"))?
-                    .into();
-
-                let length: usize = seq
-                    .next_element::<UnsignedVarInt>()?
-                    .ok_or_else(|| serde::de::Error::custom("length"))?
-                    .into();
-
-                if length > MAXIMUM_TAGGED_FIELDS {
-                    return Err(serde::de::Error::custom(format!(
-                        "maximum tagged fields exceeded {length}"
-                    )));
+                let named = type_name_of_val(&seq);
+                tracing::debug!("seq={named}");
+                let tag = u32::from(required::<A, UnsignedVarInt>(&mut seq, "tag")?);
+                let length = usize::from(required::<A, UnsignedVarInt>(&mut seq, "length")?);
+                let length = bounded(length)?;
+                let mut data = Vec::with_capacity(length);
+                for _ in 0..length {
+                    data.push(required::<A, u8>(&mut seq, "byte")?);
                 }
-
-                (0..length)
-                    .try_fold(Vec::with_capacity(length), |mut acc, _| {
-                        seq.next_element::<u8>()?
-                            .ok_or_else(|| serde::de::Error::custom("byte"))
-                            .map(|byte| {
-                                acc.push(byte);
-                                acc
-                            })
-                    })
-                    .inspect(|data| debug!(?tag, ?data))
-                    .map(|data| TagField(tag, data))
+                tracing::debug!(?tag, ?data);
+                Ok(TagField(tag, data))
             }
         }
 
-        debug!("deserializer={}", type_name_of_val(&deserializer));
-        deserializer.deserialize_seq(V)
+        let named = type_name_of_val(&deserializer);
+        tracing::debug!("deserializer={named}");
+        D::deserialize_seq(deserializer, V)
     }
 }
 
 impl From<(u32, Vec<u8>)> for TagField {
     fn from(value: (u32, Vec<u8>)) -> Self {
-        Self(value.0, value.1)
+        let (tag, data) = value;
+        TagField(tag, data)
     }
 }
 
@@ -154,38 +151,34 @@ pub struct TagBuffer(pub Vec<TagField>);
 impl TagBuffer {
     #[must_use]
     pub fn empty() -> Self {
-        Self(vec![])
+        TagBuffer(Vec::new())
     }
 
     #[must_use]
     pub fn builder() -> TagBufferBuilder {
-        TagBufferBuilder::default()
+        TagBufferBuilder { tags: Vec::new() }
     }
 
     pub fn decode<T>(&self, tag: &u32) -> Result<Option<T>>
     where
         T: for<'de> Deserialize<'de>,
     {
-        debug!("tag={tag} T={}", type_name::<T>());
-
-        self.0
-            .iter()
-            .find(|TagField(found, _)| found == tag)
-            .map_or_else(
-                || Ok(None),
-                |TagField(_, encoded)| {
-                    let mut r = Cursor::new(encoded);
-                    let mut decoder = de::Decoder::new(&mut r);
-                    T::deserialize(&mut decoder).map(Some)
-                },
-            )
+        tracing::debug!("tag={tag} T={}", type_name::<T>());
+        let wanted = self.0.iter().find(|field| field.tag() == *tag);
+        let Some(TagField(_, encoded)) = wanted else {
+            return Ok(None);
+        };
+        let mut reader = Cursor::new(encoded);
+        T::deserialize(&mut de::Decoder::new(&mut reader)).map(Some)
     }
 
     pub fn encode(tags: &[(u32, impl Serialize)]) -> Result<Self> {
-        tags.iter()
-            .map(|(tag, field)| ser::Encoder::encode(field).map(|encoded| TagField(*tag, encoded)))
-            .collect::<Result<Vec<_>>>()
-            .map(Self)
+        let mut fields = Vec::with_capacity(tags.len());
+        for (tag, field) in tags {
+            let encoded = ser::Encoder::encode(field)?;
+            fields.push(TagField(*tag, encoded));
+        }
+        Ok(TagBuffer(fields))
     }
 }
 
@@ -193,7 +186,8 @@ impl Deref for TagBuffer {
     type Target = Vec<TagField>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        let TagBuffer(fields) = self;
+        fields
     }
 }
 
@@ -205,30 +199,32 @@ pub struct TagBufferBuilder {
 impl TagBufferBuilder {
     #[must_use]
     pub fn tag(mut self, tag: u32, data: Vec<u8>) -> Self {
-        self.tags.push(TagField(tag, data));
+        let field = TagField(tag, data);
+        self.tags.push(field);
         self
     }
 
     #[must_use]
     pub fn build(self) -> TagBuffer {
-        TagBuffer(self.tags)
+        let TagBufferBuilder { tags } = self;
+        TagBuffer(tags)
     }
 }
 
 impl From<Vec<TagField>> for TagBuffer {
     fn from(value: Vec<TagField>) -> Self {
-        Self(value)
+        TagBuffer(value)
     }
 }
 
 impl ByteSize for TagBuffer {
     fn size_in_bytes(&self) -> Result<usize> {
-        chain(
-            once(UnsignedVarInt::try_from(self.0.len()).and_then(|uvi| uvi.size_in_bytes())),
-            self.0.iter().map(|tag| tag.size_in_bytes()),
-        )
-        .collect::<Result<Vec<_>>>()
-        .map(|length| length.iter().sum::<usize>())
+        let count = UnsignedVarInt::try_from(self.0.len())?;
+        let mut total = count.size_in_bytes()?;
+        for field in &self.0 {
+            total += field.size_in_bytes()?;
+        }
+        Ok(total)
     }
 }
 
@@ -237,18 +233,14 @@ impl Serialize for TagBuffer {
     where
         S: Serializer,
     {
-        let mut s = serializer.serialize_seq(None)?;
-
-        UnsignedVarInt::try_from(self.0.len())
-            .map_err(|e| serde::ser::Error::custom(format!("length too big: {e:?}")))
-            .inspect(|length| debug!(?length))
-            .and_then(|length| s.serialize_element(&length))?;
-
-        for tagged_field in &self.0 {
-            s.serialize_element(tagged_field)?;
+        let mut elements = serializer.serialize_seq(None)?;
+        let length = UnsignedVarInt::try_from(self.0.len()).map_err(too_big)?;
+        tracing::debug!(?length);
+        elements.serialize_element(&length)?;
+        for field in &self.0 {
+            elements.serialize_element(field)?;
         }
-
-        s.end()
+        elements.end()
     }
 }
 
@@ -263,52 +255,92 @@ impl<'de> Deserialize<'de> for TagBuffer {
             type Value = TagBuffer;
 
             fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str(stringify!(TagBuffer))
+                formatter.write_str("TagBuffer")
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
             where
                 A: SeqAccess<'de>,
             {
-                debug!("seq={}", type_name_of_val(&seq));
-
-                let number_of_tagged_fields: usize = seq
-                    .next_element::<UnsignedVarInt>()?
-                    .ok_or_else(|| serde::de::Error::custom("tag"))?
-                    .into();
-
-                debug!(?number_of_tagged_fields);
-
-                if number_of_tagged_fields > MAXIMUM_TAGGED_FIELDS {
-                    return Err(serde::de::Error::custom(format!(
-                        "maximum tagged fields exceeded {number_of_tagged_fields}"
-                    )));
+                let named = type_name_of_val(&seq);
+                tracing::debug!("seq={named}");
+                let counted = required::<A, UnsignedVarInt>(&mut seq, "tag")?;
+                let number_of_tagged_fields = usize::from(counted);
+                tracing::debug!(?number_of_tagged_fields);
+                let count = bounded(number_of_tagged_fields)?;
+                let mut fields = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let tag: TagField = required(&mut seq, "tagged field")?;
+                    tracing::debug!(?tag);
+                    fields.push(tag);
                 }
-
-                (0..number_of_tagged_fields)
-                    .try_fold(Vec::with_capacity(number_of_tagged_fields), |mut acc, _| {
-                        seq.next_element::<TagField>()?
-                            .ok_or_else(|| serde::de::Error::custom("tagged field"))
-                            .inspect(|tag| debug!(?tag))
-                            .map(|tag| {
-                                acc.push(tag);
-                                acc
-                            })
-                    })
-                    .map(TagBuffer)
+                Ok(TagBuffer(fields))
             }
         }
 
-        debug!("deserializer={}", type_name_of_val(&deserializer));
-        deserializer.deserialize_seq(V)
+        let named = type_name_of_val(&deserializer);
+        tracing::debug!("deserializer={named}");
+        D::deserialize_seq(deserializer, V)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{de::Decoder, ser::Encoder, *};
-    use crate::{Error, de, ser};
+    use std::fmt::Debug;
+    use std::io::Cursor;
+
     use bytes::BytesMut;
+    use serde::de::DeserializeOwned;
+    use serde::{Deserialize, Serialize};
+
+    use super::de::Decoder;
+    use super::ser::Encoder;
+    use super::{TagBuffer, TagField};
+    use crate::{ByteSize as _, Error, Result, de, ser};
+
+    /// `buffer` as the protocol serializer writes it into a frame.
+    fn framed(buffer: &TagBuffer) -> Result<Vec<u8>> {
+        let mut encoder = ser::Encoder::new(BytesMut::new());
+        buffer.serialize(&mut encoder)?;
+        Ok(BytesMut::from(encoder).to_vec())
+    }
+
+    /// `value` encodes to `wire` as a tag's payload, and decodes back from it.
+    fn payload<T>(value: &T, wire: &[u8]) -> Result<()>
+    where
+        T: Serialize + DeserializeOwned + PartialEq + Debug,
+    {
+        let mut encoded = Vec::new();
+        value.serialize(&mut Encoder::new(&mut encoded))?;
+        assert_eq!(wire, &encoded[..]);
+        let mut reader = Cursor::new(&encoded);
+        assert_eq!(*value, T::deserialize(&mut Decoder::new(&mut reader))?);
+        Ok(())
+    }
+
+    /// One field, `value`, as the payload tests encode it.
+    #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+    struct One<T> {
+        value: T,
+    }
+
+    /// The `Metadata` broker shape: a struct inside an array.
+    #[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+    struct Broker {
+        node: i32,
+        host_name: String,
+        port_number: i32,
+        rack_name: String,
+    }
+
+    /// The `metadata.version` feature, versions `min` to `max`, as an
+    /// `ApiVersionsResponse` v3 carries it in a tag.
+    fn metadata_version(min: u8, max: u8) -> Vec<u8> {
+        let mut feature = vec![2, 17];
+        feature.extend_from_slice(b"metadata.version");
+        feature.extend_from_slice(&[0, min, 0, max, 0]);
+        feature
+    }
 
     /// A tag buffer as it appears in a frame: written by the protocol
     /// serializer and read back by the protocol deserializer.
@@ -323,9 +355,7 @@ mod tests {
     /// `Cursor` without rewinding it, so all four failed on the first byte they
     /// read.
     fn round_trip(expected: &TagBuffer) -> Result<()> {
-        let mut encoder = ser::Encoder::new(BytesMut::new());
-        expected.serialize(&mut encoder)?;
-        let encoded = BytesMut::from(encoder);
+        let encoded = framed(expected)?;
 
         assert_eq!(encoded.len(), expected.size_in_bytes()?);
 
@@ -350,15 +380,8 @@ mod tests {
 
     #[test]
     fn a_tag_field_is_its_tag_its_length_and_its_payload() -> Result<()> {
-        let expected = TagBuffer::builder().tag(55, b"pqr".into()).build();
-
-        let mut encoder = ser::Encoder::new(BytesMut::new());
-        expected.serialize(&mut encoder)?;
-
-        assert_eq!(
-            vec![1, 55, 3, b'p', b'q', b'r'],
-            Vec::from(&BytesMut::from(encoder)[..])
-        );
+        let expected = TagBuffer::builder().tag(55, b"pqr".to_vec()).build();
+        assert_eq!(b"\x01\x37\x03pqr".to_vec(), framed(&expected)?);
 
         assert_eq!(TagField::from((55, b"pqr".to_vec())), expected[0]);
 
@@ -367,36 +390,17 @@ mod tests {
 
     #[test]
     fn a_tag_buffer_of_two_fields_round_trips() -> Result<()> {
-        round_trip(
-            &TagBuffer::builder()
-                .tag(66, vec![5, 4, 3, 2, 1])
-                .tag(88, b"abc".into())
-                .build(),
-        )
+        let builder = TagBuffer::builder().tag(66, (1..=5).rev().collect());
+        round_trip(&builder.tag(88, b"abc".to_vec()).build())
     }
 
     /// The tag buffer of a real `ApiVersionsResponse` v3, as a broker sends it.
     #[test]
-    fn api_versions_response_v3_000() -> Result<()> {
-        round_trip(
-            &TagBuffer::builder()
-                .tag(
-                    0,
-                    vec![
-                        2, 17, 109, 101, 116, 97, 100, 97, 116, 97, 46, 118, 101, 114, 115, 105,
-                        111, 110, 0, 1, 0, 14, 0,
-                    ],
-                )
-                .tag(1, vec![0, 0, 0, 0, 0, 0, 0, 76])
-                .tag(
-                    2,
-                    vec![
-                        2, 17, 109, 101, 116, 97, 100, 97, 116, 97, 46, 118, 101, 114, 115, 105,
-                        111, 110, 0, 14, 0, 14, 0,
-                    ],
-                )
-                .build(),
-        )
+    fn an_api_versions_v3_tag_buffer_round_trips() -> Result<()> {
+        let finalized_epoch = 76i64.to_be_bytes().to_vec();
+        let builder = TagBuffer::builder().tag(0, metadata_version(1, 14));
+        let builder = builder.tag(1, finalized_epoch);
+        round_trip(&builder.tag(2, metadata_version(14, 14)).build())
     }
 
     /// A tag's value is encoded by [`TagBuffer::encode`] and read back by tag.
@@ -467,211 +471,61 @@ mod tests {
     }
 
     #[test]
-    fn compact_string() -> Result<()> {
-        #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
-        struct Example {
-            value: String,
-        }
-
-        let expected = Example {
-            value: "Hello World!".to_owned(),
+    fn a_compact_string_is_its_length_plus_one_then_its_bytes() -> Result<()> {
+        let hello = One {
+            value: String::from("Hello World!"),
         };
-
-        let mut encoded = vec![];
-        let mut c = Cursor::new(&mut encoded);
-        let mut encoder = Encoder::new(&mut c);
-        expected.serialize(&mut encoder)?;
-
-        assert_eq!(
-            encoded,
-            vec![13, 72, 101, 108, 108, 111, 32, 87, 111, 114, 108, 100, 33]
-        );
-
-        let mut c = Cursor::new(&mut encoded);
-
-        let mut decoder = Decoder::new(&mut c);
-
-        assert_eq!(expected, Example::deserialize(&mut decoder)?);
-
-        Ok(())
+        payload(&hello, b"\x0dHello World!")?;
+        payload(
+            &One {
+                value: String::new(),
+            },
+            &[1],
+        )
     }
 
     #[test]
-    fn compact_string_empty() -> Result<()> {
-        #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
-        struct Example {
-            value: String,
-        }
-
-        let expected = Example {
-            value: "".to_owned(),
+    fn a_compact_nullable_string_is_zero_for_none() -> Result<()> {
+        payload(&One::<Option<String>> { value: None }, &[0])?;
+        let hello = One {
+            value: Some(String::from("Hello World!")),
         };
-
-        let mut encoded = vec![];
-        let mut c = Cursor::new(&mut encoded);
-        let mut encoder = Encoder::new(&mut c);
-        expected.serialize(&mut encoder)?;
-
-        assert_eq!(encoded, vec![1]);
-
-        let mut c = Cursor::new(&mut encoded);
-
-        let mut decoder = Decoder::new(&mut c);
-
-        assert_eq!(expected, Example::deserialize(&mut decoder)?);
-
-        Ok(())
+        payload(&hello, b"\x0dHello World!")
     }
 
     #[test]
-    fn compact_nullable_string_none() -> Result<()> {
-        #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
-        struct Example {
-            value: Option<String>,
-        }
-
-        let expected = Example { value: None };
-
-        let mut encoded = vec![];
-        let mut c = Cursor::new(&mut encoded);
-        let mut encoder = Encoder::new(&mut c);
-        expected.serialize(&mut encoder)?;
-
-        assert_eq!(encoded, vec![0]);
-
-        let mut c = Cursor::new(&mut encoded);
-
-        let mut decoder = Decoder::new(&mut c);
-
-        assert_eq!(expected, Example::deserialize(&mut decoder)?);
-
-        Ok(())
-    }
-
-    #[test]
-    fn compact_nullable_string_some() -> Result<()> {
-        #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
-        struct Example {
-            value: Option<String>,
-        }
-
-        let expected = Example {
-            value: Some("Hello World!".to_owned()),
+    fn a_compact_array_is_its_length_plus_one_then_its_elements() -> Result<()> {
+        let three = One {
+            value: vec![12321i32, 54345, 78987],
         };
-
-        let mut encoded = vec![];
-        let mut c = Cursor::new(&mut encoded);
-        let mut encoder = Encoder::new(&mut c);
-        expected.serialize(&mut encoder)?;
-
-        assert_eq!(
-            encoded,
-            vec![13, 72, 101, 108, 108, 111, 32, 87, 111, 114, 108, 100, 33]
-        );
-
-        let mut c = Cursor::new(&mut encoded);
-
-        let mut decoder = Decoder::new(&mut c);
-
-        assert_eq!(expected, Example::deserialize(&mut decoder)?);
-
-        Ok(())
+        let mut wire = vec![4];
+        for element in &three.value {
+            wire.extend_from_slice(&element.to_be_bytes());
+        }
+        payload(&three, &wire)?;
+        payload(&One::<Vec<i32>> { value: vec![] }, &[1])
     }
 
     #[test]
-    fn compact_array_of() -> Result<()> {
-        #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
-        struct Example {
-            value: Vec<i32>,
-        }
-
-        let expected = Example {
-            value: [12321, 54345, 78987].into(),
+    fn a_compact_array_of_structs_is_each_struct_in_turn() -> Result<()> {
+        let (host_name, rack_name) = (String::from("abc"), String::from("pqr"));
+        let (node, port_number) = (32123, 98789);
+        let broker = Broker {
+            node,
+            host_name,
+            port_number,
+            rack_name,
         };
-
-        let mut encoded = vec![];
-        let mut c = Cursor::new(&mut encoded);
-        let mut encoder = Encoder::new(&mut c);
-        expected.serialize(&mut encoder)?;
-
-        assert_eq!(encoded, vec![4, 0, 0, 48, 33, 0, 0, 212, 73, 0, 1, 52, 139]);
-
-        let mut c = Cursor::new(&mut encoded);
-
-        let mut decoder = Decoder::new(&mut c);
-
-        assert_eq!(expected, Example::deserialize(&mut decoder)?);
-
-        Ok(())
-    }
-
-    #[test]
-    fn compact_array_of_empty() -> Result<()> {
-        #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
-        struct Example {
-            value: Vec<i32>,
-        }
-
-        let expected = Example { value: [].into() };
-
-        let mut encoded = vec![];
-        let mut c = Cursor::new(&mut encoded);
-        let mut encoder = Encoder::new(&mut c);
-        expected.serialize(&mut encoder)?;
-
-        assert_eq!(encoded, vec![1]);
-
-        let mut c = Cursor::new(&mut encoded);
-
-        let mut decoder = Decoder::new(&mut c);
-
-        assert_eq!(expected, Example::deserialize(&mut decoder)?);
-
-        Ok(())
-    }
-
-    #[test]
-    fn array_of() -> Result<()> {
-        #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
-        struct Wrapper {
-            value: Vec<Example>,
-        }
-
-        #[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
-        struct Example {
-            node_id: i32,
-            host: String,
-            port: i32,
-            rack: String,
-        }
-
-        let expected = Wrapper {
-            value: vec![Example {
-                node_id: 32123,
-                host: "abc".to_owned(),
-                port: 98789,
-                rack: "pqr".to_owned(),
-            }],
-        };
-
-        let mut encoded = vec![];
-        let mut c = Cursor::new(&mut encoded);
-        let mut encoder = Encoder::new(&mut c);
-        expected.serialize(&mut encoder)?;
-
-        assert_eq!(
-            encoded,
-            vec![
-                2, 0, 0, 125, 123, 4, 97, 98, 99, 0, 1, 129, 229, 4, 112, 113, 114
-            ]
-        );
-
-        let mut c = Cursor::new(&mut encoded);
-
-        let mut decoder = Decoder::new(&mut c);
-
-        assert_eq!(expected, Wrapper::deserialize(&mut decoder)?);
-
-        Ok(())
+        let mut wire = vec![2];
+        wire.extend_from_slice(&32123i32.to_be_bytes());
+        wire.extend_from_slice(b"\x04abc");
+        wire.extend_from_slice(&98789i32.to_be_bytes());
+        wire.extend_from_slice(b"\x04pqr");
+        payload(
+            &One {
+                value: vec![broker],
+            },
+            &wire,
+        )
     }
 }
