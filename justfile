@@ -985,6 +985,17 @@ fmt:
 # timings on shared helpers, the one named `test` now says what it checks, and
 # five narrating `//` lines became the first test's doc comment. Both pass
 # against the old body too. Five comment lines went, so the ceiling comes down.
+#   defork  -51 lines, the model's JSON field readers rewritten  2869 -> 2866  2.6961 -> 2.6945
+#
+# `tansu-model/src/wv.rs` keeps `Wv`, the `As` and `AsOption` traits and every
+# impl and signature. The bodies read through one `field` accessor, and the
+# narrowing reads through one `narrowed` helper, with the same errors:
+# `Message(name)` for a field that is absent or of the wrong type, `TryFromInt`
+# for one that does not fit. `tansu-sans-io`'s generated code is byte-for-byte
+# the same before and after. The tests build their JSON with `json!` and keep
+# every expectation, and they pass against the old body too. The `//` above
+# `Wv` became its doc comment and two commented-out test cases went: three
+# comment lines, so the ceiling comes down.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -995,7 +1006,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6961" top="12":
+comments ceiling="2.6945" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
