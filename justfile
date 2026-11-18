@@ -996,6 +996,14 @@ fmt:
 # every expectation, and they pass against the old body too. The `//` above
 # `Wv` became its doc comment and two commented-out test cases went: three
 # comment lines, so the ceiling comes down.
+#   defork  -12 lines, the tagged field serializer rewritten  2866 -> 2866  2.6945 -> 2.6950
+#
+# `primitive/tagged/ser.rs` keeps `Encoder`, every `Serializer` and
+# `Serialize*` impl, signature and `where` clause. The bodies write through
+# one `put` and one `length` helper, refuse through `refused` and open
+# compounds through `opened`, with the same bytes, the same `UnexpectedType`
+# messages and the same spans. Its tests, and the golden wire fixtures, pass
+# unchanged. Only code went, so the ceiling rises.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -1006,7 +1014,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6945" top="12":
+comments ceiling="2.6950" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
