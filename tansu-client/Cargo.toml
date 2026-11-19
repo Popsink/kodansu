@@ -11,18 +11,15 @@ repository.workspace = true
 version.workspace = true
 
 [dependencies]
-anyhow.workspace = true
 backoff.workspace = true
 bytes.workspace = true
 deadpool.workspace = true
-humantime.workspace = true
 opentelemetry-semantic-conventions.workspace = true
 opentelemetry.workspace = true
 rama.workspace = true
 tansu-sans-io.workspace = true
 tansu-service.workspace = true
 thiserror.workspace = true
-tokio-util.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
 tracing.workspace = true
@@ -33,5 +30,8 @@ workspace = true
 
 
 [dev-dependencies]
+anyhow.workspace = true
 clap.workspace = true
 dotenv.workspace = true
+humantime.workspace = true
+tokio-util.workspace = true

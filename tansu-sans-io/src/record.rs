@@ -289,10 +289,6 @@ impl Record {
     pub fn value(&self) -> Option<Bytes> {
         self.value.clone()
     }
-
-    pub fn is_tombstone(&self) -> bool {
-        self.key.is_some() && self.value.is_none()
-    }
 }
 
 impl TryFrom<Builder> for Record {

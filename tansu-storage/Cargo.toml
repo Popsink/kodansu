@@ -22,9 +22,6 @@ async-trait.workspace = true
 bytes.workspace = true
 cached.workspace = true
 console.workspace = true
-chrono.workspace = true
-futures-core.workspace = true
-futures-util.workspace = true
 futures.workspace = true
 governor.workspace = true
 human-units.workspace = true
@@ -40,7 +37,6 @@ serde_json.workspace = true
 sha2.workspace = true
 tansu-sans-io.workspace = true
 thiserror.workspace = true
-tokio-util.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
 tracing.workspace = true
@@ -54,6 +50,7 @@ uuid.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 
 assert_matches.workspace = true
+chrono.workspace = true
 criterion.workspace = true
 dotenv.workspace = true
 # Only to *build* a linked-block LZ4 frame in the #253 repair test: the corrected
