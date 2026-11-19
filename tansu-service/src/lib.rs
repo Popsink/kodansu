@@ -1,4 +1,5 @@
 // Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,240 +13,93 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Common service layers used in other Tansu crates.
+//! The [`rama`] layers and services every other crate composes into a Kafka
+//! protocol stack.
 //!
-//! ## Overview
+//! What moves through them is a [`Frame`], its [`Body`], or a typed
+//! [request][`tansu_sans_io::Request`] and its
+//! [response][`tansu_sans_io::Response`]. Three transports carry them:
 //!
-//! This crate provides [Layer][`rama::Layer`] and [Service][`rama::Service`]
-//! implementations for operating on [`Frame`], [`Body`], [Request][`tansu_sans_io::Request`]
-//! and [Response][`tansu_sans_io::Response`].
+//! - TCP, served by [`TcpBytesLayer`] and initiated by [`BytesTcpService`];
+//! - a [channel][`tokio::sync::mpsc`], with [`ChannelFrameLayer`] and
+//!   [`ChannelFrameService`];
+//! - [`Bytes`][`bytes::Bytes`] in process, through [`BytesLayer`], which is
+//!   what protocol tests stack on.
 //!
-//! The following transports are provided:
+//! [`FrameRouteService`] hands each frame to the service registered for its
+//! [API key][`Frame#method.api_key`], and answers
+//! [`ApiVersionsRequest`][`tansu_sans_io::ApiVersionsRequest`] itself from the
+//! version ranges of everything it routes.
 //!
-//! - TCP with [`TcpBytesLayer`] and [`BytesTcpService`].
-//! - [`MPSC channel`][`tokio::sync::mpsc`] with [`ChannelFrameLayer`] and [`ChannelFrameService`].
-//! - [`Bytes`][`bytes::Bytes`] with [`BytesLayer`] (designed primarily for protocol testing)
-//!
-//! ### Routing
-//!
-//! Route [`Frame`] to services using [`FrameRouteService`] to automatically
-//! implement [`ApiVersionsRequest`][`tansu_sans_io::ApiVersionsRequest`]
-//! with valid protocol ranges:
+//! The example routes [`MetadataRequest`][`tansu_sans_io::MetadataRequest`] to
+//! one handler, then wraps the route in a client half ([`RequestFrameLayer`],
+//! [`FrameBytesLayer`]) and a server half ([`BytesFrameLayer`]) joined by
+//! [`BytesLayer`]. A request served on the result is encoded, carried, decoded,
+//! routed, answered and decoded again, so the
+//! [`MetadataResponse`][`tansu_sans_io::MetadataResponse`] that comes back is
+//! the handler's, and the
+//! [`ApiVersionsResponse`][`tansu_sans_io::ApiVersionsResponse`] lists exactly
+//! the two keys routed. A broker or a CLI client stacks the same way, with
+//! [`TcpBytesLayer`] or [`BytesTcpService`] where [`BytesLayer`] is.
 //!
 //! ```
-//! # use tansu_service::Error;
+//! use rama::{Context, Layer as _, Service as _};
+//! use tansu_sans_io::{ApiKey as _, ApiVersionsRequest};
+//! use tansu_sans_io::{MetadataRequest, MetadataResponse};
+//! use tansu_service::{BytesFrameLayer, BytesLayer, Error, FrameBytesLayer};
+//! use tansu_service::{FrameRouteService, RequestFrameLayer, RequestLayer, ResponseService};
+//!
 //! # #[tokio::main]
-//! # async fn main() -> Result<(), Error> {
-//! # use rama::{Context, Layer as _, Service as _};
-//! # use tansu_sans_io::{ApiKey as _, ApiVersionsRequest, MetadataRequest, MetadataResponse};
-//! # use tansu_service::{
-//! #     BytesFrameLayer, BytesFrameService, BytesLayer, BytesService, FrameBytesLayer,
-//! #     FrameBytesService, FrameRouteService, RequestFrameLayer, RequestFrameService, RequestLayer,
-//! #     ResponseService,
-//! # };
-//! let frame_route = FrameRouteService::<(), Error>::builder()
-//!     .with_service(
-//!         RequestLayer::<MetadataRequest>::new().into_layer(ResponseService::new(|_, _| {
-//!             Ok(MetadataResponse::default()
-//!                 .brokers(Some([].into()))
-//!                 .topics(Some([].into()))
-//!                 .cluster_id(Some("tansu".into()))
-//!                 .controller_id(Some(111))
-//!                 .throttle_time_ms(Some(0))
-//!                 .cluster_authorized_operations(Some(-1)))
-//!         })),
-//!     )
-//!     .and_then(|builder| builder.build())?;
-//! # Ok(())
-//! # }
-//! ```
+//! # async fn main() -> Result<(), tansu_service::Error> {
+//! let metadata = ResponseService::new(|_, _| {
+//!     let empty = MetadataResponse::default().brokers(Some(vec![])).topics(Some(vec![]));
+//!     let named = empty.cluster_id(Some("tansu".into())).controller_id(Some(111));
+//!     Ok(named.throttle_time_ms(Some(0)).cluster_authorized_operations(Some(-1)))
+//! });
+//! let routed = RequestLayer::<MetadataRequest>::new().into_layer(metadata);
+//! let routes = FrameRouteService::<(), Error>::builder().with_service(routed)?;
 //!
-//! ### Layering
+//! let halves = (RequestFrameLayer, FrameBytesLayer, BytesLayer, BytesFrameLayer::default());
+//! let stack = halves.into_layer(routes.build()?);
 //!
-//! Composing [`RequestFrameLayer`], [`FrameBytesLayer`], [`BytesLayer`],
-//! [`BytesFrameLayer`] together into `frame_route` to implement a test protocol stack.
+//! let asked = MetadataRequest::default().topics(Some(vec![]));
+//! let asked = asked.allow_auto_topic_creation(Some(false));
+//! let asked = asked.include_cluster_authorized_operations(Some(false));
+//! let asked = asked.include_topic_authorized_operations(Some(false));
+//! let answered = stack.serve(Context::default(), asked).await?;
+//! assert_eq!(Some(String::from("tansu")), answered.cluster_id);
 //!
-//! A "client" [`Frame`] is marshalled into bytes using [`FrameBytesLayer`], with [`BytesLayer`] connecting
-//! to a "server" that demarshalls using [`BytesFrameLayer`] back into frames,
-//! routing into `frame_route` (above) to [`MetadataRequest`][`tansu_sans_io::MetadataRequest`]
-//! or [`ApiVersionsRequest`][`tansu_sans_io::ApiVersionsRequest`] depending on the
-//! [API key][`Frame#method.api_key`]:
-//!
-//! ```
-//! # use tansu_service::Error;
-//! # #[tokio::main]
-//! # async fn main() -> Result<(), Error> {
-//! # use rama::{Context, Layer as _, Service as _};
-//! # use tansu_sans_io::{ApiKey as _, ApiVersionsRequest, MetadataRequest, MetadataResponse};
-//! # use tansu_service::{
-//! #     BytesFrameLayer, BytesFrameService, BytesLayer, BytesService, FrameBytesLayer,
-//! #     FrameBytesService, FrameRouteService, RequestFrameLayer, RequestFrameService, RequestLayer,
-//! #     ResponseService,
-//! # };
-//! # let frame_route = FrameRouteService::<(), Error>::builder()
-//! #     .with_service(
-//! #         RequestLayer::<MetadataRequest>::new().into_layer(ResponseService::new(|_, _| {
-//! #             Ok(MetadataResponse::default()
-//! #                 .brokers(Some([].into()))
-//! #                 .topics(Some([].into()))
-//! #                 .cluster_id(Some("tansu".into()))
-//! #                 .controller_id(Some(111))
-//! #                 .throttle_time_ms(Some(0))
-//! #                 .cluster_authorized_operations(Some(-1)))
-//! #         })),
-//! #     )
-//! #     .and_then(|builder| builder.build())?;
-//!   let service = (
-//!       // "client" initiator side:
-//!       RequestFrameLayer,
-//!       FrameBytesLayer,
-//!
-//!       // transport
-//!       BytesLayer,
-//!
-//!       // "server" side:
-//!       BytesFrameLayer::default(),
-//!   )
-//!       .into_layer(frame_route);
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! In the broker, proxy and CLI clients, [`BytesLayer`] is replaced with
-//! [`TcpBytesLayer`] (server side) or [`BytesTcpService`] (client/initiator side).
-//!
-//! ### Servicing
-//!
-//! We construct a default [`service context`][`rama::Context`] and a
-//! [`MetadataRequest`][`tansu_sans_io::MetadataRequest`] to initiate a request
-//! on the `service`. The request passes through the protocol stack
-//! and routed into our service. The service responds with a
-//! [`MetadataResponse`][`tansu_sans_io::MetadataResponse`], so that we can
-//! verify the expected `response.cluster_id`:
-//!
-//! ```
-//! # use tansu_service::Error;
-//! # #[tokio::main]
-//! # async fn main() -> Result<(), Error> {
-//! # use rama::{Context, Layer as _, Service as _};
-//! # use tansu_sans_io::{ApiKey as _, ApiVersionsRequest, MetadataRequest, MetadataResponse};
-//! # use tansu_service::{
-//! #     BytesFrameLayer, BytesFrameService, BytesLayer, BytesService, FrameBytesLayer,
-//! #     FrameBytesService, FrameRouteService, RequestFrameLayer, RequestFrameService, RequestLayer,
-//! #     ResponseService,
-//! # };
-//! # let frame_route = FrameRouteService::<(), Error>::builder()
-//! #     .with_service(
-//! #         RequestLayer::<MetadataRequest>::new().into_layer(ResponseService::new(|_, _| {
-//! #             Ok(MetadataResponse::default()
-//! #                 .brokers(Some([].into()))
-//! #                 .topics(Some([].into()))
-//! #                 .cluster_id(Some("tansu".into()))
-//! #                 .controller_id(Some(111))
-//! #                 .throttle_time_ms(Some(0))
-//! #                 .cluster_authorized_operations(Some(-1)))
-//! #         })),
-//! #     )
-//! #     .and_then(|builder| builder.build())?;
-//! # let service = (
-//! #      RequestFrameLayer,
-//! #      FrameBytesLayer,
-//! #      BytesLayer,
-//! #      BytesFrameLayer::default(),
-//! #  )
-//! #      .into_layer(frame_route);
-//!   let request = MetadataRequest::default()
-//!       .topics(Some([].into()))
-//!       .allow_auto_topic_creation(Some(false))
-//!       .include_cluster_authorized_operations(Some(false))
-//!       .include_topic_authorized_operations(Some(false));
-//!
-//!   let response = service.serve(Context::default(), request).await?;
-//!
-//!   assert_eq!(Some("tansu".into()), response.cluster_id);
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! The [`FrameRouteService`] automatically implements
-//! [`ApiVersionsRequest`][`tansu_sans_io::ApiVersionsRequest`]
-//! with valid protocol ranges for all defined services. An
-//! [`ApiVersionsResponse`][`tansu_sans_io::ApiVersionsResponse`] contains
-//! version information for both [`MetadataRequest`][`tansu_sans_io::MetadataRequest`]
-//! and [`ApiVersionsRequest`][`tansu_sans_io::ApiVersionsRequest`]:
-//!
-//! ```
-//! # use tansu_service::Error;
-//! # #[tokio::main]
-//! # async fn main() -> Result<(), Error> {
-//! # use rama::{Context, Layer as _, Service as _};
-//! # use tansu_sans_io::{ApiKey as _, ApiVersionsRequest, MetadataRequest, MetadataResponse};
-//! # use tansu_service::{
-//! #     BytesFrameLayer, BytesFrameService, BytesLayer, BytesService, FrameBytesLayer,
-//! #     FrameBytesService, FrameRouteService, RequestFrameLayer, RequestFrameService, RequestLayer,
-//! #     ResponseService,
-//! # };
-//! # let frame_route = FrameRouteService::<(), Error>::builder()
-//! #     .with_service(
-//! #         RequestLayer::<MetadataRequest>::new().into_layer(ResponseService::new(|_, _| {
-//! #             Ok(MetadataResponse::default()
-//! #                 .brokers(Some([].into()))
-//! #                 .topics(Some([].into()))
-//! #                 .cluster_id(Some("tansu".into()))
-//! #                 .controller_id(Some(111))
-//! #                 .throttle_time_ms(Some(0))
-//! #                 .cluster_authorized_operations(Some(-1)))
-//! #         })),
-//! #     )
-//! #     .and_then(|builder| builder.build())?;
-//! # let service = (
-//! #      RequestFrameLayer,
-//! #      FrameBytesLayer,
-//! #      BytesLayer,
-//! #      BytesFrameLayer::default(),
-//! #  )
-//! #      .into_layer(frame_route);
-//! let response = service
-//!     .serve(
-//!         Context::default(),
-//!         ApiVersionsRequest::default()
-//!             .client_software_name(Some("abcba".into()))
-//!             .client_software_version(Some("1.2321".into())),
-//!     )
-//!     .await?;
-//!
-//! let api_versions = response
-//!     .api_keys
-//!     .unwrap_or_default()
-//!     .into_iter()
-//!     .map(|api_version| api_version.api_key)
-//!     .collect::<Vec<_>>();
-//!
-//! assert_eq!(2, api_versions.len());
-//! assert!(api_versions.contains(&ApiVersionsRequest::KEY));
-//! assert!(api_versions.contains(&MetadataRequest::KEY));
-//! # Ok(())
+//! let hello = ApiVersionsRequest::default().client_software_name(Some("abcba".into()));
+//! let hello = hello.client_software_version(Some("1.2321".into()));
+//! let versions = stack.serve(Context::default(), hello).await?;
+//! let mut keys: Vec<i16> = versions.api_keys.iter().flatten().map(|key| key.api_key).collect();
+//! keys.sort_unstable();
+//! assert_eq!(vec![MetadataRequest::KEY, ApiVersionsRequest::KEY], keys);
+//! # Ok::<(), tansu_service::Error>(())
 //! # }
 //! ```
 
-use std::{
-    fmt, io,
-    net::SocketAddr,
-    ops::Range,
-    sync::{Arc, LazyLock, Mutex, PoisonError},
-    time::{Duration, SystemTime},
-};
+use std::net::SocketAddr;
+use std::ops::Range;
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::time::{Duration, SystemTime};
+use std::{fmt, io};
 
-use opentelemetry::{
-    InstrumentationScope, KeyValue, global,
-    metrics::{Counter, Histogram, Meter, UpDownCounter},
-};
-use opentelemetry_semantic_conventions::SCHEMA_URL;
-use rama::{Context, Layer, Service};
-use rand::{prelude::*, rngs::SmallRng};
-use tansu_sans_io::{Body, Frame};
-use tokio::{net::lookup_host, runtime::Handle, sync::oneshot, task::JoinError, time::sleep};
-use tracing::{debug, instrument};
+use opentelemetry::metrics::{Counter, Histogram, Meter, UpDownCounter};
+use opentelemetry::{InstrumentationScope, KeyValue, global};
+use opentelemetry_semantic_conventions as semconv;
+use rama::Context;
+use rama::{Layer, Service};
+use rand::prelude::*;
+use rand::rngs::SmallRng;
+use tansu_sans_io::Body;
+use tansu_sans_io::Frame;
+use tokio::net::lookup_host;
+use tokio::runtime::Handle;
+use tokio::sync::oneshot;
+use tokio::task::JoinError;
+use tokio::time::sleep;
+use tracing::debug;
 use url::Url;
 
 mod api;
@@ -254,20 +108,15 @@ mod consumer;
 mod frame;
 mod stream;
 
-pub use api::{ApiVersionsService, FrameRouteBuilder, FrameRouteService};
-
-pub use channel::{
-    ChannelFrameLayer, ChannelFrameService, FrameChannelService, FrameReceiver, FrameSender,
-    bounded_channel,
-};
-
-pub use consumer::{ConsumerGroupLayer, ConsumerGroupService};
-
-pub use frame::{
-    BodyRequestLayer, BytesFrameLayer, BytesFrameService, FrameApiKeyMatcher, FrameBodyLayer,
-    FrameBytesLayer, FrameBytesService, FrameRequestLayer, FrameService, RequestApiKeyMatcher,
-    RequestFrameLayer, RequestFrameService, RequestLayer, ResponseService,
-};
+pub use self::api::ApiVersionsService;
+pub use self::api::{FrameRouteBuilder, FrameRouteService};
+pub use self::channel::{ChannelFrameLayer, ChannelFrameService, FrameChannelService};
+pub use self::channel::{FrameReceiver, FrameSender, bounded_channel};
+pub use self::consumer::{ConsumerGroupLayer, ConsumerGroupService};
+pub use self::frame::{BodyRequestLayer, FrameBodyLayer, FrameRequestLayer, FrameService};
+pub use self::frame::{BytesFrameLayer, BytesFrameService, FrameBytesLayer, FrameBytesService};
+pub use self::frame::{FrameApiKeyMatcher, RequestApiKeyMatcher};
+pub use self::frame::{RequestFrameLayer, RequestFrameService, RequestLayer, ResponseService};
 
 /// A request parked in a long poll, counted for as long as this value lives
 /// (#362).
@@ -297,7 +146,7 @@ impl Drop for Parked {
     }
 }
 
-pub use stream::{
+pub use self::stream::{
     Admission, BytesLayer, BytesService, BytesTcpService, Keepalive, NoResponse, Peer,
     TcpBytesLayer, TcpBytesService, TcpContext, TcpContextLayer, TcpContextService,
     TcpListenerLayer, Throttle,
@@ -305,10 +154,10 @@ pub use stream::{
 
 /// Requests answered with a non-zero `throttle_time_ms` (#384).
 pub(crate) static THROTTLED_REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("tansu_throttled_requests")
-        .with_description("The number of API requests answered with a quota throttle")
-        .build()
+    counter(
+        "tansu_throttled_requests",
+        "The number of API requests answered with a quota throttle",
+    )
 });
 
 /// How long connections have spent muted between requests (#384).
@@ -353,7 +202,7 @@ pub enum Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        f.write_fmt(format_args!("{self:?}"))
     }
 }
 
@@ -424,19 +273,21 @@ impl Classify for Error {
 
 impl From<JoinError> for Error {
     fn from(value: JoinError) -> Self {
-        Self::Join(Arc::new(value))
+        let shared = Arc::new(value);
+        Error::Join(shared)
     }
 }
 
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {
-        Self::Io(Arc::new(value))
+        let shared = Arc::new(value);
+        Error::Io(shared)
     }
 }
 
 impl<T> From<PoisonError<T>> for Error {
     fn from(_value: PoisonError<T>) -> Self {
-        Self::Poison
+        Error::Poison
     }
 }
 
@@ -456,56 +307,67 @@ fn frame_length(encoded: [u8; 4]) -> Option<usize> {
 }
 
 pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {
-    global::meter_with_scope(
-        InstrumentationScope::builder(env!("CARGO_PKG_NAME"))
-            .with_version(env!("CARGO_PKG_VERSION"))
-            .with_schema_url(SCHEMA_URL)
-            .build(),
-    )
+    let named = InstrumentationScope::builder(env!("CARGO_PKG_NAME"));
+    let versioned = named.with_version(env!("CARGO_PKG_VERSION"));
+    let scope = versioned.with_schema_url(semconv::SCHEMA_URL).build();
+    global::meter_with_scope(scope)
 });
 
-/// Return the socket address for a given URL
+/// A `u64` counter on [`METER`].
+fn counter(name: &'static str, description: &'static str) -> Counter<u64> {
+    let described = METER.u64_counter(name).with_description(description);
+    described.build()
+}
+
+/// A `u64` histogram on [`METER`], in `unit`, bucketed at `boundaries`.
+fn histogram(
+    name: &'static str,
+    unit: &'static str,
+    description: &'static str,
+    boundaries: &[f64],
+) -> Histogram<u64> {
+    let described = METER.u64_histogram(name).with_description(description);
+    let bucketed = described
+        .with_unit(unit)
+        .with_boundaries(boundaries.to_vec());
+    bucketed.build()
+}
+
+/// The first IPv4 address `url`'s host and port resolve to, the lookup's time
+/// recorded in `dns_lookup_duration`, and [`Error::UnknownHost`] when either is
+/// missing or nothing IPv4 comes back.
 ///
-/// Recording DNS lookup timings in the `DNS_LOOKUP_DURATION` histogram.
+/// ```
+/// use std::net::{Ipv4Addr, SocketAddr};
 ///
-/// ```rust
-/// # use tansu_service::{Error, host_port};
-/// # use url::Url;
-/// # use std::net::Ipv4Addr;
+/// use tansu_service::host_port;
+/// use url::Url;
+///
 /// # #[tokio::main]
-/// # async fn main() -> Result<(), Error> {
-/// let earl = Url::parse("tcp://localhost:9092")?;
-/// let sock_addr = host_port(earl).await?;
-/// assert_eq!(sock_addr.ip(), Ipv4Addr::new(127, 0, 0, 1));
-/// assert_eq!(sock_addr.port(), 9092);
-/// # Ok(())
+/// # async fn main() -> Result<(), tansu_service::Error> {
+/// let resolved = host_port(Url::parse("tcp://localhost:9092")?).await?;
+/// assert_eq!(SocketAddr::from((Ipv4Addr::LOCALHOST, 9092)), resolved);
+/// # Ok::<(), tansu_service::Error>(())
 /// # }
 /// ```
 pub async fn host_port(url: Url) -> Result<SocketAddr, Error> {
-    if let Some(host) = url.host_str()
-        && let Some(port) = url.port()
-    {
-        let attributes = [KeyValue::new("url", url.to_string())];
-        let start = SystemTime::now();
+    let (Some(host), Some(port)) = (url.host_str(), url.port()) else {
+        return Err(Error::UnknownHost(url));
+    };
 
-        let mut addresses = lookup_host(format!("{host}:{port}"))
-            .await
-            .inspect(|_| {
-                DNS_LOOKUP_DURATION.record(
-                    start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    &attributes,
-                )
-            })?
-            .filter(|socket_addr| matches!(socket_addr, SocketAddr::V4(_)));
-
-        if let Some(socket_addr) = addresses.next().inspect(|socket_addr| debug!(?socket_addr)) {
-            return Ok(socket_addr);
-        }
+    let attributes = [KeyValue::new("url", String::from(url.as_str()))];
+    let asked = SystemTime::now();
+    let resolved = lookup_host(format!("{host}:{port}")).await;
+    if resolved.is_ok() {
+        let took = asked.elapsed().map_or(0, |took| took.as_millis() as u64);
+        DNS_LOOKUP_DURATION.record(took, &attributes);
     }
 
-    Err(Error::UnknownHost(url))
+    let Some(first) = resolved?.find(SocketAddr::is_ipv4) else {
+        return Err(Error::UnknownHost(url));
+    };
+    debug!(socket_addr = ?first);
+    Ok(first)
 }
 
 /// Bucket boundaries for every duration histogram here, in milliseconds.
@@ -542,39 +404,39 @@ pub(crate) const SIZE_BYTES_BOUNDARIES: &[f64] = &[
 ];
 
 pub(crate) static DNS_LOOKUP_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
-    METER
-        .u64_histogram("dns_lookup_duration")
-        .with_unit("ms")
-        .with_description("DNS lookup latencies")
-        .with_boundaries(DURATION_MS_BOUNDARIES.to_vec())
-        .build()
+    histogram(
+        "dns_lookup_duration",
+        "ms",
+        "DNS lookup latencies",
+        DURATION_MS_BOUNDARIES,
+    )
 });
 
 pub(crate) static REQUEST_SIZE: LazyLock<Histogram<u64>> = LazyLock::new(|| {
-    METER
-        .u64_histogram("tansu_request_size")
-        .with_unit("By")
-        .with_description("The API request size in bytes")
-        .with_boundaries(SIZE_BYTES_BOUNDARIES.to_vec())
-        .build()
+    histogram(
+        "tansu_request_size",
+        "By",
+        "The API request size in bytes",
+        SIZE_BYTES_BOUNDARIES,
+    )
 });
 
 pub(crate) static RESPONSE_SIZE: LazyLock<Histogram<u64>> = LazyLock::new(|| {
-    METER
-        .u64_histogram("tansu_response_size")
-        .with_unit("By")
-        .with_description("The API response size in bytes")
-        .with_boundaries(SIZE_BYTES_BOUNDARIES.to_vec())
-        .build()
+    histogram(
+        "tansu_response_size",
+        "By",
+        "The API response size in bytes",
+        SIZE_BYTES_BOUNDARIES,
+    )
 });
 
 pub(crate) static REQUEST_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
-    METER
-        .u64_histogram("tansu_request_duration")
-        .with_unit("ms")
-        .with_description("The API request latencies in milliseconds")
-        .with_boundaries(DURATION_MS_BOUNDARIES.to_vec())
-        .build()
+    histogram(
+        "tansu_request_duration",
+        "ms",
+        "The API request latencies in milliseconds",
+        DURATION_MS_BOUNDARIES,
+    )
 });
 
 /// How long the answer took to reach the socket, once the broker had it.
@@ -589,12 +451,12 @@ pub(crate) static REQUEST_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| 
 /// backpressure is the interesting sample, and an `inspect`-shaped stamp would
 /// drop exactly that one.
 pub(crate) static RESPONSE_WRITE_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
-    METER
-        .u64_histogram("tansu_response_write_duration")
-        .with_unit("ms")
-        .with_description("Time from the encoded response in hand to flush returning")
-        .with_boundaries(DURATION_MS_BOUNDARIES.to_vec())
-        .build()
+    histogram(
+        "tansu_response_write_duration",
+        "ms",
+        "Time from the encoded response in hand to flush returning",
+        DURATION_MS_BOUNDARIES,
+    )
 });
 
 /// Registers the two tokio runtime gauges, once per process.
@@ -653,26 +515,14 @@ static RUNTIME_GAUGES: LazyLock<()> = LazyLock::new(|| {
         .build();
 });
 
-pub(crate) static API_REQUESTS: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("tansu_api_requests")
-        .with_description("The number of API requests made")
-        .build()
-});
+pub(crate) static API_REQUESTS: LazyLock<Counter<u64>> =
+    LazyLock::new(|| counter("tansu_api_requests", "The number of API requests made"));
 
-pub(crate) static API_ERRORS: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("tansu_api_errors")
-        .with_description("The number of API errors")
-        .build()
-});
+pub(crate) static API_ERRORS: LazyLock<Counter<u64>> =
+    LazyLock::new(|| counter("tansu_api_errors", "The number of API errors"));
 
-pub(crate) static BYTES_SENT: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("tansu_bytes_sent")
-        .with_description("The number of bytes sent")
-        .build()
-});
+pub(crate) static BYTES_SENT: LazyLock<Counter<u64>> =
+    LazyLock::new(|| counter("tansu_bytes_sent", "The number of bytes sent"));
 
 /// Requests being served right now — working *or* parked (#362).
 ///
@@ -709,12 +559,8 @@ pub(crate) static REQUESTS_PARKED: LazyLock<UpDownCounter<i64>> = LazyLock::new(
         .build()
 });
 
-pub(crate) static BYTES_RECEIVED: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("tansu_bytes_received")
-        .with_description("The number of bytes received")
-        .build()
-});
+pub(crate) static BYTES_RECEIVED: LazyLock<Counter<u64>> =
+    LazyLock::new(|| counter("tansu_bytes_received", "The number of bytes received"));
 
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct LatencyIntroducingLayer {
@@ -724,11 +570,15 @@ pub struct LatencyIntroducingLayer {
 
 impl LatencyIntroducingLayer {
     pub fn with_seed(self, seed: u64) -> Self {
-        Self { seed, ..self }
+        let mut seeded = self;
+        seeded.seed = seed;
+        seeded
     }
 
     pub fn with_latency_millis(self, latency: Range<u64>) -> Self {
-        Self { latency, ..self }
+        let mut slowed = self;
+        slowed.latency = latency;
+        slowed
     }
 }
 
@@ -736,9 +586,8 @@ impl<S> Layer<S> for LatencyIntroducingLayer {
     type Service = LatencyIntroducingService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        Self::Service::new(inner)
-            .with_seed(self.seed)
-            .with_latency(self.latency.clone())
+        let seeded = LatencyIntroducingService::new(inner).with_seed(self.seed);
+        seeded.with_latency(self.latency.clone())
     }
 }
 
@@ -751,43 +600,45 @@ pub struct LatencyIntroducingService<S> {
 
 impl<S> fmt::Debug for LatencyIntroducingService<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct(stringify!(LatencyIntroducingService))
-            .field("latency", &self.latency)
-            .finish_non_exhaustive()
+        let mut shown = f.debug_struct("LatencyIntroducingService");
+        _ = shown.field("latency", &self.latency);
+        shown.finish_non_exhaustive()
     }
 }
 
 impl<S> LatencyIntroducingService<S> {
     pub fn new(inner: S) -> Self {
-        Self {
-            inner,
-            rng: Arc::new(Mutex::new(SmallRng::seed_from_u64(0))),
-            latency: 50..150,
+        let latency = 50..150;
+        let rng = Arc::new(Mutex::new(SmallRng::seed_from_u64(0)));
+        let wrapped = inner;
+        LatencyIntroducingService {
+            inner: wrapped,
+            latency,
+            rng,
         }
     }
 
     pub fn with_seed(self, seed: u64) -> Self {
-        Self {
-            rng: Arc::new(Mutex::new(SmallRng::seed_from_u64(seed))),
-            ..self
-        }
+        let mut reseeded = self;
+        reseeded.rng = Arc::new(Mutex::new(SmallRng::seed_from_u64(seed)));
+        reseeded
     }
 
     pub fn with_latency(self, latency: Range<u64>) -> Self {
-        Self { latency, ..self }
+        let mut slowed = self;
+        slowed.latency = latency;
+        slowed
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn introduce_latency(&self) -> Result<(), Error> {
-        let latency = self
-            .rng
-            .lock()
-            .map(|mut rng| rng.random_range(self.latency.clone()))
-            .map(Duration::from_millis)
-            .inspect(|latency| debug!(?latency))?;
-
-        sleep(latency).await;
-
+        let millis = {
+            let mut rng = self.rng.lock()?;
+            rng.random_range(self.latency.clone())
+        };
+        let pause = Duration::from_millis(millis);
+        debug!(latency = ?pause);
+        sleep(pause).await;
         Ok(())
     }
 }
@@ -803,12 +654,12 @@ where
 
     type Error = S::Error;
 
-    #[instrument(skip(ctx, req))]
+    #[tracing::instrument(skip(ctx, req))]
     async fn serve(&self, ctx: Context<State>, req: Q) -> Result<Self::Response, Self::Error> {
-        self.introduce_latency().await?;
-        let result = self.inner.serve(ctx, req).await;
-        self.introduce_latency().await?;
-        result
+        Self::introduce_latency(self).await?;
+        let served = S::serve(&self.inner, ctx, req).await;
+        Self::introduce_latency(self).await?;
+        served
     }
 }
 
