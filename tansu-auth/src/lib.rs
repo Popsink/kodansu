@@ -1,4 +1,5 @@
 // Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,30 +13,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rsasl::{
-    callback::{Context, Request, SessionCallback, SessionData},
-    config::SASLConfig,
-    mechanisms::scram::properties::ScramStoredPassword,
-    prelude::{SASLError, SASLServer, Session, SessionError, Validation},
-    property::{AuthId, AuthzId, Password},
-    validate::{Validate, ValidationError},
-};
-use std::{
-    fmt::{self, Debug, Formatter},
-    str::FromStr,
-    sync::{Arc, Mutex, PoisonError},
-};
+use std::fmt::{self, Debug, Formatter};
+use std::str::FromStr;
+use std::sync::{Arc, Mutex, PoisonError};
+
+use rsasl::callback::{Context, Request, SessionCallback, SessionData};
+use rsasl::config::SASLConfig;
+use rsasl::mechanisms::scram::properties::ScramStoredPassword;
+use rsasl::prelude::{SASLError, SASLServer, Session, SessionError, Validation};
+use rsasl::property::{AuthId, AuthzId, Password};
+use rsasl::validate::{Validate, ValidationError};
 use tansu_sans_io::ScramMechanism;
 use tansu_storage::Storage;
 use thiserror::Error;
 use tokio::task::JoinError;
-use tracing::{debug, instrument};
+use tracing::debug;
 
 mod authenticate;
 mod handshake;
 
-pub use authenticate::SaslAuthenticateService;
-pub use handshake::SaslHandshakeService;
+pub use self::authenticate::SaslAuthenticateService;
+pub use self::handshake::SaslHandshakeService;
 
 #[derive(Clone, Debug, Error)]
 pub enum Error {
@@ -48,31 +46,34 @@ pub enum Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        f.write_fmt(format_args!("{self:?}"))
     }
 }
 
 impl From<JoinError> for Error {
     fn from(value: JoinError) -> Self {
-        Self::Join(Arc::new(value))
+        let shared = Arc::new(value);
+        Error::Join(shared)
     }
 }
 
 impl<T> From<PoisonError<T>> for Error {
     fn from(_value: PoisonError<T>) -> Self {
-        Self::Poison
+        Error::Poison
     }
 }
 
 impl From<SASLError> for Error {
     fn from(value: SASLError) -> Self {
-        Self::Sasl(Arc::new(value))
+        let shared = Arc::new(value);
+        Error::Sasl(shared)
     }
 }
 
 impl From<SessionError> for Error {
     fn from(value: SessionError) -> Self {
-        Self::SaslSession(Arc::new(value))
+        let shared = Arc::new(value);
+        Error::SaslSession(shared)
     }
 }
 
@@ -90,17 +91,15 @@ pub enum Stage {
 
 impl Debug for Stage {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct(stringify!(Stage)).finish()
+        f.write_str("Stage")
     }
 }
 
 impl Authentication {
     pub fn server(config: Arc<SASLConfig>) -> Self {
-        let server = SASLServer::<Justification>::new(config.clone());
-        Self {
-            config,
-            stage: Arc::new(Mutex::new(Some(Stage::Server(server)))),
-        }
+        let first = SASLServer::<Justification>::new(Arc::clone(&config));
+        let stage = Arc::new(Mutex::new(Some(Stage::Server(first))));
+        Authentication { config, stage }
     }
 
     /// Who authenticated on this connection, once one has (#363).
@@ -114,37 +113,35 @@ impl Authentication {
     /// `None` on a connection that has not authenticated, which on a broker
     /// started without `--authentication` is every connection.
     pub fn principal(&self) -> Option<String> {
-        self.stage
-            .lock()
-            .ok()
-            .and_then(|guard| match guard.as_ref() {
-                Some(Stage::Finished(Some(success))) => Some(success.auth_id().to_owned()),
-                _ => None,
-            })
+        let guard = self.stage.lock().ok()?;
+        let Some(Stage::Finished(Some(success))) = guard.as_ref() else {
+            return None;
+        };
+        Some(String::from(success.auth_id()))
     }
 
     pub fn is_authenticated(&self) -> bool {
-        self.stage
-            .lock()
-            .map(|guard| matches!(guard.as_ref(), Some(Stage::Finished(_))))
-            .ok()
-            .unwrap_or_default()
+        let Ok(guard) = self.stage.lock() else {
+            return false;
+        };
+        matches!(guard.as_ref(), Some(Stage::Finished(_)))
     }
 
-    /// Build a fresh `Stage::Server` from the stored config. Used by
-    /// the SASL handshake handler to support re-authentication
-    /// (KIP-368): a client periodically issues a new SaslHandshake on
-    /// an existing connection, and the broker must be willing to
-    /// initiate a new SASL exchange even though the previous one
-    /// already succeeded.
+    /// A new `Stage::Server` over the same config, for a connection that
+    /// authenticates again (KIP-368).
+    ///
+    /// A client re-authenticates by sending another `SaslHandshake` on a
+    /// connection that already succeeded once; the handshake handler starts
+    /// the exchange over from this rather than refusing it.
     pub fn fresh_server(&self) -> Stage {
-        Stage::Server(SASLServer::<Justification>::new(self.config.clone()))
+        let restarted = SASLServer::<Justification>::new(Arc::clone(&self.config));
+        Stage::Server(restarted)
     }
 }
 
 impl Debug for Authentication {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct(stringify!(Authentication)).finish()
+        f.write_str("Authentication")
     }
 }
 
@@ -159,7 +156,7 @@ pub enum AuthError {
 
 impl fmt::Display for AuthError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        f.write_fmt(format_args!("{self:?}"))
     }
 }
 
@@ -172,7 +169,8 @@ impl Success {
     /// The authenticated user: the SASL authentication id, which is what a
     /// Kafka principal is built from (#363).
     pub fn auth_id(&self) -> &str {
-        self.auth_id.as_str()
+        let Success { auth_id } = self;
+        auth_id
     }
 }
 
@@ -196,68 +194,52 @@ where
     where
         S: Storage,
     {
-        Self { storage }
+        Callback { storage }
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     fn check(
         &self,
         session_data: &SessionData,
         context: &Context<'_>,
     ) -> Result<Result<Success, AuthError>, Error> {
-        debug!(mechanism = %session_data.mechanism().mechanism);
+        let mechanism = session_data.mechanism().mechanism;
+        debug!(mechanism = %mechanism);
+        let missing = |property: &str| AuthError::MissingProperty {
+            mechanism: mechanism.to_string(),
+            property: property.into(),
+        };
 
-        if session_data.mechanism().mechanism == "PLAIN" {
-            Ok(context
-                .get_ref::<Password>()
-                .ok_or(AuthError::MissingProperty {
-                    mechanism: session_data.mechanism().mechanism.to_string(),
-                    property: "Password".into(),
-                })
-                .and(
-                    context
-                        .get_ref::<AuthId>()
-                        .inspect(|auth_id| {
-                            debug!(mechanism = %session_data.mechanism().mechanism, auth_id)
-                        })
-                        .ok_or(AuthError::MissingProperty {
-                            mechanism: session_data.mechanism().mechanism.to_string(),
-                            property: "AuthId".into(),
-                        }).map(ToString::to_string).map(|auth_id| {
-                            Success { auth_id }
-                        })
-                ))
-        } else if session_data.mechanism().mechanism.starts_with("SCRAM-") {
-            Ok(context
-                .get_ref::<AuthId>()
-                .inspect(|auth_id| debug!(mechanism = %session_data.mechanism().mechanism, auth_id))
-                .ok_or(AuthError::MissingProperty {
-                    mechanism: session_data.mechanism().mechanism.to_string(),
-                    property: "AuthId".into(),
-                })
-                .and_then(|auth_id| {
-                    context
-                        .get_ref::<AuthzId>()
-                        .inspect(|authz_id| {
-                            debug!(mechanism = %session_data.mechanism().mechanism, authz_id)
-                        })
-                        .map_or(Ok(Success{
-                            auth_id:auth_id.to_string()
-                        }), |authz_id| {
-                            if authz_id == auth_id {
-                                Ok(Success{
-                                    auth_id:auth_id.to_string()
-                                })
-                            } else {
-                                Err(AuthError::Bad)
-                            }
-                        })
-                }))
-        } else {
-            Ok(Err(AuthError::UnknownMechanism(
-                session_data.mechanism().mechanism.to_string(),
-            )))
+        if mechanism == "PLAIN" {
+            let password = context.get_ref::<Password>();
+            let password = password.ok_or_else(|| missing("Password"));
+            let named = context.get_ref::<AuthId>();
+            if let Some(auth_id) = named {
+                debug!(mechanism = %mechanism, auth_id);
+            }
+            let success = named.map(|auth_id| Success {
+                auth_id: auth_id.to_string(),
+            });
+            return Ok(password.and(success.ok_or_else(|| missing("AuthId"))));
         }
+
+        if !mechanism.starts_with("SCRAM-") {
+            return Ok(Err(AuthError::UnknownMechanism(mechanism.to_string())));
+        }
+
+        let Some(auth_id) = context.get_ref::<AuthId>() else {
+            return Ok(Err(missing("AuthId")));
+        };
+        debug!(mechanism = %mechanism, auth_id);
+        if let Some(authz_id) = context.get_ref::<AuthzId>() {
+            debug!(mechanism = %mechanism, authz_id);
+            if authz_id != auth_id {
+                return Ok(Err(AuthError::Bad));
+            }
+        }
+        Ok(Ok(Success {
+            auth_id: auth_id.to_string(),
+        }))
     }
 }
 
@@ -265,65 +247,57 @@ impl<S> SessionCallback for Callback<S>
 where
     S: Storage,
 {
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     fn callback(
         &self,
         session_data: &SessionData,
         context: &Context<'_>,
         request: &mut Request<'_>,
     ) -> Result<(), SessionError> {
-        debug!(?session_data);
+        debug!(session_data = ?session_data);
 
-        if session_data.mechanism().mechanism.starts_with("SCRAM-") {
-            let mechanism = ScramMechanism::from_str(session_data.mechanism().mechanism)
-                .map_err(|error| SessionError::Boxed(Box::new(error)))?;
-
-            let auth_id = context
-                .get_ref::<AuthId>()
-                .ok_or(SessionError::ValidationError(
-                    ValidationError::MissingRequiredProperty,
-                ))?;
-
-            debug!(?auth_id, ?mechanism);
-
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-
-            if let Ok(Some(credential)) = rt
-                .block_on(
-                    async move { self.storage.user_scram_credential(auth_id, mechanism).await },
-                )
-                .inspect_err(|err| debug!(auth_id, ?mechanism, ?err))
-            {
-                _ = request
-                    .satisfy::<ScramStoredPassword<'_>>(&ScramStoredPassword::new(
-                        credential.iterations as u32,
-                        &credential.salt[..],
-                        &credential.stored_key[..],
-                        &credential.server_key[..],
-                    ))
-                    .inspect_err(|err| debug!(auth_id, ?mechanism, ?err))?;
-            }
+        let name = session_data.mechanism().mechanism;
+        if !name.starts_with("SCRAM-") {
+            return Ok(());
         }
 
+        let mechanism =
+            ScramMechanism::from_str(name).map_err(|error| SessionError::Boxed(Box::new(error)))?;
+        let unnamed = SessionError::ValidationError(ValidationError::MissingRequiredProperty);
+        let auth_id = context.get_ref::<AuthId>().ok_or(unnamed)?;
+        debug!(auth_id = ?auth_id, mechanism = ?mechanism);
+
+        let mut builder = tokio::runtime::Builder::new_current_thread();
+        let runtime = builder.enable_all().build()?;
+        let stored = runtime.block_on(self.storage.user_scram_credential(auth_id, mechanism));
+        let logged = stored.inspect_err(|err| debug!(auth_id, mechanism = ?mechanism, err = ?err));
+        let Ok(Some(credential)) = logged else {
+            return Ok(());
+        };
+
+        let iterations = credential.iterations as u32;
+        let salt = credential.salt.as_ref();
+        let stored_key = credential.stored_key.as_ref();
+        let server_key = credential.server_key.as_ref();
+        let password = ScramStoredPassword::new(iterations, salt, stored_key, server_key);
+        let satisfied = request.satisfy::<ScramStoredPassword<'_>>(&password);
+        _ = satisfied.inspect_err(|err| debug!(auth_id, mechanism = ?mechanism, err = ?err))?;
         Ok(())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     fn validate(
         &self,
         session_data: &SessionData,
         context: &Context<'_>,
         validate: &mut Validate<'_>,
     ) -> Result<(), ValidationError> {
-        debug!(?session_data);
-
-        _ = validate.with::<Justification, _>(|| {
-            self.check(session_data, context)
-                .map_err(|e| ValidationError::Boxed(Box::new(e)))
-        })?;
-
+        debug!(session_data = ?session_data);
+        let checked = || {
+            let outcome = Self::check(self, session_data, context);
+            outcome.map_err(|error| ValidationError::Boxed(Box::new(error)))
+        };
+        _ = validate.with::<Justification, _>(checked)?;
         Ok(())
     }
 }
@@ -332,22 +306,21 @@ pub fn configuration<S>(storage: S) -> Result<Arc<SASLConfig>, Error>
 where
     S: Storage,
 {
-    SASLConfig::builder()
-        .with_defaults()
-        .with_callback(Callback::new(storage))
-        .map_err(Into::into)
+    let callback = Callback::new(storage);
+    let defaults = SASLConfig::builder().with_defaults();
+    let config = defaults.with_callback(callback)?;
+    Ok(config)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::Authentication;
 
-    fn is_send<T: Send>() {}
-    fn is_sync<T: Sync>() {}
+    fn shareable<T: Send + Sync>() {}
 
+    /// A connection's authentication state is handed between tasks.
     #[test]
-    fn authentication() {
-        is_send::<Authentication>();
-        is_sync::<Authentication>();
+    fn an_authentication_is_send_and_sync() {
+        shareable::<Authentication>();
     }
 }

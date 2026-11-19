@@ -1061,6 +1061,15 @@ fmt:
 # records the same histogram; the metrics are built through `counter` and
 # `histogram` with the same names, units, descriptions and buckets. Docs and
 # code went, and the ratio barely moved, so the ceiling falls with it.
+#   defork  -27 lines, the auth crate root rewritten  2834 -> 2834  2.6724 -> 2.6731
+#
+# `tansu-auth/src/lib.rs` keeps `Error`, `Authentication`, `Stage`,
+# `AuthError`, `Success`, `Justification`, `Callback` and every impl and
+# signature. `check` returns early instead of chaining, with the same
+# `MissingProperty`, `Bad` and `UnknownMechanism` answers, the PLAIN password
+# still checked ahead of the authentication id, and the same `debug` fields;
+# `callback` looks up the same SCRAM credential and satisfies the same stored
+# password. Only code went, so the ceiling rises.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -1071,7 +1080,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6724" top="12":
+comments ceiling="2.6731" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
