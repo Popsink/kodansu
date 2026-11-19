@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,186 +12,98 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{Error, cluster_id, init_tracing, storage_url};
-use rama::{Context, Layer as _, Service, layer::MapStateLayer};
-use rand::{distr::Alphanumeric, prelude::*, rng};
-use tansu_sans_io::{
-    CreateTopicsRequest, DeleteTopicsRequest, ErrorCode, MetadataRequest,
-    create_topics_request::CreatableTopic, metadata_request::MetadataRequestTopic,
-};
-use tansu_storage::{CreateTopicsService, DeleteTopicsService, MetadataService, StorageContainer};
-use url::Url;
+//! A topic through its whole life over the API: created, found by id and by
+//! name, refused a second time, deleted, and unknown once deleted.
+
+use std::sync::Arc;
+
+use rand::distr::{Alphanumeric, SampleString as _};
+use rand::{RngExt as _, rng};
+use tansu_sans_io::create_topics_request::CreatableTopic;
+use tansu_sans_io::metadata_request::MetadataRequestTopic;
+use tansu_sans_io::metadata_response::MetadataResponseTopic;
+use tansu_sans_io::{CreateTopicsRequest, DeleteTopicsRequest, ErrorCode, MetadataRequest};
+use tansu_storage::{CreateTopicsService, DeleteTopicsService, MetadataService, Storage};
+
+use crate::common::{Error, init_tracing, serve, storage};
 
 mod common;
 
+/// What `CreateTopics` answers for one topic: its error and its id.
+async fn create(
+    storage: &Arc<dyn Storage>,
+    name: &str,
+    partitions: i32,
+    replicas: i16,
+) -> Result<(ErrorCode, Option<[u8; 16]>), Error> {
+    let creatable = CreatableTopic::default()
+        .name(name.to_owned())
+        .num_partitions(partitions)
+        .replication_factor(replicas)
+        .assignments(Some(Vec::new()))
+        .configs(Some(Vec::new()));
+    let request = CreateTopicsRequest::default().topics(Some(vec![creatable]));
+    let response = serve(storage, CreateTopicsService, request).await?;
+    let [topic] = <[_; 1]>::try_from(response.topics.unwrap_or_default()).expect("one topic");
+    Ok((ErrorCode::try_from(topic.error_code)?, topic.topic_id))
+}
+
+/// The one topic `Metadata` answers for `wanted`.
+async fn described(
+    storage: &Arc<dyn Storage>,
+    wanted: MetadataRequestTopic,
+) -> Result<MetadataResponseTopic, Error> {
+    let request = MetadataRequest::default().topics(Some(vec![wanted]));
+    let response = serve(storage, MetadataService, request).await?;
+    let [topic] = <[_; 1]>::try_from(response.topics.unwrap_or_default()).expect("one topic");
+    Ok(topic)
+}
+
+/// What `DeleteTopics` answers for `name`.
+async fn delete(storage: &Arc<dyn Storage>, name: &str) -> Result<ErrorCode, Error> {
+    let request = DeleteTopicsRequest::default().topic_names(Some(vec![name.to_owned()]));
+    let response = serve(storage, DeleteTopicsService, request).await?;
+    let [result] = <[_; 1]>::try_from(response.responses.unwrap_or_default()).expect("one result");
+    Ok(ErrorCode::try_from(result.error_code)?)
+}
+
+/// The name and the shape are random, so the lifecycle does not depend on any
+/// one of them.
 #[tokio::test]
-async fn topic_lifecycle() -> Result<(), Error> {
+async fn a_topic_from_creation_to_deletion() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let node_id = rng().random_range(0..i32::MAX);
+    let storage = storage().await?;
+    let name = Alphanumeric.sample_string(&mut rng(), 15);
+    let partitions = rng().random_range(1..64);
+    let replicas = rng().random_range(0..64);
 
-    const HOST: &str = "localhost";
-    const PORT: i32 = 9092;
+    let (_, id) = create(&storage, &name, partitions, replicas).await?;
+    let id = id.expect("a created topic has an id");
 
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(node_id)
-        .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
-
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
-    };
-
-    let delete_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(DeleteTopicsService)
-    };
-
-    let metadata = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(MetadataService)
-    };
-
-    let name = &rng()
-        .sample_iter(&Alphanumeric)
-        .take(15)
-        .map(char::from)
-        .collect::<String>()[..];
-
-    let num_partitions = rng().random_range(1..64);
-    let replication_factor = rng().random_range(0..64);
-
-    let response = create_topic
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
-                .validate_only(Some(false))
-                .topics(Some(
-                    [CreatableTopic::default()
-                        .name(name.into())
-                        .num_partitions(num_partitions)
-                        .replication_factor(replication_factor)
-                        .assignments(Some([].into()))
-                        .configs(Some([].into()))]
-                    .into(),
-                )),
-        )
-        .await?;
-
-    let topic_id = response.topics.as_deref().unwrap_or_default()[0]
-        .topic_id
-        .unwrap();
-
-    {
-        // metadata via topic uuid
-        //
-
-        let response = metadata
-            .serve(
-                Context::default(),
-                MetadataRequest::default()
-                    .allow_auto_topic_creation(Some(false))
-                    .include_cluster_authorized_operations(Some(false))
-                    .include_cluster_authorized_operations(Some(false))
-                    .topics(Some(
-                        [MetadataRequestTopic::default().topic_id(Some(topic_id))].into(),
-                    )),
-            )
-            .await?;
-
-        let topics = response.topics.as_deref().unwrap_or_default();
-
-        assert_eq!(1, topics.len());
-        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-        assert_eq!(Some(name), topics[0].name.as_deref());
-        assert_eq!(Some(topic_id), topics[0].topic_id);
-    }
-
-    {
-        // metadata via topic name
-        //
-
-        let response = metadata
-            .serve(
-                Context::default(),
-                MetadataRequest::default()
-                    .allow_auto_topic_creation(Some(false))
-                    .include_cluster_authorized_operations(Some(false))
-                    .include_cluster_authorized_operations(Some(false))
-                    .topics(Some(
-                        [MetadataRequestTopic::default().name(Some(name.into()))].into(),
-                    )),
-            )
-            .await?;
-
-        let topics = response.topics.as_deref().unwrap_or_default();
-
-        assert_eq!(1, topics.len());
-        assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-        assert_eq!(Some(name), topics[0].name.as_deref());
-        assert_eq!(Some(topic_id), topics[0].topic_id);
-    }
-
-    {
-        // creating a topic with the same name causes an API error: topic already exists
-        //
-        let response = create_topic
-            .serve(
-                Context::default(),
-                CreateTopicsRequest::default()
-                    .validate_only(Some(false))
-                    .topics(Some(
-                        [CreatableTopic::default()
-                            .name(name.into())
-                            .num_partitions(num_partitions)
-                            .replication_factor(replication_factor)
-                            .assignments(Some([].into()))
-                            .configs(Some([].into()))]
-                        .into(),
-                    )),
-            )
-            .await?;
-
-        let topics = response.topics.as_deref().unwrap_or_default();
-        assert_eq!(1, topics.len());
+    let by_id = MetadataRequestTopic::default().topic_id(Some(id));
+    let by_name = MetadataRequestTopic::default().name(Some(name.clone()));
+    for wanted in [by_id, by_name] {
+        let topic = described(&storage, wanted).await?;
         assert_eq!(
-            ErrorCode::TopicAlreadyExists,
-            ErrorCode::try_from(topics[0].error_code)?
+            (ErrorCode::None, Some(name.as_str()), Some(id)),
+            (
+                ErrorCode::try_from(topic.error_code)?,
+                topic.name.as_deref(),
+                topic.topic_id
+            )
         );
     }
 
-    {
-        let response = delete_topic
-            .serve(
-                Context::default(),
-                DeleteTopicsRequest::default().topic_names(Some([name.into()].into())),
-            )
-            .await?;
+    let (again, _) = create(&storage, &name, partitions, replicas).await?;
+    assert_eq!(ErrorCode::TopicAlreadyExists, again);
 
-        let results = response.responses.as_deref().unwrap_or_default();
-        assert_eq!(1, results.len());
-        assert_eq!(ErrorCode::None, ErrorCode::try_from(results[0].error_code)?);
-    }
-
-    {
-        let response = delete_topic
-            .serve(
-                Context::default(),
-                DeleteTopicsRequest::default().topic_names(Some([name.into()].into())),
-            )
-            .await?;
-
-        let results = response.responses.as_deref().unwrap_or_default();
-        assert_eq!(1, results.len());
-        assert_eq!(
-            ErrorCode::UnknownTopicOrPartition,
-            ErrorCode::try_from(results[0].error_code)?
-        );
-    }
+    let deleted = delete(&storage, &name).await?;
+    let again = delete(&storage, &name).await?;
+    assert_eq!(
+        (ErrorCode::None, ErrorCode::UnknownTopicOrPartition),
+        (deleted, again)
+    );
 
     Ok(())
 }

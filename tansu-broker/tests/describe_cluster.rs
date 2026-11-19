@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,81 +17,50 @@
 // it; with the module gone it belongs to the file.
 #![cfg(feature = "dynostore")]
 
-use std::sync::Arc;
+//! `DescribeCluster` served against a `memory://` engine with one broker
+//! registered: that broker is the controller and the only broker listed.
 
-use common::register_broker;
-use rama::{Context, Service};
-use tansu_broker::Result;
-use tansu_sans_io::{
-    DescribeClusterRequest, DescribeClusterResponse, ErrorCode,
-    describe_cluster_response::DescribeClusterBroker,
-};
-use tansu_storage::{DescribeClusterService, Storage};
-use tracing::debug;
-use url::Url;
-use uuid::Uuid;
+use anyhow::Result;
+use rama::Context;
+use rama::Service as _;
+use rand::RngExt as _;
+use tansu_sans_io::describe_cluster_response::DescribeClusterBroker;
+use tansu_sans_io::{DescribeClusterRequest, ErrorCode};
+use tansu_storage::DescribeClusterService;
 
-use common::init_tracing;
-use rand::{prelude::*, rng};
 pub mod common;
 
-async fn storage_container(
-    cluster: impl Into<String>,
-    node: i32,
-    advertised_listener: Url,
-) -> Result<Arc<dyn Storage>> {
-    common::storage_container(cluster, node, advertised_listener).await
-}
+/// `cluster_authorized_operations` when the broker reports none: `i32::MIN`,
+/// Kafka's sentinel for "omitted".
+const OPERATIONS_OMITTED: i32 = i32::MIN;
 
 #[tokio::test]
-async fn describe() -> Result<()> {
-    let _guard = init_tracing()?;
+async fn the_registered_broker_is_the_controller_and_the_only_broker() -> Result<()> {
+    let _guard = common::init_tracing()?;
 
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let advertised_listener = Url::parse("tcp://example.com:9092/")?;
-    let sc = storage_container(cluster_id, broker_id, advertised_listener.clone()).await?;
+    let cluster = uuid::Uuid::now_v7();
+    let node = rand::rng().random_range(0..i32::MAX);
+    let listener = url::Url::parse("tcp://example.com:9092/")?;
+    tracing::debug!(node, %listener);
 
-    debug!(broker_id, %advertised_listener);
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
+    let storage = common::storage_container(cluster, node, listener.clone()).await?;
+    common::register_broker(cluster, node, storage.clone()).await?;
 
-    let include_cluster_authorized_operations = true;
-    let endpoint_type = Some(6);
+    let request = DescribeClusterRequest::default().include_cluster_authorized_operations(true);
+    let request = request.endpoint_type(Some(6));
+    let described = DescribeClusterService.serve(Context::with_state(storage), request);
+    let response = described.await?;
 
-    let ctx = Context::with_state(sc);
-    let service = DescribeClusterService;
+    let listed = DescribeClusterBroker::default().broker_id(node).rack(None);
+    let listed = listed.host(listener.host_str().map(String::from).unwrap_or_default());
+    let listed = listed.port(listener.port().map(i32::from).unwrap_or_default());
 
-    let response = service
-        .serve(
-            ctx,
-            DescribeClusterRequest::default()
-                .include_cluster_authorized_operations(include_cluster_authorized_operations)
-                .endpoint_type(endpoint_type),
-        )
-        .await?;
-
-    let host = advertised_listener.host_str().unwrap().to_string();
-    let port = advertised_listener.port().unwrap() as i32;
-    let rack = None;
-
-    assert!(matches!(
-        response,
-        DescribeClusterResponse {
-            throttle_time_ms: 0,
-            error_code,
-            error_message: None,
-            controller_id: broker_id,
-            brokers,
-            cluster_authorized_operations: -2_147_483_648,
-            ..
-        } if error_code == i16::from(ErrorCode::None)
-        && brokers == Some(vec![DescribeClusterBroker::default()
-            .broker_id(broker_id)
-            .host(host)
-            .port(port)
-            .rack(rack)
-        ])
-    ));
+    assert_eq!(0, response.throttle_time_ms);
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
+    assert_eq!(None, response.error_message);
+    assert_eq!(node, response.controller_id);
+    assert_eq!(OPERATIONS_OMITTED, response.cluster_authorized_operations);
+    assert_eq!(Some(vec![listed]), response.brokers);
 
     Ok(())
 }

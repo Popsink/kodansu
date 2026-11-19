@@ -12,15 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::BTreeMap, marker::PhantomData, sync::Arc};
+use std::collections::BTreeMap;
+use std::marker::PhantomData;
+use std::sync::Arc;
 
-use rama::{Context, Service, service::BoxService};
-use tansu_sans_io::{
-    ApiKey, ApiVersionsRequest, ApiVersionsResponse, Body, ErrorCode, FetchRequest, Frame, Header,
-    ProduceRequest, RootMessageMeta, api_versions_response::ApiVersion,
-};
+use rama::service::BoxService;
+use rama::{Context, Service};
+use tansu_sans_io::api_versions_response::ApiVersion;
+use tansu_sans_io::{ApiKey, ApiVersionsRequest, ApiVersionsResponse, RootMessageMeta};
+use tansu_sans_io::{Body, ErrorCode, FetchRequest, Frame, Header, ProduceRequest};
 
-use crate::Error;
+use super::Error;
 
 /// The lowest version to advertise for an API whose low versions imply a record
 /// format this broker does not speak (#322).
@@ -73,7 +75,9 @@ fn advertised_min_version(api_key: i16, valid_start: i16, valid_end: i16) -> i16
         .min(valid_end)
 }
 
-/// An [`ApiVersionsResponse`] [`Service`] with a supported set of API and versions from [`RootMessageMeta`].
+/// Answers `ApiVersions` with every routed API key, each at the version range
+/// its [`RootMessageMeta`] entry declares, floored where the record format
+/// requires it..
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ApiVersionsService<E> {
     supported: Vec<i16>,
@@ -93,32 +97,23 @@ where
         _ctx: Context<State>,
         _req: ApiVersionsRequest,
     ) -> Result<Self::Response, Self::Error> {
-        Ok::<_, E>(
-            ApiVersionsResponse::default()
-                .finalized_features(Some([].into()))
-                .finalized_features_epoch(Some(-1))
-                .supported_features(Some([].into()))
-                .zk_migration_ready(Some(false))
-                .error_code(ErrorCode::None.into())
-                .api_keys(Some(
-                    RootMessageMeta::messages()
-                        .requests()
-                        .iter()
-                        .filter(|(api_key, _)| self.supported.contains(api_key))
-                        .map(|(_, meta)| {
-                            ApiVersion::default()
-                                .api_key(meta.api_key)
-                                .min_version(advertised_min_version(
-                                    meta.api_key,
-                                    meta.version.valid.start,
-                                    meta.version.valid.end,
-                                ))
-                                .max_version(meta.version.valid.end)
-                        })
-                        .collect(),
-                ))
-                .throttle_time_ms(Some(0)),
-        )
+        let routed = RootMessageMeta::messages().requests().iter();
+        let routed = routed.filter(|(key, _)| self.supported.contains(key));
+        let advertised = routed.map(|(_, meta)| {
+            let (lowest, highest) = (meta.version.valid.start, meta.version.valid.end);
+            let floored = advertised_min_version(meta.api_key, lowest, highest);
+            let version = ApiVersion::default().api_key(meta.api_key);
+            version.min_version(floored).max_version(highest)
+        });
+
+        let answer = ApiVersionsResponse::default().finalized_features(Some(vec![]));
+        let answer = answer.finalized_features_epoch(Some(-1));
+        let answer = answer
+            .supported_features(Some(vec![]))
+            .zk_migration_ready(Some(false));
+        let answer = answer.error_code(i16::from(ErrorCode::None));
+        let answer = answer.api_keys(Some(advertised.collect()));
+        Ok(answer.throttle_time_ms(Some(0)))
     }
 }
 
@@ -131,8 +126,9 @@ where
     type Error = E;
 
     async fn serve(&self, ctx: Context<State>, req: Body) -> Result<Self::Response, Self::Error> {
-        let req = ApiVersionsRequest::try_from(req)?;
-        self.serve(ctx, req).await.map(Into::into)
+        let request = ApiVersionsRequest::try_from(req)?;
+        let answered = self.serve(ctx, request).await?;
+        Ok(Body::from(answered))
     }
 }
 
@@ -146,50 +142,40 @@ where
 
     async fn serve(&self, ctx: Context<State>, req: Frame) -> Result<Self::Response, Self::Error> {
         let correlation_id = req.correlation_id()?;
-        self.serve(ctx, req.body).await.map(|body| Frame {
+        let answered: Body = self.serve(ctx, req.body).await?;
+        let header = Header::Response { correlation_id };
+        Ok(Frame {
             size: 0,
-            header: Header::Response { correlation_id },
-            body,
+            header,
+            body: answered,
         })
     }
 }
 
-/// Route [`Frame`] to a [`Service`] via [API key][`Frame#method.api_key`]
-///
-/// A simple example that routes [`MetadataRequest`][`tansu_sans_io::MetadataRequest`]
-/// and [`CreateTopicsRequest`][`tansu_sans_io::CreateTopicsRequest`].
-/// [`ApiVersionsRequest`][`tansu_sans_io::ApiVersionsRequest`] is created by the
-///  builder including both of the implemented services using the version ranges
-///  from [`RootMessageMeta`][`tansu_sans_io::RootMessageMeta`].
+/// Hands each [`Frame`] to the service routed for its API key, answering
+/// `ApiVersions` itself for every key it routes.
 ///
 /// ```
-/// # use rama::Layer as _;
-/// # use tansu_sans_io::{CreateTopicsRequest, CreateTopicsResponse, MetadataRequest, MetadataResponse};
-/// # use tansu_service::{Error, FrameRouteService, RequestLayer, ResponseService};
-/// # #[tokio::main]
-/// # async fn main() -> Result<(), Error> {
-/// let router = FrameRouteService::<(), Error>::builder()
-///     .with_service(
-///         RequestLayer::<MetadataRequest>::new().into_layer(ResponseService::new(|_, _| {
-///             Ok(MetadataResponse::default()
-///                 .brokers(Some([].into()))
-///                 .topics(Some([].into()))
-///                 .cluster_id(Some("tansu".into()))
-///                 .controller_id(Some(111))
-///                 .throttle_time_ms(Some(0))
-///                 .cluster_authorized_operations(Some(-1)))
-///         })),
-///     )
-///     .and_then(|builder| {
-///         builder.with_service(RequestLayer::<CreateTopicsRequest>::new().into_layer(
-///             ResponseService::new(|_, _| {
-///                 Ok(CreateTopicsResponse::default()
-///                     .throttle_time_ms(Some(0))
-///                     .topics(Some([].into())))
-///             }),
-///         ))
-///     })
-///     .and_then(|builder| builder.build())?;
+/// use rama::Layer as _;
+/// use tansu_sans_io::{CreateTopicsRequest, CreateTopicsResponse};
+/// use tansu_sans_io::{MetadataRequest, MetadataResponse};
+/// use tansu_service::{Error, FrameRouteService, RequestLayer, ResponseService};
+///
+/// # fn main() -> Result<(), Error> {
+/// let metadata = ResponseService::new(|_, _| {
+///     let answer = MetadataResponse::default().brokers(Some(vec![])).topics(Some(vec![]));
+///     let answer = answer.cluster_id(Some(String::from("tansu"))).controller_id(Some(111));
+///     Ok(answer.throttle_time_ms(Some(0)).cluster_authorized_operations(Some(-1)))
+/// });
+/// let create = ResponseService::new(|_, _| {
+///     let answer = CreateTopicsResponse::default().throttle_time_ms(Some(0));
+///     Ok(answer.topics(Some(vec![])))
+/// });
+///
+/// let routes = FrameRouteService::<(), Error>::builder();
+/// let routes = routes.with_service(RequestLayer::<MetadataRequest>::new().into_layer(metadata))?;
+/// let routes = routes.with_service(RequestLayer::<CreateTopicsRequest>::new().into_layer(create))?;
+/// let _router = routes.build()?;
 /// # Ok(())
 /// # }
 /// ```
@@ -208,7 +194,7 @@ where
     }
 
     pub fn builder() -> FrameRouteBuilder<State, E> {
-        FrameRouteBuilder::<State, E>::new()
+        FrameRouteBuilder::new()
     }
 }
 
@@ -221,12 +207,10 @@ where
     type Error = E;
 
     async fn serve(&self, ctx: Context<State>, req: Frame) -> Result<Self::Response, Self::Error> {
-        let api_key = req.api_key()?;
-
-        if let Some(service) = self.routes.get(&api_key) {
-            service.serve(ctx, req).await
-        } else {
-            Err(E::from(Error::UnknownServiceFrame(Box::new(req))))
+        let key = req.api_key()?;
+        match self.routes.get(&key) {
+            Some(route) => route.serve(ctx, req).await,
+            None => Err(E::from(Error::UnknownServiceFrame(Box::new(req)))),
         }
     }
 }
@@ -243,16 +227,16 @@ where
     E: std::error::Error + From<tansu_sans_io::Error> + Send + Sync + 'static,
 {
     fn new() -> Self {
-        Self {
-            routes: BTreeMap::new(),
-        }
+        let routes = BTreeMap::default();
+        Self { routes }
     }
 
     pub fn with_service<S>(self, service: S) -> Result<Self, Error>
     where
         S: Into<BoxService<State, Frame, Frame, E>> + ApiKey,
     {
-        self.with_route(S::KEY, service.into())
+        let boxed: BoxService<State, Frame, Frame, E> = service.into();
+        self.with_route(S::KEY, boxed)
     }
 
     pub fn with_route(
@@ -260,27 +244,24 @@ where
         api_key: i16,
         service: BoxService<State, Frame, Frame, E>,
     ) -> Result<Self, Error> {
-        self.routes
-            .insert(api_key, service)
-            .map_or(Ok(self), |_existing| Err(Error::DuplicateRoute(api_key)))
+        match self.routes.insert(api_key, service) {
+            None => Ok(self),
+            Some(_displaced) => Err(Error::DuplicateRoute(api_key)),
+        }
     }
 
     pub fn build(self) -> Result<FrameRouteService<State, E>, Error> {
-        let api_key = ApiVersionsRequest::KEY;
-        let mut supported = self.routes.keys().copied().collect::<Vec<_>>();
-        supported.push(api_key);
+        let versions_key = ApiVersionsRequest::KEY;
+        let mut routed: Vec<i16> = self.routes.keys().copied().collect();
+        routed.push(versions_key);
 
-        self.with_route(
-            api_key,
-            ApiVersionsService {
-                supported,
-                error: PhantomData,
-            }
-            .boxed(),
-        )
-        .map(|builder| FrameRouteService {
-            routes: Arc::new(builder.routes),
-        })
+        let versions = ApiVersionsService {
+            error: PhantomData,
+            supported: routed,
+        };
+        let with_versions = self.with_route(versions_key, versions.boxed())?;
+        let routes = Arc::new(with_versions.routes);
+        Ok(FrameRouteService { routes })
     }
 }
 

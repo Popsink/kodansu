@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,51 +12,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rama::{Context, Service};
-use tansu_sans_io::{AddPartitionsToTxnRequest, AddPartitionsToTxnResponse, ApiKey, ErrorCode};
-use tracing::instrument;
+//! `AddPartitionsToTxn`: enlists partitions in a producer's transaction.
 
-use crate::{Error, Result, Storage, TxnAddPartitionsRequest, TxnAddPartitionsResponse};
+use tansu_sans_io::{AddPartitionsToTxnRequest, AddPartitionsToTxnResponse, ErrorCode};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`AddPartitionsToTxnRequest`] returning [`AddPartitionsToTxnResponse`].
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct AddPartitionService;
+use crate::{TxnAddPartitionsRequest, TxnAddPartitionsResponse};
 
-impl ApiKey for AddPartitionService {
-    const KEY: i16 = AddPartitionsToTxnRequest::KEY;
-}
-
-impl<G> Service<G, AddPartitionsToTxnRequest> for AddPartitionService
-where
-    G: Storage,
-{
-    type Response = AddPartitionsToTxnResponse;
-    type Error = Error;
-
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: AddPartitionsToTxnRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        let req = TxnAddPartitionsRequest::try_from(req)?;
-
-        match ctx.state().txn_add_partitions(req).await? {
-            TxnAddPartitionsResponse::VersionZeroToThree(results_by_topic_v_3_and_below) => {
-                Ok(AddPartitionsToTxnResponse::default()
-                    .throttle_time_ms(0)
-                    .error_code(Some(ErrorCode::None.into()))
-                    .results_by_transaction(Some([].into()))
-                    .results_by_topic_v_3_and_below(Some(results_by_topic_v_3_and_below)))
+storage_service! {
+    /// Enlists the partitions through [`Storage::txn_add_partitions`](crate::Storage::txn_add_partitions).
+    ///
+    /// Version 4 reshaped the API: a client up to v3 sends one transaction and
+    /// reads results by topic, a later one may batch several transactions and
+    /// reads results by transaction. The storage answer says which it was, and
+    /// the field for the other shape goes back empty.
+    AddPartitionService: AddPartitionsToTxnRequest => AddPartitionsToTxnResponse,
+    |ctx, req| {
+        let enlisted = ctx
+            .state()
+            .txn_add_partitions(TxnAddPartitionsRequest::try_from(req)?)
+            .await?;
+        let (by_transaction, by_topic) = match enlisted {
+            TxnAddPartitionsResponse::VersionZeroToThree(by_topic) => (Vec::new(), by_topic),
+            TxnAddPartitionsResponse::VersionFourPlus(by_transaction) => {
+                (by_transaction, Vec::new())
             }
-
-            TxnAddPartitionsResponse::VersionFourPlus(results_by_transaction) => {
-                Ok(AddPartitionsToTxnResponse::default()
-                    .throttle_time_ms(0)
-                    .error_code(Some(ErrorCode::None.into()))
-                    .results_by_transaction(Some(results_by_transaction))
-                    .results_by_topic_v_3_and_below(Some([].into())))
-            }
-        }
+        };
+        let response = AddPartitionsToTxnResponse::default()
+            .error_code(Some(i16::from(ErrorCode::None)))
+            .results_by_transaction(Some(by_transaction))
+            .results_by_topic_v_3_and_below(Some(by_topic));
+        Ok(response)
     }
 }

@@ -12,56 +12,44 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rama::{Context, Service};
-use tansu_sans_io::{ApiKey, DeleteGroupsRequest, DeleteGroupsResponse};
-use tracing::instrument;
+use rama::Context;
+use rama::Service;
+use tansu_sans_io::ApiKey;
+use tansu_sans_io::ErrorCode;
+use tansu_sans_io::acl::Operation;
+use tansu_sans_io::acl::Resource;
+use tansu_sans_io::delete_groups_response::DeletableGroupResult;
+use tansu_sans_io::{DeleteGroupsRequest, DeleteGroupsResponse};
 
-use tansu_sans_io::{
-    ErrorCode,
-    acl::{Operation, Resource},
-    delete_groups_response::DeletableGroupResult,
-};
+use crate::Storage;
+use crate::authorized;
+use crate::{Error, Result};
 
-use crate::{Error, Result, Storage, authorized};
-
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`DeleteGroupsRequest`] returning [`DeleteGroupsResponse`].
+/// Deletes each named group the principal may `DELETE`, answering
+/// [`ErrorCode::GroupAuthorizationFailed`] for the others and
+/// [`ErrorCode::GroupIdNotFound`] for a group nothing created.
 /// ```
-/// use rama::{Context, Layer, Service as _, layer::MapStateLayer};
-/// use tansu_sans_io::{DeleteGroupsRequest, ErrorCode};
-/// use tansu_storage::{DeleteGroupsService, Error, StorageContainer};
-/// use url::Url;
+/// use rama::layer::MapStateLayer;
+/// use rama::{Context, Layer as _, Service as _};
+/// use tansu_sans_io::DeleteGroupsRequest;
+/// use tansu_sans_io::ErrorCode;
+/// use tansu_storage::{DeleteGroupsService, StorageContainer};
 ///
-/// # #[tokio::main]
-/// # async fn main() -> Result<(), Error> {
-/// let storage = StorageContainer::builder()
-///     .cluster_id("tansu")
-///     .node_id(111)
-///     .advertised_listener(Url::parse("tcp://localhost:9092")?)
-///     .storage(Url::parse("memory://tansu/")?)
-///     .build()
-///     .await?;
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> Result<(), tansu_storage::Error> {
+/// let listener = url::Url::parse("tcp://localhost:9092")?;
+/// let engine = StorageContainer::builder().cluster_id("tansu").node_id(111);
+/// let engine = engine.advertised_listener(listener);
+/// let engine = engine.storage(url::Url::parse("memory://tansu/")?).build().await?;
+/// let groups = MapStateLayer::new(|_| engine).into_layer(DeleteGroupsService);
 ///
-/// let service = MapStateLayer::new(|_| storage).into_layer(DeleteGroupsService);
-///
-/// let group_id = "abcba";
-///
-/// let response = service
-///     .serve(
-///         Context::default(),
-///         DeleteGroupsRequest::default().groups_names(Some([group_id.into()].into())),
-///     )
-///     .await?;
-///
-/// let results = response.results.unwrap_or_default();
-/// assert_eq!(1, results.len());
-/// assert_eq!(group_id, results[0].group_id.as_str());
-///
-/// // Nothing has created this group, and a delete says so rather than
-/// // reporting success for work it did not do (#445).
-/// assert_eq!(
-///     ErrorCode::GroupIdNotFound,
-///     ErrorCode::try_from(results[0].error_code)?
-/// );
+/// let named = DeleteGroupsRequest::default().groups_names(Some(vec!["abcba".into()]));
+/// let answered = groups.serve(Context::default(), named).await?;
+/// let [only] = &answered.results.unwrap_or_default()[..] else {
+///     panic!("one group asked, one result expected")
+/// };
+/// assert_eq!("abcba", only.group_id);
+/// assert_eq!(ErrorCode::GroupIdNotFound, ErrorCode::try_from(only.error_code)?);
 /// # Ok(())
 /// # }
 /// ```
@@ -79,111 +67,75 @@ where
     type Response = DeleteGroupsResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
+    #[tracing::instrument(skip(state, request))]
     async fn serve(
         &self,
-        ctx: Context<G>,
-        req: DeleteGroupsRequest,
+        state: Context<G>,
+        request: DeleteGroupsRequest,
     ) -> Result<Self::Response, Self::Error> {
         // Per group, so a refusal on one does not fail the rest of the
         // request — and deleting a group is `DELETE` on it, not `READ` like
         // the coordination APIs (#363).
-        let mut deletable = vec![];
-        let mut refused = vec![];
+        let mut permitted = Vec::new();
+        let mut denied = Vec::new();
 
-        for group_id in req.groups_names.unwrap_or_default() {
-            if authorized(&ctx, Resource::Group, &group_id, Operation::Delete).await {
-                deletable.push(group_id);
-            } else {
-                refused.push(
-                    DeletableGroupResult::default()
-                        .group_id(group_id)
-                        .error_code(ErrorCode::GroupAuthorizationFailed.into()),
-                );
+        for name in request.groups_names.unwrap_or_default() {
+            if authorized(&state, Resource::Group, &name, Operation::Delete).await {
+                permitted.push(name);
+                continue;
             }
+            let code = i16::from(ErrorCode::GroupAuthorizationFailed);
+            denied.push(
+                DeletableGroupResult::default()
+                    .group_id(name)
+                    .error_code(code),
+            );
         }
 
-        let mut results = ctx.state().delete_groups(Some(&deletable[..])).await?;
-        results.append(&mut refused);
+        let deleting = state.state().delete_groups(Some(permitted.as_slice()));
+        let mut outcomes = deleting.await?;
+        outcomes.extend(denied);
 
-        Ok(DeleteGroupsResponse::default()
-            .throttle_time_ms(0)
-            .results(Some(results)))
+        let unthrottled = DeleteGroupsResponse::default().throttle_time_ms(0);
+        Ok(unthrottled.results(Some(outcomes)))
     }
 }
 
-#[cfg(all(test, feature = "dynostore"))]
+#[cfg(all(feature = "dynostore", test))]
 mod tests {
-    use rama::{Context, Layer as _, Service, layer::MapStateLayer};
-    use tansu_sans_io::{DeleteGroupsRequest, ErrorCode};
-    use tracing::subscriber::DefaultGuard;
-    use tracing_subscriber::EnvFilter;
-    use url::Url;
+    use rama::Context;
+    use rama::Layer as _;
+    use rama::Service as _;
+    use rama::layer::MapStateLayer;
+    use tansu_sans_io::DeleteGroupsRequest;
+    use tansu_sans_io::ErrorCode;
 
-    use crate::{DeleteGroupsService, Error, StorageContainer};
-
-    fn init_tracing() -> Result<DefaultGuard, Error> {
-        use std::{fs::File, sync::Arc, thread};
-
-        Ok(tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_level(true)
-                .with_line_number(true)
-                .with_thread_names(false)
-                .with_env_filter(EnvFilter::from_default_env().add_directive(
-                    format!("{}=debug", env!("CARGO_PKG_NAME").replace("-", "_")).parse()?,
-                ))
-                .with_writer(
-                    thread::current()
-                        .name()
-                        .ok_or(Error::Message(String::from("unnamed thread")))
-                        .and_then(|name| {
-                            File::create(format!("../logs/{}/{name}.log", env!("CARGO_PKG_NAME"),))
-                                .map_err(Into::into)
-                        })
-                        .map(Arc::new)?,
-                )
-                .finish(),
-        ))
-    }
+    use crate::DeleteGroupsService;
+    use crate::{Error, StorageContainer};
 
     #[tokio::test]
-    async fn delete_non_existent() -> Result<(), Error> {
-        let _guard = init_tracing()?;
+    async fn a_group_nothing_created_is_not_found() -> Result<(), Error> {
+        let listener = url::Url::parse("tcp://localhost:9092")?;
+        let engine = StorageContainer::builder().cluster_id("tansu").node_id(111);
+        let engine = engine.advertised_listener(listener);
+        let memory = url::Url::parse("memory://tansu/")?;
+        let engine = engine.storage(memory).build().await?;
+        let groups = MapStateLayer::new(|_| engine).into_layer(DeleteGroupsService);
 
-        let storage = StorageContainer::builder()
-            .cluster_id("tansu")
-            .node_id(111)
-            .advertised_listener(Url::parse("tcp://localhost:9092")?)
-            .storage(Url::parse("memory://tansu/")?)
-            .build()
-            .await?;
+        let named = DeleteGroupsRequest::default().groups_names(Some(vec!["abcba".into()]));
+        let answered = groups.serve(Context::default(), named).await?;
+        let results = answered.results.unwrap_or_default();
+        let [only] = &results[..] else {
+            panic!("one group asked, {} results", results.len())
+        };
+        assert_eq!("abcba", only.group_id);
 
-        let service = MapStateLayer::new(|_| storage).into_layer(DeleteGroupsService);
-
-        let group_id = "abcba";
-
-        let response = service
-            .serve(
-                Context::default(),
-                DeleteGroupsRequest::default().groups_names(Some([group_id.into()].into())),
-            )
-            .await?;
-
-        let results = response.results.unwrap_or_default();
-        assert_eq!(1, results.len());
-        assert_eq!(group_id, results[0].group_id.as_str());
-
-        // This test's own name is the assertion: deleting a group that does not
-        // exist reports that it does not exist. It answered `NONE` until #445,
-        // because existence was inferred from a delete — and a delete of an
-        // absent key succeeds. Tooling that distinguishes "idle group" from
-        // "nonexistent group" had nothing to read.
-        assert_eq!(
-            ErrorCode::GroupIdNotFound,
-            ErrorCode::try_from(results[0].error_code)?
-        );
-
+        // Deleting a group that does not exist reports that it does not exist.
+        // It answered `NONE` until #445, because existence was inferred from a
+        // delete — and a delete of an absent key succeeds. Tooling that
+        // distinguishes "idle group" from "nonexistent group" had nothing to read.
+        let code = ErrorCode::try_from(only.error_code)?;
+        assert_eq!(ErrorCode::GroupIdNotFound, code);
         Ok(())
     }
 }

@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Result, TracingFormat};
 use opentelemetry_sdk::trace::SdkTracerProvider;
-use tracing_subscriber::{
-    EnvFilter, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt,
-};
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt as _;
+
+use crate::{Result, TracingFormat};
 
 #[derive(Debug)]
 pub(super) struct Guard {
@@ -25,36 +27,23 @@ pub(super) struct Guard {
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        if let Some(tracer) = self.tracer.as_ref()
-            && let Err(err) = tracer.shutdown()
-        {
-            eprintln!("{err:?}")
+        let shutdown = self.tracer.as_ref().map(SdkTracerProvider::shutdown);
+        if let Some(Err(failure)) = shutdown {
+            eprintln!("{failure:?}");
         }
     }
 }
 
 pub(super) fn init_tracing_subscriber(tracing_format: TracingFormat) -> Result<Guard> {
-    // let provider = init_tracer_provider()?;
-
-    // let tracer = provider.tracer(format!("{}-otel-subscriber", env!("CARGO_PKG_NAME")));
-
+    let filtered = tracing_subscriber::registry().with(EnvFilter::from_default_env());
     match tracing_format {
-        TracingFormat::Text => tracing_subscriber::registry()
-            .with(EnvFilter::from_default_env())
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .with_level(true)
-                    .with_line_number(true)
-                    .with_thread_ids(false)
-                    .with_span_events(FmtSpan::FULL),
-            )
-            // .with(OpenTelemetryLayer::new(tracer))
-            .init(),
-
-        TracingFormat::Json => tracing_subscriber::registry()
-            .with(EnvFilter::from_default_env())
+        TracingFormat::Text => {
+            let lines = tracing_subscriber::fmt::layer().with_level(true);
+            let lines = lines.with_line_number(true).with_thread_ids(false);
+            filtered.with(lines.with_span_events(FmtSpan::FULL)).init();
+        }
+        TracingFormat::Json => filtered
             .with(tracing_subscriber::fmt::layer().json())
-            // .with(OpenTelemetryLayer::new(tracer))
             .init(),
     }
 

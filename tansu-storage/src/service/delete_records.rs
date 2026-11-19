@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,41 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rama::{Context, Service};
-use tansu_sans_io::{ApiKey, DeleteRecordsRequest, DeleteRecordsResponse};
-use tracing::instrument;
+//! `DeleteRecords`: moves each partition's log start offset forward.
 
-use crate::{Error, Result, Storage};
+use tansu_sans_io::{DeleteRecordsRequest, DeleteRecordsResponse};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`DeleteRecordsRequest`] returning [`DeleteRecordsResponse`].
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct DeleteRecordsService;
-
-impl ApiKey for DeleteRecordsService {
-    const KEY: i16 = DeleteRecordsRequest::KEY;
-}
-
-impl<G> Service<G, DeleteRecordsRequest> for DeleteRecordsService
-where
-    G: Storage,
-{
-    type Response = DeleteRecordsResponse;
-    type Error = Error;
-
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: DeleteRecordsRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        ctx.state()
-            .delete_records(req.topics.as_deref().unwrap_or_default())
-            .await
-            .map(Some)
-            .map(|topics| {
-                DeleteRecordsResponse::default()
-                    .throttle_time_ms(0)
-                    .topics(topics)
-            })
+storage_service! {
+    /// Hands the requested topics to [`Storage::delete_records`](crate::Storage::delete_records)
+    /// and returns its per-partition results as they are.
+    DeleteRecordsService: DeleteRecordsRequest => DeleteRecordsResponse,
+    |ctx, req| {
+        let requested = req.topics.unwrap_or_default();
+        let deleted = ctx.state().delete_records(&requested).await?;
+        Ok(DeleteRecordsResponse::default().topics(Some(deleted)))
     }
 }

@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,63 +12,68 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{env, fmt, io, sync::Arc};
+//! What the storage tests share: their error type, the store they run
+//! against and a fresh cluster for each, the topics they create, and a log
+//! file per test.
 
-use dotenv::dotenv;
-use tracing::subscriber::DefaultGuard;
-use tracing_subscriber::{EnvFilter, filter::ParseError};
+use std::sync::Arc;
+
+use tansu_sans_io::Error as ProtocolError;
+use tansu_storage::Error as StorageError;
+use tracing_subscriber::filter::ParseError as FilterError;
+use url::ParseError as UrlError;
 use url::Url;
 use uuid::Uuid;
 
-#[derive(Clone, Debug, thiserror::Error)]
-pub(crate) enum Error {
-    #[allow(dead_code)]
-    Io(Arc<io::Error>),
+/// What the tests name it: every storage test returns `Result<_, Error>`.
+pub(crate) type Error = Failure;
 
-    #[allow(dead_code)]
-    Message(String),
+/// Everything a storage test can fail with. Only the conversions matter: the
+/// payloads are there for the `Debug` a failing test prints.
+#[derive(thiserror::Error, Clone, Debug)]
+#[allow(dead_code, reason = "the payloads are only read through `Debug`")]
+pub(crate) enum Failure {
+    Io(Arc<std::io::Error>),
+
+    /// A test's own failure, described.
+    Failed(String),
 
     /// Raised only by the conditional-put conformance target (#357), which is the
     /// one test that talks to the object store directly rather than through the
     /// engine — the error *class* a losing conditional writer gets is the thing
-    /// under test there, so it cannot be flattened into [`Error::Storage`].
+    /// under test there, so it cannot be flattened into [`Failure::Storage`].
     #[cfg(feature = "dynostore")]
-    #[allow(dead_code)]
     ObjectStore(Arc<object_store::Error>),
 
-    #[allow(dead_code)]
-    ParseFilter(Arc<ParseError>),
-
-    Parse(#[from] url::ParseError),
-
-    Protocol(#[from] tansu_sans_io::Error),
-    Storage(#[from] tansu_storage::Error),
+    ParseFilter(Arc<FilterError>),
+    Parse(#[from] UrlError),
+    Protocol(#[from] ProtocolError),
+    Storage(#[from] StorageError),
 }
 
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+impl std::fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{self:?}")
     }
 }
 
-impl From<io::Error> for Error {
-    fn from(value: io::Error) -> Self {
-        Self::Io(Arc::new(value))
-    }
+/// `From` for the sources a [`Failure`] holds behind an `Arc`, to stay `Clone`.
+macro_rules! shared {
+    ($($(#[$gate:meta])* $variant:ident <- $source:ty),* $(,)?) => {
+        $($(#[$gate])* impl From<$source> for Failure {
+            fn from(source: $source) -> Self {
+                Self::$variant(Arc::new(source))
+            }
+        })*
+    };
 }
 
-impl From<ParseError> for Error {
-    fn from(value: ParseError) -> Self {
-        Self::ParseFilter(Arc::new(value))
-    }
-}
-
-#[cfg(feature = "dynostore")]
-impl From<object_store::Error> for Error {
-    fn from(value: object_store::Error) -> Self {
-        Self::ObjectStore(Arc::new(value))
-    }
-}
+shared!(
+    Io <- std::io::Error,
+    ParseFilter <- FilterError,
+    #[cfg(feature = "dynostore")]
+    ObjectStore <- object_store::Error,
+);
 
 /// Names the object store the whole `tansu-storage` suite builds against (#357).
 ///
@@ -97,10 +102,11 @@ pub(crate) fn storage_url() -> Result<Url, Error> {
 /// drop the per-test keys the URL is also how tests set.
 #[allow(dead_code)]
 pub(crate) fn storage_url_with_query(query: &str) -> Result<Url, Error> {
-    _ = dotenv().ok();
+    _ = dotenv::dotenv();
 
-    let mut url =
-        Url::parse(&env::var(STORAGE_URL).unwrap_or_else(|_| String::from(DEFAULT_STORAGE_URL)))?;
+    let mut url = Url::parse(
+        &std::env::var(STORAGE_URL).unwrap_or_else(|_| String::from(DEFAULT_STORAGE_URL)),
+    )?;
 
     if !query.is_empty() {
         let merged = match url.query() {
@@ -130,34 +136,101 @@ pub(crate) fn cluster_id() -> String {
     Uuid::now_v7().to_string()
 }
 
-pub(crate) fn init_tracing() -> Result<DefaultGuard, Error> {
-    use std::{fs::File, sync::Arc, thread};
+/// The node id [`storage`] runs as.
+#[allow(dead_code)]
+pub(crate) const NODE_ID: i32 = 111;
 
-    _ = dotenv().ok();
+/// The host [`storage`] advertises.
+#[allow(dead_code)]
+pub(crate) const HOST: &str = "localhost";
 
-    Ok(tracing::subscriber::set_default(
-        tracing_subscriber::fmt()
-            .with_level(true)
-            .with_line_number(true)
-            .with_thread_names(false)
-            .with_env_filter(
-                EnvFilter::from_default_env()
-                    .add_directive(format!("{}=debug", env!("CARGO_CRATE_NAME")).parse()?),
-            )
-            .with_writer(
-                thread::current()
-                    .name()
-                    .ok_or(Error::Message(String::from("unnamed thread")))
-                    .and_then(|name| {
-                        File::create(format!(
-                            "../logs/{}/{}::{name}.log",
-                            env!("CARGO_PKG_NAME"),
-                            env!("CARGO_CRATE_NAME")
-                        ))
-                        .map_err(Into::into)
-                    })
-                    .map(Arc::new)?,
-            )
-            .finish(),
-    ))
+/// The port [`storage`] advertises.
+#[allow(dead_code)]
+pub(crate) const PORT: i32 = 9092;
+
+/// A storage engine over [`storage_url`], under a fresh [`cluster_id`], for
+/// [`NODE_ID`] advertising [`HOST`] and [`PORT`]: the setup a test needs when
+/// nothing about the broker itself is under test.
+#[allow(dead_code)]
+pub(crate) async fn storage() -> Result<Arc<dyn tansu_storage::Storage>, Error> {
+    storage_with_query("").await
+}
+
+/// [`storage`], over [`storage_url_with_query`] with `query`: for a test that
+/// sets an engine option through the URL.
+#[allow(dead_code)]
+pub(crate) async fn storage_with_query(
+    query: &str,
+) -> Result<Arc<dyn tansu_storage::Storage>, Error> {
+    let advertised = Url::parse(&format!("tcp://{HOST}:{PORT}"))?;
+    let engine = tansu_storage::StorageContainer::builder()
+        .cluster_id(cluster_id())
+        .node_id(NODE_ID)
+        .advertised_listener(advertised)
+        .storage(storage_url_with_query(query)?);
+    Ok(engine.build().await?)
+}
+
+/// Sends `request` to `service` with `storage` as its state, the way the broker
+/// routes a decoded frame.
+#[allow(dead_code)]
+pub(crate) async fn serve<S, Request>(
+    storage: &Arc<dyn tansu_storage::Storage>,
+    service: S,
+    request: Request,
+) -> Result<S::Response, Error>
+where
+    S: rama::Service<Arc<dyn tansu_storage::Storage>, Request>,
+    Error: From<S::Error>,
+{
+    let state = rama::Context::with_state(Arc::clone(storage));
+    Ok(service.serve(state, request).await?)
+}
+
+/// Creates `name` with one partition, one replica and the broker defaults.
+#[allow(dead_code)]
+pub(crate) async fn topic(
+    storage: &Arc<dyn tansu_storage::Storage>,
+    name: &str,
+) -> Result<(), Error> {
+    _ = topic_partitioned(storage, name, 1).await?;
+    Ok(())
+}
+
+/// Creates `name` with `partitions` partitions, one replica and the broker
+/// defaults, answering the id the store gave it.
+#[allow(dead_code)]
+pub(crate) async fn topic_partitioned(
+    storage: &Arc<dyn tansu_storage::Storage>,
+    name: &str,
+    partitions: i32,
+) -> Result<Uuid, Error> {
+    let creatable = tansu_sans_io::create_topics_request::CreatableTopic::default()
+        .name(name.to_owned())
+        .num_partitions(partitions)
+        .replication_factor(1)
+        .assignments(Some(Vec::new()))
+        .configs(Some(Vec::new()));
+    Ok(storage.create_topic(creatable, false).await?)
+}
+
+/// Loads `.env`, then logs this test at `debug` for this binary, on top of
+/// `RUST_LOG`, into `../logs/<package>/<crate>::<thread>.log`.
+pub(crate) fn init_tracing() -> Result<tracing::subscriber::DefaultGuard, Error> {
+    _ = dotenv::dotenv();
+    let directive = format!("{}=debug", env!("CARGO_CRATE_NAME")).parse()?;
+    let filter = tracing_subscriber::EnvFilter::from_default_env().add_directive(directive);
+
+    let unnamed = || Error::Failed(String::from("unnamed thread"));
+    let current = std::thread::current();
+    let test = current.name().ok_or_else(unnamed)?;
+    let (package, binary) = (env!("CARGO_PKG_NAME"), env!("CARGO_CRATE_NAME"));
+    let log = std::fs::File::create(format!("../logs/{package}/{binary}::{test}.log"))?;
+
+    let subscriber = tracing_subscriber::fmt().with_level(true);
+    let subscriber = subscriber.with_line_number(true).with_thread_names(false);
+    let subscriber = subscriber
+        .with_env_filter(filter)
+        .with_writer(Arc::new(log));
+    Ok(tracing::subscriber::set_default(subscriber.finish()))
 }

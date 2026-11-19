@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,146 +12,117 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{Error, cluster_id, init_tracing, storage_url};
-use rama::{Context, Layer as _, Service, layer::MapStateLayer};
+//! `IncrementalAlterConfigs`: a topic config that was never set is absent, and
+//! once set reads back through `DescribeConfigs`.
+
+use std::sync::Arc;
+
+use tansu_sans_io::describe_configs_request::DescribeConfigsResource;
+use tansu_sans_io::describe_configs_response::DescribeConfigsResult;
+use tansu_sans_io::incremental_alter_configs_request::{AlterConfigsResource, AlterableConfig};
 use tansu_sans_io::{
-    ConfigResource, CreateTopicsRequest, DescribeConfigsRequest, ErrorCode,
-    IncrementalAlterConfigsRequest, OpType,
-    create_topics_request::CreatableTopic,
-    describe_configs_request::DescribeConfigsResource,
-    incremental_alter_configs_request::{AlterConfigsResource, AlterableConfig},
+    ConfigResource, DescribeConfigsRequest, IncrementalAlterConfigsRequest, OpType,
 };
-use tansu_storage::{
-    CreateTopicsService, DescribeConfigsService, IncrementalAlterConfigsService, StorageContainer,
-};
-use url::Url;
+use tansu_storage::{DescribeConfigsService, IncrementalAlterConfigsService, Storage};
+
+use crate::common::{Error, init_tracing, serve, storage, topic_partitioned};
 
 mod common;
 
+const TOPIC: &str = "abcba";
+const KEY: &str = "x.y.z";
+
+/// `TOPIC` named as a config resource, the same way in every request.
+fn topic_resource() -> (String, i8) {
+    (TOPIC.to_owned(), ConfigResource::Topic.into())
+}
+
+/// What `DescribeConfigs` answers for `KEY` on `TOPIC`.
+async fn described(storage: &Arc<dyn Storage>) -> Result<DescribeConfigsResult, Error> {
+    let (name, kind) = topic_resource();
+    let resource = DescribeConfigsResource::default()
+        .resource_name(name)
+        .resource_type(kind)
+        .configuration_keys(Some(vec![KEY.to_owned()]));
+    let request = DescribeConfigsRequest::default().resources(Some(vec![resource]));
+    let response = serve(storage, DescribeConfigsService, request).await?;
+    let [result] = <[_; 1]>::try_from(response.results.unwrap_or_default()).expect("one result");
+    Ok(result)
+}
+
+/// Applies `operation` to `KEY` on `TOPIC`, with `value` for a `Set`.
+async fn alter(
+    storage: &Arc<dyn Storage>,
+    operation: OpType,
+    value: Option<&str>,
+) -> Result<(), Error> {
+    let change = AlterableConfig::default()
+        .config_operation(operation.into())
+        .name(KEY.to_owned())
+        .value(value.map(str::to_owned));
+    let (name, kind) = topic_resource();
+    let resource = AlterConfigsResource::default()
+        .resource_name(name)
+        .resource_type(kind)
+        .configs(Some(vec![change]));
+    let request = IncrementalAlterConfigsRequest::default().resources(Some(vec![resource]));
+    _ = serve(storage, IncrementalAlterConfigsService, request).await?;
+    Ok(())
+}
+
+/// The value `KEY` reads back as, if it is there at all.
+fn value_of(result: &DescribeConfigsResult) -> Option<Option<&str>> {
+    let configs = result.configs.as_deref().unwrap_or_default();
+    let config = configs.iter().find(|config| config.name == KEY)?;
+    Some(config.value.as_deref())
+}
+
 #[tokio::test]
-async fn req() -> Result<(), Error> {
+async fn a_set_config_reads_back_its_value() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    const HOST: &str = "localhost";
-    const PORT: i32 = 9092;
-    const NODE_ID: i32 = 111;
-
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
-
-    let resource_name = "abcba";
-
-    let create_topic = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
-    };
-
-    let response = create_topic
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default().topics(Some(
-                [CreatableTopic::default()
-                    .name(resource_name.into())
-                    .num_partitions(3)
-                    .replication_factor(1)]
-                .into(),
-            )),
-        )
-        .await?;
-
-    assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(response.topics.unwrap_or_default()[0].error_code)?
-    );
-
-    let config_name = "x.y.z";
-    let config_value = "pqr";
-
-    let describe_configs = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(DescribeConfigsService)
-    };
-
-    let response = describe_configs
-        .serve(
-            Context::default(),
-            DescribeConfigsRequest::default()
-                .include_documentation(Some(false))
-                .include_synonyms(Some(false))
-                .resources(Some(
-                    [DescribeConfigsResource::default()
-                        .resource_name(resource_name.into())
-                        .resource_type(ConfigResource::Topic.into())
-                        .configuration_keys(Some([config_name.into()].into()))]
-                    .into(),
-                )),
-        )
-        .await?;
+    let storage = storage().await?;
+    _ = topic_partitioned(&storage, TOPIC, 3).await?;
 
     // The topic carries the injected broker defaults (cleanup.policy/retention.ms),
     // but the not-yet-altered key must be absent.
-    let results = response.results.unwrap_or_default();
-    let configs = results[0].configs.as_deref().unwrap_or_default();
-    assert!(
-        !configs.iter().any(|config| config.name == config_name),
-        "unset config `{config_name}` must be absent before it is altered"
+    let before = described(&storage).await?;
+    assert_eq!(
+        None,
+        value_of(&before),
+        "unset config `{KEY}` must be absent before it is altered"
     );
 
-    let alter_configs = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(IncrementalAlterConfigsService)
-    };
+    alter(&storage, OpType::Set, Some("pqr")).await?;
 
-    let _response = alter_configs
-        .serve(
-            Context::default(),
-            IncrementalAlterConfigsRequest::default().resources(Some(
-                [AlterConfigsResource::default()
-                    .resource_name(resource_name.into())
-                    .resource_type(ConfigResource::Topic.into())
-                    .configs(Some(
-                        [AlterableConfig::default()
-                            .config_operation(OpType::Set.into())
-                            .name(config_name.into())
-                            .value(Some(config_value.into()))]
-                        .into(),
-                    ))]
-                .into(),
-            )),
-        )
-        .await?;
-
-    let response = describe_configs
-        .serve(
-            Context::default(),
-            DescribeConfigsRequest::default()
-                .include_documentation(Some(false))
-                .include_synonyms(Some(false))
-                .resources(Some(
-                    [DescribeConfigsResource::default()
-                        .resource_name(resource_name.into())
-                        .resource_type(ConfigResource::Topic.into())
-                        .configuration_keys(Some([config_name.into()].into()))]
-                    .into(),
-                )),
-        )
-        .await?;
-
-    let results = response.results.as_deref().unwrap_or(&[]);
-    assert_eq!(1, results.len());
-    assert_eq!(resource_name, results[0].resource_name.as_str());
-
-    let configs = results[0].configs.as_deref().unwrap_or(&[]);
-    let altered = configs.iter().find(|config| config.name == config_name);
+    let after = described(&storage).await?;
+    assert_eq!(TOPIC, after.resource_name);
     assert_eq!(
-        Some(config_value),
-        altered.and_then(|config| config.value.as_deref()),
-        "altered config `{config_name}` must read back its new value"
+        Some(Some("pqr")),
+        value_of(&after),
+        "altered config `{KEY}` must read back its new value"
+    );
+
+    Ok(())
+}
+
+/// A deleted config is absent again: `x.y.z` has no broker default to fall back
+/// to.
+#[tokio::test]
+async fn a_deleted_config_is_absent_again() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = storage().await?;
+    _ = topic_partitioned(&storage, TOPIC, 3).await?;
+
+    alter(&storage, OpType::Set, Some("pqr")).await?;
+    alter(&storage, OpType::Delete, None).await?;
+
+    let after = described(&storage).await?;
+    assert_eq!(
+        None,
+        value_of(&after),
+        "deleted config `{KEY}` must be absent"
     );
 
     Ok(())

@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,102 +12,72 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{Error, cluster_id, init_tracing, storage_url};
-use rama::{Context, Layer as _, Service, layer::MapStateLayer};
-use tansu_sans_io::{
-    MetadataRequest, RequestApiVersion, create_topics_request::CreatableTopic,
-    metadata_request::MetadataRequestTopic,
-};
-use tansu_storage::{MetadataService, Storage as _, StorageContainer};
-use url::Url;
+//! `Metadata`: the broker list, and which topics a request's list asks for at
+//! each version.
+
+use std::sync::Arc;
+
+use rama::Service as _;
+use tansu_sans_io::metadata_request::MetadataRequestTopic;
+use tansu_sans_io::{MetadataRequest, MetadataResponse, RequestApiVersion};
+use tansu_storage::{MetadataService, Storage};
+
+use crate::common::{Error, HOST, NODE_ID, PORT, init_tracing, serve, storage, topic_partitioned};
 
 mod common;
 
-#[tokio::test]
-async fn req() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    const HOST: &str = "localhost";
-    const PORT: i32 = 9092;
-    const NODE_ID: i32 = 111;
-
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
-
-    let service = MapStateLayer::new(|_| storage).into_layer(MetadataService);
-
-    let response = service
-        .serve(
-            Context::default(),
-            MetadataRequest::default()
-                .allow_auto_topic_creation(Some(false))
-                .include_cluster_authorized_operations(Some(false))
-                .include_topic_authorized_operations(Some(false))
-                .topics(Some([].into())),
-        )
-        .await?;
-
-    let brokers = response.brokers.as_deref().unwrap_or_default();
-    assert_eq!(1, brokers.len());
-    assert_eq!(HOST, brokers[0].host);
-    assert_eq!(PORT, brokers[0].port);
-    assert_eq!(NODE_ID, brokers[0].node_id);
-    assert!(brokers[0].rack.is_none());
-
-    Ok(())
+/// Serves `request` as a frame decoded at `version` would be — or with no
+/// version at all, as an in-process client asks.
+async fn metadata_at(
+    storage: Arc<dyn Storage>,
+    version: Option<i16>,
+    request: MetadataRequest,
+) -> Result<MetadataResponse, Error> {
+    let mut ctx = rama::Context::with_state(storage);
+    if let Some(version) = version {
+        _ = ctx.insert(RequestApiVersion(version));
+    }
+    Ok(MetadataService.serve(ctx, request).await?)
 }
 
-/// The names in a `Metadata` answer to `topics`, asked at `version` — or with
-/// no version at all, as an in-process client asks.
+/// The names in a `Metadata` answer to `topics`, asked at `version`, on a store
+/// holding the one topic `orders`.
 async fn topics_answered(
     version: Option<i16>,
     topics: Option<Vec<MetadataRequestTopic>>,
 ) -> Result<(usize, Vec<Option<String>>), Error> {
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(111)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
+    let storage = storage().await?;
+    _ = topic_partitioned(&storage, "orders", 3).await?;
 
-    _ = storage
-        .create_topic(
-            CreatableTopic::default()
-                .name("orders".into())
-                .num_partitions(3)
-                .replication_factor(1)
-                .assignments(Some([].into()))
-                .configs(Some([].into())),
-            false,
+    let request = MetadataRequest::default().topics(topics);
+    let MetadataResponse {
+        brokers, topics, ..
+    } = metadata_at(storage, version, request).await?;
+
+    let names = topics.unwrap_or_default().into_iter().map(|t| t.name);
+    Ok((brokers.map_or(0, |b| b.len()), names.collect()))
+}
+
+/// The one broker is this node, with no rack.
+#[tokio::test]
+async fn the_only_broker_is_this_node() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let request = MetadataRequest::default().topics(Some(Vec::new()));
+    let response = serve(&storage().await?, MetadataService, request).await?;
+
+    let [broker] = <[_; 1]>::try_from(response.brokers.unwrap_or_default()).expect("one broker");
+    assert_eq!(
+        (NODE_ID, HOST, PORT, None),
+        (
+            broker.node_id,
+            broker.host.as_str(),
+            broker.port,
+            broker.rack
         )
-        .await?;
+    );
 
-    let mut ctx = Context::default();
-
-    if let Some(version) = version {
-        _ = ctx.insert(RequestApiVersion(version));
-    }
-
-    let response = MapStateLayer::new(|_| storage)
-        .into_layer(MetadataService)
-        .serve(ctx, MetadataRequest::default().topics(topics))
-        .await?;
-
-    Ok((
-        response.brokers.unwrap_or_default().len(),
-        response
-            .topics
-            .unwrap_or_default()
-            .into_iter()
-            .map(|topic| topic.name)
-            .collect(),
-    ))
+    Ok(())
 }
 
 /// From v1 an empty list asks for the brokers alone (#593). A client sends it at
@@ -168,47 +138,26 @@ async fn an_empty_list_at_v0_asks_for_every_topic() -> Result<(), Error> {
 async fn a_topic_asked_for_by_id_is_answered_with_its_name() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(111)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
+    let storage = storage().await?;
+    let id = topic_partitioned(&storage, "orders", 3).await?.into_bytes();
 
-    let topic_id = storage
-        .create_topic(
-            CreatableTopic::default()
-                .name("orders".into())
-                .num_partitions(3)
-                .replication_factor(1)
-                .assignments(Some([].into()))
-                .configs(Some([].into())),
-            false,
+    let by_id = MetadataRequestTopic::default()
+        .topic_id(Some(id))
+        .name(Some(String::new()));
+    let request = MetadataRequest::default().topics(Some(vec![by_id]));
+    let response = metadata_at(storage, Some(12), request).await?;
+
+    let [topic] = <[_; 1]>::try_from(response.topics.unwrap_or_default()).expect("one topic");
+    let partitions = topic.partitions.map_or(0, |p| p.len());
+    assert_eq!(
+        (0, Some("orders"), Some(id), 3),
+        (
+            topic.error_code,
+            topic.name.as_deref(),
+            topic.topic_id,
+            partitions
         )
-        .await?;
-
-    let mut ctx = Context::default();
-    _ = ctx.insert(RequestApiVersion(12));
-
-    let response = MapStateLayer::new(|_| storage)
-        .into_layer(MetadataService)
-        .serve(
-            ctx,
-            MetadataRequest::default().topics(Some(vec![
-                MetadataRequestTopic::default()
-                    .topic_id(Some(topic_id.into_bytes()))
-                    .name(Some(String::new())),
-            ])),
-        )
-        .await?;
-
-    let topics = response.topics.unwrap_or_default();
-    assert_eq!(1, topics.len());
-    assert_eq!(0, topics[0].error_code);
-    assert_eq!(Some("orders".to_owned()), topics[0].name);
-    assert_eq!(Some(topic_id.into_bytes()), topics[0].topic_id);
-    assert_eq!(3, topics[0].partitions.as_ref().map_or(0, Vec::len));
+    );
 
     Ok(())
 }

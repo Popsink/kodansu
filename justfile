@@ -18,6 +18,15 @@ copyright:
 copyright-fix:
     python3 .github/scripts/check-copyright.py --fix
 
+# Lines git blame still attributes to upstream tansu, per inherited file and per
+# crate (Popsink/data-plane#5878). Needs full history. See docs/copyright.md.
+defork-report:
+    python3 .github/scripts/defork-report.py
+
+# Fail if a file outside copyright.toml `inherited` holds an upstream line.
+defork-check:
+    python3 .github/scripts/defork-report.py --check
+
 build profile="dev" features="dynostore" bin="tansu": (cargo-build "--profile" profile "--timings" "--bin" bin "--no-default-features" "--features" features)
 
 build-storage: clean-workspace (build "dev" "dynostore")
@@ -525,6 +534,542 @@ fmt:
 # rejoins with the consumer protocol, and a consumer group serves classic
 # members. Every `//` block added cites #626; the reasoning is in `///` on the
 # new `migration` module, and most of the lines are it and its tests.
+#   defork  -88 lines, storage_service!  3176 -> 3176  2.6795 -> 2.6809
+#
+# Five storage services lose the struct-and-impl scaffolding every service
+# repeats to a `storage_service!` macro (Popsink/data-plane#5878). No `//` line
+# was added or removed; code shrank, so the ratio rose.
+#   defork  -240 lines, five more on storage_service!  3176 -> 3176  2.6809 -> 2.6829
+#
+# Four describe services and ListPartitionReassignments move to the macro and
+# lose doc examples that repeated their `tests/` file line for line. Again no
+# `//` line moved; only code went.
+#   defork  -190 lines, three more on storage_service!  3176 -> 3176  2.6829 -> 2.6843
+#
+# FindCoordinator, InitProducerId and ListGroups move to the macro and drop
+# doc examples their `tests/` files already hold. ListGroups keeps its two
+# cited `//` blocks; none was added or removed.
+#   defork  -34 lines, the ACL services on storage_service!  3176 -> 3176  2.6843 -> 2.6850
+#
+# CreateAcls and DescribeAcls swap their scaffolding for the macro. Their
+# cited `//` blocks (#363, #578) stay as they were.
+#   defork  -125 lines, shared test setup  3176 -> 3176  2.6850 -> 2.6881
+#
+# `tansu-storage/tests/common` gains `storage`, `serve` and `topic`, and four
+# tests drop the container builder and the `MapStateLayer` wrapping they each
+# spelled out. Their cited `//` blocks stay; none was added or removed.
+#   defork  -121 lines, six tests merged into fresh_store  3178 -> 3178  2.6880 -> 2.6909
+#
+# Six one-test files become one, `tests/fresh_store.rs`, and drop the container
+# builder and the `MapStateLayer` wrapping for `storage` and `serve`; `common`
+# names the node id, host and port they assert against. Their `//` blocks move
+# unchanged.
+#   defork  -83 lines, Metadata and telemetry tests on the shared setup  3178 -> 3178  2.6908 -> 2.6927
+#
+# `tests/metadata.rs` and `tests/get_telemetry_subscriptions.rs` drop their
+# container builders for `storage`, `serve` and a new `topic_partitioned`.
+# Their cited `//` lines stay as they were.
+#   defork  -128 lines, the Fetch tests on the shared setup  3178 -> 3178  2.6926 -> 2.6957
+#
+# `tests/fetch.rs` drops two container builders for `storage`, `serve` and
+# `topic`, and the module left from a doc example whose two assertions
+# `produce.rs` and `a_fetch_at_zero_on_an_empty_log_is_in_range` already make.
+# The `//` block in `fetch_at` moves unchanged.
+#   defork  -39 lines, IncrementalAlterConfigs tests on the shared setup  3178 -> 3178  2.6956 -> 2.6966
+#
+# `tests/incremental_alter_configs.rs` drops its container builder and three
+# `MapStateLayer` wrappings for `storage`, `serve` and `topic_partitioned`, and
+# gains a `Delete` test on the same helpers. Its one `//` block stays.
+#   defork  -76 lines, the topic lifecycle test on the shared setup  3178 -> 3172  2.6965 -> 2.6933
+#
+# `tests/topic_lifecycle.rs` drops its container builder and three
+# `MapStateLayer` wrappings for `storage` and `serve`, and with them the six
+# uncited `//` lines that narrated each step ("metadata via topic uuid"); the
+# helpers `create`, `described` and `delete` are named for what they ask. The
+# ceiling comes down.
+#   defork  -79 lines, the DeleteTopics tests on the shared setup  3172 -> 3172  2.6932 -> 2.6952
+#
+# `tests/delete_topics.rs` drops three container builders and their
+# `MapStateLayer` wrappings for `storage` and `serve`, and the two copies of
+# the CreateTopics call and its seven assertions for `create` and
+# `assert_created`. No `//` line was added or removed.
+#   defork  -318 lines, the ListOffsets tests on the shared setup  3172 -> 3169  2.6951 -> 2.7000
+#
+# `tests/list_offsets.rs` wrote out its container builder, CreateTopics,
+# Produce and ListOffsets calls once per test, five times over. They become
+# `populate`, `produce`, `offsets`, `ask` and `assert_own_offsets`, and the
+# two wide-assignment tests share one body. The three-line `//` note on
+# `records_in` becomes its doc comment; every other `//` block moves
+# unchanged.
+#   defork  -141 lines, the CreateTopics tests on the shared setup  3169 -> 3169  2.6999 -> 2.7032
+#
+# `tests/create_topics.rs` built a container and wrote out a CreateTopics
+# request in each of its three first tests, and again in the #443 module. One
+# `create` serves all of them, with `outcome`, `shape`, `exists` and
+# `described` beside it. No `//` line was added or removed.
+#   defork  -676 lines, the Produce tests on the shared setup  3169 -> 3169  2.7031 -> 2.7189
+#
+# `tests/produce.rs` spelled out a container builder, an InitProducerId call,
+# a Produce request and the whole expected response in every test, and four
+# ListOffsets requests in one. They become `produce`, `only`, `init_producer`,
+# `offset_at`, `batch_of` and `sequenced`, and the module left from a doc
+# example goes. Every `//` block moves unchanged.
+#   defork  -144 lines, the group services on group_service!  3169 -> 3169  2.7188 -> 2.7223
+#
+# The seven classic and KIP-848 group services each spelled out their struct,
+# `ApiKey`, `Service` impl, response frame and `Error::Api` fallback. A
+# `group_service!` macro and `respond`/`answered` in `group/handler.rs` carry
+# them once. The fallback's cited #300 block, repeated five times, becomes
+# `answered`'s doc comment; no uncited `//` line was added or removed.
+#   defork  -1119 lines, the dynostore latency tests on ThrottledStore  3169 -> 3168  2.7222 -> 2.7478
+#
+# `dynostore/tests/latency.rs` carried its own latency-introducing
+# `ObjectStore` and spelled out CreateTopics, seven Produce calls, a Fetch
+# and seven per-batch checks in each of nine tests. `object_store`'s
+# `ThrottledStore` delays the same calls, and `engine`, `produce_all`,
+# `fetch` and `assert_took` carry the rest. The cited #428 note went with the
+# wrapper it described; one uncited line became a test's doc comment.
+#   defork  -1015 lines, the transaction tests on a shared partition  3168 -> 3126  2.7477 -> 2.7365
+#
+# `tests/txn.rs` spelled out a broker, a topic, InitProducerId,
+# AddPartitionsToTxn, six Produce calls and a dozen ListOffsets checks in each
+# of six tests. A `Partition` fixture with `begin`, `end`, `latest`,
+# `commit_offset` and `fetch` carries them. The uncited narration (`// commit
+# transaction 1`, `// end txn marker is now present`) goes, two of its
+# explanations becoming assertion messages, and the cited #555 allow goes
+# with the length that needed it.
+#   defork  -585 lines, the consumer group simulations on shared members  3126 -> 3097  2.7364 -> 2.7257
+#
+# `tests/new_cg.rs` spelled out a storage container, a route, a four-layer
+# member and a JoinGroup/SyncGroup/Heartbeat exchange in every test, with the
+# step narrated (`// c0: sync`) above each. `coordinator`, `member`,
+# `first_join`, `lead_alone`, `Script` and `settled` carry them. The cited
+# #195 stability notes and the KIP-394 interleave notes move unchanged; the
+# narration goes.
+#   defork  -838 lines, the SASL tests on the memory engine  3097 -> 3095  2.7256 -> 2.7443
+#
+# `tests/auth.rs` carried a 480-line `Storage` stub, every method but one
+# `unimplemented!()`, and spelled out a SaslHandshake/SaslAuthenticate loop
+# and hard-coded SCRAM key bytes in each test. The tests now store derived
+# credentials in a `memory://` engine and share a `Connection`. The ceiling
+# rises because the code went: two uncited lines left with it, and the cited
+# #551 note left with the stub it described.
+#   defork  -53 lines, the latency and DescribeCluster tests rewritten  3095 -> 3091  2.7443 -> 2.7420
+#
+# `tests/cg_latency.rs` and `tests/describe_cluster.rs` are rewritten on
+# `common::storage_container` and flat `use` lines. The uncited note above the
+# `LatencyIntroducingStorage` wrapper becomes a shorter one citing #111, and
+# the DescribeCluster `matches!` becomes one assertion per field.
+#   defork  -38 lines, the group consumer example rewritten  3091 -> 3091  2.7420 -> 2.7429
+#
+# `tansu-client/examples/group_consumer.rs` builds its subscriber, requests
+# and layers in short `let` steps, and `--heartbeat-interval` parses with
+# `humantime::parse_duration` directly. The ceiling rises because only code
+# went: the comment count did not move.
+#   defork  -315 lines, the sans-io message metadata tests in one binary  3091 -> 3091  2.7429 -> 2.7480
+#
+# Six `tansu-sans-io` test binaries each checked one message in
+# `MESSAGE_META`, through the same lookup and `.map(..).unwrap()` chains.
+# `tests/message_meta.rs` holds the six tests over `message`, `field`,
+# `structure_names` and `sequence_of`. The ceiling rises because only code
+# went: the comment count did not move.
+#   defork  -144 lines, the request examples on a shared module  3091 -> 3091  2.7480 -> 2.7519
+#
+# `tansu-client`'s metadata, create_topic, produce, fetch and list_offsets
+# examples each set up the same subscriber and client and built the same
+# `Metadata` request. `examples/common/mod.rs` holds those, and each example
+# builds its request in short `let` steps. The ceiling rises because only
+# code went: the comment count did not move.
+#   defork  -54 lines, the tansu-service round-trip tests on shared fixtures  3091 -> 3091  2.7519 -> 2.7533
+#
+# `tests/ch.rs` and `tests/tcp.rs` each built the same `Metadata` request
+# frame and canned response inline. `tests/common/mod.rs` holds them,
+# with the error type's `From` impls generated by one macro. The cited
+# `Classify` note moves unchanged. The ceiling rises because only code went:
+# the comment count did not move.
+#   defork  -138 lines, the sans-io version and documented-usage tests rewritten  3091 -> 3091  2.7533 -> 2.7564
+#
+# `tests/version.rs` destructured each decoded response field by field; it
+# now round-trips through one helper and compares the whole body with the
+# fields the version predates cleared. `tests/doctest.rs` holds its fetch
+# response as hex and builds its records and batches in short `let` steps.
+# The ceiling rises because only code went: the comment count did not move.
+#   defork  -60 lines, the static member tests on shared helpers  3091 -> 3087  2.7565 -> 2.7542
+#
+# `tests/cg_static.rs` spelled out the broker registration, the protocols
+# and a ten-argument JoinGroup in both tests, with the step narrated
+# (`// join static group without a member id`) above each. `registered`,
+# `join_static` and `assert_leads_alone` carry them, and the narration goes.
+#   defork  -242 lines, the FetchResponse metadata checks into `message_meta`  3087 -> 3087  2.7542 -> 2.7590
+#
+# `tansu-sans-io/tests/fetch_response.rs` looked `FetchResponse` up in
+# `MESSAGE_META` again in each of thirteen tests to check one field's
+# versions and whether its parent requires it. It becomes one table-driven
+# test in `tests/message_meta.rs`. The ceiling rises because only code went:
+# the comment count did not move.
+#   defork  -264 lines, the sans-io malformed-input tests as tables  3087 -> 3036  2.7590 -> 2.7191
+#
+# `tansu-sans-io/tests/gap6.rs` was twenty-five one-assertion tests under
+# `// ====` section banners, each byte annotated with a narrating comment.
+# The same inputs are now four table-driven tests whose case labels say what
+# each input is, and the banners and narration go.
+#   defork  -132 lines, the sans-io round-trip properties on shared helpers  3036 -> 3005  2.7191 -> 2.6942
+#
+# `tansu-sans-io/tests/proptest.rs` checked each varint's round trip, zigzag
+# identity and reported size in separate properties under `// ----`
+# banners, and compared the batches field by field. The properties now share
+# `through_codec` and `through_serde`, keep their strategies and case counts,
+# and the banners and a commented-out assertion go.
+#   defork  -135 lines, the topic storage tests on shared helpers  3005 -> 3004  2.6942 -> 2.6959
+#
+# `tansu-broker/tests/topic.rs` registered a broker, built a topic and
+# checked every partition of a description inline in each of five tests.
+# `registered`, `topic`, `create` and `assert_described` carry them, and a
+# commented-out assertion goes. The ceiling rises because code went faster
+# than comments: one line of each kind for every hundred and thirty-five.
+#   defork  -179 lines, the DescribeConfigs tests on a topic fixture  3004 -> 3004  2.6959 -> 2.6998
+#
+# `tansu-broker/tests/describe_configs.rs` spelled out three
+# `IncrementalAlterConfigs` and four `DescribeConfigs` requests in full. A
+# `Topic` fixture with `described` and `alter_policy` carries them, and the
+# cited #225 notes move unchanged. The ceiling rises because only code went:
+# the comment count did not move.
+#   defork  -167 lines, the fetch tests on shared helpers  3004 -> 3004  2.6998 -> 2.7034
+#
+# `tansu-broker/tests/fetch.rs` created a topic, listed its latest offset,
+# built a fetch and summed the fetched records inline in both tests.
+# `a_partition`, `latest`, `fetched`, `batches` and `records` carry them, and
+# the cited #552 note moves unchanged. The ceiling rises because only code
+# went: the comment count did not move.
+#   defork  -195 lines, the committed-offset tests on shared helpers  3004 -> 3004  2.7034 -> 2.7071
+#
+# `tansu-broker/tests/cg.rs` registered a broker, created a topic,
+# committed and fetched an offset inline in each of seven tests.
+# `registered`, `a_partition`, `commit`, `fetched` and `deleted_alone` carry
+# them. The ceiling rises because only code went: the comment count did not
+# move.
+#   defork  -307 lines, the metadata tests on a cluster fixture  3004 -> 3004  2.7071 -> 2.7134
+#
+# `tansu-broker/tests/metadata.rs` registered a broker, created a topic and
+# checked the broker and every partition inline in each of six tests. A
+# `Cluster` fixture with `created`, `metadata` and `assert_found`, and
+# `assert_unknown`, carry them; the cited #593 note moves, naming the renamed
+# test. The ceiling rises because only code went: the comment count did not
+# move.
+#   defork  -208 lines, the dynamic member tests on a group fixture  3004 -> 2964  2.7134 -> 2.6819
+#
+# `tests/cg_dynamic.rs` spelled out every JoinGroup, SyncGroup, Heartbeat and
+# LeaveGroup of a rebalance in full, each under a narrating `// 2nd member
+# joins` comment. A `Group` fixture carries the exchanges, the narration goes,
+# and so does the cited #555 `cognitive_complexity` allow the script length
+# needed. The cited #195 session-timeout note moves unchanged.
+#   defork  -75 lines, the compact/delete policy helpers rewritten  2964 -> 2964  2.6819 -> 2.6835
+#
+# `tansu-broker/tests/policy_compact_delete.rs` keeps its cases and their
+# notes; its broker stack, topic creation and the Produce, ListOffsets and
+# Fetch requests behind `produce_keyed`, `list_offset` and `fetched` are
+# rebuilt in short `let` steps. The ceiling rises because only code went:
+# the comment count did not move.
+#   defork  -389 lines, the produce/fetch tests on shared helpers  2964 -> 2954  2.6835 -> 2.6827
+#
+# `tansu-broker/tests/produce_fetch.rs` spelled out an idempotent produce
+# loop and, twice over, a transactional one with its AddPartitionsToTxn,
+# commit and end marker, plus the same fetch and comparison, under
+# narrating comments. `a_partition`, `committed_transactions`, `fetched`,
+# `placed` and `assert_as_produced` carry them, and the narration goes.
+#   defork  -453 lines, the ListOffsets tests on shared helpers  2954 -> 2954  2.6827 -> 2.6922
+#
+# `tansu-broker/tests/list_offsets.rs` spelled out eight ListOffsets and
+# three Produce requests in full in one 500-line body, with the cited #444
+# note repeated three times. `listed`, `produced`, `listed_on` and the
+# assertions carry them; the #444 note stays once and the #177 notes move
+# unchanged, and the cited #555 allow the body's length needed goes. The
+# ceiling rises because code went faster than the comments that counted.
+#   defork  -94 lines, the broker test helpers rewritten  2954 -> 2951  2.6922 -> 2.6921
+#
+# `tansu-broker/tests/common/mod.rs` keeps every helper the test binaries
+# call, with the same arguments; the bodies are rebuilt in short `let`
+# steps, the unused `offset_fetch` goes, and `JoinResponse` becomes a
+# `Joined` struct whose two users, `cg_dynamic` and `cg_static`, follow.
+# A commented-out `debug!` and a narrating comment go.
+#   defork  -194 lines, the sans-io API tests as round trips  2951 -> 2931  2.6921 -> 2.6777
+#
+# `tansu-sans-io/tests/api.rs` spelled out every wire value of every enum as
+# a named constant and its own assertion, under narrating comments
+# (`// compression round-trip`). One `round_trip` helper takes the values,
+# eleven tests take the nineteen, and the narration goes.
+#   defork  -347 lines, the sans-io consumer tests on shared helpers  2931 -> 2926  2.6777 -> 2.6800
+#
+# `tansu-sans-io/tests/consumer.rs` repeated the same decode, assert and
+# re-encode body around each wire fixture, and the same builder and
+# JoinGroupResponse around each `GroupConsumer` step. The fixtures are hex
+# constants of the same bytes, `assert_subscribed`, `assert_assigned`,
+# `joined`, `members` and `handed_to` carry the rest, and a narrating comment
+# becomes a test's doc. The ceiling rises because code went faster than the
+# comments that counted.
+#   defork  -223 lines, the decode bench over hex fixtures  2926 -> 2926  2.6800 -> 2.6856
+#
+# `tansu-sans-io/benches/decode_bench.rs` wrote each of its three captured
+# request frames as a decimal byte table inside its own bench function. The
+# frames are hex constants of the same bytes, benched by name from one
+# table, and the cited #555 `too_many_lines` allow the tables needed goes.
+# The ceiling rises because only code went: the comment count did not move.
+#   defork  -19 lines, the dynostore test helpers rewritten  2926 -> 2926  2.6856 -> 2.6861
+#
+# `tansu-storage/src/dynostore/tests.rs` keeps every helper its test
+# modules share; `init_tracing` is rebuilt in short `let` steps, and its two
+# own tests, a `BTreeMap::range` check and a serde widening check, are
+# rewritten to assert the same. The ceiling rises because only code went:
+# the comment count did not move.
+#   defork  -6 lines, the storage test helpers rewritten  2926 -> 2926  2.6861 -> 2.6865
+#
+# `tansu-storage/tests/common/mod.rs` keeps its store, cluster and topic
+# helpers and their cited #357 docs; the error type is a `Failure` enum
+# behind the `Error` alias every test names, its `Message` variant is
+# `Failed` in the three tests that raise it, its `Arc` conversions come from
+# one macro, and `init_tracing` is rebuilt in short `let` steps. The ceiling
+# rises because only code went: the comment count did not move.
+#   defork  -1367 lines, the snappy captures as hex behind one assertion  2926 -> 2926  2.6865 -> 2.7202
+#
+# `tansu-sans-io/tests/snappy.rs` wrote its three produce captures as decimal
+# byte tables, each followed by the same twenty lines of assertions. They are
+# hex constants of the same bytes behind `assert_one_record_of`, the 1 000
+# record case stays ignored, now saying why, and the cited #553 file-level
+# `too_many_lines` allow goes with the tables. The ceiling rises because only
+# code went: the comment count did not move.
+#   defork  -30 lines, two storage handlers' bodies rewritten  2926 -> 2923  2.7202 -> 2.7177
+#
+# `ConsumerGroupDescribe` and `GetTelemetrySubscriptions` keep their
+# declarations, which the de-fork count still holds against them; their
+# imports, docs, doctests and bodies are rewritten. The comment beside the
+# empty `requested_metrics` now cites #410, which exempts it.
+#   defork  -13 lines, the delete handlers' bodies rewritten  2923 -> 2923  2.7177 -> 2.7183
+#
+# `DeleteTopics` and `DeleteGroups` keep their declarations too. The
+# `DeleteGroups` unit test no longer opens a per-thread log file: it asserted
+# nothing about tracing, and its doctest twin never had one. Only code went.
+#   defork  +7 lines, the metadata and SCRAM handlers' bodies rewritten  2923 -> 2923  2.7183 -> 2.7178
+#
+# `Metadata` and `AlterUserScramCredentials` keep their declarations. The SCRAM
+# service had no test of its own; one now upserts a credential, reads the
+# derived keys back against `derive_keys`, and deletes it — and passes against
+# the body it replaces. Code grew, so the ceiling comes down.
+#   defork  -14 lines, the create_topics handler body rewritten  2923 -> 2923  2.7178 -> 2.7185
+#
+# `CreateTopics` keeps its declarations; the three outcomes now share one
+# `result_for` builder, and the comments are kept word for word. Only code went.
+#   defork  -23 lines, the list_offsets handler body rewritten  2923 -> 2923  2.7185 -> 2.7189
+#
+# `ListOffsets` keeps its declarations. The #444 comment, cited and so exempt,
+# is reflowed from a 30-line column at the bottom of a builder chain to seven
+# lines at full width. Only code went.
+#   defork  -70 lines, the incremental_alter_configs handler body rewritten  2923 -> 2923  2.7189 -> 2.7188
+#
+# `IncrementalAlterConfigs` keeps its declarations. Most of what went is its
+# doctest, whose two identical `DescribeConfigs` requests are now one closure.
+# The measured ratio came down, so the ceiling follows it.
+#   defork  -36 lines, the broker's auth and coordinator routes rewritten  2923 -> 2923  2.7188 -> 2.7207
+#
+# Each route function keeps its signature, which is most of what the de-fork
+# count still holds against the two files; the seven coordinator bodies are now
+# one `coordinated!` macro, and `services` calls them in the same order instead
+# of folding over an array of function pointers. Only code went.
+#   defork  -17 lines, the SASL handshake and authenticate bodies rewritten  2923 -> 2920  2.7207 -> 2.7185
+#
+# `SaslHandshake` and `SaslAuthenticate` keep their declarations. The KIP-368
+# comment beside the handshake's fresh-server reset was upstream's, and is
+# reworded in five lines instead of eight; it still cites only a KIP, so it
+# still counts. Three comment lines went, so the ceiling comes down.
+#   defork  -43 lines, the tansu-topic subcommands rewritten  2920 -> 2920  2.7185 -> 2.7196
+#
+# `create`, `delete` and `list` keep their declarations. Each built the same
+# client the same way, and `create` and `delete` checked their one result the
+# same way; both now live once in `lib.rs`. Only code went.
+#   defork  +3 lines, the record header bodies rewritten  2920 -> 2920  2.7196 -> 2.7198
+#
+# `record::Header` and its `Builder` keep their declarations; the bodies are
+# rewritten with `?` in place of `and_then` chains. No comment moved, but the
+# measured ratio rose by a hair past the old ceiling, so the ceiling follows.
+#   defork  +4 lines, the user subcommand bodies rewritten  2920 -> 2917  2.7198 -> 2.7178
+#
+# `tansu user` keeps its declarations, and every `///` on the clap enum stays
+# word for word, because those lines are the `--help` text. Three bare `//`
+# labels on its fields (`// Iterations`, `// Mode` twice) went: they said what
+# the next line said. The two PBKDF2 vectors are hex now, so the ceiling comes
+# down.
+#   defork  -31 lines, the broker subcommand bodies rewritten  2917 -> 2917  2.7178 -> 2.7181
+#
+# `tansu broker` keeps its declarations and every `///` on its clap struct.
+# The startup banner was diffed against the previous binary, plain and under
+# `FORCE_COLOR`, and is byte for byte the same. Only code went.
+#   defork  +6 lines, the topic subcommand bodies rewritten  2917 -> 2917  2.7181 -> 2.7180
+#
+# `tansu topic` keeps its declarations and its clap help text. `parse_key_val`
+# splits with `split_once`, which is the first `=` that `find` found, and keeps
+# its error message word for word. Code grew, so the ceiling comes down.
+#   defork  -17 lines, otel setup, assignor topitions and resource patterns rewritten  2917 -> 2913  2.7180 -> 2.7148
+#
+# Four files keep their declarations. `otel/tracing.rs` carried four lines of
+# commented-out OpenTelemetry layer wiring from upstream — code, not comment,
+# that nothing had compiled since the fork. They went, so the ceiling comes
+# down.
+#   defork  -7 lines, the ACL enum conversions rewritten  2913 -> 2913  2.7148 -> 2.7143
+#
+# `acl::{Permission, Operation, Resource}` keep their variants and
+# discriminants; `From<i8>` looks the value up among them instead of a guard
+# per variant, and a new test in `tests/api.rs` pins every wire value from -2
+# to 19 — against the old body as well as the new. The test's lines are code,
+# so the ceiling comes down.
+#   defork  -36 lines, the uniform assignor rewritten  2913 -> 2911  2.7143 -> 2.7138
+#
+# `UniformAssignor` keeps its declaration and its one-line delegation to the
+# round-robin assignor. Its two tests assert the same assignments through
+# shared helpers; their `// mirrors RoundRobinAssignor::…` labels became the
+# tests' doc comments. Two comment lines went, so the ceiling comes down.
+#   defork  -10 lines, the frame router and ApiVersions service rewritten  2911 -> 2911  2.7138 -> 2.7141
+#
+# `tansu-service`'s `api.rs` keeps its declarations and the #322 record-format
+# floor with its tests. The `ApiVersions` answer is assembled in `let` steps
+# from the same messages and the same floor; routing and duplicate-route
+# refusal are unchanged. Only code went.
+#   defork  -0 lines, the consumer group service rewritten  2911 -> 2910  2.7141 -> 2.7140
+#
+# `tansu-service`'s `ConsumerGroupLayer`/`ConsumerGroupService` keep their
+# declarations. One uncited comment went — `// 1/3 of session timeout,
+# otherwise 3 seconds`, which said what the next line says — so the ceiling
+# comes down.
+#   defork  -15 lines, the stream layers' small bodies rewritten  2910 -> 2910  2.7140 -> 2.7144
+#
+# `tansu-service`'s `stream.rs` is the TCP path, so only its small bodies moved:
+# the imports, the `Debug` impls, the `layer` constructors, two setters,
+# `elapsed_millis`, the metric attributes and `BytesService::serve`. The accept
+# loop and the frame reading and writing are untouched. Only code went.
+#   defork  -56 lines, the null engine's bodies rewritten  2910 -> 2910  2.7144 -> 2.7159
+#
+# `null.rs` keeps its declarations and every method signature. Four copies of
+# the `FeatureNotEnabled` answer became one `undefined`; the host, port and
+# replica lists `brokers`, `metadata` and `describe_topic_partitions` built
+# twice over became two helpers. Every rewritten method's `Debug` output was
+# diffed against the previous body before and after, and is identical. Only
+# code went.
+#   defork  -232 lines, the tansu-service route tests rewritten  2910 -> 2910  2.7159 -> 2.7211
+#
+# `tansu-service/tests/route.rs` is rewritten whole and leaves `inherited`. Its
+# seven tests built the same router and the same client stack seven times;
+# five tests on shared helpers keep every assertion. Only code went, a lot of
+# it, so the ceiling rises.
+#   defork  -13 lines, the range assignor rewritten  2910 -> 2896  2.7211 -> 2.7124
+#
+# `RangeAssignor` keeps its declaration and `assign` signature; the body is
+# loops in place of iterator chains, with the same order and the same logs.
+# Its four tests keep their assignments on shared helpers, and the fourteen
+# `//` lines narrating them — the arithmetic of each case — became the tests'
+# doc comments. The new tests pass against the old body too. Fourteen comment
+# lines went, so the ceiling comes down.
+#   defork  -299 lines, the round robin and cooperative sticky assignors rewritten  2896 -> 2874  2.7124 -> 2.6990
+#
+# `RoundRobinAssignor` and `CooperativeStickyAssignor` keep their declarations
+# and `assign` signatures. The round robin deals with a turn counter that still
+# advances past a member not subscribed to the topic, as before; the cooperative
+# sticky one still delegates to it, and its KIP-429 TODO moved into the
+# struct's doc comment. Their tests keep every assignment on shared helpers,
+# with the narrating `//` lines turned into doc comments, and the new round
+# robin tests pass against the old body too. Twenty-two comment lines went, so
+# the ceiling comes down.
+#   defork  -83 lines, the GCS put rate limiter rewritten  2874 -> 2869  2.6990 -> 2.6961
+#
+# `gcs/limit.rs` keeps every declaration and `ObjectStore` signature, and every
+# doc comment. The bodies are rewritten with the same spans, the same fields and
+# the same events: `rate_limited_ms` at `debug`, `no_rate_limit` at `warn`. The
+# delegating methods go through one `inner()` accessor. The two tests keep their
+# timings on shared helpers, the one named `test` now says what it checks, and
+# five narrating `//` lines became the first test's doc comment. Both pass
+# against the old body too. Five comment lines went, so the ceiling comes down.
+#   defork  -51 lines, the model's JSON field readers rewritten  2869 -> 2866  2.6961 -> 2.6945
+#
+# `tansu-model/src/wv.rs` keeps `Wv`, the `As` and `AsOption` traits and every
+# impl and signature. The bodies read through one `field` accessor, and the
+# narrowing reads through one `narrowed` helper, with the same errors:
+# `Message(name)` for a field that is absent or of the wrong type, `TryFromInt`
+# for one that does not fit. `tansu-sans-io`'s generated code is byte-for-byte
+# the same before and after. The tests build their JSON with `json!` and keep
+# every expectation, and they pass against the old body too. The `//` above
+# `Wv` became its doc comment and two commented-out test cases went: three
+# comment lines, so the ceiling comes down.
+#   defork  -12 lines, the tagged field serializer rewritten  2866 -> 2866  2.6945 -> 2.6950
+#
+# `primitive/tagged/ser.rs` keeps `Encoder`, every `Serializer` and
+# `Serialize*` impl, signature and `where` clause. The bodies write through
+# one `put` and one `length` helper, refuse through `refused` and open
+# compounds through `opened`, with the same bytes, the same `UnexpectedType`
+# messages and the same spans. Its tests, and the golden wire fixtures, pass
+# unchanged. Only code went, so the ceiling rises.
+#   defork  -64 lines, the tagged field deserializer rewritten  2866 -> 2866  2.6950 -> 2.6963
+#
+# `primitive/tagged/de.rs` keeps `Decoder`, `Seq`, `Struct`, every
+# `Deserializer` and `SeqAccess` impl and signature. The bodies read through
+# `read`, `length` and `payload` helpers and log through `traced`, with the same
+# bytes, the same varint overflow checks, the same size limit, the same
+# `UnexpectedType` messages and the same `debug` lines. Its tests, and the
+# golden wire fixtures, pass unchanged. Only code went, so the ceiling rises.
+#   defork  -146 lines, the tag buffer rewritten  2866 -> 2866  2.6963 -> 2.6988
+#
+# `primitive/tagged.rs` keeps `TagField`, `TagBuffer`, `TagBufferBuilder` and
+# every impl and signature. The bodies read through `required`, bound through
+# `bounded` and map length errors through `too_big`, with the same bytes, the
+# same 128 bound on both the field count and a field's length, the same error
+# messages and the same `debug` fields. Its seven payload tests became four on
+# one helper with every byte kept, the `ApiVersions` fixture is built from the
+# feature it carries, and the new tests pass against the old body too. Only
+# code went, so the ceiling rises.
+#   defork  -81 lines, the record codecs rewritten  2866 -> 2866  2.6988 -> 2.7006
+#
+# `record/codec.rs` keeps `Octets`, `VarIntSequence`, `Sequence` and every
+# impl and signature. The visitors read through `required` and `elements`,
+# with the same `length` and `item` errors and the same `debug` lines.
+# `Octets::serialize` still writes the data and ends the struct even when the
+# length failed, returning the first error, as the eager `.and(...)` chain
+# did; `decode` still casts a varint length with `as usize`. The five tests
+# became three on one `round_trip` helper with every size kept, and they pass
+# against the old body too. Only code went, so the ceiling rises.
+#   defork  -92 lines, the varints rewritten  2866 -> 2834  2.7006 -> 2.6720
+#
+# `primitive/varint.rs` keeps `VarInt`, `LongVarInt`, `UnsignedVarInt` and
+# every impl and signature. Encoding goes through one `groups` iterator, the
+# same 7-bit groups least significant first; `Decode` and the unsigned visitor
+# gather through `checked_u32`/`checked_u64` with the same `Overflow` and
+# `overflow` errors, and the signed visitors through `unchecked_u32`/
+# `unchecked_u64`, the plain arithmetic they always had. The `debug` lines say
+# the same. The four tests and the commented-out ones became five covering
+# every type's wire bytes, sizes and the overflow, passing against the old
+# body too. The commented-out tests went, so the ceiling falls.
+#   defork  -33 lines, the consumer protocol codecs rewritten  2834 -> 2834  2.6720 -> 2.6725
+#
+# `consumer/codec.rs` keeps every struct, enum, impl and signature. The
+# visitors read through `required` and `octets`, the serializers write a length
+# and its bytes through `written`, and the conversions destructure rather than
+# reach into fields, with the same version mapping, the same 1024 and 4096
+# bounds, the same error messages and the same `debug` lines. A new test pins
+# a v3 subscription's wire bytes and passes against the old body too. Only
+# code went, so the ceiling rises.
+#   defork  -149 lines, the service crate root rewritten  2834 -> 2834  2.6725 -> 2.6724
+#
+# `tansu-service/src/lib.rs` keeps `Error`, `Severity`, `Classify`, the
+# latency layer and service, and every impl and signature. The crate docs'
+# four doctests became one that routes, stacks and serves both requests, with
+# the same assertions; `host_port` resolves the same first IPv4 address and
+# records the same histogram; the metrics are built through `counter` and
+# `histogram` with the same names, units, descriptions and buckets. Docs and
+# code went, and the ratio barely moved, so the ceiling falls with it.
+#   defork  -27 lines, the auth crate root rewritten  2834 -> 2834  2.6724 -> 2.6731
+#
+# `tansu-auth/src/lib.rs` keeps `Error`, `Authentication`, `Stage`,
+# `AuthError`, `Success`, `Justification`, `Callback` and every impl and
+# signature. `check` returns early instead of chaining, with the same
+# `MissingProperty`, `Bad` and `UnknownMechanism` answers, the PLAIN password
+# still checked ahead of the authentication id, and the same `debug` fields;
+# `callback` looks up the same SCRAM credential and satisfies the same stored
+# password. Only code went, so the ceiling rises.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -535,7 +1080,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6804" top="12":
+comments ceiling="2.6731" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,159 +12,119 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use tansu_sans_io::Error;
+//! The usage the crate documents, run end to end: decoding a fetch response
+//! and inflating its records, building records and batches, and encoding a
+//! produce request.
+
+use bytes::Bytes as Octets;
+use tansu_sans_io::record::{Record, deflated, inflated};
+use tansu_sans_io::{ApiKey as _, BatchAttribute, Compression, Error, Frame};
+
+/// A v16 `Fetch` response, as hex, holding one batch of one record whose
+/// value is `poiuy`.
+const FETCH_V16: &str = concat!(
+    "000000ba000000080000000000000000000000021ccdacc38e134747b6800d12",
+    "418ed2de0200000000000000000000000000000000000000000001ffffffffff",
+    "ffffff01000000004a00000000000000000000003dffffffff02998f18900000",
+    "0000000000000190ee94543600000190ee945436000000000000000100000000",
+    "00000000000116000000010a706f6975790003000dffffffffffffffffffffff",
+    "ff000109000000000000000000020dffffffffffffffffffffffff000000",
+);
+
+fn unhex(text: &str) -> Vec<u8> {
+    let pairs = text
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| std::str::from_utf8(pair).unwrap());
+    pairs
+        .map(|pair| u8::from_str_radix(pair, 16).unwrap())
+        .collect()
+}
+
+/// The attributes of a batch compressed with LZ4.
+fn lz4() -> i16 {
+    let compressed = BatchAttribute::default().compression(Compression::Lz4);
+    compressed.into()
+}
+
+/// The first batch of the first partition of the first topic in `response`.
+fn first_batch(response: &tansu_sans_io::FetchResponse) -> Option<&deflated::Batch> {
+    let topic = response.responses.as_deref()?.first()?;
+    let partition = topic.partitions.as_deref()?.first()?;
+    partition.records.as_ref()?.batches.first()
+}
 
 #[test]
-fn fetch_response() -> Result<(), Error> {
-    use bytes::Bytes;
-    use tansu_sans_io::{ApiKey as _, FetchResponse, Frame, record::inflated};
+fn a_fetch_response_decodes_and_its_batch_inflates() -> Result<(), Error> {
+    use tansu_sans_io::FetchResponse;
 
-    let api_key = FetchResponse::KEY;
-    let api_version = 16;
+    let encoded = unhex(FETCH_V16);
+    let frame = Frame::response_from_bytes(&encoded[..], FetchResponse::KEY, 16)?;
+    let response = FetchResponse::try_from(frame.body)?;
 
-    let v = [
-        0, 0, 0, 186, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 28, 205, 172, 195, 142, 19,
-        71, 71, 182, 128, 13, 18, 65, 142, 210, 222, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 1, 255, 255, 255, 255, 255, 255, 255, 255, 1, 0, 0, 0, 0, 74, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 61, 255, 255, 255, 255, 2, 153, 143, 24, 144, 0, 0, 0, 0, 0, 0, 0,
-        0, 1, 144, 238, 148, 84, 54, 0, 0, 1, 144, 238, 148, 84, 54, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 1, 22, 0, 0, 0, 1, 10, 112, 111, 105, 117, 121, 0, 3, 0, 13, 255, 255,
-        255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 1, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
-        13, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0,
-    ];
-
-    let fetch_response = Frame::response_from_bytes(&v[..], api_key, api_version)
-        .and_then(|message_frame| FetchResponse::try_from(message_frame.body))?;
-
-    let deflated = fetch_response
-        .responses
-        .as_ref()
-        .and_then(|topics| topics.first())
-        .and_then(|topic| topic.partitions.as_ref())
-        .and_then(|partitions| partitions.first())
-        .and_then(|partition| partition.records.as_ref())
-        .map(|record_frame| record_frame.batches.as_slice())
-        .and_then(|batches| batches.first())
-        .expect("deflated batch");
-    assert_eq!(12, deflated.record_data.len());
-
-    let inflated = inflated::Batch::try_from(deflated)?;
-
-    assert_eq!(
-        Some(Bytes::from_static(b"poiuy")),
-        inflated
-            .records
-            .first()
-            .and_then(|first| first.value.clone())
-    );
-
+    let compressed = first_batch(&response).expect("deflated batch");
+    assert_eq!(12, compressed.record_data.len());
+    let records = inflated::Batch::try_from(compressed)?.records;
+    let value = records.first().and_then(|record| record.value.clone());
+    assert_eq!(Some(Octets::from_static(b"poiuy")), value);
     Ok(())
 }
 
 #[test]
-fn record_builder() -> Result<(), Error> {
-    use bytes::Bytes;
-    use tansu_sans_io::record::{Header, Record};
+fn a_record_builds_with_a_key_a_value_and_headers() {
+    use tansu_sans_io::record::Header;
 
-    let record = Record::builder()
-        .key(Some(Bytes::from_static(b"message")))
-        .value(Some(Bytes::from_static(b"hello world!")))
-        .header(
-            Header::builder()
-                .key(Bytes::from_static(b"format"))
-                .value(Bytes::from_static(b"text")),
-        )
-        .header(
-            Header::builder()
-                .key(Bytes::from_static(b"importance"))
-                .value(Bytes::from_static(b"high")),
-        );
-
-    Ok(())
-}
-
-#[test]
-fn build_batch() -> Result<(), Error> {
-    use bytes::Bytes;
-    use tansu_sans_io::{
-        BatchAttribute, Compression,
-        record::{self, deflated, inflated},
+    let header = |key: &'static [u8], value: &'static [u8]| {
+        let header = Header::builder().key(Octets::from_static(key));
+        header.value(Octets::from_static(value))
     };
+    let format = header(b"format", b"text");
+    let importance = header(b"importance", b"high");
+    let keyed = Record::builder().key(Some(Octets::from_static(b"message")));
+    let valued = keyed.value(Some(Octets::from_static(b"hello world!")));
+    let _record = valued.header(format).header(importance);
+}
 
-    let timestamp = 1_234_567_890 * 1_000;
+#[test]
+fn an_lz4_batch_deflates_and_inflates_back() -> Result<(), Error> {
+    let millis = 1_234_567_890_000;
+    let hello = Some(Octets::from_static(b"hello world!"));
 
-    let message = Some(Bytes::from_static(b"hello world!"));
+    let batch = inflated::Batch::builder().attributes(lz4());
+    let batch = batch.base_timestamp(millis).max_timestamp(millis);
+    let record = Record::builder().value(hello.clone());
+    let batch = batch.record(record).build()?;
+    let round_tripped = inflated::Batch::try_from(deflated::Batch::try_from(batch)?)?;
 
-    let deflated = inflated::Batch::builder()
-        .attributes(
-            BatchAttribute::default()
-                .compression(Compression::Lz4)
-                .into(),
-        )
-        .base_timestamp(timestamp)
-        .max_timestamp(timestamp)
-        .record(record::Record::builder().value(message.clone()))
-        .build()
-        .and_then(deflated::Batch::try_from)?;
-
-    let inflated = inflated::Batch::try_from(deflated)?;
-    assert_eq!(
-        message,
-        inflated
-            .records
-            .first()
-            .and_then(|first| first.value.clone())
-    );
-
+    let first = round_tripped.records.first();
+    assert_eq!(hello, first.and_then(|record| record.value.clone()));
     Ok(())
 }
 
 #[test]
-fn produce_request() -> Result<(), Error> {
-    use bytes::Bytes;
-    use tansu_sans_io::{
-        ApiKey as _, BatchAttribute, Compression, Frame, Header, ProduceRequest,
-        produce_request::{PartitionProduceData, TopicProduceData},
-        record::{self, deflated, inflated},
+fn a_produce_request_of_one_lz4_batch_encodes() -> Result<(), Error> {
+    use tansu_sans_io::produce_request::{PartitionProduceData, TopicProduceData};
+    use tansu_sans_io::{Header, ProduceRequest};
+
+    let hello = Some(Octets::from_static(b"hello world!"));
+    let batch = inflated::Batch::builder().attributes(lz4());
+    let batch = batch.record(Record::builder().value(hello)).build()?;
+    let batches = vec![deflated::Batch::try_from(batch)?];
+
+    let partition = PartitionProduceData::default().index(0);
+    let partition = partition.records(Some(deflated::Frame { batches }));
+    let topic = TopicProduceData::default().name("test".into());
+    let topic = topic.partition_data(Some(vec![partition]));
+    let request = ProduceRequest::default().topic_data(Some(vec![topic]));
+
+    let client_id = Some(String::from("tansu"));
+    let (api_key, api_version) = (ProduceRequest::KEY, 6);
+    let header = Header::Request {
+        api_key,
+        api_version,
+        correlation_id: 12321,
+        client_id,
     };
-
-    let batch = inflated::Batch::builder()
-        .attributes(
-            BatchAttribute::default()
-                .compression(Compression::Lz4)
-                .into(),
-        )
-        .record(record::Record::builder().value(Bytes::from_static(b"hello world!").into()))
-        .build()
-        .and_then(deflated::Batch::try_from)?;
-
-    let produce_request = ProduceRequest::default()
-        .topic_data(Some(
-            [TopicProduceData::default()
-                .name("test".into())
-                .partition_data(Some(
-                    [PartitionProduceData::default()
-                        .index(0)
-                        .records(Some(deflated::Frame {
-                            batches: vec![batch],
-                        }))]
-                    .into(),
-                ))]
-            .into(),
-        ))
-        .into();
-
-    let correlation_id = 12321;
-
-    let request = Frame::request(
-        Header::Request {
-            api_key: ProduceRequest::KEY,
-            api_version: 6,
-            correlation_id,
-            client_id: Some("tansu".into()),
-        },
-        produce_request,
-    )?;
-
+    let _encoded = Frame::request(header, request.into())?;
     Ok(())
 }

@@ -1,4 +1,3 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
 // Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,242 +12,88 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{Error, cluster_id, init_tracing, storage_url};
-use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
+//! `CreateTopics`: what a creation answers, the broker defaults `-1` stands
+//! for, a duplicate name, and the creations refused at the door.
+
+use std::sync::Arc;
+
+use tansu_sans_io::create_topics_request::CreatableTopic;
+use tansu_sans_io::create_topics_response::CreatableTopicResult;
+use tansu_sans_io::describe_topic_partitions_request::TopicRequest;
+use tansu_sans_io::describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic;
+use tansu_sans_io::metadata_request::MetadataRequestTopic;
+use tansu_sans_io::metadata_response::MetadataResponseTopic;
 use tansu_sans_io::{
-    CreateTopicsRequest, DescribeTopicPartitionsRequest, ErrorCode, NULL_TOPIC_ID,
-    create_topics_request::CreatableTopic, describe_topic_partitions_request::TopicRequest,
+    CreateTopicsRequest, DescribeTopicPartitionsRequest, ErrorCode, MetadataRequest, NULL_TOPIC_ID,
 };
-use tansu_storage::{CreateTopicsService, DescribeTopicPartitionsService, StorageContainer};
-use url::Url;
+use tansu_storage::{
+    CreateTopicsService, DescribeTopicPartitionsService, MetadataService, Storage,
+};
+
+use crate::common::{Error, NODE_ID, init_tracing, serve, storage};
 
 mod common;
 
-#[tokio::test]
-async fn create() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let node_id = 12321;
-
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(node_id)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
-
-    let service = MapStateLayer::new(|_| storage).into_layer(CreateTopicsService);
-
-    let name = "pqr";
-    let num_partitions = 5;
-    let replication_factor = 3;
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let response = service
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
-                .topics(Some(vec![
-                    CreatableTopic::default()
-                        .name(name.into())
-                        .num_partitions(num_partitions)
-                        .replication_factor(replication_factor)
-                        .assignments(assignments)
-                        .configs(configs),
-                ]))
-                .validate_only(Some(false)),
-        )
-        .await?;
-
-    let topics = response.topics.unwrap_or_default();
-
-    assert_eq!(1, topics.len());
-    assert_eq!(name, topics[0].name.as_str());
-    assert_ne!(Some(NULL_TOPIC_ID), topics[0].topic_id);
-    assert_eq!(Some(5), topics[0].num_partitions);
-    assert_eq!(Some(3), topics[0].replication_factor);
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-
-    Ok(())
+/// What `CreateTopics` answers for one topic `name` with `partitions` and
+/// `replicas`, as a dry run or not.
+async fn create(
+    storage: &Arc<dyn Storage>,
+    name: &str,
+    (partitions, replicas): (i32, i16),
+    validate_only: bool,
+) -> Result<CreatableTopicResult, Error> {
+    let creatable = CreatableTopic::default()
+        .name(name.to_owned())
+        .num_partitions(partitions)
+        .replication_factor(replicas)
+        .assignments(Some(Vec::new()))
+        .configs(Some(Vec::new()));
+    let request = CreateTopicsRequest::default()
+        .topics(Some(vec![creatable]))
+        .validate_only(Some(validate_only));
+    let response = serve(storage, CreateTopicsService, request).await?;
+    let [topic] = <[_; 1]>::try_from(response.topics.unwrap_or_default()).expect("one topic");
+    Ok(topic)
 }
 
-#[tokio::test]
-async fn create_with_default() -> Result<(), Error> {
-    let _guard = init_tracing()?;
-
-    let node_id = 12321;
-
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(node_id)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
-
-    let service = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
-    };
-
-    let name = "pqr";
-    let num_partitions = -1;
-    let replication_factor = -1;
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let response = service
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
-                .topics(Some(vec![
-                    CreatableTopic::default()
-                        .name(name.into())
-                        .num_partitions(num_partitions)
-                        .replication_factor(replication_factor)
-                        .assignments(assignments)
-                        .configs(configs),
-                ]))
-                .validate_only(Some(false)),
-        )
-        .await?;
-
-    let topics = response.topics.unwrap_or_default();
-
-    assert_eq!(1, topics.len());
-    assert_eq!(name, topics[0].name.as_str());
-    assert_ne!(Some(NULL_TOPIC_ID), topics[0].topic_id);
-    assert_eq!(Some(3), topics[0].num_partitions);
-    assert_eq!(Some(1), topics[0].replication_factor);
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-
-    let service = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(DescribeTopicPartitionsService)
-    };
-
-    let response = service
-        .serve(
-            Context::default(),
-            DescribeTopicPartitionsRequest::default()
-                .topics(Some([TopicRequest::default().name(name.into())].into())),
-        )
-        .await?;
-
-    let topics = response.topics.unwrap_or_default();
-    assert_eq!(1, topics.len());
-    assert_eq!(Some(name), topics[0].name.as_deref());
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-    let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-
-    assert_eq!(3, partitions.len());
-
-    for (index, partition) in partitions.iter().enumerate() {
-        assert_eq!(index as i32, partition.partition_index);
-        assert_eq!(node_id, partition.leader_id);
-        assert_eq!(0, partition.leader_epoch);
-        assert_eq!(ErrorCode::None, ErrorCode::try_from(partition.error_code)?);
-    }
-
-    let offline_replicas = partitions[0]
-        .offline_replicas
-        .as_deref()
-        .unwrap_or_default();
-    assert!(offline_replicas.is_empty());
-
-    let last_known_elr = partitions[0].last_known_elr.as_deref().unwrap_or_default();
-    assert!(last_known_elr.is_empty());
-
-    let eligible_leader_replicas = partitions[0]
-        .eligible_leader_replicas
-        .as_deref()
-        .unwrap_or_default();
-    assert!(eligible_leader_replicas.is_empty());
-
-    let isr_nodes = partitions[0].isr_nodes.as_deref().unwrap_or_default();
-    assert_eq!(1, isr_nodes.len());
-    assert!(isr_nodes.iter().all(|isr_node| *isr_node == node_id));
-
-    Ok(())
+/// How a creation ended: its error, and whether it answered a topic id.
+fn outcome(topic: &CreatableTopicResult) -> Result<(ErrorCode, bool), Error> {
+    let error_code = ErrorCode::try_from(topic.error_code)?;
+    Ok((error_code, topic.topic_id != Some(NULL_TOPIC_ID)))
 }
 
-#[tokio::test]
-async fn duplicate() -> Result<(), Error> {
-    let _guard = init_tracing()?;
+/// What a creation answered it made: the name, partitions and replicas.
+fn shape(topic: &CreatableTopicResult) -> (&str, Option<i32>, Option<i16>) {
+    (
+        topic.name.as_str(),
+        topic.num_partitions,
+        topic.replication_factor,
+    )
+}
 
-    let node_id = 12321;
+/// Whether the broker knows a topic by that name.
+async fn exists(storage: &Arc<dyn Storage>, name: &str) -> Result<bool, Error> {
+    let wanted = MetadataRequestTopic::default()
+        .name(Some(name.to_owned()))
+        .topic_id(Some(NULL_TOPIC_ID));
+    let request = MetadataRequest::default().topics(Some(vec![wanted]));
+    let response = serve(storage, MetadataService, request).await?;
+    let known = |topic: &MetadataResponseTopic| {
+        topic.name.as_deref() == Some(name) && topic.error_code == 0
+    };
+    Ok(response.topics.unwrap_or_default().iter().any(known))
+}
 
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(node_id)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
-
-    let service = MapStateLayer::new(|_| storage).into_layer(CreateTopicsService);
-
-    let name = "pqr";
-    let num_partitions = 5;
-    let replication_factor = 3;
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let response = service
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
-                .topics(Some(vec![
-                    CreatableTopic::default()
-                        .name(name.into())
-                        .num_partitions(num_partitions)
-                        .replication_factor(replication_factor)
-                        .assignments(assignments.clone())
-                        .configs(configs.clone()),
-                ]))
-                .validate_only(Some(false)),
-        )
-        .await?;
-
-    let topics = response.topics.unwrap_or_default();
-
-    assert_eq!(1, topics.len());
-    assert_eq!(name, topics[0].name.as_str());
-    assert_ne!(Some(NULL_TOPIC_ID), topics[0].topic_id);
-    assert_eq!(Some(5), topics[0].num_partitions);
-    assert_eq!(Some(3), topics[0].replication_factor);
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-
-    let response = service
-        .serve(
-            Context::default(),
-            CreateTopicsRequest::default()
-                .topics(Some(vec![
-                    CreatableTopic::default()
-                        .name(name.into())
-                        .num_partitions(num_partitions)
-                        .replication_factor(replication_factor)
-                        .assignments(assignments)
-                        .configs(configs),
-                ]))
-                .validate_only(Some(false)),
-        )
-        .await?;
-
-    let topics = response.topics.unwrap_or_default();
-
-    assert_eq!(1, topics.len());
-    assert_eq!(name, topics[0].name.as_str());
-    assert_eq!(Some(NULL_TOPIC_ID), topics[0].topic_id);
-    assert_eq!(Some(5), topics[0].num_partitions);
-    assert_eq!(Some(3), topics[0].replication_factor);
-    assert_eq!(
-        ErrorCode::TopicAlreadyExists,
-        ErrorCode::try_from(topics[0].error_code)?
-    );
-    Ok(())
+/// The one topic `DescribeTopicPartitions` answers for `name`.
+async fn described(
+    storage: &Arc<dyn Storage>,
+    name: &str,
+) -> Result<DescribeTopicPartitionsResponseTopic, Error> {
+    let wanted = TopicRequest::default().name(name.to_owned());
+    let request = DescribeTopicPartitionsRequest::default().topics(Some(vec![wanted]));
+    let response = serve(storage, DescribeTopicPartitionsService, request).await?;
+    let [topic] = <[_; 1]>::try_from(response.topics.unwrap_or_default()).expect("one topic");
+    Ok(topic)
 }
 
 /// Everything below is #443: a creation Kafka refuses at the door was accepted
@@ -256,89 +101,22 @@ async fn duplicate() -> Result<(), Error> {
 mod refusals {
     use std::sync::Arc;
 
-    use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
-    use tansu_sans_io::{
-        CreateTopicsRequest, ErrorCode, MetadataRequest, NULL_TOPIC_ID,
-        create_topics_request::CreatableTopic, create_topics_response::CreatableTopicResult,
-        metadata_request::MetadataRequestTopic,
-    };
-    use tansu_storage::{CreateTopicsService, MetadataService, Storage, StorageContainer};
-    use url::Url;
+    use tansu_sans_io::create_topics_response::CreatableTopicResult;
+    use tansu_sans_io::{ErrorCode, NULL_TOPIC_ID};
+    use tansu_storage::Storage;
 
-    use crate::common::{Error, cluster_id, init_tracing, storage_url};
+    use crate::common::{Error, init_tracing, storage};
 
-    async fn storage() -> Result<Arc<dyn Storage>, Error> {
-        StorageContainer::builder()
-            .cluster_id(cluster_id())
-            .node_id(111)
-            .advertised_listener(Url::parse("tcp://localhost:9092")?)
-            .storage(storage_url()?)
-            .build()
-            .await
-            .map_err(Into::into)
-    }
+    use super::exists;
 
+    /// [`super::create`] with one replica.
     async fn create(
         storage: &Arc<dyn Storage>,
         name: &str,
-        num_partitions: i32,
+        partitions: i32,
         validate_only: bool,
     ) -> Result<CreatableTopicResult, Error> {
-        let service = {
-            let storage = storage.clone();
-            MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
-        };
-
-        let response = service
-            .serve(
-                Context::default(),
-                CreateTopicsRequest::default()
-                    .topics(Some(
-                        [CreatableTopic::default()
-                            .name(name.into())
-                            .num_partitions(num_partitions)
-                            .replication_factor(1)
-                            .assignments(Some([].into()))
-                            .configs(Some([].into()))]
-                        .into(),
-                    ))
-                    .validate_only(Some(validate_only)),
-            )
-            .await?;
-
-        let topics = response.topics.unwrap_or_default();
-        assert_eq!(1, topics.len());
-
-        Ok(topics[0].clone())
-    }
-
-    /// Whether the broker knows a topic by that name.
-    async fn exists(storage: &Arc<dyn Storage>, name: &str) -> Result<bool, Error> {
-        let service = {
-            let storage = storage.clone();
-            MapStateLayer::new(|_| storage).into_layer(MetadataService)
-        };
-
-        let response = service
-            .serve(
-                Context::default(),
-                MetadataRequest::default()
-                    .topics(Some(
-                        [MetadataRequestTopic::default()
-                            .name(Some(name.into()))
-                            .topic_id(Some(NULL_TOPIC_ID))]
-                        .into(),
-                    ))
-                    .allow_auto_topic_creation(Some(false))
-                    .include_topic_authorized_operations(Some(false)),
-            )
-            .await?;
-
-        let topics = response.topics.unwrap_or_default();
-
-        Ok(topics
-            .iter()
-            .any(|topic| topic.name.as_deref() == Some(name) && topic.error_code == 0))
+        super::create(storage, name, (partitions, 1), validate_only).await
     }
 
     /// A topic name is not just a label: it is an object-store key component, a
@@ -470,10 +248,8 @@ mod refusals {
         assert_eq!(ErrorCode::None, ErrorCode::try_from(created.error_code)?);
 
         let dry_run = create(&storage, "taken", 1, true).await?;
-        assert_eq!(
-            ErrorCode::TopicAlreadyExists,
-            ErrorCode::try_from(dry_run.error_code)?,
-        );
+        let error_code = ErrorCode::try_from(dry_run.error_code)?;
+        assert_eq!(ErrorCode::TopicAlreadyExists, error_code);
 
         Ok(())
     }
@@ -500,4 +276,72 @@ mod refusals {
 
         Ok(())
     }
+}
+
+#[tokio::test]
+async fn a_creation_answers_what_was_asked() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let created = create(&storage().await?, "pqr", (5, 3), false).await?;
+    assert_eq!((ErrorCode::None, true), outcome(&created)?);
+    assert_eq!(("pqr", Some(5), Some(3)), shape(&created));
+
+    Ok(())
+}
+
+/// `-1` partitions and `-1` replicas are the broker defaults, 3 and 1, and the
+/// partitions they make are led by this node with no other replica.
+#[tokio::test]
+async fn minus_one_takes_the_broker_defaults() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = storage().await?;
+    let created = create(&storage, "pqr", (-1, -1), false).await?;
+    assert_eq!((ErrorCode::None, true), outcome(&created)?);
+    assert_eq!(("pqr", Some(3), Some(1)), shape(&created));
+
+    let topic = described(&storage, "pqr").await?;
+    let error_code = ErrorCode::try_from(topic.error_code)?;
+    assert_eq!(
+        (Some("pqr"), ErrorCode::None),
+        (topic.name.as_deref(), error_code)
+    );
+
+    let partitions = topic.partitions.unwrap_or_default();
+    let led = partitions
+        .iter()
+        .map(|p| {
+            let error_code = ErrorCode::try_from(p.error_code)?;
+            Ok((p.partition_index, p.leader_id, p.leader_epoch, error_code))
+        })
+        .collect::<Result<Vec<_>, Error>>()?;
+    let expected: Vec<_> = (0..3).map(|i| (i, NODE_ID, 0, ErrorCode::None)).collect();
+    assert_eq!(expected, led, "three partitions, each led by this node");
+
+    let first = &partitions[0];
+    let empty = |replicas: &Option<Vec<i32>>| replicas.as_deref().unwrap_or_default().is_empty();
+    assert!(empty(&first.offline_replicas));
+    assert!(empty(&first.last_known_elr));
+    assert!(empty(&first.eligible_leader_replicas));
+    assert_eq!(Some(vec![NODE_ID]), first.isr_nodes);
+
+    Ok(())
+}
+
+/// A second creation under the same name is refused, and answers no id.
+#[tokio::test]
+async fn a_duplicate_name_is_refused() -> Result<(), Error> {
+    let _guard = init_tracing()?;
+
+    let storage = storage().await?;
+    let first = create(&storage, "pqr", (5, 3), false).await?;
+    let second = create(&storage, "pqr", (5, 3), false).await?;
+    assert_eq!((ErrorCode::None, true), outcome(&first)?);
+    assert_eq!((ErrorCode::TopicAlreadyExists, false), outcome(&second)?);
+    assert_eq!(
+        [("pqr", Some(5), Some(3)); 2],
+        [shape(&first), shape(&second)]
+    );
+
+    Ok(())
 }

@@ -12,7 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, env::vars, fmt, result, str::FromStr};
+use std::collections::HashMap;
+use std::fmt;
+use std::result;
+use std::str::FromStr;
+
+use regex::Regex;
+use regex::Replacer;
 
 mod cli;
 
@@ -20,7 +26,6 @@ mod cli;
 mod harness;
 
 pub use cli::Cli;
-use regex::{Regex, Replacer};
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -69,18 +74,16 @@ impl From<HashMap<String, String>> for VarRep {
 
 impl VarRep {
     fn replace(&self, haystack: &str) -> Result<String> {
-        Regex::new(r"\$\{(?<var>[^\}]+)\}")
-            .map(|re| re.replace(haystack, self).into_owned())
-            .map_err(Into::into)
+        let reference = Regex::new(r"\$\{(?<var>[^\}]+)\}")?;
+        Ok(reference.replace(haystack, self).into_owned())
     }
 }
 
 impl Replacer for &VarRep {
     fn replace_append(&mut self, caps: &regex::Captures<'_>, dst: &mut String) {
-        if let Some(variable) = caps.name("var")
-            && let Some(value) = self.0.get(variable.as_str())
-        {
-            dst.push_str(value);
+        let known = caps.name("var").and_then(|name| self.0.get(name.as_str()));
+        if let Some(expansion) = known {
+            dst.push_str(expansion);
         }
     }
 }
@@ -102,10 +105,10 @@ where
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        VarRep::from(vars().collect::<HashMap<_, _>>())
-            .replace(s)
-            .and_then(|s| T::from_str(&s).map_err(Into::into))
-            .map(|t| Self(t))
+        let environment: HashMap<_, _> = std::env::vars().collect();
+        let expanded = VarRep::from(environment).replace(s)?;
+        let parsed = T::from_str(&expanded)?;
+        Ok(Self(parsed))
     }
 }
 

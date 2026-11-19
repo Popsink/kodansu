@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,499 +17,193 @@
 // it; with the module gone it belongs to the file.
 #![cfg(feature = "dynostore")]
 
-use std::sync::Arc;
+//! What `Storage::metadata` answers for no list, an empty list, and topics
+//! asked for by name and by id, known and unknown: always the one broker,
+//! and the topics as asked.
 
-use common::{alphanumeric_string, register_broker};
-use tansu_broker::Result;
-use tansu_sans_io::{ErrorCode, NULL_TOPIC_ID, create_topics_request::CreatableTopic};
-use tansu_storage::{Storage, TopicId};
-use tracing::debug;
-use url::Url;
-use uuid::Uuid;
+use rand::RngExt as _;
+use tansu_sans_io::create_topics_request::CreatableTopic;
+use tansu_sans_io::{ErrorCode, NULL_TOPIC_ID};
+use tansu_storage::{MetadataResponse, TopicId};
 
-use common::init_tracing;
-use rand::{prelude::*, rng};
 pub mod common;
 
-async fn storage_container(
-    cluster: impl Into<String>,
+type Engine = std::sync::Arc<dyn tansu_storage::Storage>;
+
+const PARTITIONS: i32 = 6;
+const REPLICAS: i16 = 3;
+
+/// A `memory://` engine advertising `tcp://example.com:9092/`, with that
+/// broker registered at a random node id.
+struct Cluster {
+    engine: Engine,
     node: i32,
-    advertised_listener: Url,
-) -> Result<Arc<dyn Storage>> {
-    common::storage_container(cluster, node, advertised_listener).await
+    listener: url::Url,
+}
+
+impl Cluster {
+    async fn registered() -> tansu_broker::Result<Self> {
+        let cluster = uuid::Uuid::now_v7();
+        let node = rand::rng().random_range(0..i32::MAX);
+        let listener = url::Url::parse("tcp://example.com:9092/")?;
+        let engine = common::storage_container(cluster, node, listener.clone()).await?;
+        tracing::debug!(broker_id = node, advertised_listener = %listener);
+        common::register_broker(cluster, node, engine.clone()).await?;
+        Ok(Self {
+            engine,
+            node,
+            listener,
+        })
+    }
+
+    /// A randomly named topic of six partitions held three times, with its id.
+    async fn created(&self) -> tansu_broker::Result<(String, uuid::Uuid)> {
+        let name = common::alphanumeric_string(15);
+        tracing::debug!(topic_name = ?name);
+        let topic = CreatableTopic::default()
+            .name(name.clone())
+            .num_partitions(PARTITIONS);
+        let topic = topic.replication_factor(REPLICAS).assignments(Some(vec![]));
+        let creating = self.engine.create_topic(topic.configs(Some(vec![])), false);
+        let id = creating.await?;
+        tracing::debug!(topic_id = ?id);
+        Ok((name, id))
+    }
+
+    /// Metadata for `topics`, asserting that it lists this broker alone.
+    async fn metadata(&self, topics: Option<&[TopicId]>) -> tansu_broker::Result<MetadataResponse> {
+        let answer = self.engine.metadata(topics).await?;
+        tracing::debug!(metadata = ?answer);
+
+        let brokers = answer.brokers();
+        assert_eq!(1, brokers.len());
+        let host = self.listener.host_str().unwrap_or("0.0.0.0");
+        let port = i32::from(self.listener.port().unwrap_or(9092));
+        let broker = &brokers[0];
+        assert_eq!(
+            (self.node, host, port),
+            (broker.node_id, broker.host.as_str(), broker.port)
+        );
+        Ok(answer)
+    }
+
+    /// Asserts that `metadata` holds one topic, `name` at `id`, error-free, with six partitions
+    /// each led by this broker at epoch 0 and held by it three times over.
+    fn assert_found(&self, metadata: &MetadataResponse, name: &str, id: uuid::Uuid) {
+        let [topic] = metadata.topics() else {
+            panic!("one topic in {metadata:?}")
+        };
+        assert_eq!(i16::from(ErrorCode::None), topic.error_code);
+        assert_eq!(Some(name), topic.name.as_deref());
+        assert_eq!(Some(id.as_bytes()), topic.topic_id.as_ref());
+
+        let partitions = topic.partitions.as_deref().unwrap_or_default();
+        assert_eq!(PARTITIONS as usize, partitions.len());
+        let everywhere = vec![self.node; REPLICAS as usize];
+        for partition in partitions {
+            tracing::debug!(?partition);
+            assert_eq!(
+                (self.node, Some(0)),
+                (partition.leader_id, partition.leader_epoch)
+            );
+            assert!(
+                partition
+                    .offline_replicas
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+            );
+            assert_eq!(
+                &everywhere[..],
+                partition.replica_nodes.as_deref().unwrap_or_default()
+            );
+            assert_eq!(
+                &everywhere[..],
+                partition.isr_nodes.as_deref().unwrap_or_default()
+            );
+        }
+    }
+}
+
+/// Asserts that `metadata` holds one topic, unknown, as the request named it.
+fn assert_unknown(metadata: &MetadataResponse, name: Option<&str>, id: &[u8; 16]) {
+    let [topic] = metadata.topics() else {
+        panic!("one topic in {metadata:?}")
+    };
+    let unknown = i16::from(ErrorCode::UnknownTopicOrPartition);
+    assert_eq!((unknown, name), (topic.error_code, topic.name.as_deref()));
+    assert_eq!(Some(id), topic.topic_id.as_ref());
 }
 
 #[tokio::test]
-async fn topics_none() -> Result<()> {
-    let _guard = init_tracing()?;
+async fn no_list_answers_every_topic() -> tansu_broker::Result<()> {
+    let _guard = common::init_tracing()?;
+    let cluster = Cluster::registered().await?;
+    let (name, id) = cluster.created().await?;
 
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let advertised_listener = Url::parse("tcp://example.com:9092/")?;
-    let sc = storage_container(cluster_id, broker_id, advertised_listener.clone()).await?;
-
-    debug!(broker_id, %advertised_listener);
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let num_partitions = 6;
-    let replication_factor = 3;
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let id = sc
-        .create_topic(
-            CreatableTopic::default()
-                .name(topic_name.clone())
-                .num_partitions(num_partitions)
-                .replication_factor(replication_factor)
-                .assignments(assignments.clone())
-                .configs(configs.clone()),
-            false,
-        )
-        .await
-        .inspect(|topic_id| debug!(?topic_id))?;
-
-    let metadata = sc
-        .metadata(None)
-        .await
-        .inspect(|metadata| debug!(?metadata))?;
-
-    assert_eq!(1, metadata.brokers().len());
-    assert_eq!(broker_id, metadata.brokers()[0].node_id);
-    assert_eq!(
-        advertised_listener.host_str().unwrap_or("0.0.0.0"),
-        metadata.brokers()[0].host
-    );
-    assert_eq!(
-        advertised_listener.port().unwrap_or(9092) as i32,
-        metadata.brokers()[0].port
-    );
-
-    assert_eq!(1, metadata.topics().len());
-    assert_eq!(i16::from(ErrorCode::None), metadata.topics()[0].error_code);
-    assert_eq!(Some(topic_name), metadata.topics()[0].name);
-    assert_eq!(Some(id.as_bytes()), metadata.topics()[0].topic_id.as_ref());
-
-    let partitions = metadata.topics()[0]
-        .partitions
-        .as_deref()
-        .unwrap_or_default();
-
-    assert_eq!(num_partitions, partitions.len() as i32);
-
-    assert!(
-        partitions
-            .iter()
-            .map(|partition| partition.leader_id)
-            .inspect(|leader_id| debug!(leader_id))
-            .all(|leader_id| leader_id == broker_id)
-    );
-
-    assert!(
-        partitions
-            .iter()
-            .map(|partition| partition.leader_epoch)
-            .inspect(|leader_epoch| debug!(leader_epoch))
-            .all(|leader_epoch| leader_epoch == Some(0))
-    );
-
-    assert!(
-        partitions
-            .iter()
-            .map(|partition| partition.offline_replicas.as_deref().unwrap_or_default())
-            .inspect(|offline_replicas| debug!(?offline_replicas))
-            .all(|offline_replicas| offline_replicas.is_empty())
-    );
-
-    assert!(
-        partitions
-            .iter()
-            .map(|partition| partition.replica_nodes.as_deref().unwrap_or_default())
-            .inspect(|replica_nodes| debug!(?replica_nodes))
-            .all(
-                |replica_nodes| (replica_nodes.len() as i16) == replication_factor
-                    && replica_nodes
-                        .iter()
-                        .all(|replica_node| *replica_node == broker_id)
-            )
-    );
-
-    assert!(
-        partitions
-            .iter()
-            .map(|partition| partition.isr_nodes.as_deref().unwrap_or_default())
-            .inspect(|isr_nodes| debug!(?isr_nodes))
-            .all(|isr_nodes| {
-                (isr_nodes.len() as i16) == replication_factor
-                    && isr_nodes.iter().all(|isr_node| *isr_node == broker_id)
-            })
-    );
-
+    let metadata = cluster.metadata(None).await?;
+    cluster.assert_found(&metadata, &name, id);
     Ok(())
 }
 
-/// An empty list asks for the brokers and no topic at all (#593); `topics_none`
-/// is the request for every topic.
+/// An empty list asks for the brokers and no topic at all (#593);
+/// `no_list_answers_every_topic` is the request for every topic.
 #[tokio::test]
-async fn topics_some_empty() -> Result<()> {
-    let _guard = init_tracing()?;
+async fn an_empty_list_answers_no_topic() -> tansu_broker::Result<()> {
+    let _guard = common::init_tracing()?;
+    let cluster = Cluster::registered().await?;
+    let _created = cluster.created().await?;
 
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let advertised_listener = Url::parse("tcp://example.com:9092/")?;
-    let sc = storage_container(cluster_id, broker_id, advertised_listener.clone()).await?;
-
-    debug!(broker_id, %advertised_listener);
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let num_partitions = 6;
-    let replication_factor = 3;
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    _ = sc
-        .create_topic(
-            CreatableTopic::default()
-                .name(topic_name.clone())
-                .num_partitions(num_partitions)
-                .replication_factor(replication_factor)
-                .assignments(assignments.clone())
-                .configs(configs.clone()),
-            false,
-        )
-        .await
-        .inspect(|topic_id| debug!(?topic_id))?;
-
-    let metadata = sc
-        .metadata(Some([].as_slice()))
-        .await
-        .inspect(|metadata| debug!(?metadata))?;
-
-    assert_eq!(1, metadata.brokers().len());
-    assert_eq!(broker_id, metadata.brokers()[0].node_id);
-    assert_eq!(
-        advertised_listener.host_str().unwrap_or("0.0.0.0"),
-        metadata.brokers()[0].host
-    );
-    assert_eq!(
-        advertised_listener.port().unwrap_or(9092) as i32,
-        metadata.brokers()[0].port
-    );
-
+    let metadata = cluster.metadata(Some(&[])).await?;
     assert!(metadata.topics().is_empty());
-
     Ok(())
 }
 
 #[tokio::test]
-async fn topics_some_matching_by_name() -> Result<()> {
-    let _guard = init_tracing()?;
+async fn a_known_name_answers_its_topic() -> tansu_broker::Result<()> {
+    let _guard = common::init_tracing()?;
+    let cluster = Cluster::registered().await?;
+    let (name, id) = cluster.created().await?;
 
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let advertised_listener = Url::parse("tcp://example.com:9092/")?;
-    let sc = storage_container(cluster_id, broker_id, advertised_listener.clone()).await?;
-
-    debug!(broker_id, %advertised_listener);
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let num_partitions = 6;
-    let replication_factor = 3;
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let id = sc
-        .create_topic(
-            CreatableTopic::default()
-                .name(topic_name.clone())
-                .num_partitions(num_partitions)
-                .replication_factor(replication_factor)
-                .assignments(assignments.clone())
-                .configs(configs.clone()),
-            false,
-        )
-        .await
-        .inspect(|topic_id| debug!(?topic_id))?;
-
-    let metadata = sc
-        .metadata(Some([TopicId::Name(topic_name.clone())].as_slice()))
-        .await
-        .inspect(|metadata| debug!(?metadata))?;
-
-    assert_eq!(1, metadata.brokers().len());
-    assert_eq!(broker_id, metadata.brokers()[0].node_id);
-    assert_eq!(
-        advertised_listener.host_str().unwrap_or("0.0.0.0"),
-        metadata.brokers()[0].host
-    );
-    assert_eq!(
-        advertised_listener.port().unwrap_or(9092) as i32,
-        metadata.brokers()[0].port
-    );
-
-    assert_eq!(1, metadata.topics().len());
-    assert_eq!(i16::from(ErrorCode::None), metadata.topics()[0].error_code);
-    assert_eq!(Some(topic_name), metadata.topics()[0].name);
-    assert_eq!(Some(id.as_bytes()), metadata.topics()[0].topic_id.as_ref());
-
-    let partitions = metadata.topics()[0]
-        .partitions
-        .as_deref()
-        .unwrap_or_default();
-
-    assert_eq!(num_partitions, partitions.len() as i32);
-
-    assert!(
-        partitions
-            .iter()
-            .map(|partition| partition.leader_id)
-            .inspect(|leader_id| debug!(leader_id))
-            .all(|leader_id| leader_id == broker_id)
-    );
-
-    assert!(
-        partitions
-            .iter()
-            .map(|partition| partition.leader_epoch)
-            .inspect(|leader_epoch| debug!(leader_epoch))
-            .all(|leader_epoch| leader_epoch == Some(0))
-    );
-
-    assert!(
-        partitions
-            .iter()
-            .map(|partition| partition.offline_replicas.as_deref().unwrap_or_default())
-            .inspect(|offline_replicas| debug!(?offline_replicas))
-            .all(|offline_replicas| offline_replicas.is_empty())
-    );
-
-    assert!(
-        partitions
-            .iter()
-            .map(|partition| partition.replica_nodes.as_deref().unwrap_or_default())
-            .inspect(|replica_nodes| debug!(?replica_nodes))
-            .all(
-                |replica_nodes| (replica_nodes.len() as i16) == replication_factor
-                    && replica_nodes
-                        .iter()
-                        .all(|replica_node| *replica_node == broker_id)
-            )
-    );
-
-    assert!(
-        partitions
-            .iter()
-            .map(|partition| partition.isr_nodes.as_deref().unwrap_or_default())
-            .inspect(|isr_nodes| debug!(?isr_nodes))
-            .all(|isr_nodes| {
-                (isr_nodes.len() as i16) == replication_factor
-                    && isr_nodes.iter().all(|isr_node| *isr_node == broker_id)
-            })
-    );
-
+    let metadata = cluster
+        .metadata(Some(&[TopicId::Name(name.clone())]))
+        .await?;
+    cluster.assert_found(&metadata, &name, id);
     Ok(())
 }
 
 #[tokio::test]
-async fn topics_some_not_matching_by_name() -> Result<()> {
-    let _guard = init_tracing()?;
+async fn an_unknown_name_answers_unknown_with_a_null_id() -> tansu_broker::Result<()> {
+    let _guard = common::init_tracing()?;
+    let cluster = Cluster::registered().await?;
+    let name = common::alphanumeric_string(15);
+    tracing::debug!(topic_name = ?name);
 
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let advertised_listener = Url::parse("tcp://example.com:9092/")?;
-    let sc = storage_container(cluster_id, broker_id, advertised_listener.clone()).await?;
-
-    debug!(broker_id, %advertised_listener);
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let metadata = sc
-        .metadata(Some([TopicId::Name(topic_name.clone())].as_slice()))
-        .await
-        .inspect(|metadata| debug!(?metadata))?;
-
-    assert_eq!(1, metadata.brokers().len());
-    assert_eq!(broker_id, metadata.brokers()[0].node_id);
-    assert_eq!(
-        advertised_listener.host_str().unwrap_or("0.0.0.0"),
-        metadata.brokers()[0].host
-    );
-    assert_eq!(
-        advertised_listener.port().unwrap_or(9092) as i32,
-        metadata.brokers()[0].port
-    );
-
-    assert_eq!(1, metadata.topics().len());
-    assert_eq!(
-        i16::from(ErrorCode::UnknownTopicOrPartition),
-        metadata.topics()[0].error_code
-    );
-    assert_eq!(Some(topic_name), metadata.topics()[0].name);
-    assert_eq!(Some(&NULL_TOPIC_ID), metadata.topics()[0].topic_id.as_ref());
-
+    let metadata = cluster
+        .metadata(Some(&[TopicId::Name(name.clone())]))
+        .await?;
+    assert_unknown(&metadata, Some(&name), &NULL_TOPIC_ID);
     Ok(())
 }
 
 #[tokio::test]
-async fn topics_some_matching_by_id() -> Result<()> {
-    let _guard = init_tracing()?;
+async fn a_known_id_answers_its_topic() -> tansu_broker::Result<()> {
+    let _guard = common::init_tracing()?;
+    let cluster = Cluster::registered().await?;
+    let (name, id) = cluster.created().await?;
 
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let advertised_listener = Url::parse("tcp://example.com:9092/")?;
-    let sc = storage_container(cluster_id, broker_id, advertised_listener.clone()).await?;
-
-    debug!(broker_id, %advertised_listener);
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let num_partitions = 6;
-    let replication_factor = 3;
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let id = sc
-        .create_topic(
-            CreatableTopic::default()
-                .name(topic_name.clone())
-                .num_partitions(num_partitions)
-                .replication_factor(replication_factor)
-                .assignments(assignments.clone())
-                .configs(configs.clone()),
-            false,
-        )
-        .await
-        .inspect(|topic_id| debug!(?topic_id))?;
-
-    let metadata = sc
-        .metadata(Some([TopicId::Id(id)].as_slice()))
-        .await
-        .inspect(|metadata| debug!(?metadata))?;
-
-    assert_eq!(1, metadata.brokers().len());
-    assert_eq!(broker_id, metadata.brokers()[0].node_id);
-    assert_eq!(
-        advertised_listener.host_str().unwrap_or("0.0.0.0"),
-        metadata.brokers()[0].host
-    );
-    assert_eq!(
-        advertised_listener.port().unwrap_or(9092) as i32,
-        metadata.brokers()[0].port
-    );
-
-    assert_eq!(1, metadata.topics().len());
-    assert_eq!(i16::from(ErrorCode::None), metadata.topics()[0].error_code);
-    assert_eq!(Some(topic_name), metadata.topics()[0].name);
-    assert_eq!(Some(id.as_bytes()), metadata.topics()[0].topic_id.as_ref());
-
-    let partitions = metadata.topics()[0]
-        .partitions
-        .as_deref()
-        .unwrap_or_default();
-
-    assert_eq!(num_partitions, partitions.len() as i32);
-
-    assert!(
-        partitions
-            .iter()
-            .map(|partition| partition.leader_id)
-            .inspect(|leader_id| debug!(leader_id))
-            .all(|leader_id| leader_id == broker_id)
-    );
-
-    assert!(
-        partitions
-            .iter()
-            .map(|partition| partition.leader_epoch)
-            .inspect(|leader_epoch| debug!(leader_epoch))
-            .all(|leader_epoch| leader_epoch == Some(0))
-    );
-
-    assert!(
-        partitions
-            .iter()
-            .map(|partition| partition.offline_replicas.as_deref().unwrap_or_default())
-            .inspect(|offline_replicas| debug!(?offline_replicas))
-            .all(|offline_replicas| offline_replicas.is_empty())
-    );
-
-    assert!(
-        partitions
-            .iter()
-            .map(|partition| partition.replica_nodes.as_deref().unwrap_or_default())
-            .inspect(|replica_nodes| debug!(?replica_nodes))
-            .all(
-                |replica_nodes| (replica_nodes.len() as i16) == replication_factor
-                    && replica_nodes
-                        .iter()
-                        .all(|replica_node| *replica_node == broker_id)
-            )
-    );
-
-    assert!(
-        partitions
-            .iter()
-            .map(|partition| partition.isr_nodes.as_deref().unwrap_or_default())
-            .inspect(|isr_nodes| debug!(?isr_nodes))
-            .all(|isr_nodes| {
-                (isr_nodes.len() as i16) == replication_factor
-                    && isr_nodes.iter().all(|isr_node| *isr_node == broker_id)
-            })
-    );
-
+    let metadata = cluster.metadata(Some(&[TopicId::Id(id)])).await?;
+    cluster.assert_found(&metadata, &name, id);
     Ok(())
 }
 
 #[tokio::test]
-async fn topics_some_not_matching_by_id() -> Result<()> {
-    let _guard = init_tracing()?;
+async fn an_unknown_id_answers_unknown_without_a_name() -> tansu_broker::Result<()> {
+    let _guard = common::init_tracing()?;
+    let cluster = Cluster::registered().await?;
+    let id = uuid::Uuid::new_v4();
 
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let advertised_listener = Url::parse("tcp://example.com:9092/")?;
-    let sc = storage_container(cluster_id, broker_id, advertised_listener.clone()).await?;
-
-    debug!(broker_id, %advertised_listener);
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let id = Uuid::new_v4();
-
-    let metadata = sc
-        .metadata(Some([TopicId::Id(id)].as_slice()))
-        .await
-        .inspect(|metadata| debug!(?metadata))?;
-
-    assert_eq!(1, metadata.brokers().len());
-    assert_eq!(broker_id, metadata.brokers()[0].node_id);
-    assert_eq!(
-        advertised_listener.host_str().unwrap_or("0.0.0.0"),
-        metadata.brokers()[0].host
-    );
-    assert_eq!(
-        advertised_listener.port().unwrap_or(9092) as i32,
-        metadata.brokers()[0].port
-    );
-
-    assert_eq!(1, metadata.topics().len());
-    assert_eq!(
-        i16::from(ErrorCode::UnknownTopicOrPartition),
-        metadata.topics()[0].error_code
-    );
-    assert_eq!(None, metadata.topics()[0].name);
-    assert_eq!(Some(id.as_bytes()), metadata.topics()[0].topic_id.as_ref());
-
+    let metadata = cluster.metadata(Some(&[TopicId::Id(id)])).await?;
+    assert_unknown(&metadata, None, id.as_bytes());
     Ok(())
 }

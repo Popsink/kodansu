@@ -196,13 +196,13 @@ where clippy says 228. Quote the clippy number when
 moving the threshold, or the two disagree by a factor of two.
 
 The threshold is deliberately set on **shipped** code. Test and bench targets
-run over it — a 1536-line body in `tansu-sans-io/tests/snappy.rs`, two
-400-plus-line `DescribeConfigs` fixtures in
+can run over it — two 400-plus-line `DescribeConfigs` fixtures in
 `tansu-sans-io/tests/golden.rs` — because a golden fixture is a byte table and
 a protocol test is a script, neither of which shortens. Widening the threshold
-to swallow a fixture table would have set it at 1536 and gated nothing, so
-those carry an `#[allow]` instead, on the item where that is only two of a
-file's bodies and on the file where it is all of them.
+to swallow a fixture table would gate nothing, so those carry an `#[allow]` on
+the item instead. `tansu-sans-io/tests/snappy.rs` carried one on the whole
+file for a 1536-line body until its captures became hex constants behind one
+shared assertion, and it went with them.
 
 #553 took the count down rather than the threshold up: the near-copies in
 `tansu-broker/tests/policy_compact_delete.rs` and the fixture tables written
@@ -666,10 +666,11 @@ The nextest phase is already close to its floor: the slowest single test is 58s,
 so the 813 tests cost 64s wall. Sharding across runners would buy at most ~35s
 and cost a full compile per shard.
 
-That 58s floor is four tests — `new_cg::consumer_next_action_{08,16,24,32}c` —
+That 58s floor is four tests — `new_cg::churn_of_{08,16,24,32}_members` (then named
+`consumer_next_action_{08,16,24,32}c`) —
 which drive a consumer group simulation through `LatencyIntroducingLayer`, i.e.
 real `tokio::time::sleep` calls. `#[tokio::test(start_paused = true)]` takes
-`consumer_next_action_08c` from 48s to 0.14s, but it then fails: the group
+`churn_of_08_members` from 48s to 0.14s, but it then fails: the group
 coordinator ages member sessions off `SystemTime::now()`, which does not advance
 under a paused clock, so transient members are never evicted and the assertion on
 a settled generation fails. Wall-clock is load-bearing there until session expiry

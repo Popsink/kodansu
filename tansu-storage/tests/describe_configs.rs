@@ -1,4 +1,3 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
 // Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -13,47 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{Error, cluster_id, init_tracing, storage_url};
-use rama::{Context, Layer as _, Service, layer::MapStateLayer};
+//! `DescribeConfigs` against topics that exist, never existed, and were
+//! deleted.
+
 use std::sync::Arc;
-use tansu_sans_io::{
-    ConfigResource, DescribeConfigsRequest, DescribeConfigsResponse, ErrorCode,
-    create_topics_request::CreatableTopic, describe_configs_request::DescribeConfigsResource,
-};
-use tansu_storage::{DescribeConfigsService, Storage, StorageContainer, TopicId};
-use url::Url;
+
+use tansu_sans_io::describe_configs_request::DescribeConfigsResource;
+use tansu_sans_io::{ConfigResource, DescribeConfigsRequest, DescribeConfigsResponse, ErrorCode};
+use tansu_storage::{DescribeConfigsService, Storage, TopicId};
+
+use crate::common::{Error, init_tracing, serve, storage, topic};
 
 mod common;
 
-async fn storage() -> Result<Arc<dyn Storage>, Error> {
-    StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(111)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(storage_url()?)
-        .build()
-        .await
-        .map_err(Into::into)
+/// Every config of topic `name`.
+async fn describe(
+    storage: &Arc<dyn Storage>,
+    name: &str,
+) -> Result<DescribeConfigsResponse, Error> {
+    let resource = DescribeConfigsResource::default()
+        .resource_type(i8::from(ConfigResource::Topic))
+        .resource_name(name.to_owned())
+        .configuration_keys(Some(Vec::new()));
+    let request = DescribeConfigsRequest::default().resources(Some(vec![resource]));
+    serve(storage, DescribeConfigsService, request).await
 }
 
-async fn describe(storage: Arc<dyn Storage>, name: &str) -> Result<DescribeConfigsResponse, Error> {
-    MapStateLayer::new(|_| storage)
-        .into_layer(DescribeConfigsService)
-        .serve(
-            Context::default(),
-            DescribeConfigsRequest::default()
-                .include_documentation(Some(false))
-                .include_synonyms(Some(false))
-                .resources(Some(
-                    [DescribeConfigsResource::default()
-                        .resource_name(name.into())
-                        .resource_type(ConfigResource::Topic.into())
-                        .configuration_keys(Some([].into()))]
-                    .into(),
-                )),
-        )
-        .await
-        .map_err(Into::into)
+/// The error code of the one result a single-resource describe returns.
+fn outcome(response: &DescribeConfigsResponse) -> Result<ErrorCode, Error> {
+    let results = response.results.as_deref().unwrap_or_default();
+    assert_eq!(1, results.len());
+    Ok(ErrorCode::try_from(results[0].error_code)?)
 }
 
 /// A topic that exists is described, and the broker-level defaults it was
@@ -65,24 +54,12 @@ async fn an_existing_topic_is_described() -> Result<(), Error> {
     let storage = storage().await?;
     let name = "abcba";
 
-    _ = storage
-        .create_topic(
-            CreatableTopic::default()
-                .name(name.into())
-                .num_partitions(1)
-                .replication_factor(1)
-                .assignments(Some([].into()))
-                .configs(Some([].into())),
-            false,
-        )
-        .await?;
+    topic(&storage, name).await?;
 
-    let response = describe(storage, name).await?;
-
-    let results = response.results.unwrap_or_default();
-    assert_eq!(1, results.len());
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(results[0].error_code)?);
-    assert!(!results[0].configs.as_deref().unwrap_or_default().is_empty());
+    let response = describe(&storage, name).await?;
+    assert_eq!(ErrorCode::None, outcome(&response)?);
+    let configs = response.results.unwrap_or_default().remove(0).configs;
+    assert!(!configs.unwrap_or_default().is_empty());
 
     Ok(())
 }
@@ -97,16 +74,11 @@ async fn an_existing_topic_is_described() -> Result<(), Error> {
 async fn a_topic_that_does_not_exist_is_unknown() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let response = describe(storage().await?, "never-created").await?;
-
-    let results = response.results.unwrap_or_default();
-    assert_eq!(1, results.len());
-    assert_eq!(
-        ErrorCode::UnknownTopicOrPartition,
-        ErrorCode::try_from(results[0].error_code)?
-    );
-    assert_eq!("never-created", results[0].resource_name.as_str());
-    assert!(results[0].configs.as_deref().unwrap_or_default().is_empty());
+    let response = describe(&storage().await?, "never-created").await?;
+    assert_eq!(ErrorCode::UnknownTopicOrPartition, outcome(&response)?);
+    let result = response.results.unwrap_or_default().remove(0);
+    assert_eq!("never-created", result.resource_name);
+    assert!(result.configs.unwrap_or_default().is_empty());
 
     Ok(())
 }
@@ -120,40 +92,17 @@ async fn a_deleted_topic_is_unknown_again() -> Result<(), Error> {
     let storage = storage().await?;
     let name = "transient";
 
-    _ = storage
-        .create_topic(
-            CreatableTopic::default()
-                .name(name.into())
-                .num_partitions(1)
-                .replication_factor(1)
-                .assignments(Some([].into()))
-                .configs(Some([].into())),
-            false,
-        )
-        .await?;
+    topic(&storage, name).await?;
 
-    assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(
-            describe(storage.clone(), name)
-                .await?
-                .results
-                .unwrap_or_default()[0]
-                .error_code
-        )?
-    );
+    assert_eq!(ErrorCode::None, outcome(&describe(&storage, name).await?)?);
 
     assert_eq!(
         ErrorCode::None,
         storage.delete_topic(&TopicId::Name(name.into())).await?
     );
 
-    assert_eq!(
-        ErrorCode::UnknownTopicOrPartition,
-        ErrorCode::try_from(
-            describe(storage, name).await?.results.unwrap_or_default()[0].error_code
-        )?
-    );
+    let after = describe(&storage, name).await?;
+    assert_eq!(ErrorCode::UnknownTopicOrPartition, outcome(&after)?);
 
     Ok(())
 }

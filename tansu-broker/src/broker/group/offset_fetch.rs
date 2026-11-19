@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,37 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rama::{Context, Service};
-use tansu_sans_io::{ApiKey, Frame, Header, OffsetFetchRequest};
-use tracing::instrument;
+//! `OffsetFetch`: the positions a group has committed.
 
-use super::answer;
-use tansu_sans_io::{
-    ErrorCode,
-    acl::{Operation, Resource},
-};
+use tansu_sans_io::acl::{Operation, Resource};
+use tansu_sans_io::{ErrorCode, OffsetFetchRequest};
 use tansu_storage::authorized;
 
-use crate::{Error, Result, coordinator::group::Coordinator};
+use super::answer;
+use super::handler::respond;
+use crate::Error;
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct OffsetFetchService;
+group_service! {
+    OffsetFetchService: OffsetFetchRequest,
+    |ctx, frame| {
+        let correlation_id = frame.correlation_id()?;
+        let OffsetFetchRequest {
+            group_id,
+            topics,
+            groups,
+            require_stable,
+            ..
+        } = OffsetFetchRequest::try_from(frame.body)?;
 
-impl ApiKey for OffsetFetchService {
-    const KEY: i16 = OffsetFetchRequest::KEY;
-}
-
-impl<C> Service<C, Frame> for OffsetFetchService
-where
-    C: Coordinator,
-{
-    type Response = Frame;
-    type Error = Error;
-
-    #[instrument(skip(ctx, req))]
-    async fn serve(&self, mut ctx: Context<C>, req: Frame) -> Result<Self::Response, Self::Error> {
-        let correlation_id = req.correlation_id()?;
-        let offset_fetch = OffsetFetchRequest::try_from(req.body)?;
+        let refused = |error_code| answer::offset_fetch(error_code, groups.as_deref());
 
         // Every group the request names, in either shape: `group_id` below v8,
         // the `groups` array from v8. Refused as a whole rather than per group,
@@ -50,58 +42,28 @@ where
         // request would need a response shape that does not exist here, and
         // stamping the refusal on the allowed groups too would be worse than
         // refusing the call the client can retry one group at a time.
-        let mut named = offset_fetch.group_id.iter().cloned().collect::<Vec<_>>();
-
-        named.extend(
-            offset_fetch
-                .groups
-                .iter()
-                .flatten()
-                .map(|group| group.group_id.clone()),
-        );
-
-        for group_id in &named {
-            if !authorized(&ctx, Resource::Group, group_id, Operation::Describe).await {
-                return Ok(Frame {
-                    size: 0,
-                    header: Header::Response { correlation_id },
-                    body: answer::offset_fetch(
-                        ErrorCode::GroupAuthorizationFailed,
-                        offset_fetch.groups.as_deref(),
-                    ),
-                });
+        let named = group_id
+            .iter()
+            .chain(groups.iter().flatten().map(|group| &group.group_id));
+        for name in named {
+            if !authorized(&ctx, Resource::Group, name, Operation::Describe).await {
+                return Ok(respond(correlation_id, refused(ErrorCode::GroupAuthorizationFailed)));
             }
         }
 
-        let coordinator = ctx.state_mut();
-
-        coordinator
-            .offset_fetch(
-                offset_fetch.group_id.as_deref(),
-                offset_fetch.topics.as_deref(),
-                offset_fetch.groups.as_deref(),
-                offset_fetch.require_stable,
-            )
-            .await
-            .or_else(|error| match error {
-                // An `Error::Api` is an answer the broker chose, not a failure.
-                // Answering it here is what stops it from ending the connection
-                // with no response written — `early eof` to the caller (#300). See
-                // [`super::answer`]. Storage answers a failed offsets read the
-                // same way (#607).
-                Error::Api(error_code) | Error::Storage(tansu_storage::Error::Api(error_code)) => {
-                    Ok(answer::offset_fetch(
-                        error_code,
-                        offset_fetch.groups.as_deref(),
-                    ))
-                }
-
-                otherwise => Err(otherwise),
-            })
-            .map(|body| Frame {
-                size: 0,
-                header: Header::Response { correlation_id },
-                body,
-            })
+        let fetched = ctx
+            .state_mut()
+            .offset_fetch(group_id.as_deref(), topics.as_deref(), groups.as_deref(), require_stable)
+            .await;
+        match fetched {
+            Ok(body) => Ok(respond(correlation_id, body)),
+            // Answered rather than ending the connection, as every group
+            // service answers an `Error::Api` (#300) — and storage answers a
+            // failed offsets read the same way (#607).
+            Err(Error::Api(error_code) | Error::Storage(tansu_storage::Error::Api(error_code))) => {
+                Ok(respond(correlation_id, refused(error_code)))
+            }
+            Err(otherwise) => Err(otherwise),
+        }
     }
 }

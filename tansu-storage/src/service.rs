@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[macro_use]
+mod handler;
+
 mod alter_client_quotas;
 mod alter_user_scram_credentials;
 mod consumer_group_describe;

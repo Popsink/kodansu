@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,91 +12,45 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rama::{Context, Service};
-use tansu_sans_io::{ApiKey, Frame, Header, OffsetCommitRequest};
-use tracing::instrument;
+//! `OffsetCommit`: a group commits the positions its members have consumed to.
 
-use super::answer;
-use tansu_sans_io::{
-    ErrorCode,
-    acl::{Operation, Resource},
-};
+use tansu_sans_io::acl::{Operation, Resource};
+use tansu_sans_io::{ErrorCode, OffsetCommitRequest};
 use tansu_storage::authorized;
 
-use crate::{
-    Error, Result,
-    coordinator::group::{Coordinator, OffsetCommit},
-};
+use super::answer;
+use super::handler::{answered, respond};
+use crate::coordinator::group::OffsetCommit;
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct OffsetCommitService;
+group_service! {
+    OffsetCommitService: OffsetCommitRequest,
+    |ctx, frame| {
+        let correlation_id = frame.correlation_id()?;
+        let OffsetCommitRequest {
+            group_id,
+            generation_id_or_member_epoch,
+            member_id,
+            group_instance_id,
+            retention_time_ms,
+            topics,
+            ..
+        } = OffsetCommitRequest::try_from(frame.body)?;
 
-impl ApiKey for OffsetCommitService {
-    const KEY: i16 = OffsetCommitRequest::KEY;
-}
+        let refused = |error_code| answer::offset_commit(error_code, topics.as_deref());
 
-impl<C> Service<C, Frame> for OffsetCommitService
-where
-    C: Coordinator,
-{
-    type Response = Frame;
-    type Error = Error;
-
-    #[instrument(skip(ctx, req))]
-    async fn serve(&self, mut ctx: Context<C>, req: Frame) -> Result<Self::Response, Self::Error> {
-        let correlation_id = req.correlation_id()?;
-        let mut offset_commit = OffsetCommitRequest::try_from(req.body)?;
-
-        _ = offset_commit
-            .retention_time_ms
-            .take_if(|retention_ms| retention_ms.is_negative());
-
-        if !authorized(
-            &ctx,
-            Resource::Group,
-            &offset_commit.group_id,
-            Operation::Read,
-        )
-        .await
-        {
-            return Ok(Frame {
-                size: 0,
-                header: Header::Response { correlation_id },
-                body: answer::offset_commit(
-                    ErrorCode::GroupAuthorizationFailed,
-                    offset_commit.topics.as_deref(),
-                ),
-            });
+        if !authorized(&ctx, Resource::Group, &group_id, Operation::Read).await {
+            return Ok(respond(correlation_id, refused(ErrorCode::GroupAuthorizationFailed)));
         }
 
-        let coordinator = ctx.state_mut();
-
-        coordinator
-            .offset_commit(OffsetCommit {
-                group_id: offset_commit.group_id.as_str(),
-                generation_id_or_member_epoch: offset_commit.generation_id_or_member_epoch,
-                member_id: offset_commit.member_id.as_deref(),
-                group_instance_id: offset_commit.group_instance_id.as_deref(),
-                retention_time_ms: offset_commit.retention_time_ms,
-                topics: offset_commit.topics.as_deref(),
-            })
-            .await
-            .or_else(|error| match error {
-                // An `Error::Api` is an answer the broker chose, not a failure.
-                // Answering it here is what stops it from ending the connection
-                // with no response written — `early eof` to the caller (#300). See
-                // [`super::answer`].
-                Error::Api(error_code) => Ok(answer::offset_commit(
-                    error_code,
-                    offset_commit.topics.as_deref(),
-                )),
-
-                otherwise => Err(otherwise),
-            })
-            .map(|body| Frame {
-                size: 0,
-                header: Header::Response { correlation_id },
-                body,
-            })
+        let commit = OffsetCommit {
+            group_id: &group_id,
+            generation_id_or_member_epoch,
+            member_id: member_id.as_deref(),
+            group_instance_id: group_instance_id.as_deref(),
+            retention_time_ms: retention_time_ms.filter(|ms| !ms.is_negative()),
+            topics: topics.as_deref(),
+        };
+        let committed = ctx.state_mut().offset_commit(commit).await;
+        answered(committed, refused).map(|body| respond(correlation_id, body))
     }
 }

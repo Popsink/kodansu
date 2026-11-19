@@ -118,7 +118,7 @@ async fn url_batch_count_threshold_reaches_the_segment_flush() -> Result<(), Err
     )
     .await
     .map_err(|_| {
-        Error::Message(format!(
+        Error::Failed(format!(
             "{BATCHES} batches did not flush: the URL's coalesce_batches never reached the flush"
         ))
     })?;

@@ -12,57 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rama::{Context, Service};
-use tansu_sans_io::{
-    ApiKey, DeleteTopicsRequest, DeleteTopicsResponse, ErrorCode,
-    delete_topics_response::DeletableTopicResult,
-};
-use tracing::instrument;
-
+use rama::Context;
+use rama::Service;
 use tansu_sans_io::acl::{Operation, Resource};
+use tansu_sans_io::delete_topics_response::DeletableTopicResult;
+use tansu_sans_io::{ApiKey, DeleteTopicsRequest, DeleteTopicsResponse, ErrorCode};
 
-use crate::{Error, Result, Storage, authorized, enforcing};
+use crate::{Error, Result};
+use crate::{Storage, authorized, enforcing};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`DeleteTopicsRequest`] returning [`DeleteTopicsResponse`].
+/// Deletes each topic a `DeleteTopics` request names, by id or by name,
+/// answering one result per topic: refused where the principal may not
+/// delete it, otherwise whatever [`Storage::delete_topic`] answered.
 /// ```
-/// use rama::{Context, Layer, Service as _, layer::MapStateLayer};
-/// use tansu_sans_io::{DeleteTopicsRequest, DeleteTopicsResponse,
-///     delete_topics_response::DeletableTopicResult, ErrorCode};
-/// use tansu_storage::{DeleteTopicsService, Error, StorageContainer};
-/// use url::Url;
+/// use rama::layer::MapStateLayer;
+/// use rama::{Context, Layer as _, Service as _};
+/// use tansu_sans_io::ErrorCode;
+/// use tansu_sans_io::delete_topics_response::DeletableTopicResult;
+/// use tansu_sans_io::{DeleteTopicsRequest, DeleteTopicsResponse};
+/// use tansu_storage::{DeleteTopicsService, StorageContainer};
 ///
-/// # #[tokio::main]
-/// # async fn main() -> Result<(), Error> {
-/// let storage = StorageContainer::builder()
-///     .cluster_id("tansu")
-///     .node_id(111)
-///     .advertised_listener(Url::parse("tcp://localhost:9092")?)
-///     .storage(Url::parse("memory://tansu/")?)
-///     .build()
-///     .await?;
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> Result<(), tansu_storage::Error> {
+/// let listener = url::Url::parse("tcp://localhost:9092")?;
+/// let engine = StorageContainer::builder().cluster_id("tansu").node_id(111);
+/// let engine = engine.advertised_listener(listener);
+/// let engine = engine.storage(url::Url::parse("memory://tansu/")?).build().await?;
+/// let delete = MapStateLayer::new(|_| engine).into_layer(DeleteTopicsService);
 ///
-/// let service = MapStateLayer::new(|_| storage).into_layer(DeleteTopicsService);
+/// let request = DeleteTopicsRequest::default().topic_names(Some(vec!["pqr".into()]));
+/// let answered = delete.serve(Context::default(), request).await?;
 ///
-/// let topic = "pqr";
-///
-/// let error_code = ErrorCode::UnknownTopicOrPartition;
-///
-/// assert_eq!(
-///     DeleteTopicsResponse::default()
-///         .throttle_time_ms(Some(0))
-///         .responses(Some(vec![
-///             DeletableTopicResult::default()
-///                 .error_code(error_code.into())
-///                 .error_message(Some(error_code.to_string()))
-///                 .name(Some(topic.into())),
-///         ])),
-///     service
-///         .serve(
-///             Context::default(),
-///             DeleteTopicsRequest::default().topic_names(Some(vec![topic.into()]))
-///         )
-///         .await?
-/// );
+/// let unknown = ErrorCode::UnknownTopicOrPartition;
+/// let result = DeletableTopicResult::default().name(Some("pqr".into()));
+/// let result = result.error_code(unknown.into()).error_message(Some(unknown.to_string()));
+/// let expected = DeleteTopicsResponse::default().throttle_time_ms(Some(0));
+/// assert_eq!(expected.responses(Some(vec![result])), answered);
 /// # Ok(())
 /// # }
 /// ```
@@ -80,15 +65,24 @@ where
     type Response = DeleteTopicsResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
+    #[tracing::instrument(skip(state, request))]
     async fn serve(
         &self,
-        ctx: Context<G>,
-        req: DeleteTopicsRequest,
+        state: Context<G>,
+        request: DeleteTopicsRequest,
     ) -> Result<Self::Response, Self::Error> {
-        let mut responses = vec![];
+        let answered = |name, topic_id, code: ErrorCode| {
+            let result = DeletableTopicResult::default()
+                .name(name)
+                .topic_id(topic_id);
+            result
+                .error_code(i16::from(code))
+                .error_message(Some(code.to_string()))
+        };
+        let refused = ErrorCode::TopicAuthorizationFailed;
+        let mut results = vec![];
 
-        for topic in req.topics.unwrap_or_default() {
+        for topic in request.topics.unwrap_or_default() {
             // Per topic, because that is where the response carries a code —
             // and a delete refused for one topic must not fail the rest of the
             // request (#363).
@@ -99,44 +93,33 @@ where
             // cannot leak — but only where authorization is on at all, or a
             // broker without `--authentication` would stop serving a request
             // it has always served.
-            let error_code = match topic.name.as_deref() {
-                Some(name) if !authorized(&ctx, Resource::Topic, name, Operation::Delete).await => {
-                    ErrorCode::TopicAuthorizationFailed
+            let outcome = match topic.name.as_deref() {
+                Some(name)
+                    if !authorized(&state, Resource::Topic, name, Operation::Delete).await =>
+                {
+                    refused
                 }
-
-                None if enforcing(&ctx) => ErrorCode::TopicAuthorizationFailed,
-
-                _ => ctx.state().delete_topic(&topic.clone().into()).await?,
+                None if enforcing(&state) => refused,
+                _ => {
+                    let target = crate::TopicId::from(topic.clone());
+                    state.state().delete_topic(&target).await?
+                }
             };
-
-            responses.push(
-                DeletableTopicResult::default()
-                    .name(topic.name.clone())
-                    .topic_id(Some(topic.topic_id))
-                    .error_code(i16::from(error_code))
-                    .error_message(Some(error_code.to_string())),
-            );
+            results.push(answered(topic.name.clone(), Some(topic.topic_id), outcome));
         }
 
-        for topic in req.topic_names.unwrap_or_default() {
-            let error_code = if !authorized(&ctx, Resource::Topic, &topic, Operation::Delete).await
-            {
-                ErrorCode::TopicAuthorizationFailed
+        for name in request.topic_names.unwrap_or_default() {
+            let allowed = authorized(&state, Resource::Topic, &name, Operation::Delete).await;
+            let outcome = if allowed {
+                let target = crate::TopicId::from(name.clone());
+                state.state().delete_topic(&target).await?
             } else {
-                ctx.state().delete_topic(&topic.clone().into()).await?
+                refused
             };
-
-            responses.push(
-                DeletableTopicResult::default()
-                    .name(Some(topic))
-                    .topic_id(None)
-                    .error_code(i16::from(error_code))
-                    .error_message(Some(error_code.to_string())),
-            );
+            results.push(answered(Some(name), None, outcome));
         }
 
-        Ok(DeleteTopicsResponse::default()
-            .throttle_time_ms(Some(0))
-            .responses(Some(responses)))
+        let unthrottled = DeleteTopicsResponse::default().throttle_time_ms(Some(0));
+        Ok(unthrottled.responses(Some(results)))
     }
 }

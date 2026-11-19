@@ -13,38 +13,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    path::{Path, PathBuf},
-    str::FromStr as _,
-    time::Duration,
-};
+use std::path::{Path, PathBuf};
+use std::str::FromStr as _;
+use std::time::Duration;
 
-use crate::{EnvVarExp, Error, Result, cli::storage_engines};
+use clap::Parser;
+use owo_colors::OwoColorize as _;
+use owo_colors::{Stream, Style};
+use rustls::ServerConfig;
+use rustls::pki_types::pem::PemObject as _;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use tansu_broker::broker::Broker;
+use tansu_broker::coordinator::group::administrator::Controller;
+use tansu_broker::coordinator::group::{ConsumerGroupConfig, MigrationPolicy};
+use tansu_broker::{Keepalive, NODE_ID, SOCKET_REQUEST_MAX_BYTES};
+use tansu_sans_io::ErrorCode;
+use tansu_storage::DEFAULT_CLEANUP_POLICY;
+use tansu_storage::{ArcDynStorage, QuotaLimits, TopicDefaults};
+use tansu_storage::{CONSUMER_HEARTBEAT_INTERVAL_MS, CONSUMER_SESSION_TIMEOUT_MS};
+use url::Url;
 
 use super::DEFAULT_BROKER;
-use clap::Parser;
-use owo_colors::{OwoColorize as _, Stream, Style};
-use rustls::{
-    ServerConfig,
-    pki_types::{
-        CertificateDer, PrivateKeyDer,
-        pem::{Error as TlsPkiPemError, PemObject as _},
-    },
-};
-use tansu_broker::{
-    Keepalive, NODE_ID, SOCKET_REQUEST_MAX_BYTES,
-    broker::Broker,
-    coordinator::group::{ConsumerGroupConfig, MigrationPolicy, administrator::Controller},
-};
-use tansu_sans_io::ErrorCode;
-use tansu_storage::{
-    ArcDynStorage, CONSUMER_HEARTBEAT_INTERVAL_MS, CONSUMER_SESSION_TIMEOUT_MS,
-    DEFAULT_CLEANUP_POLICY, QuotaLimits, TopicDefaults,
-};
-use tokio::time::Instant;
-use tracing::debug;
-use url::Url;
-use uuid::Uuid;
+use crate::cli::storage_engines;
+use crate::{EnvVarExp, Error, Result};
 
 #[derive(Clone, Debug, Parser)]
 pub(super) struct Arg {
@@ -311,27 +302,27 @@ fn parse_retention_ms(value: &str) -> Result<i64, String> {
 }
 
 fn load_certs(filename: &Path) -> Result<Vec<CertificateDer<'static>>> {
-    CertificateDer::pem_file_iter(filename)
-        .and_then(|der| der.collect::<Result<Vec<_>, TlsPkiPemError>>())
-        .map_err(Into::into)
+    let chain = CertificateDer::pem_file_iter(filename)?;
+    let loaded: Result<Vec<_>, rustls::pki_types::pem::Error> = chain.collect();
+    Ok(loaded?)
 }
 
 fn load_private_key(filename: &Path) -> Result<PrivateKeyDer<'static>> {
-    PrivateKeyDer::from_pem_file(filename).map_err(Into::into)
+    let key = PrivateKeyDer::from_pem_file(filename)?;
+    Ok(key)
 }
 
 fn server_config(certs: &Path, private_key: &Path) -> Result<ServerConfig> {
-    ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(load_certs(certs)?, load_private_key(private_key)?)
-        .map_err(Into::into)
+    let chain = load_certs(certs)?;
+    let key = load_private_key(private_key)?;
+    let unauthenticated = ServerConfig::builder().with_no_client_auth();
+    Ok(unauthenticated.with_single_cert(chain, key)?)
 }
 
 fn redact_password(mut url: Url) -> Url {
     if url.password().is_some() {
-        _ = url.set_password(None).ok();
+        let _ignored = url.set_password(None);
     }
-
     url
 }
 
@@ -348,39 +339,34 @@ impl Arg {
     /// tests below drive; serving is `tansu-broker`'s own suite, which has an
     /// accept loop to stop and a client to answer (#556).
     pub(super) async fn main(self) -> Result<ErrorCode> {
-        let started = Instant::now();
-        self.build()
-            .await?
-            .main(started)
-            .await
-            .inspect(|result| debug!(?result))
-            .inspect_err(|err| debug!(?err))
-            .map_err(Into::into)
+        let started = tokio::time::Instant::now();
+        let broker = self.build().await?;
+        let served = broker.main(started).await;
+        match &served {
+            Ok(result) => tracing::debug!(?result),
+            Err(err) => tracing::debug!(?err),
+        }
+        served.map_err(Error::from)
     }
 
     async fn build(self) -> Result<Broker<Controller<ArcDynStorage>, ArcDynStorage>> {
         let connections_max_idle = self.connections_max_idle();
         let keepalive = self.keepalive();
         let consumer_group_config = self.consumer_group_config()?;
-        let cluster_id = self.cluster_id;
-        let incarnation_id = Uuid::now_v7();
-        let otlp_endpoint_url = self
-            .otlp_endpoint_url
-            .map(|env_var_exp| env_var_exp.into_inner());
-
-        let storage_engine = self.storage_engine.into_inner();
+        let otlp = self.otlp_endpoint_url.map(EnvVarExp::into_inner);
+        let (storage_engine, listener) = (
+            self.storage_engine.into_inner(),
+            self.listener_url.into_inner(),
+        );
         let advertised_listener = self.advertised_listener_url.into_inner();
-        let listener = self.listener_url.into_inner();
 
         // A cert that will not load fails startup. It used to end in `.ok()`,
         // which turned an unreadable file, a mismatched key or a malformed PEM
         // into `None` — and `None` is a plaintext broker on the port an operator
         // just configured for TLS (#358). The same class of defect as building
         // the acceptor and dropping it: configured, accepted, and inert.
-        let tls_server_config = self
-            .cert
-            .as_deref()
-            .zip(self.key.as_deref())
+        let pair = self.cert.as_deref().zip(self.key.as_deref());
+        let tls = pair
             .map(|(certs, key)| server_config(certs, key))
             .transpose()?;
 
@@ -390,16 +376,19 @@ impl Arg {
             retention_ms: self.default_retention_ms,
         };
 
-        let broker = Broker::<Controller<ArcDynStorage>, ArcDynStorage>::builder()
-            .node_id(NODE_ID)
-            .cluster_id(cluster_id)
-            .incarnation_id(incarnation_id)
-            .advertised_listener(advertised_listener.clone())
-            .otlp_endpoint_url(otlp_endpoint_url)
-            .storage(storage_engine.clone())
+        let broker = Broker::<Controller<ArcDynStorage>, ArcDynStorage>::builder().node_id(NODE_ID);
+        let broker = broker
+            .cluster_id(self.cluster_id)
+            .incarnation_id(uuid::Uuid::now_v7());
+        let broker = broker.advertised_listener(advertised_listener.clone());
+        let broker = broker
+            .otlp_endpoint_url(otlp)
+            .storage(storage_engine.clone());
+        let broker = broker
             .listener(listener.clone())
-            .authentication(self.authentication)
-            .tls_server_config(tls_server_config)
+            .authentication(self.authentication);
+        let broker = broker
+            .tls_server_config(tls)
             .topic_defaults(topic_defaults)
             .super_users(self.super_users)
             .quota_defaults(QuotaLimits {
@@ -420,35 +409,31 @@ impl Arg {
             .silent(self.silent);
 
         if !self.silent {
-            let sheet = Sheet::default();
+            let styles = Sheet::default();
+            let out = Stream::Stdout;
 
-            println!(
-                "tansu {} {}",
-                "broker".if_supports_color(Stream::Stdout, |text| text.style(sheet.headline)),
-                env!("CARGO_PKG_VERSION")
-                    .if_supports_color(Stream::Stdout, |text| text.style(sheet.version))
-            );
+            let role = "broker".if_supports_color(out, |text| text.style(styles.headline));
+            let release = env!("CARGO_PKG_VERSION");
+            let release = release.if_supports_color(out, |text| text.style(styles.version));
+            println!("tansu {role} {release}");
 
-            println!(
-                "listening on: {} (advertised: {})",
-                listener.if_supports_color(Stream::Stdout, |text| text.style(sheet.listener)),
-                advertised_listener.if_supports_color(Stream::Stdout, |text| text
-                    .style(sheet.advertised_listener))
-            );
+            let bound = listener.if_supports_color(out, |text| text.style(styles.listener));
+            let advertised = advertised_listener
+                .if_supports_color(out, |text| text.style(styles.advertised_listener));
+            println!("listening on: {bound} (advertised: {advertised})");
 
-            println!(
-                "storage: {} {:?}",
-                redact_password(storage_engine)
-                    .if_supports_color(Stream::Stdout, |text| text.style(sheet.storage)),
-                storage_engines()
-                    .iter()
-                    .map(|storage_engine| storage_engine
-                        .if_supports_color(Stream::Stdout, |text| text.style(sheet.storage)))
-                    .collect::<Vec<_>>()
-            );
+            let redacted = redact_password(storage_engine);
+            let engine = redacted.if_supports_color(out, |text| text.style(styles.storage));
+            let known = storage_engines();
+            let known: Vec<_> = known
+                .iter()
+                .map(|engine| engine.if_supports_color(out, |text| text.style(styles.storage)))
+                .collect();
+            println!("storage: {engine} {known:?}");
         }
 
-        broker.build().await.map_err(Into::into)
+        let built = broker.build().await?;
+        Ok(built)
     }
 }
 
@@ -462,12 +447,13 @@ struct Sheet {
 
 impl Default for Sheet {
     fn default() -> Self {
+        let emphasis = Style::new().magenta().bold();
         Self {
-            advertised_listener: Style::new().magenta().bold(),
             headline: Style::new().green().bold(),
-            listener: Style::new().magenta().bold(),
-            storage: Style::new().magenta().bold(),
-            version: Style::new().magenta().bold(),
+            advertised_listener: emphasis,
+            listener: emphasis,
+            storage: emphasis,
+            version: emphasis,
         }
     }
 }

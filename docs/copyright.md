@@ -142,6 +142,122 @@ added here. It was gutted, not rewritten, and it does not qualify.
 
 Both notices stay on these files. Apache-2.0 §4(c) retains the original either way.
 
+## Leaving `inherited`
+
+Popsink/data-plane#5878 drives `inherited` to empty by rewriting what is left of
+upstream, one file at a time. A file leaves the list — and loses Peter Morgan's
+notice for Popsink's alone — only once `git blame` attributes none of its lines to
+upstream. `just defork-report` measures that; `just defork-check` enforces the half
+of it a CI job can enforce. Both need full history (`fetch-depth: 0`).
+
+A line is upstream's when its blame commit is `[blame] fork_point` in
+`copyright.toml` or an ancestor of it, or one of `[blame] ports`. The ports have to
+be named because blame cannot tell them apart from our own work: `27df1fb` is
+dated after the fork, so the tansu-io#680 code it brought in looks new.
+`tansu-service/src/consumer.rs` is 260 lines, and plain blame against the fork
+point attributes none of them to upstream; counting the port, 170 are. The
+notice and the 12-line grant are not counted. They are byte-identical in every
+file and get replaced, not rewritten.
+
+Lines of syntax alone are not counted either: blank lines, lines with no letter or
+digit (`}`, `)]`, `});`), and a bare attribute opener such as `#[derive(`. The
+first rewrite showed why. `tansu-sans-io/src/primitive/uuid.rs` was rewritten
+until no identifier, signature or import was left from upstream. Blame still
+matched ten lines of it back to the fork point: blanks, closing braces and the
+`#[derive(` that rustfmt opens a long derive list with. Those lines exist because
+the type has the same shape, and identical behaviour is the point of the rewrite.
+Counting them would make the exit criterion unreachable, or reachable only by
+fighting rustfmt.
+
+A bare module declaration (`mod tagged;`, `pub(crate) mod limit;`) is skipped on
+the same grounds. It names a file, so the only way to rewrite it is to rename the
+file. Four facade files had nothing else left from upstream —
+`tansu-sans-io/src/primitive.rs`, `tansu-storage/src/gcs.rs`,
+`tansu-storage/src/service/txn.rs` and `tansu-broker/src/broker/group.rs` — and
+left `inherited` with this rule. A `mod` with a body (`mod tests {`) is still
+counted.
+
+So is a bare crate flag (`#![no_main]`). libfuzzer supplies `main`, so every fuzz
+target has to start with exactly that line, and there is no other way to write
+it. An attribute with arguments (`#![cfg_attr(…)]`, `#![doc = …]`) is still
+counted. The five small fuzz targets were rewritten and left `inherited` with
+this rule. `generate_seeds.rs` followed once its seeds became a table of hex
+strings, written to the same files with the same bytes.
+
+So is a bare `Ok(())` on its own line. It ends every test that returns a
+`Result`, and the four small `tansu-storage` tests rewritten in the same change
+kept nothing else from upstream. `Ok(value)` with anything inside the brackets
+is still counted.
+
+So is a bare macro or `use` opener: `assert_eq!(`, `assert!(`, `vec![`,
+`use tansu_sans_io::{`, or a nested `sync::{` inside an import. rustfmt writes
+one whenever a macro call or an import list does not fit on a line, and the
+contents follow on lines that are counted. Like `#[derive(`, the line itself
+only says that the contents are too long: `assert_eq!(` alone is 1,259 lines in
+this tree. A function call opener (`round_trip_request(`, `Frame::request(`)
+is still counted, because it names what is called. The rule took 710 lines
+off the plain total, and `tansu-storage/tests/incremental_alter_configs.rs`
+left `inherited` with it.
+
+So is a bare test marker, `#[test]` or `#[tokio::test]`, on the grounds of the
+crate flag above: every test carries one, and there is no other way to write
+it. Blame lines a rewritten test's marker up with whichever upstream marker the
+diff lands on. An attribute that records a decision (`#[must_use]`,
+`#[non_exhaustive]`, `#[default]`) is still counted. The rule took 358 lines
+off the plain total, and `tansu-storage/tests/delete_topics.rs` left
+`inherited` with it.
+
+It first left out a marker with runtime arguments, `#[tokio::test(start_paused
+= true)]` or `flavor = …`, and the consumer-group simulations showed why that
+was the wrong line to draw: each of their tests carries the same
+`start_paused = true`, because each runs on the paused clock, and a rewrite
+lined them up one for one with upstream's. The arguments configure the
+runtime the test needs; they are no more authored than the bare marker. Taking
+them too removed 10 lines, eight of them `tansu-broker/tests/new_cg.rs`'s, which
+left `inherited` with it.
+
+So is the tracing guard a test opens with, `let _guard = init_tracing()?;`
+(or `common::`, `super::`, `.unwrap()`). It is the first line of the 699 tests
+that log, as `Ok(())` is their last, and it lines up with whichever upstream
+test the diff lands on. Any other `let _guard = …` is still counted. The rule
+took 221 lines off the plain total, and `tansu-storage/tests/produce.rs` left
+`inherited` with it.
+
+So is a keyword alone on a line: `where`, `loop {`, `else {` or `} else {`.
+Like `}`, it is punctuation around a keyword, and a rewrite keeps it wherever
+the code it opens still needs a `where` clause, a loop or an `else`. A line
+that adds anything to the keyword (`} else if …`, `where T: …`) is still
+counted, and so is a declaration (`pub struct ConsumerGroupLayer {`,
+`impl … {`, `type Response = ();`): it carries a name the API fixes, which is
+why `tansu-client/src/consumer.rs` stays `inherited` after its rewrite. The
+rule took 505 lines off the plain total, and with two `.await` chains split,
+`tansu-broker/src/broker/group/join.rs` and `sync.rs` left `inherited` with it.
+
+The report gives two numbers per file, because one blame mode is not enough:
+
+| measure | `git blame` | catches | misses |
+|---|---|---|---|
+| plain | `-w -M` | lines last changed upstream | upstream lines moved into a new file |
+| moved | `-w -M -C` | also lines moved in from a file changed in the same commit | — |
+
+`plain` is what #550 fooled. Splitting `dynostore.rs` into eighteen modules
+rewrote nothing, but every line in those modules was last touched by the split
+commit, so plain blame puts them all at zero. `moved` follows the lines back
+through the split (`dynostore/storage.rs`: 0 plain, 7 moved).
+
+So `moved` is the exit criterion: **a file leaves `inherited` when both columns
+read 0.** `moved` is not used as the CI gate, because it is too eager for files
+that were never upstream's. Run over the whole tree, it attributes upstream lines
+to 58 Popsink files: test setup and imports copied from an inherited neighbour in
+the same commit, which `-C` matches. `plain` over the same tree flags none, which
+is why it can gate. `just defork-check` fails when a
+file outside `inherited` has a single `plain` upstream line, so a file cannot
+leave the list early. The reviewer checks `moved` from the report when a PR drops
+a file from the list.
+
+`ports` follows the same rule as `inherited`: the epic stopped upstream ports, so
+it only ever shrinks.
+
 ## Related decisions
 
 - **`workspace.package.authors`** is `["Popsink SAS"]`. It was

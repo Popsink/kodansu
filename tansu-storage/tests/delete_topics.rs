@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,211 +12,137 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::common::{Error, cluster_id, init_tracing, storage_url};
-use assert_matches::assert_matches;
-use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
+//! `DeleteTopics`: an unknown topic by name or by id, and a topic deleted and
+//! then created again under the same name.
+
+use std::sync::Arc;
+
+use tansu_sans_io::create_topics_request::CreatableTopic;
+use tansu_sans_io::create_topics_response::CreatableTopicResult;
+use tansu_sans_io::delete_topics_request::DeleteTopicState;
+use tansu_sans_io::delete_topics_response::DeletableTopicResult;
 use tansu_sans_io::{
-    CreateTopicsRequest, CreateTopicsResponse, DeleteTopicsRequest, DeleteTopicsResponse,
-    ErrorCode, NULL_TOPIC_ID, create_topics_request::CreatableTopic,
-    delete_topics_request::DeleteTopicState, delete_topics_response::DeletableTopicResult,
+    CreateTopicsRequest, DeleteTopicsRequest, DeleteTopicsResponse, ErrorCode, NULL_TOPIC_ID,
 };
-use tansu_storage::{CreateTopicsService, DeleteTopicsService, StorageContainer};
-use url::Url;
-use uuid::Uuid;
+use tansu_storage::{CreateTopicsService, DeleteTopicsService, Storage};
+
+use crate::common::{Error, init_tracing, serve, storage};
 
 mod common;
 
+const TOPIC: &str = "pqr";
+const PARTITIONS: i32 = 5;
+const REPLICAS: i16 = 3;
+
+/// An id no topic in a fresh store has.
+const UNKNOWN_ID: [u8; 16] = [7; 16];
+
+/// The one result of a one-topic delete, once the answer is known to be
+/// unthrottled.
+fn only(response: DeleteTopicsResponse) -> DeletableTopicResult {
+    let DeleteTopicsResponse {
+        throttle_time_ms,
+        responses,
+        ..
+    } = response;
+    assert_eq!(Some(0), throttle_time_ms);
+    let [result] = <[_; 1]>::try_from(responses.unwrap_or_default()).expect("one result");
+    result
+}
+
+/// `result` as `DeleteTopics` reports `error_code` for it, message included.
+fn reported(error_code: ErrorCode, result: DeletableTopicResult) -> DeletableTopicResult {
+    let message = Some(error_code.to_string());
+    result
+        .error_code(i16::from(error_code))
+        .error_message(message)
+}
+
+/// What `CreateTopics` answers for `TOPIC`.
+async fn create(storage: &Arc<dyn Storage>) -> Result<CreatableTopicResult, Error> {
+    let creatable = CreatableTopic::default()
+        .name(TOPIC.to_owned())
+        .num_partitions(PARTITIONS)
+        .replication_factor(REPLICAS)
+        .assignments(Some(Vec::new()))
+        .configs(Some(Vec::new()));
+    let request = CreateTopicsRequest::default().topics(Some(vec![creatable]));
+    let response = serve(storage, CreateTopicsService, request).await?;
+    let [topic] = <[_; 1]>::try_from(response.topics.unwrap_or_default()).expect("one topic");
+    Ok(topic)
+}
+
+/// `TOPIC` was created as asked, with no config of its own.
+fn assert_created(topic: &CreatableTopicResult) {
+    let configs = topic.configs.as_ref().map(Vec::len);
+    assert_eq!(
+        (TOPIC, ErrorCode::None.into(), Some(0), Some(0)),
+        (
+            topic.name.as_str(),
+            topic.error_code,
+            topic.topic_config_error_code,
+            configs
+        )
+    );
+    assert_eq!(
+        (Some(PARTITIONS), Some(REPLICAS)),
+        (topic.num_partitions, topic.replication_factor)
+    );
+}
+
 #[tokio::test]
-async fn delete_unknown_by_name() -> Result<(), Error> {
+async fn an_unknown_name_is_unknown() -> Result<(), Error> {
     let _guard = init_tracing()?;
 
-    let node_id = 12321;
+    let request = DeleteTopicsRequest::default().topic_names(Some(vec![TOPIC.to_owned()]));
+    let response = serve(&storage().await?, DeleteTopicsService, request).await?;
 
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(node_id)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
-
-    let service = MapStateLayer::new(|_| storage).into_layer(DeleteTopicsService);
-
-    let topic = "pqr";
-
-    let error_code = ErrorCode::UnknownTopicOrPartition;
-
+    let named = DeletableTopicResult::default().name(Some(TOPIC.to_owned()));
     assert_eq!(
-        DeleteTopicsResponse::default()
-            .throttle_time_ms(Some(0))
-            .responses(Some(vec![
-                DeletableTopicResult::default()
-                    .error_code(error_code.into())
-                    .error_message(Some(error_code.to_string()))
-                    .name(Some(topic.into())),
-            ])),
-        service
-            .serve(
-                Context::default(),
-                DeleteTopicsRequest::default().topic_names(Some(vec![topic.into()]))
-            )
-            .await?
+        reported(ErrorCode::UnknownTopicOrPartition, named),
+        only(response)
     );
 
     Ok(())
 }
 
 #[tokio::test]
-async fn delete_unknown_by_uuid() -> Result<(), Error> {
-    let node_id = 12321;
+async fn an_unknown_id_is_unknown() -> Result<(), Error> {
+    let _guard = init_tracing()?;
 
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(node_id)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
+    let by_id = DeleteTopicState::default().topic_id(UNKNOWN_ID);
+    let request = DeleteTopicsRequest::default().topics(Some(vec![by_id]));
+    let response = serve(&storage().await?, DeleteTopicsService, request).await?;
 
-    let service = MapStateLayer::new(|_| storage).into_layer(DeleteTopicsService);
-
-    let topic = Uuid::new_v4();
-
-    let error_code = ErrorCode::UnknownTopicOrPartition;
-
+    let identified = DeletableTopicResult::default().topic_id(Some(UNKNOWN_ID));
     assert_eq!(
-        DeleteTopicsResponse::default()
-            .throttle_time_ms(Some(0))
-            .responses(Some(vec![
-                DeletableTopicResult::default()
-                    .error_code(error_code.into())
-                    .error_message(Some(error_code.to_string()))
-                    .topic_id(Some(topic.into_bytes()))
-            ])),
-        service
-            .serve(
-                Context::default(),
-                DeleteTopicsRequest::default().topics(Some(vec![
-                    DeleteTopicState::default().topic_id(topic.into_bytes())
-                ]))
-            )
-            .await?
+        reported(ErrorCode::UnknownTopicOrPartition, identified),
+        only(response)
     );
 
     Ok(())
 }
 
+/// A deleted name is free again: creating it a second time succeeds as the
+/// first time did.
 #[tokio::test]
-async fn create_delete_create_by_name() -> Result<(), Error> {
-    let node_id = 12321;
+async fn a_deleted_name_can_be_created_again() -> Result<(), Error> {
+    let _guard = init_tracing()?;
 
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster_id())
-        .node_id(node_id)
-        .advertised_listener(Url::parse("tcp://localhost:9092")?)
-        .storage(storage_url()?)
-        .build()
-        .await?;
+    let storage = storage().await?;
+    assert_created(&create(&storage).await?);
 
-    let create_topics = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
-    };
+    let by_name = DeleteTopicState::default()
+        .name(Some(TOPIC.to_owned()))
+        .topic_id(NULL_TOPIC_ID);
+    let request = DeleteTopicsRequest::default().topics(Some(vec![by_name]));
+    let response = serve(&storage, DeleteTopicsService, request).await?;
+    let deleted = DeletableTopicResult::default()
+        .name(Some(TOPIC.to_owned()))
+        .topic_id(Some(NULL_TOPIC_ID));
+    assert_eq!(reported(ErrorCode::None, deleted), only(response));
 
-    let name = "pqr";
-    let num_partitions = 5;
-    let replication_factor = 3;
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let topic = "pqr";
-
-    let error_code = ErrorCode::None;
-
-    assert_matches!(
-        create_topics
-            .serve(
-                Context::default(),
-                CreateTopicsRequest::default()
-                    .topics(Some(
-                        [CreatableTopic::default()
-                            .name(name.into())
-                            .num_partitions(num_partitions)
-                            .replication_factor(replication_factor)
-                            .assignments(assignments.clone())
-                            .configs(configs.clone()),]
-                        .into()
-                    ))
-                    .validate_only(Some(false))
-            )
-            .await?,
-        CreateTopicsResponse { topics: Some(topics), ..} => {
-            assert_eq!(topics.len(), 1);
-            assert_eq!(topic, topics[0].name.as_str());
-            assert_matches!(topics[0].configs.as_ref(), Some(configs) if configs.is_empty());
-            assert_eq!(topics[0].topic_config_error_code, Some(0));
-            assert_eq!(topics[0].num_partitions, Some(num_partitions));
-            assert_eq!(topics[0].replication_factor, Some(replication_factor));
-            assert_eq!(topics[0].error_code, i16::from(error_code));
-        }
-    );
-
-    let delete_topics = {
-        let storage = storage.clone();
-        MapStateLayer::new(|_| storage).into_layer(DeleteTopicsService)
-    };
-
-    let error_code = ErrorCode::None;
-
-    assert_eq!(
-        DeleteTopicsResponse::default()
-            .throttle_time_ms(Some(0))
-            .responses(Some(vec![
-                DeletableTopicResult::default()
-                    .error_code(error_code.into())
-                    .error_message(Some(error_code.to_string()))
-                    .name(Some(name.into()))
-                    .topic_id(Some(NULL_TOPIC_ID)),
-            ])),
-        delete_topics
-            .serve(
-                Context::default(),
-                DeleteTopicsRequest::default().topics(Some(vec![
-                    DeleteTopicState::default()
-                        .name(Some(name.into()))
-                        .topic_id(NULL_TOPIC_ID),
-                ]))
-            )
-            .await?
-    );
-
-    assert_matches!(
-        create_topics
-            .serve(
-                Context::default(),
-                CreateTopicsRequest::default()
-                    .topics(Some(
-                        [CreatableTopic::default()
-                            .name(name.into())
-                            .num_partitions(num_partitions)
-                            .replication_factor(replication_factor)
-                            .assignments(assignments.clone())
-                            .configs(configs.clone()),]
-                        .into()
-                    ))
-                    .validate_only(Some(false))
-            )
-            .await?,
-        CreateTopicsResponse { topics: Some(topics), ..} => {
-            assert_eq!(topics.len(), 1);
-            assert_eq!(topic, topics[0].name.as_str());
-            assert_matches!(topics[0].configs.as_ref(), Some(configs) if configs.is_empty());
-            assert_eq!(topics[0].topic_config_error_code, Some(0));
-            assert_eq!(topics[0].num_partitions, Some(num_partitions));
-            assert_eq!(topics[0].replication_factor, Some(replication_factor));
-            assert_eq!(topics[0].error_code, i16::from(error_code));
-        }
-    );
+    assert_created(&create(&storage).await?);
 
     Ok(())
 }

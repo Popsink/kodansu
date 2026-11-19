@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,110 +12,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rama::{Context, Service};
-use tansu_sans_io::{ApiKey, InitProducerIdRequest, InitProducerIdResponse};
-use tracing::instrument;
+//! `InitProducerId`: a producer id and epoch for an idempotent or
+//! transactional producer.
 
-use crate::{Error, Result, Storage};
+use tansu_sans_io::{InitProducerIdRequest, InitProducerIdResponse};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`InitProducerIdRequest`] returning [`InitProducerIdResponse`].
-/// ```
-/// use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
-/// use tansu_sans_io::{ErrorCode, InitProducerIdRequest, InitProducerIdResponse};
-/// use tansu_storage::{Error, InitProducerIdService, StorageContainer};
-/// use url::Url;
-///
-/// # #[tokio::main]
-/// # async fn main() -> Result<(), Error> {
-/// const HOST: &str = "localhost";
-/// const PORT: i32 = 9092;
-/// const NODE_ID: i32 = 111;
-///
-/// let storage = StorageContainer::builder()
-///     .cluster_id("tansu")
-///     .node_id(NODE_ID)
-///     .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-///     .storage(Url::parse("memory://tansu/")?)
-///     .build()
-///     .await?;
-///
-/// let service = MapStateLayer::new(|_| storage).into_layer(InitProducerIdService);
-///
-/// let transactional_id = None;
-/// let transaction_timeout_ms = 0;
-/// let producer_id = Some(-1);
-/// let producer_epoch = Some(-1);
-///
-/// assert_eq!(
-///     service
-///         .serve(
-///             Context::default(),
-///             InitProducerIdRequest::default()
-///                 .transactional_id(transactional_id.clone())
-///                 .transaction_timeout_ms(transaction_timeout_ms)
-///                 .producer_id(producer_id)
-///                 .producer_epoch(producer_epoch)
-///         )
-///         .await?,
-///     InitProducerIdResponse::default()
-///         .error_code(ErrorCode::None.into())
-///         .producer_id(1)
-///         .producer_epoch(0)
-/// );
-///
-/// assert_eq!(
-///     service
-///         .serve(
-///             Context::default(),
-///             InitProducerIdRequest::default()
-///                 .transactional_id(transactional_id)
-///                 .transaction_timeout_ms(transaction_timeout_ms)
-///                 .producer_id(producer_id)
-///                 .producer_epoch(producer_epoch)
-///         )
-///         .await?,
-///     InitProducerIdResponse::default()
-///         .error_code(ErrorCode::None.into())
-///         .producer_id(2)
-///         .producer_epoch(0)
-/// );
-/// # Ok(())
-/// # }
-/// ```
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct InitProducerIdService;
-
-impl ApiKey for InitProducerIdService {
-    const KEY: i16 = InitProducerIdRequest::KEY;
-}
-
-impl<G> Service<G, InitProducerIdRequest> for InitProducerIdService
-where
-    G: Storage,
-{
-    type Response = InitProducerIdResponse;
-    type Error = Error;
-
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: InitProducerIdRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        ctx.state()
-            .init_producer(
-                req.transactional_id.as_deref(),
-                req.transaction_timeout_ms,
-                req.producer_id,
-                req.producer_epoch,
-            )
-            .await
-            .map(|response| {
-                InitProducerIdResponse::default()
-                    .throttle_time_ms(0)
-                    .error_code(response.error.into())
-                    .producer_id(response.id)
-                    .producer_epoch(response.epoch)
-            })
+storage_service! {
+    /// Allocates or bumps the producer through
+    /// [`Storage::init_producer`](crate::Storage::init_producer) and returns
+    /// what it decided, error code included.
+    ///
+    /// `tests/init_producer_id.rs` allocates two producers without a
+    /// transaction and checks they get consecutive ids.
+    InitProducerIdService: InitProducerIdRequest => InitProducerIdResponse,
+    |ctx, req| {
+        let InitProducerIdRequest {
+            transactional_id,
+            transaction_timeout_ms,
+            producer_id,
+            producer_epoch,
+            ..
+        } = req;
+        let transactional_id = transactional_id.as_deref();
+        let producer = ctx
+            .state()
+            .init_producer(transactional_id, transaction_timeout_ms, producer_id, producer_epoch)
+            .await?;
+        Ok(InitProducerIdResponse::default()
+            .error_code(producer.error.into())
+            .producer_id(producer.id)
+            .producer_epoch(producer.epoch))
     }
 }

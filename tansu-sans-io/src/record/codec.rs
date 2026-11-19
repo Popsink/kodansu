@@ -12,97 +12,109 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{
-    ByteSize, Decode, Encode, Result,
-    primitive::varint::{UnsignedVarInt, VarInt},
-};
-use bytes::{BufMut, Bytes, BytesMut};
-use serde::{
-    Deserialize, Deserializer, Serialize, Serializer,
-    de::{self, SeqAccess, Visitor},
-    ser::{self, SerializeSeq, SerializeStruct},
-};
-use std::{
-    fmt::{self, Formatter},
-    marker::PhantomData,
-};
-use tracing::{debug, instrument};
+use std::fmt::{self, Formatter};
+use std::marker::PhantomData;
+
+use bytes::BufMut;
+use bytes::{Bytes, BytesMut};
+use serde::de::{self, SeqAccess, Visitor};
+use serde::ser::{self, SerializeSeq, SerializeStruct};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use crate::primitive::varint::{UnsignedVarInt, VarInt};
+use crate::{ByteSize, Decode, Encode, Result};
+
+/// The serializer's error for a length that does not fit the wire's type.
+fn too_long<E: ser::Error>(error: impl fmt::Display) -> E {
+    E::custom(error.to_string())
+}
+
+/// The next element of `seq`, an error naming `what` where there is none.
+fn required<'de, A, T>(seq: &mut A, what: &'static str) -> Result<T, A::Error>
+where
+    A: SeqAccess<'de>,
+    T: Deserialize<'de>,
+{
+    seq.next_element()?.ok_or_else(|| de::Error::custom(what))
+}
+
+/// The next `length` elements of `seq`, after the count that announced them.
+fn elements<'de, A, T>(seq: &mut A, length: i32) -> Result<Vec<T>, A::Error>
+where
+    A: SeqAccess<'de>,
+    T: Deserialize<'de>,
+{
+    let capacity = usize::try_from(length).map_err(|error| {
+        let caused = format!("length: {length}, caused: {error:?}");
+        <A::Error as de::Error>::custom(caused)
+    })?;
+    let mut items = Vec::with_capacity(capacity);
+    for _ in 0..length {
+        items.push(required(seq, "item")?);
+    }
+    Ok(items)
+}
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Octets(pub Option<Bytes>);
 
 impl ByteSize for Octets {
     fn size_in_bytes(&self) -> Result<usize> {
-        self.0.as_ref().map_or_else(
-            || VarInt(-1).size_in_bytes(),
-            |bytes| {
-                VarInt::try_from(bytes.len())
-                    .and_then(|v| v.size_in_bytes())
-                    .map(|vlen| vlen + bytes.len())
-            },
-        )
+        let Some(present) = &self.0 else {
+            return VarInt(-1).size_in_bytes();
+        };
+        let prefix = VarInt::try_from(present.len())?.size_in_bytes()?;
+        Ok(prefix + present.len())
     }
 }
 
 impl Encode for Octets {
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     fn encode(&self) -> Result<Bytes> {
-        match self.0.clone() {
-            None => VarInt::from(-1).encode(),
-            Some(data) => {
-                let mut encoded = self.size_in_bytes().map(BytesMut::with_capacity)?;
-
-                let length = VarInt::try_from(data.len())?;
-                encoded.put(length.encode()?);
-                encoded.put(data);
-
-                Ok(encoded.into())
-            }
-        }
+        let Some(data) = &self.0 else {
+            return VarInt::from(-1).encode();
+        };
+        let mut encoded = BytesMut::with_capacity(self.size_in_bytes()?);
+        encoded.put(VarInt::try_from(data.len())?.encode()?);
+        encoded.put(data.clone());
+        Ok(encoded.freeze())
     }
 }
 
 impl Decode for Octets {
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     fn decode(encoded: &mut Bytes) -> Result<Self> {
-        let length = VarInt::decode(encoded)?.0;
-
+        let VarInt(length) = VarInt::decode(encoded)?;
         if length == -1 {
-            Ok(Self(None))
-        } else {
-            Ok(Self(Some(encoded.split_to(length as usize))))
+            return Ok(Octets(None));
         }
+        let taken = encoded.split_to(length as usize);
+        Ok(Octets(Some(taken)))
     }
 }
 
 impl Octets {
     #[must_use]
     pub fn empty() -> Self {
-        Self(None)
+        Octets(None)
     }
 
     pub fn serialize<S>(i: &Option<Bytes>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        match i {
-            None => {
-                let mut s = serializer.serialize_struct(stringify!(Octets), 1)?;
-                s.serialize_field("length", &VarInt(-1))?;
-                s.end()
-            }
+        let Some(bytes) = i else {
+            let mut absent = serializer.serialize_struct("Octets", 1)?;
+            absent.serialize_field("length", &VarInt(-1))?;
+            return absent.end();
+        };
 
-            Some(bytes) => {
-                let mut s = serializer.serialize_struct(stringify!(Octets), 2)?;
-
-                i32::try_from(bytes.len())
-                    .map_err(|e| ser::Error::custom(e.to_string()))
-                    .map(VarInt)
-                    .and_then(|length| s.serialize_field("length", &length))
-                    .and(s.serialize_field("data", &bytes))
-                    .and(s.end())
-            }
-        }
+        let mut present = serializer.serialize_struct("Octets", 2)?;
+        let length = i32::try_from(bytes.len()).map_err(too_long);
+        let wrote_length = length.and_then(|n| present.serialize_field("length", &VarInt(n)));
+        let wrote_data = present.serialize_field("data", &bytes);
+        let ended = present.end();
+        wrote_length.and(wrote_data).and(ended)
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Bytes>, D::Error>
@@ -115,80 +127,69 @@ impl Octets {
             type Value = Option<Bytes>;
 
             fn expecting(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-                formatter.write_str(stringify!(Bytes))
+                formatter.write_str("Bytes")
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
             where
                 A: SeqAccess<'de>,
             {
-                let mut length = seq
-                    .next_element::<VarInt>()?
-                    .ok_or_else(|| de::Error::custom("length"))?
-                    .0;
-
-                debug!(?length);
-
+                let VarInt(length) = required(&mut seq, "length")?;
+                tracing::debug!(length = ?length);
                 if length == -1 {
-                    Ok(None)
-                } else {
-                    let mut r = usize::try_from(length)
-                        .map(BytesMut::with_capacity)
-                        .map_err(|error| de::Error::custom(format!("{error:?}")))?;
-
-                    while length >= 1 {
-                        let char = seq
-                            .next_element::<u8>()?
-                            .ok_or_else(|| de::Error::custom("byte"))?;
-
-                        r.put_u8(char);
-                        length -= 1;
-                    }
-
-                    debug!(?r);
-
-                    Ok(Some(r.into()))
+                    return Ok(None);
                 }
+
+                let capacity = usize::try_from(length)
+                    .map_err(|error| de::Error::custom(format!("{error:?}")))?;
+                let mut collected = BytesMut::with_capacity(capacity);
+                for _ in 0..length {
+                    collected.put_u8(required(&mut seq, "byte")?);
+                }
+                tracing::debug!(r = ?collected);
+                Ok(Some(collected.freeze()))
             }
         }
 
-        deserializer.deserialize_seq(V)
+        D::deserialize_seq(deserializer, V)
     }
 }
 
 impl From<Octets> for Option<Bytes> {
     fn from(value: Octets) -> Self {
-        value.0
+        let Octets(bytes) = value;
+        bytes
     }
 }
 
 impl From<Bytes> for Octets {
     fn from(value: Bytes) -> Self {
-        Self(Some(value))
+        Octets(Some(value))
     }
 }
 
 impl From<Option<Bytes>> for Octets {
     fn from(value: Option<Bytes>) -> Self {
-        Self(value)
+        Octets(value)
     }
 }
 
 impl From<Option<Vec<u8>>> for Octets {
     fn from(value: Option<Vec<u8>>) -> Self {
-        Self(value.map(Into::into))
+        Octets(value.map(Bytes::from))
     }
 }
 
 impl From<Vec<u8>> for Octets {
     fn from(value: Vec<u8>) -> Self {
-        Self(Some(value.into()))
+        Octets(Some(Bytes::from(value)))
     }
 }
 
 impl From<&[u8]> for Octets {
     fn from(value: &[u8]) -> Self {
-        Self(Some(Bytes::copy_from_slice(value)))
+        let copied = Bytes::copy_from_slice(value);
+        Octets(Some(copied))
     }
 }
 
@@ -197,7 +198,7 @@ impl Serialize for Octets {
     where
         S: Serializer,
     {
-        Self::serialize(&self.0, serializer)
+        Octets::serialize(&self.0, serializer)
     }
 }
 
@@ -206,7 +207,7 @@ impl<'de> Deserialize<'de> for Octets {
     where
         D: Deserializer<'de>,
     {
-        Self::deserialize(deserializer).map(Self)
+        Octets::deserialize(deserializer).map(Octets)
     }
 }
 
@@ -219,29 +220,27 @@ impl<T> IntoIterator for VarIntSequence<T> {
     type IntoIter = std::vec::IntoIter<Self::Item>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
+        let VarIntSequence(items) = self;
+        items.into_iter()
     }
 }
 
 impl<T> FromIterator<T> for VarIntSequence<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        let mut c = Self(vec![]);
-        for i in iter {
-            c.0.push(i);
-        }
-        c
+        VarIntSequence(iter.into_iter().collect())
     }
 }
 
 impl<T> From<VarIntSequence<T>> for Vec<T> {
     fn from(value: VarIntSequence<T>) -> Self {
-        value.0
+        let VarIntSequence(items) = value;
+        items
     }
 }
 
 impl<T> From<Vec<T>> for VarIntSequence<T> {
     fn from(value: Vec<T>) -> Self {
-        Self(value)
+        VarIntSequence(value)
     }
 }
 
@@ -249,15 +248,14 @@ impl<T> ByteSize for VarIntSequence<T>
 where
     T: ByteSize,
 {
-    #[instrument(skip_all, ret)]
+    #[tracing::instrument(skip_all, ret)]
     fn size_in_bytes(&self) -> Result<usize> {
-        self.0.iter().try_fold(
-            i32::try_from(self.0.len())
-                .map_err(Into::into)
-                .map(VarInt)
-                .and_then(|vlen| vlen.size_in_bytes())?,
-            |acc, t| t.size_in_bytes().map(|tlen| acc + tlen),
-        )
+        let count = i32::try_from(self.0.len())?;
+        let mut total = VarInt(count).size_in_bytes()?;
+        for item in &self.0 {
+            total += item.size_in_bytes()?;
+        }
+        Ok(total)
     }
 }
 
@@ -265,18 +263,14 @@ impl<T> Encode for VarIntSequence<T>
 where
     T: Encode + ByteSize,
 {
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     fn encode(&self) -> Result<Bytes> {
-        let mut encoded = self.size_in_bytes().map(BytesMut::with_capacity)?;
-
-        let length = VarInt::try_from(self.0.len())?;
-        encoded.put(length.encode()?);
-
-        for i in self.0.iter() {
-            encoded.put(i.encode()?);
+        let mut encoded = BytesMut::with_capacity(self.size_in_bytes()?);
+        encoded.put(VarInt::try_from(self.0.len())?.encode()?);
+        for item in &self.0 {
+            encoded.put(item.encode()?);
         }
-
-        Ok(encoded.into())
+        Ok(encoded.freeze())
     }
 }
 
@@ -284,20 +278,18 @@ impl<T> Decode for VarIntSequence<T>
 where
     T: Decode,
 {
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     fn decode(encoded: &mut Bytes) -> Result<Self> {
-        debug!(encoded = ?encoded[..]);
+        tracing::debug!(encoded = ?&encoded[..]);
+        let VarInt(count) = VarInt::decode(encoded)?;
+        let length = count as usize;
+        tracing::debug!(length);
 
-        let length = VarInt::decode(encoded)
-            .map(|length| length.0 as usize)
-            .inspect(|length| debug!(length))?;
-
-        let mut items = Vec::with_capacity(length);
+        let mut decoded = Vec::with_capacity(length);
         for _ in 0..length {
-            items.push(T::decode(encoded)?);
+            decoded.push(T::decode(encoded)?);
         }
-
-        Ok(Self(items))
+        Ok(VarIntSequence(decoded))
     }
 }
 
@@ -307,17 +299,13 @@ impl<T> VarIntSequence<T> {
         S: Serializer,
         T: Serialize,
     {
-        let mut s = serializer.serialize_seq(Some(v.len()))?;
-
-        i32::try_from(v.len())
-            .map_err(|e| ser::Error::custom(e.to_string()))
-            .map(VarInt)
-            .and_then(|length| s.serialize_element(&length))?;
-
-        for i in v {
-            s.serialize_element(&i)?;
+        let mut sequence = serializer.serialize_seq(Some(v.len()))?;
+        let length = i32::try_from(v.len()).map_err(too_long)?;
+        sequence.serialize_element(&VarInt(length))?;
+        for item in v {
+            sequence.serialize_element(&item)?;
         }
-        s.end()
+        sequence.end()
     }
 }
 
@@ -339,38 +327,20 @@ where
             type Value = Vec<T>;
 
             fn expecting(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-                formatter.write_str(stringify!(Sequence))
+                formatter.write_str("Sequence")
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
             where
                 A: SeqAccess<'de>,
             {
-                seq.next_element::<VarInt>()?
-                    .ok_or_else(|| <A::Error as de::Error>::custom("length"))
-                    .map(|v| v.0)
-                    .inspect(|length| debug!("length: {length}"))
-                    .and_then(|length| {
-                        (0..length).try_fold(
-                            Vec::with_capacity(length.try_into().map_err(|e| {
-                                <A::Error as de::Error>::custom(format!(
-                                    "length: {length}, caused: {e:?}"
-                                ))
-                            })?),
-                            |mut acc, _| {
-                                seq.next_element::<T>()?
-                                    .ok_or_else(|| <A::Error as de::Error>::custom("item"))
-                                    .map(|t| {
-                                        acc.push(t);
-                                        acc
-                                    })
-                            },
-                        )
-                    })
+                let VarInt(length) = required(&mut seq, "length")?;
+                tracing::debug!("length: {length}");
+                elements(&mut seq, length)
             }
         }
 
-        deserializer.deserialize_seq(V(PhantomData))
+        D::deserialize_seq(deserializer, V(PhantomData))
     }
 }
 
@@ -379,7 +349,7 @@ impl<T: Serialize> Serialize for VarIntSequence<T> {
     where
         S: Serializer,
     {
-        Self::serialize(&self.0, serializer)
+        VarIntSequence::<T>::serialize(&self.0, serializer)
     }
 }
 
@@ -392,23 +362,20 @@ impl<T> IntoIterator for Sequence<T> {
     type IntoIter = std::vec::IntoIter<Self::Item>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
+        let Sequence(items) = self;
+        items.into_iter()
     }
 }
 
 impl<T> FromIterator<T> for Sequence<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
-        let mut c = Self(vec![]);
-        for i in iter {
-            c.0.push(i);
-        }
-        c
+        Sequence(iter.into_iter().collect())
     }
 }
 
 impl<T> From<Vec<T>> for Sequence<T> {
     fn from(value: Vec<T>) -> Self {
-        Self(value)
+        Sequence(value)
     }
 }
 
@@ -417,16 +384,13 @@ impl<T: Serialize> Sequence<T> {
     where
         S: Serializer,
     {
-        let mut s = serializer.serialize_seq(Some(v.len()))?;
-
-        u32::try_from(v.len())
-            .map_err(|e| ser::Error::custom(e.to_string()))
-            .and_then(|length| s.serialize_element(&length))?;
-
-        for i in v {
-            s.serialize_element(&i)?;
+        let mut sequence = serializer.serialize_seq(Some(v.len()))?;
+        let length = u32::try_from(v.len()).map_err(too_long)?;
+        sequence.serialize_element(&length)?;
+        for item in v {
+            sequence.serialize_element(&item)?;
         }
-        s.end()
+        sequence.end()
     }
 }
 
@@ -445,37 +409,20 @@ impl<T> Sequence<T> {
             type Value = Vec<T>;
 
             fn expecting(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
-                formatter.write_str(stringify!(Sequence))
+                formatter.write_str("Sequence")
             }
 
             fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
             where
                 A: SeqAccess<'de>,
             {
-                seq.next_element::<i32>()?
-                    .ok_or_else(|| <A::Error as de::Error>::custom("length"))
-                    .inspect(|length| debug!("length: {length}"))
-                    .and_then(|length| {
-                        (0..length).try_fold(
-                            Vec::with_capacity(length.try_into().map_err(|e| {
-                                <A::Error as de::Error>::custom(format!(
-                                    "length: {length}, caused: {e:?}"
-                                ))
-                            })?),
-                            |mut acc, _| {
-                                seq.next_element::<T>()?
-                                    .ok_or_else(|| <A::Error as de::Error>::custom("item"))
-                                    .map(|t| {
-                                        acc.push(t);
-                                        acc
-                                    })
-                            },
-                        )
-                    })
+                let length: i32 = required(&mut seq, "length")?;
+                tracing::debug!("length: {length}");
+                elements(&mut seq, length)
             }
         }
 
-        deserializer.deserialize_seq(V(PhantomData))
+        D::deserialize_seq(deserializer, V(PhantomData))
     }
 }
 
@@ -484,17 +431,18 @@ where
     T: ByteSize,
 {
     fn size_in_bytes(&self) -> Result<usize> {
-        self.0.iter().try_fold(size_of::<u32>(), |acc, i| {
-            UnsignedVarInt::size_inclusive(i).map(|sz| acc + sz)
-        })
+        let mut total = size_of::<u32>();
+        for item in &self.0 {
+            total += UnsignedVarInt::size_inclusive(item)?;
+        }
+        Ok(total)
     }
 }
 
 impl<T> Extend<T> for Sequence<T> {
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
-        for i in iter {
-            self.0.push(i);
-        }
+        let Sequence(items) = self;
+        items.extend(iter);
     }
 }
 
@@ -503,7 +451,7 @@ impl<T: Serialize> Serialize for Sequence<T> {
     where
         S: Serializer,
     {
-        Self::serialize(&self.0, serializer)
+        Sequence::<T>::serialize(&self.0, serializer)
     }
 }
 
@@ -516,108 +464,79 @@ where
     where
         D: Deserializer<'de>,
     {
-        Self::deserialize(deserializer).map(Self)
+        Sequence::<T>::deserialize(deserializer).map(Sequence)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{fmt::Debug, fs::File, sync::Arc, thread};
+    use std::fmt::Debug;
 
-    use tracing::subscriber::DefaultGuard;
-    use tracing_subscriber::{EnvFilter, fmt::format::FmtSpan};
+    use bytes::Bytes;
+    use tracing_subscriber::fmt::format::FmtSpan;
 
-    use crate::Error;
+    use super::{Octets, VarIntSequence};
+    use crate::{ByteSize, Decode, Encode, Error, Result};
 
-    use super::*;
+    /// Logs this test at `debug` for this crate, spans included, on top of
+    /// `RUST_LOG`, into `../logs/<package>/<thread>.log`: one file per test.
+    fn init_tracing() -> Result<tracing::subscriber::DefaultGuard> {
+        let directive = format!("{}=debug", env!("CARGO_CRATE_NAME")).parse()?;
+        let filter = tracing_subscriber::EnvFilter::from_default_env().add_directive(directive);
 
-    fn init_tracing() -> Result<DefaultGuard, Error> {
-        Ok(tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_level(true)
-                .with_line_number(true)
-                .with_thread_names(false)
-                .with_span_events(FmtSpan::FULL)
-                .with_env_filter(
-                    EnvFilter::from_default_env()
-                        .add_directive(format!("{}=debug", env!("CARGO_CRATE_NAME")).parse()?),
-                )
-                .with_writer(
-                    thread::current()
-                        .name()
-                        .ok_or(Error::Message(String::from("unnamed thread")))
-                        .and_then(|name| {
-                            File::create(format!("../logs/{}/{name}.log", env!("CARGO_PKG_NAME"),))
-                                .map_err(Into::into)
-                        })
-                        .map(Arc::new)?,
-                )
-                .finish(),
-        ))
+        let unnamed = || Error::Message(String::from("unnamed thread"));
+        let current = std::thread::current();
+        let test = current.name().ok_or_else(unnamed)?;
+        let log = std::fs::File::create(format!("../logs/{}/{test}.log", env!("CARGO_PKG_NAME")))?;
+
+        let subscriber = tracing_subscriber::fmt().with_level(true);
+        let subscriber = subscriber.with_line_number(true).with_thread_names(false);
+        let subscriber = subscriber.with_span_events(FmtSpan::FULL);
+        let subscriber = subscriber.with_env_filter(filter);
+        let subscriber = subscriber.with_writer(std::sync::Arc::new(log));
+        Ok(tracing::subscriber::set_default(subscriber.finish()))
     }
 
-    #[instrument(skip_all)]
-    fn encode_decode<T>(expected: T) -> Result<()>
+    /// `value` takes `size` bytes, and decodes back to itself from what it
+    /// encodes to, leaving nothing over.
+    fn round_trip<T>(value: T, size: usize) -> Result<()>
     where
-        T: Encode + Decode + Debug + PartialEq,
+        T: Encode + Decode + ByteSize + Debug + PartialEq,
     {
-        debug!(?expected);
-
-        let mut encoded = expected
-            .encode()
-            .inspect(|encoded| debug!(encoded = ?encoded[..]))?;
-        let actual = T::decode(&mut encoded).inspect(|actual| debug!(?actual))?;
-
-        assert_eq!(expected, actual);
-        assert_eq!(0, encoded.len());
+        assert_eq!(size, value.size_in_bytes()?);
+        let mut encoded = value.encode()?;
+        tracing::debug!(encoded = ?&encoded[..]);
+        let decoded = T::decode(&mut encoded)?;
+        assert_eq!((value, 0), (decoded, encoded.len()));
         Ok(())
     }
 
-    #[test]
-    fn octets_none() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let expected = Octets(None);
-        assert_eq!(1, expected.size_in_bytes()?);
-        encode_decode(expected)
+    /// Octets holding `content`.
+    fn octets(content: &'static [u8]) -> Octets {
+        Octets(Some(Bytes::from_static(content)))
     }
 
+    /// Absent octets are a length of minus one and nothing after it.
     #[test]
-    fn octets_some() -> Result<()> {
+    fn absent_octets_are_a_length_of_minus_one() -> Result<()> {
         let _guard = init_tracing()?;
-
-        let expected = Octets(Some(Bytes::from_static(b"34543")));
-        assert_eq!(6, expected.size_in_bytes()?);
-        encode_decode(expected)
+        round_trip(Octets(None), 1)
     }
 
+    /// Present octets are their length, then their bytes.
     #[test]
-    fn empty_var_int_seq() -> Result<()> {
+    fn present_octets_are_their_length_then_their_bytes() -> Result<()> {
         let _guard = init_tracing()?;
-
-        let expected = VarIntSequence(Vec::<Octets>::new());
-        assert_eq!(1, expected.size_in_bytes()?);
-        encode_decode(expected)
+        round_trip(octets(b"34543"), 6)
     }
 
+    /// A varint sequence is its count, then each item: none, one and two.
     #[test]
-    fn single_var_int_seq() -> Result<()> {
+    fn a_varint_sequence_is_its_count_then_its_items() -> Result<()> {
         let _guard = init_tracing()?;
-
-        let expected = VarIntSequence(vec![Octets(Some(Bytes::from_static(b"34543")))]);
-        assert_eq!(7, expected.size_in_bytes()?);
-        encode_decode(expected)
-    }
-
-    #[test]
-    fn multiple_var_int_seq() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let expected = VarIntSequence(vec![
-            Octets(Some(Bytes::from_static(b"34543"))),
-            Octets(Some(Bytes::from_static(b"32123"))),
-        ]);
-        assert_eq!(13, expected.size_in_bytes()?);
-        encode_decode(expected)
+        round_trip(VarIntSequence(Vec::<Octets>::new()), 1)?;
+        round_trip(VarIntSequence(vec![octets(b"34543")]), 7)?;
+        let two = vec![octets(b"34543"), octets(b"32123")];
+        round_trip(VarIntSequence(two), 13)
     }
 }

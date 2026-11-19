@@ -12,16 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rama::{Context, Service};
-use tansu_sans_io::{
-    ApiKey, ErrorCode, MetadataRequest, MetadataResponse, RequestApiVersion,
-    create_topics_request::CreatableTopic, metadata_response::MetadataResponseTopic,
-};
-use tracing::{error, instrument, warn};
+use rama::Context;
+use rama::Service;
+use tansu_sans_io::RequestApiVersion;
+use tansu_sans_io::acl::Operation;
+use tansu_sans_io::acl::Resource;
+use tansu_sans_io::create_topics_request::CreatableTopic;
+use tansu_sans_io::metadata_response::MetadataResponseTopic;
+use tansu_sans_io::{ApiKey, ErrorCode};
+use tansu_sans_io::{MetadataRequest, MetadataResponse};
 
-use tansu_sans_io::acl::{Operation, Resource};
-
-use crate::{Error, Result, Storage, TopicId, authorized, enforcing, validation};
+use crate::Storage;
+use crate::TopicId;
+use crate::validation;
+use crate::{Error, Result};
+use crate::{authorized, enforcing};
 
 /// Answer a name that cannot be a topic with `INVALID_TOPIC_EXCEPTION` rather
 /// than `UNKNOWN_TOPIC_OR_PARTITION` (#579), which is what Kafka's
@@ -68,46 +73,33 @@ fn resolve_topics<T>(topics: Option<Vec<T>>, version: Option<RequestApiVersion>)
     }
 }
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`MetadataRequest`] returning [`MetadataRequest`].
+/// Answers `Metadata` with this node as the only broker, and the topics asked
+/// about — auto-creating the unknown ones when both the broker and the request
+/// allow it, and hiding or refusing those the principal may not `DESCRIBE`.
 /// ```
-/// use rama::{Context, Layer as _, Service, layer::MapStateLayer};
-/// use tansu_sans_io::MetadataRequest;
-/// use tansu_storage::{Error, MetadataService, StorageContainer};
-/// use url::Url;
+/// use rama::layer::MapStateLayer;
+/// use rama::{Context, Layer as _, Service as _};
+/// use tansu_storage::{MetadataService, StorageContainer};
 ///
-/// # #[tokio::main]
-/// # async fn main() -> Result<(), Error> {
-/// const HOST: &str = "localhost";
-/// const PORT: i32 = 9092;
-/// const NODE_ID: i32 = 111;
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> Result<(), tansu_storage::Error> {
+/// let listener = url::Url::parse("tcp://localhost:9092")?;
+/// let engine = StorageContainer::builder().cluster_id("tansu").node_id(111);
+/// let engine = engine.advertised_listener(listener);
+/// let engine = engine.storage(url::Url::parse("memory://tansu/")?).build().await?;
+/// let metadata = MapStateLayer::new(|_| engine).into_layer(MetadataService);
 ///
-/// let storage = StorageContainer::builder()
-///     .cluster_id("tansu")
-///     .node_id(NODE_ID)
-///     .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-///     .storage(Url::parse("memory://tansu/")?)
-///     .build()
-///     .await?;
+/// let asked = tansu_sans_io::MetadataRequest::default().allow_auto_topic_creation(Some(false));
+/// let asked = asked.include_cluster_authorized_operations(Some(false));
+/// let asked = asked.include_topic_authorized_operations(Some(false));
+/// let brokers_only = asked.topics(Some(vec![]));
+/// let answered = metadata.serve(Context::default(), brokers_only).await?;
 ///
-/// let service = MapStateLayer::new(|_| storage).into_layer(MetadataService);
-///
-/// let response = service
-///     .serve(
-///         Context::default(),
-///         MetadataRequest::default()
-///             .allow_auto_topic_creation(Some(false))
-///             .include_cluster_authorized_operations(Some(false))
-///             .include_topic_authorized_operations(Some(false))
-///             .topics(Some([].into())),
-///     )
-///     .await?;
-///
-/// let brokers = response.brokers.as_deref().unwrap_or_default();
-/// assert_eq!(1, brokers.len());
-/// assert_eq!(HOST, brokers[0].host);
-/// assert_eq!(PORT, brokers[0].port);
-/// assert_eq!(NODE_ID, brokers[0].node_id);
-/// assert!(brokers[0].rack.is_none());
+/// let [this_node] = answered.brokers.as_deref().unwrap_or_default() else {
+///     panic!("a single-node cluster lists one broker")
+/// };
+/// assert_eq!(("localhost", 9092), (this_node.host.as_str(), this_node.port));
+/// assert_eq!((111, None), (this_node.node_id, this_node.rack.as_deref()));
 /// # Ok(())
 /// # }
 /// ```
@@ -125,22 +117,20 @@ where
     type Response = MetadataResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
+    #[tracing::instrument(skip(state, request))]
     async fn serve(
         &self,
-        ctx: Context<G>,
-        req: MetadataRequest,
+        state: Context<G>,
+        request: MetadataRequest,
     ) -> Result<Self::Response, Self::Error> {
-        let allow_auto_topic_creation = req.allow_auto_topic_creation.unwrap_or(false);
+        let allow_auto_topic_creation = request.allow_auto_topic_creation == Some(true);
 
-        let topics = resolve_topics(req.topics, ctx.get::<RequestApiVersion>().copied())
-            .map(|topics| topics.iter().map(TopicId::from).collect::<Vec<_>>());
+        let version = state.get::<RequestApiVersion>().copied();
+        let topics: Option<Vec<TopicId>> = resolve_topics(request.topics, version)
+            .map(|asked| asked.iter().map(Into::into).collect());
 
-        let mut response = ctx
-            .state()
-            .metadata(topics.as_deref())
-            .await
-            .inspect_err(|err| error!(?err))?;
+        let reading = state.state().metadata(topics.as_deref());
+        let mut response = reading.await.inspect_err(|err| tracing::error!(?err))?;
 
         // Auto-create any explicitly-named topic that came back unknown, when
         // both the broker policy and the request opt in (Kafka
@@ -148,7 +138,7 @@ where
         // idempotent: a topic another replica raced us to create surfaces as
         // `TopicAlreadyExists` and is treated as success. Only named topics are
         // eligible — an unknown topic-id cannot be created.
-        let auto_create = ctx.state().auto_create_topic_config();
+        let auto_create = state.state().auto_create_topic_config();
 
         if auto_create.enable && allow_auto_topic_creation {
             let unknown = i16::from(ErrorCode::UnknownTopicOrPartition);
@@ -180,24 +170,22 @@ where
                         .assignments(Some([].into()))
                         .configs(Some([].into()));
 
-                    match ctx.state().create_topic(creatable, false).await {
+                    match state.state().create_topic(creatable, false).await {
                         Ok(_) | Err(Error::Api(ErrorCode::TopicAlreadyExists)) => {}
-                        Err(err) => warn!(?err, %name, "auto-create topic failed"),
+                        Err(err) => tracing::warn!(?err, %name, "auto-create topic failed"),
                     }
                 }
 
                 // Re-read so the response reflects the freshly created topics.
-                response = ctx
-                    .state()
-                    .metadata(topics.as_deref())
-                    .await
-                    .inspect_err(|err| error!(?err))?;
+                let rereading = state.state().metadata(topics.as_deref());
+                response = rereading.await.inspect_err(|err| tracing::error!(?err))?;
             }
         }
 
-        let brokers = Some(response.brokers().to_owned());
-        let cluster_id = response.cluster().map(|s| s.into());
-        let controller_id = response.controller();
+        let answer = MetadataResponse::default().throttle_time_ms(Some(0));
+        let answer = answer.brokers(Some(response.brokers().to_vec()));
+        let answer = answer.cluster_id(response.cluster().map(String::from));
+        let answer = answer.controller_id(response.controller());
 
         // Metadata is where a namespace leaks (#363). Refusing to *read* a
         // topic still leaves its name visible here, and on a mutualised fleet
@@ -218,13 +206,13 @@ where
 
         for topic in response.topics() {
             let allowed = match topic.name.as_deref() {
-                Some(name) => authorized(&ctx, Resource::Topic, name, Operation::Describe).await,
+                Some(name) => authorized(&state, Resource::Topic, name, Operation::Describe).await,
 
                 // Resolved by id and nameless: an ACL is written on a name, so
                 // there is nothing to ask about. Only reachable when
                 // authorization is on, where refusing is the answer that
                 // cannot leak.
-                None => !enforcing(&ctx),
+                None => !enforcing(&state),
             };
 
             if allowed {
@@ -239,17 +227,7 @@ where
             }
         }
 
-        let topics = Some(visible);
-        let cluster_authorized_operations = Some(-1);
-
-        let throttle_time_ms = Some(0);
-
-        Ok(MetadataResponse::default()
-            .throttle_time_ms(throttle_time_ms)
-            .brokers(brokers)
-            .cluster_id(cluster_id)
-            .controller_id(controller_id)
-            .topics(topics)
-            .cluster_authorized_operations(cluster_authorized_operations))
+        let answer = answer.topics(Some(visible));
+        Ok(answer.cluster_authorized_operations(Some(-1)))
     }
 }

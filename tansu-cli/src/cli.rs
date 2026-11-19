@@ -12,19 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Tansu CLI
-//!
-//! The CLI is a single statically linked binary that contains:
-//! - Broker
-//! - Topic: Topic administration
-//! - User: SASL/SCRAM credential administration
+//! The `tansu` command line: the broker, which runs when no subcommand is
+//! given, and the `topic` and `user` administration subcommands that talk to
+//! one.
 
-use std::process;
+use clap::Parser;
+use clap::Subcommand;
+use tansu_sans_io::ErrorCode;
 
 use crate::Result;
-use clap::{Parser, Subcommand};
-use tansu_sans_io::ErrorCode;
-use tracing::debug;
 
 #[cfg(feature = "dynostore")]
 mod audit;
@@ -43,7 +39,8 @@ fn storage_engines() -> Vec<&'static str> {
 }
 
 fn after_help() -> String {
-    format!("Storage engines: {}", storage_engines().join(", "))
+    let engines = storage_engines().join(", ");
+    format!("Storage engines: {engines}")
 }
 
 #[derive(Clone, Debug, Parser)]
@@ -103,17 +100,16 @@ impl Cli {
     /// uncovered rather than excluded from the denominator — a `main` behind
     /// an `--ignore-filename-regex` is a `main` nobody counts again (#556).
     pub async fn main() -> Result<ErrorCode> {
-        debug!(
-            pid = process::id(),
-            storage = ?storage_engines()
-        );
+        let pid = std::process::id();
+        let storage = storage_engines();
+        tracing::debug!(pid, ?storage);
 
         match Cli::parse().subcommand() {
             #[cfg(feature = "dynostore")]
             Command::Audit(arg) => arg.main().await,
-            Command::Broker(arg) => arg.main().await,
-            Command::Topic { command } => command.main().await,
-            Command::User { command } => command.main().await,
+            Command::Broker(serving) => serving.main().await,
+            Command::Topic { command: topics } => topics.main().await,
+            Command::User { command: users } => users.main().await,
         }
     }
 }

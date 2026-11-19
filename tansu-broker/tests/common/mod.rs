@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,58 +12,60 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-use bytes::Bytes;
-use rand::{
-    distr::{Alphanumeric, StandardUniform},
-    prelude::*,
-    rng,
-};
-use std::{sync::Arc, thread};
-use tansu_broker::{
-    Error, Result,
-    coordinator::group::{Coordinator, administrator::Controller},
-};
-use tansu_sans_io::{
-    ErrorCode, HeartbeatResponse, JoinGroupResponse, LeaveGroupResponse, OffsetFetchResponse,
-    SyncGroupResponse, join_group_request::JoinGroupRequestProtocol,
-    join_group_response::JoinGroupResponseMember, leave_group_request::MemberIdentity,
-    offset_fetch_request::OffsetFetchRequestTopic, sync_group_request::SyncGroupRequestAssignment,
-};
-use tansu_storage::{BrokerRegistrationRequest, Storage, StorageContainer};
-use tracing::subscriber::DefaultGuard;
-use tracing_subscriber::EnvFilter;
-use url::Url;
-use uuid::Uuid;
+//! What the broker tests share: a log file per test, the `memory://` engine,
+//! random names and bytes, broker registration, and the group protocol calls
+//! a consumer makes, answered as typed responses.
 
-pub(crate) fn init_tracing() -> Result<DefaultGuard> {
-    use std::{fs::File, sync::Arc};
+#![allow(dead_code, reason = "each test binary uses part of this")]
 
-    Ok(tracing::subscriber::set_default(
-        tracing_subscriber::fmt()
-            .with_level(true)
-            .with_line_number(true)
-            .with_thread_names(false)
-            .with_env_filter(
-                EnvFilter::from_default_env()
-                    .add_directive(format!("{}=debug", env!("CARGO_CRATE_NAME")).parse()?),
-            )
-            .with_writer(
-                thread::current()
-                    .name()
-                    .ok_or(Error::Message(String::from("unnamed thread")))
-                    .and_then(|name| {
-                        File::create(format!(
-                            "../logs/{}/{}::{name}.log",
-                            env!("CARGO_PKG_NAME"),
-                            env!("CARGO_CRATE_NAME")
-                        ))
-                        .map_err(Into::into)
-                    })
-                    .map(Arc::new)?,
-            )
-            .finish(),
-    ))
+use std::fs::File;
+use std::sync::Arc;
+use std::thread;
+
+use rand::RngExt as _;
+use rand::distr::{Alphanumeric, StandardUniform};
+use tansu_broker::coordinator::group::Coordinator as _;
+use tansu_broker::coordinator::group::administrator::Controller;
+use tansu_sans_io::join_group_request::JoinGroupRequestProtocol;
+use tansu_sans_io::join_group_response::JoinGroupResponseMember;
+use tansu_sans_io::leave_group_request::MemberIdentity;
+use tansu_sans_io::sync_group_request::SyncGroupRequestAssignment;
+use tansu_sans_io::{Body, ErrorCode, HeartbeatResponse, JoinGroupResponse};
+use tansu_sans_io::{LeaveGroupResponse, SyncGroupResponse};
+use tansu_storage::{BrokerRegistrationRequest, StorageContainer};
+use tracing::subscriber::DefaultGuard as Guard;
+
+type Engine = Arc<dyn tansu_storage::Storage>;
+type Outcome<T> = tansu_broker::Result<T>;
+
+/// The client id every join here carries.
+pub(crate) const CONSOLE_CLIENT: &str = "console-consumer";
+
+/// The assignors every member offers, in the order it prefers them.
+pub(crate) const RANGE_ASSIGNOR: &str = "range";
+pub(crate) const STICKY_ASSIGNOR: &str = "cooperative-sticky";
+
+/// The protocol type of a consumer group.
+pub(crate) const CONSUMER_PROTOCOL: &str = "consumer";
+
+/// Logs this test at `debug` for this binary, on top of `RUST_LOG`, into
+/// `../logs/<package>/<crate>::<thread>.log`: one file per test.
+pub(crate) fn init_tracing() -> Outcome<Guard> {
+    let directive = format!("{}=debug", env!("CARGO_CRATE_NAME")).parse()?;
+    let filter = tracing_subscriber::EnvFilter::from_default_env().add_directive(directive);
+
+    let unnamed = || tansu_broker::Error::Message(String::from("unnamed thread"));
+    let current = thread::current();
+    let test = current.name().ok_or_else(unnamed)?;
+    let (package, binary) = (env!("CARGO_PKG_NAME"), env!("CARGO_CRATE_NAME"));
+    let log = File::create(format!("../logs/{package}/{binary}::{test}.log"))?;
+
+    let subscriber = tracing_subscriber::fmt().with_level(true);
+    let subscriber = subscriber.with_line_number(true).with_thread_names(false);
+    let subscriber = subscriber
+        .with_env_filter(filter)
+        .with_writer(Arc::new(log));
+    Ok(tracing::subscriber::set_default(subscriber.finish()))
 }
 
 /// The one storage every broker test runs against.
@@ -72,327 +74,235 @@ pub(crate) fn init_tracing() -> Result<DefaultGuard> {
 /// variant — the PostgreSQL, libSQL, SlateDB and Turso arms left with #96 —
 /// and every call site passed `StorageType::InMemory`, so the parameter chose
 /// between one thing.
-pub(crate) async fn storage_container<C>(
-    cluster: C,
-    node: i32,
-    advertised_listener: Url,
-) -> Result<Arc<dyn Storage>>
-where
-    C: Into<String>,
-{
-    StorageContainer::builder()
-        .cluster_id(cluster)
-        .node_id(node)
-        .advertised_listener(advertised_listener)
-        .storage(Url::parse("memory://")?)
-        .build()
-        .await
-        .map_err(Into::into)
+pub(crate) async fn storage_container(
+    cluster_id: impl Into<String>,
+    node_id: i32,
+    listener: url::Url,
+) -> Outcome<Engine> {
+    let builder = StorageContainer::builder()
+        .cluster_id(cluster_id)
+        .node_id(node_id);
+    let builder = builder.advertised_listener(listener);
+    let building = builder.storage(url::Url::parse("memory://")?).build();
+    building.await.map_err(Into::into)
 }
 
-pub(crate) fn alphanumeric_string(length: usize) -> String {
-    rng()
-        .sample_iter(&Alphanumeric)
-        .take(length)
-        .map(char::from)
-        .collect()
+pub(crate) fn alphanumeric_string(len: usize) -> String {
+    let letters = rand::rng().sample_iter(&Alphanumeric).take(len);
+    letters.map(char::from).collect()
 }
 
-pub(crate) fn random_bytes(length: usize) -> Bytes {
-    rng()
-        .sample_iter(StandardUniform)
-        .take(length)
-        .collect::<Vec<u8>>()
-        .into()
+pub(crate) fn random_bytes(length: usize) -> bytes::Bytes {
+    let octets = rand::rng().sample_iter(StandardUniform).take(length);
+    octets.collect::<Vec<u8>>().into()
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn join_group<G>(
-    controller: &mut Controller<G>,
-    client_id: Option<&str>,
-    group_id: &str,
-    session_timeout_ms: i32,
-    rebalance_timeout_ms: Option<i32>,
-    member_id: &str,
-    group_instance_id: Option<&str>,
-    protocol_type: &str,
-    protocols: Option<&[JoinGroupRequestProtocol]>,
-    reason: Option<&str>,
-) -> Result<JoinGroupResponse>
-where
-    G: Storage + Clone,
-{
-    controller
-        .join(
-            client_id,
-            group_id,
-            session_timeout_ms,
-            rebalance_timeout_ms,
-            member_id,
-            group_instance_id,
-            protocol_type,
-            protocols,
-            reason,
-        )
-        .await
-        .and_then(|body| TryInto::try_into(body).map_err(Into::into))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn sync_group<G>(
-    controller: &mut Controller<G>,
-    group_id: &str,
-    generation_id: i32,
-    member_id: &str,
-    group_instance_id: Option<&str>,
-    protocol_type: &str,
-    protocol_name: &str,
-    assignments: &[SyncGroupRequestAssignment],
-) -> Result<SyncGroupResponse>
-where
-    G: Storage + Clone,
-{
-    controller
-        .sync(
-            group_id,
-            generation_id,
-            member_id,
-            group_instance_id,
-            Some(protocol_type),
-            Some(protocol_name),
-            Some(assignments),
-        )
-        .await
-        .and_then(|body| TryInto::try_into(body).map_err(Into::into))
-}
-
-pub(crate) async fn heartbeat<G>(
-    controller: &mut Controller<G>,
-    group_id: &str,
-    generation_id: i32,
-    member_id: &str,
-    group_instance_id: Option<&str>,
-) -> Result<HeartbeatResponse>
-where
-    G: Storage + Clone,
-{
-    controller
-        .heartbeat(group_id, generation_id, member_id, group_instance_id)
-        .await
-        .and_then(|body| TryInto::try_into(body).map_err(Into::into))
-}
-
-pub(crate) async fn offset_fetch<G>(
-    controller: &mut Controller<G>,
-    group_id: &str,
-    topics: &[OffsetFetchRequestTopic],
-) -> Result<OffsetFetchResponse>
-where
-    G: Storage + Clone,
-{
-    controller
-        .offset_fetch(Some(group_id), Some(topics), None, Some(false))
-        .await
-        .and_then(|body| TryInto::try_into(body).map_err(Into::into))
-}
-
-pub(crate) async fn leave<G>(
-    controller: &mut Controller<G>,
-    group_id: &str,
-    member_id: &str,
-    group_instance_id: Option<&str>,
-) -> Result<LeaveGroupResponse>
-where
-    G: Storage + Clone,
-{
-    controller
-        .leave(
-            group_id,
-            None,
-            Some(&[MemberIdentity::default()
-                .member_id(member_id.into())
-                .group_instance_id(group_instance_id.map(|s| s.to_owned()))
-                .reason(Some("the consumer is being closed".into()))]),
-        )
-        .await
-        .and_then(|body| TryInto::try_into(body).map_err(Into::into))
-}
-
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) enum JoinResponse {
-    Leader {
-        id: String,
-        generation: i32,
-        members: Vec<JoinGroupResponseMember>,
-        protocols: Vec<JoinGroupRequestProtocol>,
-    },
-    Follower {
-        leader: String,
-        id: String,
-        generation: i32,
-        protocols: Vec<JoinGroupRequestProtocol>,
-    },
-}
-
-impl JoinResponse {
-    #[allow(dead_code)]
-    pub(crate) fn leader(&self) -> &str {
-        match self {
-            Self::Leader { id: leader, .. } | Self::Follower { leader, .. } => leader.as_str(),
-        }
-    }
-
-    pub(crate) fn id(&self) -> &str {
-        match self {
-            Self::Leader { id, .. } | Self::Follower { id, .. } => id.as_str(),
-        }
-    }
-
-    pub(crate) fn generation(&self) -> i32 {
-        match self {
-            Self::Leader { generation, .. } | Self::Follower { generation, .. } => *generation,
-        }
-    }
-
-    pub(crate) fn is_leader(&self) -> bool {
-        matches!(self, Self::Leader { .. })
-    }
-
-    pub(crate) fn protocols(&self) -> &[JoinGroupRequestProtocol] {
-        match self {
-            Self::Leader { protocols, .. } | Self::Follower { protocols, .. } => &protocols[..],
-        }
-    }
-}
-
-pub(crate) const CLIENT_ID: &str = "console-consumer";
-pub(crate) const RANGE: &str = "range";
-pub(crate) const COOPERATIVE_STICKY: &str = "cooperative-sticky";
-pub(crate) const PROTOCOL_TYPE: &str = "consumer";
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn join<G>(
-    controller: &mut Controller<G>,
-    group_id: &str,
-    member_id: Option<&str>,
-    group_instance_id: Option<&str>,
-    protocols: Option<Vec<JoinGroupRequestProtocol>>,
-    session_timeout_ms: i32,
-    rebalance_timeout_ms: Option<i32>,
-) -> Result<JoinResponse>
-where
-    G: Storage + Clone,
-{
-    let reason = None;
-
-    let protocols = protocols.unwrap_or_else(|| {
-        [
-            JoinGroupRequestProtocol::default()
-                .name(RANGE.into())
-                .metadata(random_bytes(15)),
-            JoinGroupRequestProtocol::default()
-                .name(COOPERATIVE_STICKY.into())
-                .metadata(random_bytes(15)),
-        ]
-        .into()
-    });
-
-    let join_response = join_group(
-        controller,
-        Some(CLIENT_ID),
-        group_id,
-        session_timeout_ms,
-        rebalance_timeout_ms,
-        member_id.unwrap_or_default(),
-        group_instance_id,
-        PROTOCOL_TYPE,
-        Some(&protocols[..]),
-        reason,
-    )
-    .await?;
-
-    if member_id.is_none() && group_instance_id.is_none() {
-        // join rejected as member id is required for a dynamic group
-        //
-        assert_eq!(
-            ErrorCode::MemberIdRequired,
-            ErrorCode::try_from(join_response.error_code)?
-        );
-        assert_eq!(Some("".into()), join_response.protocol_name);
-        assert!(join_response.leader.is_empty());
-        assert!(join_response.member_id.starts_with(CLIENT_ID));
-        assert_eq!(0, join_response.members.unwrap_or_default().len());
-
-        Box::pin(join(
-            controller,
-            group_id,
-            Some(join_response.member_id.as_str()),
-            group_instance_id,
-            Some(protocols),
-            session_timeout_ms,
-            rebalance_timeout_ms,
-        ))
-        .await
-    } else if join_response.member_id == join_response.leader {
-        assert_eq!(
-            ErrorCode::None,
-            ErrorCode::try_from(join_response.error_code)?
-        );
-        assert_eq!(Some(PROTOCOL_TYPE.into()), join_response.protocol_type);
-        assert_eq!(Some(RANGE.into()), join_response.protocol_name);
-
-        let id = join_response.leader;
-        let generation = join_response.generation_id;
-        let members = join_response.members.unwrap_or_default();
-
-        Ok(JoinResponse::Leader {
-            id,
-            generation,
-            members,
-            protocols,
-        })
-    } else {
-        assert_eq!(
-            ErrorCode::None,
-            ErrorCode::try_from(join_response.error_code)?
-        );
-        assert_eq!(Some(PROTOCOL_TYPE.into()), join_response.protocol_type);
-        assert_eq!(Some(RANGE.into()), join_response.protocol_name);
-        assert_ne!(join_response.member_id, join_response.leader);
-        assert_eq!(0, join_response.members.unwrap_or_default().len());
-
-        let id = join_response.member_id;
-        let leader = join_response.leader;
-        let generation = join_response.generation_id;
-
-        Ok(JoinResponse::Follower {
-            leader,
-            id,
-            generation,
-            protocols,
-        })
-    }
-}
-
-pub(crate) async fn register_broker<C, G>(cluster_id: C, broker_id: i32, sc: G) -> Result<()>
-where
-    C: Into<String>,
-    G: Storage,
-{
-    let incarnation_id = Uuid::now_v7();
-
-    // debug!(?cluster_id, ?broker_id, ?incarnation_id);
-
-    let broker_registration = BrokerRegistrationRequest {
+/// Registers broker `broker_id` of `cluster_id` with `engine`, under a fresh
+/// incarnation.
+pub(crate) async fn register_broker(
+    cluster_id: impl Into<String>,
+    broker_id: i32,
+    engine: impl tansu_storage::Storage,
+) -> Outcome<()> {
+    let (incarnation, cluster, rack) = (uuid::Uuid::now_v7(), cluster_id.into(), None);
+    let registration = BrokerRegistrationRequest {
         broker_id,
-        cluster_id: cluster_id.into(),
-        incarnation_id,
-        rack: None,
+        cluster_id: cluster,
+        incarnation_id: incarnation,
+        rack,
     };
+    let registering = engine.register_broker(registration);
+    registering.await.map_err(Into::into)
+}
 
-    sc.register_broker(broker_registration)
-        .await
-        .map_err(Into::into)
+/// `answer` as the response type the call it answers returns.
+fn typed<T>(answer: tansu_broker::Result<Body>) -> Outcome<T>
+where
+    T: TryFrom<Body>,
+    tansu_broker::Error: From<T::Error>,
+{
+    Ok(T::try_from(answer?)?)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one per JoinGroup field a test sets"
+)]
+pub(crate) async fn join_group(
+    coordinator: &mut Controller<Engine>,
+    client: Option<&str>,
+    group: &str,
+    session_ms: i32,
+    rebalance_ms: Option<i32>,
+    member: &str,
+    instance: Option<&str>,
+    kind: &str,
+    offered: Option<&[JoinGroupRequestProtocol]>,
+    why: Option<&str>,
+) -> Outcome<JoinGroupResponse> {
+    let joining = coordinator.join(
+        client,
+        group,
+        session_ms,
+        rebalance_ms,
+        member,
+        instance,
+        kind,
+        offered,
+        why,
+    );
+    typed(joining.await)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one per SyncGroup field a test sets"
+)]
+pub(crate) async fn sync_group(
+    coordinator: &mut Controller<Engine>,
+    group: &str,
+    generation_id: i32,
+    member: &str,
+    instance: Option<&str>,
+    kind: &str,
+    protocol: &str,
+    handed: &[SyncGroupRequestAssignment],
+) -> Outcome<SyncGroupResponse> {
+    let (kind, protocol, handed) = (Some(kind), Some(protocol), Some(handed));
+    let syncing = coordinator.sync(
+        group,
+        generation_id,
+        member,
+        instance,
+        kind,
+        protocol,
+        handed,
+    );
+    typed(syncing.await)
+}
+
+pub(crate) async fn heartbeat(
+    coordinator: &mut Controller<Engine>,
+    group: &str,
+    generation_id: i32,
+    member: &str,
+    instance: Option<&str>,
+) -> Outcome<HeartbeatResponse> {
+    let beating = coordinator.heartbeat(group, generation_id, member, instance);
+    typed(beating.await)
+}
+
+/// Leaves `group` as `member`, as a consumer does when it is closed.
+pub(crate) async fn leave(
+    coordinator: &mut Controller<Engine>,
+    group: &str,
+    member: &str,
+    instance: Option<&str>,
+) -> Outcome<LeaveGroupResponse> {
+    let leaving = MemberIdentity::default().member_id(member.into());
+    let leaving = leaving.group_instance_id(instance.map(String::from));
+    let leaving = leaving.reason(Some("the consumer is being closed".into()));
+    let leavers = [leaving];
+    let left = coordinator.leave(group, None, Some(&leavers));
+    typed(left.await)
+}
+
+/// Where a join left a member: its id, its generation, the leader it was
+/// told of (itself when it leads), the members a leader is told of, and the
+/// protocols it offered, to offer again on a rejoin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Joined {
+    pub(crate) id: String,
+    pub(crate) generation: i32,
+    pub(crate) leader: String,
+    pub(crate) members: Vec<JoinGroupResponseMember>,
+    pub(crate) protocols: Vec<JoinGroupRequestProtocol>,
+}
+
+impl Joined {
+    pub(crate) fn leads(&self) -> bool {
+        self.id == self.leader
+    }
+}
+
+/// Joins `group` as the console consumer, offering `protocols` or else range
+/// and cooperative-sticky with random metadata.
+///
+/// A dynamic member with no id is first refused with `MemberIdRequired` and
+/// the id to come back with, and rejoins with it. Either way the answer is
+/// asserted to be range under `consumer`, and a follower is told no members.
+pub(crate) async fn join(
+    coordinator: &mut Controller<Engine>,
+    group: &str,
+    member: Option<&str>,
+    instance: Option<&str>,
+    offers: Option<Vec<JoinGroupRequestProtocol>>,
+    session_ms: i32,
+    rebalance_ms: Option<i32>,
+) -> Outcome<Joined> {
+    let offer = |name: &str| {
+        let protocol = JoinGroupRequestProtocol::default().name(name.into());
+        protocol.metadata(random_bytes(15))
+    };
+    let offers = offers.unwrap_or_else(|| vec![offer(RANGE_ASSIGNOR), offer(STICKY_ASSIGNOR)]);
+    let (client, id) = (Some(CONSOLE_CLIENT), member.unwrap_or_default());
+    let joining = join_group(
+        coordinator,
+        client,
+        group,
+        session_ms,
+        rebalance_ms,
+        id,
+        instance,
+        CONSUMER_PROTOCOL,
+        Some(&offers[..]),
+        None,
+    );
+    let answer = joining.await?;
+    let outcome = ErrorCode::try_from(answer.error_code)?;
+
+    if member.is_none() && instance.is_none() {
+        assert_eq!(ErrorCode::MemberIdRequired, outcome);
+        assert_eq!(
+            (Some(""), ""),
+            (answer.protocol_name.as_deref(), answer.leader.as_str())
+        );
+        assert!(
+            answer.member_id.starts_with(CONSOLE_CLIENT),
+            "{}",
+            answer.member_id
+        );
+        assert_eq!(0, answer.members.unwrap_or_default().len());
+        let given = Some(answer.member_id.as_str());
+        let again = join(
+            coordinator,
+            group,
+            given,
+            instance,
+            Some(offers),
+            session_ms,
+            rebalance_ms,
+        );
+        return Box::pin(again).await;
+    }
+
+    assert_eq!(ErrorCode::None, outcome);
+    let chosen = (
+        answer.protocol_type.as_deref(),
+        answer.protocol_name.as_deref(),
+    );
+    assert_eq!((Some(CONSUMER_PROTOCOL), Some(RANGE_ASSIGNOR)), chosen);
+    let members = answer.members.unwrap_or_default();
+    if answer.member_id != answer.leader {
+        assert_eq!(0, members.len());
+    }
+    Ok(Joined {
+        id: answer.member_id,
+        generation: answer.generation_id,
+        leader: answer.leader,
+        members,
+        protocols: offers,
+    })
 }
 
 /// A wall-clock reading derived from `tokio`'s clock, for a test that runs
@@ -410,10 +320,8 @@ where
 /// has no absolute zero, and `nextest` runs each test in its own process, so
 /// "first use" is this test's start.
 pub(crate) fn paused_clock() -> std::time::SystemTime {
-    use std::{
-        sync::OnceLock,
-        time::{Duration, SystemTime},
-    };
+    use std::sync::OnceLock;
+    use std::time::{Duration, SystemTime};
 
     use tokio::time::Instant;
 
@@ -423,7 +331,6 @@ pub(crate) fn paused_clock() -> std::time::SystemTime {
 
     static STARTED: OnceLock<Instant> = OnceLock::new();
 
-    SystemTime::UNIX_EPOCH
-        + ORIGIN
-        + Instant::now().duration_since(*STARTED.get_or_init(Instant::now))
+    let since_start = Instant::now().duration_since(*STARTED.get_or_init(Instant::now));
+    SystemTime::UNIX_EPOCH + ORIGIN + since_start
 }

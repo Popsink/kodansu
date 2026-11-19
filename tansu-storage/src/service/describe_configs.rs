@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,95 +12,38 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rama::{Context, Service};
-use tansu_sans_io::{ApiKey, ConfigResource, DescribeConfigsRequest, DescribeConfigsResponse};
-use tracing::{error, instrument};
+//! `DescribeConfigs`: the configuration of each resource the client names.
 
-use crate::{Error, Result, Storage};
+use tansu_sans_io::{
+    ConfigResource, DescribeConfigsRequest, DescribeConfigsResponse,
+    describe_configs_request::DescribeConfigsResource,
+};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`DescribeConfigsRequest`] returning [`DescribeConfigsResponse`].
-/// ```
-/// use rama::{Context, Layer, Service as _, layer::MapStateLayer};
-/// use tansu_sans_io::{ConfigResource, DescribeConfigsRequest,
-///     EndpointType, ErrorCode, describe_configs_request::DescribeConfigsResource};
-/// use tansu_storage::{DescribeConfigsService, Error, StorageContainer};
-/// use url::Url;
-///
-/// # #[tokio::main]
-/// # async fn main() -> Result<(), Error> {
-/// let storage = StorageContainer::builder()
-///     .cluster_id("tansu")
-///     .node_id(111)
-///     .advertised_listener(Url::parse("tcp://localhost:9092")?)
-///     .storage(Url::parse("memory://tansu/")?)
-///     .build()
-///     .await?;
-///
-/// let service = MapStateLayer::new(|_| storage).into_layer(DescribeConfigsService);
-///
-/// let response = service
-///     .serve(
-///         Context::default(),
-///         DescribeConfigsRequest::default()
-///             .include_documentation(Some(false))
-///             .include_synonyms(Some(false))
-///             .resources(Some(
-///                 [DescribeConfigsResource::default()
-///                     .resource_name("abcba".into())
-///                     .resource_type(ConfigResource::Topic.into())
-///                     .configuration_keys(Some([].into()))]
-///                 .into(),
-///             )),
-///     )
-///     .await?;
-///
-/// // "abcba" was never created, so it is reported as unknown rather than as a
-/// // topic with an empty config (#579).
-/// let results = response.results.unwrap_or_default();
-/// assert_eq!(1, results.len());
-/// assert_eq!(
-///     ErrorCode::UnknownTopicOrPartition,
-///     ErrorCode::try_from(results[0].error_code)?
-/// );
-/// assert!(results[0].configs.as_deref().unwrap_or_default().is_empty());
-/// # Ok(())
-/// # }
-/// ```
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct DescribeConfigsService;
-
-impl ApiKey for DescribeConfigsService {
-    const KEY: i16 = DescribeConfigsRequest::KEY;
-}
-
-impl<G> Service<G, DescribeConfigsRequest> for DescribeConfigsService
-where
-    G: Storage,
-{
-    type Response = DescribeConfigsResponse;
-    type Error = Error;
-
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: DescribeConfigsRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        let mut results = vec![];
-
-        for resource in req.resources.unwrap_or_default() {
-            results.push(
-                ctx.state()
-                    .describe_config(
-                        resource.resource_name.as_str(),
-                        ConfigResource::from(resource.resource_type),
-                        resource.configuration_keys.as_deref(),
-                    )
-                    .await
-                    .inspect_err(|err| error!(?err))?,
-            );
+storage_service! {
+    /// Asks [`Storage::describe_config`](crate::Storage::describe_config) about
+    /// each resource in turn, in request order. A resource that does not exist
+    /// comes back with its own error code; only a storage failure fails the
+    /// whole request.
+    ///
+    /// `tests/describe_configs.rs` covers a topic that exists and one that
+    /// does not (#579).
+    DescribeConfigsService: DescribeConfigsRequest => DescribeConfigsResponse,
+    |ctx, req| {
+        let storage = ctx.state();
+        let mut results = Vec::new();
+        for resource in req.resources.into_iter().flatten() {
+            let DescribeConfigsResource {
+                resource_name,
+                resource_type,
+                configuration_keys,
+                ..
+            } = resource;
+            let kind = ConfigResource::from(resource_type);
+            let keys = configuration_keys.as_deref();
+            let described = storage.describe_config(&resource_name, kind, keys).await;
+            results.push(described.inspect_err(|err| tracing::error!(?err))?);
         }
-
-        Ok(DescribeConfigsResponse::default().results(Some(results)))
+        let response = DescribeConfigsResponse::default().results(results.into());
+        Ok(response)
     }
 }

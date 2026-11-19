@@ -12,19 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::BTreeMap, time::SystemTime};
+use std::collections::BTreeMap;
+use std::time::SystemTime;
 
-use rama::{Context, Service};
-use tansu_sans_io::{
-    ApiKey, ConsumerGroupDescribeRequest,
-    consumer_group_describe_response::{ConsumerGroupDescribeResponse, DescribedGroup},
-    to_timestamp,
-};
-use tracing::{debug, instrument};
+use rama::Context;
+use rama::Service;
+use tansu_sans_io::consumer_group_describe_response::ConsumerGroupDescribeResponse;
+use tansu_sans_io::consumer_group_describe_response::DescribedGroup;
+use tansu_sans_io::{ApiKey, ConsumerGroupDescribeRequest, to_timestamp};
 
-use crate::{Error, Result, Storage};
+use crate::Storage;
+use crate::{Error, Result};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`ConsumerGroupDescribeRequest`] returning [`ConsumerGroupDescribeResponse`].
+/// Answers `ConsumerGroupDescribe` from the [`Storage`] it is served with.
 ///
 /// A KIP-848 group — one with a [`ConsumerGroupDoc`](crate::ConsumerGroupDoc)
 /// — is reported from that document: members, epochs, current and target
@@ -34,39 +34,29 @@ use crate::{Error, Result, Storage};
 /// [`DescribeGroups`](crate::DescribeGroupsService), which is the path that
 /// carries a classic group's membership.
 /// ```
-/// use rama::{Context, Layer, Service as _, layer::MapStateLayer};
-/// use tansu_sans_io::{ConsumerGroupDescribeRequest, ErrorCode};
-/// use tansu_storage::{ConsumerGroupDescribeService, Error, StorageContainer};
-/// use url::Url;
+/// use rama::layer::MapStateLayer;
+/// use rama::{Context, Layer as _, Service as _};
+/// use tansu_sans_io::ConsumerGroupDescribeRequest;
+/// use tansu_sans_io::ErrorCode;
+/// use tansu_storage::{ConsumerGroupDescribeService, StorageContainer};
 ///
-/// # #[tokio::main]
-/// # async fn main() -> Result<(), Error> {
-/// let storage = StorageContainer::builder()
-///     .cluster_id("tansu")
-///     .node_id(111)
-///     .advertised_listener(Url::parse("tcp://localhost:9092")?)
-///     .storage(Url::parse("memory://tansu/")?)
-///     .build()
-///     .await?;
+/// # #[tokio::main(flavor = "current_thread")]
+/// # async fn main() -> Result<(), tansu_storage::Error> {
+/// let listener = url::Url::parse("tcp://localhost:9092")?;
+/// let engine = StorageContainer::builder().cluster_id("tansu").node_id(111);
+/// let engine = engine.advertised_listener(listener);
+/// let engine = engine.storage(url::Url::parse("memory://tansu/")?).build().await?;
+/// let describe = MapStateLayer::new(|_| engine).into_layer(ConsumerGroupDescribeService);
 ///
-/// let service = MapStateLayer::new(|_| storage).into_layer(ConsumerGroupDescribeService);
+/// let request = ConsumerGroupDescribeRequest::default().group_ids(Some(vec!["abc".into()]));
+/// let request = request.include_authorized_operations(false);
+/// let described = describe.serve(Context::default(), request).await?;
 ///
-/// let group_id = "abc";
-///
-/// let response = service
-///     .serve(
-///         Context::default(),
-///         ConsumerGroupDescribeRequest::default()
-///             .group_ids(Some([group_id.into()].into()))
-///             .include_authorized_operations(false),
-///     )
-///     .await?;
-///
-/// let groups = response.groups.unwrap_or_default();
-/// assert_eq!(1, groups.len());
-/// assert_eq!(ErrorCode::GroupIdNotFound, ErrorCode::try_from(groups[0].error_code)?);
-/// assert_eq!(group_id, groups[0].group_id.as_str());
-/// assert_eq!("Unknown", groups[0].group_state.as_str());
+/// let [unknown] = &described.groups.unwrap_or_default()[..] else {
+///     panic!("one group")
+/// };
+/// assert_eq!(ErrorCode::GroupIdNotFound, ErrorCode::try_from(unknown.error_code)?);
+/// assert_eq!(("abc", "Unknown"), (unknown.group_id.as_str(), unknown.group_state.as_str()));
 /// # Ok(())
 /// # }
 /// ```
@@ -84,14 +74,14 @@ where
     type Response = ConsumerGroupDescribeResponse;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
+    #[tracing::instrument(skip(state, request))]
     async fn serve(
         &self,
-        ctx: Context<G>,
-        req: ConsumerGroupDescribeRequest,
+        state: Context<G>,
+        request: ConsumerGroupDescribeRequest,
     ) -> Result<Self::Response, Self::Error> {
-        let storage = ctx.state();
-        let group_ids = req.group_ids.unwrap_or_default();
+        let storage = state.state();
+        let group_ids = request.group_ids.unwrap_or_default();
         let now_ms = to_timestamp(&SystemTime::now()).unwrap_or_default();
 
         let mut consumer = BTreeMap::new();
@@ -117,17 +107,16 @@ where
             }
         }
 
-        let classic = if classic.is_empty() {
+        let classic: BTreeMap<_, _> = if classic.is_empty() {
             BTreeMap::new()
         } else {
-            storage
-                .describe_groups(Some(&classic), req.include_authorized_operations)
-                .await
-                .inspect(|described| debug!(?described))?
-                .iter()
-                .map(DescribedGroup::from)
-                .map(|described| (described.group_id.clone(), described))
-                .collect()
+            let operations = request.include_authorized_operations;
+            let describing = storage.describe_groups(Some(&classic), operations);
+            let answered = describing.await?;
+            tracing::debug!(described = ?answered);
+            let keyed = |group: DescribedGroup| (group.group_id.clone(), group);
+            let groups = answered.iter().map(DescribedGroup::from);
+            groups.map(keyed).collect()
         };
 
         let has_members =
@@ -146,8 +135,7 @@ where
             })
             .collect();
 
-        Ok(ConsumerGroupDescribeResponse::default()
-            .throttle_time_ms(0)
-            .groups(Some(groups)))
+        let unthrottled = ConsumerGroupDescribeResponse::default().throttle_time_ms(0);
+        Ok(unthrottled.groups(Some(groups)))
     }
 }

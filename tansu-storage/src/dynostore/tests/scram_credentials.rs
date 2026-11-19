@@ -16,8 +16,9 @@
 //!
 //! These exist because all three of these methods were stubs returning
 //! `Ok(())` and `Ok(None)` on the only backend that ships. Every test passed:
-//! the handshake is covered against a hand-written mock storage in
-//! `tansu-broker/tests/auth.rs`, and the `Null` engine correctly refuses. What
+//! the handshake was covered against a hand-written mock storage in
+//! `tansu-broker/tests/auth.rs` (it runs against the `memory://` engine now),
+//! and the `Null` engine correctly refuses. What
 //! nothing asserted was that a credential written to the object store could be
 //! read back from it — so `tansu user create` reported success, persisted
 //! nothing, and `--authentication` produced a broker no client could ever

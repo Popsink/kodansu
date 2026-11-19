@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,1592 +16,365 @@
 // engine this fork ships. The gate was on `mod in_memory` until #552 dissolved
 // it; with the module gone it belongs to the file.
 #![cfg(feature = "dynostore")]
-// A transaction test is a scripted sequence of protocol exchanges, each with
-// its own assertion: the branch count #555's nursery gate sees is the length
-// of the script.
-#![allow(clippy::cognitive_complexity)]
 
-use std::{collections::BTreeMap, slice, sync::Arc, time::Duration};
+use std::{collections::BTreeSet, slice, sync::Arc, time::Duration};
 
-use bytes::Bytes;
-use common::{alphanumeric_string, init_tracing, register_broker};
-use rand::{prelude::*, rng};
-use tansu_broker::Result;
-use tansu_sans_io::{
-    BatchAttribute, ControlBatch, EndTransactionMarker, ErrorCode, IsolationLevel, ListOffset,
-    add_partitions_to_txn_request::AddPartitionsToTxnTopic,
-    add_partitions_to_txn_response::{
-        AddPartitionsToTxnPartitionResult, AddPartitionsToTxnTopicResult,
-    },
-    create_topics_request::CreatableTopic,
-    record::{Record, inflated},
-    txn_offset_commit_request::{TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic},
+use anyhow::Result;
+use rand::{RngExt as _, rng};
+use tansu_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
+use tansu_sans_io::add_partitions_to_txn_response::AddPartitionsToTxnPartitionResult;
+use tansu_sans_io::add_partitions_to_txn_response::AddPartitionsToTxnTopicResult;
+use tansu_sans_io::create_topics_request::CreatableTopic;
+use tansu_sans_io::record::{Record, inflated};
+use tansu_sans_io::txn_offset_commit_request::{
+    TxnOffsetCommitRequestPartition, TxnOffsetCommitRequestTopic,
 };
-use tansu_storage::{Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnOffsetCommitRequest};
-use tracing::{debug, error};
-use url::Url;
-use uuid::Uuid;
+use tansu_sans_io::{BatchAttribute, ControlBatch, EndTransactionMarker, ErrorCode};
+use tansu_sans_io::{IsolationLevel, ListOffset};
+use tansu_storage::{
+    ProducerIdResponse, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnOffsetCommitRequest,
+};
 
-pub mod common;
+use crate::common::{alphanumeric_string, init_tracing, register_broker};
 
-// txns that overlap on the same topition
-//
+mod common;
 
-async fn storage_container(cluster: impl Into<String>, node: i32) -> Result<Arc<dyn Storage>> {
-    common::storage_container(cluster, node, Url::parse("tcp://127.0.0.1/")?).await
+const PARTITIONS: i32 = 6;
+
+/// How many single-record batches [`Partition::begin`] produces.
+const RECORDS: i32 = 6;
+
+const TIMEOUT_MS: i32 = 10_000;
+
+const MAX_WAIT: Duration = Duration::from_millis(500);
+
+/// A transaction id and the producer it was initialised with.
+type Txn = (String, ProducerIdResponse);
+
+/// One partition, picked at random, of a fresh topic on a freshly registered
+/// broker: every transaction in a test writes here.
+struct Partition {
+    storage: Arc<dyn Storage>,
+    id: uuid::Uuid,
+    topition: Topition,
+    produced: BTreeSet<i64>,
 }
 
-#[tokio::test]
-async fn simple_txn_commit_offset_abort() -> Result<()> {
-    let _guard = init_tracing()?;
+impl Partition {
+    async fn new() -> Result<Self> {
+        let (cluster, node) = (uuid::Uuid::now_v7(), rng().random_range(0..i32::MAX));
+        let url = url::Url::parse("tcp://127.0.0.1/")?;
+        let storage = common::storage_container(cluster, node, url).await?;
+        register_broker(cluster, node, storage.clone()).await?;
 
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let sc = storage_container(cluster_id, broker_id).await?;
+        let name = alphanumeric_string(15);
+        let topic = CreatableTopic::default()
+            .name(name.clone())
+            .num_partitions(PARTITIONS)
+            .replication_factor(0)
+            .assignments(Some([].into()))
+            .configs(Some([].into()));
+        let id = storage.create_topic(topic, false).await?;
 
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let num_partitions = 6;
-    let replication_factor = 0;
-
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let topic_id = sc
-        .create_topic(
-            CreatableTopic::default()
-                .name(topic_name.clone())
-                .num_partitions(num_partitions)
-                .replication_factor(replication_factor)
-                .assignments(assignments.clone())
-                .configs(configs.clone()),
-            false,
-        )
-        .await?;
-    debug!(?topic_id);
-
-    let transaction_timeout_ms = 10_000;
-
-    let partition_index = rng().random_range(0..num_partitions);
-
-    let transaction_id = alphanumeric_string(10);
-    let group_id = alphanumeric_string(10);
-
-    let producer = sc
-        .init_producer(
-            Some(transaction_id.as_str()),
-            transaction_timeout_ms,
-            Some(-1),
-            Some(-1),
-        )
-        .await
-        .inspect(|producer| debug!(transaction_id, ?producer))
-        .inspect_err(|err| error!(?err, transaction_id, transaction_timeout_ms))?;
-
-    let topition = Topition::new(topic_name.clone(), partition_index);
-
-    let offsets = sc
-        .offset_fetch(
-            Some(group_id.as_str()),
-            slice::from_ref(&topition),
-            Some(false),
-        )
-        .await
-        .inspect(|offsets| debug!(?offsets, ?topition))?;
-
-    assert!(offsets.contains_key(&topition));
-    assert_eq!(
-        Some(-1),
-        offsets.get(&topition).map(|committed| committed.offset)
-    );
-
-    let committed_offset = 32123;
-
-    let result = sc
-        .txn_offset_commit(TxnOffsetCommitRequest {
-            transaction_id: transaction_id.clone(),
-            group_id: group_id.clone(),
-            producer_id: producer.id,
-            producer_epoch: producer.epoch,
-            generation_id: None,
-            member_id: None,
-            group_instance_id: None,
-            topics: vec![
-                TxnOffsetCommitRequestTopic::default()
-                    .name(topic_name.clone())
-                    .partitions(Some(vec![
-                        TxnOffsetCommitRequestPartition::default()
-                            .partition_index(partition_index)
-                            .committed_offset(committed_offset)
-                            .committed_leader_epoch(None)
-                            .committed_metadata(None),
-                    ])),
-            ],
+        Ok(Self {
+            storage,
+            id,
+            topition: Topition::new(name, rng().random_range(0..PARTITIONS)),
+            produced: BTreeSet::new(),
         })
-        .await?;
+    }
 
-    assert_eq!(1, result.len());
-    assert_eq!(topic_name, result[0].name);
-    assert_eq!(1, result[0].partitions.as_ref().unwrap_or(&vec![]).len());
-    assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(result[0].partitions.as_ref().unwrap()[0].error_code)?
-    );
+    fn name(&self) -> String {
+        self.topition.topic().to_owned()
+    }
 
-    let offsets = sc
-        .offset_fetch(
-            Some(group_id.as_str()),
-            slice::from_ref(&topition),
-            Some(false),
-        )
-        .await
-        .inspect(|offsets| debug!(?offsets, ?topition))?;
+    fn index(&self) -> i32 {
+        self.topition.partition()
+    }
 
-    assert!(offsets.contains_key(&topition));
-    assert_eq!(
-        Some(-1),
-        offsets.get(&topition).map(|committed| committed.offset)
-    );
+    async fn init(&self, txn: &str) -> Result<ProducerIdResponse> {
+        Ok(self
+            .storage
+            .init_producer(Some(txn), TIMEOUT_MS, Some(-1), Some(-1))
+            .await?)
+    }
 
-    let commit = false;
-    assert_eq!(
-        ErrorCode::None,
-        sc.txn_end(transaction_id.as_str(), producer.id, producer.epoch, commit)
-            .await
-            .inspect(|status| debug!(transaction_id, ?producer, commit, ?status))
-            .inspect_err(|err| error!(?err, transaction_id, ?producer, commit))?
-    );
+    /// A transaction that has only been initialised.
+    async fn open(&self) -> Result<Txn> {
+        let txn = alphanumeric_string(10);
+        let owner = self.init(&txn).await?;
+        Ok((txn, owner))
+    }
 
-    let offsets = sc
-        .offset_fetch(
-            Some(group_id.as_str()),
-            slice::from_ref(&topition),
-            Some(false),
-        )
-        .await
-        .inspect(|offsets| debug!(?offsets, ?topition))?;
+    /// A transaction with this partition added to it, holding [`RECORDS`]
+    /// uncommitted batches.
+    async fn begin(&mut self) -> Result<Txn> {
+        let (txn, owner) = self.open().await?;
 
-    assert!(offsets.contains_key(&topition));
-    assert_eq!(
-        Some(-1),
-        offsets.get(&topition).map(|committed| committed.offset)
-    );
+        let topic = AddPartitionsToTxnTopic::default()
+            .name(self.name())
+            .partitions(Some(vec![self.index()]));
+        let request = TxnAddPartitionsRequest::VersionZeroToThree {
+            transaction_id: txn.clone(),
+            producer_id: owner.id,
+            producer_epoch: owner.epoch,
+            topics: vec![topic],
+        };
+        let added = self.storage.txn_add_partitions(request).await?;
+        let accepted = AddPartitionsToTxnPartitionResult::default()
+            .partition_index(self.index())
+            .partition_error_code(ErrorCode::None.into());
+        let expected = AddPartitionsToTxnTopicResult::default()
+            .name(self.name())
+            .results_by_partition(Some(vec![accepted]));
+        assert_eq!([expected], added.zero_to_three());
 
-    assert_eq!(
-        ErrorCode::None,
-        sc.delete_topic(&TopicId::from(topic_id)).await?
-    );
+        let transactional: i16 = BatchAttribute::default().transaction(true).into();
+        for sequence in 0..RECORDS {
+            let record = Record::builder()
+                .key(Some(alphanumeric_string(15).into()))
+                .value(Some(alphanumeric_string(15).into()));
+            let transactional_batch = inflated::Batch::builder()
+                .record(record)
+                .attributes(transactional)
+                .producer_id(owner.id)
+                .producer_epoch(owner.epoch)
+                .base_sequence(sequence)
+                .build()
+                .and_then(TryInto::try_into)?;
 
-    Ok(())
-}
-
-#[tokio::test]
-async fn simple_txn_commit_offset_commit() -> Result<()> {
-    let _guard = init_tracing()?;
-
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let sc = storage_container(cluster_id, broker_id).await?;
-
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let num_partitions = 6;
-    let replication_factor = 0;
-
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let topic_id = sc
-        .create_topic(
-            CreatableTopic::default()
-                .name(topic_name.clone())
-                .num_partitions(num_partitions)
-                .replication_factor(replication_factor)
-                .assignments(assignments.clone())
-                .configs(configs.clone()),
-            false,
-        )
-        .await?;
-    debug!(?topic_id);
-
-    let transaction_timeout_ms = 10_000;
-
-    let partition_index = rng().random_range(0..num_partitions);
-
-    let transaction_id = alphanumeric_string(10);
-    let group_id = alphanumeric_string(10);
-
-    let producer = sc
-        .init_producer(
-            Some(transaction_id.as_str()),
-            transaction_timeout_ms,
-            Some(-1),
-            Some(-1),
-        )
-        .await
-        .inspect(|producer| debug!(transaction_id, ?producer))
-        .inspect_err(|err| error!(?err, transaction_id, transaction_timeout_ms))?;
-
-    let topition = Topition::new(topic_name.clone(), partition_index);
-
-    let offsets = sc
-        .offset_fetch(
-            Some(group_id.as_str()),
-            slice::from_ref(&topition),
-            Some(false),
-        )
-        .await
-        .inspect(|offsets| debug!(?offsets, ?topition))?;
-
-    assert!(offsets.contains_key(&topition));
-    assert_eq!(
-        Some(-1),
-        offsets.get(&topition).map(|committed| committed.offset)
-    );
-
-    let committed_offset = 32123;
-
-    let result = sc
-        .txn_offset_commit(TxnOffsetCommitRequest {
-            transaction_id: transaction_id.clone(),
-            group_id: group_id.clone(),
-            producer_id: producer.id,
-            producer_epoch: producer.epoch,
-            generation_id: None,
-            member_id: None,
-            group_instance_id: None,
-            topics: vec![
-                TxnOffsetCommitRequestTopic::default()
-                    .name(topic_name.clone())
-                    .partitions(Some(vec![
-                        TxnOffsetCommitRequestPartition::default()
-                            .partition_index(partition_index)
-                            .committed_offset(committed_offset)
-                            .committed_leader_epoch(None)
-                            .committed_metadata(None),
-                    ])),
-            ],
-        })
-        .await?;
-
-    assert_eq!(1, result.len());
-    assert_eq!(topic_name, result[0].name);
-    assert_eq!(1, result[0].partitions.as_ref().unwrap_or(&vec![]).len());
-    assert_eq!(
-        ErrorCode::None,
-        ErrorCode::try_from(result[0].partitions.as_ref().unwrap()[0].error_code)?
-    );
-
-    let offsets = sc
-        .offset_fetch(
-            Some(group_id.as_str()),
-            slice::from_ref(&topition),
-            Some(false),
-        )
-        .await
-        .inspect(|offsets| debug!(?offsets, ?topition))?;
-
-    assert!(offsets.contains_key(&topition));
-    assert_eq!(
-        Some(-1),
-        offsets.get(&topition).map(|committed| committed.offset)
-    );
-
-    let commit = true;
-    assert_eq!(
-        ErrorCode::None,
-        sc.txn_end(transaction_id.as_str(), producer.id, producer.epoch, commit)
-            .await
-            .inspect(|status| debug!(transaction_id, ?producer, commit, ?status))
-            .inspect_err(|err| error!(?err, transaction_id, ?producer, commit))?
-    );
-
-    let offsets = sc
-        .offset_fetch(
-            Some(group_id.as_str()),
-            slice::from_ref(&topition),
-            Some(false),
-        )
-        .await
-        .inspect(|offsets| debug!(?offsets, ?topition))?;
-
-    assert!(offsets.contains_key(&topition));
-    assert_eq!(
-        Some(committed_offset),
-        offsets.get(&topition).map(|committed| committed.offset)
-    );
-
-    assert_eq!(
-        ErrorCode::None,
-        sc.delete_topic(&TopicId::from(topic_id)).await?
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn simple_txn_produce_commit() -> Result<()> {
-    let _guard = init_tracing()?;
-
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let sc = storage_container(cluster_id, broker_id).await?;
-
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let num_partitions = 6;
-    let replication_factor = 0;
-
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let topic_id = sc
-        .create_topic(
-            CreatableTopic::default()
-                .name(topic_name.clone())
-                .num_partitions(num_partitions)
-                .replication_factor(replication_factor)
-                .assignments(assignments.clone())
-                .configs(configs.clone()),
-            false,
-        )
-        .await?;
-    debug!(?topic_id);
-
-    let transaction_timeout_ms = 10_000;
-
-    let partition_index = rng().random_range(0..num_partitions);
-    let topition = Topition::new(topic_name.clone(), partition_index);
-    let num_records = 6;
-    let num_transactions = 1;
-    let mut offset_producer = BTreeMap::new();
-
-    let list_offsets_before = sc
-        .list_offsets(
-            IsolationLevel::ReadUncommitted,
-            &[(topition.clone(), ListOffset::Latest)],
-        )
-        .await?;
-    assert_eq!(1, list_offsets_before.len());
-    assert_eq!(topic_name, list_offsets_before[0].0.topic());
-    assert_eq!(partition_index, list_offsets_before[0].0.partition());
-    assert_eq!(ErrorCode::None, list_offsets_before[0].1.error_code);
-    assert_eq!(Some(0), list_offsets_before[0].1.offset);
-
-    let transactions = {
-        let mut transactions = Vec::new();
-
-        for transaction in (0..num_transactions).map(|_| alphanumeric_string(10)) {
-            let producer = sc
-                .init_producer(
-                    Some(transaction.as_str()),
-                    transaction_timeout_ms,
-                    Some(-1),
-                    Some(-1),
-                )
-                .await
-                .inspect(|producer| debug!(transaction, ?producer))
-                .inspect_err(|err| error!(?err, transaction, transaction_timeout_ms))?;
-
-            let add_partitions = sc
-                .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
-                    transaction_id: transaction.clone(),
-                    producer_id: producer.id,
-                    producer_epoch: producer.epoch,
-                    topics: [AddPartitionsToTxnTopic::default()
-                        .name(topic_name.clone())
-                        .partitions(Some([partition_index].into()))]
-                    .into(),
-                })
-                .await
-                .inspect(|add_partitions| {
-                    debug!(
-                        transaction,
-                        ?producer,
-                        topic = topic_name,
-                        partition = partition_index,
-                        ?add_partitions
-                    )
-                })
-                .inspect_err(|err| {
-                    error!(
-                        ?err,
-                        transaction,
-                        ?producer,
-                        topic = topic_name,
-                        partition = partition_index,
-                    )
-                })?;
-
-            assert_eq!(
-                [AddPartitionsToTxnTopicResult::default()
-                    .name(topic_name.clone())
-                    .results_by_partition(Some(
-                        [AddPartitionsToTxnPartitionResult::default()
-                            .partition_index(partition_index)
-                            .partition_error_code(ErrorCode::None.into())]
-                        .into()
-                    ))],
-                add_partitions.zero_to_three()
-            );
-
-            for base_sequence in 0..num_records {
-                let key = Bytes::copy_from_slice(alphanumeric_string(15).as_bytes());
-                let value = Bytes::copy_from_slice(alphanumeric_string(15).as_bytes());
-
-                let batch = inflated::Batch::builder()
-                    .record(
-                        Record::builder()
-                            .key(key.clone().into())
-                            .value(value.clone().into()),
-                    )
-                    .attributes(BatchAttribute::default().transaction(true).into())
-                    .producer_id(producer.id)
-                    .producer_epoch(producer.epoch)
-                    .base_sequence(base_sequence)
-                    .build()
-                    .and_then(TryInto::try_into)
-                    .inspect(|deflated| debug!(base_sequence, ?deflated, ?producer))
-                    .inspect_err(|err| error!(?err, base_sequence, ?producer))?;
-
-                let offset = sc
-                    .produce(Some(transaction.as_str()), &topition, batch)
-                    .await
-                    .inspect(|offset| debug!(?offset))
-                    .inspect_err(|err| error!(?err, ?topition))?;
-
-                assert_eq!(None, offset_producer.insert(offset, (producer, key, value)));
-            }
-
-            transactions.push((transaction, producer));
+            let producing = self
+                .storage
+                .produce(Some(&txn), &self.topition, transactional_batch);
+            let offset = producing.await?;
+            assert!(self.produced.insert(offset), "{offset} handed out twice");
         }
 
-        transactions
+        Ok((txn, owner))
+    }
+
+    async fn end(&self, (txn, owner): &Txn, commit: bool) -> Result<()> {
+        let ending = self.storage.txn_end(txn, owner.id, owner.epoch, commit);
+        assert_eq!(ErrorCode::None, ending.await?);
+        Ok(())
+    }
+
+    async fn latest(&self, isolation: IsolationLevel) -> Result<Option<i64>> {
+        let asked = [(self.topition.clone(), ListOffset::Latest)];
+        let listed = self.storage.list_offsets(isolation, &asked).await?;
+        let [(topition, offset)] = listed.as_slice() else {
+            panic!("one partition asked for, {} listed", listed.len())
+        };
+        assert_eq!(&self.topition, topition);
+        assert_eq!(ErrorCode::None, offset.error_code);
+        Ok(offset.offset)
+    }
+
+    async fn uncommitted(&self) -> Result<Option<i64>> {
+        self.latest(IsolationLevel::ReadUncommitted).await
+    }
+
+    async fn committed(&self) -> Result<Option<i64>> {
+        self.latest(IsolationLevel::ReadCommitted).await
+    }
+
+    async fn group_offset(&self, group: &str) -> Result<Option<i64>> {
+        let asked = slice::from_ref(&self.topition);
+        let fetching = self.storage.offset_fetch(Some(group), asked, Some(false));
+        let offsets = fetching.await?;
+        Ok(offsets.get(&self.topition).map(|stored| stored.offset))
+    }
+
+    async fn commit_offset(&self, (txn, owner): &Txn, group: &str, offset: i64) -> Result<()> {
+        let partition = TxnOffsetCommitRequestPartition::default()
+            .partition_index(self.index())
+            .committed_offset(offset);
+        let topic = TxnOffsetCommitRequestTopic::default()
+            .name(self.name())
+            .partitions(Some(vec![partition]));
+
+        let (generation_id, member_id, group_instance_id) = (None, None, None);
+        let request = TxnOffsetCommitRequest {
+            transaction_id: txn.clone(),
+            group_id: group.to_owned(),
+            producer_id: owner.id,
+            producer_epoch: owner.epoch,
+            generation_id,
+            member_id,
+            group_instance_id,
+            topics: vec![topic],
+        };
+        let topics = self.storage.txn_offset_commit(request).await?;
+
+        let [topic] = topics.as_slice() else {
+            panic!("one topic committed, {} answered", topics.len())
+        };
+        assert_eq!(self.name(), topic.name);
+        let [partition] = topic.partitions.as_deref().unwrap_or_default() else {
+            panic!("one partition committed, {topic:?} answered")
+        };
+        assert_eq!(ErrorCode::None, ErrorCode::try_from(partition.error_code)?);
+        Ok(())
+    }
+
+    async fn fetch(&self, offset: i64) -> Result<Vec<inflated::Batch>> {
+        let uncommitted = IsolationLevel::ReadUncommitted;
+        self.storage
+            .fetch(&self.topition, offset, 1, 50 * 1024, uncommitted, MAX_WAIT)
+            .await?
+            .into_iter()
+            .map(|batch| inflated::Batch::try_from(batch).map_err(Into::into))
+            .collect()
+    }
+
+    async fn delete(self) -> Result<()> {
+        let deleted = self.storage.delete_topic(&TopicId::from(self.id)).await?;
+        assert_eq!(ErrorCode::None, deleted);
+        Ok(())
+    }
+}
+
+/// Asserts that `batches` is the single end marker of `txn`, as `control`.
+fn assert_marker(
+    batches: &[inflated::Batch],
+    (_, owner): &Txn,
+    control: ControlBatch,
+) -> Result<()> {
+    let [batch] = batches else {
+        panic!("one marker expected, {} batches fetched", batches.len())
     };
-
-    {
-        let list_offset_type = ListOffset::Latest;
-        let isolation_level = IsolationLevel::ReadUncommitted;
-
-        let list_offsets_after = sc
-            .list_offsets(isolation_level, &[(topition.clone(), list_offset_type)])
-            .await
-            .inspect(|list_offsets_after| {
-                debug!(
-                    ?list_offsets_after,
-                    ?isolation_level,
-                    ?topition,
-                    ?list_offset_type,
-                )
-            })
-            .inspect_err(|err| error!(?err, ?isolation_level, ?topition, ?list_offset_type,))?;
-
-        assert_eq!(1, list_offsets_after.len());
-        assert_eq!(topic_name, list_offsets_after[0].0.topic());
-        assert_eq!(partition_index, list_offsets_after[0].0.partition());
-        assert_eq!(ErrorCode::None, list_offsets_after[0].1.error_code);
-
-        let offset = i64::from(num_records * num_transactions);
-
-        assert_eq!(Some(offset), list_offsets_after[0].1.offset);
-    }
-
-    {
-        let list_offset_type = ListOffset::Latest;
-        let isolation_level = IsolationLevel::ReadCommitted;
-
-        let list_offsets_after = sc
-            .list_offsets(isolation_level, &[(topition.clone(), list_offset_type)])
-            .await
-            .inspect(|list_offsets_after| {
-                debug!(
-                    ?list_offsets_after,
-                    ?isolation_level,
-                    ?topition,
-                    ?list_offset_type,
-                )
-            })
-            .inspect_err(|err| error!(?err, ?isolation_level, ?topition, ?list_offset_type,))?;
-
-        assert_eq!(1, list_offsets_after.len());
-        assert_eq!(topic_name, list_offsets_after[0].0.topic());
-        assert_eq!(partition_index, list_offsets_after[0].0.partition());
-        assert_eq!(ErrorCode::None, list_offsets_after[0].1.error_code);
-        assert_eq!(Some(0), list_offsets_after[0].1.offset);
-    }
-
-    // commit transaction 1
-    //
-    {
-        let transaction_id = transactions[0].0.as_str();
-        let producer_id = transactions[0].1.id;
-        let producer_epoch = transactions[0].1.epoch;
-        let commit = true;
-
-        assert_eq!(
-            ErrorCode::None,
-            sc.txn_end(transaction_id, producer_id, producer_epoch, commit)
-                .await
-                .inspect(|status| debug!(
-                    transaction_id,
-                    producer_id,
-                    producer_epoch,
-                    commit,
-                    ?status
-                ))
-                .inspect_err(|err| error!(
-                    ?err,
-                    transaction_id, producer_id, producer_epoch, commit
-                ))?
-        );
-    }
-
-    {
-        let isolation_level = IsolationLevel::ReadUncommitted;
-        let list_offset_type = ListOffset::Latest;
-
-        let list_offsets_after = sc
-            .list_offsets(isolation_level, &[(topition.clone(), list_offset_type)])
-            .await
-            .inspect(|list_offsets_after| {
-                debug!(
-                    ?list_offsets_after,
-                    ?isolation_level,
-                    ?topition,
-                    ?list_offset_type,
-                )
-            })
-            .inspect_err(|err| error!(?err, ?isolation_level, ?topition, ?list_offset_type,))?;
-
-        assert_eq!(1, list_offsets_after.len());
-        assert_eq!(topic_name, list_offsets_after[0].0.topic());
-        assert_eq!(partition_index, list_offsets_after[0].0.partition());
-        assert_eq!(ErrorCode::None, list_offsets_after[0].1.error_code);
-
-        // end txn marker is now present for txn 1
-        //
-        let offset = i64::from(num_records * num_transactions) + 1;
-
-        assert_eq!(Some(offset), list_offsets_after[0].1.offset);
-    }
-
-    {
-        // txn 1 is committed
-        //
-        let isolation_level = IsolationLevel::ReadCommitted;
-        let list_offset_type = ListOffset::Latest;
-
-        let list_offsets_after = sc
-            .list_offsets(isolation_level, &[(topition.clone(), list_offset_type)])
-            .await
-            .inspect(|list_offsets_after| {
-                debug!(
-                    ?list_offsets_after,
-                    ?isolation_level,
-                    ?topition,
-                    ?list_offset_type,
-                )
-            })
-            .inspect_err(|err| error!(?err, ?isolation_level, ?topition, ?list_offset_type,))?;
-
-        assert_eq!(1, list_offsets_after.len());
-        assert_eq!(topic_name, list_offsets_after[0].0.topic());
-        assert_eq!(partition_index, list_offsets_after[0].0.partition());
-        assert_eq!(ErrorCode::None, list_offsets_after[0].1.error_code);
-
-        // end txn marker is now present for txn 1
-        //
-        let offset = i64::from(num_records * num_transactions) + 1;
-        assert_eq!(Some(offset), list_offsets_after[0].1.offset);
-    }
-
     assert_eq!(
-        ErrorCode::None,
-        sc.delete_topic(&TopicId::from(topic_id)).await?
+        (owner.id, owner.epoch),
+        (batch.producer_id, batch.producer_epoch)
+    );
+    let [marker] = batch.records.as_slice() else {
+        panic!("one marker record expected, {batch:?} fetched")
+    };
+    assert_eq!(Some(control.try_into()?), marker.key);
+    let end = EndTransactionMarker::default();
+    assert_eq!(Some(end.try_into()?), marker.value);
+    Ok(())
+}
+
+/// Commits an offset inside a transaction that is then ended with `commit`,
+/// and answers what the group sees afterwards.
+async fn offset_after_txn_end(commit: bool) -> Result<Option<i64>> {
+    let partition = Partition::new().await?;
+    let group = alphanumeric_string(10);
+    let txn = partition.open().await?;
+
+    assert_eq!(Some(-1), partition.group_offset(&group).await?);
+    partition.commit_offset(&txn, &group, 32123).await?;
+    assert_eq!(
+        Some(-1),
+        partition.group_offset(&group).await?,
+        "an offset is invisible until its transaction ends"
     );
 
+    partition.end(&txn, commit).await?;
+    let seen = partition.group_offset(&group).await?;
+    partition.delete().await?;
+    Ok(seen)
+}
+
+#[tokio::test]
+async fn offset_committed_in_an_aborted_txn_is_never_seen() -> Result<()> {
+    let _guard = init_tracing()?;
+    assert_eq!(Some(-1), offset_after_txn_end(false).await?);
     Ok(())
 }
 
 #[tokio::test]
-async fn simple_txn_produce_abort() -> Result<()> {
+async fn offset_committed_in_a_txn_is_seen_once_it_commits() -> Result<()> {
     let _guard = init_tracing()?;
-
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let sc = storage_container(cluster_id, broker_id).await?;
-
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
-
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let num_partitions = 6;
-    let replication_factor = 0;
-
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let topic_id = sc
-        .create_topic(
-            CreatableTopic::default()
-                .name(topic_name.clone())
-                .num_partitions(num_partitions)
-                .replication_factor(replication_factor)
-                .assignments(assignments.clone())
-                .configs(configs.clone()),
-            false,
-        )
-        .await?;
-    debug!(?topic_id);
-
-    let transaction_timeout_ms = 10_000;
-
-    let partition_index = rng().random_range(0..num_partitions);
-    let topition = Topition::new(topic_name.clone(), partition_index);
-    let num_records = 6;
-    let num_transactions = 1;
-    let mut offset_producer = BTreeMap::new();
-
-    let list_offsets_before = sc
-        .list_offsets(
-            IsolationLevel::ReadUncommitted,
-            &[(topition.clone(), ListOffset::Latest)],
-        )
-        .await?;
-    assert_eq!(1, list_offsets_before.len());
-    assert_eq!(topic_name, list_offsets_before[0].0.topic());
-    assert_eq!(partition_index, list_offsets_before[0].0.partition());
-    assert_eq!(ErrorCode::None, list_offsets_before[0].1.error_code);
-    assert_eq!(Some(0), list_offsets_before[0].1.offset);
-
-    let transactions = {
-        let mut transactions = Vec::new();
-
-        for transaction in (0..num_transactions).map(|_| alphanumeric_string(10)) {
-            let producer = sc
-                .init_producer(
-                    Some(transaction.as_str()),
-                    transaction_timeout_ms,
-                    Some(-1),
-                    Some(-1),
-                )
-                .await
-                .inspect(|producer| debug!(transaction, ?producer))
-                .inspect_err(|err| error!(?err, transaction, transaction_timeout_ms))?;
-
-            let add_partitions = sc
-                .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
-                    transaction_id: transaction.clone(),
-                    producer_id: producer.id,
-                    producer_epoch: producer.epoch,
-                    topics: [AddPartitionsToTxnTopic::default()
-                        .name(topic_name.clone())
-                        .partitions(Some([partition_index].into()))]
-                    .into(),
-                })
-                .await
-                .inspect(|add_partitions| {
-                    debug!(
-                        transaction,
-                        ?producer,
-                        topic = topic_name,
-                        partition = partition_index,
-                        ?add_partitions
-                    )
-                })
-                .inspect_err(|err| {
-                    error!(
-                        ?err,
-                        transaction,
-                        ?producer,
-                        topic = topic_name,
-                        partition = partition_index,
-                    )
-                })?;
-
-            assert_eq!(
-                [AddPartitionsToTxnTopicResult::default()
-                    .name(topic_name.clone())
-                    .results_by_partition(Some(
-                        [AddPartitionsToTxnPartitionResult::default()
-                            .partition_index(partition_index)
-                            .partition_error_code(ErrorCode::None.into())]
-                        .into()
-                    ))],
-                add_partitions.zero_to_three()
-            );
-
-            for base_sequence in 0..num_records {
-                let key = Bytes::copy_from_slice(alphanumeric_string(15).as_bytes());
-                let value = Bytes::copy_from_slice(alphanumeric_string(15).as_bytes());
-
-                let batch = inflated::Batch::builder()
-                    .record(
-                        Record::builder()
-                            .key(key.clone().into())
-                            .value(value.clone().into()),
-                    )
-                    .attributes(BatchAttribute::default().transaction(true).into())
-                    .producer_id(producer.id)
-                    .producer_epoch(producer.epoch)
-                    .base_sequence(base_sequence)
-                    .build()
-                    .and_then(TryInto::try_into)
-                    .inspect(|deflated| debug!(base_sequence, ?deflated, ?producer))
-                    .inspect_err(|err| error!(?err, base_sequence, ?producer))?;
-
-                let offset = sc
-                    .produce(Some(transaction.as_str()), &topition, batch)
-                    .await
-                    .inspect(|offset| debug!(?offset))
-                    .inspect_err(|err| error!(?err, ?topition))?;
-
-                assert_eq!(None, offset_producer.insert(offset, (producer, key, value)));
-            }
-
-            transactions.push((transaction, producer));
-        }
-
-        transactions
-    };
-
-    {
-        let list_offset_type = ListOffset::Latest;
-        let isolation_level = IsolationLevel::ReadUncommitted;
-
-        let list_offsets_after = sc
-            .list_offsets(isolation_level, &[(topition.clone(), list_offset_type)])
-            .await
-            .inspect(|list_offsets_after| {
-                debug!(
-                    ?list_offsets_after,
-                    ?isolation_level,
-                    ?topition,
-                    ?list_offset_type,
-                )
-            })
-            .inspect_err(|err| error!(?err, ?isolation_level, ?topition, ?list_offset_type,))?;
-
-        assert_eq!(1, list_offsets_after.len());
-        assert_eq!(topic_name, list_offsets_after[0].0.topic());
-        assert_eq!(partition_index, list_offsets_after[0].0.partition());
-        assert_eq!(ErrorCode::None, list_offsets_after[0].1.error_code);
-
-        let offset = i64::from(num_records * num_transactions);
-
-        assert_eq!(Some(offset), list_offsets_after[0].1.offset);
-    }
-
-    {
-        let list_offset_type = ListOffset::Latest;
-        let isolation_level = IsolationLevel::ReadCommitted;
-
-        let list_offsets_after = sc
-            .list_offsets(isolation_level, &[(topition.clone(), list_offset_type)])
-            .await
-            .inspect(|list_offsets_after| {
-                debug!(
-                    ?list_offsets_after,
-                    ?isolation_level,
-                    ?topition,
-                    ?list_offset_type,
-                )
-            })
-            .inspect_err(|err| error!(?err, ?isolation_level, ?topition, ?list_offset_type,))?;
-
-        assert_eq!(1, list_offsets_after.len());
-        assert_eq!(topic_name, list_offsets_after[0].0.topic());
-        assert_eq!(partition_index, list_offsets_after[0].0.partition());
-        assert_eq!(ErrorCode::None, list_offsets_after[0].1.error_code);
-        assert_eq!(Some(0), list_offsets_after[0].1.offset);
-    }
-
-    // abort transaction 1
-    //
-    {
-        let transaction_id = transactions[0].0.as_str();
-        let producer_id = transactions[0].1.id;
-        let producer_epoch = transactions[0].1.epoch;
-        let commit = false;
-
-        assert_eq!(
-            ErrorCode::None,
-            sc.txn_end(transaction_id, producer_id, producer_epoch, commit)
-                .await
-                .inspect(|status| debug!(
-                    transaction_id,
-                    producer_id,
-                    producer_epoch,
-                    commit,
-                    ?status
-                ))
-                .inspect_err(|err| error!(
-                    ?err,
-                    transaction_id, producer_id, producer_epoch, commit
-                ))?
-        );
-    }
-
-    {
-        let isolation_level = IsolationLevel::ReadUncommitted;
-        let list_offset_type = ListOffset::Latest;
-
-        let list_offsets_after = sc
-            .list_offsets(isolation_level, &[(topition.clone(), list_offset_type)])
-            .await
-            .inspect(|list_offsets_after| {
-                debug!(
-                    ?list_offsets_after,
-                    ?isolation_level,
-                    ?topition,
-                    ?list_offset_type,
-                )
-            })
-            .inspect_err(|err| error!(?err, ?isolation_level, ?topition, ?list_offset_type,))?;
-
-        assert_eq!(1, list_offsets_after.len());
-        assert_eq!(topic_name, list_offsets_after[0].0.topic());
-        assert_eq!(partition_index, list_offsets_after[0].0.partition());
-        assert_eq!(ErrorCode::None, list_offsets_after[0].1.error_code);
-
-        // end txn marker is now present for txn 1
-        //
-        let offset = i64::from(num_records * num_transactions) + 1;
-        assert_eq!(Some(offset), list_offsets_after[0].1.offset);
-    }
-
-    {
-        // txn 1 is committed
-        //
-        let isolation_level = IsolationLevel::ReadCommitted;
-        let list_offset_type = ListOffset::Latest;
-
-        let list_offsets_after = sc
-            .list_offsets(isolation_level, &[(topition.clone(), list_offset_type)])
-            .await
-            .inspect(|list_offsets_after| {
-                debug!(
-                    ?list_offsets_after,
-                    ?isolation_level,
-                    ?topition,
-                    ?list_offset_type,
-                )
-            })
-            .inspect_err(|err| error!(?err, ?isolation_level, ?topition, ?list_offset_type,))?;
-
-        assert_eq!(1, list_offsets_after.len());
-        assert_eq!(topic_name, list_offsets_after[0].0.topic());
-        assert_eq!(partition_index, list_offsets_after[0].0.partition());
-        assert_eq!(ErrorCode::None, list_offsets_after[0].1.error_code);
-
-        // end txn marker is now present for txn 1
-        //
-        let offset = i64::from(num_records * num_transactions) + 1;
-        assert_eq!(Some(offset), list_offsets_after[0].1.offset);
-    }
-
-    assert_eq!(
-        ErrorCode::None,
-        sc.delete_topic(&TopicId::from(topic_id)).await?
-    );
-
+    assert_eq!(Some(32123), offset_after_txn_end(true).await?);
     Ok(())
 }
 
-#[tokio::test]
-async fn with_overlap() -> Result<()> {
-    let _guard = init_tracing()?;
+/// Produces in one transaction that is then ended with `commit`: either way
+/// its marker is the last offset, at both isolation levels.
+async fn produce_then_end(commit: bool) -> Result<()> {
+    let mut partition = Partition::new().await?;
+    assert_eq!(Some(0), partition.uncommitted().await?);
 
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let sc = storage_container(cluster_id, broker_id).await?;
+    let txn = partition.begin().await?;
+    let produced = i64::from(RECORDS);
+    assert_eq!(Some(produced), partition.uncommitted().await?);
+    assert_eq!(Some(0), partition.committed().await?);
 
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
+    partition.end(&txn, commit).await?;
+    assert_eq!(Some(produced + 1), partition.uncommitted().await?);
+    assert_eq!(Some(produced + 1), partition.committed().await?);
 
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let num_partitions = 6;
-    let replication_factor = 0;
-
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let topic_id = sc
-        .create_topic(
-            CreatableTopic::default()
-                .name(topic_name.clone())
-                .num_partitions(num_partitions)
-                .replication_factor(replication_factor)
-                .assignments(assignments.clone())
-                .configs(configs.clone()),
-            false,
-        )
-        .await?;
-    debug!(?topic_id);
-
-    let transaction_timeout_ms = 10_000;
-
-    let partition_index = rng().random_range(0..num_partitions);
-    let topition = Topition::new(topic_name.clone(), partition_index);
-    let num_records = 6;
-    let num_transactions = 2;
-    let mut offset_producer = BTreeMap::new();
-
-    let list_offsets_before = sc
-        .list_offsets(
-            IsolationLevel::ReadUncommitted,
-            &[(topition.clone(), ListOffset::Latest)],
-        )
-        .await?;
-    assert_eq!(1, list_offsets_before.len());
-    assert_eq!(topic_name, list_offsets_before[0].0.topic());
-    assert_eq!(partition_index, list_offsets_before[0].0.partition());
-    assert_eq!(ErrorCode::None, list_offsets_before[0].1.error_code);
-    assert_eq!(Some(0), list_offsets_before[0].1.offset);
-
-    let transactions = {
-        let mut transactions = Vec::new();
-
-        for transaction in (0..num_transactions).map(|_| alphanumeric_string(10)) {
-            let producer = sc
-                .init_producer(
-                    Some(transaction.as_str()),
-                    transaction_timeout_ms,
-                    Some(-1),
-                    Some(-1),
-                )
-                .await
-                .inspect(|producer| debug!(transaction, ?producer))
-                .inspect_err(|err| error!(?err, transaction, transaction_timeout_ms))?;
-
-            let add_partitions = sc
-                .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
-                    transaction_id: transaction.clone(),
-                    producer_id: producer.id,
-                    producer_epoch: producer.epoch,
-                    topics: [AddPartitionsToTxnTopic::default()
-                        .name(topic_name.clone())
-                        .partitions(Some([partition_index].into()))]
-                    .into(),
-                })
-                .await
-                .inspect(|add_partitions| {
-                    debug!(
-                        transaction,
-                        ?producer,
-                        topic = topic_name,
-                        partition = partition_index,
-                        ?add_partitions
-                    )
-                })
-                .inspect_err(|err| {
-                    error!(
-                        ?err,
-                        transaction,
-                        ?producer,
-                        topic = topic_name,
-                        partition = partition_index,
-                    )
-                })?;
-
-            assert_eq!(
-                [AddPartitionsToTxnTopicResult::default()
-                    .name(topic_name.clone())
-                    .results_by_partition(Some(
-                        [AddPartitionsToTxnPartitionResult::default()
-                            .partition_index(partition_index)
-                            .partition_error_code(ErrorCode::None.into())]
-                        .into()
-                    ))],
-                add_partitions.zero_to_three()
-            );
-
-            for base_sequence in 0..num_records {
-                let key = Bytes::copy_from_slice(alphanumeric_string(15).as_bytes());
-                let value = Bytes::copy_from_slice(alphanumeric_string(15).as_bytes());
-
-                let batch = inflated::Batch::builder()
-                    .record(
-                        Record::builder()
-                            .key(key.clone().into())
-                            .value(value.clone().into()),
-                    )
-                    .attributes(BatchAttribute::default().transaction(true).into())
-                    .producer_id(producer.id)
-                    .producer_epoch(producer.epoch)
-                    .base_sequence(base_sequence)
-                    .build()
-                    .and_then(TryInto::try_into)
-                    .inspect(|deflated| debug!(base_sequence, ?deflated, ?producer))
-                    .inspect_err(|err| error!(?err, base_sequence, ?producer))?;
-
-                let offset = sc
-                    .produce(Some(transaction.as_str()), &topition, batch)
-                    .await
-                    .inspect(|offset| debug!(?offset))
-                    .inspect_err(|err| error!(?err, ?topition))?;
-
-                assert_eq!(None, offset_producer.insert(offset, (producer, key, value)));
-            }
-
-            transactions.push((transaction, producer));
-        }
-
-        transactions
-    };
-
-    {
-        let list_offset_type = ListOffset::Latest;
-        let isolation_level = IsolationLevel::ReadUncommitted;
-
-        let list_offsets_after = sc
-            .list_offsets(isolation_level, &[(topition.clone(), list_offset_type)])
-            .await
-            .inspect(|list_offsets_after| {
-                debug!(
-                    ?list_offsets_after,
-                    ?isolation_level,
-                    ?topition,
-                    ?list_offset_type,
-                )
-            })
-            .inspect_err(|err| error!(?err, ?isolation_level, ?topition, ?list_offset_type,))?;
-
-        assert_eq!(1, list_offsets_after.len());
-        assert_eq!(topic_name, list_offsets_after[0].0.topic());
-        assert_eq!(partition_index, list_offsets_after[0].0.partition());
-        assert_eq!(ErrorCode::None, list_offsets_after[0].1.error_code);
-
-        let offset = i64::from(num_records * num_transactions);
-
-        assert_eq!(Some(offset), list_offsets_after[0].1.offset);
-    }
-
-    {
-        let list_offset_type = ListOffset::Latest;
-        let isolation_level = IsolationLevel::ReadCommitted;
-
-        let list_offsets_after = sc
-            .list_offsets(isolation_level, &[(topition.clone(), list_offset_type)])
-            .await
-            .inspect(|list_offsets_after| {
-                debug!(
-                    ?list_offsets_after,
-                    ?isolation_level,
-                    ?topition,
-                    ?list_offset_type,
-                )
-            })
-            .inspect_err(|err| error!(?err, ?isolation_level, ?topition, ?list_offset_type,))?;
-
-        assert_eq!(1, list_offsets_after.len());
-        assert_eq!(topic_name, list_offsets_after[0].0.topic());
-        assert_eq!(partition_index, list_offsets_after[0].0.partition());
-        assert_eq!(ErrorCode::None, list_offsets_after[0].1.error_code);
-        assert_eq!(Some(0), list_offsets_after[0].1.offset);
-    }
-
-    // commit transaction 1
-    //
-    {
-        let transaction_id = transactions[0].0.as_str();
-        let producer_id = transactions[0].1.id;
-        let producer_epoch = transactions[0].1.epoch;
-        let commit = true;
-
-        assert_eq!(
-            ErrorCode::None,
-            sc.txn_end(transaction_id, producer_id, producer_epoch, commit)
-                .await
-                .inspect(|status| debug!(
-                    transaction_id,
-                    producer_id,
-                    producer_epoch,
-                    commit,
-                    ?status
-                ))
-                .inspect_err(|err| error!(
-                    ?err,
-                    transaction_id, producer_id, producer_epoch, commit
-                ))?
-        );
-    }
-
-    {
-        let isolation_level = IsolationLevel::ReadUncommitted;
-        let list_offset_type = ListOffset::Latest;
-
-        let list_offsets_after = sc
-            .list_offsets(isolation_level, &[(topition.clone(), list_offset_type)])
-            .await
-            .inspect(|list_offsets_after| {
-                debug!(
-                    ?list_offsets_after,
-                    ?isolation_level,
-                    ?topition,
-                    ?list_offset_type,
-                )
-            })
-            .inspect_err(|err| error!(?err, ?isolation_level, ?topition, ?list_offset_type,))?;
-
-        assert_eq!(1, list_offsets_after.len());
-        assert_eq!(topic_name, list_offsets_after[0].0.topic());
-        assert_eq!(partition_index, list_offsets_after[0].0.partition());
-        assert_eq!(ErrorCode::None, list_offsets_after[0].1.error_code);
-
-        // end txn marker is now present for txn 1
-        //
-        let offset = i64::from(num_records * num_transactions) + 1;
-
-        assert_eq!(Some(offset), list_offsets_after[0].1.offset);
-    }
-
-    {
-        // txn 1 is committed, but isn't visible at read committed because it overlaps with txn 2
-        //
-        let isolation_level = IsolationLevel::ReadCommitted;
-        let list_offset_type = ListOffset::Latest;
-
-        let list_offsets_after = sc
-            .list_offsets(isolation_level, &[(topition.clone(), list_offset_type)])
-            .await
-            .inspect(|list_offsets_after| {
-                debug!(
-                    ?list_offsets_after,
-                    ?isolation_level,
-                    ?topition,
-                    ?list_offset_type,
-                )
-            })
-            .inspect_err(|err| error!(?err, ?isolation_level, ?topition, ?list_offset_type,))?;
-
-        assert_eq!(1, list_offsets_after.len());
-        assert_eq!(topic_name, list_offsets_after[0].0.topic());
-        assert_eq!(partition_index, list_offsets_after[0].0.partition());
-        assert_eq!(ErrorCode::None, list_offsets_after[0].1.error_code);
-        assert_eq!(Some(0), list_offsets_after[0].1.offset);
-    }
-
-    // commit transaction 2
-    //
-    {
-        let transaction_id = transactions[1].0.as_str();
-        let producer_id = transactions[1].1.id;
-        let producer_epoch = transactions[1].1.epoch;
-        let commit = true;
-
-        assert_eq!(
-            ErrorCode::None,
-            sc.txn_end(transaction_id, producer_id, producer_epoch, commit)
-                .await
-                .inspect(|status| debug!(
-                    transaction_id,
-                    producer_id,
-                    producer_epoch,
-                    commit,
-                    ?status
-                ))
-                .inspect_err(|err| error!(
-                    ?err,
-                    transaction_id, producer_id, producer_epoch, commit
-                ))?
-        );
-    }
-
-    {
-        let isolation_level = IsolationLevel::ReadUncommitted;
-        let list_offset_type = ListOffset::Latest;
-
-        let list_offsets_after = sc
-            .list_offsets(isolation_level, &[(topition.clone(), list_offset_type)])
-            .await
-            .inspect(|list_offsets_after| {
-                debug!(
-                    ?list_offsets_after,
-                    ?isolation_level,
-                    ?topition,
-                    ?list_offset_type,
-                )
-            })
-            .inspect_err(|err| error!(?err, ?isolation_level, ?topition, ?list_offset_type,))?;
-
-        assert_eq!(1, list_offsets_after.len());
-        assert_eq!(topic_name, list_offsets_after[0].0.topic());
-        assert_eq!(partition_index, list_offsets_after[0].0.partition());
-        assert_eq!(ErrorCode::None, list_offsets_after[0].1.error_code);
-
-        // end txn marker is now present for txn 2
-        //
-        let offset: i64 = i64::from(num_records * num_transactions) + 2;
-
-        assert_eq!(Some(offset), list_offsets_after[0].1.offset);
-    }
-
-    {
-        let isolation_level = IsolationLevel::ReadCommitted;
-        let list_offset_type = ListOffset::Latest;
-
-        let list_offsets_after = sc
-            .list_offsets(isolation_level, &[(topition.clone(), list_offset_type)])
-            .await
-            .inspect(|list_offsets_after| {
-                debug!(
-                    ?list_offsets_after,
-                    ?isolation_level,
-                    ?topition,
-                    ?list_offset_type,
-                )
-            })
-            .inspect_err(|err| error!(?err, ?isolation_level, ?topition, ?list_offset_type,))?;
-
-        assert_eq!(1, list_offsets_after.len());
-        assert_eq!(topic_name, list_offsets_after[0].0.topic());
-        assert_eq!(partition_index, list_offsets_after[0].0.partition());
-        assert_eq!(ErrorCode::None, list_offsets_after[0].1.error_code);
-
-        // end txn marker is now present for txn 2
-        //
-        let offset: i64 = i64::from(num_records * num_transactions) + 2;
-
-        assert_eq!(Some(offset), list_offsets_after[0].1.offset);
-    }
-
-    assert_eq!(
-        ErrorCode::None,
-        sc.delete_topic(&TopicId::from(topic_id)).await?
-    );
-
-    Ok(())
+    partition.delete().await
 }
 
 #[tokio::test]
-async fn init_producer_twice() -> Result<()> {
+async fn committed_produce_ends_with_its_marker() -> Result<()> {
+    let _guard = init_tracing()?;
+    produce_then_end(true).await
+}
+
+#[tokio::test]
+async fn aborted_produce_ends_with_its_marker() -> Result<()> {
+    let _guard = init_tracing()?;
+    produce_then_end(false).await
+}
+
+#[tokio::test]
+async fn an_overlapping_open_txn_hides_an_earlier_commit() -> Result<()> {
     let _guard = init_tracing()?;
 
-    let cluster_id = Uuid::now_v7();
-    let broker_id = rng().random_range(0..i32::MAX);
-    let sc = storage_container(cluster_id, broker_id).await?;
+    let mut partition = Partition::new().await?;
+    assert_eq!(Some(0), partition.uncommitted().await?);
 
-    register_broker(cluster_id, broker_id, sc.clone()).await?;
+    let first = partition.begin().await?;
+    let second = partition.begin().await?;
+    let produced = i64::from(2 * RECORDS);
+    assert_eq!(Some(produced), partition.uncommitted().await?);
+    assert_eq!(Some(0), partition.committed().await?);
 
-    let topic_name: String = alphanumeric_string(15);
-    debug!(?topic_name);
-
-    let num_partitions = 6;
-    let replication_factor = 0;
-
-    let assignments = Some([].into());
-    let configs = Some([].into());
-
-    let topic_id = sc
-        .create_topic(
-            CreatableTopic::default()
-                .name(topic_name.clone())
-                .num_partitions(num_partitions)
-                .replication_factor(replication_factor)
-                .assignments(assignments.clone())
-                .configs(configs.clone()),
-            false,
-        )
-        .await?;
-    debug!(?topic_id);
-
-    let transaction_timeout_ms = 10_000;
-
-    let partition_index = rng().random_range(0..num_partitions);
-    let topition = Topition::new(topic_name.clone(), partition_index);
-    let num_records = 6;
-    let num_transactions = 2;
-    let mut offset_producer = BTreeMap::new();
-
-    let transactions = {
-        let mut transactions = Vec::new();
-
-        for transaction in (0..num_transactions).map(|_| alphanumeric_string(10)) {
-            let producer = sc
-                .init_producer(
-                    Some(transaction.as_str()),
-                    transaction_timeout_ms,
-                    Some(-1),
-                    Some(-1),
-                )
-                .await
-                .inspect_err(|err| error!(?err))?;
-            debug!(?producer);
-
-            let add_partitions = sc
-                .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
-                    transaction_id: transaction.clone(),
-                    producer_id: producer.id,
-                    producer_epoch: producer.epoch,
-                    topics: [AddPartitionsToTxnTopic::default()
-                        .name(topic_name.clone())
-                        .partitions(Some([partition_index].into()))]
-                    .into(),
-                })
-                .await
-                .inspect_err(|err| error!(?err))?;
-            debug!(?add_partitions);
-
-            assert_eq!(
-                [AddPartitionsToTxnTopicResult::default()
-                    .name(topic_name.clone())
-                    .results_by_partition(Some(
-                        [AddPartitionsToTxnPartitionResult::default()
-                            .partition_index(partition_index)
-                            .partition_error_code(ErrorCode::None.into())]
-                        .into()
-                    ))],
-                add_partitions.zero_to_three()
-            );
-
-            for base_sequence in 0..num_records {
-                debug!(base_sequence);
-
-                let key = Bytes::copy_from_slice(alphanumeric_string(15).as_bytes());
-                let value = Bytes::copy_from_slice(alphanumeric_string(15).as_bytes());
-
-                let batch = inflated::Batch::builder()
-                    .record(
-                        Record::builder()
-                            .key(key.clone().into())
-                            .value(value.clone().into()),
-                    )
-                    .attributes(BatchAttribute::default().transaction(true).into())
-                    .producer_id(producer.id)
-                    .producer_epoch(producer.epoch)
-                    .base_sequence(base_sequence)
-                    .build()
-                    .and_then(TryInto::try_into)
-                    .inspect(|deflated| debug!(?deflated))
-                    .inspect_err(|err| error!(?err))?;
-
-                debug!(base_sequence, ?batch);
-
-                let offset = sc
-                    .produce(Some(transaction.as_str()), &topition, batch)
-                    .await
-                    .inspect(|offset| debug!(?offset))
-                    .inspect_err(|err| error!(?err))?;
-
-                debug!(offset);
-
-                assert_eq!(None, offset_producer.insert(offset, (producer, key, value)));
-            }
-
-            transactions.push((transaction, producer));
-        }
-
-        transactions
-    };
-
-    {
-        let list_offsets_after = sc
-            .list_offsets(
-                IsolationLevel::ReadUncommitted,
-                &[(topition.clone(), ListOffset::Latest)],
-            )
-            .await
-            .inspect_err(|err| error!(?err))?;
-        assert_eq!(1, list_offsets_after.len());
-        assert_eq!(topic_name, list_offsets_after[0].0.topic());
-        assert_eq!(partition_index, list_offsets_after[0].0.partition());
-        assert_eq!(ErrorCode::None, list_offsets_after[0].1.error_code);
-
-        let offset = i64::from(num_records * num_transactions);
-        assert_eq!(Some(offset), list_offsets_after[0].1.offset);
-    }
-
-    {
-        let list_offsets_after = sc
-            .list_offsets(
-                IsolationLevel::ReadCommitted,
-                &[(topition.clone(), ListOffset::Latest)],
-            )
-            .await
-            .inspect_err(|err| error!(?err))?;
-        assert_eq!(1, list_offsets_after.len());
-        assert_eq!(topic_name, list_offsets_after[0].0.topic());
-        assert_eq!(partition_index, list_offsets_after[0].0.partition());
-        assert_eq!(ErrorCode::None, list_offsets_after[0].1.error_code);
-        assert_eq!(Some(0), list_offsets_after[0].1.offset);
-    }
-
-    // commit transactions[0]
-    //
+    partition.end(&first, true).await?;
+    assert_eq!(Some(produced + 1), partition.uncommitted().await?);
     assert_eq!(
-        ErrorCode::None,
-        sc.txn_end(
-            transactions[0].0.as_str(),
-            transactions[0].1.id,
-            transactions[0].1.epoch,
-            true
-        )
-        .await
-        .inspect_err(|err| error!(?err))?
+        Some(0),
+        partition.committed().await?,
+        "the first commit is hidden while the second, overlapping, is open"
     );
 
-    {
-        let list_offsets = sc
-            .list_offsets(
-                IsolationLevel::ReadUncommitted,
-                &[(topition.clone(), ListOffset::Latest)],
-            )
-            .await
-            .inspect_err(|err| error!(?err))?;
-        assert_eq!(1, list_offsets.len());
-        assert_eq!(topic_name, list_offsets[0].0.topic());
-        assert_eq!(partition_index, list_offsets[0].0.partition());
-        assert_eq!(ErrorCode::None, list_offsets[0].1.error_code);
+    partition.end(&second, true).await?;
+    assert_eq!(Some(produced + 2), partition.uncommitted().await?);
+    assert_eq!(Some(produced + 2), partition.committed().await?);
 
-        let offset = i64::from(num_records * num_transactions) + 1;
-        assert_eq!(
-            // end txn marker is now present for transactions[0], but it overlaps with [1]
-            //
-            Some(offset),
-            list_offsets[0].1.offset
-        );
-    }
+    partition.delete().await
+}
 
-    let min_bytes = 1;
-    let max_bytes = 50 * 1024;
-    let max_wait = Duration::from_millis(500);
+#[tokio::test]
+async fn init_producer_again_aborts_the_open_txn() -> Result<()> {
+    let _guard = init_tracing()?;
 
-    let batches = sc
-        .fetch(
-            &topition,
-            (num_records * num_transactions) as i64,
-            min_bytes,
-            max_bytes as u32,
-            IsolationLevel::ReadUncommitted,
-            max_wait,
-        )
-        .await
-        .and_then(|batches| {
-            batches.into_iter().try_fold(Vec::new(), |mut acc, batch| {
-                inflated::Batch::try_from(batch)
-                    .map(|inflated| {
-                        acc.push(inflated);
-                        acc
-                    })
-                    .map_err(Into::into)
-            })
-        })
-        .inspect_err(|err| error!(?err))?;
+    let mut partition = Partition::new().await?;
+    let first = partition.begin().await?;
+    let second = partition.begin().await?;
+    let produced = i64::from(2 * RECORDS);
+    assert_eq!(Some(produced), partition.uncommitted().await?);
+    assert_eq!(Some(0), partition.committed().await?);
 
-    debug!(min_bytes, max_bytes, ?batches);
+    partition.end(&first, true).await?;
+    assert_eq!(Some(produced + 1), partition.uncommitted().await?);
+    let fetched = partition.fetch(produced).await?;
+    assert_marker(&fetched, &first, ControlBatch::default().commit())?;
 
-    assert_eq!(1, batches.len());
-    assert_eq!(transactions[0].1.id, batches[0].producer_id);
-    assert_eq!(transactions[0].1.epoch, batches[0].producer_epoch);
-    assert_eq!(1, batches[0].records.len());
-
-    // the fetched batch has transactions[0] commit end transaction marker
+    let fenced = partition.init(&second.0).await?;
+    assert_eq!(second.1.id, fenced.id);
     assert_eq!(
-        Some(ControlBatch::default().commit().try_into()?),
-        batches[0].records[0].key
+        second.1.epoch + 1,
+        fenced.epoch,
+        "initialising an open transaction again bumps its epoch, and aborts it"
     );
+    assert_eq!(Some(produced + 2), partition.uncommitted().await?);
+    let fetched = partition.fetch(produced + 1).await?;
+    assert_marker(&fetched, &second, ControlBatch::default().abort())?;
 
-    assert_eq!(
-        Some(EndTransactionMarker::default().try_into()?),
-        batches[0].records[0].value
-    );
-
-    // init producer on transactions[1], will cause abort of
-    // [1], with both [0] and [1] then visible at read committed.
-    //
-    let producer = sc
-        .init_producer(
-            Some(transactions[1].0.as_str()),
-            transaction_timeout_ms,
-            Some(-1),
-            Some(-1),
-        )
-        .await
-        .inspect_err(|err| error!(?err))?;
-
-    assert_eq!(transactions[1].1.id, producer.id);
-
-    // new epoch for [1] producer
-    assert_eq!(transactions[1].1.epoch + 1, producer.epoch);
-
-    {
-        let list_offsets = sc
-            .list_offsets(
-                IsolationLevel::ReadUncommitted,
-                &[(topition.clone(), ListOffset::Latest)],
-            )
-            .await
-            .inspect_err(|err| error!(?err))?;
-        assert_eq!(1, list_offsets.len());
-        assert_eq!(topic_name, list_offsets[0].0.topic());
-        assert_eq!(partition_index, list_offsets[0].0.partition());
-        assert_eq!(ErrorCode::None, list_offsets[0].1.error_code);
-
-        let offset = i64::from(num_records * num_transactions) + 2;
-        assert_eq!(
-            // end txn marker is now present for transactions[1]
-            //
-            Some(offset),
-            list_offsets[0].1.offset
-        );
-    }
-
-    let batches = sc
-        .fetch(
-            &topition,
-            (num_records * num_transactions + 1) as i64,
-            min_bytes,
-            max_bytes as u32,
-            IsolationLevel::ReadUncommitted,
-            max_wait,
-        )
-        .await
-        .and_then(|batches| {
-            batches.into_iter().try_fold(Vec::new(), |mut acc, batch| {
-                inflated::Batch::try_from(batch)
-                    .map(|inflated| {
-                        acc.push(inflated);
-                        acc
-                    })
-                    .map_err(Into::into)
-            })
-        })
-        .inspect_err(|err| error!(?err))?;
-
-    debug!(min_bytes, max_bytes, ?batches);
-
-    assert_eq!(1, batches.len());
-    assert_eq!(transactions[1].1.id, batches[0].producer_id);
-    assert_eq!(transactions[1].1.epoch, batches[0].producer_epoch);
-    assert_eq!(1, batches[0].records.len());
-
-    // transactions[1] abort end transaction marker
-    assert_eq!(
-        Some(ControlBatch::default().abort().try_into()?),
-        batches[0].records[0].key
-    );
-
-    assert_eq!(
-        Some(EndTransactionMarker::default().try_into()?),
-        batches[0].records[0].value
-    );
-
-    assert_eq!(
-        ErrorCode::None,
-        sc.delete_topic(&TopicId::from(topic_id)).await?
-    );
-
-    Ok(())
+    partition.delete().await
 }

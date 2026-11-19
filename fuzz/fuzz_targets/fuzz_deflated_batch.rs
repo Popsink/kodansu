@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -11,12 +11,11 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//! The record batch header: whatever arrives as a produce payload goes through
+//! `deflated::Batch::try_from` before anything else looks at it.
 
 #![no_main]
-use bytes::Bytes;
-use libfuzzer_sys::fuzz_target;
-use tansu_sans_io::record::deflated;
 
-fuzz_target!(|data: &[u8]| {
-    let _ = deflated::Batch::try_from(Bytes::copy_from_slice(data));
+libfuzzer_sys::fuzz_target!(|input: &[u8]| {
+    _ = tansu_sans_io::record::deflated::Batch::try_from(bytes::Bytes::from(input.to_vec()));
 });

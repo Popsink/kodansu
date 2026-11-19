@@ -15,69 +15,36 @@
 //! `ConsumerGroupHeartbeat` (api_key 68), the KIP-848 consumer group protocol
 //! (#612).
 
-use rama::{Context, Service};
-use tansu_sans_io::{
-    ApiKey, ConsumerGroupHeartbeatRequest, ErrorCode, Frame, Header,
-    acl::{Operation, Resource},
-};
+use tansu_sans_io::acl::{Operation, Resource};
+use tansu_sans_io::{ConsumerGroupHeartbeatRequest, ErrorCode};
 use tansu_service::Peer;
 use tansu_storage::authorized;
-use tracing::instrument;
 
 use super::answer;
-use crate::{Error, Result, coordinator::group::Coordinator};
+use super::handler::{answered, respond};
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct ConsumerGroupHeartbeatService;
-
-impl ApiKey for ConsumerGroupHeartbeatService {
-    const KEY: i16 = ConsumerGroupHeartbeatRequest::KEY;
-}
-
-impl<C> Service<C, Frame> for ConsumerGroupHeartbeatService
-where
-    C: Coordinator,
-{
-    type Response = Frame;
-    type Error = Error;
-
-    #[instrument(skip(ctx, req))]
-    async fn serve(&self, mut ctx: Context<C>, req: Frame) -> Result<Self::Response, Self::Error> {
-        let correlation_id = req.correlation_id()?;
-        let client_id = req
-            .client_id()
-            .map(|client_id| client_id.map(|client_id| client_id.to_owned()))?;
-
-        let request = ConsumerGroupHeartbeatRequest::try_from(req.body)?;
+group_service! {
+    ConsumerGroupHeartbeatService: ConsumerGroupHeartbeatRequest,
+    |ctx, frame| {
+        let correlation_id = frame.correlation_id()?;
+        let client_id = frame.client_id()?.map(str::to_owned);
+        let request = ConsumerGroupHeartbeatRequest::try_from(frame.body)?;
 
         // As Kafka prints an `InetAddress`, which `kafka-consumer-groups`
         // shows as is in its HOST column (#628).
-        let client_host = ctx
-            .get::<Peer>()
-            .map(|Peer(addr)| format!("/{}", addr.ip()));
+        let client_host = ctx.get::<Peer>().map(|Peer(addr)| format!("/{}", addr.ip()));
 
         // `READ` on the group, as for the classic `JoinGroup` and `Heartbeat`
         // (#363).
         if !authorized(&ctx, Resource::Group, &request.group_id, Operation::Read).await {
-            return Ok(Frame {
-                size: 0,
-                header: Header::Response { correlation_id },
-                body: answer::consumer_group_heartbeat(ErrorCode::GroupAuthorizationFailed),
-            });
+            let refused = answer::consumer_group_heartbeat(ErrorCode::GroupAuthorizationFailed);
+            return Ok(respond(correlation_id, refused));
         }
 
-        ctx.state_mut()
+        let beat = ctx
+            .state_mut()
             .consumer_group_heartbeat(client_id.as_deref(), client_host.as_deref(), &request)
-            .await
-            .or_else(|error| match error {
-                // An answer the broker chose, not a failure (#300).
-                Error::Api(error_code) => Ok(answer::consumer_group_heartbeat(error_code)),
-                otherwise => Err(otherwise),
-            })
-            .map(|body| Frame {
-                size: 0,
-                header: Header::Response { correlation_id },
-                body,
-            })
+            .await;
+        answered(beat, answer::consumer_group_heartbeat).map(|body| respond(correlation_id, body))
     }
 }

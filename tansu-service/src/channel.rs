@@ -12,15 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rama::{Context, Layer, Service};
+use rama::Context;
+use rama::Layer;
+use rama::Service;
 use tansu_sans_io::Frame;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
-use tracing::debug;
 
-use crate::Error;
+use super::Error;
 
-/// A [`Layer`] receiving [`Frame`]s from a [`FrameReceiver`] channel
+/// Wraps a frame service in a [`ChannelFrameService`] that drains a
+/// [`FrameReceiver`] until the token is cancelled.
 #[derive(Clone, Debug, Default)]
 pub struct ChannelFrameLayer {
     cancellation: CancellationToken,
@@ -36,21 +39,24 @@ impl<S> Layer<S> for ChannelFrameLayer {
     type Service = ChannelFrameService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        Self::Service {
+        let cancellation = self.cancellation.clone();
+        ChannelFrameService {
+            cancellation,
             inner,
-            cancellation: self.cancellation.clone(),
         }
     }
 }
 
-/// A [`Service`] receiving [`Frame`]s from a [`FrameReceiver`] channel
+/// Serves each frame arriving on a [`FrameReceiver`] with the inner service,
+/// replying on the frame's own oneshot, until its token is cancelled.
 #[derive(Clone, Debug, Default)]
 pub struct ChannelFrameService<S> {
     inner: S,
     cancellation: CancellationToken,
 }
 
-/// A channel frame receiver
+/// The receiving half of [`bounded_channel`]: each frame comes with the
+/// oneshot its response goes back on.
 pub type FrameReceiver = mpsc::Receiver<(Frame, oneshot::Sender<Frame>)>;
 
 impl<S, State> Service<State, FrameReceiver> for ChannelFrameService<S>
@@ -67,36 +73,29 @@ where
         ctx: Context<State>,
         mut req: FrameReceiver,
     ) -> Result<Self::Response, Self::Error> {
+        let unsendable = |unsent: Frame| S::Error::from(Error::UnableToSend(Box::new(unsent)));
         loop {
             tokio::select! {
-                Some((frame, tx)) = req.recv() => {
-                    debug!(?frame, ?tx);
-
-                    self.inner
-                        .serve(ctx.clone(), frame)
-                        .await
-                        .and_then(|response| {
-                            tx.send(response)
-                                .map_err(|unsent| Error::UnableToSend(Box::new(unsent)))
-                                .map_err(Into::into)
-                        })?
+                Some((frame, reply)) = req.recv() => {
+                    tracing::debug!(?frame, tx = ?reply);
+                    let answer = self.inner.serve(ctx.clone(), frame).await?;
+                    reply.send(answer).map_err(unsendable)?;
                 }
 
-                cancelled = self.cancellation.cancelled() => {
-                    debug!(?cancelled);
-                    break;
+                stopped = self.cancellation.cancelled() => {
+                    tracing::debug!(cancelled = ?stopped);
+                    return Ok(());
                 }
             }
         }
-
-        Ok(())
     }
 }
 
-/// A channel frame sender
+/// The sending half of [`bounded_channel`].
 pub type FrameSender = mpsc::Sender<(Frame, oneshot::Sender<Frame>)>;
 
-/// A [`Service`] sending [`Frame`]s over a [`FrameSender`] channel
+/// Sends each frame down a [`FrameSender`] and waits for the response that
+/// comes back on its oneshot.
 #[derive(Clone, Debug)]
 pub struct FrameChannelService {
     tx: FrameSender,
@@ -117,18 +116,18 @@ where
     type Error = Error;
 
     async fn serve(&self, _ctx: Context<State>, req: Frame) -> Result<Self::Response, Self::Error> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-
-        self.tx
-            .send((req, resp_tx))
-            .await
-            .map_err(|send_error| Error::UnableToSend(Box::new(send_error.0.0)))?;
-
-        resp_rx.await.map_err(Error::OneshotRecv)
+        let (reply, answer) = oneshot::channel();
+        let sending = self.tx.send((req, reply));
+        let refused = |rejected: mpsc::error::SendError<_>| {
+            let (frame, _reply): (Frame, oneshot::Sender<Frame>) = rejected.0;
+            Error::UnableToSend(Box::new(frame))
+        };
+        sending.await.map_err(refused)?;
+        answer.await.map_err(Error::OneshotRecv)
     }
 }
 
-/// A bounded channel for sending and receiving frames
+/// A [`FrameSender`] and [`FrameReceiver`] pair holding up to `buffer` frames in flight.
 pub fn bounded_channel(buffer: usize) -> (FrameSender, FrameReceiver) {
-    mpsc::channel::<(Frame, oneshot::Sender<Frame>)>(buffer)
+    mpsc::channel(buffer)
 }

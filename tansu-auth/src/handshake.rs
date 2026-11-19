@@ -12,12 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{Authentication, Error, Stage};
-use rama::{Context, Service};
-use rsasl::prelude::Mechname;
-use tansu_sans_io::{ApiKey, ErrorCode, SaslHandshakeRequest, SaslHandshakeResponse};
-use tracing::{debug, instrument};
+use rama::Context;
+use rama::Service;
+use tansu_sans_io::{ApiKey, ErrorCode};
+use tansu_sans_io::{SaslHandshakeRequest, SaslHandshakeResponse};
 
+use crate::Authentication;
+use crate::Error;
+use crate::Stage;
+
+/// Refuses the mechanism a client asked for, naming it back.
+fn unsupported(mechanism: String) -> SaslHandshakeResponse {
+    let refusal = SaslHandshakeResponse::default();
+    let refusal = refusal.error_code(i16::from(ErrorCode::UnsupportedSaslMechanism));
+    refusal.mechanisms(Some(vec![mechanism]))
+}
+
+/// Starts a SASL session on the connection for the mechanism a client names,
+/// refusing it when the connection has no authentication or the mechanism is
+/// not one the server offers.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SaslHandshakeService;
 
@@ -32,56 +45,43 @@ where
     type Response = SaslHandshakeResponse;
     type Error = Error;
 
-    #[instrument(skip(self, ctx), ret)]
+    #[tracing::instrument(skip(self, ctx), ret)]
     async fn serve(
         &self,
         ctx: Context<S>,
         req: SaslHandshakeRequest,
     ) -> Result<Self::Response, Self::Error> {
-        if let Some(authentication) = ctx.get::<Authentication>().cloned() {
-            authentication.stage
-            .lock()
-            .map_err(Into::into)
-            .and_then(|mut guard| {
-                // Re-authentication (KIP-368): a Java kafka-clients
-                // connection periodically issues another SaslHandshake
-                // on the same TCP socket. The previous handshake left
-                // the Stage in `Session`/`Finished`, so a stale
-                // `take()` would fall into the else branch and reject
-                // a perfectly valid mechanism with
-                // `UnsupportedSaslMechanism`. Always start with a
-                // fresh `SASLServer` built from the stored config.
-                if guard.as_ref().is_none_or(|guard|!matches!(guard, Stage::Server(_))) {
-                    debug!(?guard);
-                    _ = guard.replace(authentication.fresh_server());
-                }
+        let Some(authentication) = ctx.get::<Authentication>().cloned() else {
+            return Ok(unsupported(req.mechanism));
+        };
+        let mut stage = authentication.stage.lock()?;
 
-                if let Some(Stage::Server(server)) = guard.take() && let Ok(mechanism) = Mechname::parse(req.mechanism.as_bytes()) {
-                    debug!(available = ?server.get_available().into_iter().map(|mechanism|mechanism.mechanism.as_str()).collect::<Vec<_>>());
+        // A Java client re-authenticates on the same socket (KIP-368) by
+        // sending another SaslHandshake. The last exchange left a `Session` or
+        // `Finished` behind, not a `Server`, and taking that as it is would
+        // refuse a mechanism the server does offer — so anything but a fresh
+        // server is replaced by one built from the stored config.
+        if !matches!(stage.as_ref(), Some(Stage::Server(_))) {
+            tracing::debug!(guard = ?stage);
+            _ = stage.replace(authentication.fresh_server());
+        }
 
-                    server
-                        .start_suggested(mechanism)
-                        .inspect_err(|err| debug!(?err, ?mechanism))
-                        .map_err(Into::into)
-                        .map(|session| {
-                            let mechanisms = [session.get_mechname().to_string()];
+        if let Some(Stage::Server(server)) = stage.take()
+            && let Ok(mechanism) = rsasl::prelude::Mechname::parse(req.mechanism.as_bytes())
+        {
+            let offered = server.get_available().into_iter();
+            let offered: Vec<&str> = offered.map(|each| each.mechanism.as_str()).collect();
+            tracing::debug!(available = ?offered);
 
-                            _ = guard.replace(Stage::Session(session));
+            let starting = server.start_suggested(mechanism);
+            let session = starting.inspect_err(|err| tracing::debug!(?err, ?mechanism))?;
+            let chosen = session.get_mechname().to_string();
+            _ = stage.replace(Stage::Session(session));
 
-                            SaslHandshakeResponse::default()
-                                .error_code(ErrorCode::None.into())
-                                .mechanisms(Some(mechanisms.into()))
-                        })
-                } else {
-                    Ok(SaslHandshakeResponse::default()
-                        .error_code(ErrorCode::UnsupportedSaslMechanism.into())
-                        .mechanisms(Some([req.mechanism].into())))
-                }
-            })
+            let started = SaslHandshakeResponse::default().error_code(i16::from(ErrorCode::None));
+            Ok(started.mechanisms(Some(vec![chosen])))
         } else {
-            Ok(SaslHandshakeResponse::default()
-                .error_code(ErrorCode::UnsupportedSaslMechanism.into())
-                .mechanisms(Some([req.mechanism].into())))
+            Ok(unsupported(req.mechanism))
         }
     }
 }

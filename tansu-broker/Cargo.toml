@@ -64,4 +64,8 @@ pretty_assertions.workspace = true
 # suite needs no checked-in key material and nothing expires.
 rcgen.workspace = true
 
+# Derives the SCRAM keys `tests/auth.rs` checks a handshake against from the
+# password, salt and iteration count, the way `tansu user` does.
+sha2.workspace = true
+
 tansu-storage = { workspace = true }

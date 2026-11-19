@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2025 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,45 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rama::{Context, Service};
-use tansu_sans_io::{AddOffsetsToTxnRequest, AddOffsetsToTxnResponse, ApiKey};
-use tracing::instrument;
+//! `AddOffsetsToTxn`: brings a consumer group's offsets into a transaction.
 
-use crate::{Error, Result, Storage};
+use tansu_sans_io::{AddOffsetsToTxnRequest, AddOffsetsToTxnResponse};
 
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`AddOffsetsToTxnRequest`] returning [`AddOffsetsToTxnResponse`].
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct AddOffsetsService;
-
-impl ApiKey for AddOffsetsService {
-    const KEY: i16 = AddOffsetsToTxnRequest::KEY;
-}
-
-impl<G> Service<G, AddOffsetsToTxnRequest> for AddOffsetsService
-where
-    G: Storage,
-{
-    type Response = AddOffsetsToTxnResponse;
-    type Error = Error;
-
-    #[instrument(skip(ctx, req))]
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: AddOffsetsToTxnRequest,
-    ) -> Result<Self::Response, Self::Error> {
-        ctx.state()
-            .txn_add_offsets(
-                req.transactional_id.as_str(),
-                req.producer_id,
-                req.producer_epoch,
-                req.group_id.as_str(),
-            )
-            .await
-            .map(|error_code| {
-                AddOffsetsToTxnResponse::default()
-                    .throttle_time_ms(0)
-                    .error_code(error_code.into())
-            })
+storage_service! {
+    /// Registers the group with the producer's open transaction through
+    /// [`Storage::txn_add_offsets`](crate::Storage::txn_add_offsets), and
+    /// reports its error code.
+    AddOffsetsService: AddOffsetsToTxnRequest => AddOffsetsToTxnResponse,
+    |ctx, req| {
+        let AddOffsetsToTxnRequest {
+            transactional_id,
+            producer_id,
+            producer_epoch,
+            group_id,
+            ..
+        } = req;
+        let outcome = ctx
+            .state()
+            .txn_add_offsets(&transactional_id, producer_id, producer_epoch, &group_id)
+            .await?;
+        Ok(AddOffsetsToTxnResponse::default().error_code(outcome.into()))
     }
 }

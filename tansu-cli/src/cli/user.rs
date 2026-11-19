@@ -12,19 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::Result;
-use bytes::{Bytes, BytesMut};
-use clap::{Subcommand, ValueEnum};
-use pbkdf2::{hmac::Hmac, pbkdf2};
-use rand::{Rng as _, rng};
-use sha2::{Sha256, Sha512};
-use tansu_client::{Client, ConnectionManager};
-use tansu_sans_io::{
-    AlterUserScramCredentialsRequest, ErrorCode, ScramMechanism,
-    alter_user_scram_credentials_request::{ScramCredentialDeletion, ScramCredentialUpsertion},
-};
-use tracing::debug;
+use bytes::Bytes;
+use bytes::BytesMut;
+use clap::Subcommand;
+use clap::ValueEnum;
+use pbkdf2::hmac::Hmac;
+use rand::Rng as _;
+use sha2::Sha256;
+use sha2::Sha512;
+use tansu_sans_io::alter_user_scram_credentials_request::ScramCredentialDeletion;
+use tansu_sans_io::alter_user_scram_credentials_request::ScramCredentialUpsertion;
+use tansu_sans_io::{AlterUserScramCredentialsRequest, ErrorCode, ScramMechanism};
 use url::Url;
+
+use crate::Result;
 
 use super::DEFAULT_BROKER;
 
@@ -42,11 +43,9 @@ pub(super) enum Command {
         /// Password
         password: String,
 
-        // Iterations
         #[arg(long, default_value = "8192")]
         iterations: Option<u32>,
 
-        // Mode
         #[arg(long, value_enum, default_value = "scram512")]
         mechanism: Mechanism,
     },
@@ -60,7 +59,6 @@ pub(super) enum Command {
         /// The name of the user
         name: String,
 
-        // Mode
         #[arg(long, value_enum, default_value = "scram512")]
         mechanism: Mechanism,
     },
@@ -78,27 +76,30 @@ pub(super) enum Mechanism {
 
 impl Mechanism {
     fn salted_password(&self, password: &[u8], iterations: u32, salt: &[u8]) -> Result<Bytes> {
+        let digest_length = match self {
+            Self::Scram256 => 32,
+            Self::Scram512 => 64,
+        };
+        let mut salted = BytesMut::zeroed(digest_length);
         match self {
-            Mechanism::Scram256 => {
-                let mut buf = BytesMut::zeroed(32);
-                pbkdf2::<Hmac<Sha256>>(password, salt, iterations, &mut buf)?;
-                Ok(buf.into())
+            Self::Scram256 => {
+                pbkdf2::pbkdf2::<Hmac<Sha256>>(password, salt, iterations, &mut salted)?
             }
-            Mechanism::Scram512 => {
-                let mut buf = BytesMut::zeroed(64);
-                pbkdf2::<Hmac<Sha512>>(password, salt, iterations, &mut buf)?;
-                Ok(buf.into())
+            Self::Scram512 => {
+                pbkdf2::pbkdf2::<Hmac<Sha512>>(password, salt, iterations, &mut salted)?
             }
         }
+        Ok(salted.freeze())
     }
 }
 
 impl From<&Mechanism> for i8 {
     fn from(value: &Mechanism) -> Self {
-        match value {
-            Mechanism::Scram256 => ScramMechanism::Scram256.into(),
-            Mechanism::Scram512 => ScramMechanism::Scram512.into(),
-        }
+        let wire = match value {
+            Mechanism::Scram256 => ScramMechanism::Scram256,
+            Mechanism::Scram512 => ScramMechanism::Scram512,
+        };
+        i8::from(wire)
     }
 }
 
@@ -107,93 +108,72 @@ impl Command {
     const DEFAULT_ITERATIONS: u32 = 2u32.pow(14);
 
     fn broker(&self) -> Url {
-        match self {
-            Command::Create { broker, .. } => broker.to_owned(),
-            Command::Delete { broker, .. } => broker.to_owned(),
-        }
+        let (Self::Create { broker, .. } | Self::Delete { broker, .. }) = self;
+        broker.clone()
     }
 
     fn upsertions(&self) -> Option<Vec<ScramCredentialUpsertion>> {
-        match self {
-            Command::Create {
-                name,
-                password,
-                iterations,
-                mechanism,
-                ..
-            } => {
-                let mut salt = BytesMut::zeroed(Self::DEFAULT_SALT_LEN);
-                rng().fill_bytes(&mut salt);
+        let Self::Create {
+            name: user,
+            password: secret,
+            iterations: asked,
+            mechanism: digest,
+            ..
+        } = self
+        else {
+            return Some(Vec::new());
+        };
 
-                let iterations = iterations.unwrap_or(Self::DEFAULT_ITERATIONS);
+        let mut salt = BytesMut::zeroed(Command::DEFAULT_SALT_LEN);
+        rand::rng().fill_bytes(&mut salt);
+        let rounds = asked.unwrap_or(Self::DEFAULT_ITERATIONS);
+        let salted = digest
+            .salted_password(secret.as_bytes(), rounds, &salt)
+            .ok()?;
 
-                mechanism
-                    .salted_password(password.as_bytes(), iterations, &salt[..])
-                    .ok()
-                    .map(|salted_password| {
-                        [ScramCredentialUpsertion::default()
-                            .name(name.into())
-                            .mechanism(mechanism.into())
-                            .iterations(iterations as i32)
-                            .salt(salt.into())
-                            .salted_password(salted_password)]
-                        .into()
-                    })
-            }
-
-            _ => Some([].into()),
-        }
+        let upsertion = ScramCredentialUpsertion::default().name(user.clone());
+        let upsertion = upsertion
+            .mechanism(i8::from(digest))
+            .iterations(rounds as i32);
+        Some(vec![upsertion.salt(salt.freeze()).salted_password(salted)])
     }
 
     fn deletions(&self) -> Option<Vec<ScramCredentialDeletion>> {
-        match self {
-            Command::Create { .. } => Some([].into()),
-            Command::Delete {
-                name,
-                mechanism: mode,
-                ..
-            } => Some(
-                [ScramCredentialDeletion::default()
-                    .name(name.into())
-                    .mechanism(mode.into())]
-                .into(),
-            ),
-        }
+        let Self::Delete {
+            name: user,
+            mechanism: digest,
+            ..
+        } = self
+        else {
+            return Some(Vec::new());
+        };
+        let deletion = ScramCredentialDeletion::default().name(user.clone());
+        Some(vec![deletion.mechanism(i8::from(digest))])
     }
 
     pub(super) async fn main(self) -> Result<ErrorCode> {
-        let client = ConnectionManager::builder(self.broker())
-            .client_id(Some(env!("CARGO_PKG_NAME").into()))
-            .build()
-            .await
-            .inspect(|pool| debug!(?pool))
-            .map(Client::new)?;
+        let manager = tansu_client::ConnectionManager::builder(self.broker());
+        let manager = manager.client_id(Some(String::from(env!("CARGO_PKG_NAME"))));
+        let pool = manager.build().await?;
+        tracing::debug!(?pool);
+        let client = tansu_client::Client::new(pool);
 
-        let req = AlterUserScramCredentialsRequest::default()
-            .deletions(self.deletions())
-            .upsertions(self.upsertions());
-
-        let response = client
-            .call(req)
-            .await
-            .inspect(|response| debug!(?response))?;
+        let request = AlterUserScramCredentialsRequest::default().deletions(self.deletions());
+        let response = client.call(request.upsertions(self.upsertions())).await?;
+        tracing::debug!(?response);
 
         // The broker answers per user, and this used to discard the answer and
         // return `None` unconditionally — so a credential the broker refused
         // exited 0, and the shell script that created it saw a user that does
         // not exist (#556). One deletion or one upsertion goes out at a time,
         // so the first non-`None` is the whole verdict.
-        response
-            .results
-            .unwrap_or_default()
-            .iter()
-            .map(|result| ErrorCode::try_from(result.error_code))
-            .find_map(|code| match code {
-                Ok(ErrorCode::None) => None,
-                otherwise => Some(otherwise),
-            })
-            .unwrap_or(Ok(ErrorCode::None))
-            .map_err(Into::into)
+        for result in response.results.unwrap_or_default() {
+            let code = ErrorCode::try_from(result.error_code)?;
+            if code != ErrorCode::None {
+                return Ok(code);
+            }
+        }
+        Ok(ErrorCode::None)
     }
 }
 
@@ -217,41 +197,27 @@ mod tests {
             .command
     }
 
-    #[test]
-    fn test_salted_password_256() -> Result<()> {
-        let password = "password";
-        let salt = b"abcdef";
-        let iterations = 1000;
-        let mechanism = Mechanism::Scram256;
+    /// PBKDF2 of `password` salted with `abcdef` over 1 000 rounds, under
+    /// HMAC-SHA-256 and HMAC-SHA-512.
+    const PBKDF2_SHA256: &str = "91db26ffce86edda06e752019495a1d2b9f32e4c5e8570d990a2c95b1dff0513";
+    const PBKDF2_SHA512: &str = concat!(
+        "9a23999111a18b18cc28651d8b33887de45412f0a9cb7b2212a72de201d766ac",
+        "964bea47eebbc22e052677f8ca6e2c273ee32ed2d0c9b4b75bd49439406073af",
+    );
 
-        let result = mechanism.salted_password(password.as_bytes(), iterations, salt)?;
-        assert_eq!(
-            [
-                145, 219, 38, 255, 206, 134, 237, 218, 6, 231, 82, 1, 148, 149, 161, 210, 185, 243,
-                46, 76, 94, 133, 112, 217, 144, 162, 201, 91, 29, 255, 5, 19
-            ],
-            &result[..]
-        );
-        Ok(())
+    fn unhex(digits: &str) -> Vec<u8> {
+        let pairs = digits.as_bytes().chunks(2);
+        let byte =
+            |pair: &[u8]| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
+        pairs.map(byte).collect()
     }
 
     #[test]
-    fn test_salted_password_512() -> Result<()> {
-        let password = "password";
-        let salt = b"abcdef";
-        let iterations = 1000;
-        let mechanism = Mechanism::Scram512;
-
-        let result = mechanism.salted_password(password.as_bytes(), iterations, salt)?;
-        assert_eq!(
-            [
-                154, 35, 153, 145, 17, 161, 139, 24, 204, 40, 101, 29, 139, 51, 136, 125, 228, 84,
-                18, 240, 169, 203, 123, 34, 18, 167, 45, 226, 1, 215, 102, 172, 150, 75, 234, 71,
-                238, 187, 194, 46, 5, 38, 119, 248, 202, 110, 44, 39, 62, 227, 46, 210, 208, 201,
-                180, 183, 91, 212, 148, 57, 64, 96, 115, 175
-            ],
-            &result[..]
-        );
+    fn salted_passwords_are_pbkdf2_of_the_mechanism_digest() -> Result<()> {
+        let salted =
+            |mechanism: Mechanism| mechanism.salted_password(b"password", 1_000, b"abcdef");
+        assert_eq!(unhex(PBKDF2_SHA256), salted(Mechanism::Scram256)?.to_vec());
+        assert_eq!(unhex(PBKDF2_SHA512), salted(Mechanism::Scram512)?.to_vec());
         Ok(())
     }
 

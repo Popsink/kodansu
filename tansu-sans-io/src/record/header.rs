@@ -12,11 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{ByteSize, Decode, Encode, Result, record::codec::Octets};
-use bytes::{BufMut as _, Bytes, BytesMut};
-use serde::{Deserialize, Serialize};
-use tracing::instrument;
+use bytes::BufMut as _;
+use bytes::{Bytes, BytesMut};
+use serde::Deserialize;
+use serde::Serialize;
 
+use crate::record::codec::Octets;
+use crate::{ByteSize, Decode, Encode, Result};
+
+/// A record header: an optional key and an optional value, each encoded as
+/// varint-length-prefixed octets.
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct Header {
     #[serde(serialize_with = "Octets::serialize")]
@@ -30,55 +35,51 @@ pub struct Header {
 
 impl ByteSize for Header {
     fn size_in_bytes(&self) -> Result<usize> {
-        Octets(self.key.clone())
-            .size_in_bytes()
-            .and_then(|key_octets| {
-                Octets(self.value.clone())
-                    .size_in_bytes()
-                    .map(|value_octets| key_octets + value_octets)
-            })
+        let key_size = Octets(self.key.clone()).size_in_bytes()?;
+        let value_size = Octets(self.value.clone()).size_in_bytes()?;
+        Ok(key_size + value_size)
     }
 }
 
 impl Encode for Header {
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     fn encode(&self) -> Result<Bytes> {
-        let mut encoded = self.size_in_bytes().map(BytesMut::with_capacity)?;
-
-        encoded.put(Octets(self.key.clone()).encode()?);
-        encoded.put(Octets(self.value.clone()).encode()?);
-
-        Ok(encoded.into())
+        let capacity = self.size_in_bytes()?;
+        let mut encoded = BytesMut::with_capacity(capacity);
+        for half in [&self.key, &self.value] {
+            encoded.put(Octets(half.clone()).encode()?);
+        }
+        Ok(encoded.freeze())
     }
 }
 
 impl Decode for Header {
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     fn decode(encoded: &mut Bytes) -> Result<Self> {
-        Octets::decode(encoded).and_then(|key| {
-            Octets::decode(encoded).map(|value| Self {
-                key: key.into(),
-                value: value.into(),
-            })
+        let key_octets = Octets::decode(encoded)?;
+        let value_octets = Octets::decode(encoded)?;
+        Ok(Self {
+            key: key_octets.0,
+            value: value_octets.0,
         })
     }
 }
 
 impl Header {
     pub fn builder() -> Builder {
-        Builder::default()
+        Default::default()
     }
 }
 
 impl From<Builder> for Header {
     fn from(value: Builder) -> Self {
-        Self {
-            key: value.key.0,
-            value: value.value.0,
-        }
+        let Builder { key, value } = value;
+        let (key, value) = (Option::from(key), Option::from(value));
+        Self { key, value }
     }
 }
 
+/// Builds a [`Header`] one half at a time.
 #[derive(Clone, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct Builder {
     key: Octets,
@@ -88,38 +89,32 @@ pub struct Builder {
 impl Builder {
     #[must_use]
     pub fn key(mut self, key: Bytes) -> Self {
-        self.key = Octets::from(Some(key));
+        self.key = Octets(Some(key));
         self
     }
 
     #[must_use]
     pub fn value(mut self, value: Bytes) -> Self {
-        self.value = Octets::from(Some(value));
+        self.value = Octets(Some(value));
         self
     }
 
     #[must_use]
     pub fn build(self) -> Header {
-        Header {
-            key: self.key.0,
-            value: self.value.0,
-        }
+        Header::from(self)
     }
 }
 
 impl From<Header> for Builder {
     fn from(value: Header) -> Self {
-        Self {
-            key: value.key.into(),
-            value: value.value.into(),
-        }
+        let Header { key, value } = value;
+        let (key, value) = (Octets(key), Octets(value));
+        Self { key, value }
     }
 }
 
 impl ByteSize for Builder {
     fn size_in_bytes(&self) -> Result<usize> {
-        self.key
-            .size_in_bytes()
-            .and_then(|ksz| self.value.size_in_bytes().map(|vsz| ksz + vsz))
+        Ok(self.key.size_in_bytes()? + self.value.size_in_bytes()?)
     }
 }

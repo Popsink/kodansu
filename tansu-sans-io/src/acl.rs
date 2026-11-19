@@ -12,57 +12,48 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
-/// Represents whether an ACL grants or denies permissions
+/// What an ACL does with the operation it names: grant it or refuse it.
 #[derive(
     Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
 )]
 #[serde(rename_all = "snake_case")]
 #[repr(i8)]
 pub enum Permission {
-    /// Represents any permission which this client cannot understand,
-    /// perhaps because this client is too old.
+    /// A wire value this enum has no variant for.
     #[default]
     Unknown = 0,
 
-    /// In a filter, matches any permission.
+    /// Only in a filter: either permission.
     Any = 1,
 
-    /// Disallows access
+    /// The operation is refused.
     Deny = 2,
 
-    /// Grants access
+    /// The operation is granted.
     Allow = 3,
 }
 
 impl From<i8> for Permission {
     fn from(value: i8) -> Self {
-        match value {
-            perm if perm == Permission::Allow as i8 => Permission::Allow,
-            perm if perm == Permission::Any as i8 => Permission::Any,
-            perm if perm == Permission::Deny as i8 => Permission::Deny,
-
-            _ => Permission::Unknown,
-        }
+        let known = [Self::Any, Self::Deny, Self::Allow];
+        known
+            .into_iter()
+            .find(|each| *each as i8 == value)
+            .unwrap_or_default()
     }
 }
 
-/// Represents an operation which an ACL grants or denies permission to perform.
+/// The operation an ACL grants or refuses.
 ///
-/// Some operations imply other operations:
-/// <ul>
-/// <li>[`Allow`] [`All`] implies [`Allow`] everything
-/// <li>[`Deny`] [`All`] implies [`Deny`] everything
+/// Granting some operations grants others with them:
 ///
-/// <li>[`Allow`] [`Read`] implies [`Allow`] [`Describe`]
-/// <li>[`Allow`] [`Write`] implies [`Allow`] [`Describe`]
-/// <li>[`Allow`] [`Delete`] implies [`Allow`] [`Describe`]
-///
-/// <li>[`Allow`] [`Alter`] implies [`Allow`] [`Describe`]
-///
-/// <li>[`Allow`] [`AlterConfigs`] implies [`Allow`] [`DescribeConfigs`]
-/// </ul>
+/// - [`Operation::All`] covers every operation, granted or refused;
+/// - [`Operation::Read`], [`Operation::Write`], [`Operation::Delete`] and
+///   [`Operation::Alter`] each also grant [`Operation::Describe`];
+/// - [`Operation::AlterConfigs`] also grants [`Operation::DescribeConfigs`].
 #[derive(
     Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
 )]
@@ -91,75 +82,78 @@ pub enum Operation {
 
 impl From<i8> for Operation {
     fn from(value: i8) -> Self {
-        match value {
-            op if op == Operation::All as i8 => Operation::All,
-            op if op == Operation::Alter as i8 => Operation::Alter,
-            op if op == Operation::AlterConfigs as i8 => Operation::AlterConfigs,
-            op if op == Operation::Any as i8 => Operation::Any,
-            op if op == Operation::ClusterAction as i8 => Operation::ClusterAction,
-            op if op == Operation::Create as i8 => Operation::Create,
-            op if op == Operation::CreateTokens as i8 => Operation::CreateTokens,
-            op if op == Operation::Delete as i8 => Operation::Delete,
-            op if op == Operation::Describe as i8 => Operation::Describe,
-            op if op == Operation::DescribeConfigs as i8 => Operation::DescribeConfigs,
-            op if op == Operation::DescribeTokens as i8 => Operation::DescribeTokens,
-            op if op == Operation::IdempotentWrite as i8 => Operation::IdempotentWrite,
-            op if op == Operation::Read as i8 => Operation::Read,
-            op if op == Operation::TwoPhaseCommit as i8 => Operation::TwoPhaseCommit,
-            op if op == Operation::Write as i8 => Operation::Write,
-
-            _ => Operation::Unknown,
-        }
+        let known = [
+            Self::Any,
+            Self::All,
+            Self::Read,
+            Self::Write,
+            Self::Create,
+            Self::Delete,
+            Self::Alter,
+            Self::Describe,
+            Self::ClusterAction,
+            Self::DescribeConfigs,
+            Self::AlterConfigs,
+            Self::IdempotentWrite,
+            Self::CreateTokens,
+            Self::DescribeTokens,
+            Self::TwoPhaseCommit,
+        ];
+        known
+            .into_iter()
+            .find(|each| *each as i8 == value)
+            .unwrap_or_default()
     }
 }
 
-/// Represents a type of resource which an ACL can be applied to.
+/// The kind of thing an ACL is written on.
 #[derive(
     Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
 )]
 #[serde(rename_all = "snake_case")]
 #[repr(i8)]
 pub enum Resource {
-    /// Represents any ResourceType which this client cannot understand,
-    /// perhaps because this client is too old.
+    /// A wire value this enum has no variant for.
     #[default]
     Unknown = 0,
 
-    /// In a filter, matches any ResourceType
+    /// Only in a filter: any kind of resource.
     Any = 1,
 
-    /// A topic
+    /// A topic, by name.
     Topic = 2,
 
-    /// A consumer group
+    /// A consumer group, by id.
     Group = 3,
 
-    /// The cluster as a whole
+    /// The cluster itself.
     Cluster = 4,
 
-    /// A transactional ID
+    /// A producer's transactional id.
     TransactionalId = 5,
 
-    /// A token ID
+    /// A delegation token, by id.
     DelegationToken = 6,
 
-    /// A user principal
+    /// A user principal.
     User = 7,
 }
 
 impl From<i8> for Resource {
     fn from(value: i8) -> Self {
-        match value {
-            r if r == Resource::Any as i8 => Resource::Any,
-            r if r == Resource::Cluster as i8 => Resource::Cluster,
-            r if r == Resource::DelegationToken as i8 => Resource::DelegationToken,
-            r if r == Resource::Group as i8 => Resource::Group,
-            r if r == Resource::Topic as i8 => Resource::Topic,
-            r if r == Resource::TransactionalId as i8 => Resource::TransactionalId,
-            r if r == Resource::User as i8 => Resource::User,
-
-            _ => Resource::Unknown,
-        }
+        let known = [
+            Self::Any,
+            Self::Topic,
+            Self::Group,
+            Self::Cluster,
+            Self::TransactionalId,
+            Self::DelegationToken,
+            Self::User,
+        ];
+        known
+            .into_iter()
+            .find(|each| *each as i8 == value)
+            .unwrap_or_default()
     }
 }
 

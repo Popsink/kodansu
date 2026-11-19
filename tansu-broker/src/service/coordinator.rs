@@ -12,25 +12,36 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rama::{
-    Layer as _, Service as _,
-    layer::{MapErrLayer, MapStateLayer},
-};
-use tansu_sans_io::{
-    ApiKey as _, ConsumerGroupHeartbeatRequest, HeartbeatRequest, JoinGroupRequest,
-    LeaveGroupRequest, OffsetCommitRequest, OffsetFetchRequest, SyncGroupRequest,
-};
+use rama::Layer as _;
+use rama::Service as _;
+use rama::layer::MapErrLayer;
+use rama::layer::MapStateLayer;
+use tansu_sans_io::ApiKey as _;
+use tansu_sans_io::ConsumerGroupHeartbeatRequest;
+use tansu_sans_io::{HeartbeatRequest, JoinGroupRequest, LeaveGroupRequest, SyncGroupRequest};
+use tansu_sans_io::{OffsetCommitRequest, OffsetFetchRequest};
 use tansu_service::FrameRouteBuilder;
 
-use crate::{
-    Error,
-    broker::group::{
-        consumer_group_heartbeat::ConsumerGroupHeartbeatService, heartbeat::HeartbeatService,
-        join::JoinGroupService, leave::LeaveGroupService, offset_commit::OffsetCommitService,
-        offset_fetch::OffsetFetchService, sync::SyncGroupService,
-    },
-    coordinator::group::Coordinator,
-};
+use crate::Error;
+use crate::broker::group::consumer_group_heartbeat::ConsumerGroupHeartbeatService;
+use crate::broker::group::heartbeat::HeartbeatService;
+use crate::broker::group::join::JoinGroupService;
+use crate::broker::group::leave::LeaveGroupService;
+use crate::broker::group::offset_commit::OffsetCommitService;
+use crate::broker::group::offset_fetch::OffsetFetchService;
+use crate::broker::group::sync::SyncGroupService;
+use crate::coordinator::group::Coordinator;
+
+/// Adds the route for `$request` to `$builder`: `$service`, with
+/// `$coordinator` as its state and its errors mapped into the broker's [`Error`].
+macro_rules! coordinated {
+    ($builder:ident, $coordinator:ident, $request:ident => $service:ident) => {{
+        let stateful = MapStateLayer::new(|_| $coordinator);
+        let route = (MapErrLayer::new(Error::from), stateful).into_layer($service);
+        let routed = $builder.with_route($request::KEY, route.boxed());
+        routed.map_err(Error::from)
+    }};
+}
 
 pub fn services<C>(
     builder: FrameRouteBuilder<(), Error>,
@@ -39,19 +50,13 @@ pub fn services<C>(
 where
     C: Coordinator,
 {
-    [
-        consumer_group_heartbeat,
-        heartbeat,
-        join_group,
-        leave_group,
-        offset_commit,
-        offset_fetch,
-        sync_group,
-    ]
-    .iter()
-    .try_fold(builder, |builder, service| {
-        service(builder, coordinator.clone())
-    })
+    let builder = consumer_group_heartbeat(builder, coordinator.clone())?;
+    let builder = heartbeat(builder, coordinator.clone())?;
+    let builder = join_group(builder, coordinator.clone())?;
+    let builder = leave_group(builder, coordinator.clone())?;
+    let builder = offset_commit(builder, coordinator.clone())?;
+    let builder = offset_fetch(builder, coordinator.clone())?;
+    sync_group(builder, coordinator)
 }
 
 /// `ConsumerGroupHeartbeat`, and with it the advertisement that this broker
@@ -64,17 +69,7 @@ pub fn consumer_group_heartbeat<C>(
 where
     C: Coordinator,
 {
-    builder
-        .with_route(
-            ConsumerGroupHeartbeatRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| coordinator),
-            )
-                .into_layer(ConsumerGroupHeartbeatService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    coordinated!(builder, coordinator, ConsumerGroupHeartbeatRequest => ConsumerGroupHeartbeatService)
 }
 
 pub fn heartbeat<C>(
@@ -84,17 +79,7 @@ pub fn heartbeat<C>(
 where
     C: Coordinator,
 {
-    builder
-        .with_route(
-            HeartbeatRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| coordinator),
-            )
-                .into_layer(HeartbeatService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    coordinated!(builder, coordinator, HeartbeatRequest => HeartbeatService)
 }
 
 pub fn join_group<C>(
@@ -104,17 +89,7 @@ pub fn join_group<C>(
 where
     C: Coordinator,
 {
-    builder
-        .with_route(
-            JoinGroupRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| coordinator),
-            )
-                .into_layer(JoinGroupService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    coordinated!(builder, coordinator, JoinGroupRequest => JoinGroupService)
 }
 
 pub fn leave_group<C>(
@@ -124,17 +99,7 @@ pub fn leave_group<C>(
 where
     C: Coordinator,
 {
-    builder
-        .with_route(
-            LeaveGroupRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| coordinator),
-            )
-                .into_layer(LeaveGroupService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    coordinated!(builder, coordinator, LeaveGroupRequest => LeaveGroupService)
 }
 
 pub fn offset_commit<C>(
@@ -144,17 +109,7 @@ pub fn offset_commit<C>(
 where
     C: Coordinator,
 {
-    builder
-        .with_route(
-            OffsetCommitRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| coordinator),
-            )
-                .into_layer(OffsetCommitService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    coordinated!(builder, coordinator, OffsetCommitRequest => OffsetCommitService)
 }
 
 pub fn offset_fetch<C>(
@@ -164,17 +119,7 @@ pub fn offset_fetch<C>(
 where
     C: Coordinator,
 {
-    builder
-        .with_route(
-            OffsetFetchRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| coordinator),
-            )
-                .into_layer(OffsetFetchService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    coordinated!(builder, coordinator, OffsetFetchRequest => OffsetFetchService)
 }
 
 pub fn sync_group<C>(
@@ -184,15 +129,5 @@ pub fn sync_group<C>(
 where
     C: Coordinator,
 {
-    builder
-        .with_route(
-            SyncGroupRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| coordinator),
-            )
-                .into_layer(SyncGroupService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    coordinated!(builder, coordinator, SyncGroupRequest => SyncGroupService)
 }

@@ -13,20 +13,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    error::{self},
-    fmt::Debug,
-    future::{Future, pending},
-    io,
-    marker::PhantomData,
-    net::SocketAddr,
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    time::{Duration, SystemTime},
-};
+use std::error;
+use std::fmt::Debug;
+use std::future::{Future, pending};
+use std::io;
+use std::marker::PhantomData;
+use std::net::SocketAddr;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
 use futures::{StreamExt as _, stream::FuturesOrdered};
@@ -35,15 +31,13 @@ use opentelemetry::KeyValue;
 use rama::{Context, Layer, Service};
 use socket2::{SockRef, TcpKeepalive};
 use tansu_sans_io::{ApiKey as _, ProduceRequest, RootMessageMeta};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufWriter},
-    net::{TcpListener, TcpStream},
-    sync::{Notify, Semaphore, SemaphorePermit, mpsc},
-    task::JoinSet,
-    time::sleep,
-};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Notify, Semaphore, SemaphorePermit, mpsc};
+use tokio::task::JoinSet;
+use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument as _, debug, error, info_span, instrument, warn};
+use tracing::{Instrument as _, debug, error, info_span, warn};
 
 use crate::{
     BYTES_RECEIVED, BYTES_SENT, Classify, Error, REQUEST_DURATION, REQUEST_SIZE,
@@ -251,9 +245,10 @@ impl<S> Layer<S> for TcpListenerLayer {
     type Service = TcpListenerService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        Self::Service {
-            cancellation: self.cancellation.clone(),
+        let cancellation = self.cancellation.clone();
+        TcpListenerService {
             inner,
+            cancellation,
         }
     }
 }
@@ -267,7 +262,7 @@ pub struct TcpListenerService<S> {
 
 impl<S> Debug for TcpListenerService<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct(stringify!(TcpListenerService)).finish()
+        f.debug_struct("TcpListenerService").finish()
     }
 }
 
@@ -281,7 +276,7 @@ where
     type Response = ();
     type Error = S::Error;
 
-    #[instrument(skip(ctx, req))]
+    #[tracing::instrument(skip(ctx, req))]
     async fn serve(
         &self,
         ctx: Context<State>,
@@ -465,14 +460,15 @@ impl TcpContext {
     pub const CONNECTIONS_MAX_IDLE: Duration = Duration::from_secs(600);
 
     pub fn cluster_id(self, cluster_id: Option<String>) -> Self {
-        Self { cluster_id, ..self }
+        let mut adjusted = self;
+        adjusted.cluster_id = cluster_id;
+        adjusted
     }
 
     pub fn maximum_frame_size(self, maximum_frame_size: Option<usize>) -> Self {
-        Self {
-            maximum_frame_size,
-            ..self
-        }
+        let mut adjusted = self;
+        adjusted.maximum_frame_size = maximum_frame_size;
+        adjusted
     }
 
     /// Watch `drain` for this process being asked to stop (#361).
@@ -583,10 +579,8 @@ impl<S> Layer<S> for TcpContextLayer {
     type Service = TcpContextService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        Self::Service {
-            inner,
-            state: self.state.clone(),
-        }
+        let state = self.state.clone();
+        TcpContextService { inner, state }
     }
 }
 
@@ -599,7 +593,7 @@ pub struct TcpContextService<S> {
 
 impl<S> Debug for TcpContextService<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct(stringify!(TcpContextService)).finish()
+        f.debug_struct("TcpContextService").finish()
     }
 }
 
@@ -615,11 +609,10 @@ where
     type Response = S::Response;
     type Error = S::Error;
 
-    #[instrument(skip_all, fields(peer = ?ctx.get::<Peer>().map(|Peer(peer)| *peer)))]
+    #[tracing::instrument(skip_all, fields(peer = ?ctx.get::<Peer>().map(|Peer(peer)| *peer)))]
     async fn serve(&self, ctx: Context<State>, req: Stream) -> Result<Self::Response, Self::Error> {
-        let (ctx, _) = ctx.swap_state(self.state.clone());
-
-        self.inner.serve(ctx, req).await
+        let (with_state, _previous) = ctx.swap_state(self.state.clone());
+        self.inner.serve(with_state, req).await
     }
 }
 
@@ -691,7 +684,7 @@ impl Service<TcpStream, Bytes> for BytesTcpService {
     type Response = Bytes;
     type Error = Error;
 
-    #[instrument(skip(ctx, req))]
+    #[tracing::instrument(skip(ctx, req))]
     async fn serve(
         &self,
         mut ctx: Context<TcpStream>,
@@ -737,10 +730,8 @@ impl<S, State> Layer<S> for TcpBytesLayer<State> {
     type Service = TcpBytesService<S, State>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        Self::Service {
-            inner,
-            _state: PhantomData,
-        }
+        let _state = PhantomData;
+        TcpBytesService { _state, inner }
     }
 }
 
@@ -753,15 +744,14 @@ pub struct TcpBytesService<S, State> {
 
 impl<S, State> Debug for TcpBytesService<S, State> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct(stringify!(TcpBytesService)).finish()
+        f.debug_struct("TcpBytesService").finish()
     }
 }
 
 impl<S, State> TcpBytesService<S, State> {
     fn elapsed_millis(&self, start: SystemTime) -> u64 {
-        start
-            .elapsed()
-            .map_or(0, |duration| duration.as_millis() as u64)
+        let elapsed = start.elapsed().unwrap_or_default();
+        elapsed.as_millis() as u64
     }
 }
 
@@ -771,7 +761,7 @@ where
     S::Error: From<Error> + From<io::Error> + Debug,
     State: Clone + Default + Send + Sync + 'static,
 {
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn wait<R>(
         &self,
         req: &mut R,
@@ -823,7 +813,7 @@ where
         Ok(size)
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn read<R>(&self, req: &mut R, size: [u8; 4]) -> Result<Bytes, S::Error>
     where
         R: AsyncReadExt + Unpin,
@@ -831,7 +821,7 @@ where
         read_frame(req, size).await
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn process(
         &self,
         attributes: &[KeyValue],
@@ -855,7 +845,7 @@ where
         })
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn write<W>(
         &self,
         req: &mut W,
@@ -918,23 +908,15 @@ where
 
     type Error = S::Error;
 
-    #[instrument(skip(ctx, req))]
+    #[tracing::instrument(skip(ctx, req))]
     async fn serve(
         &self,
         ctx: Context<TcpContext>,
         req: Stream,
     ) -> Result<Self::Response, Self::Error> {
-        let attributes = {
-            let state = ctx.state();
-
-            let mut attributes = vec![];
-
-            if let Some(cluster_id) = state.cluster_id.clone() {
-                attributes.push(KeyValue::new("cluster_id", cluster_id))
-            }
-
-            attributes
-        };
+        let cluster = ctx.state().cluster_id.clone();
+        let tagged = cluster.map(|named| KeyValue::new("cluster_id", named));
+        let attributes: Vec<KeyValue> = tagged.into_iter().collect();
 
         let maximum_frame_size = ctx.state().maximum_frame_size;
         let drain = ctx.state().drain.clone();
@@ -1170,7 +1152,7 @@ impl<S> Layer<S> for BytesLayer {
     type Service = BytesService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        Self::Service { inner }
+        BytesService { inner }
     }
 }
 
@@ -1182,7 +1164,7 @@ pub struct BytesService<S> {
 
 impl<S> Debug for BytesService<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct(stringify!(BytesService)).finish()
+        f.debug_struct("BytesService").finish()
     }
 }
 
@@ -1194,13 +1176,12 @@ where
     type Response = Bytes;
     type Error = S::Error;
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn serve(&self, ctx: Context<State>, req: Bytes) -> Result<Self::Response, Self::Error> {
         debug!(req = ?&req[..]);
-        self.inner
-            .serve(ctx, req)
-            .await
-            .inspect(|response| debug!(response = ?&response[..]))
+        let response = self.inner.serve(ctx, req).await?;
+        debug!(response = ?&response[..]);
+        Ok(response)
     }
 }
 

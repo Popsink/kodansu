@@ -12,45 +12,40 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    collections::BTreeMap,
-    ops::Range,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::{Duration, SystemTime},
-};
+use std::collections::BTreeMap;
+use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
-use rand::{prelude::*, rngs::SmallRng};
-use tansu_sans_io::{
-    ConfigResource, ErrorCode, IsolationLevel, ListOffset, ScramMechanism,
-    create_topics_request::CreatableTopic, delete_groups_response::DeletableGroupResult,
-    delete_records_request::DeleteRecordsTopic, delete_records_response::DeleteRecordsTopicResult,
-    describe_cluster_response::DescribeClusterBroker,
-    describe_configs_response::DescribeConfigsResult,
-    describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
-    incremental_alter_configs_request::AlterConfigsResource,
-    incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup, record::deflated,
-    txn_offset_commit_response::TxnOffsetCommitResponseTopic,
-};
-use tokio::time::sleep;
-use tracing::{debug, instrument};
+use rand::RngExt as _;
+use rand::SeedableRng as _;
+use rand::rngs::SmallRng;
+use tansu_sans_io::create_topics_request::CreatableTopic;
+use tansu_sans_io::delete_groups_response::DeletableGroupResult;
+use tansu_sans_io::delete_records_request::DeleteRecordsTopic;
+use tansu_sans_io::delete_records_response::DeleteRecordsTopicResult;
+use tansu_sans_io::describe_cluster_response::DescribeClusterBroker;
+use tansu_sans_io::describe_configs_response::DescribeConfigsResult;
+use tansu_sans_io::describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic;
+use tansu_sans_io::incremental_alter_configs_request::AlterConfigsResource;
+use tansu_sans_io::incremental_alter_configs_response::AlterConfigsResourceResponse;
+use tansu_sans_io::list_groups_response::ListedGroup;
+use tansu_sans_io::record::deflated;
+use tansu_sans_io::txn_offset_commit_response::TxnOffsetCommitResponseTopic;
+use tansu_sans_io::{ConfigResource, ErrorCode, IsolationLevel, ListOffset, ScramMechanism};
 use url::Url;
 use uuid::Uuid;
 
 use crate::delegate::storage_methods;
-use crate::{
-    Ack, AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
-    BrokerRegistrationRequest, CommittedOffset, ConsumerGroupDoc, ContactStamps, GenerationDoc,
-    ListOffsetResponse, MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProducerIdResponse, QuotaAlteration, QuotaEntity, QuotaFilterComponent,
-    QuotaLimits, Quotas, Result, ScramCredential, Storage, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-    Version,
-};
+use crate::{Ack, AclBinding, AclFilter, AutoTopicCreate, BrokerRegistrationRequest};
+use crate::{AssignmentDoc, AssignmentOutcome, ConsumerGroupDoc, GenerationDoc, MemberDoc};
+use crate::{CommittedOffset, ContactStamps, NamedGroupDetail, OffsetCommitRequest, OffsetStage};
+use crate::{ListOffsetResponse, MetadataResponse, ProducerIdResponse, Result, Storage};
+use crate::{QuotaAlteration, QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas};
+use crate::{ScramCredential, TopicId, Topition, UpdateError, Version};
+use crate::{TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest};
 
 #[derive(Clone, Debug)]
 pub struct LatencyIntroducingStorage<S> {
@@ -106,18 +101,20 @@ where
     S: Storage,
 {
     pub fn new(storage: S) -> Self {
+        let zero = || Arc::new(AtomicU64::default());
+        let seeded = Arc::new(Mutex::new(SmallRng::seed_from_u64(0)));
         Self {
-            storage,
-            rng: Arc::new(Mutex::new(SmallRng::seed_from_u64(0))),
+            outdate_generation_updates: zero(),
+            consumer_renewals: zero(),
+            consumer_group_updates: zero(),
+            member_reads: zero(),
+            member_lists: zero(),
+            generation_cas_conflicts: zero(),
+            generation_updates: zero(),
+            member_puts: zero(),
             latency: 50..150,
-            member_puts: Arc::new(AtomicU64::new(0)),
-            generation_updates: Arc::new(AtomicU64::new(0)),
-            generation_cas_conflicts: Arc::new(AtomicU64::new(0)),
-            member_lists: Arc::new(AtomicU64::new(0)),
-            member_reads: Arc::new(AtomicU64::new(0)),
-            consumer_group_updates: Arc::new(AtomicU64::new(0)),
-            consumer_renewals: Arc::new(AtomicU64::new(0)),
-            outdate_generation_updates: Arc::new(AtomicU64::new(0)),
+            rng: seeded,
+            storage,
         }
     }
 
@@ -171,33 +168,31 @@ where
     /// that handles a genuine race handles this, and one that does not is
     /// exercised here rather than in production.
     pub fn outdating_generation_updates(self, updates: u64) -> Self {
-        self.outdate_generation_updates
-            .store(updates, Ordering::Relaxed);
+        let remaining = &self.outdate_generation_updates;
+        remaining.store(updates, Ordering::Relaxed);
         self
     }
 
     pub fn with_seed(self, seed: u64) -> Self {
-        Self {
-            rng: Arc::new(Mutex::new(SmallRng::seed_from_u64(seed))),
-            ..self
-        }
+        let reseeded = SmallRng::seed_from_u64(seed);
+        let rng = Arc::new(Mutex::new(reseeded));
+        Self { rng, ..self }
     }
 
     pub fn with_latency(self, latency: Range<u64>) -> Self {
-        Self { latency, ..self }
+        let mut adjusted = self;
+        adjusted.latency = latency;
+        adjusted
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn introduce_latency(&self) -> Result<()> {
-        let latency = self
-            .rng
-            .lock()
-            .map(|mut rng| rng.random_range(self.latency.clone()))
-            .map(Duration::from_millis)
-            .inspect(|latency| debug!(?latency))?;
-
-        sleep(latency).await;
-
+        let pause = {
+            let mut rng = self.rng.lock()?;
+            Duration::from_millis(rng.random_range(self.latency.clone()))
+        };
+        tracing::debug!(latency = ?pause);
+        tokio::time::sleep(pause).await;
         Ok(())
     }
 }
@@ -211,7 +206,10 @@ impl<G> LatencyIntroducingStorage<G>
 where
     G: Storage + Clone,
 {
-    #[instrument(skip_all, fields(transaction_id, topic = topition.topic, partition = topition.partition))]
+    #[tracing::instrument(
+        skip_all,
+        fields(transaction_id, topic = topition.topic, partition = topition.partition)
+    )]
     async fn traced_produce(
         &self,
         transaction_id: Option<&str>,
@@ -219,8 +217,8 @@ where
         batch: deflated::Batch,
     ) -> Result<i64> {
         self.introduce_latency().await?;
-
-        self.storage.produce(transaction_id, topition, batch).await
+        let producing = self.storage.produce(transaction_id, topition, batch);
+        producing.await
     }
 }
 

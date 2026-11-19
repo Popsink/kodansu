@@ -12,33 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, Mutex},
-    time::{Duration, SystemTime},
-};
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
-use async_trait::async_trait;
-use tansu_sans_io::{
-    ConfigResource, ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, ScramMechanism,
-    add_partitions_to_txn_response::{AddPartitionsToTxnResult, AddPartitionsToTxnTopicResult},
-    create_topics_request::CreatableTopic,
-    delete_groups_response::DeletableGroupResult,
-    delete_records_request::DeleteRecordsTopic,
-    delete_records_response::DeleteRecordsTopicResult,
-    describe_cluster_response::DescribeClusterBroker,
-    describe_configs_response::DescribeConfigsResult,
-    describe_topic_partitions_response::{
-        DescribeTopicPartitionsResponsePartition, DescribeTopicPartitionsResponseTopic,
-    },
-    incremental_alter_configs_request::AlterConfigsResource,
-    incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup,
-    metadata_response::{MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic},
-    record::deflated::Batch,
-    txn_offset_commit_response::TxnOffsetCommitResponseTopic,
-};
-use tracing::instrument;
+use tansu_sans_io::add_partitions_to_txn_response::AddPartitionsToTxnResult;
+use tansu_sans_io::add_partitions_to_txn_response::AddPartitionsToTxnTopicResult;
+use tansu_sans_io::create_topics_request::CreatableTopic;
+use tansu_sans_io::delete_groups_response::DeletableGroupResult;
+use tansu_sans_io::delete_records_request::DeleteRecordsTopic;
+use tansu_sans_io::delete_records_response::DeleteRecordsTopicResult;
+use tansu_sans_io::describe_cluster_response::DescribeClusterBroker;
+use tansu_sans_io::describe_configs_response::DescribeConfigsResult;
+use tansu_sans_io::describe_topic_partitions_response::DescribeTopicPartitionsResponsePartition;
+use tansu_sans_io::describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic;
+use tansu_sans_io::incremental_alter_configs_request::AlterConfigsResource;
+use tansu_sans_io::incremental_alter_configs_response::AlterConfigsResourceResponse;
+use tansu_sans_io::list_groups_response::ListedGroup;
+use tansu_sans_io::metadata_response::MetadataResponseBroker;
+use tansu_sans_io::metadata_response::{MetadataResponsePartition, MetadataResponseTopic};
+use tansu_sans_io::record::deflated::Batch;
+use tansu_sans_io::txn_offset_commit_response::TxnOffsetCommitResponseTopic;
+use tansu_sans_io::{ConfigResource, ErrorCode, IsolationLevel, ListOffset};
+use tansu_sans_io::{NULL_TOPIC_ID, ScramMechanism};
 use url::Url;
 use uuid::Uuid;
 
@@ -108,6 +104,19 @@ impl Engine {
         }
     }
 
+    /// This node's advertised host and port, `0.0.0.0` and 9092 where the
+    /// listener leaves either out.
+    fn host_and_port(&self) -> (String, i32) {
+        let host = self.advertised_listener.host_str().unwrap_or("0.0.0.0");
+        let port = self.advertised_listener.port().unwrap_or(9092);
+        (host.to_owned(), i32::from(port))
+    }
+
+    /// This node's id, once per replica: the only replica there is.
+    fn replicas(&self, factor: i16) -> Vec<i32> {
+        vec![self.node; factor as usize]
+    }
+
     /// A version distinct from every other, as an object store's etag is.
     fn next_version() -> Version {
         let id = Uuid::now_v7();
@@ -122,77 +131,64 @@ impl Engine {
 const FEATURE: &str = "storage";
 const MESSAGE: &str = "storage has not been defined";
 
-#[async_trait]
+/// The answer of the methods that cannot work without storage.
+fn undefined<T>() -> Result<T> {
+    let (feature, message) = (String::from(FEATURE), String::from(MESSAGE));
+    Err(Error::FeatureNotEnabled { feature, message })
+}
+
+#[async_trait::async_trait]
 impl Storage for Engine {
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn register_broker(&self, _broker_registration: BrokerRegistrationRequest) -> Result<()> {
         Ok(())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn brokers(&self) -> Result<Vec<DescribeClusterBroker>> {
-        let broker_id = self.node;
-        let host = self
-            .advertised_listener
-            .host_str()
-            .unwrap_or("0.0.0.0")
-            .into();
-        let port = self.advertised_listener.port().unwrap_or(9092).into();
-        let rack = None;
-
-        Ok(vec![
-            DescribeClusterBroker::default()
-                .broker_id(broker_id)
-                .host(host)
-                .port(port)
-                .rack(rack),
-        ])
+        let (host, port) = self.host_and_port();
+        let this_node = DescribeClusterBroker::default()
+            .broker_id(self.node)
+            .host(host);
+        Ok(vec![this_node.port(port).rack(None)])
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn create_topic(&self, topic: CreatableTopic, _validate_only: bool) -> Result<Uuid> {
-        self.topics
-            .lock()
-            .map_err(Into::into)
-            .and_then(|mut topics| {
-                if topics.iter().any(|existing| existing.name == topic.name) {
-                    Err(Error::Api(ErrorCode::TopicAlreadyExists))
-                } else {
-                    topics.push(topic);
-                    Ok(Uuid::now_v7())
-                }
-            })
+        let mut created = self.topics.lock()?;
+        if created.iter().any(|existing| existing.name == topic.name) {
+            return Err(Error::Api(ErrorCode::TopicAlreadyExists));
+        }
+        created.push(topic);
+        Ok(Uuid::now_v7())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn delete_records(
         &self,
         _topics: &[DeleteRecordsTopic],
     ) -> Result<Vec<DeleteRecordsTopicResult>> {
-        Err(Error::FeatureNotEnabled {
-            feature: FEATURE.into(),
-            message: MESSAGE.into(),
-        })
+        undefined()
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn delete_topic(&self, _topic: &TopicId) -> Result<ErrorCode> {
         Ok(ErrorCode::None)
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn incremental_alter_resource(
         &self,
         resource: AlterConfigsResource,
     ) -> Result<AlterConfigsResourceResponse> {
-        Ok(AlterConfigsResourceResponse::default()
-            .error_code(ErrorCode::None.into())
-            .error_message(Some(ErrorCode::None.to_string()))
-            .resource_name(resource.resource_name)
-            .resource_type(resource.resource_type))
+        let none = ErrorCode::None;
+        let altered = AlterConfigsResourceResponse::default().error_code(i16::from(none));
+        let altered = altered.error_message(Some(none.to_string()));
+        let altered = altered.resource_name(resource.resource_name);
+        Ok(altered.resource_type(resource.resource_type))
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn produce(
         &self,
         _transaction_id: Option<&str>,
@@ -204,7 +200,7 @@ impl Storage for Engine {
 
     /// Nothing to wait for, so nothing to pipeline: the [`Ack`] is already
     /// resolved, with the offset [`Self::produce`] answers.
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn admit(
         &self,
         transaction_id: Option<&str>,
@@ -216,7 +212,7 @@ impl Storage for Engine {
         Ok(Box::pin(std::future::ready(produced)))
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn fetch(
         &self,
         _topition: &Topition,
@@ -226,10 +222,10 @@ impl Storage for Engine {
         _isolation_level: IsolationLevel,
         _max_wait: Duration,
     ) -> Result<Vec<Batch>> {
-        Ok([].into())
+        Ok(Vec::new())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn offset_stage(&self, _topition: &Topition) -> Result<OffsetStage> {
         Ok(OffsetStage::default())
     }
@@ -258,20 +254,18 @@ impl Storage for Engine {
         self.offset_stage(topition).await
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn offset_commit(
         &self,
         _group: &str,
         _retention: Option<Duration>,
         offsets: &[(Topition, OffsetCommitRequest)],
     ) -> Result<Vec<(Topition, ErrorCode)>> {
-        Ok(offsets
-            .iter()
-            .map(|(topition, _)| (topition.to_owned(), ErrorCode::None))
-            .collect())
+        let accepted = |(at, _): &(Topition, OffsetCommitRequest)| (at.clone(), ErrorCode::None);
+        Ok(offsets.iter().map(accepted).collect())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn committed_offset_topitions(
         &self,
         _group_id: &str,
@@ -279,172 +273,136 @@ impl Storage for Engine {
         Ok(BTreeMap::new())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn offset_fetch(
         &self,
         _group_id: Option<&str>,
         topics: &[Topition],
         _require_stable: Option<bool>,
     ) -> Result<BTreeMap<Topition, CommittedOffset>> {
-        Ok(topics
-            .iter()
-            .map(|topition| (topition.to_owned(), CommittedOffset::new(0, None)))
-            .collect())
+        let at_zero = |at: &Topition| (at.clone(), CommittedOffset::new(0, None));
+        Ok(topics.iter().map(at_zero).collect())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn list_offsets(
         &self,
         _isolation_level: IsolationLevel,
         offsets: &[(Topition, ListOffset)],
     ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
-        Ok(offsets
-            .iter()
-            .map(|(topition, _)| {
-                (
-                    topition.to_owned(),
-                    ListOffsetResponse {
-                        error_code: ErrorCode::None,
-                        timestamp: None,
-                        offset: Some(0),
-                    },
-                )
-            })
-            .collect())
+        let start = ListOffsetResponse {
+            offset: Some(0),
+            ..ListOffsetResponse::default()
+        };
+        let listed = |(at, _): &(Topition, ListOffset)| (at.clone(), start);
+        Ok(offsets.iter().map(listed).collect())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
         let asks_for_none = topics.is_some_and(<[TopicId]>::is_empty);
-        let node_id = self.node;
-        let host = self
-            .advertised_listener
-            .host_str()
-            .unwrap_or("0.0.0.0")
-            .into();
-        let port = self.advertised_listener.port().unwrap_or(9092).into();
-        let rack = None;
+        let (host, port) = self.host_and_port();
+        let created = self.topics.lock()?;
 
-        self.topics
-            .lock()
-            .map(|topics| {
-                topics
-                    .iter()
-                    .filter(|_| !asks_for_none)
-                    .map(|topic| {
-                        MetadataResponseTopic::default()
-                            .error_code(ErrorCode::None.into())
-                            .is_internal(Some(false))
-                            .name(Some(topic.name.clone()))
-                            .partitions(Some(
-                                (0..topic.num_partitions)
-                                    .map(|partition_index| {
-                                        MetadataResponsePartition::default()
-                                            .leader_id(self.node)
-                                            .leader_epoch(Some(-1))
-                                            .partition_index(partition_index)
-                                            .error_code(ErrorCode::None.into())
-                                            .offline_replicas(Some([].into()))
-                                            .replica_nodes(Some(vec![
-                                                self.node;
-                                                topic.replication_factor
-                                                    as usize
-                                            ]))
-                                            .isr_nodes(Some(vec![
-                                                self.node;
-                                                topic.replication_factor as usize
-                                            ]))
-                                    })
-                                    .collect(),
-                            ))
-                            .topic_id(Some(NULL_TOPIC_ID))
-                            .topic_authorized_operations(Some(i32::MIN))
-                    })
-                    .collect()
-            })
-            .map(|topics| MetadataResponse {
-                cluster: Some(self.cluster.clone()),
-                controller: Some(self.node),
-                brokers: [MetadataResponseBroker::default()
-                    .node_id(node_id)
-                    .host(host)
-                    .port(port)
-                    .rack(rack)]
-                .into(),
-                topics,
-            })
-            .map_err(Into::into)
+        let partition = |index, factor| {
+            let led = MetadataResponsePartition::default().leader_id(self.node);
+            let led = led.leader_epoch(Some(-1)).partition_index(index);
+            let led = led
+                .error_code(i16::from(ErrorCode::None))
+                .offline_replicas(Some(vec![]));
+            let led = led.replica_nodes(Some(self.replicas(factor)));
+            led.isr_nodes(Some(self.replicas(factor)))
+        };
+        let describe = |topic: &CreatableTopic| {
+            let indexes = 0..topic.num_partitions;
+            let partitions = indexes.map(|index| partition(index, topic.replication_factor));
+            let named = MetadataResponseTopic::default().error_code(i16::from(ErrorCode::None));
+            let named = named
+                .is_internal(Some(false))
+                .name(Some(topic.name.clone()));
+            let named = named
+                .partitions(Some(partitions.collect()))
+                .topic_id(Some(NULL_TOPIC_ID));
+            named.topic_authorized_operations(Some(i32::MIN))
+        };
+        let listed = created
+            .iter()
+            .filter(|_| !asks_for_none)
+            .map(describe)
+            .collect();
+
+        let this_node = MetadataResponseBroker::default()
+            .node_id(self.node)
+            .host(host);
+        let brokers = vec![this_node.port(port).rack(None)];
+        let (cluster, controller) = (Some(self.cluster.clone()), Some(self.node));
+        Ok(MetadataResponse {
+            topics: listed,
+            brokers,
+            controller,
+            cluster,
+        })
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn describe_config(
         &self,
         name: &str,
         resource: ConfigResource,
         _keys: Option<&[String]>,
     ) -> Result<DescribeConfigsResult> {
-        Ok(DescribeConfigsResult::default()
-            .configs(Some([].into()))
-            .resource_name(name.to_string())
-            .resource_type(resource.into())
-            .error_code(ErrorCode::None.into())
-            .error_message(Some(ErrorCode::None.to_string())))
+        let none = ErrorCode::None;
+        let described = DescribeConfigsResult::default().configs(Some(vec![]));
+        let described = described
+            .resource_name(name.to_owned())
+            .resource_type(i8::from(resource));
+        Ok(described
+            .error_code(i16::from(none))
+            .error_message(Some(none.to_string())))
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn describe_topic_partitions(
         &self,
         _topics: Option<&[TopicId]>,
         _partition_limit: i32,
         _cursor: Option<Topition>,
     ) -> Result<Vec<DescribeTopicPartitionsResponseTopic>> {
-        self.topics.lock().map_err(Into::into).map(|existing| {
-            existing
-                .iter()
-                .map(|existing| {
-                    DescribeTopicPartitionsResponseTopic::default()
-                        .error_code(ErrorCode::None.into())
-                        .name(Some(existing.name.clone()))
-                        .partitions(Some(
-                            (0..existing.num_partitions)
-                                .map(|partition_index| {
-                                    DescribeTopicPartitionsResponsePartition::default()
-                                        .leader_id(self.node)
-                                        .partition_index(partition_index)
-                                        .isr_nodes(Some(vec![
-                                            self.node;
-                                            existing.replication_factor as usize
-                                        ]))
-                                })
-                                .collect(),
-                        ))
-                })
-                .collect()
-        })
+        let created = self.topics.lock()?;
+        let describe = |topic: &CreatableTopic| {
+            let in_sync = self.replicas(topic.replication_factor);
+            let partition = |index| {
+                let led = DescribeTopicPartitionsResponsePartition::default().leader_id(self.node);
+                led.partition_index(index).isr_nodes(Some(in_sync.clone()))
+            };
+            let partitions = (0..topic.num_partitions).map(partition).collect();
+            let named = DescribeTopicPartitionsResponseTopic::default();
+            let named = named.error_code(i16::from(ErrorCode::None));
+            named
+                .name(Some(topic.name.clone()))
+                .partitions(Some(partitions))
+        };
+        Ok(created.iter().map(describe).collect())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn list_groups(&self, _states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
-        Ok([].into())
+        Ok(Vec::new())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn delete_groups(
         &self,
         group_ids: Option<&[String]>,
     ) -> Result<Vec<DeletableGroupResult>> {
-        Ok(group_ids
-            .unwrap_or_default()
-            .iter()
-            .map(|group_id| {
-                DeletableGroupResult::default()
-                    .error_code(ErrorCode::None.into())
-                    .group_id(group_id.to_owned())
-            })
-            .collect())
+        let deleted = |group: &String| {
+            let result = DeletableGroupResult::default().error_code(i16::from(ErrorCode::None));
+            result.group_id(group.clone())
+        };
+        Ok(group_ids.unwrap_or_default().iter().map(deleted).collect())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn describe_groups(
         &self,
         group_ids: Option<&[String]>,
@@ -460,7 +418,7 @@ impl Storage for Engine {
             .collect())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn write_group_member(
         &self,
         group_id: &str,
@@ -496,7 +454,7 @@ impl Storage for Engine {
             })
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn read_group_member(
         &self,
         group_id: &str,
@@ -510,7 +468,7 @@ impl Storage for Engine {
             .map(|members| members.get(&key).cloned())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn delete_group_member(&self, group_id: &str, member_id: &str) -> Result<()> {
         let key = (group_id.to_owned(), member_id.to_owned());
 
@@ -519,7 +477,7 @@ impl Storage for Engine {
         })
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn list_group_members(
         &self,
         group_id: &str,
@@ -548,7 +506,7 @@ impl Storage for Engine {
 
     /// In memory for the life of the process, like everything else this engine
     /// keeps.
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn create_acls(&self, bindings: &[AclBinding]) -> Result<Vec<ErrorCode>> {
         self.acls.lock().map_err(Into::into).map(|mut acls| {
             for binding in bindings {
@@ -559,7 +517,7 @@ impl Storage for Engine {
         })
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn describe_acls(&self, filter: &AclFilter) -> Result<Vec<AclBinding>> {
         self.acls
             .lock()
@@ -567,7 +525,7 @@ impl Storage for Engine {
             .map(|acls| acls.matching(filter).cloned().collect())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn delete_acls(&self, filters: &[AclFilter]) -> Result<Vec<Vec<AclBinding>>> {
         self.acls.lock().map_err(Into::into).map(|mut acls| {
             filters
@@ -585,7 +543,7 @@ impl Storage for Engine {
         })
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn alter_client_quotas(
         &self,
         alterations: &[QuotaAlteration],
@@ -612,7 +570,7 @@ impl Storage for Engine {
         })
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn describe_client_quotas(
         &self,
         components: &[QuotaFilterComponent],
@@ -624,7 +582,7 @@ impl Storage for Engine {
             .map(|quotas| quotas.matching(components, strict))
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn client_quotas(&self) -> Result<Quotas> {
         self.quotas.lock().map_err(Into::into).map(|quotas| {
             let quotas: &Quotas = &quotas;
@@ -635,12 +593,12 @@ impl Storage for Engine {
     /// The Null engine holds every group in memory for the life of the
     /// process, so there is no cluster to have written a layout and nothing to
     /// disagree with.
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn assert_group_schema(&self) -> Result<()> {
         Ok(())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn read_group_generation(
         &self,
         group_id: &str,
@@ -651,7 +609,7 @@ impl Storage for Engine {
             .map(|generations| generations.get(group_id).cloned())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn update_group_generation(
         &self,
         group_id: &str,
@@ -681,7 +639,7 @@ impl Storage for Engine {
             })
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn read_consumer_group(
         &self,
         group_id: &str,
@@ -692,7 +650,7 @@ impl Storage for Engine {
             .map(|groups| groups.get(group_id).cloned())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn renew_consumer_member(
         &self,
         group_id: &str,
@@ -712,7 +670,7 @@ impl Storage for Engine {
             })
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn list_consumer_member_stamps(&self, group_id: &str) -> Result<ContactStamps> {
         self.consumer_stamps
             .lock()
@@ -720,7 +678,7 @@ impl Storage for Engine {
             .map(|stamps| stamps.get(group_id).cloned().unwrap_or_default())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn delete_consumer_member_stamps(
         &self,
         group_id: &str,
@@ -742,7 +700,7 @@ impl Storage for Engine {
             })
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn update_consumer_group(
         &self,
         group_id: &str,
@@ -772,7 +730,7 @@ impl Storage for Engine {
             })
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn create_group_assignment(
         &self,
         group_id: &str,
@@ -795,7 +753,7 @@ impl Storage for Engine {
             })
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn read_group_assignment(
         &self,
         group_id: &str,
@@ -809,7 +767,7 @@ impl Storage for Engine {
             .map(|assignments| assignments.get(&key).cloned())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn delete_group_assignments_before(
         &self,
         group_id: &str,
@@ -829,7 +787,7 @@ impl Storage for Engine {
             })
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn init_producer(
         &self,
         _transaction_id: Option<&str>,
@@ -844,7 +802,7 @@ impl Storage for Engine {
         })
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn txn_add_offsets(
         &self,
         _transaction_id: &str,
@@ -855,7 +813,7 @@ impl Storage for Engine {
         Ok(ErrorCode::None)
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn txn_add_partitions(
         &self,
         partitions: TxnAddPartitionsRequest,
@@ -884,7 +842,7 @@ impl Storage for Engine {
         })
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn txn_offset_commit(
         &self,
         offsets: TxnOffsetCommitRequest,
@@ -896,7 +854,7 @@ impl Storage for Engine {
             .collect())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn txn_end(
         &self,
         _transaction_id: &str,
@@ -907,65 +865,56 @@ impl Storage for Engine {
         Ok(ErrorCode::None)
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn maintain(&self, _now: SystemTime) -> Result<()> {
         Ok(())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn cluster_id(&self) -> Result<String> {
         Ok(self.cluster.clone())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn node(&self) -> Result<i32> {
         Ok(self.node)
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn advertised_listener(&self) -> Result<Url> {
         Ok(self.advertised_listener.clone())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn ping(&self) -> Result<()> {
         Ok(())
     }
 
-    #[instrument(skip_all)]
+    #[tracing::instrument(skip_all)]
     async fn delete_user_scram_credential(
         &self,
         _user: &str,
         _mechanism: ScramMechanism,
     ) -> Result<()> {
-        Err(Error::FeatureNotEnabled {
-            feature: FEATURE.into(),
-            message: MESSAGE.into(),
-        })
+        undefined()
     }
 
-    #[instrument(ret)]
+    #[tracing::instrument(ret)]
     async fn upsert_user_scram_credential(
         &self,
         user: &str,
         _mechanism: ScramMechanism,
         _credential: ScramCredential,
     ) -> Result<()> {
-        Err(Error::FeatureNotEnabled {
-            feature: FEATURE.into(),
-            message: MESSAGE.into(),
-        })
+        undefined()
     }
 
-    #[instrument(ret)]
+    #[tracing::instrument(ret)]
     async fn user_scram_credential(
         &self,
         _user: &str,
         _mechanism: ScramMechanism,
     ) -> Result<Option<ScramCredential>> {
-        Err(Error::FeatureNotEnabled {
-            feature: FEATURE.into(),
-            message: MESSAGE.into(),
-        })
+        undefined()
     }
 }

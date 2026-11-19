@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,1245 +12,302 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    collections::BTreeMap,
-    sync::Arc,
-    time::{Duration, SystemTime},
-};
+//! SASL/SCRAM over the broker's framing: `SaslHandshake`, then
+//! `SaslAuthenticate` until the client is satisfied, against credentials held
+//! in a `memory://` engine.
 
-use async_trait::async_trait;
-use bytes::{BufMut, Bytes, BytesMut};
-use common::init_tracing;
-use rama::{Context, Layer as _, Service as _};
-use rsasl::{
-    config::SASLConfig,
-    prelude::{Mechname, SASLClient, SessionError, State},
-};
-use tansu_broker::{
-    Error, Result,
-    service::{auth, storage},
-};
-use tansu_sans_io::{
-    ApiKey, Body, ConfigResource, CreateTopicsRequest, ErrorCode, Frame, Header, IsolationLevel,
-    ListOffset, SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
-    SaslHandshakeResponse, ScramMechanism, create_topics_request::CreatableTopic,
-    delete_groups_response::DeletableGroupResult, delete_records_request::DeleteRecordsTopic,
-    delete_records_response::DeleteRecordsTopicResult,
-    describe_cluster_response::DescribeClusterBroker,
-    describe_configs_response::DescribeConfigsResult,
-    describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
-    incremental_alter_configs_request::AlterConfigsResource,
-    incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup, record::deflated::Batch,
-    txn_offset_commit_response::TxnOffsetCommitResponseTopic,
-};
-use tansu_service::{BytesFrameLayer, BytesFrameService, FrameRouteService};
-use tansu_storage::{
-    AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
-    BrokerRegistrationRequest, CommittedOffset, ConsumerGroupDoc, ContactStamps, GenerationDoc,
-    ListOffsetResponse, MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest,
-    OffsetStage, ProducerIdResponse, QuotaAlteration, QuotaEntity, QuotaFilterComponent,
-    QuotaLimits, Quotas, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
-};
-use tracing::{debug, instrument};
-use url::Url;
-use uuid::Uuid;
+use std::mem;
 
-pub mod common;
+use bytes::{BufMut as _, Bytes, BytesMut};
+use rama::Service as _;
+use rama::{Context, Layer as _};
+use rsasl::config::SASLConfig;
+use rsasl::mechanisms::scram::tools::{derive_keys, hash_password};
+use rsasl::prelude::{Mechname, SASLClient, Session, SessionError, State};
+use sha2::digest::core_api::BlockSizeUser;
+use sha2::digest::{Digest, FixedOutputReset};
+use sha2::{Sha256, Sha512};
+use tansu_broker::service::{auth, storage};
+use tansu_broker::{Error, NODE_ID, Result};
+use tansu_sans_io::Error as ProtocolError;
+use tansu_sans_io::create_topics_request::CreatableTopic;
+use tansu_sans_io::{ApiKey, Body, CreateTopicsRequest, ErrorCode, Frame, Header};
+use tansu_sans_io::{SaslAuthenticateRequest, SaslAuthenticateResponse};
+use tansu_sans_io::{SaslHandshakeRequest, SaslHandshakeResponse, ScramMechanism};
+use tansu_service::FrameRouteService;
+use tansu_service::{BytesFrameLayer, BytesFrameService};
+use tansu_storage::{ScramCredential, Storage};
 
-type Broker = BytesFrameService<FrameRouteService<(), Error>>;
+use crate::common::{init_tracing, storage_container};
 
-fn broker<S>(storage: S, sasl_config: Option<Arc<SASLConfig>>) -> Result<Broker>
-where
-    S: Storage + Clone,
-{
-    storage::services(FrameRouteService::<(), Error>::builder(), storage)
-        .and_then(auth::services)
-        .and_then(|builder| builder.build().map_err(Into::into))
-        .map(|frame_route| {
-            (BytesFrameLayer::default().with_sasl_config(sasl_config),).into_layer(frame_route)
-        })
+mod common;
+
+/// The one principal these tests authenticate as.
+const USER: &str = "alice";
+
+/// `USER`'s password, from which every stored credential here is derived.
+const SECRET: &str = "secret";
+
+const CLIENT: &str = "rdkafka";
+
+const ITERATIONS: i32 = 8192;
+
+type SaslBroker = BytesFrameService<FrameRouteService<(), Error>>;
+
+/// A digest SCRAM can be run over: SHA-256 and SHA-512 here.
+trait ScramDigest: Digest + BlockSizeUser + FixedOutputReset + Clone + Sync {}
+
+impl<D> ScramDigest for D where D: Digest + BlockSizeUser + FixedOutputReset + Clone + Sync {}
+
+/// `which` mechanism, and the keys a SCRAM server checks a client's proof against,
+/// derived with digest `D` from `SECRET` over `salt`.
+fn stored<D: ScramDigest>(
+    which: ScramMechanism,
+    salt: &'static [u8],
+) -> (ScramMechanism, ScramCredential) {
+    let mut salted = Default::default();
+    hash_password::<D>(SECRET.as_bytes(), ITERATIONS as u32, salt, &mut salted);
+    let (client_key, server_key) = derive_keys::<D>(&salted);
+    let derived = ScramCredential {
+        salt: Bytes::from_static(salt),
+        iterations: ITERATIONS,
+        stored_key: Bytes::copy_from_slice(&D::digest(client_key)),
+        server_key: Bytes::copy_from_slice(&server_key),
+    };
+    (which, derived)
 }
 
-#[tokio::test]
-async fn auth_handshake_scram_256_v1() -> Result<()> {
-    let _guard = init_tracing()?;
+fn scram_256() -> (ScramMechanism, ScramCredential) {
+    stored::<Sha256>(ScramMechanism::Scram256, b"k52tay1vvtia5e6lc37gn3f3h")
+}
 
-    const PRINCIPAL: &str = "alice";
-    const PASSWORD: &str = "secret";
-    const CLIENT_ID: &str = "rdkafka";
+fn scram_512() -> (ScramMechanism, ScramCredential) {
+    stored::<Sha512>(ScramMechanism::Scram512, b"3kg0jllwpec5yvd2rc4xzfnab")
+}
 
-    let engine = Engine::default().with_credential(
-        PRINCIPAL,
-        ScramMechanism::Scram256,
-        ScramCredential {
-            salt: Bytes::from_static(&[
-                107, 53, 50, 116, 97, 121, 49, 118, 118, 116, 105, 97, 53, 101, 54, 108, 99, 51,
-                55, 103, 110, 51, 102, 51, 104,
-            ]),
-            iterations: 8192,
-            stored_key: Bytes::from_static(&[
-                150, 254, 7, 121, 81, 205, 192, 207, 60, 206, 251, 24, 31, 131, 31, 15, 96, 75, 20,
-                228, 251, 132, 22, 235, 160, 72, 200, 130, 127, 49, 29, 150,
-            ]),
-            server_key: Bytes::from_static(&[
-                186, 175, 253, 227, 176, 106, 88, 53, 186, 173, 104, 88, 94, 40, 115, 166, 44, 183,
-                199, 177, 137, 41, 225, 132, 56, 32, 70, 255, 223, 209, 22, 146,
-            ]),
-        },
-    );
+/// A broker over a fresh `memory://` engine, with SASL enabled and `USER`
+/// holding a credential for each `(mechanism, credential)` given.
+async fn broker(credentials: Vec<(ScramMechanism, ScramCredential)>) -> Result<SaslBroker> {
+    let listener = url::Url::parse("tcp://127.0.0.1:9092/")?;
+    let engine = storage_container("tansu", NODE_ID, listener).await?;
+    for (mechanism, credential) in credentials {
+        let stored = engine.upsert_user_scram_credential(USER, mechanism, credential);
+        stored.await?;
+    }
 
-    let broker = tansu_auth::configuration(engine.clone())
-        .map_err(Into::into)
-        .map(Some)
-        .and_then(|sasl_config| broker(engine, sasl_config))?;
+    let sasl = tansu_auth::configuration(engine.clone())?;
+    let routes =
+        storage::services(FrameRouteService::builder(), engine).and_then(auth::services)?;
+    let framing = BytesFrameLayer::default().with_sasl_config(Some(sasl));
+    Ok(framing.into_layer(routes.build()?))
+}
 
-    const API_VERSION: i16 = 1;
-    let mut correlation_id = 0;
+fn mechanism(name: &str) -> Option<&Mechname> {
+    Mechname::parse(name.as_bytes()).ok()
+}
 
-    let ctx = Context::default();
+/// A SCRAM client session for `USER` with `password`, over whichever of the
+/// mechanisms the broker `offered` it prefers. SCRAM is client-first.
+fn client(offered: &SaslHandshakeResponse, password: &str) -> Session {
+    let mechanisms = offered.mechanisms.as_deref().unwrap_or_default();
+    let names: Vec<_> = mechanisms.iter().filter_map(|m| mechanism(m)).collect();
+    let config = SASLConfig::with_credentials(None, USER.into(), password.into());
+    let sasl = SASLClient::new(config.expect("a SASL client config from a user and password"));
+    let session = sasl
+        .start_suggested(&names)
+        .expect("a mechanism both sides support");
+    assert!(session.are_we_first(), "a SCRAM client speaks first");
+    session
+}
 
-    let response = broker
-        .serve(
-            ctx.clone(),
-            Frame::request(
-                Header::Request {
-                    api_key: SaslHandshakeRequest::KEY,
-                    api_version: API_VERSION,
-                    correlation_id,
-                    client_id: Some(CLIENT_ID.into()),
-                },
-                Body::SaslHandshakeRequest(
-                    SaslHandshakeRequest::default().mechanism("SCRAM-SHA-256".into()),
-                ),
-            )?,
-        )
-        .await?;
+/// One connection's worth of requests at `api_version`, numbered from
+/// `correlation_id`.
+struct Connection {
+    broker: SaslBroker,
+    api_version: i16,
+    correlation_id: i32,
+}
 
-    let response = Frame::response_from_bytes(response, SaslHandshakeResponse::KEY, API_VERSION)
-        .and_then(|response| SaslHandshakeResponse::try_from(response.body))?;
-    debug!(?response);
-
-    let offered = response
-        .mechanisms
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|mechanism| Mechname::parse(mechanism.as_bytes()).ok())
-        .collect::<Vec<_>>();
-
-    let sasl = SASLClient::new(
-        SASLConfig::with_credentials(None, PRINCIPAL.into(), PASSWORD.into())
-            .expect("sasl credential config"),
-    );
-
-    let mut session = sasl.start_suggested(&offered).unwrap();
-
-    assert!(session.are_we_first());
-
-    let mut input = None;
-
-    loop {
-        correlation_id += 1;
-        let mut output = BytesMut::new().writer();
-
-        match session.step(input.as_deref(), &mut output).unwrap() {
-            State::Running => {
-                let response = broker
-                    .serve(
-                        ctx.clone(),
-                        Frame::request(
-                            Header::Request {
-                                api_key: SaslAuthenticateRequest::KEY,
-                                api_version: API_VERSION,
-                                correlation_id,
-                                client_id: Some(CLIENT_ID.into()),
-                            },
-                            Body::SaslAuthenticateRequest(
-                                SaslAuthenticateRequest::default()
-                                    .auth_bytes(Bytes::from(output.into_inner())),
-                            ),
-                        )?,
-                    )
-                    .await?;
-
-                let response = Frame::response_from_bytes(
-                    response,
-                    SaslAuthenticateResponse::KEY,
-                    API_VERSION,
-                )
-                .and_then(|response| SaslAuthenticateResponse::try_from(response.body))?;
-                debug!(?response);
-                assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
-
-                input = Some(response.auth_bytes);
-            }
-            State::Finished(message_sent) => {
-                debug!(?message_sent);
-                break;
-            }
+impl Connection {
+    fn new(broker: SaslBroker, api_version: i16) -> Self {
+        Self {
+            broker,
+            api_version,
+            correlation_id: 0,
         }
     }
 
-    Ok(())
-}
+    async fn send(&mut self, api_key: i16, body: Body) -> Result<Bytes> {
+        let header = Header::Request {
+            api_key,
+            api_version: self.api_version,
+            correlation_id: self.correlation_id,
+            client_id: Some(CLIENT.to_owned()),
+        };
+        self.correlation_id += 1;
+        let request = Frame::request(header, body)?;
+        self.broker.serve(Context::default(), request).await
+    }
 
-/// Regression: a successful SASL handshake + authenticate must not
-/// prevent a subsequent re-authentication on the same connection
-/// (KIP-368, used by Java kafka-clients, Strimzi Kafka Connect, etc).
-///
-/// Pre-fix the second `SaslHandshakeRequest` failed with
-/// `UnsupportedSaslMechanism` because `Authentication`'s Stage had
-/// transitioned `Server -> Session -> Finished` and never reset.
-#[tokio::test]
-async fn auth_handshake_scram_256_v1_reauth() -> Result<()> {
-    let _guard = init_tracing()?;
+    async fn handshake(&mut self, mechanism: &str) -> Result<SaslHandshakeResponse> {
+        let request = SaslHandshakeRequest::default().mechanism(mechanism.into());
+        let response = self.send(SaslHandshakeRequest::KEY, request.into()).await?;
+        let key = SaslHandshakeResponse::KEY;
+        let frame = Frame::response_from_bytes(response, key, self.api_version)?;
+        Ok(SaslHandshakeResponse::try_from(frame.body)?)
+    }
 
-    const PRINCIPAL: &str = "alice";
-    const PASSWORD: &str = "secret";
-    const CLIENT_ID: &str = "rdkafka";
+    async fn authenticate(&mut self, auth_bytes: Bytes) -> Result<SaslAuthenticateResponse> {
+        let request = SaslAuthenticateRequest::default().auth_bytes(auth_bytes);
+        let sending = self.send(SaslAuthenticateRequest::KEY, request.into());
+        let response = sending.await?;
+        let key = SaslAuthenticateResponse::KEY;
+        let frame = Frame::response_from_bytes(response, key, self.api_version)?;
+        Ok(SaslAuthenticateResponse::try_from(frame.body)?)
+    }
 
-    let engine = Engine::default().with_credential(
-        PRINCIPAL,
-        ScramMechanism::Scram256,
-        ScramCredential {
-            salt: Bytes::from_static(&[
-                107, 53, 50, 116, 97, 121, 49, 118, 118, 116, 105, 97, 53, 101, 54, 108, 99, 51,
-                55, 103, 110, 51, 102, 51, 104,
-            ]),
-            iterations: 8192,
-            stored_key: Bytes::from_static(&[
-                150, 254, 7, 121, 81, 205, 192, 207, 60, 206, 251, 24, 31, 131, 31, 15, 96, 75, 20,
-                228, 251, 132, 22, 235, 160, 72, 200, 130, 127, 49, 29, 150,
-            ]),
-            server_key: Bytes::from_static(&[
-                186, 175, 253, 227, 176, 106, 88, 53, 186, 173, 104, 88, 94, 40, 115, 166, 44, 183,
-                199, 177, 137, 41, 225, 132, 56, 32, 70, 255, 223, 209, 22, 146,
-            ]),
-        },
-    );
+    /// Runs the SCRAM exchange as `USER` with `password` over the mechanisms
+    /// `offered`, carrying each client message in a `SaslAuthenticate` that
+    /// must succeed. Answers how the client's session ended: `Ok` once it has
+    /// verified the server.
+    async fn scram(
+        &mut self,
+        offered: &SaslHandshakeResponse,
+        password: &str,
+    ) -> Result<Result<(), SessionError>> {
+        let mut session = client(offered, password);
+        let mut input: Option<Bytes> = None;
+        let mut token = Vec::new();
 
-    let broker = tansu_auth::configuration(engine.clone())
-        .map_err(Into::into)
-        .map(Some)
-        .and_then(|sasl_config| broker(engine, sasl_config))?;
-
-    const API_VERSION: i16 = 1;
-    let ctx = Context::default();
-    let mut correlation_id = 0;
-
-    // Run a full handshake + authenticate twice on the same broker
-    // (i.e. same `Authentication` shared via the BytesFrameLayer).
-    for round in 0..2 {
-        let response = broker
-            .serve(
-                ctx.clone(),
-                Frame::request(
-                    Header::Request {
-                        api_key: SaslHandshakeRequest::KEY,
-                        api_version: API_VERSION,
-                        correlation_id,
-                        client_id: Some(CLIENT_ID.into()),
-                    },
-                    Body::SaslHandshakeRequest(
-                        SaslHandshakeRequest::default().mechanism("SCRAM-SHA-256".into()),
-                    ),
-                )?,
-            )
-            .await?;
-
-        let response =
-            Frame::response_from_bytes(response, SaslHandshakeResponse::KEY, API_VERSION)
-                .and_then(|response| SaslHandshakeResponse::try_from(response.body))?;
-        debug!(round, ?response);
-        assert_eq!(
-            ErrorCode::None,
-            ErrorCode::try_from(response.error_code)?,
-            "SaslHandshake (round {round}) must succeed; pre-fix the second one returns \
-             UnsupportedSaslMechanism because Stage was already Finished",
-        );
-
-        let offered = response
-            .mechanisms
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|mechanism| Mechname::parse(mechanism.as_bytes()).ok())
-            .collect::<Vec<_>>();
-
-        let sasl = SASLClient::new(
-            SASLConfig::with_credentials(None, PRINCIPAL.into(), PASSWORD.into())
-                .expect("sasl credential config"),
-        );
-
-        let mut session = sasl.start_suggested(&offered).unwrap();
-        assert!(session.are_we_first());
-        let mut input = None;
-
-        loop {
-            correlation_id += 1;
-            let mut output = BytesMut::new().writer();
-
-            match session.step(input.as_deref(), &mut output).unwrap() {
-                State::Running => {
-                    let response = broker
-                        .serve(
-                            ctx.clone(),
-                            Frame::request(
-                                Header::Request {
-                                    api_key: SaslAuthenticateRequest::KEY,
-                                    api_version: API_VERSION,
-                                    correlation_id,
-                                    client_id: Some(CLIENT_ID.into()),
-                                },
-                                Body::SaslAuthenticateRequest(
-                                    SaslAuthenticateRequest::default()
-                                        .auth_bytes(Bytes::from(output.into_inner())),
-                                ),
-                            )?,
-                        )
-                        .await?;
-
-                    let response = Frame::response_from_bytes(
-                        response,
-                        SaslAuthenticateResponse::KEY,
-                        API_VERSION,
-                    )
-                    .and_then(|response| SaslAuthenticateResponse::try_from(response.body))?;
-                    debug!(round, ?response);
-                    assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
-                    input = Some(response.auth_bytes);
+        let ended = loop {
+            match session.step(input.as_deref(), &mut token) {
+                Ok(State::Running) => {
+                    let message = Bytes::from(mem::take(&mut token));
+                    let answer = self.authenticate(message).await?;
+                    assert_eq!(ErrorCode::None, ErrorCode::try_from(answer.error_code)?);
+                    input = Some(answer.auth_bytes);
                 }
-                State::Finished(_) => break,
+                Ok(State::Finished(_)) => break Ok(()),
+                Err(refused) => break Err(refused),
             }
-        }
-        correlation_id += 1;
+        };
+        Ok(ended)
     }
+}
 
+#[tokio::test]
+async fn scram_sha_256_over_v1_framing() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let mut connection = Connection::new(broker(vec![scram_256()]).await?, 1);
+    let offered = connection.handshake("SCRAM-SHA-256").await?;
+    assert!(connection.scram(&offered, SECRET).await?.is_ok());
+    Ok(())
+}
+
+/// A client may authenticate again on a connection it has already
+/// authenticated (KIP-368): Java's kafka-clients do so when their session
+/// lifetime runs out, and so does Kafka Connect on Strimzi.
+///
+/// The broker used to answer the second `SaslHandshake` with
+/// `UnsupportedSaslMechanism`: the connection's authentication stage only ever
+/// moved forward, from server to session to finished, and a finished stage had
+/// no way back to accepting a handshake.
+#[tokio::test]
+async fn scram_sha_256_again_on_the_same_connection() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let mut connection = Connection::new(broker(vec![scram_256()]).await?, 1);
+    for attempt in ["first", "second"] {
+        let offered = connection.handshake("SCRAM-SHA-256").await?;
+        let accepted = ErrorCode::try_from(offered.error_code)?;
+        assert_eq!(ErrorCode::None, accepted, "the {attempt} handshake");
+        assert!(connection.scram(&offered, SECRET).await?.is_ok());
+    }
     Ok(())
 }
 
 #[tokio::test]
-async fn auth_handshake_scram_512_v1() -> Result<()> {
+async fn scram_sha_512_over_v1_framing() -> Result<()> {
     let _guard = init_tracing()?;
 
-    const PRINCIPAL: &str = "alice";
-    const PASSWORD: &str = "secret";
-    const CLIENT_ID: &str = "rdkafka";
-
-    let engine = Engine::default().with_credential(
-        PRINCIPAL,
-        ScramMechanism::Scram512,
-        ScramCredential {
-            salt: Bytes::from_static(&[
-                51, 107, 103, 48, 106, 108, 108, 119, 112, 101, 99, 53, 121, 118, 100, 50, 114, 99,
-                52, 120, 122, 102, 110, 97, 98,
-            ]),
-            iterations: 8192,
-            stored_key: Bytes::from_static(&[
-                196, 134, 61, 247, 249, 195, 172, 31, 25, 47, 16, 203, 108, 147, 118, 10, 196, 207,
-                147, 26, 36, 10, 101, 115, 52, 79, 87, 86, 200, 153, 131, 34, 102, 91, 132, 40, 85,
-                78, 240, 50, 240, 152, 39, 87, 20, 230, 28, 185, 102, 114, 87, 182, 51, 83, 110,
-                35, 77, 93, 186, 24, 204, 17, 121, 100,
-            ]),
-            server_key: Bytes::from_static(&[
-                232, 156, 219, 209, 141, 82, 172, 239, 164, 247, 237, 158, 68, 216, 177, 230, 69,
-                25, 238, 6, 99, 212, 9, 238, 103, 116, 42, 34, 119, 91, 207, 81, 77, 81, 235, 48,
-                218, 126, 38, 209, 153, 135, 164, 8, 230, 100, 94, 19, 105, 222, 2, 57, 38, 42, 48,
-                210, 161, 61, 146, 10, 7, 92, 100, 192,
-            ]),
-        },
-    );
-
-    let broker = tansu_auth::configuration(engine.clone())
-        .map_err(Into::into)
-        .map(Some)
-        .and_then(|sasl_config| broker(engine, sasl_config))?;
-
-    const API_VERSION: i16 = 1;
-    let mut correlation_id = 0;
-
-    let ctx = Context::default();
-
-    let response = broker
-        .serve(
-            ctx.clone(),
-            Frame::request(
-                Header::Request {
-                    api_key: SaslHandshakeRequest::KEY,
-                    api_version: API_VERSION,
-                    correlation_id,
-                    client_id: Some(CLIENT_ID.into()),
-                },
-                Body::SaslHandshakeRequest(
-                    SaslHandshakeRequest::default().mechanism("SCRAM-SHA-512".into()),
-                ),
-            )?,
-        )
-        .await?;
-
-    let response = Frame::response_from_bytes(response, SaslHandshakeResponse::KEY, API_VERSION)
-        .and_then(|response| SaslHandshakeResponse::try_from(response.body))?;
-    debug!(?response);
-
-    let offered = response
-        .mechanisms
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|mechanism| Mechname::parse(mechanism.as_bytes()).ok())
-        .collect::<Vec<_>>();
-
-    let sasl = SASLClient::new(
-        SASLConfig::with_credentials(None, PRINCIPAL.into(), PASSWORD.into())
-            .expect("sasl credential config"),
-    );
-
-    let mut session = sasl.start_suggested(&offered).unwrap();
-
-    assert!(session.are_we_first());
-
-    let mut input = None;
-
-    loop {
-        correlation_id += 1;
-        let mut output = BytesMut::new().writer();
-
-        match session.step(input.as_deref(), &mut output).unwrap() {
-            State::Running => {
-                let response = broker
-                    .serve(
-                        ctx.clone(),
-                        Frame::request(
-                            Header::Request {
-                                api_key: SaslAuthenticateRequest::KEY,
-                                api_version: API_VERSION,
-                                correlation_id,
-                                client_id: Some(CLIENT_ID.into()),
-                            },
-                            Body::SaslAuthenticateRequest(
-                                SaslAuthenticateRequest::default()
-                                    .auth_bytes(Bytes::from(output.into_inner())),
-                            ),
-                        )?,
-                    )
-                    .await?;
-
-                let response = Frame::response_from_bytes(
-                    response,
-                    SaslAuthenticateResponse::KEY,
-                    API_VERSION,
-                )
-                .and_then(|response| SaslAuthenticateResponse::try_from(response.body))?;
-                debug!(?response);
-                assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
-
-                input = Some(response.auth_bytes);
-            }
-            State::Finished(message_sent) => {
-                debug!(?message_sent);
-                break;
-            }
-        }
-    }
-
+    let mut connection = Connection::new(broker(vec![scram_512()]).await?, 1);
+    let offered = connection.handshake("SCRAM-SHA-512").await?;
+    assert!(connection.scram(&offered, SECRET).await?.is_ok());
     Ok(())
 }
 
 #[tokio::test]
-async fn auth_handshake_scram_512_bad_password_v1() -> Result<()> {
+async fn scram_sha_512_with_the_wrong_password_is_refused() -> Result<()> {
     let _guard = init_tracing()?;
 
-    const PRINCIPAL: &str = "alice";
-    const PASSWORD: &str = "not_secret";
-    const CLIENT_ID: &str = "rdkafka";
-
-    let engine = Engine::default().with_credential(
-        PRINCIPAL,
-        ScramMechanism::Scram512,
-        ScramCredential {
-            salt: Bytes::from_static(&[
-                51, 107, 103, 48, 106, 108, 108, 119, 112, 101, 99, 53, 121, 118, 100, 50, 114, 99,
-                52, 120, 122, 102, 110, 97, 98,
-            ]),
-            iterations: 8192,
-            stored_key: Bytes::from_static(&[
-                196, 134, 61, 247, 249, 195, 172, 31, 25, 47, 16, 203, 108, 147, 118, 10, 196, 207,
-                147, 26, 36, 10, 101, 115, 52, 79, 87, 86, 200, 153, 131, 34, 102, 91, 132, 40, 85,
-                78, 240, 50, 240, 152, 39, 87, 20, 230, 28, 185, 102, 114, 87, 182, 51, 83, 110,
-                35, 77, 93, 186, 24, 204, 17, 121, 100,
-            ]),
-            server_key: Bytes::from_static(&[
-                232, 156, 219, 209, 141, 82, 172, 239, 164, 247, 237, 158, 68, 216, 177, 230, 69,
-                25, 238, 6, 99, 212, 9, 238, 103, 116, 42, 34, 119, 91, 207, 81, 77, 81, 235, 48,
-                218, 126, 38, 209, 153, 135, 164, 8, 230, 100, 94, 19, 105, 222, 2, 57, 38, 42, 48,
-                210, 161, 61, 146, 10, 7, 92, 100, 192,
-            ]),
-        },
+    let mut connection = Connection::new(broker(vec![scram_512()]).await?, 1);
+    let offered = connection.handshake("SCRAM-SHA-512").await?;
+    let ended = connection.scram(&offered, "not_secret").await?;
+    assert!(
+        matches!(ended, Err(SessionError::MechanismError(_))),
+        "the client rejects the server's final message: {ended:?}"
     );
-
-    let broker = tansu_auth::configuration(engine.clone())
-        .map_err(Into::into)
-        .map(Some)
-        .and_then(|sasl_config| broker(engine, sasl_config))?;
-
-    const API_VERSION: i16 = 1;
-    let mut correlation_id = 0;
-
-    let ctx = Context::default();
-
-    let response = broker
-        .serve(
-            ctx.clone(),
-            Frame::request(
-                Header::Request {
-                    api_key: SaslHandshakeRequest::KEY,
-                    api_version: API_VERSION,
-                    correlation_id,
-                    client_id: Some(CLIENT_ID.into()),
-                },
-                Body::SaslHandshakeRequest(
-                    SaslHandshakeRequest::default().mechanism("SCRAM-SHA-512".into()),
-                ),
-            )?,
-        )
-        .await?;
-
-    let response = Frame::response_from_bytes(response, SaslHandshakeResponse::KEY, API_VERSION)
-        .and_then(|response| SaslHandshakeResponse::try_from(response.body))?;
-    debug!(?response);
-
-    let offered = response
-        .mechanisms
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|mechanism| Mechname::parse(mechanism.as_bytes()).ok())
-        .collect::<Vec<_>>();
-
-    let sasl = SASLClient::new(
-        SASLConfig::with_credentials(None, PRINCIPAL.into(), PASSWORD.into())
-            .expect("sasl credential config"),
-    );
-
-    let mut session = sasl.start_suggested(&offered).unwrap();
-
-    assert!(session.are_we_first());
-
-    let mut input = None;
-
-    loop {
-        correlation_id += 1;
-        let mut output = BytesMut::new().writer();
-
-        match session
-            .step(input.as_deref(), &mut output)
-            .inspect(|response| debug!(?response))
-            .inspect_err(|err| debug!(?err))
-        {
-            Ok(State::Running) => {
-                let response = broker
-                    .serve(
-                        ctx.clone(),
-                        Frame::request(
-                            Header::Request {
-                                api_key: SaslAuthenticateRequest::KEY,
-                                api_version: API_VERSION,
-                                correlation_id,
-                                client_id: Some(CLIENT_ID.into()),
-                            },
-                            Body::SaslAuthenticateRequest(
-                                SaslAuthenticateRequest::default()
-                                    .auth_bytes(Bytes::from(output.into_inner())),
-                            ),
-                        )?,
-                    )
-                    .await?;
-
-                let response = Frame::response_from_bytes(
-                    response,
-                    SaslAuthenticateResponse::KEY,
-                    API_VERSION,
-                )
-                .and_then(|response| SaslAuthenticateResponse::try_from(response.body))?;
-                debug!(?response);
-                assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
-
-                input = Some(response.auth_bytes);
-            }
-
-            Ok(State::Finished(message_sent)) => {
-                debug!(?message_sent);
-                unimplemented!()
-            }
-
-            Err(SessionError::MechanismError(_mechanism)) => break,
-
-            Err(_) => unimplemented!(),
-        }
-    }
-
     Ok(())
 }
 
 #[tokio::test]
-async fn not_authenticated() -> Result<()> {
+async fn a_request_before_authenticating_is_refused() -> Result<()> {
     let _guard = init_tracing()?;
 
-    let engine = Engine::default();
+    let mut connection = Connection::new(broker(vec![]).await?, 7);
+    connection.correlation_id = 1;
+    let mut topic = CreatableTopic::default();
+    topic.name = "abc".into();
+    topic.num_partitions = 6;
+    topic.replication_factor = 1;
+    topic.assignments = Some(vec![]);
+    topic.configs = Some(vec![]);
+    let mut request = CreateTopicsRequest::default();
+    request.topics = Some(vec![topic]);
+    request.timeout_ms = 30_000;
+    request.validate_only = Some(false);
 
-    let broker = tansu_auth::configuration(engine.clone())
-        .map_err(Into::into)
-        .map(Some)
-        .and_then(|sasl_config| broker(engine, sasl_config))?;
-
-    const CLIENT_ID: &str = "client";
-    const API_VERSION: i16 = 7;
-
-    let ctx = Context::default();
-
-    assert!(matches!(
-        broker
-            .serve(
-                ctx.clone(),
-                Frame::request(
-                    Header::Request {
-                        api_key: CreateTopicsRequest::KEY,
-                        api_version: API_VERSION,
-                        correlation_id: 1,
-                        client_id: Some(CLIENT_ID.into()),
-                    },
-                    Body::CreateTopicsRequest(
-                        CreateTopicsRequest::default()
-                            .timeout_ms(30_000)
-                            .validate_only(Some(false))
-                            .topics(Some(
-                                [CreatableTopic::default()
-                                    .assignments(Some([].into()))
-                                    .configs(Some([].into()))
-                                    .name("abc".into())
-                                    .num_partitions(6)
-                                    .replication_factor(1)]
-                                .into(),
-                            )),
-                    ),
-                )?,
-            )
-            .await,
-        Err(Error::KafkaProtocol(tansu_sans_io::Error::NotAuthenticated)),
-    ));
-
+    let refused = connection
+        .send(CreateTopicsRequest::KEY, request.into())
+        .await;
+    let is_refused = matches!(
+        refused,
+        Err(Error::KafkaProtocol(ProtocolError::NotAuthenticated))
+    );
+    assert!(is_refused, "{refused:?}");
     Ok(())
 }
 
+/// Version 0 of `SaslHandshake` hands the rest of the exchange to raw SASL
+/// tokens, each a 4-byte big-endian length and its bytes, with no Kafka
+/// framing around them.
 #[tokio::test]
-async fn auth_handshake_scram_256_v0() -> Result<()> {
+async fn scram_sha_256_over_v0_raw_tokens() -> Result<()> {
     let _guard = init_tracing()?;
 
-    const PRINCIPAL: &str = "alice";
-    const PASSWORD: &str = "secret";
-    const CLIENT_ID: &str = "rdkafka";
+    let mut connection = Connection::new(broker(vec![scram_256()]).await?, 0);
+    connection.correlation_id = 1;
+    let offered = connection.handshake("SCRAM-SHA-256").await?;
+    assert_eq!(ErrorCode::None, ErrorCode::try_from(offered.error_code)?);
 
-    let engine = Engine::default().with_credential(
-        PRINCIPAL,
-        ScramMechanism::Scram256,
-        ScramCredential {
-            salt: Bytes::from_static(&[
-                107, 53, 50, 116, 97, 121, 49, 118, 118, 116, 105, 97, 53, 101, 54, 108, 99, 51,
-                55, 103, 110, 51, 102, 51, 104,
-            ]),
-            iterations: 8192,
-            stored_key: Bytes::from_static(&[
-                150, 254, 7, 121, 81, 205, 192, 207, 60, 206, 251, 24, 31, 131, 31, 15, 96, 75, 20,
-                228, 251, 132, 22, 235, 160, 72, 200, 130, 127, 49, 29, 150,
-            ]),
-            server_key: Bytes::from_static(&[
-                186, 175, 253, 227, 176, 106, 88, 53, 186, 173, 104, 88, 94, 40, 115, 166, 44, 183,
-                199, 177, 137, 41, 225, 132, 56, 32, 70, 255, 223, 209, 22, 146,
-            ]),
-        },
-    );
+    let mut session = client(&offered, SECRET);
+    let mut input: Option<Bytes> = None;
+    let mut token = Vec::new();
 
-    let broker = tansu_auth::configuration(engine.clone())
-        .map_err(Into::into)
-        .map(Some)
-        .and_then(|sasl_config| broker(engine, sasl_config))?;
+    while let State::Running = session
+        .step(input.as_deref(), &mut token)
+        .expect("a SCRAM step")
+    {
+        let mut framed = BytesMut::new();
+        framed.put_i32(i32::try_from(token.len())?);
+        framed.put_slice(&mem::take(&mut token));
 
-    const API_VERSION: i16 = 0;
-
-    let ctx = Context::default();
-
-    let response = broker
-        .serve(
-            ctx.clone(),
-            Frame::request(
-                Header::Request {
-                    api_key: SaslHandshakeRequest::KEY,
-                    api_version: API_VERSION,
-                    correlation_id: 1,
-                    client_id: Some(CLIENT_ID.into()),
-                },
-                Body::SaslHandshakeRequest(
-                    SaslHandshakeRequest::default().mechanism("SCRAM-SHA-256".into()),
-                ),
-            )?,
-        )
-        .await?;
-
-    let response = Frame::response_from_bytes(response, SaslHandshakeResponse::KEY, API_VERSION)
-        .and_then(|response| SaslHandshakeResponse::try_from(response.body))?;
-    debug!(?response);
-    assert_eq!(ErrorCode::None, ErrorCode::try_from(response.error_code)?);
-
-    let offered = response
-        .mechanisms
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|mechanism| Mechname::parse(mechanism.as_bytes()).ok())
-        .collect::<Vec<_>>();
-
-    let sasl = SASLClient::new(
-        SASLConfig::with_credentials(None, PRINCIPAL.into(), PASSWORD.into())
-            .expect("sasl credential config"),
-    );
-
-    let mut session = sasl.start_suggested(&offered).unwrap();
-
-    assert!(session.are_we_first());
-
-    let mut input = None;
-
-    loop {
-        let mut output = BytesMut::new().writer();
-
-        match session
-            .step(input.as_deref(), &mut output)
-            .inspect(|response| debug!(?response))
-            .inspect_err(|err| debug!(?err))
-            .unwrap()
-        {
-            State::Running => {
-                let auth_bytes = Bytes::from(output.into_inner());
-                let frame = i32::try_from(auth_bytes.len()).map(|size| {
-                    let mut frame = BytesMut::new();
-                    frame.put(&size.to_be_bytes()[..]);
-                    frame.put(auth_bytes);
-                    Bytes::from(frame)
-                })?;
-
-                let response = broker.serve(ctx.clone(), frame).await?;
-
-                input = Some(response.slice(4..));
-            }
-
-            State::Finished(message_sent) => {
-                debug!(?message_sent);
-                break;
-            }
-        }
+        let answer = connection
+            .broker
+            .serve(Context::default(), framed.freeze())
+            .await?;
+        input = Some(answer.slice(4..));
     }
-
     Ok(())
-}
-
-#[derive(Clone, Debug, Default, Hash)]
-struct Engine {
-    credentials: BTreeMap<(String, ScramMechanism), ScramCredential>,
-}
-
-impl Engine {
-    fn with_credential(
-        mut self,
-        user: impl Into<String>,
-        mechanism: ScramMechanism,
-        credential: ScramCredential,
-    ) -> Self {
-        _ = self
-            .credentials
-            .insert((user.into(), mechanism), credential);
-        self
-    }
-}
-
-#[async_trait]
-impl Storage for Engine {
-    #[instrument(skip_all)]
-    async fn register_broker(
-        &self,
-        _broker_registration: BrokerRegistrationRequest,
-    ) -> tansu_storage::Result<()> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn brokers(&self) -> tansu_storage::Result<Vec<DescribeClusterBroker>> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn create_topic(
-        &self,
-        _topic: CreatableTopic,
-        _validate_only: bool,
-    ) -> tansu_storage::Result<Uuid> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn delete_records(
-        &self,
-        _topics: &[DeleteRecordsTopic],
-    ) -> tansu_storage::Result<Vec<DeleteRecordsTopicResult>> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn delete_topic(&self, _topic: &TopicId) -> tansu_storage::Result<ErrorCode> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn incremental_alter_resource(
-        &self,
-        _resource: AlterConfigsResource,
-    ) -> tansu_storage::Result<AlterConfigsResourceResponse> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn produce(
-        &self,
-        _transaction_id: Option<&str>,
-        _topition: &Topition,
-        _deflated: Batch,
-    ) -> tansu_storage::Result<i64> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn admit(
-        &self,
-        _transaction_id: Option<&str>,
-        _topition: &Topition,
-        _deflated: Batch,
-    ) -> tansu_storage::Result<tansu_storage::Ack> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn fetch(
-        &self,
-        _topition: &Topition,
-        _offset: i64,
-        _min_bytes: u32,
-        _max_bytes: u32,
-        _isolation_level: IsolationLevel,
-        _max_wait: Duration,
-    ) -> tansu_storage::Result<Vec<Batch>> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn offset_stage(&self, _topition: &Topition) -> tansu_storage::Result<OffsetStage> {
-        unimplemented!()
-    }
-
-    // These three had trait defaults until #551, so this stub inherited them
-    // rather than refusing like every other method it does not serve — the
-    // #273 shape, in a test double. An authentication test reaches none of
-    // them; `unimplemented!()` says so.
-    #[instrument(skip_all)]
-    async fn offset_stage_at(
-        &self,
-        _topition: &Topition,
-        _isolation: IsolationLevel,
-    ) -> tansu_storage::Result<OffsetStage> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn offset_stage_refreshed(
-        &self,
-        _topition: &Topition,
-    ) -> tansu_storage::Result<OffsetStage> {
-        unimplemented!()
-    }
-
-    fn auto_create_topic_config(&self) -> AutoTopicCreate {
-        unimplemented!()
-    }
-
-    fn fetch_max_bytes(&self) -> u32 {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn offset_commit(
-        &self,
-        _group: &str,
-        _retention: Option<Duration>,
-        _offsets: &[(Topition, OffsetCommitRequest)],
-    ) -> tansu_storage::Result<Vec<(Topition, ErrorCode)>> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn committed_offset_topitions(
-        &self,
-        _group_id: &str,
-    ) -> tansu_storage::Result<BTreeMap<Topition, CommittedOffset>> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn offset_fetch(
-        &self,
-        _group_id: Option<&str>,
-        _topics: &[Topition],
-        _require_stable: Option<bool>,
-    ) -> tansu_storage::Result<BTreeMap<Topition, CommittedOffset>> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn list_offsets(
-        &self,
-        _isolation_level: IsolationLevel,
-        _offsets: &[(Topition, ListOffset)],
-    ) -> tansu_storage::Result<Vec<(Topition, ListOffsetResponse)>> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn metadata(
-        &self,
-        _topics: Option<&[TopicId]>,
-    ) -> tansu_storage::Result<MetadataResponse> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn describe_config(
-        &self,
-        _name: &str,
-        _resource: ConfigResource,
-        _keys: Option<&[String]>,
-    ) -> tansu_storage::Result<DescribeConfigsResult> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn describe_topic_partitions(
-        &self,
-        _topics: Option<&[TopicId]>,
-        _partition_limit: i32,
-        _cursor: Option<Topition>,
-    ) -> tansu_storage::Result<Vec<DescribeTopicPartitionsResponseTopic>> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn list_groups(
-        &self,
-        _states_filter: Option<&[String]>,
-    ) -> tansu_storage::Result<Vec<ListedGroup>> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn delete_groups(
-        &self,
-        _group_ids: Option<&[String]>,
-    ) -> tansu_storage::Result<Vec<DeletableGroupResult>> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn describe_groups(
-        &self,
-        _group_ids: Option<&[String]>,
-        _include_authorized_operations: bool,
-    ) -> tansu_storage::Result<Vec<NamedGroupDetail>> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn write_group_member(
-        &self,
-        _group_id: &str,
-        _member_id: &str,
-        _member: MemberDoc,
-        _version: Option<Version>,
-    ) -> tansu_storage::Result<Version, UpdateError<MemberDoc>> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn read_group_member(
-        &self,
-        _group_id: &str,
-        _member_id: &str,
-    ) -> tansu_storage::Result<Option<(MemberDoc, Version)>> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn delete_group_member(
-        &self,
-        _group_id: &str,
-        _member_id: &str,
-    ) -> tansu_storage::Result<()> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn list_group_members(
-        &self,
-        _group_id: &str,
-    ) -> tansu_storage::Result<BTreeMap<String, (MemberDoc, Version)>> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn list_group_member_stamps(
-        &self,
-        _group_id: &str,
-    ) -> tansu_storage::Result<BTreeMap<String, i64>> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    #[instrument(skip_all)]
-    async fn create_acls(&self, _bindings: &[AclBinding]) -> tansu_storage::Result<Vec<ErrorCode>> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn describe_acls(&self, _filter: &AclFilter) -> tansu_storage::Result<Vec<AclBinding>> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn delete_acls(
-        &self,
-        _filters: &[AclFilter],
-    ) -> tansu_storage::Result<Vec<Vec<AclBinding>>> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn assert_group_schema(&self) -> tansu_storage::Result<()> {
-        unimplemented!()
-    }
-
-    async fn read_group_generation(
-        &self,
-        _group_id: &str,
-    ) -> tansu_storage::Result<Option<(GenerationDoc, Version)>> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn update_group_generation(
-        &self,
-        _group_id: &str,
-        _generation: GenerationDoc,
-        _version: Option<Version>,
-    ) -> tansu_storage::Result<Version, UpdateError<GenerationDoc>> {
-        unimplemented!()
-    }
-
-    async fn read_consumer_group(
-        &self,
-        _group_id: &str,
-    ) -> tansu_storage::Result<Option<(ConsumerGroupDoc, Version)>> {
-        unimplemented!()
-    }
-
-    async fn update_consumer_group(
-        &self,
-        _group_id: &str,
-        _group: ConsumerGroupDoc,
-        _version: Option<Version>,
-    ) -> tansu_storage::Result<Version, UpdateError<ConsumerGroupDoc>> {
-        unimplemented!()
-    }
-
-    async fn renew_consumer_member(
-        &self,
-        _group_id: &str,
-        _member_id: &str,
-        _last_contact_ms: i64,
-    ) -> tansu_storage::Result<()> {
-        unimplemented!()
-    }
-
-    async fn list_consumer_member_stamps(
-        &self,
-        _group_id: &str,
-    ) -> tansu_storage::Result<ContactStamps> {
-        unimplemented!()
-    }
-
-    async fn delete_consumer_member_stamps(
-        &self,
-        _group_id: &str,
-        _stamps: &[(String, i64)],
-    ) -> tansu_storage::Result<()> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn create_group_assignment(
-        &self,
-        _group_id: &str,
-        _generation_id: i32,
-        _assignment: AssignmentDoc,
-    ) -> tansu_storage::Result<AssignmentOutcome> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn read_group_assignment(
-        &self,
-        _group_id: &str,
-        _generation_id: i32,
-    ) -> tansu_storage::Result<Option<AssignmentDoc>> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn delete_group_assignments_before(
-        &self,
-        _group_id: &str,
-        _generation_id: i32,
-    ) -> tansu_storage::Result<u64> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn init_producer(
-        &self,
-        _transaction_id: Option<&str>,
-        _transaction_timeout_ms: i32,
-        _producer_id: Option<i64>,
-        _producer_epoch: Option<i16>,
-    ) -> tansu_storage::Result<ProducerIdResponse> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn txn_add_offsets(
-        &self,
-        _transaction_id: &str,
-        _producer_id: i64,
-        _producer_epoch: i16,
-        _group_id: &str,
-    ) -> tansu_storage::Result<ErrorCode> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn txn_add_partitions(
-        &self,
-        _partitions: TxnAddPartitionsRequest,
-    ) -> tansu_storage::Result<TxnAddPartitionsResponse> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn txn_offset_commit(
-        &self,
-        _offsets: TxnOffsetCommitRequest,
-    ) -> tansu_storage::Result<Vec<TxnOffsetCommitResponseTopic>> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn txn_end(
-        &self,
-        _transaction_id: &str,
-        _producer_id: i64,
-        _producer_epoch: i16,
-        _committed: bool,
-    ) -> tansu_storage::Result<ErrorCode> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn maintain(&self, _now: SystemTime) -> tansu_storage::Result<()> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn cluster_id(&self) -> tansu_storage::Result<String> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn node(&self) -> tansu_storage::Result<i32> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn advertised_listener(&self) -> tansu_storage::Result<Url> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn ping(&self) -> tansu_storage::Result<()> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn delete_user_scram_credential(
-        &self,
-        _user: &str,
-        _mechanism: ScramMechanism,
-    ) -> tansu_storage::Result<()> {
-        unimplemented!()
-    }
-
-    #[instrument(skip_all)]
-    async fn upsert_user_scram_credential(
-        &self,
-        user: &str,
-        mechanism: ScramMechanism,
-        credential: ScramCredential,
-    ) -> tansu_storage::Result<()> {
-        debug!(user, ?mechanism, ?credential);
-        unimplemented!()
-    }
-
-    #[instrument(fields(user, mechanism))]
-    async fn user_scram_credential(
-        &self,
-        user: &str,
-        mechanism: ScramMechanism,
-    ) -> tansu_storage::Result<Option<ScramCredential>> {
-        debug!(user, ?mechanism);
-        Ok(self.credentials.get(&(user.into(), mechanism)).cloned())
-    }
-
-    async fn alter_client_quotas(
-        &self,
-        _alterations: &[QuotaAlteration],
-        _validate_only: bool,
-    ) -> tansu_storage::Result<Vec<ErrorCode>> {
-        unimplemented!()
-    }
-
-    async fn describe_client_quotas(
-        &self,
-        _components: &[QuotaFilterComponent],
-        _strict: bool,
-    ) -> tansu_storage::Result<Vec<(QuotaEntity, QuotaLimits)>> {
-        unimplemented!()
-    }
-
-    async fn client_quotas(&self) -> tansu_storage::Result<Quotas> {
-        Ok(Quotas::default())
-    }
 }

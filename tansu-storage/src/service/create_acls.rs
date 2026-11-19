@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,35 +14,19 @@
 
 //! `CreateAcls`, which used to answer success without doing anything (#363).
 
-use rama::{Context, Service};
 use tansu_sans_io::{
-    ApiKey, CreateAclsRequest, CreateAclsResponse, ErrorCode,
-    create_acls_response::AclCreationResult,
+    CreateAclsRequest, CreateAclsResponse, ErrorCode, create_acls_response::AclCreationResult,
 };
 
 use tansu_sans_io::acl::Operation;
 
-use crate::{AclBinding, Error, NO_AUTHORIZER, Storage, authorized_cluster, enforcing};
+use crate::{AclBinding, NO_AUTHORIZER, authorized_cluster, enforcing};
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct CreateAclsService;
-
-impl ApiKey for CreateAclsService {
-    const KEY: i16 = CreateAclsRequest::KEY;
-}
-
-impl<G> Service<G, CreateAclsRequest> for CreateAclsService
-where
-    G: Storage,
-{
-    type Response = CreateAclsResponse;
-    type Error = Error;
-
-    async fn serve(
-        &self,
-        ctx: Context<G>,
-        req: CreateAclsRequest,
-    ) -> Result<Self::Response, Self::Error> {
+storage_service! {
+    /// Stores the requested ACL bindings, once an authorizer is enforcing them
+    /// and the principal may `Alter` the cluster.
+    CreateAclsService: CreateAclsRequest => CreateAclsResponse,
+    |ctx, req| {
         let creations = req.creations.unwrap_or_default();
 
         // Storing a rule that nothing will ever consult is worse than refusing

@@ -126,7 +126,7 @@ fn object_store() -> Result<Arc<dyn ObjectStore>, Error> {
         // Neither is a store a broker writes to, so neither has a conditional
         // put to conform to: `file://` is the offline audit's alone and
         // `null://` stores nothing.
-        backend @ (Backend::Local | Backend::Null) => Err(Error::Message(format!(
+        backend @ (Backend::Local | Backend::Null) => Err(Error::Failed(format!(
             "conditional put is not a property of {backend:?} ({storage})"
         ))),
     }
@@ -564,7 +564,7 @@ async fn a_version_the_store_never_issued_is_refused() -> Result<(), Error> {
     _ = storage
         .update_group_generation(&group, generation_doc(0), None)
         .await
-        .map_err(|error| Error::Message(format!("{error:?}")))?;
+        .map_err(|error| Error::Failed(format!("{error:?}")))?;
 
     let invented = Version::from(invented_version()?);
 
@@ -630,12 +630,12 @@ async fn a_stale_generation_update_is_outdated_carrying_the_current_value() -> R
     let first = storage
         .update_group_generation(&group, generation_doc(0), None)
         .await
-        .map_err(|error| Error::Message(format!("{error:?}")))?;
+        .map_err(|error| Error::Failed(format!("{error:?}")))?;
 
     let second = storage
         .update_group_generation(&group, generation_doc(1), Some(first.clone()))
         .await
-        .map_err(|error| Error::Message(format!("{error:?}")))?;
+        .map_err(|error| Error::Failed(format!("{error:?}")))?;
 
     match storage
         .update_group_generation(&group, generation_doc(2), Some(first))
@@ -725,7 +725,7 @@ async fn a_spent_member_version_stays_spent_across_a_liveness_rewrite() -> Resul
     let first = storage
         .write_group_member(&group, "m-1", member_doc(0), None)
         .await
-        .map_err(|error| Error::Message(format!("{error:?}")))?;
+        .map_err(|error| Error::Failed(format!("{error:?}")))?;
 
     // Same content, one millisecond apart or not — only `seq` differs, which is
     // the whole of the guarantee being asserted.
@@ -735,7 +735,7 @@ async fn a_spent_member_version_stays_spent_across_a_liveness_rewrite() -> Resul
     let second = storage
         .write_group_member(&group, "m-1", renewed.clone(), Some(first.clone()))
         .await
-        .map_err(|error| Error::Message(format!("{error:?}")))?;
+        .map_err(|error| Error::Failed(format!("{error:?}")))?;
 
     match storage
         .write_group_member(&group, "m-1", member_doc(2), Some(first))

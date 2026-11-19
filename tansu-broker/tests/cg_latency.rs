@@ -1,4 +1,4 @@
-// Copyright ⓒ 2024-2026 Peter Morgan <peter.james.morgan@gmail.com>
+// Copyright ⓒ 2026 Popsink SAS
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,130 +12,108 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::{Arc, atomic};
+//! One member, driven by [`GroupConsumer`], through the group coordinator
+//! behind seeded wire latency: join, sync, then the heartbeats of a group that
+//! has settled, which must leave `generation.json` alone.
 
-use common::init_tracing;
-use rama::{Context, Layer, Service};
-use tansu_broker::{
-    Error, NODE_ID, coordinator::group::administrator::Controller, service::coordinator::services,
-};
-use tansu_sans_io::{
-    ErrorCode, HeartbeatRequest, JoinGroupRequest, MetadataResponse, SyncGroupRequest,
-    consumer::{GroupConsumer, MemberAssignment},
-    metadata_response::{MetadataResponsePartition, MetadataResponseTopic},
-};
-use tansu_service::{
-    BytesFrameLayer, FrameBytesLayer, FrameRouteService, LatencyIntroducingLayer, RequestFrameLayer,
-};
-use tansu_storage::{LatencyIntroducingStorage, StorageContainer};
-use tracing::debug;
-use url::Url;
+use std::sync::Arc;
+use std::sync::atomic::Ordering::Relaxed;
+
+use anyhow::Result;
+use rama::Context;
+use rama::Layer as _;
+use rama::Service as _;
+use tansu_broker::NODE_ID;
+use tansu_broker::coordinator::group::administrator::Controller;
+use tansu_broker::service::coordinator::services;
+use tansu_sans_io::consumer::DynConsumerAssignment;
+use tansu_sans_io::consumer::GroupConsumer;
+use tansu_sans_io::consumer::MemberAssignment;
+use tansu_sans_io::metadata_response::MetadataResponsePartition;
+use tansu_sans_io::metadata_response::MetadataResponseTopic;
+use tansu_sans_io::{ErrorCode, HeartbeatRequest, JoinGroupRequest};
+use tansu_sans_io::{MetadataResponse, SyncGroupRequest};
+use tansu_service::{BytesFrameLayer, FrameBytesLayer, FrameRouteService};
+use tansu_service::{LatencyIntroducingLayer, RequestFrameLayer};
+use tansu_storage::LatencyIntroducingStorage;
 
 pub mod common;
 
+const GROUP: &str = "abc";
+const TOPIC: &str = "pqr";
+
+type Route = FrameRouteService<(), tansu_broker::Error>;
+
+/// What the member is told the cluster holds: [`TOPIC`] in three partitions.
+fn three_partitions() -> MetadataResponse {
+    let partitions = (0..3).map(|i| MetadataResponsePartition::default().partition_index(i));
+    let topic = MetadataResponseTopic::default().name(Some(TOPIC.into()));
+    let topic = topic.partitions(Some(partitions.collect()));
+    MetadataResponse::default().topics(Some(vec![topic]))
+}
+
+fn code(error_code: i16) -> Result<ErrorCode> {
+    ErrorCode::try_from(error_code).map_err(Into::into)
+}
+
 #[tokio::test]
-async fn stack() -> Result<(), Error> {
-    let _guard = init_tracing()?;
+async fn a_settled_member_heartbeats_without_rewriting_its_generation() -> Result<()> {
+    let _guard = common::init_tracing()?;
 
-    let seed = 0;
-    let latency = 50..150;
+    let listener = "tcp://127.0.0.1:9092/".parse()?;
+    let engine = common::storage_container("tansu", NODE_ID, listener).await?;
 
-    let cluster = "tansu";
+    // #111: this wrapper is here to count the writes of `generation.json`, the
+    // one object a group's members contend on. Its own delay is next to none,
+    // because the wire layer below already brings the latency.
+    let storage = LatencyIntroducingStorage::new(engine).with_latency(0..1);
+    let generation_writes = storage.generation_updates_handle();
+    let groups = Controller::with_storage(storage)?;
 
-    let storage = StorageContainer::builder()
-        .cluster_id(cluster)
-        .node_id(NODE_ID)
-        .advertised_listener(Url::parse("tcp://127.0.0.1:9092/")?)
-        .storage(Url::parse("memory://")?)
-        .build()
-        .await?;
+    let routes = services(Route::builder(), groups)?;
+    let framed = (FrameBytesLayer, BytesFrameLayer::default()).into_layer(routes.build()?);
+    let wire = LatencyIntroducingLayer::default().with_seed(0);
+    let wire = wire.with_latency_millis(50..150);
+    let sut = (RequestFrameLayer, wire).into_layer(framed);
+    let ctx = Context::default();
 
-    // Wrapped so the test can see every write of the one object a group's
-    // members can contend on. Latency is left at near-zero here — the service
-    // stack already introduces its own, and this wrapper is present for its
-    // counter, not its delay.
-    let storage = LatencyIntroducingStorage::new(storage).with_latency(0..1);
-    let generation_updates = storage.generation_updates_handle();
+    let hook: Arc<DynConsumerAssignment> =
+        Arc::new(|group, assignment| tracing::debug!(group, %assignment));
+    let consumer = GroupConsumer::builder(GROUP).topics([TOPIC]);
+    let consumer = consumer.metadata(three_partitions());
+    let mut consumer = consumer.on_assignment(Some(hook)).build();
 
-    let coordinator = Controller::with_storage(storage)?;
+    let anonymous = JoinGroupRequest::try_from(consumer.next_action(None)?)?;
+    assert_eq!("", anonymous.member_id);
+    let refused = sut.serve(ctx.clone(), anonymous).await?;
+    assert_eq!(ErrorCode::MemberIdRequired, code(refused.error_code)?);
+    assert_ne!("", refused.member_id);
 
-    let route = services(FrameRouteService::<(), Error>::builder(), coordinator)
-        .and_then(|builder| builder.build().map_err(Into::into))?;
+    let named = JoinGroupRequest::try_from(consumer.next_action(Some(refused.into()))?)?;
+    assert_ne!("", named.member_id);
+    let joined = sut.serve(ctx.clone(), named).await?;
+    assert_eq!(ErrorCode::None, code(joined.error_code)?);
+    assert_eq!(
+        (0, &joined.member_id),
+        (joined.generation_id, &joined.leader)
+    );
+    assert_eq!(Some(1), joined.members.as_ref().map(Vec::len));
 
-    let latency_introducing = LatencyIntroducingLayer::default()
-        .with_seed(seed)
-        .with_latency_millis(latency);
+    let leader_sync = SyncGroupRequest::try_from(consumer.next_action(Some(joined.into()))?)?;
+    assert_eq!(
+        (GROUP, 0),
+        (leader_sync.group_id.as_str(), leader_sync.generation_id)
+    );
+    assert_eq!(Some(1), leader_sync.assignments.as_ref().map(Vec::len));
+    let synced = sut.serve(ctx.clone(), leader_sync).await?;
+    assert_eq!(ErrorCode::None, code(synced.error_code)?);
 
-    let sut = (
-        RequestFrameLayer,
-        latency_introducing,
-        FrameBytesLayer,
-        BytesFrameLayer::default(),
-    )
-        .into_layer(route);
+    let assigned = MemberAssignment::try_from(synced.assignment.clone())?;
+    tracing::debug!(?assigned);
+    assert_ne!(0, assigned.assignment.assigned_partitions.len());
 
-    let group_id = "abc";
-    let topic = "pqr";
-
-    let metadata = MetadataResponse::default().topics(Some(
-        [MetadataResponseTopic::default()
-            .name(Some(topic.into()))
-            .partitions(Some(
-                (0..3)
-                    .map(|partition_index| {
-                        MetadataResponsePartition::default().partition_index(partition_index)
-                    })
-                    .collect(),
-            ))]
-        .into(),
-    ));
-
-    let mut consumer = GroupConsumer::builder(group_id)
-        .topics([topic])
-        .metadata(metadata)
-        .on_assignment(Some(Arc::new(
-            |group: String, assignment: MemberAssignment| debug!(group, %assignment),
-        )))
-        .build();
-
-    let initial = consumer
-        .next_action(None)
-        .and_then(JoinGroupRequest::try_from)?;
-    assert!(initial.member_id.is_empty());
-
-    let context = Context::default();
-
-    let r0 = sut.serve(context.clone(), initial).await?;
-    assert_eq!(i16::from(ErrorCode::MemberIdRequired), r0.error_code);
-    assert!(!r0.member_id.is_empty());
-
-    let next_action = consumer.next_action(Some(r0.into()))?;
-
-    let join = JoinGroupRequest::try_from(next_action)?;
-    assert!(!join.member_id.is_empty());
-
-    let r1 = sut.serve(context.clone(), join).await?;
-    assert_eq!(i16::from(ErrorCode::None), r1.error_code);
-    assert_eq!(0, r1.generation_id);
-    assert_eq!(r1.leader, r1.member_id);
-    assert_eq!(1, r1.members.as_deref().unwrap_or_default().len());
-
-    let next_action = consumer.next_action(Some(r1.into()))?;
-    let sync = SyncGroupRequest::try_from(next_action)?;
-    assert_eq!(group_id, sync.group_id);
-    assert_eq!(0, sync.generation_id);
-    assert_eq!(1, sync.assignments.as_deref().unwrap_or_default().len());
-
-    let r2 = sut.serve(context.clone(), sync).await?;
-    assert_eq!(i16::from(ErrorCode::None), r2.error_code);
-
-    let member_assignment = MemberAssignment::try_from(r2.assignment.clone())
-        .inspect(|member_assignment| debug!(?member_assignment))?;
-    assert!(!member_assignment.assignment.assigned_partitions.is_empty());
-
-    let next_action = consumer.next_action(Some(r2.into()))?;
-    let heartbeat = HeartbeatRequest::try_from(next_action)?;
-    assert_eq!(0, heartbeat.generation_id);
+    let beat = HeartbeatRequest::try_from(consumer.next_action(Some(synced.into()))?)?;
+    assert_eq!(0, beat.generation_id);
 
     // #111's actual claim, false until #273 and structural since #359: a
     // steady-state heartbeat writes ZERO tier-1 PUTs on the contended object.
@@ -150,16 +128,16 @@ async fn stack() -> Result<(), Error> {
     //
     // The group is Stable and this member has just been assigned, so nothing
     // about the composition changes from here.
-    let settled = generation_updates.load(atomic::Ordering::Relaxed);
+    let settled = generation_writes.load(Relaxed);
 
     for _ in 0..3 {
-        let response = sut.serve(context.clone(), heartbeat.clone()).await?;
-        assert_eq!(i16::from(ErrorCode::None), response.error_code);
+        let answer = sut.serve(ctx.clone(), beat.clone()).await?;
+        assert_eq!(ErrorCode::None, code(answer.error_code)?);
     }
 
     assert_eq!(
         settled,
-        generation_updates.load(atomic::Ordering::Relaxed),
+        generation_writes.load(Relaxed),
         "a steady-state heartbeat must not rewrite generation.json (#111/#273/#359)",
     );
 

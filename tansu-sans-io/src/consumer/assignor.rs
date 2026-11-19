@@ -34,27 +34,23 @@ struct Topition {
 
 impl From<&MetadataResponse> for BTreeSet<Topition> {
     fn from(value: &MetadataResponse) -> Self {
-        value
-            .topics
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .flat_map(|topic| {
-                if let Some(name) = topic.name.as_deref() {
-                    topic
-                        .partitions
-                        .as_deref()
-                        .unwrap_or_default()
-                        .iter()
-                        .map(|partition| Topition {
-                            topic: name.into(),
-                            partition: partition.partition_index,
-                        })
-                        .collect::<Vec<_>>()
-                } else {
-                    vec![]
-                }
-            })
-            .collect::<BTreeSet<_>>()
+        let mut every = BTreeSet::new();
+        for listed in value.topics.as_deref().unwrap_or_default() {
+            let Some(named) = listed.name.as_deref() else {
+                continue;
+            };
+            for index in listed
+                .partitions
+                .iter()
+                .flatten()
+                .map(|p| p.partition_index)
+            {
+                _ = every.insert(Topition {
+                    topic: named.to_owned(),
+                    partition: index,
+                });
+            }
+        }
+        every
     }
 }
