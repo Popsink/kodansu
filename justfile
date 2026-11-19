@@ -1052,6 +1052,15 @@ fmt:
 # bounds, the same error messages and the same `debug` lines. A new test pins
 # a v3 subscription's wire bytes and passes against the old body too. Only
 # code went, so the ceiling rises.
+#   defork  -149 lines, the service crate root rewritten  2834 -> 2834  2.6725 -> 2.6724
+#
+# `tansu-service/src/lib.rs` keeps `Error`, `Severity`, `Classify`, the
+# latency layer and service, and every impl and signature. The crate docs'
+# four doctests became one that routes, stacks and serves both requests, with
+# the same assertions; `host_port` resolves the same first IPv4 address and
+# records the same histogram; the metrics are built through `counter` and
+# `histogram` with the same names, units, descriptions and buckets. Docs and
+# code went, and the ratio barely moved, so the ceiling falls with it.
 #
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
@@ -1062,7 +1071,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6725" top="12":
+comments ceiling="2.6724" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
