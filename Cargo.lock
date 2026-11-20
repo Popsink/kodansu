@@ -3810,7 +3810,6 @@ name = "tansu-model"
 version = "1.0.0-alpha.22"
 dependencies = [
  "convert_case",
- "lazy_static",
  "proc-macro2",
  "quote",
  "regex",

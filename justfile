@@ -1147,6 +1147,15 @@ fmt:
 # `Debug`, as before. Three lines more code lowers the ratio a hair, under
 # the ceiling #734 set, so the ceiling stays.
 #
+#   defork  -74 lines, the model's parser and metadata rewritten  2817 -> 2814  2.6696 -> 2.6686
+#
+# `tansu-model/src/lib.rs` keeps every type, field, impl and signature; the
+# generated `tansu-sans-io` code is byte-identical before and after (diffed in
+# `OUT_DIR`). The parsers share `parsed_all`, the `ToTokens` impls share
+# `expression`, and the kind predicates read the kind through `name` and
+# `kind_of_sequence`. The three edition labels inside the reserved-word list
+# went with the list's layout, so the ratio falls and the ceiling follows it.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1156,7 +1165,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6696" top="12":
+comments ceiling="2.6686" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
