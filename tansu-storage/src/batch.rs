@@ -12,35 +12,29 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt::Debug,
-    pin::Pin,
-    sync::{Arc, LazyLock, Mutex},
-    task::{Context, Poll, Waker},
-    time::{Duration, SystemTime},
-};
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Debug;
+use std::pin::Pin;
+use std::sync::{Arc, LazyLock, Mutex};
+use std::task::{Context, Poll, Waker};
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
-use opentelemetry::{
-    KeyValue,
-    metrics::{Counter, Gauge, Histogram},
-};
-use tansu_sans_io::{
-    ConfigResource, ErrorCode, IsolationLevel, ListOffset, ScramMechanism,
-    create_topics_request::CreatableTopic,
-    delete_groups_response::DeletableGroupResult,
-    delete_records_request::DeleteRecordsTopic,
-    delete_records_response::DeleteRecordsTopicResult,
-    describe_cluster_response::DescribeClusterBroker,
-    describe_configs_response::DescribeConfigsResult,
-    describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
-    incremental_alter_configs_request::AlterConfigsResource,
-    incremental_alter_configs_response::AlterConfigsResourceResponse,
-    list_groups_response::ListedGroup,
-    record::{Record, deflated, inflated},
-    txn_offset_commit_response::TxnOffsetCommitResponseTopic,
-};
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::{Counter, Gauge, Histogram};
+use tansu_sans_io::create_topics_request::CreatableTopic;
+use tansu_sans_io::delete_groups_response::DeletableGroupResult;
+use tansu_sans_io::delete_records_request::DeleteRecordsTopic;
+use tansu_sans_io::delete_records_response::DeleteRecordsTopicResult;
+use tansu_sans_io::describe_cluster_response::DescribeClusterBroker;
+use tansu_sans_io::describe_configs_response::DescribeConfigsResult;
+use tansu_sans_io::describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic;
+use tansu_sans_io::incremental_alter_configs_request::AlterConfigsResource;
+use tansu_sans_io::incremental_alter_configs_response::AlterConfigsResourceResponse;
+use tansu_sans_io::list_groups_response::ListedGroup;
+use tansu_sans_io::record::{Record, deflated, inflated};
+use tansu_sans_io::txn_offset_commit_response::TxnOffsetCommitResponseTopic;
+use tansu_sans_io::{ConfigResource, ErrorCode, IsolationLevel, ListOffset, ScramMechanism};
 use tokio::time::sleep;
 use tracing::{debug, instrument, warn};
 use url::Url;
@@ -57,65 +51,60 @@ use crate::{
     Version,
 };
 
+/// A counter called `name`.
+fn counter(name: &'static str, description: &'static str) -> Counter<u64> {
+    let counter = METER.u64_counter(name);
+    counter.with_description(description).build()
+}
+
 static BATCH_REQUESTS_LENGTH: LazyLock<Gauge<u64>> =
     LazyLock::new(|| METER.u64_gauge("batch_request_gauge").build());
 
 static BATCH_RESPONSES_LENGTH: LazyLock<Gauge<u64>> =
     LazyLock::new(|| METER.u64_gauge("batch_response_gauge").build());
 
-static BATCH_TICKET_POLL: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("batch_ticket_poll")
-        .with_description("The number of ticket polls")
-        .build()
-});
+static BATCH_TICKET_POLL: LazyLock<Counter<u64>> =
+    LazyLock::new(|| counter("batch_ticket_poll", "The number of ticket polls"));
 
 static SEND_QUEUED_PRODUCED_RECORDS_COUNTER: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("batch_send_queued_records")
-        .with_description("The number of produced send queued records")
-        .build()
+    let description = "The number of produced send queued records";
+    counter("batch_send_queued_records", description)
 });
 
 static SEND_QUEUED_WAKE_COUNTER: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("batch_send_queued_wake_event")
-        .with_description("The number of wake events sent")
-        .build()
+    counter(
+        "batch_send_queued_wake_event",
+        "The number of wake events sent",
+    )
 });
 
 static PRODUCE_REQUEST_MINIMUM_SIZE_TRIGGER: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("batch_produce_minimum_size_trigger")
-        .with_description("The number of times the minimum size was a trigger")
-        .build()
+    let description = "The number of times the minimum size was a trigger";
+    counter("batch_produce_minimum_size_trigger", description)
 });
 
 static PRODUCE_REQUEST_YOUR_TICKET_IS_READY: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("batch_produce_your_ticket_is_ready")
-        .with_description("The number of notifications that your ticket was ready while waiting")
-        .build()
+    let description = "The number of notifications that your ticket was ready while waiting";
+    counter("batch_produce_your_ticket_is_ready", description)
 });
 
 static PRODUCE_REQUEST_TIMEOUT_EXPIRED_TRIGGER: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("batch_produce_timeout_expired_trigger")
-        .with_description("The number of times the timeout expiry was a trigger")
-        .build()
+    let description = "The number of times the timeout expiry was a trigger";
+    counter("batch_produce_timeout_expired_trigger", description)
 });
 
 static PRODUCE_REQUEST_QUEUED_COUNTER: LazyLock<Counter<u64>> = LazyLock::new(|| {
-    METER
-        .u64_counter("batch_produce_queued")
-        .with_description("The number of produce requests queued")
-        .build()
+    counter(
+        "batch_produce_queued",
+        "The number of produce requests queued",
+    )
 });
 
 static PRODUCE_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
-    METER
+    let histogram = METER
         .u64_histogram("batch_produce_duration")
-        .with_unit("ms")
+        .with_unit("ms");
+    histogram
         .with_description("The batch produce latency in milliseconds")
         .build()
 });
@@ -128,16 +117,15 @@ struct Ticket<G> {
 
 impl<G> Ticket<G> {
     fn new(batcher: ProduceRequestBatcher<G>) -> Self {
-        Self {
-            id: Uuid::now_v7(),
-            batcher,
-        }
+        let id = Uuid::now_v7();
+        Ticket { id, batcher }
     }
 }
 
 impl<G> AsRef<Uuid> for Ticket<G> {
     fn as_ref(&self) -> &Uuid {
-        &self.id
+        let Ticket { id, .. } = self;
+        id
     }
 }
 
@@ -145,19 +133,18 @@ impl<G> Future for Ticket<G> {
     type Output = Result<i64, Error>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let polled = |outcome: &'static str| {
+            BATCH_TICKET_POLL.add(1, &[KeyValue::new("outcome", outcome)]);
+        };
         let mut responses = self.batcher.responses.lock()?;
-
-        match responses.remove(&self.id) {
-            Some(BatchResponse::Response(response)) => {
-                BATCH_TICKET_POLL.add(1, &[KeyValue::new("outcome", "ready")]);
-                Poll::Ready(Ok(response))
-            }
-            Some(BatchResponse::Waker(_)) | None => {
-                BATCH_TICKET_POLL.add(1, &[KeyValue::new("outcome", "pending")]);
-                _ = responses.insert(self.id, BatchResponse::Waker(cx.waker().clone()));
-                Poll::Pending
-            }
+        if let Some(BatchResponse::Response(offset)) = responses.remove(&self.id) {
+            polled("ready");
+            return Poll::Ready(Ok(offset));
         }
+        polled("pending");
+        let waiting = BatchResponse::Waker(cx.waker().clone());
+        _ = responses.insert(self.id, waiting);
+        Poll::Pending
     }
 }
 
@@ -191,18 +178,16 @@ pub(crate) struct ProduceRequestBatcher<G> {
 
 impl<G> ProduceRequestBatcher<G> {
     fn update_metrics(&self) -> Result<()> {
-        self.requests
-            .lock()
-            .map_err(Into::into)
-            .map(|requests| requests.values().map(|queue| queue.len() as u64).sum())
-            .map(|length| BATCH_REQUESTS_LENGTH.record(length, &[]))
-            .and(
-                self.responses
-                    .lock()
-                    .map_err(Into::into)
-                    .map(|responses| responses.len() as u64)
-                    .map(|length| BATCH_RESPONSES_LENGTH.record(length, &[])),
-            )
+        let queued = self.requests.lock().map(|requests| {
+            let length: u64 = requests.values().map(|queue| queue.len() as u64).sum();
+            BATCH_REQUESTS_LENGTH.record(length, &[]);
+        });
+        let answered = self.responses.lock().map(|responses| {
+            BATCH_RESPONSES_LENGTH.record(responses.len() as u64, &[]);
+        });
+        queued
+            .map_err(Error::from)
+            .and(answered.map_err(Error::from))
     }
 }
 
@@ -211,28 +196,25 @@ where
     G: Storage,
 {
     pub(crate) fn new(storage: G) -> Self {
-        Self {
+        ProduceRequestBatcher {
             storage,
-            minimum_size: Default::default(),
-            maximum_delay: Default::default(),
-
-            requests: Arc::new(Mutex::new(BTreeMap::new())),
-            responses: Arc::new(Mutex::new(BTreeMap::new())),
+            maximum_delay: None,
+            minimum_size: None,
+            requests: Arc::default(),
+            responses: Arc::default(),
         }
     }
 
     pub(crate) fn with_minimum_size(self, minimum_size: Option<usize>) -> Self {
-        Self {
-            minimum_size,
-            ..self
-        }
+        let mut batcher = self;
+        batcher.minimum_size = minimum_size;
+        batcher
     }
 
     pub(crate) fn with_maximum_delay(self, maximum_delay: Option<Duration>) -> Self {
-        Self {
-            maximum_delay,
-            ..self
-        }
+        let mut batcher = self;
+        batcher.maximum_delay = maximum_delay;
+        batcher
     }
 
     #[instrument(skip(self, transaction_id, topition, producer_id))]
@@ -243,52 +225,45 @@ where
         topition: &Topition,
         producer_id: i64,
     ) -> Result<(), Error> {
-        let Some(queued) = self.requests.lock().map(|mut requests| {
-            BATCH_REQUESTS_LENGTH
-                .record(requests.values().map(|queue| queue.len() as u64).sum(), &[]);
-
-            requests.remove(&TopitionProducerId {
-                topition: topition.to_owned(),
-                producer_id,
-            })
-        })?
-        else {
+        let key = TopitionProducerId {
+            topition: topition.to_owned(),
+            producer_id,
+        };
+        let removed = {
+            let mut requests = self.requests.lock()?;
+            let length: u64 = requests.values().map(|queue| queue.len() as u64).sum();
+            BATCH_REQUESTS_LENGTH.record(length, &[]);
+            requests.remove(&key)
+        };
+        let Some(queued) = removed else {
             BATCH_REQUESTS_LENGTH.record(0, &[]);
-
             return Ok(());
         };
 
-        let owners = queued
-            .iter()
-            .map(|batch_request| batch_request.id)
-            .collect::<BTreeSet<_>>();
-
+        let owners: BTreeSet<Uuid> = queued.iter().map(|request| request.id).collect();
         debug!(owners = owners.len());
-
         let attributes = [KeyValue::new("topic", topition.topic.clone())];
 
-        if let Some(queued) = combine(queued.into_iter().map(|queued| queued.batch).collect())? {
-            let record_count = (queued.last_offset_delta + 1) as u64;
+        let batches = queued.into_iter().map(|request| request.batch).collect();
+        let Some(combined) = combine(batches)? else {
+            return Ok(());
+        };
+        let record_count = (combined.last_offset_delta + 1) as u64;
+        let offset = self
+            .storage
+            .produce(transaction_id, topition, combined)
+            .await?;
+        debug!(offset = offset);
+        SEND_QUEUED_PRODUCED_RECORDS_COUNTER.add(record_count, &attributes);
 
-            let offset = self
-                .storage
-                .produce(transaction_id, topition, queued)
-                .await
-                .inspect(|offset| debug!(offset))?;
-
-            SEND_QUEUED_PRODUCED_RECORDS_COUNTER.add(record_count, &attributes);
-
-            self.responses.lock().map(|mut responses| {
-                for owner in owners {
-                    if let Some(BatchResponse::Waker(waker)) =
-                        responses.insert(owner, BatchResponse::Response(offset))
-                    {
-                        debug!(waking = %owner);
-                        SEND_QUEUED_WAKE_COUNTER.add(1, &attributes);
-                        waker.wake();
-                    }
-                }
-            })?;
+        let mut responses = self.responses.lock()?;
+        for owner in owners {
+            let previous = responses.insert(owner, BatchResponse::Response(offset));
+            if let Some(BatchResponse::Waker(waker)) = previous {
+                debug!(waking = %owner);
+                SEND_QUEUED_WAKE_COUNTER.add(1, &attributes);
+                waker.wake();
+            }
         }
 
         Ok(())
@@ -316,92 +291,72 @@ where
         };
 
         let start = SystemTime::now();
-
         let attributes = [KeyValue::new("topic", topition.topic.clone())];
-
         let producer_id = batch.producer_id;
-
-        let topition_producer_id = TopitionProducerId {
+        let key = TopitionProducerId {
             topition: topition.to_owned(),
             producer_id,
         };
 
-        let ticket = self.requests.lock().map(|mut requests| {
+        let ticket = {
+            let mut requests = self.requests.lock()?;
             let ticket = Ticket::new(self.clone());
-
-            let queue = requests.entry(topition_producer_id.clone()).or_default();
-
+            let queue = requests.entry(key.clone()).or_default();
             queue.push(BatchRequest {
                 id: ticket.id,
                 batch,
             });
-
             PRODUCE_REQUEST_QUEUED_COUNTER.add(1, &attributes);
             debug!(queue_len = queue.len());
-
             ticket
-        })?;
-
+        };
         debug!(ticket = %ticket.id);
 
-        let mut iteration = -1;
-
+        let mut round: i32 = 0;
         loop {
             self.update_metrics()?;
+            let waiting = ticket.clone();
+            let id = waiting.id;
 
-            let ticket = ticket.clone();
-            let id = ticket.id;
+            let queued_bytes: usize = {
+                let requests = self.requests.lock()?;
+                let queue = requests.get(&key);
+                let sizes = queue
+                    .into_iter()
+                    .flatten()
+                    .map(|request| request.batch.record_data.len());
+                sizes.sum()
+            };
+            debug!(queued_bytes = queued_bytes);
 
-            iteration += 1;
-
-            let queued_bytes = self
-                .requests
-                .lock()
-                .map(|requests| {
-                    requests
-                        .get(&topition_producer_id)
-                        .map(|queue| {
-                            queue
-                                .iter()
-                                .map(|batch_request| batch_request.batch.record_data.len())
-                                .sum::<usize>()
-                        })
-                        .unwrap_or_default()
-                })
-                .inspect(|queued_bytes| debug!(queued_bytes))?;
-
-            if self
-                .minimum_size
-                .inspect(|minimum_size| debug!(minimum_size, queued_bytes))
-                .is_some_and(|minimum_size| queued_bytes > minimum_size)
-            {
-                PRODUCE_REQUEST_MINIMUM_SIZE_TRIGGER.add(1, &attributes);
-
-                self.send_queued(&id, transaction_id, topition, producer_id)
-                    .await?;
+            if let Some(minimum_size) = self.minimum_size {
+                debug!(minimum_size = minimum_size, queued_bytes = queued_bytes);
+                if queued_bytes > minimum_size {
+                    PRODUCE_REQUEST_MINIMUM_SIZE_TRIGGER.add(1, &attributes);
+                    self.send_queued(&id, transaction_id, topition, producer_id)
+                        .await?;
+                }
             }
 
-            let patience = sleep(maximum_delay);
-
             tokio::select! {
-                response = ticket  => {
-                    let elapsed = start.elapsed().map_or(0, |duration| duration.as_millis() as u64);
-                    debug!(ready = %id, elapsed, iteration);
+                response = waiting => {
+                    let elapsed = start.elapsed().map_or(0, |took| took.as_millis() as u64);
+                    debug!(ready = %id, elapsed = elapsed, iteration = round);
                     PRODUCE_REQUEST_YOUR_TICKET_IS_READY.add(1, &attributes);
                     PRODUCE_DURATION.record(elapsed, &attributes);
                     self.update_metrics()?;
                     return response;
                 }
 
-                _ = patience => {
-                    if iteration > 1 {
-                        warn!(ticket = %id, iteration);
+                () = sleep(maximum_delay) => {
+                    if round > 1 {
+                        warn!(ticket = %id, iteration = round);
                     }
-
                     PRODUCE_REQUEST_TIMEOUT_EXPIRED_TRIGGER.add(1, &attributes);
                     self.send_queued(&id, transaction_id, topition, producer_id).await?;
                 }
             }
+            round += 1;
         }
     }
 }
@@ -487,52 +442,49 @@ storage_methods!(batcher_delegation);
 #[instrument(skip_all)]
 fn combine(batches: Vec<deflated::Batch>) -> Result<Option<deflated::Batch>> {
     debug!(len = batches.len());
-
-    let mut i = batches.into_iter();
-
-    let Some(first) = i.next() else {
+    let mut batches = batches.into_iter();
+    let Some(first) = batches.next() else {
         return Ok(None);
     };
 
     let mut sink = inflated::Batch::try_from(first)?;
     debug!(
-        sink.base_offset,
-        sink.last_offset_delta, sink.base_sequence, sink.max_timestamp
+        sink.base_offset = sink.base_offset,
+        sink.last_offset_delta = sink.last_offset_delta,
+        sink.base_sequence = sink.base_sequence,
+        sink.max_timestamp = sink.max_timestamp
     );
 
-    for batch in i {
-        let batch = inflated::Batch::try_from(batch)?;
-
+    for next in batches {
+        let batch = inflated::Batch::try_from(next)?;
         debug!(
-            sink.last_offset_delta,
-            sink.max_timestamp, batch.base_offset, batch.last_offset_delta, batch.base_sequence
+            sink.last_offset_delta = sink.last_offset_delta,
+            sink.max_timestamp = sink.max_timestamp,
+            batch.base_offset = batch.base_offset,
+            batch.last_offset_delta = batch.last_offset_delta,
+            batch.base_sequence = batch.base_sequence
         );
 
-        sink.records.append(
-            &mut batch
-                .records
-                .into_iter()
-                .map(|record| Record {
-                    offset_delta: record.offset_delta + sink.last_offset_delta + 1,
-                    timestamp_delta: record.timestamp_delta
-                        + (sink.base_timestamp - batch.base_timestamp),
-                    ..record
-                })
-                .collect::<Vec<_>>(),
-        );
+        let offset_shift = sink.last_offset_delta + 1;
+        let time_shift = sink.base_timestamp - batch.base_timestamp;
+        let shifted = batch.records.into_iter().map(|record| Record {
+            offset_delta: record.offset_delta + offset_shift,
+            timestamp_delta: record.timestamp_delta + time_shift,
+            ..record
+        });
+        sink.records.extend(shifted);
 
         sink.last_offset_delta += batch.last_offset_delta + 1;
         sink.max_timestamp = sink.max_timestamp.max(batch.max_timestamp);
     }
 
     debug!(
-        sink.base_offset,
-        sink.last_offset_delta, sink.base_sequence, sink.max_timestamp
+        sink.base_offset = sink.base_offset,
+        sink.last_offset_delta = sink.last_offset_delta,
+        sink.base_sequence = sink.base_sequence,
+        sink.max_timestamp = sink.max_timestamp
     );
-
-    deflated::Batch::try_from(sink)
-        .map(Some)
-        .map_err(Into::into)
+    Ok(Some(deflated::Batch::try_from(sink)?))
 }
 
 #[cfg(test)]
