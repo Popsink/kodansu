@@ -19,17 +19,16 @@ mod migration;
 
 pub use consumer::{ConsumerGroupConfig, MigrationPolicy};
 
-use crate::Result;
-use async_trait::async_trait;
 use std::fmt::Debug;
-use tansu_sans_io::{
-    Body, ConsumerGroupHeartbeatRequest,
-    join_group_request::JoinGroupRequestProtocol,
-    leave_group_request::MemberIdentity,
-    offset_commit_request::OffsetCommitRequestTopic,
-    offset_fetch_request::{OffsetFetchRequestGroup, OffsetFetchRequestTopic},
-    sync_group_request::SyncGroupRequestAssignment,
-};
+
+use tansu_sans_io::join_group_request::JoinGroupRequestProtocol;
+use tansu_sans_io::leave_group_request::MemberIdentity;
+use tansu_sans_io::offset_commit_request::OffsetCommitRequestTopic;
+use tansu_sans_io::offset_fetch_request::{OffsetFetchRequestGroup, OffsetFetchRequestTopic};
+use tansu_sans_io::sync_group_request::SyncGroupRequestAssignment;
+use tansu_sans_io::{Body, ConsumerGroupHeartbeatRequest};
+
+use crate::Result;
 
 #[derive(Debug)]
 pub struct OffsetCommit<'a> {
@@ -41,7 +40,7 @@ pub struct OffsetCommit<'a> {
     pub topics: Option<&'a [OffsetCommitRequestTopic]>,
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 pub trait Coordinator: Clone + Debug + Send + Sync + 'static {
     #[allow(clippy::too_many_arguments)]
     async fn join(
