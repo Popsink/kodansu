@@ -1166,6 +1166,14 @@ fmt:
 # `tag_kind`, the throttle arms and the field metadata choose the same types.
 # Only code went, so the ceiling rises.
 #
+#   defork  -266 lines, the model's tests rewritten  2814 -> 2814  2.6703 -> 2.6771
+#
+# `tansu-model/src/lib.rs`'s seventeen tests keep their names and assert the
+# same things. The expected `Field`s are built by `field` with only what each
+# case sets, the descriptors are compact `json!` rather than raw strings, and
+# the table-shaped tests (`type_mapping_test`, `version_range_*`) loop over
+# their cases. Only code went, so the ceiling rises.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1175,7 +1183,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6703" top="12":
+comments ceiling="2.6771" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
