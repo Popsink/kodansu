@@ -12,61 +12,87 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-//! Structures representing Kafka JSON protocol definitions.
+//! The model of Apache Kafka's JSON message descriptors.
 //!
-//! This crate converts Kafka JSON protocol definitions into structures
-//! that can be easily used during the Tansu Sans I/O build process.
+//! `tansu-sans-io`'s build script reads every descriptor into a [`Message`]
+//! and generates the protocol types from it; [`MessageMeta`] and [`FieldMeta`]
+//! are what the generated code keeps of them at run time.
 
 pub mod error;
 pub mod wv;
 
-use convert_case::{Case, Casing};
-pub use error::Error;
-use lazy_static::lazy_static;
+use std::fmt;
+use std::str::FromStr;
+
+use convert_case::{Case, Casing as _};
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::ToTokens;
 use regex::Regex;
 use serde_json::Value;
-use std::{fmt, str::FromStr};
 use syn::{Expr, Type};
 use tracing::debug;
-use wv::{As, AsOption, Wv};
 
+pub use self::error::Error;
+use self::wv::{As as _, AsOption as _, Wv};
+
+/// `$e`'s name behind this crate's, as the generated code spells a path.
 macro_rules! prefix_crate {
-    ($e:ident) => {
-        format!("{}::{}", env!("CARGO_CRATE_NAME"), stringify!($e))
-    };
+    ($e:ident) => {{
+        let krate = env!("CARGO_CRATE_NAME");
+        format!("{krate}::{}", stringify!($e))
+    }};
 }
 
+/// The `Debug` of `$e` behind this crate's name, and `$f`'s behind `$e` when
+/// `$e` names the enum `$f` is a variant of.
 macro_rules! with_crate {
-    ($e:expr_2021) => {
-        format!("{}::{:?}", env!("CARGO_CRATE_NAME"), $e)
-    };
+    ($e:expr_2021) => {{
+        let krate = env!("CARGO_CRATE_NAME");
+        format!("{krate}::{:?}", $e)
+    }};
 
-    ($e:expr_2021, $f:expr_2021) => {
-        format!("{}::{}::{:?}", env!("CARGO_CRATE_NAME"), $e, $f)
-    };
+    ($e:expr_2021, $f:expr_2021) => {{
+        let krate = env!("CARGO_CRATE_NAME");
+        format!("{krate}::{}::{:?}", $e, $f)
+    }};
+}
+
+/// The expression `spelled`, as tokens.
+///
+/// # Panics
+///
+/// When `spelled` is not an expression, which only a bug in this crate's own
+/// `Debug` output could cause.
+fn expression(spelled: &str) -> Expr {
+    let parsed = syn::parse_str::<Expr>(spelled);
+    parsed.unwrap_or_else(|_| panic!("an expression: {spelled}"))
+}
+
+/// Every value of `values`, parsed by `parse`; the first failure, if any.
+fn parsed_all<T>(values: &[Value], parse: impl Fn(&Value) -> Result<T>) -> Result<Vec<T>> {
+    values.iter().map(parse).collect()
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 fn type_mapping(kind: &str) -> String {
-    match kind {
-        "bytes" => String::from("bytes::Bytes"),
-        "float64" => String::from("f64"),
-        "int16" => String::from("i16"),
-        "int32" => String::from("i32"),
-        "int64" => String::from("i64"),
-        "int8" => String::from("i8"),
-        "string" => String::from("String"),
-        "uint16" => String::from("u16"),
-        "uuid" => String::from("[u8; 16]"),
-        "records" => String::from("crate::RecordBatch"),
-
-        sequence if sequence.starts_with("[]") => type_mapping(&sequence[2..]),
-
-        s => String::from(s),
+    if let Some(element) = kind.strip_prefix("[]") {
+        return type_mapping(element);
     }
+    let rust = match kind {
+        "bytes" => "bytes::Bytes",
+        "float64" => "f64",
+        "int8" => "i8",
+        "int16" => "i16",
+        "int32" => "i32",
+        "int64" => "i64",
+        "uint16" => "u16",
+        "string" => "String",
+        "uuid" => "[u8; 16]",
+        "records" => "crate::RecordBatch",
+        named => named,
+    };
+    rust.to_owned()
 }
 
 #[derive(Clone, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -76,75 +102,76 @@ pub struct Kind(String);
 impl ToTokens for Kind {
     #![allow(clippy::unwrap_used)]
     fn to_tokens(&self, tokens: &mut TokenStream) {
-        let expr = with_crate!(self);
-        syn::parse_str::<Expr>(&expr).unwrap().to_tokens(tokens);
+        let spelled = with_crate!(self);
+        expression(&spelled).to_tokens(tokens);
     }
 }
 
 impl From<Type> for Kind {
     fn from(value: Type) -> Self {
-        Self(value.to_token_stream().to_string())
+        let spelled = value.to_token_stream().to_string();
+        Kind(spelled)
     }
 }
 
-lazy_static! {
-    static ref PRIMITIVE: &'static [&'static str] = &[
-        "bool", "bytes", "float64", "int16", "int32", "int64", "int8", "records", "string",
-        "uint16", "uuid",
-    ];
-}
+/// The kinds the protocol defines itself, as opposed to the structures a
+/// message declares.
+const PRIMITIVE: &[&str] = &[
+    "bool", "int8", "int16", "int32", "int64", "uint16", "float64", "string", "bytes", "uuid",
+    "records",
+];
 
 impl Kind {
     #[must_use]
     pub fn new(kind: &str) -> Self {
-        Self(kind.to_owned())
+        Kind(String::from(kind))
     }
 
     #[must_use]
     pub fn name(&self) -> &str {
-        &self.0[..]
+        let Kind(spelled) = self;
+        spelled.as_str()
     }
 
     #[must_use]
     #[allow(clippy::missing_panics_doc)]
     /// The Rust type name of this kind.
     pub fn type_name(&self) -> Type {
-        syn::parse_str::<Type>(&type_mapping(&self.0))
-            .unwrap_or_else(|_| panic!("not a type: {self:?}"))
+        let mapped = type_mapping(self.name());
+        let parsed = syn::parse_str::<Type>(&mapped);
+        parsed.unwrap_or_else(|_| panic!("not a type: {self:?}"))
     }
 
     #[must_use]
     /// Returns true if this kind is a sequence (array)
     pub fn is_sequence(&self) -> bool {
-        self.0.starts_with("[]")
+        self.kind_of_sequence().is_some()
     }
 
     #[must_use]
-    /// Returns true is this kind is a Kafka primitive (defined) type
+    /// Whether this kind is one the protocol defines itself.
     pub fn is_primitive(&self) -> bool {
-        PRIMITIVE.contains(&self.0.as_str())
+        PRIMITIVE.contains(&self.name())
     }
 
     #[must_use]
-    /// Returns true if this kind is a float64
+    /// Whether this kind is a `float64`.
     pub fn is_float(&self) -> bool {
-        self.0.eq("float64")
+        self.name() == "float64"
     }
 
     #[must_use]
-    /// Returns true if this is a sequence of Kafka primitive types
+    /// Whether this kind is a sequence of a kind the protocol defines itself.
     pub fn is_sequence_of_primitive(&self) -> bool {
-        self.is_sequence() && PRIMITIVE.contains(&&self.0[2..])
+        let element = self.kind_of_sequence();
+        element.is_some_and(|element| element.is_primitive())
     }
 
     #[must_use]
-    /// Optionally when the kind is a sequence, returns the kind of the sequence
+    /// The kind of each element, when this kind is a sequence.
     pub fn kind_of_sequence(&self) -> Option<Self> {
-        if self.is_sequence() {
-            Some(Self::new(&self.0[2..]))
-        } else {
-            None
-        }
+        let element = self.name().strip_prefix("[]")?;
+        Some(Kind::new(element))
     }
 }
 
@@ -152,7 +179,7 @@ impl FromStr for Kind {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(s.to_owned()))
+        Ok(Kind::new(s))
     }
 }
 
@@ -160,7 +187,8 @@ impl TryFrom<&Value> for Kind {
     type Error = Error;
 
     fn try_from(value: &Value) -> Result<Self, Self::Error> {
-        as_str(value, "type").and_then(Self::from_str)
+        let spelled = as_str(value, "type")?;
+        spelled.parse()
     }
 }
 
@@ -177,12 +205,11 @@ impl TryFrom<&Value> for Listener {
     type Error = Error;
 
     fn try_from(value: &Value) -> Result<Self, Self::Error> {
-        value
-            .as_str()
-            .ok_or(Error::Message(String::from(
-                "expecting string for listener",
-            )))
-            .and_then(Self::from_str)
+        let Some(spelled) = value.as_str() else {
+            let why = "expecting string for listener";
+            return Err(Error::Message(why.to_owned()));
+        };
+        spelled.parse()
     }
 }
 
@@ -190,12 +217,13 @@ impl FromStr for Listener {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "zkBroker" => Ok(Self::ZkBroker),
-            "broker" => Ok(Self::Broker),
-            "controller" => Ok(Self::Controller),
-            s => Err(Error::Message(String::from(s))),
-        }
+        let listener = match s {
+            "zkBroker" => Listener::ZkBroker,
+            "broker" => Listener::Broker,
+            "controller" => Listener::Controller,
+            unknown => return Err(Error::Message(unknown.to_owned())),
+        };
+        Ok(listener)
     }
 }
 
@@ -210,8 +238,8 @@ pub enum MessageKind {
 impl ToTokens for MessageKind {
     #[allow(clippy::unwrap_used)]
     fn to_tokens(&self, tokens: &mut TokenStream) {
-        let expr = with_crate!("MessageKind", self);
-        syn::parse_str::<Expr>(&expr).unwrap().to_tokens(tokens);
+        let spelled = with_crate!("MessageKind", self);
+        expression(&spelled).to_tokens(tokens);
     }
 }
 
@@ -219,7 +247,8 @@ impl TryFrom<&Value> for MessageKind {
     type Error = Error;
 
     fn try_from(value: &Value) -> Result<Self, Self::Error> {
-        as_str(value, "type").and_then(Self::from_str)
+        let spelled = as_str(value, "type")?;
+        spelled.parse()
     }
 }
 
@@ -227,11 +256,12 @@ impl FromStr for MessageKind {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "request" => Ok(Self::Request),
-            "response" => Ok(Self::Response),
-            s => Err(Error::Message(String::from(s))),
-        }
+        let kind = match s {
+            "request" => MessageKind::Request,
+            "response" => MessageKind::Response,
+            unknown => return Err(Error::Message(unknown.to_owned())),
+        };
+        Ok(kind)
     }
 }
 
@@ -244,40 +274,37 @@ pub struct VersionRange {
 
 impl fmt::Debug for VersionRange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct(&prefix_crate!(VersionRange))
-            .field("start", &self.start)
-            .field("end", &self.end)
-            .finish()
+        let VersionRange { start, end } = self;
+        let name = prefix_crate!(VersionRange);
+        let mut range = f.debug_struct(&name);
+        range.field("start", start).field("end", end).finish()
     }
 }
 
 impl VersionRange {
     #[must_use]
     pub fn within(&self, version: i16) -> bool {
-        version >= self.start && version <= self.end
+        (self.start..=self.end).contains(&version)
     }
 
     #[must_use]
     pub fn is_mandatory(&self, parent: Option<VersionRange>) -> bool {
-        parent.map_or(
-            self.start == 0 && self.end == i16::MAX,
-            |VersionRange { start, end }| {
-                if start > self.start {
-                    self.end == end
-                } else {
-                    self.start == start && self.end == end
-                }
-            },
-        )
+        let Some(VersionRange { start, end }) = parent else {
+            return self.start == 0 && self.end == i16::MAX;
+        };
+        let ends_with_parent = self.end == end;
+        if start > self.start {
+            ends_with_parent
+        } else {
+            self.start == start && ends_with_parent
+        }
     }
 }
 
 impl ToTokens for VersionRange {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-        let expr = format!("{self:?}");
-        syn::parse_str::<Expr>(&expr)
-            .unwrap_or_else(|_| panic!("an expression: {self:?}"))
-            .to_tokens(tokens);
+        let spelled = format!("{self:?}");
+        expression(&spelled).to_tokens(tokens);
     }
 }
 
@@ -285,38 +312,30 @@ impl FromStr for VersionRange {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        #![allow(clippy::expect_used)]
-        lazy_static! {
-            static ref RX: Regex =
-                Regex::new(r"^(?<start>\d+)(-(?<end>\d+)|(?<infinite>\+))?$").expect("regex");
-        }
+        /// `N`, `N-M` or `N+`.
+        static RANGE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+            let pattern = r"^(?<start>\d+)(-(?<end>\d+)|(?<infinite>\+))?$";
+            Regex::new(pattern).unwrap_or_else(|_| panic!("regex"))
+        });
 
         if s == "none" {
-            Ok(VersionRange { start: -2, end: -1 })
-        } else {
-            RX.captures(s)
-                .ok_or(Error::Message(format!("invalid version range format: {s}")))
-                .and_then(|captures| {
-                    let parse = |name, default: i16| {
-                        captures
-                            .name(name)
-                            .map_or(Ok(&default.to_string()[..]), |s| Ok(s.as_str()))
-                            .and_then(str::parse)
-                    };
-
-                    let start = parse("start", 0)?;
-
-                    let end = if let Some(end) = captures.name("end") {
-                        str::parse(end.as_str())?
-                    } else if captures.name("infinite").is_some() {
-                        i16::MAX
-                    } else {
-                        start
-                    };
-
-                    Ok(VersionRange { start, end })
-                })
+            return Ok(VersionRange { start: -2, end: -1 });
         }
+        let Some(captures) = RANGE.captures(s) else {
+            let why = format!("invalid version range format: {s}");
+            return Err(Error::Message(why));
+        };
+
+        let start = match captures.name("start") {
+            Some(given) => given.as_str().parse()?,
+            None => 0,
+        };
+        let end = match (captures.name("end"), captures.name("infinite")) {
+            (Some(given), _) => given.as_str().parse()?,
+            (None, Some(_)) => i16::MAX,
+            (None, None) => start,
+        };
+        Ok(VersionRange { start, end })
     }
 }
 
@@ -334,25 +353,28 @@ pub struct Version {
 impl ToTokens for Version {
     #[allow(clippy::unwrap_used)]
     fn to_tokens(&self, tokens: &mut TokenStream) {
-        let expr = with_crate!(self);
-        syn::parse_str::<Expr>(&expr).unwrap().to_tokens(tokens);
+        let spelled = with_crate!(self);
+        expression(&spelled).to_tokens(tokens);
     }
 }
 
 impl Version {
     #[must_use]
     pub fn valid(&self) -> VersionRange {
-        self.valid
+        let Version { valid, .. } = self;
+        *valid
     }
 
     #[must_use]
     pub fn deprecated(&self) -> Option<VersionRange> {
-        self.deprecated
+        let Version { deprecated, .. } = self;
+        *deprecated
     }
 
     #[must_use]
     pub fn flexible(&self) -> VersionRange {
-        self.flexible
+        let Version { flexible, .. } = self;
+        *flexible
     }
 }
 
@@ -360,12 +382,14 @@ impl<'a> TryFrom<&Wv<'a>> for Version {
     type Error = Error;
 
     fn try_from(value: &Wv<'a>) -> Result<Self, Self::Error> {
-        debug!("value: {:?}", value);
-
-        Ok(Self {
-            valid: value.as_a("validVersions")?,
-            deprecated: value.as_option("deprecatedVersions")?,
-            flexible: value.as_a("flexibleVersions")?,
+        debug!("value: {value:?}");
+        let valid = value.as_a("validVersions")?;
+        let deprecated = value.as_option("deprecatedVersions")?;
+        let flexible = value.as_a("flexibleVersions")?;
+        Ok(Version {
+            valid,
+            deprecated,
+            flexible,
         })
     }
 }
@@ -400,74 +424,78 @@ pub struct Field {
 impl Field {
     #[must_use]
     pub fn ident(&self) -> Ident {
-        match self.name.to_case(Case::Snake) {
-            reserved if is_reserved_keyword(&reserved) => {
-                Ident::new_raw(&reserved, Span::call_site())
-            }
-
-            otherwise => Ident::new(&otherwise, Span::call_site()),
+        let snake = self.name.to_case(Case::Snake);
+        let here = Span::call_site();
+        if is_reserved_keyword(&snake) {
+            Ident::new_raw(&snake, here)
+        } else {
+            Ident::new(&snake, here)
         }
     }
 
     #[must_use]
     pub fn name(&self) -> &str {
-        &self.name
+        let Field { name, .. } = self;
+        name.as_str()
     }
 
     #[must_use]
     pub fn kind(&self) -> &Kind {
-        &self.kind
+        let Field { kind, .. } = self;
+        kind
     }
 
     #[must_use]
     pub fn fields(&self) -> Option<&[Field]> {
-        self.fields.as_deref()
+        let Field { fields, .. } = self;
+        fields.as_deref()
     }
 
     #[must_use]
     pub fn versions(&self) -> VersionRange {
-        self.versions
+        let Field { versions, .. } = self;
+        *versions
     }
 
     #[must_use]
     pub fn nullable(&self) -> Option<VersionRange> {
-        self.nullable
+        let Field { nullable, .. } = self;
+        *nullable
     }
 
     #[must_use]
     pub fn tagged(&self) -> Option<VersionRange> {
-        self.tagged
+        let Field { tagged, .. } = self;
+        *tagged
     }
 
     #[must_use]
     pub fn tag(&self) -> Option<u32> {
-        self.tag
+        let Field { tag, .. } = self;
+        *tag
     }
 
     #[must_use]
     pub fn about(&self) -> Option<&str> {
-        self.about.as_deref()
+        let Field { about, .. } = self;
+        about.as_deref()
     }
 
     #[must_use]
     pub fn has_tags(&self) -> bool {
-        self.tagged.is_some()
+        self.tagged().is_some()
     }
 
     #[must_use]
     pub fn has_records(&self) -> bool {
-        self.kind.0 == "records"
-            || self
-                .fields()
-                .is_some_and(|fields| fields.iter().any(Field::has_records))
+        let nested = self.fields().unwrap_or_default();
+        self.kind.name() == "records" || nested.iter().any(Field::has_records)
     }
 
     #[must_use]
     pub fn has_float(&self) -> bool {
-        self.kind().is_float()
-            || self
-                .fields()
-                .is_some_and(|fields| fields.iter().any(Field::has_float))
+        let nested = self.fields().unwrap_or_default();
+        self.kind.is_float() || nested.iter().any(Field::has_float)
     }
 }
 
@@ -475,109 +503,38 @@ impl<'a> TryFrom<&Wv<'a>> for Field {
     type Error = Error;
 
     fn try_from(value: &Wv<'a>) -> Result<Self, Self::Error> {
-        let name = value.as_a("name")?;
-        let kind = value.as_a("type")?;
-        let about = value.as_option("about")?;
-        let versions = value.as_a("versions")?;
-        let map_key = value.as_option("mapKey")?;
-        let nullable = value.as_option("nullableVersions")?;
-        let tag = value.as_option("tag")?;
-        let tagged = value.as_option("taggedVersions")?;
-        let entity_type = value.as_option("entityType")?;
-        let default = value.as_option("default")?;
-
-        let fields = value
-            .as_option("fields")?
-            .map_or(Ok(None), |values: &[Value]| {
-                values
-                    .iter()
-                    .try_fold(Vec::new(), |mut acc, field| {
-                        Field::try_from(&Wv::from(field)).map(|f| {
-                            acc.push(f);
-                            acc
-                        })
-                    })
-                    .map(Some)
-            })?;
-
-        Ok(Field {
-            name,
-            kind,
-            about,
-            versions,
-            map_key,
-            nullable,
-            tag,
-            tagged,
-            entity_type,
-            default,
-            fields,
-        })
+        let mut field = Field {
+            name: value.as_a("name")?,
+            kind: value.as_a("type")?,
+            about: value.as_option("about")?,
+            versions: value.as_a("versions")?,
+            map_key: value.as_option("mapKey")?,
+            nullable: value.as_option("nullableVersions")?,
+            tag: value.as_option("tag")?,
+            tagged: value.as_option("taggedVersions")?,
+            entity_type: value.as_option("entityType")?,
+            default: value.as_option("default")?,
+            fields: None,
+        };
+        let nested: Option<&[Value]> = value.as_option("fields")?;
+        if let Some(values) = nested {
+            let parse = |nested: &Value| Field::try_from(&Wv::from(nested));
+            field.fields = Some(parsed_all(values, parse)?);
+        }
+        Ok(field)
     }
 }
 
 fn is_reserved_keyword(s: &str) -> bool {
-    lazy_static! {
-        static ref RESERVED: Vec<&'static str> = vec!["as",
-        "break",
-        "const",
-        "continue",
-        "crate",
-        "else",
-        "enum",
-        "extern",
-        "false",
-        "fn",
-        "for",
-        "if",
-        "impl",
-        "in",
-        "let",
-        "loop",
-        "match",
-        "mod",
-        "move",
-        "mut",
-        "pub",
-        "ref",
-        "return",
-        "self",
-        "Self",
-        "static",
-        "struct",
-        "super",
-        "trait",
-        "true",
-        "type",
-        "unsafe",
-        "use",
-        "where",
-        "while",
-
-        // 2018 edition
-        "async",
-        "await",
-        "dyn",
-
-        // reserved
-        "abstract",
-        "become",
-        "box",
-        "do",
-        "final",
-        "macro",
-        "override",
-        "priv",
-        "typeof",
-        "unsized",
-        "virtual",
-        "yield",
-
-        // reserved 2018 edition
-        "try",
-        ];
-    }
-
+    /// Rust's strict keywords, the ones reserved for later, and those the 2018
+    /// edition added to both: a field named after one becomes a raw identifier.
+    const RESERVED: &[&str] = &[
+        "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum",
+        "extern", "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move",
+        "mut", "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait",
+        "true", "type", "unsafe", "use", "where", "while", "abstract", "become", "box", "do",
+        "final", "macro", "override", "priv", "try", "typeof", "unsized", "virtual", "yield",
+    ];
     RESERVED.contains(&s)
 }
 
@@ -595,61 +552,70 @@ pub struct Message {
 impl Message {
     #[must_use]
     pub fn api_key(&self) -> i16 {
-        self.api_key
+        let Message { api_key, .. } = self;
+        *api_key
     }
 
     #[must_use]
     pub fn kind(&self) -> MessageKind {
-        self.kind
+        let Message { kind, .. } = self;
+        *kind
     }
 
     #[must_use]
     pub fn name(&self) -> &str {
-        &self.name
+        let Message { name, .. } = self;
+        name.as_str()
     }
 
     #[must_use]
     #[allow(clippy::missing_panics_doc, clippy::unwrap_used)]
     pub fn type_name(&self) -> Type {
-        syn::parse_str::<Type>(&self.name).unwrap()
+        let parsed = syn::parse_str::<Type>(self.name());
+        parsed.unwrap()
     }
 
     #[must_use]
     pub fn version(&self) -> Version {
-        self.versions
+        let Message { versions, .. } = self;
+        *versions
     }
 
     #[must_use]
     pub fn listeners(&self) -> Option<&[Listener]> {
-        self.listeners.as_deref()
+        let Message { listeners, .. } = self;
+        listeners.as_deref()
     }
 
     #[must_use]
     pub fn fields(&self) -> &[Field] {
-        &self.fields
+        let Message { fields, .. } = self;
+        fields.as_slice()
     }
 
     #[must_use]
     pub fn common_structs(&self) -> Option<&[CommonStruct]> {
-        self.common_structs.as_deref()
+        let Message { common_structs, .. } = self;
+        common_structs.as_deref()
     }
 
     #[must_use]
     pub fn has_records(&self) -> bool {
-        self.fields().iter().any(Field::has_records)
+        let fields = self.fields();
+        fields.iter().any(Field::has_records)
     }
 
     #[must_use]
     pub fn has_tags(&self) -> bool {
-        self.fields().iter().any(Field::has_tags)
+        let fields = self.fields();
+        fields.iter().any(Field::has_tags)
     }
 
     #[must_use]
     pub fn has_float(&self) -> bool {
-        self.fields.iter().any(|field| field.kind().is_float())
-            || self
-                .common_structs()
-                .is_some_and(|structures| structures.iter().any(CommonStruct::has_float))
+        let floating = |field: &Field| field.kind().is_float();
+        let shared = self.common_structs().unwrap_or_default();
+        self.fields.iter().any(floating) || shared.iter().any(CommonStruct::has_float)
     }
 }
 
@@ -660,46 +626,24 @@ impl<'a> TryFrom<&Wv<'a>> for Message {
         let api_key = value.as_a("apiKey")?;
         let name = value.as_a("name")?;
         let kind = value.as_a("type")?;
-        let listeners = value
-            .as_option("listeners")?
-            .map_or(Ok(None), |maybe: &[Value]| {
-                maybe
-                    .iter()
-                    .try_fold(Vec::new(), |mut acc, listener| {
-                        Listener::try_from(listener).map(|l| {
-                            acc.push(l);
-                            acc
-                        })
-                    })
-                    .map(Some)
-            })?;
-
-        let fields = value.as_a("fields").and_then(|fields: &[Value]| {
-            fields.iter().try_fold(Vec::new(), |mut acc, field| {
-                Field::try_from(&Wv::from(field)).map(|f| {
-                    acc.push(f);
-                    acc
-                })
-            })
-        })?;
-
+        let listed: Option<&[Value]> = value.as_option("listeners")?;
+        let listeners = match listed {
+            Some(values) => Some(parsed_all(values, |listener| Listener::try_from(listener))?),
+            None => None,
+        };
+        let declared: &[Value] = value.as_a("fields")?;
+        let fields = parsed_all(declared, |field| Field::try_from(&Wv::from(field)))?;
         let versions = Version::try_from(value)?;
-        let common_structs =
-            value
-                .as_option("commonStructs")?
-                .map_or(Ok(None), |maybe: &[Value]| {
-                    maybe
-                        .iter()
-                        .try_fold(Vec::new(), |mut acc, value| {
-                            CommonStruct::try_from(&Wv::from(value)).map(|field| {
-                                acc.push(field);
-                                acc
-                            })
-                        })
-                        .map(Some)
-                })?;
+        let shared: Option<&[Value]> = value.as_option("commonStructs")?;
+        let common_structs = match shared {
+            Some(values) => {
+                let parse = |value: &Value| CommonStruct::try_from(&Wv::from(value));
+                Some(parsed_all(values, parse)?)
+            }
+            None => None,
+        };
 
-        Ok(Self {
+        Ok(Message {
             api_key,
             kind,
             listeners,
@@ -720,23 +664,27 @@ pub struct CommonStruct {
 impl CommonStruct {
     #[must_use]
     pub fn name(&self) -> &str {
-        self.name.as_str()
+        let CommonStruct { name, .. } = self;
+        name
     }
 
     #[must_use]
     #[allow(clippy::missing_panics_doc)]
     pub fn type_name(&self) -> Type {
-        syn::parse_str::<Type>(&self.name).unwrap_or_else(|_| panic!("not a type: {self:?}"))
+        let parsed = syn::parse_str::<Type>(self.name());
+        parsed.unwrap_or_else(|_| panic!("not a type: {self:?}"))
     }
 
     #[must_use]
     pub fn fields(&self) -> &Vec<Field> {
-        &self.fields
+        let CommonStruct { fields, .. } = self;
+        fields
     }
 
     #[must_use]
     pub fn has_float(&self) -> bool {
-        self.fields.iter().any(|field| field.kind().is_float())
+        let floating = |field: &Field| field.kind().is_float();
+        self.fields().iter().any(floating)
     }
 }
 
@@ -745,16 +693,9 @@ impl<'a> TryFrom<&Wv<'a>> for CommonStruct {
 
     fn try_from(value: &Wv<'a>) -> Result<Self, Self::Error> {
         let name = value.as_a("name")?;
-        let fields = value.as_a("fields").and_then(|fields: &[Value]| {
-            fields.iter().try_fold(Vec::new(), |mut acc, field| {
-                Field::try_from(&Wv::from(field)).map(|f| {
-                    acc.push(f);
-                    acc
-                })
-            })
-        })?;
-
-        Ok(Self { name, fields })
+        let declared: &[Value] = value.as_a("fields")?;
+        let fields = parsed_all(declared, |field| Field::try_from(&Wv::from(field)))?;
+        Ok(CommonStruct { name, fields })
     }
 }
 
@@ -776,38 +717,29 @@ pub struct MessageMeta {
 impl MessageMeta {
     #[must_use]
     pub fn is_flexible(&self, version: i16) -> bool {
-        self.version.flexible.within(version)
+        let flexible = self.version.flexible();
+        flexible.within(version)
     }
 
     #[must_use]
     pub fn structures(&self) -> Vec<(&str, &FieldMeta)> {
-        self.fields
-            .iter()
-            .filter(|(_, fm)| fm.is_structure())
-            .flat_map(|(name, fm)| {
-                debug!(name = self.name, field = ?name, kind = ?fm.kind.0);
-
-                let mut children = fm.structures();
-
-                if let Some(kind) = fm.kind.kind_of_sequence() {
-                    if !kind.is_primitive() {
-                        children.push((kind.name(), *fm));
-                    }
-                } else {
-                    children.push((fm.kind.name(), *fm));
-                }
-
-                children
-            })
-            .collect()
+        let mut found = Vec::new();
+        for (name, meta) in self.fields.iter().filter(|(_, meta)| meta.is_structure()) {
+            debug!(name = self.name, field = ?name, kind = ?meta.kind.name());
+            found.extend(meta.structures());
+            match meta.kind.kind_of_sequence() {
+                Some(element) if element.is_primitive() => {}
+                Some(element) => found.push((element.name(), *meta)),
+                None => found.push((meta.kind.name(), *meta)),
+            }
+        }
+        found
     }
 
     #[must_use]
     pub fn field(&self, name: &str) -> Option<&'static FieldMeta> {
-        self.fields
-            .iter()
-            .find(|(found, _)| name == *found)
-            .map(|(_, meta)| *meta)
+        let (_, meta) = self.fields.iter().find(|(named, _)| *named == name)?;
+        Some(*meta)
     }
 }
 
@@ -831,46 +763,38 @@ pub struct FieldMeta {
 impl FieldMeta {
     #[must_use]
     pub fn is_nullable(&self, version: i16) -> bool {
-        self.nullable.is_some_and(|range| range.within(version))
+        let nullable = self.nullable;
+        nullable.is_some_and(|range| range.within(version))
     }
 
     #[must_use]
     pub fn is_mandatory(&self, parent: Option<VersionRange>) -> bool {
-        self.version.is_mandatory(parent)
+        let version = self.version;
+        version.is_mandatory(parent)
     }
 
     #[must_use]
     pub fn is_structure(&self) -> bool {
-        self.kind
-            .kind_of_sequence()
-            .is_some_and(|sk| !sk.is_primitive())
-            || !self.fields.is_empty()
+        let element = self.kind.kind_of_sequence();
+        element.is_some_and(|element| !element.is_primitive()) || !self.fields.is_empty()
     }
 
     #[must_use]
     pub fn structures(&self) -> Vec<(&str, &FieldMeta)> {
-        self.fields
-            .iter()
-            .filter(|(_, fm)| fm.is_structure())
-            .flat_map(|(_, fm)| {
-                let mut children = fm.structures();
-
-                if let Some(kind) = fm.kind.kind_of_sequence()
-                    && !kind.is_primitive()
-                {
-                    children.push((kind.name(), *fm));
-                }
-
-                children
-            })
-            .collect()
+        let mut found = Vec::new();
+        for (_, meta) in self.fields.iter().filter(|(_, meta)| meta.is_structure()) {
+            found.extend(meta.structures());
+            let element = meta.kind.kind_of_sequence();
+            if let Some(element) = element.filter(|element| !element.is_primitive()) {
+                found.push((element.name(), *meta));
+            }
+        }
+        found
     }
 
     pub fn field(&self, name: &str) -> Option<&FieldMeta> {
-        self.fields
-            .iter()
-            .find(|field| name == field.0)
-            .map(|(_, meta)| *meta)
+        let (_, meta) = self.fields.iter().find(|(named, _)| *named == name)?;
+        Some(*meta)
     }
 }
 
@@ -880,43 +804,42 @@ pub struct KindMeta(pub &'static str);
 impl KindMeta {
     #[must_use]
     pub fn name(&self) -> &'static str {
-        self.0
+        let KindMeta(spelled) = *self;
+        spelled
     }
 
     #[must_use]
     pub fn is_sequence(&self) -> bool {
-        self.0.starts_with("[]")
+        self.kind_of_sequence().is_some()
     }
 
     #[must_use]
     pub fn is_primitive(&self) -> bool {
-        PRIMITIVE.contains(&self.0)
+        PRIMITIVE.contains(&self.name())
     }
 
     #[must_use]
     pub fn is_string(&self) -> bool {
-        self.0 == "string"
+        self.name() == "string"
     }
 
     #[must_use]
     pub fn is_records(&self) -> bool {
-        self.0 == "records"
+        self.name() == "records"
     }
 
     #[must_use]
     pub fn kind_of_sequence(&self) -> Option<Self> {
-        if self.is_sequence() {
-            Some(Self(&self.0[2..]))
-        } else {
-            None
-        }
+        let element = self.name().strip_prefix("[]")?;
+        Some(KindMeta(element))
     }
 }
 
 fn as_str<'v>(value: &'v Value, name: &str) -> Result<&'v str> {
-    value[name]
-        .as_str()
-        .ok_or(Error::Message(String::from(name)))
+    let Some(spelled) = value[name].as_str() else {
+        return Err(Error::Message(name.to_owned()));
+    };
+    Ok(spelled)
 }
 
 #[cfg(test)]
