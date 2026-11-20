@@ -69,6 +69,7 @@ mod short_region;
 mod stale_out_of_range;
 mod substream_identity;
 mod topic_churn;
+mod txn_overlap;
 mod vanished_footer;
 mod watermark_hint;
 

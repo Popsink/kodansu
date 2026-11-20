@@ -1174,6 +1174,15 @@ fmt:
 # the table-shaped tests (`type_mapping_test`, `version_range_*`) loop over
 # their cases. Only code went, so the ceiling rises.
 #
+#   defork  -21 lines, the object-store engine root rewritten  2814 -> 2814  2.6771 -> 2.6746
+#
+# `tansu-storage/src/dynostore.rs` keeps `DynoStore`, `Meta`, the transaction
+# documents and every impl and signature. `produced`, `overlapping_transactions`
+# and the `TxnDetail` start offsets share `produced_ranges`, and answer the same
+# ranges, the same refusals and the same first clashing epoch per transaction.
+# `dynostore/tests/txn_overlap.rs` (116 lines) pins those three down; it passes
+# on the old body too. The new tests lower the ratio, and the ceiling follows.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1183,7 +1192,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6771" top="12":
+comments ceiling="2.6746" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
