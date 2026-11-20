@@ -12,35 +12,47 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rama::{
-    Context, Layer as _, Service,
-    layer::{MapErrLayer, MapStateLayer},
-};
-use tansu_sans_io::{
-    AddOffsetsToTxnRequest, AddPartitionsToTxnRequest, AlterClientQuotasRequest,
-    AlterUserScramCredentialsRequest, ApiKey as _, ConsumerGroupDescribeRequest, CreateAclsRequest,
-    CreateTopicsRequest, DeleteAclsRequest, DeleteGroupsRequest, DeleteRecordsRequest,
-    DeleteTopicsRequest, DescribeAclsRequest, DescribeClientQuotasRequest, DescribeClusterRequest,
-    DescribeConfigsRequest, DescribeGroupsRequest, DescribeTopicPartitionsRequest,
-    DescribeUserScramCredentialsRequest, EndTxnRequest, FetchRequest, FindCoordinatorRequest,
-    IncrementalAlterConfigsRequest, InitProducerIdRequest, ListGroupsRequest, ListOffsetsRequest,
-    ListPartitionReassignmentsRequest, MetadataRequest, ProduceRequest, TxnOffsetCommitRequest,
-};
+use rama::layer::{MapErrLayer, MapStateLayer};
+use rama::{Context, Layer as _, Service};
+use tansu_sans_io::{AddOffsetsToTxnRequest, AddPartitionsToTxnRequest, AlterClientQuotasRequest};
+use tansu_sans_io::{AlterUserScramCredentialsRequest, ConsumerGroupDescribeRequest};
+use tansu_sans_io::{CreateAclsRequest, CreateTopicsRequest, DeleteAclsRequest};
+use tansu_sans_io::{DeleteGroupsRequest, DeleteRecordsRequest, DeleteTopicsRequest};
+use tansu_sans_io::{DescribeAclsRequest, DescribeClientQuotasRequest, DescribeClusterRequest};
+use tansu_sans_io::{DescribeConfigsRequest, DescribeGroupsRequest};
+use tansu_sans_io::{DescribeTopicPartitionsRequest, DescribeUserScramCredentialsRequest};
+use tansu_sans_io::{EndTxnRequest, FetchRequest, FindCoordinatorRequest};
+use tansu_sans_io::{IncrementalAlterConfigsRequest, InitProducerIdRequest, ListGroupsRequest};
+use tansu_sans_io::{ListOffsetsRequest, ListPartitionReassignmentsRequest, MetadataRequest};
+use tansu_sans_io::{ProduceRequest, TxnOffsetCommitRequest};
 use tansu_service::{Admission, FrameRequestLayer, FrameRouteBuilder, NoResponse};
-use tansu_storage::{
-    AlterClientQuotasService, AlterUserScramCredentialsService, ConsumerGroupDescribeService,
-    CreateAclsService, CreateTopicsService, DeleteAclsService, DeleteGroupsService,
-    DeleteRecordsService, DeleteTopicsService, DescribeAclsService, DescribeClientQuotasService,
-    DescribeClusterService, DescribeConfigsService, DescribeGroupsService,
-    DescribeTopicPartitionsService, DescribeUserScramCredentialsService, FetchService,
-    FindCoordinatorService, IncrementalAlterConfigsService, InitProducerIdService,
-    ListGroupsService, ListOffsetsService, ListPartitionReassignmentsService, MetadataService,
-    OnAdmitted, ProduceService, Storage, TxnAddOffsetsService, TxnAddPartitionService,
-    TxnEndService, TxnOffsetCommitService,
-};
+use tansu_storage::{AlterClientQuotasService, AlterUserScramCredentialsService};
+use tansu_storage::{ConsumerGroupDescribeService, CreateAclsService, CreateTopicsService};
+use tansu_storage::{DeleteAclsService, DeleteGroupsService, DeleteRecordsService};
+use tansu_storage::{DeleteTopicsService, DescribeAclsService, DescribeClientQuotasService};
+use tansu_storage::{DescribeClusterService, DescribeConfigsService, DescribeGroupsService};
+use tansu_storage::{DescribeTopicPartitionsService, DescribeUserScramCredentialsService};
+use tansu_storage::{FetchService, FindCoordinatorService, IncrementalAlterConfigsService};
+use tansu_storage::{InitProducerIdService, ListGroupsService, ListOffsetsService};
+use tansu_storage::{ListPartitionReassignmentsService, MetadataService, OnAdmitted};
+use tansu_storage::{ProduceService, Storage, TxnAddOffsetsService, TxnAddPartitionService};
+use tansu_storage::{TxnEndService, TxnOffsetCommitService};
 use tracing::warn;
 
 use crate::Error;
+
+/// `builder` with a route for `$request`, served by `$service` over
+/// `storage`, its errors made this crate's.
+macro_rules! storage_route {
+    ($builder:expr, $storage:expr, $request:ty, $service:expr) => {{
+        let state = MapStateLayer::new(|_| $storage);
+        let layers = (MapErrLayer::new(Error::from), state);
+        let decoded = (layers, FrameRequestLayer::<$request>::new());
+        let route = decoded.into_layer($service).boxed();
+        let key = <$request as tansu_sans_io::ApiKey>::KEY;
+        $builder.with_route(key, route).map_err(Error::from)
+    }};
+}
 
 /// The [`Storage`]-backed routes, and with them the API keys this broker
 /// advertises: `ApiVersionsService::supported` is derived from the routes
@@ -73,7 +85,7 @@ pub fn services<S>(
 where
     S: Storage + Clone,
 {
-    [
+    let registrations = [
         add_offsets_to_txn,
         add_partitions_to_txn,
         alter_client_quotas,
@@ -103,11 +115,12 @@ where
         metadata,
         produce,
         txn_offset_commit_request,
-    ]
-    .iter()
-    .try_fold(builder, |builder, service| {
-        service(builder, storage.clone())
-    })
+    ];
+    let mut routes = builder;
+    for register in registrations {
+        routes = register(routes, storage.clone())?;
+    }
+    Ok(routes)
 }
 
 pub fn alter_client_quotas<S>(
@@ -117,18 +130,12 @@ pub fn alter_client_quotas<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            AlterClientQuotasRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<AlterClientQuotasRequest>::new(),
-            )
-                .into_layer(AlterClientQuotasService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(
+        builder,
+        storage,
+        AlterClientQuotasRequest,
+        AlterClientQuotasService
+    )
 }
 
 pub fn describe_client_quotas<S>(
@@ -138,18 +145,12 @@ pub fn describe_client_quotas<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            DescribeClientQuotasRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<DescribeClientQuotasRequest>::new(),
-            )
-                .into_layer(DescribeClientQuotasService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(
+        builder,
+        storage,
+        DescribeClientQuotasRequest,
+        DescribeClientQuotasService
+    )
 }
 
 pub fn alter_user_scram_credentials<S>(
@@ -159,18 +160,12 @@ pub fn alter_user_scram_credentials<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            AlterUserScramCredentialsRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<AlterUserScramCredentialsRequest>::new(),
-            )
-                .into_layer(AlterUserScramCredentialsService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(
+        builder,
+        storage,
+        AlterUserScramCredentialsRequest,
+        AlterUserScramCredentialsService
+    )
 }
 
 pub fn describe_user_scram_credentials<S>(
@@ -180,18 +175,12 @@ pub fn describe_user_scram_credentials<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            DescribeUserScramCredentialsRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<DescribeUserScramCredentialsRequest>::new(),
-            )
-                .into_layer(DescribeUserScramCredentialsService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(
+        builder,
+        storage,
+        DescribeUserScramCredentialsRequest,
+        DescribeUserScramCredentialsService
+    )
 }
 
 pub fn create_acls<S>(
@@ -201,18 +190,7 @@ pub fn create_acls<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            CreateAclsRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<CreateAclsRequest>::new(),
-            )
-                .into_layer(CreateAclsService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(builder, storage, CreateAclsRequest, CreateAclsService)
 }
 
 pub fn delete_acls<S>(
@@ -222,18 +200,7 @@ pub fn delete_acls<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            DeleteAclsRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<DeleteAclsRequest>::new(),
-            )
-                .into_layer(DeleteAclsService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(builder, storage, DeleteAclsRequest, DeleteAclsService)
 }
 
 pub fn describe_acls<S>(
@@ -243,18 +210,7 @@ pub fn describe_acls<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            DescribeAclsRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<DescribeAclsRequest>::new(),
-            )
-                .into_layer(DescribeAclsService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(builder, storage, DescribeAclsRequest, DescribeAclsService)
 }
 
 pub fn consumer_group_describe<S>(
@@ -264,18 +220,12 @@ pub fn consumer_group_describe<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            ConsumerGroupDescribeRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<ConsumerGroupDescribeRequest>::new(),
-            )
-                .into_layer(ConsumerGroupDescribeService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(
+        builder,
+        storage,
+        ConsumerGroupDescribeRequest,
+        ConsumerGroupDescribeService
+    )
 }
 
 pub fn create_topics<S>(
@@ -285,18 +235,7 @@ pub fn create_topics<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            CreateTopicsRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<CreateTopicsRequest>::new(),
-            )
-                .into_layer(CreateTopicsService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(builder, storage, CreateTopicsRequest, CreateTopicsService)
 }
 
 pub fn delete_groups<S>(
@@ -306,18 +245,7 @@ pub fn delete_groups<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            DeleteGroupsRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<DeleteGroupsRequest>::new(),
-            )
-                .into_layer(DeleteGroupsService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(builder, storage, DeleteGroupsRequest, DeleteGroupsService)
 }
 
 pub fn delete_records<S>(
@@ -327,18 +255,7 @@ pub fn delete_records<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            DeleteRecordsRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<DeleteRecordsRequest>::new(),
-            )
-                .into_layer(DeleteRecordsService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(builder, storage, DeleteRecordsRequest, DeleteRecordsService)
 }
 
 pub fn delete_topics<S>(
@@ -348,18 +265,7 @@ pub fn delete_topics<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            DeleteTopicsRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<DeleteTopicsRequest>::new(),
-            )
-                .into_layer(DeleteTopicsService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(builder, storage, DeleteTopicsRequest, DeleteTopicsService)
 }
 
 pub fn describe_cluster<S>(
@@ -369,18 +275,12 @@ pub fn describe_cluster<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            DescribeClusterRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<DescribeClusterRequest>::new(),
-            )
-                .into_layer(DescribeClusterService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(
+        builder,
+        storage,
+        DescribeClusterRequest,
+        DescribeClusterService
+    )
 }
 
 pub fn describe_configs<S>(
@@ -390,18 +290,12 @@ pub fn describe_configs<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            DescribeConfigsRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<DescribeConfigsRequest>::new(),
-            )
-                .into_layer(DescribeConfigsService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(
+        builder,
+        storage,
+        DescribeConfigsRequest,
+        DescribeConfigsService
+    )
 }
 
 pub fn describe_groups<S>(
@@ -411,18 +305,12 @@ pub fn describe_groups<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            DescribeGroupsRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<DescribeGroupsRequest>::new(),
-            )
-                .into_layer(DescribeGroupsService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(
+        builder,
+        storage,
+        DescribeGroupsRequest,
+        DescribeGroupsService
+    )
 }
 
 pub fn describe_topic_partitions<S>(
@@ -432,18 +320,12 @@ pub fn describe_topic_partitions<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            DescribeTopicPartitionsRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<DescribeTopicPartitionsRequest>::new(),
-            )
-                .into_layer(DescribeTopicPartitionsService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(
+        builder,
+        storage,
+        DescribeTopicPartitionsRequest,
+        DescribeTopicPartitionsService
+    )
 }
 
 pub fn fetch<S>(
@@ -453,18 +335,7 @@ pub fn fetch<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            FetchRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<FetchRequest>::new(),
-            )
-                .into_layer(FetchService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(builder, storage, FetchRequest, FetchService)
 }
 
 pub fn find_coordinator<S>(
@@ -474,18 +345,12 @@ pub fn find_coordinator<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            FindCoordinatorRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<FindCoordinatorRequest>::new(),
-            )
-                .into_layer(FindCoordinatorService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(
+        builder,
+        storage,
+        FindCoordinatorRequest,
+        FindCoordinatorService
+    )
 }
 
 pub fn incremental_alter_configs<S>(
@@ -495,18 +360,12 @@ pub fn incremental_alter_configs<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            IncrementalAlterConfigsRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<IncrementalAlterConfigsRequest>::new(),
-            )
-                .into_layer(IncrementalAlterConfigsService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(
+        builder,
+        storage,
+        IncrementalAlterConfigsRequest,
+        IncrementalAlterConfigsService
+    )
 }
 
 pub fn init_producer_id<S>(
@@ -516,18 +375,12 @@ pub fn init_producer_id<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            InitProducerIdRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<InitProducerIdRequest>::new(),
-            )
-                .into_layer(InitProducerIdService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(
+        builder,
+        storage,
+        InitProducerIdRequest,
+        InitProducerIdService
+    )
 }
 
 pub fn list_groups<S>(
@@ -537,18 +390,7 @@ pub fn list_groups<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            ListGroupsRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<ListGroupsRequest>::new(),
-            )
-                .into_layer(ListGroupsService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(builder, storage, ListGroupsRequest, ListGroupsService)
 }
 
 pub fn list_offsets<S>(
@@ -558,18 +400,7 @@ pub fn list_offsets<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            ListOffsetsRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<ListOffsetsRequest>::new(),
-            )
-                .into_layer(ListOffsetsService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(builder, storage, ListOffsetsRequest, ListOffsetsService)
 }
 
 pub fn list_partition_reassignments<S>(
@@ -579,18 +410,12 @@ pub fn list_partition_reassignments<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            ListPartitionReassignmentsRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<ListPartitionReassignmentsRequest>::new(),
-            )
-                .into_layer(ListPartitionReassignmentsService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(
+        builder,
+        storage,
+        ListPartitionReassignmentsRequest,
+        ListPartitionReassignmentsService
+    )
 }
 
 pub fn metadata<S>(
@@ -600,18 +425,7 @@ pub fn metadata<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            MetadataRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<MetadataRequest>::new(),
-            )
-                .into_layer(MetadataService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(builder, storage, MetadataRequest, MetadataService)
 }
 
 /// Kafka's `acks=0`: the request is served and **not answered** (#440).
@@ -689,18 +503,7 @@ pub fn produce<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            ProduceRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<ProduceRequest>::new(),
-            )
-                .into_layer(Acks(ProduceService))
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(builder, storage, ProduceRequest, Acks(ProduceService))
 }
 
 pub fn add_offsets_to_txn<S>(
@@ -710,18 +513,12 @@ pub fn add_offsets_to_txn<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            AddOffsetsToTxnRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<AddOffsetsToTxnRequest>::new(),
-            )
-                .into_layer(TxnAddOffsetsService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(
+        builder,
+        storage,
+        AddOffsetsToTxnRequest,
+        TxnAddOffsetsService
+    )
 }
 
 pub fn add_partitions_to_txn<S>(
@@ -731,18 +528,12 @@ pub fn add_partitions_to_txn<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            AddPartitionsToTxnRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<AddPartitionsToTxnRequest>::new(),
-            )
-                .into_layer(TxnAddPartitionService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(
+        builder,
+        storage,
+        AddPartitionsToTxnRequest,
+        TxnAddPartitionService
+    )
 }
 
 /// `EndTxn` (api key 26): commit or abort a transaction.
@@ -759,18 +550,7 @@ pub fn end_txn<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            EndTxnRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<EndTxnRequest>::new(),
-            )
-                .into_layer(TxnEndService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(builder, storage, EndTxnRequest, TxnEndService)
 }
 
 pub fn txn_offset_commit_request<S>(
@@ -780,16 +560,10 @@ pub fn txn_offset_commit_request<S>(
 where
     S: Storage + Clone,
 {
-    builder
-        .with_route(
-            TxnOffsetCommitRequest::KEY,
-            (
-                MapErrLayer::new(Error::from),
-                MapStateLayer::new(|_| storage),
-                FrameRequestLayer::<TxnOffsetCommitRequest>::new(),
-            )
-                .into_layer(TxnOffsetCommitService)
-                .boxed(),
-        )
-        .map_err(Into::into)
+    storage_route!(
+        builder,
+        storage,
+        TxnOffsetCommitRequest,
+        TxnOffsetCommitService
+    )
 }
