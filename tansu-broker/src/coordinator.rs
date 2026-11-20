@@ -15,7 +15,7 @@
 use rama::{Context, Layer, Service};
 use tansu_sans_io::{ApiKey, Body, Frame};
 
-use crate::coordinator::group::Coordinator;
+use self::group::Coordinator;
 
 pub mod group;
 
@@ -43,8 +43,9 @@ where
     type Error = S::Error;
 
     async fn serve(&self, ctx: Context<State>, req: Frame) -> Result<Self::Response, Self::Error> {
-        let (ctx, _) = ctx.swap_state(self.coordinator.clone());
-        self.inner.serve(ctx, req).await.map(Into::into)
+        let (coordinated, _) = ctx.swap_state(self.coordinator.clone());
+        let response = self.inner.serve(coordinated, req).await?;
+        Ok(response.into())
     }
 }
 
@@ -55,7 +56,7 @@ pub struct CoordinatorLayer<C> {
 
 impl<C> CoordinatorLayer<C> {
     pub fn new(coordinator: C) -> Self {
-        Self { coordinator }
+        CoordinatorLayer { coordinator }
     }
 }
 
@@ -66,9 +67,7 @@ where
     type Service = CoordinatorService<C, S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        Self::Service {
-            coordinator: self.coordinator.clone(),
-            inner,
-        }
+        let coordinator = self.coordinator.clone();
+        CoordinatorService { coordinator, inner }
     }
 }

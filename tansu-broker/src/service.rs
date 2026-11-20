@@ -14,19 +14,17 @@
 
 use std::sync::Arc;
 
-use rama::Layer;
+use rama::Layer as _;
 use rsasl::config::SASLConfig;
-use tansu_service::{
-    BytesFrameLayer, BytesFrameService, FrameRouteService, TcpBytesLayer, TcpBytesService,
-    TcpContext, TcpContextLayer, TcpContextService,
-};
+use tansu_service::{BytesFrameLayer, BytesFrameService, FrameRouteService, TcpBytesLayer};
+use tansu_service::{TcpBytesService, TcpContext, TcpContextLayer, TcpContextService};
 use tansu_storage::{Authorizer, QuotaEnforcer, Storage};
-
-use crate::service::principal::{RequesterLayer, RequesterService};
-use crate::service::quota::{QuotaLayer, QuotaService};
 use tracing::debug;
 
-use crate::{Error, Result, coordinator::group::Coordinator};
+use self::principal::{RequesterLayer, RequesterService};
+use self::quota::{QuotaLayer, QuotaService};
+use crate::coordinator::group::Coordinator;
+use crate::{Error, Result};
 
 pub mod auth;
 pub mod coordinator;
@@ -71,24 +69,23 @@ where
     S: Storage + Clone,
     C: Coordinator,
 {
-    storage::services(FrameRouteService::<(), Error>::builder(), storage)
-        .inspect(|builder| debug!(?builder))
-        .and_then(|builder| {
-            coordinator::services(builder, coordinator).inspect(|builder| debug!(?builder))
-        })
-        .and_then(auth::services)
-        .and_then(|builder| builder.build().map_err(Into::into))
-        .map(|route| {
-            (
-                TcpContextLayer::new(tcp),
-                TcpBytesLayer::default(),
-                BytesFrameLayer::default().with_sasl_config(sasl_config),
-                RequesterLayer::new(authorizer),
-                // Immediately inside the layer that says who is asking, and
-                // outside every API's own service: a quota is a property of the
-                // principal, not of the produce path (#384).
-                QuotaLayer::new(enforcer),
-            )
-                .into_layer(route)
-        })
+    let routes = FrameRouteService::<(), Error>::builder();
+    let routes = storage::services(routes, storage)?;
+    debug!(builder = ?routes);
+    let routes = coordinator::services(routes, coordinator)?;
+    debug!(builder = ?routes);
+    let route = auth::services(routes)?.build()?;
+
+    let connection = (TcpContextLayer::new(tcp), TcpBytesLayer::default());
+    let framing = BytesFrameLayer::default().with_sasl_config(sasl_config);
+    let layers = (
+        connection,
+        framing,
+        RequesterLayer::new(authorizer),
+        // Immediately inside the layer that says who is asking, and
+        // outside every API's own service: a quota is a property of the
+        // principal, not of the produce path (#384).
+        QuotaLayer::new(enforcer),
+    );
+    Ok(layers.into_layer(route))
 }

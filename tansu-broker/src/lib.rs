@@ -12,22 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    fmt, io,
-    net::AddrParseError,
-    num::TryFromIntError,
-    result,
-    str::FromStr,
-    sync::{Arc, LazyLock, PoisonError},
-    time::{Duration, SystemTimeError},
-};
+use std::net::AddrParseError;
+use std::num::TryFromIntError;
+use std::str::FromStr;
+use std::sync::{Arc, LazyLock, PoisonError};
+use std::time::{Duration, SystemTimeError};
+use std::{fmt, io, result};
 
-use opentelemetry::{InstrumentationScope, global, metrics::Meter};
+use opentelemetry::metrics::Meter;
+use opentelemetry::{InstrumentationScope, global};
 use opentelemetry_otlp::ExporterBuildError;
 use opentelemetry_semantic_conventions::SCHEMA_URL;
 use tansu_sans_io::ErrorCode;
-use thiserror::Error;
-use tokio::{sync::broadcast::error::SendError, task::JoinError};
+use tokio::sync::broadcast::error::SendError;
+use tokio::task::JoinError;
 use tracing_subscriber::filter::ParseError;
 
 pub mod broker;
@@ -55,10 +53,11 @@ pub enum CancelKind {
 /// `Interrupt` is a human at a terminal who wants out now, and gets it.
 impl From<CancelKind> for Duration {
     fn from(cancellation: CancelKind) -> Self {
-        match cancellation {
-            CancelKind::Interrupt => Duration::ZERO,
-            CancelKind::Terminate => Duration::from_secs(35),
-        }
+        let patience_secs = match cancellation {
+            CancelKind::Interrupt => 0,
+            CancelKind::Terminate => 35,
+        };
+        Duration::from_secs(patience_secs)
     }
 }
 
@@ -81,15 +80,12 @@ pub const CONNECTIONS_MAX_IDLE: Duration = tansu_service::TcpContext::CONNECTION
 pub use tansu_service::Keepalive;
 
 pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {
-    global::meter_with_scope(
-        InstrumentationScope::builder(env!("CARGO_PKG_NAME"))
-            .with_version(env!("CARGO_PKG_VERSION"))
-            .with_schema_url(SCHEMA_URL)
-            .build(),
-    )
+    let scope = InstrumentationScope::builder(env!("CARGO_PKG_NAME"));
+    let scope = scope.with_version(env!("CARGO_PKG_VERSION"));
+    global::meter_with_scope(scope.with_schema_url(SCHEMA_URL).build())
 });
 
-#[derive(Clone, Debug, Error)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
     AddrParse(#[from] AddrParseError),
     Api(ErrorCode),
@@ -172,55 +168,61 @@ impl tansu_service::Classify for Error {
 
 impl From<JoinError> for Error {
     fn from(value: JoinError) -> Self {
-        Self::Join(Arc::new(value))
+        let shared = Arc::new(value);
+        Error::Join(shared)
     }
 }
 
 impl From<serde_json::Error> for Error {
     fn from(value: serde_json::Error) -> Self {
-        Self::from(Arc::new(value))
+        let shared = Arc::new(value);
+        Error::from(shared)
     }
 }
 
 impl From<Arc<serde_json::Error>> for Error {
     fn from(value: Arc<serde_json::Error>) -> Self {
-        Self::Json(value)
+        Error::Json(value)
     }
 }
 
 impl From<ExporterBuildError> for Error {
     fn from(value: ExporterBuildError) -> Self {
-        Self::ExporterBuild(Arc::new(value))
+        let shared = Arc::new(value);
+        Error::ExporterBuild(shared)
     }
 }
 
 impl From<SendError<CancelKind>> for Error {
     fn from(value: SendError<CancelKind>) -> Self {
-        Self::Send(Arc::new(value))
+        let shared = Arc::new(value);
+        Error::Send(shared)
     }
 }
 
 impl From<ParseError> for Error {
     fn from(value: ParseError) -> Self {
-        Self::ParseFilter(Arc::new(value))
+        let shared = Arc::new(value);
+        Error::ParseFilter(shared)
     }
 }
 
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {
-        Self::Io(Arc::new(value))
+        let shared = Arc::new(value);
+        Error::Io(shared)
     }
 }
 
 impl<T> From<PoisonError<T>> for Error {
     fn from(_value: PoisonError<T>) -> Self {
-        Self::Poison
+        Error::Poison
     }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        f.write_fmt(format_args!("{self:?}"))
     }
 }
 
@@ -236,11 +238,12 @@ impl FromStr for TracingFormat {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "text" => Ok(Self::Text),
-            "json" => Ok(Self::Json),
-            otherwise => Err(Error::UnsupportedTracingFormat(otherwise.to_owned())),
-        }
+        let format = match s {
+            "text" => TracingFormat::Text,
+            "json" => TracingFormat::Json,
+            unknown => return Err(Error::UnsupportedTracingFormat(String::from(unknown))),
+        };
+        Ok(format)
     }
 }
 
