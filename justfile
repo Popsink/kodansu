@@ -1139,6 +1139,14 @@ fmt:
 # and assignments, still only when debug is on. Only code went, so the ceiling
 # rises.
 #
+#   defork  +3 lines, the model's error type rewritten  2817 -> 2817  2.6696 -> 2.6696
+#
+# `tansu-model/src/error.rs` keeps `Error`, every variant and every impl and
+# signature. The `From` impls wrap the same values, `custom` formats the same
+# message, and `Display` writes a `Message` as itself and anything else as its
+# `Debug`, as before. Three lines more code lowers the ratio a hair, under
+# the ceiling #734 set, so the ceiling stays.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.

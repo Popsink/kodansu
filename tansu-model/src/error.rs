@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{
-    fmt::{self, Display},
-    io, num, str, string,
-    sync::Arc,
-};
+use std::fmt::{self, Display};
+use std::sync::Arc;
+use std::{io, num, str, string};
 
-use serde::{de, ser};
+use serde::de;
+use serde::ser;
 
 #[derive(Clone, Debug)]
 pub enum Error {
@@ -43,69 +42,73 @@ impl std::error::Error for Error {}
 
 impl ser::Error for Error {
     fn custom<T: Display>(msg: T) -> Self {
-        Error::Message(msg.to_string())
+        let text = format!("{msg}");
+        Error::Message(text)
     }
 }
 
 impl de::Error for Error {
     fn custom<T: Display>(msg: T) -> Self {
-        Error::Message(msg.to_string())
+        let text = format!("{msg}");
+        Error::Message(text)
     }
 }
 
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {
-        Self::Io(Arc::new(value))
+        let shared = Arc::new(value);
+        Error::Io(shared)
     }
 }
 
 impl From<str::Utf8Error> for Error {
     fn from(value: str::Utf8Error) -> Self {
-        Self::Utf8(value)
+        Error::Utf8(value)
     }
 }
 
 impl From<string::FromUtf8Error> for Error {
     fn from(value: string::FromUtf8Error) -> Self {
-        Self::FromUtf8(value)
+        Error::FromUtf8(value)
     }
 }
 
 impl From<num::TryFromIntError> for Error {
     fn from(value: num::TryFromIntError) -> Self {
-        Self::TryFromInt(value)
+        Error::TryFromInt(value)
     }
 }
 
 impl From<str::ParseBoolError> for Error {
     fn from(value: str::ParseBoolError) -> Self {
-        Self::ParseBool(value)
+        Error::ParseBool(value)
     }
 }
 
 impl From<num::ParseIntError> for Error {
     fn from(value: num::ParseIntError) -> Self {
-        Self::ParseInt(value)
+        Error::ParseInt(value)
     }
 }
 
 impl From<serde_json::Error> for Error {
     fn from(value: serde_json::Error) -> Self {
-        Self::Json(Arc::new(value))
+        let shared = Arc::new(value);
+        Error::Json(shared)
     }
 }
 
 impl From<syn::Error> for Error {
     fn from(value: syn::Error) -> Self {
-        Self::Syn(value)
+        Error::Syn(value)
     }
 }
 
 impl Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Error::Message(e) => f.write_str(e),
-            e => write!(f, "{e:?}"),
-        }
+        let Error::Message(text) = self else {
+            return f.write_fmt(format_args!("{self:?}"));
+        };
+        f.write_str(text)
     }
 }
