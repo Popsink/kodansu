@@ -15,47 +15,39 @@
 
 pub mod group;
 
-use crate::{
-    CancelKind, METER, Result,
-    coordinator::group::{ConsumerGroupConfig, Coordinator, administrator::Controller},
-    otel,
-    service::services,
-};
+use std::future::{Future, pending};
+use std::io;
+use std::marker::PhantomData;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::str::FromStr as _;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use console::Term;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use opentelemetry::metrics::{Counter, Histogram};
-use rama::{Context, Service};
+use rama::{Context, Service as _};
 use rsasl::config::SASLConfig;
 use rustls::ServerConfig;
-use std::{
-    future::{Future, pending},
-    io,
-    marker::PhantomData,
-    net::{IpAddr, Ipv6Addr, SocketAddr},
-    str::FromStr,
-    sync::{
-        Arc, LazyLock,
-        atomic::{AtomicBool, Ordering},
-    },
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
 use tansu_sans_io::{ErrorCode, RootMessageMeta};
 use tansu_service::{Classify as _, Keepalive, Peer, Severity, TcpContext};
-use tansu_storage::{
-    ArcDynStorage, Authorizer, BrokerRegistrationRequest, QuotaEnforcer, QuotaLimits, Storage,
-    StorageContainer, TopicDefaults,
-};
-use tokio::{
-    net::{TcpListener, TcpStream},
-    signal::unix::{SignalKind, signal},
-    task::JoinSet,
-    time::{self, Instant, MissedTickBehavior, sleep},
-};
+use tansu_storage::{ArcDynStorage, Authorizer, BrokerRegistrationRequest, QuotaEnforcer};
+use tansu_storage::{QuotaLimits, Storage, StorageContainer, TopicDefaults};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::task::JoinSet;
+use tokio::time::{self, Instant, MissedTickBehavior, sleep};
 use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, Level, debug, error, span, warn};
+use tracing::{Instrument as _, debug, error, warn};
 use url::Url;
 use uuid::Uuid;
+
+use crate::coordinator::group::administrator::Controller;
+use crate::coordinator::group::{ConsumerGroupConfig, Coordinator};
+use crate::service::services;
+use crate::{CancelKind, METER, Result, otel};
 
 /// Maintenance passes that failed at the top, by reason.
 ///
@@ -322,7 +314,7 @@ where
         groups: G,
         incarnation_id: Uuid,
     ) -> Self {
-        Self {
+        Broker {
             node_id,
             cluster_id: cluster_id.to_owned(),
             incarnation_id,
@@ -351,95 +343,72 @@ where
     }
 
     pub fn builder() -> PhantomBuilder {
-        Builder::default()
+        PhantomBuilder::default()
     }
 
     pub async fn main(mut self, started: Instant) -> Result<ErrorCode> {
-        {
-            let root_meta = RootMessageMeta::messages();
-            debug!(
-                messages = root_meta
-                    .requests()
-                    .values()
-                    .map(|meta| meta.name)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
+        let requests = RootMessageMeta::messages().requests();
+        let names: Vec<&str> = requests.values().map(|meta| meta.name).collect();
+        debug!(messages = names.join(", "));
 
-        let mut set = JoinSet::new();
-
-        let mut interrupt_signal = signal(SignalKind::interrupt()).unwrap();
-        debug!(?interrupt_signal);
-
-        let mut terminate_signal = signal(SignalKind::terminate()).unwrap();
-        debug!(?terminate_signal);
+        let mut tasks = JoinSet::new();
+        let mut interrupts = signal(SignalKind::interrupt()).unwrap();
+        debug!(interrupt_signal = ?interrupts);
+        let mut terminations = signal(SignalKind::terminate()).unwrap();
+        debug!(terminate_signal = ?terminations);
 
         let silent = self.silent;
-
         let token = self.cancellation.clone();
-
-        _ = set.spawn(async move {
-            self.serve(started)
-                .await
-                .inspect_err(|err| error!(?err))
-                .unwrap();
+        _ = tasks.spawn(async move {
+            let served = self.serve(started).await;
+            if let Err(err) = &served {
+                error!(err = ?err);
+            }
+            served.unwrap();
         });
 
         let kind = tokio::select! {
-            v = set.join_next() => {
-                debug!(?v);
+            finished = tasks.join_next() => {
+                debug!(v = ?finished);
                 None
             }
-
-            interrupt = interrupt_signal.recv() => {
-                debug!(?interrupt);
+            interrupt = interrupts.recv() => {
+                debug!(interrupt = ?interrupt);
                 Some(CancelKind::Interrupt)
             }
-
-            terminate = terminate_signal.recv() => {
-                debug!(?terminate);
+            terminate = terminations.recv() => {
+                debug!(terminate = ?terminate);
                 Some(CancelKind::Terminate)
             }
         };
+        let Some(kind) = kind else {
+            return Ok(ErrorCode::None);
+        };
 
-        if let Some(kind) = kind {
-            token.cancel();
-
-            let cleanup = async {
-                while !set.is_empty() {
-                    debug!(len = set.len());
-
-                    _ = set.join_next().await;
+        token.cancel();
+        let joined = async {
+            loop {
+                let len = tasks.len();
+                if len == 0 {
+                    break;
                 }
-            };
-
-            let patience = sleep(Duration::from(kind));
-
-            tokio::select! {
-                v = cleanup => {
-                    debug!(?v)
-                }
-
-                _ = patience => {
-                    debug!(aborting = set.len());
-                    set.abort_all();
-
-                    while !set.is_empty() {
-                        _ = set.join_next().await;
-                    }
-                }
+                debug!(len = len);
+                _ = tasks.join_next().await;
             }
-
-            if !silent {
-                let stdout = Term::stdout();
-
-                if stdout.is_term() {
-                    _ = stdout.clear_screen().ok();
-                }
+        };
+        tokio::select! {
+            finished = joined => debug!(v = ?finished),
+            () = sleep(Duration::from(kind)) => {
+                debug!(aborting = tasks.len());
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
             }
         }
 
+        let stdout = Term::stdout();
+        if !silent && stdout.is_term() {
+            _ = stdout.clear_screen().ok();
+        }
         Ok(ErrorCode::None)
     }
 
@@ -457,30 +426,29 @@ where
     }
 
     pub async fn register(&mut self) -> Result<()> {
-        self.storage
-            .register_broker(BrokerRegistrationRequest {
-                broker_id: self.node_id,
-                cluster_id: self.cluster_id.clone(),
-                incarnation_id: self.incarnation_id,
-                rack: None,
-            })
-            .await
-            .map_err(Into::into)
+        let registration = BrokerRegistrationRequest {
+            broker_id: self.node_id,
+            cluster_id: self.cluster_id.clone(),
+            incarnation_id: self.incarnation_id,
+            rack: None,
+        };
+        self.storage.register_broker(registration).await?;
+        Ok(())
     }
 
     pub async fn listen(&self, started: Instant) -> Result<()> {
-        debug!(%self.listener, %self.advertised_listener);
+        tracing::debug!(%self.listener, %self.advertised_listener);
 
         // `Option` so the drain below can drop it. A listener left bound while
         // nothing accepts is worse than one that is gone: the kernel keeps
         // completing handshakes into the backlog, so a client connecting to a
         // stopping replica waits for a response that will never be read
         // instead of being refused and moving on (#361).
-        let mut listener = Some(
-            bind(&self.listener, 9092)
-                .await
-                .inspect_err(|err| error!(?err, %self.advertised_listener))?,
-        );
+        let bound = bind(&self.listener, 9092).await;
+        if let Err(err) = &bound {
+            error!(err = ?err, advertised_listener = %self.advertised_listener);
+        }
+        let mut listener = Some(bound?);
 
         // Upper bound on a single maintenance run so a *hung* pass cannot hold the
         // in-flight guard forever and disable maintenance pod-wide until restart
@@ -560,29 +528,20 @@ where
         let maintenance_in_flight = Arc::new(AtomicBool::new(false));
 
         let mut set = JoinSet::new();
-
         let m = MultiProgress::new();
+        let spinner_style = spinner_style();
 
-        let spinner_style = ProgressStyle::with_template("{prefix:.bold.dim} {spinner} {msg}")
-            .unwrap()
-            .tick_chars("⠁⠂⠄⡀⢀⠠⠐");
-
-        let ls = if self.silent {
-            None
-        } else {
-            println!("ready in {}ms", started.elapsed().as_millis(),);
-
-            let ls = m.add(ProgressBar::new_spinner());
-            ls.set_style(spinner_style.clone());
-
+        let ls = (!self.silent).then(|| {
+            let ready_ms = started.elapsed().as_millis();
+            println!("ready in {ready_ms}ms");
+            let listening = m.add(ProgressBar::new_spinner());
+            listening.set_style(spinner_style.clone());
             if let Some(Ok(local_addr)) = listener.as_ref().map(TcpListener::local_addr) {
-                ls.set_prefix(format!("[{local_addr:?}]"));
+                listening.set_prefix(format!("[{local_addr:?}]"));
             }
-
-            ls.set_message("listening for connection...");
-
-            Some(ls)
-        };
+            listening.set_message("listening for connection...");
+            listening
+        });
 
         // The client listener speaks TLS whenever a certificate is configured,
         // and this is the acceptor that makes it so. It used to be bound to
@@ -598,12 +557,10 @@ where
         let acceptor = self.tls_server_config.clone().map(TlsAcceptor::from);
 
         let mut connections = 0;
-
         loop {
             connections += 1;
-
-            if let Some(ref ls) = ls {
-                ls.tick();
+            if let Some(listening) = &ls {
+                listening.tick();
             }
 
             tokio::select! {
@@ -631,11 +588,11 @@ where
                     {
                         warn!("skipping maintenance tick: previous run still in flight");
                     } else {
-                        let storage = self.storage.clone();
-                        let in_flight = maintenance_in_flight.clone();
+                        let maintained = self.storage.clone();
+                        let in_flight = Arc::clone(&maintenance_in_flight);
 
-                        let handle = set.spawn(async move {
-                            let span = span!(Level::DEBUG, "maintenance");
+                        let spawned = set.spawn(async move {
+                            let span = tracing::debug_span!("maintenance");
 
                             // Bounded so a hung run releases the guard and the next
                             // tick can retry, rather than wedging maintenance
@@ -649,7 +606,7 @@ where
                                 // visible at the level production runs at, plus a
                                 // counter so it does not depend on someone reading
                                 // logs (#284).
-                                _ = storage
+                                _ = maintained
                                     .maintain(SystemTime::now())
                                     .await
                                     .inspect(|maintain| debug!(?maintain))
@@ -678,16 +635,16 @@ where
                             }).instrument(span).await
                         });
 
-                        debug!(?handle);
+                        debug!(handle = ?spawned);
                     }
                 }
 
-                v = set.join_next(), if !set.is_empty() => {
-                    debug!(?v);
+                finished = set.join_next(), if !set.is_empty() => {
+                    debug!(v = ?finished);
                 }
 
-                message = self.cancellation.cancelled() => {
-                    debug!(?message);
+                stopped = self.cancellation.cancelled() => {
+                    debug!(message = ?stopped);
                     break;
                 }
             }
@@ -708,9 +665,12 @@ where
         let draining = Instant::now();
 
         let drain = async {
-            while !set.is_empty() {
-                debug!(in_flight = set.len());
-
+            loop {
+                let in_flight = set.len();
+                if in_flight == 0 {
+                    break;
+                }
+                debug!(in_flight = in_flight);
                 _ = set.join_next().await;
             }
         };
@@ -751,27 +711,26 @@ where
         addr: SocketAddr,
         acceptor: Option<TlsAcceptor>,
     ) -> Result<()> {
-        let mut c = Context::default();
+        let mut ctx = Context::default();
 
         // What `TcpContextService` used to read off the stream with
         // `peer_addr()` — the call that made the service stack `TcpStream`-only
         // and so kept TLS out of it. The accept loop knows the address already.
-        _ = c.insert(Peer(addr));
+        _ = ctx.insert(Peer(addr));
 
-        let pb = if self.silent {
-            None
-        } else {
-            let pb = m.add(ProgressBar::new_spinner());
-            pb.set_style(spinner_style.clone());
-            pb.set_prefix(format!("[{connections}/{addr:?}]"));
-            pb.set_message("connected");
-            pb.tick();
+        let pb = (!self.silent).then(|| {
+            let connected = m.add(ProgressBar::new_spinner());
+            connected.set_style(spinner_style.clone());
+            connected.set_prefix(format!("[{connections}/{addr:?}]"));
+            connected.set_message("connected");
+            connected.tick();
+            connected
+        });
+        if let Some(connected) = &pb {
+            _ = ctx.insert(connected.clone());
+        }
 
-            _ = c.insert(pb.clone());
-            Some(pb)
-        };
-
-        stream.set_nodelay(true)?;
+        TcpStream::set_nodelay(&stream, true)?;
 
         // Warned and served without, not `?`: an error here ends the accept
         // loop, and a peer that resets between `accept` and this call must not
@@ -795,20 +754,20 @@ where
                 // the drain runs out of patience (#361).
                 .drain(self.cancellation.clone()),
             groups,
-            self.storage.clone(),
+            S::clone(&self.storage),
             self.sasl_config.clone(),
             self.authorizer.clone(),
             self.enforcer.clone(),
         )?;
 
-        let handle = set.spawn(async move {
+        let spawned = set.spawn(async move {
             match acceptor {
                 // The handshake runs here, in the connection's own task, and not
                 // in `listen`'s accept loop: a peer that opens a socket and then
                 // says nothing must cost itself, not everything queued behind
                 // `accept`.
                 Some(acceptor) => match acceptor.accept(stream).await {
-                    Ok(stream) => report_connection(service.serve(c, stream).await),
+                    Ok(stream) => report_connection(service.serve(ctx, stream).await),
 
                     // Where a plaintext client on a TLS listener arrives, and
                     // the one event #358's silence left no trace of at all.
@@ -817,15 +776,15 @@ where
                     Err(err) => warn!(%addr, ?err, "TLS handshake failed; refusing the connection"),
                 },
 
-                None => report_connection(service.serve(c, stream).await),
+                None => report_connection(service.serve(ctx, stream).await),
             }
 
-            if let Some(ref pb) = pb {
-                pb.finish_and_clear();
+            if let Some(connected) = &pb {
+                connected.finish_and_clear();
             }
         });
 
-        debug!(?handle);
+        debug!(handle = ?spawned);
 
         Ok(())
     }
@@ -870,38 +829,42 @@ fn report_connection(served: Result<()>) {
             }
         },
 
-        Ok(response) => {
-            debug!(?response)
-        }
+        Ok(()) => debug!(response = ?()),
     }
 }
 
 /// Bind a TCP listener on `url`, falling back to the unspecified address
 /// and/or `default_port` when the URL leaves them out.
 async fn bind(url: &Url, default_port: u16) -> Result<TcpListener> {
-    TcpListener::bind(url.host().map_or_else(
-        || {
-            SocketAddr::from((
-                IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-                url.port().unwrap_or(default_port),
-            ))
-        },
-        |host| {
-            let port = url.port().unwrap_or(default_port);
-            debug!(?host, port);
-
+    let port = url.port().unwrap_or(default_port);
+    let unspecified = SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
+    let address = match url.host() {
+        None => unspecified,
+        Some(host) => {
+            debug!(host = ?host, port = port);
             match host {
-                url::Host::Domain(domain) => SocketAddr::from_str(&format!("{domain}:{port}"))
-                    .unwrap_or(SocketAddr::from((IpAddr::V6(Ipv6Addr::UNSPECIFIED), port))),
-                url::Host::Ipv4(ipv4_addr) => SocketAddr::from((IpAddr::V4(ipv4_addr), port)),
-                url::Host::Ipv6(ipv6_addr) => SocketAddr::from((IpAddr::V6(ipv6_addr), port)),
+                url::Host::Domain(domain) => {
+                    let named = SocketAddr::from_str(&format!("{domain}:{port}"));
+                    named.unwrap_or(unspecified)
+                }
+                url::Host::Ipv4(v4) => SocketAddr::from((IpAddr::V4(v4), port)),
+                url::Host::Ipv6(v6) => SocketAddr::from((IpAddr::V6(v6), port)),
             }
-        },
-    ))
-    .await
-    .inspect(|listener| debug!(%url, listener = ?listener.local_addr().ok()))
-    .inspect_err(|err| error!(?err, %url))
-    .map_err(Into::into)
+        }
+    };
+
+    let bound = TcpListener::bind(address).await;
+    match &bound {
+        Ok(listening) => debug!(url = %url, listener = ?listening.local_addr().ok()),
+        Err(err) => error!(err = ?err, url = %url),
+    }
+    bound.map_err(Into::into)
+}
+
+/// The style of every spinner the listener draws.
+fn spinner_style() -> ProgressStyle {
+    let template = ProgressStyle::with_template("{prefix:.bold.dim} {spinner} {msg}");
+    template.unwrap().tick_chars("⠁⠂⠄⡀⢀⠠⠐")
 }
 
 #[derive(Clone, Debug, Default)]
@@ -972,113 +935,131 @@ type PhantomBuilder = Builder<
 >;
 
 impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
+    /// This builder with its six typestate fields mapped through `retype`,
+    /// every other field carried over as it is.
+    fn retyped<N2, C2, I2, A2, S2, L2>(
+        self,
+        retype: impl FnOnce(N, C, I, A, S, L) -> (N2, C2, I2, A2, S2, L2),
+    ) -> Builder<N2, C2, I2, A2, S2, L2> {
+        let Builder {
+            node_id,
+            cluster_id,
+            incarnation_id,
+            advertised_listener,
+            storage,
+            listener,
+            otlp_endpoint_url,
+            authentication,
+            tls_server_config,
+            silent,
+            maintenance,
+            topic_defaults,
+            super_users,
+            quota_defaults,
+            quota_fleet_size,
+            maximum_frame_size,
+            pipeline_depth,
+            liveness,
+            consumer_group_config,
+            cancellation,
+        } = self;
+        let (node_id, cluster_id, incarnation_id, advertised_listener, storage, listener) = retype(
+            node_id,
+            cluster_id,
+            incarnation_id,
+            advertised_listener,
+            storage,
+            listener,
+        );
+        Builder {
+            node_id,
+            cluster_id,
+            incarnation_id,
+            advertised_listener,
+            storage,
+            listener,
+            otlp_endpoint_url,
+            authentication,
+            tls_server_config,
+            silent,
+            maintenance,
+            topic_defaults,
+            super_users,
+            quota_defaults,
+            quota_fleet_size,
+            maximum_frame_size,
+            pipeline_depth,
+            liveness,
+            consumer_group_config,
+            cancellation,
+        }
+    }
+}
+
+impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
     const MAINTENANCE_INTERVAL: &str = "maintenance_interval";
 
     pub fn node_id(self, node_id: i32) -> Builder<i32, C, I, A, S, L> {
-        Builder {
-            node_id,
-            cluster_id: self.cluster_id,
-            incarnation_id: self.incarnation_id,
-            advertised_listener: self.advertised_listener,
-            storage: self.storage,
-            listener: self.listener,
-            otlp_endpoint_url: self.otlp_endpoint_url,
-            authentication: self.authentication,
-            tls_server_config: self.tls_server_config,
-            silent: self.silent,
-            maintenance: self.maintenance,
-            topic_defaults: self.topic_defaults,
-
-            super_users: self.super_users,
-            quota_defaults: self.quota_defaults,
-            quota_fleet_size: self.quota_fleet_size,
-            maximum_frame_size: self.maximum_frame_size,
-            pipeline_depth: self.pipeline_depth,
-            liveness: self.liveness,
-            consumer_group_config: self.consumer_group_config,
-            cancellation: self.cancellation,
-        }
+        self.retyped(
+            |_, cluster_id, incarnation_id, advertised_listener, storage, listener| {
+                (
+                    node_id,
+                    cluster_id,
+                    incarnation_id,
+                    advertised_listener,
+                    storage,
+                    listener,
+                )
+            },
+        )
     }
 
     pub fn cluster_id(self, cluster_id: impl Into<String>) -> Builder<N, String, I, A, S, L> {
-        Builder {
-            node_id: self.node_id,
-            cluster_id: cluster_id.into(),
-            incarnation_id: self.incarnation_id,
-            advertised_listener: self.advertised_listener,
-            storage: self.storage,
-            listener: self.listener,
-            otlp_endpoint_url: self.otlp_endpoint_url,
-            authentication: self.authentication,
-            tls_server_config: self.tls_server_config,
-            silent: self.silent,
-            maintenance: self.maintenance,
-            topic_defaults: self.topic_defaults,
-
-            super_users: self.super_users,
-            quota_defaults: self.quota_defaults,
-            quota_fleet_size: self.quota_fleet_size,
-            maximum_frame_size: self.maximum_frame_size,
-            pipeline_depth: self.pipeline_depth,
-            liveness: self.liveness,
-            consumer_group_config: self.consumer_group_config,
-            cancellation: self.cancellation,
-        }
+        self.retyped(
+            |node_id, _, incarnation_id, advertised_listener, storage, listener| {
+                (
+                    node_id,
+                    cluster_id.into(),
+                    incarnation_id,
+                    advertised_listener,
+                    storage,
+                    listener,
+                )
+            },
+        )
     }
 
     pub fn incarnation_id(self, incarnation_id: impl Into<Uuid>) -> Builder<N, C, Uuid, A, S, L> {
-        Builder {
-            node_id: self.node_id,
-            cluster_id: self.cluster_id,
-            incarnation_id: incarnation_id.into(),
-            advertised_listener: self.advertised_listener,
-            storage: self.storage,
-            listener: self.listener,
-            otlp_endpoint_url: self.otlp_endpoint_url,
-            authentication: self.authentication,
-            tls_server_config: self.tls_server_config,
-            silent: self.silent,
-            maintenance: self.maintenance,
-            topic_defaults: self.topic_defaults,
-
-            super_users: self.super_users,
-            quota_defaults: self.quota_defaults,
-            quota_fleet_size: self.quota_fleet_size,
-            maximum_frame_size: self.maximum_frame_size,
-            pipeline_depth: self.pipeline_depth,
-            liveness: self.liveness,
-            consumer_group_config: self.consumer_group_config,
-            cancellation: self.cancellation,
-        }
+        self.retyped(
+            |node_id, cluster_id, _, advertised_listener, storage, listener| {
+                (
+                    node_id,
+                    cluster_id,
+                    incarnation_id.into(),
+                    advertised_listener,
+                    storage,
+                    listener,
+                )
+            },
+        )
     }
 
     pub fn advertised_listener(
         self,
         advertised_listener: impl Into<Url>,
     ) -> Builder<N, C, I, Url, S, L> {
-        Builder {
-            node_id: self.node_id,
-            cluster_id: self.cluster_id,
-            incarnation_id: self.incarnation_id,
-            advertised_listener: advertised_listener.into(),
-            storage: self.storage,
-            listener: self.listener,
-            otlp_endpoint_url: self.otlp_endpoint_url,
-            authentication: self.authentication,
-            tls_server_config: self.tls_server_config,
-            silent: self.silent,
-            maintenance: self.maintenance,
-            topic_defaults: self.topic_defaults,
-
-            super_users: self.super_users,
-            quota_defaults: self.quota_defaults,
-            quota_fleet_size: self.quota_fleet_size,
-            maximum_frame_size: self.maximum_frame_size,
-            pipeline_depth: self.pipeline_depth,
-            liveness: self.liveness,
-            consumer_group_config: self.consumer_group_config,
-            cancellation: self.cancellation,
-        }
+        self.retyped(
+            |node_id, cluster_id, incarnation_id, _, storage, listener| {
+                (
+                    node_id,
+                    cluster_id,
+                    incarnation_id,
+                    advertised_listener.into(),
+                    storage,
+                    listener,
+                )
+            },
+        )
     }
 
     pub fn storage(self, mut storage: Url) -> Builder<N, C, I, A, Url, L> {
@@ -1102,118 +1083,89 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
                 })
             });
 
-        let pairs = storage
+        let kept: Vec<(String, String)> = storage
             .query_pairs()
-            .filter_map(|(k, v)| {
-                if k == Self::MAINTENANCE_INTERVAL {
-                    None
-                } else {
-                    Some((k.to_string(), v.to_string()))
-                }
-            })
-            .collect::<Vec<_>>();
-
-        if pairs.is_empty() {
+            .filter(|(key, _)| key != Self::MAINTENANCE_INTERVAL)
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        if kept.is_empty() {
             storage.set_query(None);
         } else {
-            _ = storage.query_pairs_mut().clear().extend_pairs(pairs);
+            _ = storage.query_pairs_mut().clear().extend_pairs(kept);
         }
 
         debug!(?maintenance, %storage);
 
-        Builder {
-            node_id: self.node_id,
-            cluster_id: self.cluster_id,
-            incarnation_id: self.incarnation_id,
-            advertised_listener: self.advertised_listener,
-            storage,
-            listener: self.listener,
-            otlp_endpoint_url: self.otlp_endpoint_url,
-            authentication: self.authentication,
-            tls_server_config: self.tls_server_config,
-            silent: self.silent,
-            maintenance,
-            topic_defaults: self.topic_defaults,
-
-            super_users: self.super_users,
-            quota_defaults: self.quota_defaults,
-            quota_fleet_size: self.quota_fleet_size,
-            maximum_frame_size: self.maximum_frame_size,
-            pipeline_depth: self.pipeline_depth,
-            liveness: self.liveness,
-            consumer_group_config: self.consumer_group_config,
-            cancellation: self.cancellation,
-        }
+        let mut retyped = self.retyped(
+            |node_id, cluster_id, incarnation_id, advertised_listener, _, listener| {
+                (
+                    node_id,
+                    cluster_id,
+                    incarnation_id,
+                    advertised_listener,
+                    storage,
+                    listener,
+                )
+            },
+        );
+        retyped.maintenance = maintenance;
+        retyped
     }
 
     pub fn listener(self, listener: Url) -> Builder<N, C, I, A, S, Url> {
-        debug!(%listener);
+        tracing::debug!(%listener);
 
-        Builder {
-            node_id: self.node_id,
-            cluster_id: self.cluster_id,
-            incarnation_id: self.incarnation_id,
-            advertised_listener: self.advertised_listener,
-            storage: self.storage,
-            listener,
-            otlp_endpoint_url: self.otlp_endpoint_url,
-            authentication: self.authentication,
-            tls_server_config: self.tls_server_config,
-            silent: self.silent,
-            maintenance: self.maintenance,
-            topic_defaults: self.topic_defaults,
-
-            super_users: self.super_users,
-            quota_defaults: self.quota_defaults,
-            quota_fleet_size: self.quota_fleet_size,
-            maximum_frame_size: self.maximum_frame_size,
-            pipeline_depth: self.pipeline_depth,
-            liveness: self.liveness,
-            consumer_group_config: self.consumer_group_config,
-            cancellation: self.cancellation,
-        }
+        self.retyped(
+            |node_id, cluster_id, incarnation_id, advertised_listener, storage, _| {
+                (
+                    node_id,
+                    cluster_id,
+                    incarnation_id,
+                    advertised_listener,
+                    storage,
+                    listener,
+                )
+            },
+        )
     }
 
     pub fn otlp_endpoint_url(self, otlp_endpoint_url: Option<Url>) -> Self {
-        Self {
-            otlp_endpoint_url,
-            ..self
-        }
+        let mut builder = self;
+        builder.otlp_endpoint_url = otlp_endpoint_url;
+        builder
     }
 
     pub fn authentication(self, authentication: bool) -> Self {
-        Self {
-            authentication,
-            ..self
-        }
+        let mut builder = self;
+        builder.authentication = authentication;
+        builder
     }
 
     pub fn tls_server_config(self, tls_server_config: Option<ServerConfig>) -> Self {
-        Self {
-            tls_server_config,
-            ..self
-        }
+        let mut builder = self;
+        builder.tls_server_config = tls_server_config;
+        builder
     }
     pub fn silent(self, silent: bool) -> Self {
-        Self { silent, ..self }
+        let mut builder = self;
+        builder.silent = silent;
+        builder
     }
 
     /// Principals allowed everything without consulting an ACL (#363), in
     /// Kafka's `User:name` spelling.
     pub fn super_users(self, super_users: Vec<String>) -> Self {
-        Self {
-            super_users,
-            ..self
-        }
+        let mut builder = self;
+        builder.super_users = super_users;
+        builder
     }
 
     /// The quota a principal gets when the cluster's own quotas name neither it
     /// nor a default (#384).
     pub fn quota_defaults(self, quota_defaults: QuotaLimits) -> Self {
-        Self {
-            quota_defaults,
-            ..self
-        }
+        let mut builder = self;
+        builder.quota_defaults = quota_defaults;
+        builder
     }
 
     /// How many replicas a configured quota is shared between (#384). `1`
@@ -1225,10 +1177,9 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
     /// same thing as the cap never having been armed — which is what it was
     /// until #477.
     pub fn maximum_frame_size(self, maximum_frame_size: Option<usize>) -> Self {
-        Self {
-            maximum_frame_size,
-            ..self
-        }
+        let mut builder = self;
+        builder.maximum_frame_size = maximum_frame_size;
+        builder
     }
 
     /// Read at most `pipeline_depth` requests on a connection ahead of their
@@ -1236,50 +1187,39 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
     /// [`TcpContext::PIPELINE_DEPTH`] for the default and
     /// [`TcpContext::MAXIMUM_PIPELINE_DEPTH`] for what raising it costs.
     pub fn pipeline_depth(self, pipeline_depth: usize) -> Self {
-        Self {
-            pipeline_depth: Some(pipeline_depth),
-            ..self
-        }
+        let mut builder = self;
+        builder.pipeline_depth = Some(pipeline_depth);
+        builder
     }
 
     /// Close a connection that has owed nothing and read nothing for
     /// `connections_max_idle` (#605), Kafka's `connections.max.idle.ms`;
     /// `None` never does. See [`TcpContext::CONNECTIONS_MAX_IDLE`].
     pub fn connections_max_idle(self, connections_max_idle: Option<Duration>) -> Self {
-        Self {
-            liveness: Liveness {
-                connections_max_idle,
-                ..self.liveness
-            },
-            ..self
-        }
+        let mut builder = self;
+        builder.liveness.connections_max_idle = connections_max_idle;
+        builder
     }
 
     /// TCP keepalive on every accepted connection (#605); `None` leaves it
     /// off. See [`Keepalive`].
     pub fn keepalive(self, keepalive: Option<Keepalive>) -> Self {
-        Self {
-            liveness: Liveness {
-                keepalive,
-                ..self.liveness
-            },
-            ..self
-        }
+        let mut builder = self;
+        builder.liveness.keepalive = keepalive;
+        builder
     }
 
     /// Hold consumer-protocol groups to `consumer_group_config` (#628).
     pub fn consumer_group_config(self, consumer_group_config: ConsumerGroupConfig) -> Self {
-        Self {
-            consumer_group_config,
-            ..self
-        }
+        let mut builder = self;
+        builder.consumer_group_config = consumer_group_config;
+        builder
     }
 
     pub fn quota_fleet_size(self, quota_fleet_size: u32) -> Self {
-        Self {
-            quota_fleet_size,
-            ..self
-        }
+        let mut builder = self;
+        builder.quota_fleet_size = quota_fleet_size;
+        builder
     }
 
     /// The token that asks this broker to stop and drain (#361).
@@ -1288,40 +1228,36 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
     /// `serve` directly — a test, or an embedder — needs a handle on the same
     /// token to ask for the drain at all.
     pub fn cancellation(self, cancellation: CancellationToken) -> Self {
-        Self {
-            cancellation,
-            ..self
-        }
+        let mut builder = self;
+        builder.cancellation = cancellation;
+        builder
     }
 
     pub fn topic_defaults(self, topic_defaults: TopicDefaults) -> Self {
-        Self {
-            topic_defaults,
-            ..self
-        }
+        let mut builder = self;
+        builder.topic_defaults = topic_defaults;
+        builder
     }
 }
 
 impl Builder<i32, String, Uuid, Url, Url, Url> {
     pub async fn build(self) -> Result<Broker<Controller<ArcDynStorage>, ArcDynStorage>> {
-        if let Some(otlp_endpoint_url) = self
-            .otlp_endpoint_url
-            .clone()
-            .inspect(|otlp_endpoint_url| debug!(%otlp_endpoint_url))
-        {
-            otel::metric_exporter(otlp_endpoint_url)?;
+        if let Some(endpoint) = self.otlp_endpoint_url.clone() {
+            debug!(otlp_endpoint_url = %endpoint);
+            otel::metric_exporter(endpoint)?;
         }
 
-        let storage = StorageContainer::builder()
+        let container = StorageContainer::builder()
             .cluster_id(self.cluster_id.clone())
             .node_id(self.node_id)
             .advertised_listener(self.advertised_listener.clone())
-            .storage(self.storage.clone())
+            .storage(self.storage.clone());
+        let built = container
             .topic_defaults(self.topic_defaults.clone())
             .silent(self.silent)
             .build()
-            .await
-            .map(|storage| Arc::new(storage) as ArcDynStorage)?;
+            .await?;
+        let storage: ArcDynStorage = Arc::new(built);
 
         // One coordinator, and nothing to choose between: a group is coordinated
         // by whichever replica the request arrived at (#360). There is no owner
@@ -1334,10 +1270,9 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
             // replica is asked to stop, rather than being cut mid-poll (#361).
             .with_cancellation(self.cancellation.clone());
 
-        let sasl_config = if self.authentication {
-            tansu_auth::configuration(storage.clone()).map(Some)?
-        } else {
-            None
+        let sasl_config = match self.authentication {
+            true => Some(tansu_auth::configuration(Arc::clone(&storage))?),
+            false => None,
         };
 
         // Enforcement follows authentication: without it there are no
@@ -1356,18 +1291,19 @@ impl Builder<i32, String, Uuid, Url, Url, Url> {
                 .with_replicas(self.quota_fleet_size.max(1))
         });
 
+        let tls_server_config = self.tls_server_config.map(Arc::new);
         Ok(Broker {
-            node_id: self.node_id,
             cluster_id: self.cluster_id.clone(),
+            node_id: self.node_id,
             incarnation_id: self.incarnation_id,
-            listener: self.listener,
             advertised_listener: self.advertised_listener,
-            storage,
+            listener: self.listener,
             groups,
-            sasl_config,
+            storage,
             authorizer,
             enforcer,
-            tls_server_config: self.tls_server_config.map(Arc::new),
+            sasl_config,
+            tls_server_config,
 
             silent: self.silent,
             maintenance: self.maintenance,
