@@ -1192,6 +1192,16 @@ fmt:
 # partition answers share `recordless`; `serve` reads the same isolation, wait
 # and byte bounds. Only code went, so the ceiling rises.
 #
+#   defork  -189 lines, the optimistic-concurrency document rewritten  2814 -> 2814  2.6749 -> 2.6797
+#
+# `tansu-storage/src/dynostore/opticon.rs` keeps `OptiCon`, `DataVersion`,
+# every impl and signature and every cited comment. The six reads and writes
+# share `count`, `noted`, `guard`, `version_of`, `encoded` and `put_options`;
+# they count and log the same requests and failures, retry the same
+# conflicts, and keep `with` reading the value even when its refresh failed,
+# as the eager `.and` did. The six tests assert the same values through
+# `store`, `stored`, `next` and `bump`. Only code went, so the ceiling rises.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1201,7 +1211,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6749" top="12":
+comments ceiling="2.6797" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
