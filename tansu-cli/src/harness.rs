@@ -21,8 +21,8 @@
 //! the request (#556). So the tests that matter drive the real `main` against
 //! an in-process broker over `memory://` and assert the effect on it.
 //!
-//! The same shape as `tansu-topic`'s own suite, which is where the pattern
-//! comes from.
+//! The same shape as `tests/topic.rs`, the suite of the `tansu-topic` crate
+//! this one absorbed, which is where the pattern comes from.
 
 use std::net::{Ipv4Addr, TcpListener as StdTcpListener};
 

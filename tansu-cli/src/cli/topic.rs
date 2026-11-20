@@ -16,9 +16,9 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::str::FromStr;
 
+use crate::topic::Topic;
 use clap::Subcommand;
 use tansu_sans_io::ErrorCode;
-use tansu_topic::Topic;
 use url::Url;
 
 use crate::Result;
@@ -163,7 +163,7 @@ mod tests {
         );
     }
 
-    /// Every subcommand becomes the `tansu-topic` request it names, with the
+    /// Every subcommand becomes the [`Topic`] request it names, with the
     /// broker, the name and the configs it was given. The conversion is the
     /// whole of what this module does.
     #[test]

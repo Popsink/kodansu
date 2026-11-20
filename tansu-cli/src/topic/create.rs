@@ -20,7 +20,7 @@ use tansu_sans_io::create_topics_request::{CreatableTopic, CreatableTopicConfig}
 use url::Url;
 
 use super::Topic;
-use crate::{Error, Result};
+use super::{Error, Result};
 
 #[derive(Clone, Debug, Default)]
 pub struct Builder<B, N, P> {
@@ -105,7 +105,7 @@ impl Create {
             partitions: count,
             configs: overrides,
         } = self.configuration;
-        let client = crate::connected(&broker).await?;
+        let client = super::connected(&broker).await?;
 
         let to_config = |(key, value)| CreatableTopicConfig::default().name(key).value(Some(value));
         let overrides: Vec<_> = overrides.into_iter().map(to_config).collect();
@@ -119,6 +119,6 @@ impl Create {
         tracing::debug!(response = ?answered);
         let results = answered.topics.unwrap_or_default();
         let codes: Vec<i16> = results.iter().map(|result| result.error_code).collect();
-        crate::sole_code(&codes)
+        super::sole_code(&codes)
     }
 }

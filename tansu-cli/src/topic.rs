@@ -21,9 +21,9 @@ use std::sync::Arc;
 use tansu_sans_io::ErrorCode;
 use url::Url;
 
-use crate::create::Create;
-use crate::delete::Delete;
-use crate::list::List;
+use self::create::Create;
+use self::delete::Delete;
+use self::list::List;
 
 mod create;
 mod delete;
@@ -46,7 +46,10 @@ pub enum Error {
 /// A client of `broker`, identifying itself by this crate's name.
 pub(crate) async fn connected(broker: &Url) -> Result<tansu_client::Client> {
     let manager = tansu_client::ConnectionManager::builder(broker.clone());
-    let manager = manager.client_id(Some(String::from(env!("CARGO_PKG_NAME"))));
+    // Still "tansu-topic", the name of the crate this module was until
+    // Popsink/data-plane#5881 folded it into `tansu-cli`: the client id is on
+    // the wire, and the merge changes no request.
+    let manager = manager.client_id(Some(String::from("tansu-topic")));
     let pool = manager.build().await?;
     tracing::debug!(?pool);
     Ok(tansu_client::Client::new(pool))

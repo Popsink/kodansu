@@ -32,13 +32,13 @@ use std::{
 
 use anyhow::Result;
 use tansu_broker::{NODE_ID, broker::Broker, coordinator::group::administrator::Controller};
+use tansu_cli::topic::Topic;
 use tansu_client::{Client, ConnectionManager};
 use tansu_sans_io::{
     ConfigResource, DescribeConfigsRequest, ErrorCode,
     describe_configs_request::DescribeConfigsResource,
 };
 use tansu_storage::ArcDynStorage;
-use tansu_topic::Topic;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -323,12 +323,13 @@ async fn a_broker_that_is_not_there_is_an_error_not_a_code() -> Result<()> {
 fn the_error_conversions_keep_their_cause_and_clone() {
     use std::io;
 
-    let io: tansu_topic::Error = io::Error::new(io::ErrorKind::NotFound, "no such broker").into();
+    let io: tansu_cli::topic::Error =
+        io::Error::new(io::ErrorKind::NotFound, "no such broker").into();
     let rendered = io.to_string();
     assert!(rendered.contains("no such broker"), "{rendered}");
     assert_eq!(rendered, io.clone().to_string());
 
-    let json: tansu_topic::Error = serde_json::from_str::<serde_json::Value>("{")
+    let json: tansu_cli::topic::Error = serde_json::from_str::<serde_json::Value>("{")
         .unwrap_err()
         .into();
     let rendered = json.to_string();
