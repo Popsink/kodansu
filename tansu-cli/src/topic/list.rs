@@ -15,8 +15,8 @@
 use tansu_sans_io::{ErrorCode, MetadataRequest};
 use url::Url;
 
-use crate::Topic;
-use crate::{Error, Result};
+use super::Topic;
+use super::{Error, Result};
 
 #[derive(Clone, Debug, Default)]
 pub struct Builder<B> {
@@ -56,7 +56,7 @@ impl TryFrom<Configuration> for List {
 
 impl List {
     pub(crate) async fn main(self) -> Result<ErrorCode> {
-        let client = crate::connected(&self.configuration.broker).await?;
+        let client = super::connected(&self.configuration.broker).await?;
 
         let request = MetadataRequest::default().allow_auto_topic_creation(Some(false));
         let request = request.include_cluster_authorized_operations(Some(false));

@@ -53,7 +53,7 @@ async fn main() -> Result<ErrorCode> {
     match &outcome {
         Ok(ErrorCode::None) => tracing::debug!("{}", ErrorCode::None),
         Ok(code) => tracing::error!("{code}"),
-        Err(tansu_cli::Error::Topic(tansu_topic::Error::Client(_))) => {
+        Err(tansu_cli::Error::Topic(tansu_cli::topic::Error::Client(_))) => {
             tracing::error!("{CLIENT_ERROR_MESSAGE}");
         }
         Err(tansu_cli::Error::Topic(failure)) => {

@@ -11,7 +11,6 @@ members = [
     "tansu-sans-io",
     "tansu-service",
     "tansu-storage",
-    "tansu-topic",
 ]
 
 [workspace.package]
@@ -120,7 +119,6 @@ tansu-model = { version = "1.0.0-alpha.1", path = "tansu-model", default-feature
 tansu-sans-io = { version = "1.0.0-alpha.1", path = "tansu-sans-io", default-features = false }
 tansu-service = { version = "1.0.0-alpha.1", path = "tansu-service", default-features = false }
 tansu-storage = { version = "1.0.0-alpha.1", path = "tansu-storage", default-features = false }
-tansu-topic = { version = "1.0.0-alpha.1", path = "tansu-topic", default-features = false }
 tempfile = "3"
 thiserror = "2.0"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }

@@ -16,8 +16,8 @@ use tansu_sans_io::delete_topics_request::DeleteTopicState;
 use tansu_sans_io::{DeleteTopicsRequest, ErrorCode, NULL_TOPIC_ID};
 use url::Url;
 
-use crate::Topic;
-use crate::{Error, Result};
+use super::Topic;
+use super::{Error, Result};
 
 #[derive(Clone, Debug, Default)]
 pub struct Builder<B, N> {
@@ -65,7 +65,7 @@ impl TryFrom<Configuration> for Delete {
 
 impl Delete {
     pub(crate) async fn main(self) -> Result<ErrorCode> {
-        let client = crate::connected(&self.configuration.broker).await?;
+        let client = super::connected(&self.configuration.broker).await?;
 
         let named = Some(self.configuration.name);
         let topic = DeleteTopicState::default()
@@ -78,6 +78,6 @@ impl Delete {
         tracing::debug!(response = ?answered);
         let results = answered.responses.unwrap_or_default();
         let codes: Vec<i16> = results.iter().map(|result| result.error_code).collect();
-        crate::sole_code(&codes)
+        super::sole_code(&codes)
     }
 }

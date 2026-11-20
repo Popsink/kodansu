@@ -37,7 +37,6 @@ tansu-broker.workspace = true
 tansu-client.workspace = true
 tansu-sans-io.workspace = true
 tansu-storage.workspace = true
-tansu-topic.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -56,3 +55,11 @@ tansu-service.workspace = true
 
 tempfile.workspace = true
 tokio-util.workspace = true
+
+# `tests/topic.rs`, the suite `tansu-topic` brought with it when it was folded
+# in here (Popsink/data-plane#5881): `anyhow` for its `Result`, and the object
+# store asked for directly, since that suite starts a broker over `memory://`
+# whether or not this crate's `dynostore` feature is on.
+anyhow.workspace = true
+tansu-broker = { workspace = true, features = ["dynostore"] }
+tansu-storage = { workspace = true, features = ["dynostore"] }

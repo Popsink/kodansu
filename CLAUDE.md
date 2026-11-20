@@ -73,9 +73,8 @@ The `proxy` and `perf` subcommands and their crates (`tansu-proxy`, `tansu-perf`
 | `tansu-storage` | Storage abstraction: `Box<dyn Storage>` over the object store (`DynoStore`) and the `Null` engine, selected by `StorageContainer::builder` |
 | `tansu-client` | Async Kafka protocol client (rama service layers) |
 | `tansu-model` | Kafka JSON protocol definitions (used in build.rs) |
-| `tansu-cli` | Clap-based CLI argument parsing |
+| `tansu-cli` | Clap-based CLI argument parsing, and the topic administration behind `tansu topic` (the former `tansu-topic` crate) |
 | `tansu-auth` | SASL/SCRAM authentication |
-| `tansu-topic` | Topic administration used by `tansu topic` |
 
 ### Sans-I/O Code Generation (`tansu-sans-io`)
 

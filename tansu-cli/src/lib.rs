@@ -21,6 +21,7 @@ use regex::Regex;
 use regex::Replacer;
 
 mod cli;
+pub mod topic;
 
 #[cfg(test)]
 mod harness;
@@ -39,7 +40,7 @@ pub enum Error {
     Server(Box<tansu_broker::Error>),
     Tls(#[from] rustls::Error),
     TlsPkiPem(#[from] rustls::pki_types::pem::Error),
-    Topic(#[from] tansu_topic::Error),
+    Topic(#[from] topic::Error),
     Url(#[from] url::ParseError),
 }
 

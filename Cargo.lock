@@ -3688,7 +3688,6 @@ dependencies = [
  "tansu-cli",
  "tansu-sans-io",
  "tansu-storage",
- "tansu-topic",
  "tikv-jemallocator",
  "tokio",
  "tracing",
@@ -3754,6 +3753,7 @@ dependencies = [
 name = "tansu-cli"
 version = "1.0.0-alpha.22"
 dependencies = [
+ "anyhow",
  "bytes",
  "clap",
  "dotenv",
@@ -3772,7 +3772,6 @@ dependencies = [
  "tansu-sans-io",
  "tansu-service",
  "tansu-storage",
- "tansu-topic",
  "tempfile",
  "thiserror",
  "tokio",
@@ -3909,24 +3908,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "url",
- "uuid",
-]
-
-[[package]]
-name = "tansu-topic"
-version = "1.0.0-alpha.22"
-dependencies = [
- "anyhow",
- "serde_json",
- "tansu-broker",
- "tansu-client",
- "tansu-sans-io",
- "tansu-storage",
- "thiserror",
- "tokio",
- "tokio-util",
- "tracing",
  "url",
  "uuid",
 ]
