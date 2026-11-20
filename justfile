@@ -1202,6 +1202,16 @@ fmt:
 # as the eager `.and` did. The six tests assert the same values through
 # `store`, `stored`, `next` and `bump`. Only code went, so the ceiling rises.
 #
+#   defork  -112 lines, the metadata etag cache rewritten  2814 -> 2814  2.6797 -> 2.6818
+#
+# `tansu-storage/src/dynostore/metadata.rs` keeps `Cache`, `CacheEntry`, every
+# impl and signature and every cited comment. `get_opts` decides the same hit,
+# miss, no-match, coalesced and uncached outcomes in one `match` and counts
+# them through `tally`; both memo insertions go through `memoize`, which
+# counts the same add, existing and replace; the metric statics share
+# `counter`. The upstream tests keep their names and assertions on top of
+# `six`, `revalidating` and `unchanged`. The ceiling follows the ratio.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1211,7 +1221,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6797" top="12":
+comments ceiling="2.6818" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
