@@ -1128,6 +1128,17 @@ fmt:
 # same patience, `listen` binds, ticks, spawns and drains the same way, and
 # `bind` resolves the same address. Only code went, so the ceiling rises.
 #
+#   defork  -62 lines, the group coordinator's offset paths rewritten  2817 -> 2817  2.6680 -> 2.6696
+#
+# `tansu-broker/src/coordinator/group/administrator.rs` keeps `Controller`,
+# every impl and signature, and every cited comment (the #445 metadata notes
+# are reworded, still cited). `fetch_offset` and `commit_offset` answer with
+# the same topics in name order and the same partitions in storage order,
+# through `requested_topitions` and `topic_names`; `counted` records the same
+# request counter; the join and sync debug lines decode the same protocols
+# and assignments, still only when debug is on. Only code went, so the ceiling
+# rises.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1137,7 +1148,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6680" top="12":
+comments ceiling="2.6696" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
