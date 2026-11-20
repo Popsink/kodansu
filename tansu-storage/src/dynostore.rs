@@ -75,6 +75,7 @@ use rand::prelude::*;
 use rand::rng;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use tansu_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
 use tansu_sans_io::add_partitions_to_txn_response::AddPartitionsToTxnPartitionResult;
 use tansu_sans_io::add_partitions_to_txn_response::AddPartitionsToTxnTopicResult;
 use tansu_sans_io::create_topics_request::{CreatableTopic, CreatableTopicConfig};
@@ -96,6 +97,7 @@ use tansu_sans_io::metadata_response::{MetadataResponsePartition, MetadataRespon
 use tansu_sans_io::record::{Record, deflated, inflated};
 use tansu_sans_io::txn_offset_commit_response::TxnOffsetCommitResponsePartition;
 use tansu_sans_io::txn_offset_commit_response::TxnOffsetCommitResponseTopic;
+use tansu_sans_io::{AddPartitionsToTxnRequest, AddPartitionsToTxnResponse};
 use tansu_sans_io::{BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch};
 use tansu_sans_io::{EndTransactionMarker, ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID};
 use tansu_sans_io::{OpType, ScramMechanism, TimestampType, to_system_time};
@@ -147,8 +149,8 @@ use crate::{
     GroupMember, GroupSchema, GroupState, ListOffsetResponse, METER, MemberDoc, MetadataResponse,
     NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, QuotaAlteration,
     QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas, Result, ScramCredential, Storage,
-    TopicDefaults, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, TxnState, UpdateError, Version, storage_error_code, validation,
+    TopicDefaults, TopicId, Topition, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
+    added_by_topic, storage_error_code, validation,
 };
 
 const APPLICATION_JSON: &str = "application/json";

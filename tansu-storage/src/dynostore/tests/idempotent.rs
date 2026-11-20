@@ -29,13 +29,14 @@
 
 use bytes::Bytes;
 use object_store::memory::InMemory;
+use tansu_sans_io::AddPartitionsToTxnRequest;
 use tansu_sans_io::{
     BatchAttribute, ErrorCode, add_partitions_to_txn_request::AddPartitionsToTxnTopic,
     create_topics_request::CreatableTopic, record::Record, record::deflated, record::inflated,
 };
 
 use crate::{
-    Error, Result, Storage, Topition, TxnAddPartitionsRequest,
+    Error, Result, Storage, Topition,
     dynostore::{CoalesceTuning, CompactRun, DynoStore, Substream, tests::init_tracing},
 };
 
@@ -306,15 +307,18 @@ async fn aborted_transaction_surfaces_in_offset_stage() -> Result<(), Error> {
         .await?;
 
     _ = store
-        .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
-            transaction_id: txn.into(),
-            producer_id: producer.id,
-            producer_epoch: producer.epoch,
-            topics: [AddPartitionsToTxnTopic::default()
-                .name(topic.into())
-                .partitions(Some([0].into()))]
-            .into(),
-        })
+        .txn_add_partitions(
+            AddPartitionsToTxnRequest::default()
+                .v_3_and_below_transactional_id(Some(txn.into()))
+                .v_3_and_below_producer_id(Some(producer.id))
+                .v_3_and_below_producer_epoch(Some(producer.epoch))
+                .v_3_and_below_topics(Some(
+                    [AddPartitionsToTxnTopic::default()
+                        .name(topic.into())
+                        .partitions(Some([0].into()))]
+                    .into(),
+                )),
+        )
         .await?;
 
     assert_eq!(

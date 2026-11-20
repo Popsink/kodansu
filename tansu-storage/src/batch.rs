@@ -47,8 +47,7 @@ use crate::{
     GenerationDoc, ListOffsetResponse, METER, MemberDoc, MetadataResponse, NamedGroupDetail,
     OffsetCommitRequest, OffsetStage, ProducerIdResponse, QuotaAlteration, QuotaEntity,
     QuotaFilterComponent, QuotaLimits, Quotas, Result, ScramCredential, Storage, TopicId, Topition,
-    TxnAddPartitionsRequest, TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError,
-    Version,
+    TxnOffsetCommitRequest, UpdateError, Version,
 };
 
 /// A counter called `name`.

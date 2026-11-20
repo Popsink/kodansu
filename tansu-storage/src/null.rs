@@ -33,6 +33,7 @@ use tansu_sans_io::metadata_response::MetadataResponseBroker;
 use tansu_sans_io::metadata_response::{MetadataResponsePartition, MetadataResponseTopic};
 use tansu_sans_io::record::deflated::Batch;
 use tansu_sans_io::txn_offset_commit_response::TxnOffsetCommitResponseTopic;
+use tansu_sans_io::{AddPartitionsToTxnRequest, AddPartitionsToTxnResponse};
 use tansu_sans_io::{ConfigResource, ErrorCode, IsolationLevel, ListOffset};
 use tansu_sans_io::{NULL_TOPIC_ID, ScramMechanism};
 use url::Url;
@@ -44,8 +45,8 @@ use crate::{
     DEFAULT_FETCH_MAX_BYTES, Error, GenerationDoc, GroupDetailResponse, ListOffsetResponse,
     MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
     ProducerIdResponse, QuotaAlteration, QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas,
-    Result, ScramCredential, Storage, TopicId, Topition, TxnAddPartitionsRequest,
-    TxnAddPartitionsResponse, TxnOffsetCommitRequest, UpdateError, Version,
+    Result, ScramCredential, Storage, TopicId, Topition, TxnOffsetCommitRequest, UpdateError,
+    Version,
 };
 
 /// A stored document with the version identifying it, as the object store
@@ -816,30 +817,42 @@ impl Storage for Engine {
     #[tracing::instrument(skip_all)]
     async fn txn_add_partitions(
         &self,
-        partitions: TxnAddPartitionsRequest,
-    ) -> Result<TxnAddPartitionsResponse> {
-        Ok(match partitions {
-            TxnAddPartitionsRequest::VersionZeroToThree { topics, .. } => {
-                TxnAddPartitionsResponse::VersionZeroToThree(
-                    topics
-                        .iter()
-                        .map(|topic| {
-                            AddPartitionsToTxnTopicResult::default()
-                                .name(topic.name.clone())
-                                .results_by_partition(Some([].into()))
-                        })
-                        .collect(),
-                )
+        partitions: AddPartitionsToTxnRequest,
+    ) -> Result<AddPartitionsToTxnResponse> {
+        match partitions {
+            AddPartitionsToTxnRequest {
+                transactions: None,
+                v_3_and_below_transactional_id: Some(_),
+                v_3_and_below_producer_id: Some(_),
+                v_3_and_below_producer_epoch: Some(_),
+                v_3_and_below_topics: Some(topics),
+                ..
+            } => {
+                let answered = topics.iter().map(|topic| {
+                    AddPartitionsToTxnTopicResult::default()
+                        .name(topic.name.clone())
+                        .results_by_partition(Some(Vec::new()))
+                });
+                Ok(crate::added_by_topic(answered.collect()))
             }
-            TxnAddPartitionsRequest::VersionFourPlus { transactions } => {
-                TxnAddPartitionsResponse::VersionFourPlus(
-                    transactions
-                        .iter()
-                        .map(|_| AddPartitionsToTxnResult::default())
-                        .collect(),
-                )
+            AddPartitionsToTxnRequest {
+                transactions: Some(transactions),
+                v_3_and_below_transactional_id: None,
+                v_3_and_below_producer_id: None,
+                v_3_and_below_producer_epoch: None,
+                v_3_and_below_topics: None,
+                ..
+            } => {
+                let answered = transactions
+                    .iter()
+                    .map(|_| AddPartitionsToTxnResult::default());
+                Ok(crate::added_by_transaction(answered.collect()))
             }
-        })
+            unexpected => {
+                let boxed = Box::new(unexpected);
+                Err(Error::UnexpectedAddPartitionsToTxnRequest(boxed))
+            }
+        }
     }
 
     #[tracing::instrument(skip_all)]

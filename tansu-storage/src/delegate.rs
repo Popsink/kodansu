@@ -117,7 +117,7 @@ macro_rules! storage_methods {
             fn assert_group_schema(&self) -> Result<()>;
             fn init_producer(&self, transaction_id: Option<&str>, transaction_timeout_ms: i32, producer_id: Option<i64>, producer_epoch: Option<i16>) -> Result<ProducerIdResponse>;
             fn txn_add_offsets(&self, transaction_id: &str, producer_id: i64, producer_epoch: i16, group_id: &str) -> Result<ErrorCode>;
-            fn txn_add_partitions(&self, partitions: TxnAddPartitionsRequest) -> Result<TxnAddPartitionsResponse>;
+            fn txn_add_partitions(&self, partitions: tansu_sans_io::AddPartitionsToTxnRequest) -> Result<tansu_sans_io::AddPartitionsToTxnResponse>;
             fn txn_offset_commit(&self, offsets: TxnOffsetCommitRequest) -> Result<Vec<TxnOffsetCommitResponseTopic>>;
             fn txn_end(&self, transaction_id: &str, producer_id: i64, producer_epoch: i16, committed: bool) -> Result<ErrorCode>;
             fn maintain(&self, _now: SystemTime) -> Result<()>;

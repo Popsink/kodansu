@@ -2083,8 +2083,8 @@ impl Storage for DynoStore {
 
     async fn txn_add_partitions(
         &self,
-        partitions: TxnAddPartitionsRequest,
-    ) -> Result<TxnAddPartitionsResponse> {
+        partitions: AddPartitionsToTxnRequest,
+    ) -> Result<AddPartitionsToTxnResponse> {
         self.add_txn_partitions(partitions).await
     }
 

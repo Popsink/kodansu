@@ -23,6 +23,7 @@
 
 use std::collections::BTreeMap;
 use std::time::Duration;
+use tansu_sans_io::AddPartitionsToTxnRequest;
 
 use rand::RngExt as _;
 use tansu_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnTopic;
@@ -31,7 +32,7 @@ use tansu_sans_io::add_partitions_to_txn_response::AddPartitionsToTxnTopicResult
 use tansu_sans_io::create_topics_request::CreatableTopic;
 use tansu_sans_io::record::{Record, deflated, inflated};
 use tansu_sans_io::{BatchAttribute, ControlBatch, EndTransactionMarker, ErrorCode};
-use tansu_storage::{ProducerIdResponse, Topition, TxnAddPartitionsRequest};
+use tansu_storage::{ProducerIdResponse, Topition};
 
 pub mod common;
 
@@ -136,19 +137,21 @@ async fn committed_transactions(
         tracing::debug!(transaction = round, txn_producer = ?producer);
 
         let topic = AddPartitionsToTxnTopic::default().name(name.clone());
-        let adding = engine.txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
-            transaction_id: txn_id.clone(),
-            producer_id: producer.id,
-            producer_epoch: producer.epoch,
-            topics: vec![topic.partitions(Some(vec![index]))],
-        });
+        let adding = engine.txn_add_partitions(
+            AddPartitionsToTxnRequest::default()
+                .v_3_and_below_transactional_id(Some(txn_id.clone()))
+                .v_3_and_below_producer_id(Some(producer.id))
+                .v_3_and_below_producer_epoch(Some(producer.epoch))
+                .v_3_and_below_topics(Some(vec![topic.partitions(Some(vec![index]))])),
+        );
         let added = adding.await;
         let added = added.inspect_err(|err| tracing::error!(?err, name, index))?;
         let result = AddPartitionsToTxnPartitionResult::default().partition_index(index);
         let result = result.partition_error_code(ErrorCode::None.into());
         let topic = AddPartitionsToTxnTopicResult::default().name(name.clone());
         let topic = topic.results_by_partition(Some(vec![result]));
-        assert_eq!([topic], added.zero_to_three());
+        let by_topic = added.results_by_topic_v_3_and_below.unwrap_or_default();
+        assert_eq!(vec![topic], by_topic);
 
         let transactional = BatchAttribute::default().transaction(true).into();
         for base_sequence in 0..RECORDS {
