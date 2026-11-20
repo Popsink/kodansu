@@ -28,6 +28,7 @@ use std::{
     },
     time::{Duration, SystemTime},
 };
+use tansu_sans_io::AddPartitionsToTxnRequest;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -46,7 +47,7 @@ use tansu_sans_io::{
 };
 
 use crate::{
-    Error, Result, Storage, TopicId, Topition, TxnAddPartitionsRequest,
+    Error, Result, Storage, TopicId, Topition,
     dynostore::{
         CoalesceTuning, CompactRun, DynoStore, Era, PrefixLease, SegmentFooter, ServedEnd,
         Substream, SubstreamEntry, TxnProduceOffset, retention::maybe_expirable,
@@ -4633,19 +4634,22 @@ async fn begin_txn(store: &DynoStore, txn: &str, topics: &[&str]) -> Result<(i64
     assert_eq!(ErrorCode::None, producer.error);
 
     _ = store
-        .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
-            transaction_id: txn.into(),
-            producer_id: producer.id,
-            producer_epoch: producer.epoch,
-            topics: topics
-                .iter()
-                .map(|topic| {
-                    AddPartitionsToTxnTopic::default()
-                        .name((*topic).into())
-                        .partitions(Some([0].into()))
-                })
-                .collect(),
-        })
+        .txn_add_partitions(
+            AddPartitionsToTxnRequest::default()
+                .v_3_and_below_transactional_id(Some(txn.into()))
+                .v_3_and_below_producer_id(Some(producer.id))
+                .v_3_and_below_producer_epoch(Some(producer.epoch))
+                .v_3_and_below_topics(Some(
+                    topics
+                        .iter()
+                        .map(|topic| {
+                            AddPartitionsToTxnTopic::default()
+                                .name((*topic).into())
+                                .partitions(Some([0].into()))
+                        })
+                        .collect(),
+                )),
+        )
         .await?;
 
     Ok((producer.id, producer.epoch))

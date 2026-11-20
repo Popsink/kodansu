@@ -519,155 +519,59 @@ impl DynoStore {
     /// one that batches several.
     pub(super) async fn add_txn_partitions(
         &self,
-        partitions: TxnAddPartitionsRequest,
-    ) -> Result<TxnAddPartitionsResponse> {
+        partitions: AddPartitionsToTxnRequest,
+    ) -> Result<AddPartitionsToTxnResponse> {
         match partitions {
-            TxnAddPartitionsRequest::VersionZeroToThree {
-                transaction_id,
-                producer_id,
-                producer_epoch,
-                ref topics,
+            AddPartitionsToTxnRequest {
+                transactions: None,
+                v_3_and_below_transactional_id: Some(transaction_id),
+                v_3_and_below_producer_id: Some(producer_id),
+                v_3_and_below_producer_epoch: Some(producer_epoch),
+                v_3_and_below_topics: Some(ref topics),
+                ..
             } => {
-                self.meta
+                let answered = self
+                    .meta
                     .with_mut(&self.object_store, |meta| {
                         let Some(transaction) = meta.transactions.get_mut(&transaction_id) else {
-                            let mut results = vec![];
-
-                            for topic in topics {
-                                let mut results_by_partition = vec![];
-
-                                for partition_index in topic.partitions.as_deref().unwrap_or(&[]) {
-                                    results_by_partition.push(
-                                        AddPartitionsToTxnPartitionResult::default()
-                                            .partition_index(*partition_index)
-                                            .partition_error_code(
-                                                ErrorCode::TransactionalIdNotFound.into(),
-                                            ),
-                                    );
-                                }
-
-                                results.push(
-                                    AddPartitionsToTxnTopicResult::default()
-                                        .name(topic.name.clone())
-                                        .results_by_partition(Some(results_by_partition)),
-                                )
-                            }
-
-                            return Ok(TxnAddPartitionsResponse::VersionZeroToThree(results));
+                            return Ok(partition_results(
+                                topics,
+                                ErrorCode::TransactionalIdNotFound,
+                            ));
                         };
-
                         if transaction.producer != producer_id {
-                            let mut results = vec![];
-
-                            for topic in topics {
-                                let mut results_by_partition = vec![];
-
-                                for partition_index in topic.partitions.as_deref().unwrap_or(&[]) {
-                                    results_by_partition.push(
-                                        AddPartitionsToTxnPartitionResult::default()
-                                            .partition_index(*partition_index)
-                                            .partition_error_code(
-                                                ErrorCode::UnknownProducerId.into(),
-                                            ),
-                                    );
-                                }
-
-                                results.push(
-                                    AddPartitionsToTxnTopicResult::default()
-                                        .name(topic.name.clone())
-                                        .results_by_partition(Some(results_by_partition)),
-                                )
-                            }
-
-                            return Ok(TxnAddPartitionsResponse::VersionZeroToThree(results));
+                            return Ok(partition_results(topics, ErrorCode::UnknownProducerId));
                         }
-
                         let Some(mut current_epoch) = transaction.epochs.last_entry() else {
-                            let mut results = vec![];
-
-                            for topic in topics {
-                                let mut results_by_partition = vec![];
-
-                                for partition_index in topic.partitions.as_deref().unwrap_or(&[]) {
-                                    results_by_partition.push(
-                                        AddPartitionsToTxnPartitionResult::default()
-                                            .partition_index(*partition_index)
-                                            .partition_error_code(ErrorCode::ProducerFenced.into()),
-                                    );
-                                }
-
-                                results.push(
-                                    AddPartitionsToTxnTopicResult::default()
-                                        .name(topic.name.clone())
-                                        .results_by_partition(Some(results_by_partition)),
-                                )
-                            }
-
-                            return Ok(TxnAddPartitionsResponse::VersionZeroToThree(results));
+                            return Ok(partition_results(topics, ErrorCode::ProducerFenced));
                         };
-
                         if &producer_epoch != current_epoch.key() {
-                            let mut results = vec![];
-
-                            for topic in topics {
-                                let mut results_by_partition = vec![];
-
-                                for partition_index in topic.partitions.as_deref().unwrap_or(&[]) {
-                                    results_by_partition.push(
-                                        AddPartitionsToTxnPartitionResult::default()
-                                            .partition_index(*partition_index)
-                                            .partition_error_code(ErrorCode::ProducerFenced.into()),
-                                    );
-                                }
-
-                                results.push(
-                                    AddPartitionsToTxnTopicResult::default()
-                                        .name(topic.name.clone())
-                                        .results_by_partition(Some(results_by_partition)),
-                                )
-                            }
-
-                            return Ok(TxnAddPartitionsResponse::VersionZeroToThree(results));
+                            return Ok(partition_results(topics, ErrorCode::ProducerFenced));
                         }
 
                         let txn_detail = current_epoch.get_mut();
-
-                        let mut results = vec![];
-
                         for topic in topics {
-                            let mut results_by_partition = vec![];
-
-                            for partition_index in topic.partitions.as_deref().unwrap_or(&[]) {
-                                _ = txn_detail
-                                    .produces
-                                    .entry(topic.name.clone())
-                                    .or_default()
-                                    .entry(*partition_index)
-                                    .or_default();
-
-                                results_by_partition.push(
-                                    AddPartitionsToTxnPartitionResult::default()
-                                        .partition_index(*partition_index)
-                                        .partition_error_code(i16::from(ErrorCode::None)),
-                                );
+                            for &partition_index in topic.partitions.as_deref().unwrap_or(&[]) {
+                                let enlisted = txn_detail.produces.entry(topic.name.clone());
+                                _ = enlisted.or_default().entry(partition_index).or_default();
                             }
-
-                            results.push(
-                                AddPartitionsToTxnTopicResult::default()
-                                    .name(topic.name.clone())
-                                    .results_by_partition(Some(results_by_partition)),
-                            )
                         }
-
                         txn_detail.started_at = Some(SystemTime::now());
                         txn_detail.state = Some(TxnState::Begin);
-
-                        Ok(TxnAddPartitionsResponse::VersionZeroToThree(results))
+                        Ok(partition_results(topics, ErrorCode::None))
                     })
-                    .await
+                    .await?;
+                Ok(added_by_topic(answered))
             }
 
-            TxnAddPartitionsRequest::VersionFourPlus { .. } => {
+            AddPartitionsToTxnRequest {
+                transactions: Some(_),
+                v_3_and_below_transactional_id: None,
+                v_3_and_below_producer_id: None,
+                v_3_and_below_producer_epoch: None,
+                v_3_and_below_topics: None,
+                ..
+            } => {
                 // Not implemented. A client controls the API version it sends
                 // and is not bound by the advertised range, so this needed no
                 // error condition at all to panic the request task (#276).
@@ -675,6 +579,32 @@ impl DynoStore {
 
                 Err(Error::Api(ErrorCode::UnsupportedVersion))
             }
+
+            unexpected => {
+                let boxed = Box::new(unexpected);
+                Err(Error::UnexpectedAddPartitionsToTxnRequest(boxed))
+            }
         }
     }
+}
+
+/// Every partition of every topic in `topics`, answered `error_code`, in the
+/// order asked.
+fn partition_results(
+    topics: &[AddPartitionsToTxnTopic],
+    error_code: ErrorCode,
+) -> Vec<AddPartitionsToTxnTopicResult> {
+    let code: i16 = error_code.into();
+    let answered = |topic: &AddPartitionsToTxnTopic| {
+        let indexes = topic.partitions.as_deref().unwrap_or(&[]);
+        let partitions = indexes.iter().map(|&partition_index| {
+            AddPartitionsToTxnPartitionResult::default()
+                .partition_index(partition_index)
+                .partition_error_code(code)
+        });
+        AddPartitionsToTxnTopicResult::default()
+            .name(topic.name.clone())
+            .results_by_partition(Some(partitions.collect()))
+    };
+    topics.iter().map(answered).collect()
 }

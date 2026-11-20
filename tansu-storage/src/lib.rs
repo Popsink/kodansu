@@ -106,9 +106,6 @@ use opentelemetry::{InstrumentationScope, global};
 use opentelemetry_semantic_conventions::SCHEMA_URL;
 use serde::{Deserialize, Serialize};
 use tansu_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnRequest;
-use tansu_sans_io::add_partitions_to_txn_request::{
-    AddPartitionsToTxnTopic, AddPartitionsToTxnTransaction,
-};
 use tansu_sans_io::add_partitions_to_txn_response::{
     AddPartitionsToTxnResult, AddPartitionsToTxnTopicResult,
 };
@@ -132,7 +129,8 @@ use tansu_sans_io::offset_commit_request::OffsetCommitRequestPartition;
 use tansu_sans_io::record::deflated;
 use tansu_sans_io::txn_offset_commit_request::TxnOffsetCommitRequestTopic;
 use tansu_sans_io::txn_offset_commit_response::TxnOffsetCommitResponseTopic;
-use tansu_sans_io::{ConfigResource, ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID};
+use tansu_sans_io::{AddPartitionsToTxnResponse, ConfigResource, ErrorCode, IsolationLevel};
+use tansu_sans_io::{ListOffset, NULL_TOPIC_ID};
 use tansu_sans_io::{ScramMechanism, consumer_group_describe_response, describe_groups_response};
 use tansu_sans_io::{to_system_time, to_timestamp};
 use tracing::debug;
@@ -1344,74 +1342,27 @@ impl Default for ProducerIdResponse {
     }
 }
 
-/// For protocol versions 0..=3 using [`AddPartitionsToTxnTopic`],
-/// thereafter using [`AddPartitionsToTxnTransaction`].
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-pub enum TxnAddPartitionsRequest {
-    VersionZeroToThree {
-        transaction_id: String,
-        producer_id: i64,
-        producer_epoch: i16,
-        topics: Vec<AddPartitionsToTxnTopic>,
-    },
-
-    VersionFourPlus {
-        transactions: Vec<AddPartitionsToTxnTransaction>,
-    },
+/// A below-v4 `AddPartitionsToTxn` answer: results by topic, and an empty
+/// list by transaction, as the protocol has a client read the field of its
+/// own shape.
+pub(crate) fn added_by_topic(
+    results: Vec<AddPartitionsToTxnTopicResult>,
+) -> AddPartitionsToTxnResponse {
+    AddPartitionsToTxnResponse::default()
+        .error_code(Some(i16::from(ErrorCode::None)))
+        .results_by_transaction(Some(Vec::new()))
+        .results_by_topic_v_3_and_below(Some(results))
 }
 
-impl TryFrom<AddPartitionsToTxnRequest> for TxnAddPartitionsRequest {
-    type Error = Error;
-
-    fn try_from(value: AddPartitionsToTxnRequest) -> result::Result<Self, Self::Error> {
-        match value {
-            AddPartitionsToTxnRequest {
-                transactions: None,
-                v_3_and_below_transactional_id: Some(transactional_id),
-                v_3_and_below_producer_id: Some(producer_id),
-                v_3_and_below_producer_epoch: Some(producer_epoch),
-                v_3_and_below_topics: Some(topics),
-                ..
-            } => Ok(Self::VersionZeroToThree {
-                transaction_id: transactional_id,
-                producer_id,
-                producer_epoch,
-                topics,
-            }),
-
-            AddPartitionsToTxnRequest {
-                transactions: Some(transactions),
-                v_3_and_below_transactional_id: None,
-                v_3_and_below_producer_id: None,
-                v_3_and_below_producer_epoch: None,
-                v_3_and_below_topics: None,
-                ..
-            } => Ok(Self::VersionFourPlus { transactions }),
-
-            unexpected => {
-                let boxed = Box::new(unexpected);
-                Err(Error::UnexpectedAddPartitionsToTxnRequest(boxed))
-            }
-        }
-    }
-}
-
-/// Transaction Add Partitions Response
-///
-/// For protocol versions 0..=3 using `AddPartitionsToTxnTopic`, thereafter using `AddPartitionsToTxnTransaction`.
-#[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-pub enum TxnAddPartitionsResponse {
-    VersionZeroToThree(Vec<AddPartitionsToTxnTopicResult>),
-    VersionFourPlus(Vec<AddPartitionsToTxnResult>),
-}
-
-impl TxnAddPartitionsResponse {
-    pub fn zero_to_three(&self) -> &[AddPartitionsToTxnTopicResult] {
-        let TxnAddPartitionsResponse::VersionZeroToThree(results) = self else {
-            return &[];
-        };
-        results
-    }
+/// A v4+ `AddPartitionsToTxn` answer: results by transaction, and an empty
+/// list by topic.
+pub(crate) fn added_by_transaction(
+    results: Vec<AddPartitionsToTxnResult>,
+) -> AddPartitionsToTxnResponse {
+    AddPartitionsToTxnResponse::default()
+        .error_code(Some(i16::from(ErrorCode::None)))
+        .results_by_transaction(Some(results))
+        .results_by_topic_v_3_and_below(Some(Vec::new()))
 }
 
 /// Transaction Offset Commit Request
@@ -1964,8 +1915,8 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// Add partitions to a transaction.
     async fn txn_add_partitions(
         &self,
-        partitions: TxnAddPartitionsRequest,
-    ) -> Result<TxnAddPartitionsResponse>;
+        partitions: AddPartitionsToTxnRequest,
+    ) -> Result<AddPartitionsToTxnResponse>;
 
     /// Commit an offset within a transaction.
     async fn txn_offset_commit(

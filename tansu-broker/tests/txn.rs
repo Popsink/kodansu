@@ -18,6 +18,7 @@
 #![cfg(feature = "dynostore")]
 
 use std::{collections::BTreeSet, slice, sync::Arc, time::Duration};
+use tansu_sans_io::AddPartitionsToTxnRequest;
 
 use anyhow::Result;
 use rand::{RngExt as _, rng};
@@ -31,9 +32,7 @@ use tansu_sans_io::txn_offset_commit_request::{
 };
 use tansu_sans_io::{BatchAttribute, ControlBatch, EndTransactionMarker, ErrorCode};
 use tansu_sans_io::{IsolationLevel, ListOffset};
-use tansu_storage::{
-    ProducerIdResponse, Storage, TopicId, Topition, TxnAddPartitionsRequest, TxnOffsetCommitRequest,
-};
+use tansu_storage::{ProducerIdResponse, Storage, TopicId, Topition, TxnOffsetCommitRequest};
 
 use crate::common::{alphanumeric_string, init_tracing, register_broker};
 
@@ -114,12 +113,11 @@ impl Partition {
         let topic = AddPartitionsToTxnTopic::default()
             .name(self.name())
             .partitions(Some(vec![self.index()]));
-        let request = TxnAddPartitionsRequest::VersionZeroToThree {
-            transaction_id: txn.clone(),
-            producer_id: owner.id,
-            producer_epoch: owner.epoch,
-            topics: vec![topic],
-        };
+        let request = AddPartitionsToTxnRequest::default()
+            .v_3_and_below_transactional_id(Some(txn.clone()))
+            .v_3_and_below_producer_id(Some(owner.id))
+            .v_3_and_below_producer_epoch(Some(owner.epoch))
+            .v_3_and_below_topics(Some(vec![topic]));
         let added = self.storage.txn_add_partitions(request).await?;
         let accepted = AddPartitionsToTxnPartitionResult::default()
             .partition_index(self.index())
@@ -127,7 +125,8 @@ impl Partition {
         let expected = AddPartitionsToTxnTopicResult::default()
             .name(self.name())
             .results_by_partition(Some(vec![accepted]));
-        assert_eq!([expected], added.zero_to_three());
+        let by_topic = added.results_by_topic_v_3_and_below.unwrap_or_default();
+        assert_eq!(vec![expected], by_topic);
 
         let transactional: i16 = BatchAttribute::default().transaction(true).into();
         for sequence in 0..RECORDS {

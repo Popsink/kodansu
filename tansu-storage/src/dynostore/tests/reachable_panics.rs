@@ -27,12 +27,13 @@ use object_store::{
     path::Path,
 };
 use std::fmt::{self, Debug, Display};
+use tansu_sans_io::AddPartitionsToTxnRequest;
 use tansu_sans_io::{
     ConfigResource, ErrorCode, OpType, incremental_alter_configs_request::AlterableConfig,
 };
 
 use crate::{
-    Error, Result, Storage, TxnAddPartitionsRequest,
+    Error, Result, Storage,
     dynostore::{DynoStore, TopicMetadata, tests::init_tracing},
 };
 
@@ -195,9 +196,7 @@ async fn add_partitions_to_txn_v4_is_unsupported() -> Result<()> {
     let store = DynoStore::new(CLUSTER, NODE, InMemory::new());
 
     match store
-        .txn_add_partitions(TxnAddPartitionsRequest::VersionFourPlus {
-            transactions: vec![],
-        })
+        .txn_add_partitions(AddPartitionsToTxnRequest::default().transactions(Some(vec![])))
         .await
     {
         Err(Error::Api(code)) => assert_eq!(ErrorCode::UnsupportedVersion, code),

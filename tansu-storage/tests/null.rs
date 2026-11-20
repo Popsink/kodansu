@@ -35,6 +35,7 @@
 //! flamegraph shows the retry rather than the work (#556's fifth milestone).
 
 use std::{collections::BTreeMap, time::Duration};
+use tansu_sans_io::AddPartitionsToTxnRequest;
 
 use bytes::Bytes;
 use tansu_sans_io::{
@@ -53,8 +54,8 @@ use tansu_storage::{
     BrokerRegistrationRequest, CommittedOffset, DEFAULT_FETCH_MAX_BYTES, Error, GenerationDoc,
     MemberDoc, NamedGroupDetail, OffsetCommitRequest, PRODUCER_BYTE_RATE, QuotaAlteration,
     QuotaEntity, QuotaFilterComponent, QuotaLimits, QuotaMatch, QuotaOp, ScramCredential, Storage,
-    StorageContainer, TopicId, Topition, TxnAddPartitionsRequest, TxnAddPartitionsResponse,
-    TxnOffsetCommitRequest, USER_ENTITY, UpdateError, Version, WILDCARD_HOST,
+    StorageContainer, TopicId, Topition, TxnOffsetCommitRequest, USER_ENTITY, UpdateError, Version,
+    WILDCARD_HOST,
 };
 use url::Url;
 use uuid::Uuid;
@@ -411,20 +412,20 @@ async fn transactions_are_acknowledged_shape_intact() -> Result {
 
     // One result per topic, in the order asked. Two topics in, two out.
     let added = storage
-        .txn_add_partitions(TxnAddPartitionsRequest::VersionZeroToThree {
-            transaction_id: "txn-1".into(),
-            producer_id: producer.id,
-            producer_epoch: producer.epoch,
-            topics: vec![
-                AddPartitionsToTxnTopic::default().name("abc".into()),
-                AddPartitionsToTxnTopic::default().name("def".into()),
-            ],
-        })
+        .txn_add_partitions(
+            AddPartitionsToTxnRequest::default()
+                .v_3_and_below_transactional_id(Some("txn-1".into()))
+                .v_3_and_below_producer_id(Some(producer.id))
+                .v_3_and_below_producer_epoch(Some(producer.epoch))
+                .v_3_and_below_topics(Some(vec![
+                    AddPartitionsToTxnTopic::default().name("abc".into()),
+                    AddPartitionsToTxnTopic::default().name("def".into()),
+                ])),
+        )
         .await?;
 
-    let TxnAddPartitionsResponse::VersionZeroToThree(results) = added else {
-        panic!("a v0-3 request must not be answered with a v4+ response");
-    };
+    assert_eq!(Some(vec![]), added.results_by_transaction);
+    let results = added.results_by_topic_v_3_and_below.unwrap_or_default();
     assert_eq!(
         vec!["abc", "def"],
         results

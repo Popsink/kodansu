@@ -1262,6 +1262,15 @@ fmt:
 # alone as it took the chain alone. The progress bar and `METER` read the
 # same. Only code went, so the ceiling rises.
 #
+#   refactor  -111 lines, AddPartitionsToTxn on the protocol's own types  2814 -> 2814  2.6950 -> 2.6971
+#
+# Lot E's second refactoring (Popsink/data-plane#5884): `TxnAddPartitionsRequest`
+# and `TxnAddPartitionsResponse` re-encoded the protocol's v0-3 / v4+ split, and
+# are gone. `Storage::txn_add_partitions` takes and answers the
+# `tansu-sans-io` types; each engine matches the two shapes itself and answers
+# through `added_by_topic` / `added_by_transaction`, which build the response
+# the service used to. Only code went, so the ceiling rises.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1271,7 +1280,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6950" top="12":
+comments ceiling="2.6971" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
