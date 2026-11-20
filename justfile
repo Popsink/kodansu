@@ -1183,6 +1183,15 @@ fmt:
 # `dynostore/tests/txn_overlap.rs` (116 lines) pins those three down; it passes
 # on the old body too. The new tests lower the ratio, and the ceiling follows.
 #
+#   defork  -8 lines, the fetch service's shell rewritten  2814 -> 2814  2.6746 -> 2.6749
+#
+# `tansu-storage/src/service/fetch.rs` keeps `FetchService`, `Budget`, the
+# fetch loop and every impl, signature and cited comment. Its doctest moves
+# from `FETCH_CONCURRENCY`'s doc comment, where it had drifted, onto
+# `FetchService`, and fetches the same partition; the three record-less
+# partition answers share `recordless`; `serve` reads the same isolation, wait
+# and byte bounds. Only code went, so the ceiling rises.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1192,7 +1201,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6746" top="12":
+comments ceiling="2.6749" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

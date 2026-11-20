@@ -22,114 +22,20 @@ use std::{
 use futures::{StreamExt as _, TryStreamExt as _};
 use opentelemetry::KeyValue;
 use rama::{Context, Service};
-use tansu_sans_io::{
-    ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel, NULL_TOPIC_ID,
-    fetch_request::{FetchPartition, FetchTopic},
-    fetch_response::{
-        AbortedTransaction, EpochEndOffset, FetchableTopicResponse, LeaderIdAndEpoch,
-        PartitionData, SnapshotId,
-    },
-    metadata_response::MetadataResponseTopic,
-    record::deflated::{Batch, Frame},
-};
+use tansu_sans_io::NULL_TOPIC_ID;
+use tansu_sans_io::acl::{Operation, Resource};
+use tansu_sans_io::fetch_request::{FetchPartition, FetchTopic};
+use tansu_sans_io::fetch_response::{AbortedTransaction, EpochEndOffset, FetchableTopicResponse};
+use tansu_sans_io::fetch_response::{LeaderIdAndEpoch, PartitionData, SnapshotId};
+use tansu_sans_io::metadata_response::MetadataResponseTopic;
+use tansu_sans_io::record::deflated::{Batch, Frame};
+use tansu_sans_io::{ApiKey, ErrorCode, FetchRequest, FetchResponse, IsolationLevel};
 use tokio::time::{Duration, Instant, sleep};
 use tracing::{debug, error, info, instrument, warn};
 
-use tansu_sans_io::acl::{Operation, Resource};
+use crate::{Error, FETCH_OUT_OF_RANGE, OffsetStage, Parked, Result, Storage, Topition};
+use crate::{authorized, storage_error_code};
 
-use crate::{
-    Error, FETCH_OUT_OF_RANGE, OffsetStage, Parked, Result, Storage, Topition, authorized,
-    storage_error_code,
-};
-
-/// A [`Service`] using [`Storage`] as [`Context`] taking [`FetchRequest`] returning [`FetchResponse`].
-/// ```
-/// use rama::{Context, Layer as _, Service as _, layer::MapStateLayer};
-/// use tansu_sans_io::{
-///     CreateTopicsRequest, ErrorCode, FetchRequest,
-///     create_topics_request::CreatableTopic,
-///     fetch_request::{FetchPartition, FetchTopic},
-/// };
-/// use tansu_storage::{CreateTopicsService, Error, FetchService, StorageContainer};
-/// use url::Url;
-///
-/// # #[tokio::main]
-/// # async fn main() -> Result<(), Error> {
-/// const CLUSTER_ID: &str = "tansu";
-/// const NODE_ID: i32 = 111;
-/// const HOST: &str = "localhost";
-/// const PORT: i32 = 9092;
-///
-/// let storage = StorageContainer::builder()
-///     .cluster_id(CLUSTER_ID)
-///     .node_id(NODE_ID)
-///     .advertised_listener(Url::parse(&format!("tcp://{HOST}:{PORT}"))?)
-///     .storage(Url::parse("memory://tansu/")?)
-///     .build()
-///     .await?;
-///
-/// let create_topic = {
-///     let storage = storage.clone();
-///     MapStateLayer::new(|_| storage).into_layer(CreateTopicsService)
-/// };
-///
-/// let name = "abcba";
-///
-/// let response = create_topic
-///     .serve(
-///         Context::default(),
-///         CreateTopicsRequest::default()
-///             .topics(Some(vec![
-///                 CreatableTopic::default()
-///                     .name(name.into())
-///                     .num_partitions(5)
-///                     .replication_factor(3)
-///                     .assignments(Some([].into()))
-///                     .configs(Some([].into())),
-///             ]))
-///             .validate_only(Some(false)),
-///     )
-///     .await?;
-///
-/// let topics = response.topics.unwrap_or_default();
-/// assert_eq!(1, topics.len());
-/// assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
-///
-/// let fetch = {
-///     let storage = storage.clone();
-///     MapStateLayer::new(|_| storage).into_layer(FetchService)
-/// };
-///
-/// let partition = 0;
-///
-/// let response = fetch
-///     .serve(
-///         Context::default(),
-///         FetchRequest::default()
-///             .topics(Some(
-///                 [FetchTopic::default()
-///                     .topic(Some(name.into()))
-///                     .partitions(Some(
-///                         [FetchPartition::default().partition(partition)].into(),
-///                     ))]
-///                 .into(),
-///             ))
-///             .max_bytes(Some(0))
-///             .max_wait_ms(5_000),
-///     )
-///     .await?;
-///
-/// let topics = response.responses.as_deref().unwrap_or_default();
-/// assert_eq!(1, topics.len());
-/// let partitions = topics[0].partitions.as_deref().unwrap_or_default();
-/// assert_eq!(1, partitions.len());
-/// assert_eq!(
-///     ErrorCode::None,
-///     ErrorCode::try_from(partitions[0].error_code)?
-/// );
-/// # Ok(())
-/// # }
-/// ```
 /// Partitions read at once across the whole request (#426).
 ///
 /// The same bound as every other fan-out in the engine — `FOOTER_FETCH_CONCURRENCY`,
@@ -246,6 +152,64 @@ impl Budget {
     }
 }
 
+/// Serves a [`FetchRequest`] from the [`Storage`] in its [`Context`].
+///
+/// ```
+/// use rama::layer::MapStateLayer;
+/// use rama::{Context, Layer as _, Service as _};
+/// use tansu_sans_io::create_topics_request::CreatableTopic;
+/// use tansu_sans_io::fetch_request::{FetchPartition, FetchTopic};
+/// use tansu_sans_io::{CreateTopicsRequest, ErrorCode, FetchRequest};
+/// use tansu_storage::{CreateTopicsService, Error, FetchService, StorageContainer};
+/// use url::Url;
+///
+/// # #[tokio::main]
+/// # async fn main() -> Result<(), Error> {
+/// let storage = StorageContainer::builder()
+///     .cluster_id("tansu")
+///     .node_id(111)
+///     .advertised_listener(Url::parse("tcp://localhost:9092")?)
+///     .storage(Url::parse("memory://tansu/")?)
+///     .build()
+///     .await?;
+/// let state = |storage: &_| {
+///     let storage = Clone::clone(storage);
+///     MapStateLayer::new(move |_| storage)
+/// };
+///
+/// let topic = CreatableTopic::default()
+///     .name(String::from("abcba"))
+///     .num_partitions(5)
+///     .replication_factor(3)
+///     .assignments(Some(Vec::new()))
+///     .configs(Some(Vec::new()));
+/// let create = CreateTopicsRequest::default()
+///     .topics(Some(vec![topic]))
+///     .validate_only(Some(false));
+/// let created = state(&storage).into_layer(CreateTopicsService);
+/// let topics = created.serve(Context::default(), create).await?.topics.unwrap_or_default();
+/// assert_eq!(1, topics.len());
+/// assert_eq!(ErrorCode::None, ErrorCode::try_from(topics[0].error_code)?);
+///
+/// let partitions = vec![FetchPartition::default().partition(0)];
+/// let wanted = FetchTopic::default()
+///     .topic(Some(String::from("abcba")))
+///     .partitions(Some(partitions));
+/// let fetch = FetchRequest::default()
+///     .topics(Some(vec![wanted]))
+///     .max_bytes(Some(0))
+///     .max_wait_ms(5_000);
+/// let fetching = state(&storage).into_layer(FetchService);
+/// let answered = fetching.serve(Context::default(), fetch).await?;
+///
+/// let topics = answered.responses.unwrap_or_default();
+/// assert_eq!(1, topics.len());
+/// let partitions = topics[0].partitions.as_deref().unwrap_or_default();
+/// assert_eq!(1, partitions.len());
+/// assert_eq!(ErrorCode::None, ErrorCode::try_from(partitions[0].error_code)?);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FetchService;
 
@@ -584,33 +548,12 @@ impl FetchService {
         log: &OffsetStage,
         error_code: ErrorCode,
     ) -> PartitionData {
-        PartitionData::default()
-            .partition_index(partition_index)
-            .error_code(error_code.into())
-            .high_watermark(log.high_watermark())
-            .last_stable_offset(Some(log.last_stable()))
-            .log_start_offset(Some(log.log_start()))
-            .diverging_epoch(None)
-            .current_leader(None)
-            .snapshot_id(None)
-            .aborted_transactions(Some([].into()))
-            .preferred_read_replica(Some(-1))
-            .records(None)
+        let (high, stable, start) = (log.high_watermark(), log.last_stable(), log.log_start());
+        recordless(partition_index, error_code, high, stable, start)
     }
 
     fn unservable_partition(&self, partition_index: i32, error_code: ErrorCode) -> PartitionData {
-        PartitionData::default()
-            .partition_index(partition_index)
-            .error_code(error_code.into())
-            .high_watermark(0)
-            .last_stable_offset(Some(0))
-            .log_start_offset(Some(-1))
-            .diverging_epoch(None)
-            .current_leader(None)
-            .snapshot_id(None)
-            .aborted_transactions(Some([].into()))
-            .preferred_read_replica(Some(-1))
-            .records(None)
+        recordless(partition_index, error_code, 0, 0, -1)
     }
 
     /// A topic this principal may not read, refused the way an unknown one is
@@ -636,32 +579,22 @@ impl FetchService {
         fetch: &FetchTopic,
         error_code: ErrorCode,
     ) -> Result<FetchableTopicResponse> {
-        Ok(FetchableTopicResponse::default()
+        let refused = |partition: &FetchPartition| {
+            let diverging = EpochEndOffset::default().epoch(-1).end_offset(-1);
+            let leader = LeaderIdAndEpoch::default().leader_id(0).leader_epoch(0);
+            let snapshot = SnapshotId::default().end_offset(-1).epoch(-1);
+            recordless(partition.partition, error_code, 0, 0, -1)
+                .diverging_epoch(Some(diverging))
+                .current_leader(Some(leader))
+                .snapshot_id(Some(snapshot))
+        };
+        let partitions = fetch.partitions.as_ref();
+        let answered = partitions.map(|partitions| partitions.iter().map(refused).collect());
+        let response = FetchableTopicResponse::default()
             .topic(fetch.topic.clone())
             .topic_id(Some(NULL_TOPIC_ID))
-            .partitions(fetch.partitions.as_ref().map(|partitions| {
-                partitions
-                    .iter()
-                    .map(|partition| {
-                        PartitionData::default()
-                            .partition_index(partition.partition)
-                            .error_code(error_code.into())
-                            .high_watermark(0)
-                            .last_stable_offset(Some(0))
-                            .log_start_offset(Some(-1))
-                            .diverging_epoch(Some(
-                                EpochEndOffset::default().epoch(-1).end_offset(-1),
-                            ))
-                            .current_leader(Some(
-                                LeaderIdAndEpoch::default().leader_id(0).leader_epoch(0),
-                            ))
-                            .snapshot_id(Some(SnapshotId::default().end_offset(-1).epoch(-1)))
-                            .aborted_transactions(Some([].into()))
-                            .preferred_read_replica(Some(-1))
-                            .records(None)
-                    })
-                    .collect()
-            })))
+            .partitions(answered);
+        Ok(response)
     }
 
     #[instrument(skip(self, ctx, isolation, topics))]
@@ -900,14 +833,11 @@ where
         let started_at = SystemTime::now();
 
         let responses = Some(if let Some(topics) = req.topics {
-            let isolation_level = req
-                .isolation_level
-                .map_or(Ok(IsolationLevel::ReadUncommitted), |isolation| {
-                    IsolationLevel::try_from(isolation)
-                })?;
-
-            let max_wait_ms = u64::try_from(req.max_wait_ms).map(Duration::from_millis)?;
-
+            let isolation_level = match req.isolation_level {
+                Some(isolation) => IsolationLevel::try_from(isolation)?,
+                None => IsolationLevel::ReadUncommitted,
+            };
+            let max_wait_ms = Duration::from_millis(u64::try_from(req.max_wait_ms)?);
             let min_bytes = u32::try_from(req.min_bytes)?;
 
             // A clamp, not a default: a client asking for 16 MiB is answered
@@ -916,27 +846,28 @@ where
             // fleet left alone, which a compile-time constant cannot express.
             let cap = ctx.state().fetch_max_bytes();
 
-            let max_bytes = req.max_bytes.map_or(Ok(cap), |max_bytes| {
-                u32::try_from(max_bytes).map(|max_bytes| max_bytes.min(cap))
-            })?;
+            let max_bytes = match req.max_bytes {
+                Some(asked) => u32::try_from(asked)?.min(cap),
+                None => cap,
+            };
 
-            self.fetch(
+            let answering = self.fetch(
                 &ctx,
                 max_wait_ms,
                 min_bytes,
                 max_bytes,
                 isolation_level,
-                topics.as_ref(),
-            )
-            .await?
+                &topics,
+            );
+            answering.await?
         } else {
-            vec![]
+            Vec::new()
         });
 
-        Ok(FetchResponse::default()
+        let answered = FetchResponse::default()
+            .session_id(Some(0))
             .throttle_time_ms(Some(0))
             .error_code(Some(ErrorCode::None.into()))
-            .session_id(Some(0))
             // NodeEndpoints is a tagged field (tag 0) only valid from Fetch v16
             // (KIP-951). Emitting it (even as an empty list) on a response whose
             // negotiated version is < 16 makes clients fail to decode with
@@ -944,9 +875,34 @@ where
             // KafkaBasedLog work thread (#7). It carries no information for us
             // (no leader endpoints to advertise), so leave it unset.
             .node_endpoints(None)
-            .responses(responses))
-        .inspect(|r| debug!(?r, elapsed = ?started_at.elapsed().ok()))
+            .responses(responses);
+        debug!(r = ?answered, elapsed = ?started_at.elapsed().ok());
+        Ok(answered)
     }
+}
+
+/// A partition answered with `error_code` and no records, at the given high
+/// watermark, last stable offset and log start.
+fn recordless(
+    partition_index: i32,
+    error_code: ErrorCode,
+    high_watermark: i64,
+    last_stable: i64,
+    log_start: i64,
+) -> PartitionData {
+    let code: i16 = error_code.into();
+    PartitionData::default()
+        .partition_index(partition_index)
+        .error_code(code)
+        .high_watermark(high_watermark)
+        .last_stable_offset(Some(last_stable))
+        .log_start_offset(Some(log_start))
+        .diverging_epoch(None)
+        .current_leader(None)
+        .snapshot_id(None)
+        .aborted_transactions(Some(Vec::new()))
+        .preferred_read_replica(Some(-1))
+        .records(None)
 }
 
 trait ByteSize {
@@ -958,7 +914,7 @@ where
     T: ByteSize,
 {
     fn byte_size(&self) -> u64 {
-        self.iter().map(|item| item.byte_size()).sum()
+        self.iter().map(ByteSize::byte_size).sum()
     }
 }
 
@@ -967,7 +923,10 @@ where
     T: ByteSize,
 {
     fn byte_size(&self) -> u64 {
-        self.as_ref().map_or(0, |some| some.byte_size())
+        let Some(present) = self else {
+            return 0;
+        };
+        present.byte_size()
     }
 }
 
@@ -1000,19 +959,22 @@ impl ByteSize for Batch {
 
 impl ByteSize for Frame {
     fn byte_size(&self) -> u64 {
-        self.batches.byte_size()
+        let Frame { batches } = self;
+        batches.byte_size()
     }
 }
 
 impl ByteSize for PartitionData {
     fn byte_size(&self) -> u64 {
-        self.records.byte_size()
+        let records = &self.records;
+        records.byte_size()
     }
 }
 
 impl ByteSize for FetchableTopicResponse {
     fn byte_size(&self) -> u64 {
-        self.partitions.byte_size()
+        let partitions = &self.partitions;
+        partitions.byte_size()
     }
 }
 
