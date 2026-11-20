@@ -1080,6 +1080,16 @@ fmt:
 # the same order. `object_store_error_name` answers the same names. No comment
 # changed, only code went, so the ceiling rises.
 #
+#   defork  +12 lines, the frame layers rewritten  2834 -> 2819  2.6752 -> 2.6611
+#
+# `tansu-service/src/frame.rs` keeps every layer and service, their fields,
+# and every impl and signature. The v0 SASL handshake's three states move into
+# `handshake_v0`, `begin_handshake_v0` and `end_handshake_v0`, and its framing
+# into `opaque_token` and `length_prefixed`, with the same bytes, the same
+# `NotAuthenticated` refusal and the same metrics. The fifteen body comments
+# that paraphrased the protocol guide became those helpers' doc comments,
+# so the ratio falls and the ceiling follows it down.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1089,7 +1099,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6752" top="12":
+comments ceiling="2.6611" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
