@@ -57,50 +57,43 @@
 //! to stop (#361) — an answer being the whole difference between a scale-in
 //! event a client absorbs and one it reports as a broker that dropped it.
 
-use std::{
-    collections::{BTreeMap, BTreeSet, HashSet},
-    fmt::{self, Debug},
-    hash::Hash,
-    ops::{Deref, Div as _, Mul},
-    sync::{Arc, LazyLock, Mutex},
-    time::SystemTime,
-};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::fmt::{self, Debug};
+use std::hash::Hash;
+use std::ops::{Div as _, Mul};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::SystemTime;
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use cached::stores::ExpiringSizedCache;
 use futures::StreamExt as _;
-use opentelemetry::{
-    KeyValue,
-    metrics::{Counter, Histogram},
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::{Counter, Histogram};
+use rand::prelude::*;
+use rand::rng;
+use tansu_sans_io::consumer::{CONSUMER, MemberAssignment, MemberMetadata};
+use tansu_sans_io::heartbeat_response::HeartbeatResponse;
+use tansu_sans_io::join_group_request::JoinGroupRequestProtocol;
+use tansu_sans_io::join_group_response::{JoinGroupResponse, JoinGroupResponseMember};
+use tansu_sans_io::leave_group_request::MemberIdentity;
+use tansu_sans_io::leave_group_response::{LeaveGroupResponse, MemberResponse};
+use tansu_sans_io::offset_commit_response::OffsetCommitResponse;
+use tansu_sans_io::offset_commit_response::{
+    OffsetCommitResponsePartition, OffsetCommitResponseTopic,
 };
-use rand::{prelude::*, rng};
-use tansu_sans_io::{
-    Body, ConsumerGroupHeartbeatRequest, ErrorCode,
-    consumer::{CONSUMER, MemberAssignment, MemberMetadata},
-    heartbeat_response::HeartbeatResponse,
-    join_group_request::JoinGroupRequestProtocol,
-    join_group_response::{JoinGroupResponse, JoinGroupResponseMember},
-    leave_group_request::MemberIdentity,
-    leave_group_response::{LeaveGroupResponse, MemberResponse},
-    offset_commit_response::{
-        OffsetCommitResponse, OffsetCommitResponsePartition, OffsetCommitResponseTopic,
-    },
-    offset_fetch_request::{OffsetFetchRequestGroup, OffsetFetchRequestTopic},
-    offset_fetch_response::{
-        OffsetFetchResponse, OffsetFetchResponseGroup, OffsetFetchResponsePartition,
-        OffsetFetchResponsePartitions, OffsetFetchResponseTopic, OffsetFetchResponseTopics,
-    },
-    sync_group_request::SyncGroupRequestAssignment,
-    sync_group_response::SyncGroupResponse,
-    to_timestamp,
+use tansu_sans_io::offset_fetch_request::{OffsetFetchRequestGroup, OffsetFetchRequestTopic};
+use tansu_sans_io::offset_fetch_response::{OffsetFetchResponse, OffsetFetchResponseGroup};
+use tansu_sans_io::offset_fetch_response::{
+    OffsetFetchResponsePartition, OffsetFetchResponsePartitions,
 };
+use tansu_sans_io::offset_fetch_response::{OffsetFetchResponseTopic, OffsetFetchResponseTopics};
+use tansu_sans_io::sync_group_request::SyncGroupRequestAssignment;
+use tansu_sans_io::sync_group_response::SyncGroupResponse;
+use tansu_sans_io::{Body, ConsumerGroupHeartbeatRequest, ErrorCode, to_timestamp};
 use tansu_service::Parked;
-use tansu_storage::{
-    AssignmentDoc, AssignmentOutcome, ConsumerGroupDoc, ConsumerGroupState, ContactStamps,
-    GenerationDoc, MemberDoc, MemberRef, OffsetCommitRequest, Storage, TopicId, Topition,
-    UpdateError, Version,
-};
+use tansu_storage::{AssignmentDoc, AssignmentOutcome, ConsumerGroupDoc, ConsumerGroupState};
+use tansu_storage::{ContactStamps, GenerationDoc, MemberDoc, MemberRef, OffsetCommitRequest};
+use tansu_storage::{Storage, TopicId, Topition, UpdateError, Version};
 use tokio::time::{Duration, Instant, sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
@@ -1222,7 +1215,7 @@ where
 
             () = self.cancellation.cancelled() => {
                 debug!(method, "answering a long poll early: this replica is stopping");
-                COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "long_poll_drained")]);
+                counted("long_poll_drained");
                 false
             }
         }
@@ -1575,7 +1568,7 @@ where
         }
 
         if !self.claim_sweep_locally(group_id, now_ms, due_after) {
-            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sweep_deduped")]);
+            counted("sweep_deduped");
             return Ok(None);
         }
 
@@ -1600,14 +1593,14 @@ where
             // way there is nothing here to sweep; the caller continues against
             // whatever won.
             Err(UpdateError::Outdated { .. } | UpdateError::Vanished) => {
-                COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sweep_claim_lost")]);
+                counted("sweep_claim_lost");
                 return self.read_view(group_id).await.map(Some);
             }
 
             Err(error) => return Err(update_error(error)),
         };
 
-        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sweep_claimed")]);
+        counted("sweep_claimed");
 
         // The group as this claim left it — composed from what was written
         // rather than read back, because a CAS that succeeded says exactly what
@@ -1748,7 +1741,7 @@ where
             // onto a generation it was not computed against: the next window
             // reaches the same verdict about anyone still lapsed.
             Err(UpdateError::Outdated { .. } | UpdateError::Vanished) => {
-                COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sweep_eviction_lost")]);
+                counted("sweep_eviction_lost");
                 self.read_view(group_id).await.map(Some)
             }
 
@@ -1778,7 +1771,7 @@ where
     ) -> BTreeSet<String> {
         let freshness_ms = admission_freshness_ms(generation.session_timeout_ms);
 
-        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_admission_listed")]);
+        counted("join_admission_listed");
 
         // A listing that fails is answered as "nobody else is joining", not as
         // a failed join: this is an optimisation over a member admitting
@@ -1980,184 +1973,114 @@ where
         groups: Option<&[OffsetFetchRequestGroup]>,
         require_stable: Option<bool>,
     ) -> Result<Body> {
-        debug!(?group_id, ?topics, ?groups, ?require_stable);
+        debug!(
+            group_id = ?group_id,
+            topics = ?topics,
+            groups = ?groups,
+            require_stable = ?require_stable
+        );
 
-        let topics = if let Some(topics) = topics {
-            let topics: Vec<Topition> = topics
-                .iter()
-                .flat_map(|topic| {
-                    topic
-                        .partition_indexes
-                        .as_ref()
-                        .map(|partition_indexes| {
-                            partition_indexes
-                                .iter()
-                                .map(|partition_index| {
-                                    Topition::new(topic.name.clone(), *partition_index)
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default()
-                })
-                .collect();
-
-            self.storage
-                .offset_fetch(group_id, topics.deref(), require_stable)
-                .await
-                .map(|offsets| {
-                    offsets
+        let topics = match topics {
+            None => None,
+            Some(requested) => {
+                let wanted = requested_topitions(requested.iter().map(|topic| {
+                    let indexes = topic.partition_indexes.as_deref().unwrap_or_default();
+                    (topic.name.as_str(), indexes)
+                }));
+                let fetched = self.storage.offset_fetch(group_id, &wanted, require_stable);
+                let committed = fetched.await?;
+                let names = topic_names(committed.keys());
+                let answered = names.into_iter().map(|name| {
+                    let mine = committed
                         .iter()
-                        .fold(BTreeSet::new(), |mut topics, (topition, _)| {
-                            _ = topics.insert(topition.topic());
-                            topics
-                        })
-                        .iter()
-                        .map(|topic_name| {
-                            OffsetFetchResponseTopic::default()
-                                .name((*topic_name).into())
-                                .partitions(Some(
-                                    offsets
-                                        .iter()
-                                        .filter_map(|(topition, committed)| {
-                                            if topition.topic() == *topic_name {
-                                                Some(
-                                                    OffsetFetchResponsePartition::default()
-                                                        .partition_index(topition.partition())
-                                                        .committed_offset(committed.offset)
-                                                        .committed_leader_epoch(Some(-1))
-                                                        // What the client
-                                                        // committed, not `""`
-                                                        // (#445). It was stored
-                                                        // all along and dropped
-                                                        // on the way out, so a
-                                                        // framework keeping its
-                                                        // restore point here
-                                                        // lost it with no error
-                                                        // at write time.
-                                                        .metadata(
-                                                            committed
-                                                                .metadata
-                                                                .clone()
-                                                                .or_else(|| Some(String::new())),
-                                                        )
-                                                        .error_code(ErrorCode::None.into()),
-                                                )
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .collect(),
-                                ))
-                        })
-                        .collect()
-                })
-                .map(Some)?
-        } else {
-            None
-        };
-
-        let groups = if let Some(groups) = groups {
-            let mut responses = vec![];
-
-            for group in groups {
-                debug!(?group);
-
-                let response = if let Some(topics) = group.topics.as_ref().map(|topics| {
-                    topics
-                        .iter()
-                        .flat_map(|topic| {
-                            topic
-                                .partition_indexes
-                                .as_ref()
-                                .map(|partition_indexes| {
-                                    partition_indexes
-                                        .iter()
-                                        .map(|partition_index| {
-                                            Topition::new(topic.name.clone(), *partition_index)
-                                        })
-                                        .collect::<Vec<_>>()
-                                })
-                                .unwrap_or_default()
-                        })
-                        .collect::<Vec<_>>()
-                }) {
-                    self.storage
-                        .offset_fetch(
-                            Some(group.group_id.as_str()),
-                            topics.deref(),
-                            require_stable,
-                        )
-                        .await
-                        .inspect(|offsets| debug!(?offsets))
-                        .inspect_err(|err| error!(?err, ?group))
-                } else {
-                    self.storage
-                        .committed_offset_topitions(&group.group_id)
-                        .await
-                        .inspect(|offsets| debug!(?offsets))
-                        .inspect_err(|err| error!(?err, ?group))
-                }
-                .map(|offsets| {
-                    OffsetFetchResponseGroup::default()
-                        .group_id(group.group_id.clone())
-                        .topics(Some(
-                            offsets
-                                .iter()
-                                .fold(BTreeSet::new(), |mut topics, (topition, _)| {
-                                    _ = topics.insert(topition.topic());
-                                    topics
-                                })
-                                .iter()
-                                .map(|topic_name| {
-                                    OffsetFetchResponseTopics::default()
-                                        .name((*topic_name).into())
-                                        .partitions(Some(
-                                            offsets
-                                                .iter()
-                                                .filter_map(|(topition, committed)| {
-                                                    if topition.topic() == *topic_name {
-                                                        Some(
-                                                            OffsetFetchResponsePartitions::default(
-                                                            )
-                                                            .partition_index(topition.partition())
-                                                            .committed_offset(committed.offset)
-                                                            .committed_leader_epoch(-1)
-                                                            // As above (#445).
-                                                            // Nullable in this
-                                                            // shape, so an
-                                                            // absent metadata
-                                                            // stays absent
-                                                            // rather than
-                                                            // becoming `""`.
-                                                            .metadata(committed.metadata.clone())
-                                                            .error_code(ErrorCode::None.into()),
-                                                        )
-                                                    } else {
-                                                        None
-                                                    }
-                                                })
-                                                .collect(),
-                                        ))
-                                })
-                                .collect(),
-                        ))
-                        .error_code(ErrorCode::None.into())
-                })?;
-
-                responses.push(response);
+                        .filter(|(topition, _)| topition.topic() == name);
+                    let partitions = mine.map(|(topition, offset)| {
+                        OffsetFetchResponsePartition::default()
+                            .partition_index(topition.partition())
+                            .committed_offset(offset.offset)
+                            .committed_leader_epoch(Some(-1))
+                            // What the client committed, not `""` (#445). It
+                            // was stored all along and dropped on the way out,
+                            // so a framework keeping its restore point here
+                            // lost it with no error at write time.
+                            .metadata(offset.metadata.clone().or_else(|| Some(String::new())))
+                            .error_code(ErrorCode::None.into())
+                    });
+                    OffsetFetchResponseTopic::default()
+                        .name(name.into())
+                        .partitions(Some(partitions.collect()))
+                });
+                Some(answered.collect())
             }
-
-            Some(responses)
-        } else {
-            None
         };
 
-        Ok(OffsetFetchResponse::default()
+        let groups = match groups {
+            None => None,
+            Some(asked) => {
+                let mut answers = Vec::new();
+                for group in asked {
+                    debug!(group = ?group);
+                    let group_id = group.group_id.as_str();
+                    let fetched = match group.topics.as_ref() {
+                        Some(topics) => {
+                            let wanted = requested_topitions(topics.iter().map(|topic| {
+                                let indexes =
+                                    topic.partition_indexes.as_deref().unwrap_or_default();
+                                (topic.name.as_str(), indexes)
+                            }));
+                            let fetching =
+                                self.storage
+                                    .offset_fetch(Some(group_id), &wanted, require_stable);
+                            fetching.await
+                        }
+                        None => {
+                            self.storage
+                                .committed_offset_topitions(&group.group_id)
+                                .await
+                        }
+                    };
+                    match &fetched {
+                        Ok(offsets) => debug!(offsets = ?offsets),
+                        Err(err) => error!(err = ?err, group = ?group),
+                    }
+                    let offsets = fetched?;
+
+                    let names = topic_names(offsets.keys());
+                    let topics = names.into_iter().map(|name| {
+                        let mine = offsets
+                            .iter()
+                            .filter(|(topition, _)| topition.topic() == name);
+                        let partitions = mine.map(|(topition, offset)| {
+                            OffsetFetchResponsePartitions::default()
+                                .partition_index(topition.partition())
+                                .committed_offset(offset.offset)
+                                .committed_leader_epoch(-1)
+                                // As above (#445). Nullable in this shape, so
+                                // an absent metadata stays absent rather than
+                                // becoming `""`.
+                                .metadata(offset.metadata.clone())
+                                .error_code(ErrorCode::None.into())
+                        });
+                        OffsetFetchResponseTopics::default()
+                            .name(name.into())
+                            .partitions(Some(partitions.collect()))
+                    });
+                    let answer = OffsetFetchResponseGroup::default()
+                        .group_id(group.group_id.clone())
+                        .topics(Some(topics.collect()))
+                        .error_code(ErrorCode::None.into());
+                    answers.push(answer);
+                }
+                Some(answers)
+            }
+        };
+
+        let answer = OffsetFetchResponse::default()
             .throttle_time_ms(Some(0))
             .topics(topics)
             .error_code(Some(ErrorCode::None.into()))
-            .groups(groups)
-            .into())
+            .groups(groups);
+        Ok(answer.into())
     }
 
     /// What a commit from a member the current generation names, carrying
@@ -2202,97 +2125,97 @@ where
     }
 
     async fn commit_offset(&self, detail: &OffsetCommit<'_>) -> Result<Body> {
-        let retention_time_ms = detail.retention_time_ms.map_or(Ok(None), |ms| {
-            u64::try_from(ms)
-                .map(Duration::from_millis)
-                .map_err(Error::from)
-                .map(Some)
-        })?;
+        let retention_time_ms = match detail.retention_time_ms {
+            None => None,
+            Some(ms) => Some(Duration::from_millis(u64::try_from(ms)?)),
+        };
 
         let Some(topics) = detail.topics else {
             return Ok(offset_commit_error(detail, ErrorCode::UnknownMemberId));
         };
 
-        let mut offsets = vec![];
-
+        let mut offsets = Vec::new();
         for topic in topics {
-            if let Some(ref partitions) = topic.partitions {
-                for partition in partitions {
-                    let topition = Topition::new(topic.name.clone(), partition.partition_index);
-                    let offset = OffsetCommitRequest::try_from(partition)?;
-
-                    offsets.push((topition, offset));
-                }
+            for partition in topic.partitions.iter().flatten() {
+                let topition = Topition::new(topic.name.clone(), partition.partition_index);
+                let offset = OffsetCommitRequest::try_from(partition)?;
+                offsets.push((topition, offset));
             }
         }
 
-        self.storage
-            .offset_commit(detail.group_id, retention_time_ms, offsets.deref())
-            .await
-            .map(|value| {
-                let topics = value
-                    .iter()
-                    .fold(BTreeSet::new(), |mut topics, (topition, _)| {
-                        _ = topics.insert(topition.topic());
-                        topics
-                    })
-                    .iter()
-                    .map(|topic_name| {
-                        OffsetCommitResponseTopic::default()
-                            .name((*topic_name).into())
-                            .partitions(Some(
-                                value
-                                    .iter()
-                                    .filter_map(|(topition, error_code)| {
-                                        if topition.topic() == *topic_name {
-                                            Some(
-                                                OffsetCommitResponsePartition::default()
-                                                    .partition_index(topition.partition())
-                                                    .error_code(i16::from(*error_code)),
-                                            )
-                                        } else {
-                                            None
-                                        }
-                                    })
-                                    .collect(),
-                            ))
-                    })
-                    .collect();
-
-                OffsetCommitResponse::default()
-                    .throttle_time_ms(Some(0))
-                    .topics(Some(topics))
-                    .into()
-            })
-            .inspect_err(|err| error!(?err))
-            .map_err(Into::into)
+        let committing = self
+            .storage
+            .offset_commit(detail.group_id, retention_time_ms, &offsets);
+        let codes = match committing.await {
+            Ok(codes) => codes,
+            Err(err) => {
+                error!(err = ?err);
+                return Err(err.into());
+            }
+        };
+        let names = topic_names(codes.iter().map(|(topition, _)| topition));
+        let topics = names.into_iter().map(|name| {
+            let mine = codes
+                .iter()
+                .filter(|(topition, _)| topition.topic() == name);
+            let partitions = mine.map(|(topition, code)| {
+                OffsetCommitResponsePartition::default()
+                    .partition_index(topition.partition())
+                    .error_code(i16::from(*code))
+            });
+            OffsetCommitResponseTopic::default()
+                .name(name.into())
+                .partitions(Some(partitions.collect()))
+        });
+        let answer = OffsetCommitResponse::default()
+            .throttle_time_ms(Some(0))
+            .topics(Some(topics.collect()));
+        Ok(answer.into())
     }
+}
+
+/// The topitions a request names: every partition index of every topic, in
+/// request order.
+fn requested_topitions<'a>(topics: impl Iterator<Item = (&'a str, &'a [i32])>) -> Vec<Topition> {
+    let mut wanted = Vec::new();
+    for (name, indexes) in topics {
+        wanted.extend(
+            indexes
+                .iter()
+                .map(|&index| Topition::new(name.to_owned(), index)),
+        );
+    }
+    wanted
+}
+
+/// The topics `topitions` name, each once, in name order.
+fn topic_names<'a>(topitions: impl Iterator<Item = &'a Topition>) -> BTreeSet<&'a str> {
+    topitions.map(Topition::topic).collect()
 }
 
 /// Every partition of an `OffsetCommit` answered with the same error.
 fn offset_commit_error(detail: &OffsetCommit<'_>, error_code: ErrorCode) -> Body {
-    OffsetCommitResponse::default()
+    let code: i16 = error_code.into();
+    let topics = detail.topics.map(|topics| {
+        let answered = topics.iter().map(|topic| {
+            let partitions = topic.partitions.as_ref().map(|partitions| {
+                let each = partitions.iter().map(|partition| {
+                    OffsetCommitResponsePartition::default()
+                        .partition_index(partition.partition_index)
+                        .error_code(code)
+                });
+                each.collect()
+            });
+            OffsetCommitResponseTopic::default()
+                .name(topic.name.clone())
+                .partitions(partitions)
+        });
+        answered.collect()
+    });
+    let answer = OffsetCommitResponse::default()
         .throttle_time_ms(Some(0))
-        .topics(detail.topics.map(|topics| {
-            topics
-                .iter()
-                .map(|topic| {
-                    OffsetCommitResponseTopic::default()
-                        .name(topic.name.clone())
-                        .partitions(topic.partitions.as_ref().map(|partitions| {
-                            partitions
-                                .iter()
-                                .map(|partition| {
-                                    OffsetCommitResponsePartition::default()
-                                        .partition_index(partition.partition_index)
-                                        .error_code(error_code.into())
-                                })
-                                .collect()
-                        }))
-                })
-                .collect()
-        }))
-        .into()
+        .topics(topics);
+    answer.into()
 }
 
 /// A failed conditional write, as this crate's error.
@@ -2361,7 +2284,7 @@ fn join_error(
         .into()
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 impl<O> Coordinator for Controller<O>
 where
     O: Storage + Clone,
@@ -2388,28 +2311,21 @@ where
         protocols: Option<&[JoinGroupRequestProtocol]>,
         reason: Option<&str>,
     ) -> Result<Body> {
+        let decode = |protocol: &JoinGroupRequestProtocol| {
+            let metadata = MemberMetadata::try_from(protocol.metadata.clone()).ok()?;
+            Some((protocol.name.clone(), metadata.to_string()))
+        };
         debug!(
-            ?client_id,
-            ?session_timeout_ms,
-            ?rebalance_timeout_ms,
-            ?group_instance_id,
-            ?protocol_type,
-            protocols = ?protocols
-                .map(|protocols| {
-                    protocols
-                        .iter()
-                        .filter_map(|protocol| {
-                            MemberMetadata::try_from(protocol.metadata.clone())
-                                .ok()
-                                .map(|metadata| (protocol.name.clone(), metadata.to_string()))
-                        })
-                        .collect::<BTreeMap<_, _>>()
-                })
-                .unwrap_or_default(),
-            ?reason,
+            client_id = ?client_id,
+            session_timeout_ms = ?session_timeout_ms,
+            rebalance_timeout_ms = ?rebalance_timeout_ms,
+            group_instance_id = ?group_instance_id,
+            protocol_type = ?protocol_type,
+            protocols = ?described(protocols.unwrap_or_default(), decode),
+            reason = ?reason,
         );
 
-        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join")]);
+        counted("join");
 
         // How long this call has been long-polling, on the MONOTONIC clock
         // (#256). Deliberately not the wall clock: `SystemTime` makes
@@ -2435,7 +2351,7 @@ where
         let mut consumer_checked = false;
 
         loop {
-            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_loop")]);
+            counted("join_loop");
 
             let now = (self.now)();
             let now_ms = epoch_ms(now);
@@ -2881,7 +2797,7 @@ where
                     Err(error) => return Err(update_error(error)),
                 }
             } else {
-                COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "join_noop_skip")]);
+                counted("join_noop_skip");
             }
 
             let is_leader = view.leader() == Some(member_id.as_str());
@@ -3002,27 +2918,18 @@ where
         protocol_name: Option<&str>,
         assignments: Option<&[SyncGroupRequestAssignment]>,
     ) -> Result<Body> {
+        let decode = |request: &SyncGroupRequestAssignment| {
+            let assignment = MemberAssignment::try_from(request.assignment.clone()).ok()?;
+            Some((request.member_id.clone(), assignment.to_string()))
+        };
         debug!(
-            ?group_instance_id,
-            ?protocol_type,
-            ?protocol_name,
-            assignments = ?assignments
-                .map(|assignments| {
-                    assignments
-                        .iter()
-                        .filter_map(|request| {
-                            MemberAssignment::try_from(request.assignment.clone())
-                                .ok()
-                                .map(|member_assignment| {
-                                    (request.member_id.clone(), member_assignment.to_string())
-                                })
-                        })
-                        .collect::<BTreeMap<_, _>>()
-                })
-                .unwrap_or_default(),
+            group_instance_id = ?group_instance_id,
+            protocol_type = ?protocol_type,
+            protocol_name = ?protocol_name,
+            assignments = ?described(assignments.unwrap_or_default(), decode),
         );
 
-        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sync")]);
+        counted("sync");
 
         // Once per request, not once per iteration: this inspects the
         // assignments the caller sent, which do not change between retries.
@@ -3032,7 +2939,7 @@ where
         let polling_since = Instant::now();
 
         loop {
-            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "sync_loop")]);
+            counted("sync_loop");
 
             let now = (self.now)();
             let mut view = self.read_view(group_id).await?;
@@ -3121,9 +3028,9 @@ where
         member_id: Option<&str>,
         members: Option<&[MemberIdentity]>,
     ) -> Result<Body> {
-        debug!(?members);
+        debug!(members = ?members);
 
-        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "leave")]);
+        counted("leave");
 
         // Who the request names, in the two shapes LeaveGroup has: the older
         // single-member form, and the batched one.
@@ -3142,7 +3049,7 @@ where
         let mut conflicts = 0u32;
 
         loop {
-            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "leave_loop")]);
+            counted("leave_loop");
 
             let now = (self.now)();
             let now_ms = epoch_ms(now);
@@ -3276,7 +3183,7 @@ where
 
     #[instrument(skip(self, offset_commit), fields(group_id = offset_commit.group_id, generation_id = offset_commit.generation_id_or_member_epoch))]
     async fn offset_commit(&self, offset_commit: OffsetCommit<'_>) -> Result<Body> {
-        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "offset_commit")]);
+        counted("offset_commit");
 
         let group_id = offset_commit.group_id;
         let member_id = offset_commit.member_id.unwrap_or_default();
@@ -3361,9 +3268,14 @@ where
         groups: Option<&[OffsetFetchRequestGroup]>,
         require_stable: Option<bool>,
     ) -> Result<Body> {
-        debug!(?group_id, ?topics, ?groups, ?require_stable);
+        debug!(
+            group_id = ?group_id,
+            topics = ?topics,
+            groups = ?groups,
+            require_stable = ?require_stable
+        );
 
-        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "offset_fetch")]);
+        counted("offset_fetch");
 
         let Some(groups) = groups else {
             return self
@@ -3428,7 +3340,7 @@ where
         client_host: Option<&str>,
         request: &ConsumerGroupHeartbeatRequest,
     ) -> Result<Body> {
-        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "consumer_group_heartbeat")]);
+        counted("consumer_group_heartbeat");
 
         let client = Client {
             id: client_id.unwrap_or_default(),
@@ -3446,9 +3358,14 @@ where
         member_id: &str,
         group_instance_id: Option<&str>,
     ) -> Result<Body> {
-        debug!(?group_id, ?generation_id, ?member_id, ?group_instance_id);
+        debug!(
+            group_id = ?group_id,
+            generation_id = ?generation_id,
+            member_id = ?member_id,
+            group_instance_id = ?group_instance_id
+        );
 
-        COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "heartbeat")]);
+        counted("heartbeat");
 
         let now = (self.now)();
         let mut view = self.read_view(group_id).await?;
@@ -3479,7 +3396,7 @@ where
         _ = self.observe_rebalance(group_id, &view, now);
 
         let error_code = if !view.exists() || !view.generation.members.contains_key(member_id) {
-            COORDINATOR_REQUESTS.add(1, &[KeyValue::new("method", "heartbeat_unknown_member")]);
+            counted("heartbeat_unknown_member");
             ErrorCode::UnknownMemberId
         } else {
             // A member this generation names has just contacted us, so it is
@@ -4624,13 +4541,28 @@ where
     }
 }
 
+/// Count one coordinator request for `method`.
+fn counted(method: &'static str) {
+    let labels = [KeyValue::new("method", method)];
+    COORDINATOR_REQUESTS.add(1, &labels);
+}
+
+/// What `decode` makes of each of `items`, keyed and ordered, for a debug line;
+/// an item it cannot decode is left out.
+fn described<T>(
+    items: &[T],
+    decode: impl Fn(&T) -> Option<(String, String)>,
+) -> BTreeMap<String, String> {
+    items.iter().filter_map(decode).collect()
+}
+
 fn has_unique_elements<T>(iter: T) -> bool
 where
     T: IntoIterator,
     T::Item: Eq + Hash,
 {
-    let mut uniq = HashSet::new();
-    iter.into_iter().all(|x| uniq.insert(x))
+    let mut seen = HashSet::new();
+    iter.into_iter().all(move |item| seen.insert(item))
 }
 
 #[cfg(test)]
