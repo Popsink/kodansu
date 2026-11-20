@@ -124,7 +124,6 @@ pub enum Error {
     Protocol(#[from] tansu_sans_io::Error),
     Service(#[from] tansu_service::Error),
     UnknownApiKey(i16),
-    UnknownHost(Url),
 }
 
 impl tansu_service::Classify for Error {
@@ -238,7 +237,7 @@ impl ConnectionManager {
     }
 
     /// The client id every request to the broker carries.
-    pub fn client_id(&self) -> Option<String> {
+    pub(crate) fn client_id(&self) -> Option<String> {
         let ConnectionManager { client_id, .. } = self;
         client_id.clone()
     }
@@ -335,8 +334,8 @@ async fn checkout(pool: &Pool) -> Result<Object<ConnectionManager>, PoolError<Er
     Ok(connection)
 }
 
-/// [Builds][`Builder#method.build`] a [`Pool`] of [`Connection`]s to a
-/// [broker][`Builder#method.broker`].
+/// [Builds][`Builder#method.build`] a [`Pool`] of [`Connection`]s to the
+/// broker given to [`ConnectionManager::builder`].
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Builder {
     broker: Url,
@@ -345,12 +344,6 @@ pub struct Builder {
 }
 
 impl Builder {
-    /// A builder of connections to `broker`, with no client id and the
-    /// default pool size.
-    pub fn broker(broker: Url) -> Self {
-        ConnectionManager::builder(broker)
-    }
-
     /// The client id every request to the broker carries.
     pub fn client_id(self, client_id: Option<String>) -> Self {
         let mut builder = self;
@@ -468,12 +461,12 @@ where
 /// A [`Layer`] of [`RequestPoolService`]: the [`Pool`] becomes the
 /// [`Context`] state of the [`Service`] it wraps.
 #[derive(Clone, Debug)]
-pub struct RequestPoolLayer {
+pub(crate) struct RequestPoolLayer {
     pool: Pool,
 }
 
 impl RequestPoolLayer {
-    pub fn new(pool: Pool) -> Self {
+    pub(crate) fn new(pool: Pool) -> Self {
         RequestPoolLayer { pool }
     }
 }
@@ -490,7 +483,7 @@ impl<S> Layer<S> for RequestPoolLayer {
 /// Serves a [`Request`] with the [`Pool`] as the [`Context`] state of the
 /// inner [`Service`].
 #[derive(Clone, Debug)]
-pub struct RequestPoolService<S> {
+pub(crate) struct RequestPoolService<S> {
     pool: Pool,
     inner: S,
 }
@@ -595,7 +588,7 @@ where
 
 /// A [`Layer`] of [`RequestConnectionService`].
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct RequestConnectionLayer;
+pub(crate) struct RequestConnectionLayer;
 
 impl<S> Layer<S> for RequestConnectionLayer {
     type Service = RequestConnectionService<S>;
@@ -609,7 +602,7 @@ impl<S> Layer<S> for RequestConnectionLayer {
 /// request goes in a [`Frame`] at the newest version the broker supports, and
 /// the inner [`Service`] gets the connection as its [`Context`] state.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct RequestConnectionService<S> {
+pub(crate) struct RequestConnectionService<S> {
     inner: S,
 }
 
