@@ -19,7 +19,7 @@ use tansu_sans_io::{InitProducerIdRequest, InitProducerIdResponse};
 
 storage_service! {
     /// Allocates or bumps the producer through
-    /// [`Storage::init_producer`](crate::Storage::init_producer) and returns
+    /// [`TxnStorage::init_producer`](crate::TxnStorage::init_producer) and returns
     /// what it decided, error code included.
     ///
     /// `tests/init_producer_id.rs` allocates two producers without a

@@ -32,6 +32,8 @@
 //! update at all would report the same zero.
 
 use bytes::Bytes;
+
+use crate::{GroupStorage as _, LogStorage as _, MetadataStorage as _};
 use futures::stream::StreamExt as _;
 use object_store::{
     ObjectStore as _, ObjectStoreExt as _, PutMode, PutOptions, PutPayload, UpdateVersion,
@@ -44,7 +46,7 @@ use tansu_sans_io::{
 };
 
 use crate::{
-    Error, MemberRef, OffsetCommitRequest, Result, Storage as _, Topition, UpdateError,
+    Error, MemberRef, OffsetCommitRequest, Result, Topition, UpdateError,
     dynostore::{CoalesceTuning, DynoStore},
     gcs::generation::{GenerationConditioned, Refusals},
 };

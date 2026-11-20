@@ -43,7 +43,7 @@ fn result_for(name: String, id: [u8; 16], code: ErrorCode) -> CreatableTopicResu
 /// for the broker's default (`-1`).
 ///
 /// Broker-level [`crate::TopicDefaults`] are applied by the engine, inside
-/// [`Storage::create_topic`], not here: this is one of two paths that create a
+/// [`crate::MetadataStorage::create_topic`], not here: this is one of two paths that create a
 /// topic (the other is auto-create, in [`super::MetadataService`]), and a topic's
 /// effective config must not depend on which one it came through (#225).
 ///

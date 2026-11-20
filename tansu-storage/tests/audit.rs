@@ -46,7 +46,7 @@ use tansu_sans_io::{
     create_topics_request::CreatableTopic,
     record::{Record, deflated, inflated},
 };
-use tansu_storage::{Audit, Backend, Storage as _, StorageContainer, Topition};
+use tansu_storage::{Audit, Backend, StorageContainer, Topition};
 use url::Url;
 
 use crate::common::{Error, cluster_id, init_tracing, storage_url};

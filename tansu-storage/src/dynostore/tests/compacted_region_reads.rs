@@ -36,6 +36,8 @@ use std::{
 };
 
 use async_trait::async_trait;
+
+use crate::{LogStorage as _, MetadataStorage as _};
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::{
@@ -50,7 +52,7 @@ use tansu_sans_io::{
 };
 
 use crate::{
-    Result, Storage as _, Topition,
+    Result, Topition,
     dynostore::{
         CoalesceTuning, DynoStore, SegmentFooter, Substream, SubstreamEntry, SubstreamWrite,
         compaction::capped_regions, tests::init_tracing,

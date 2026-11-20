@@ -25,6 +25,8 @@
 
 use std::collections::BTreeSet;
 
+use crate::MetadataStorage as _;
+
 use bytes::Bytes;
 use object_store::{ObjectStoreExt as _, memory::InMemory, path::Path};
 use tansu_sans_io::{
@@ -33,7 +35,7 @@ use tansu_sans_io::{
 };
 
 use crate::{
-    Result, Storage as _, Topition,
+    Result, Topition,
     dynostore::{
         CoalesceTuning, CompactRun, DynoStore, PrefixIndex, Substream, tests::init_tracing,
     },

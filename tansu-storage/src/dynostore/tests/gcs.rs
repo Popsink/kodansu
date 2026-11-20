@@ -69,11 +69,13 @@ use std::{
 };
 
 use bytes::Bytes;
+
+use crate::{GroupStorage as _, LogStorage as _, MetadataStorage as _};
 use object_store::{ObjectStore, PutOptions, PutPayload, memory::InMemory, path::Path};
 use tokio::task::JoinSet;
 
 use crate::{
-    MemberRef, Result, Storage, UpdateError,
+    MemberRef, Result, UpdateError,
     dynostore::{DynoStore, tests::init_tracing},
     gcs::limit::PutRateLimiter,
 };

@@ -881,7 +881,7 @@ impl DynoStore {
     ///
     /// That is the cost of the fix, and it is a real one: a timestamp query used
     /// to be answered entirely from the warm index, and now costs one region GET
-    /// per partition, issued at [`Storage::list_offsets`]'s bounded concurrency
+    /// per partition, issued at [`LogStorage::list_offsets`]'s bounded concurrency
     /// like every other per-partition read in that request. EARLIEST and LATEST
     /// are untouched — they resolve to positions the index knows exactly, and
     /// neither reads a byte.
@@ -933,7 +933,7 @@ impl DynoStore {
     /// Resolve one partition's `ListOffsets` entry: the offset (and best-effort
     /// timestamp) for `offset_request`. `stable` maps a topition to its first
     /// unstable offset under read-committed isolation (empty for
-    /// read-uncommitted). This is a single entry of [`Storage::list_offsets`],
+    /// read-uncommitted). This is a single entry of [`LogStorage::list_offsets`],
     /// split out so a request's partitions can be resolved concurrently —
     /// `Ok(None)` means "no entry for this partition" (an unparseable batch
     /// object name), exactly the cases the sequential loop used to `continue`

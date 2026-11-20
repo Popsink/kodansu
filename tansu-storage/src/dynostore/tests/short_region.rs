@@ -57,6 +57,8 @@
 
 use std::time::Duration;
 
+use crate::{LogStorage as _, MetadataStorage as _};
+
 use bytes::Bytes;
 use futures::TryStreamExt as _;
 use object_store::{
@@ -69,7 +71,7 @@ use tansu_sans_io::{
 };
 
 use crate::{
-    Error, Result, Storage as _, Topition,
+    Error, Result, Topition,
     dynostore::{
         CoalesceTuning, DynoStore, SEGMENT_FORMAT_VERSION_V3, SEGMENT_MAGIC, SegmentFooter,
         Substream,

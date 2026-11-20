@@ -18,7 +18,7 @@ use tansu_sans_io::{AddOffsetsToTxnRequest, AddOffsetsToTxnResponse};
 
 storage_service! {
     /// Registers the group with the producer's open transaction through
-    /// [`Storage::txn_add_offsets`](crate::Storage::txn_add_offsets), and
+    /// [`TxnStorage::txn_add_offsets`](crate::TxnStorage::txn_add_offsets), and
     /// reports its error code.
     AddOffsetsService: AddOffsetsToTxnRequest => AddOffsetsToTxnResponse,
     |ctx, req| {

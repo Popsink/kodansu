@@ -31,7 +31,7 @@
 use std::sync::{Arc, Mutex};
 
 use tansu_sans_io::create_topics_request::CreatableTopic;
-use tansu_storage::{Storage, StorageContainer};
+use tansu_storage::StorageContainer;
 use tracing::{Level, subscriber::DefaultGuard};
 use tracing_subscriber::{
     Layer,

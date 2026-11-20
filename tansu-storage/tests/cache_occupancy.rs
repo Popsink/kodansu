@@ -26,7 +26,7 @@
 //! was absent from every process that could exhibit the bug, and present on the
 //! only one that could not.
 //!
-//! So these tests never call [`Storage::maintain`]. Everything below is what a
+//! So these tests never call [`MetadataStorage::maintain`]. Everything below is what a
 //! client asks for, and the assertion is that the series exists anyway.
 //!
 //! Read back through a **delta** reader, for the reason `retention_signal`

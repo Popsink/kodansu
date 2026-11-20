@@ -21,6 +21,8 @@
 
 use std::sync::Arc;
 
+use crate::{LogStorage as _, MetadataStorage as _};
+
 use bytes::Bytes;
 use futures::TryStreamExt as _;
 use object_store::{
@@ -34,7 +36,7 @@ use tansu_sans_io::{
 use url::Url;
 
 use crate::{
-    Error, Result, Storage, TopicId, Topition,
+    Error, Result, TopicId, Topition,
     dynostore::{CoalesceTuning, DynoStore, SEGMENT_FORMAT_VERSION_V4},
 };
 

@@ -23,7 +23,7 @@ use crate::{Storage, authorized, enforcing};
 
 /// Deletes each topic a `DeleteTopics` request names, by id or by name,
 /// answering one result per topic: refused where the principal may not
-/// delete it, otherwise whatever [`Storage::delete_topic`] answered.
+/// delete it, otherwise whatever [`crate::MetadataStorage::delete_topic`] answered.
 /// ```
 /// use rama::layer::MapStateLayer;
 /// use rama::{Context, Layer as _, Service as _};

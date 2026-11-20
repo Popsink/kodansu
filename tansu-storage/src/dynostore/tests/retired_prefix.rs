@@ -33,6 +33,8 @@
 //! a successor's own if it outlived them.
 
 use bytes::Bytes;
+
+use crate::{LogStorage as _, MetadataStorage as _};
 use futures::TryStreamExt as _;
 use object_store::{ObjectStore as _, ObjectStoreExt as _, memory::InMemory, path::Path};
 use tansu_sans_io::{
@@ -42,7 +44,7 @@ use tansu_sans_io::{
 };
 
 use crate::{
-    Error, Result, Storage as _, TopicId, Topition,
+    Error, Result, TopicId, Topition,
     dynostore::{DynoStore, tests::init_tracing},
 };
 

@@ -41,6 +41,7 @@ use tansu_storage::{
     AutoTopicCreate, DEFAULT_FETCH_MAX_BYTES, GenerationDoc, LatencyIntroducingStorage, MemberDoc,
     Storage, StorageContainer, Topition,
 };
+use tansu_storage::{GroupStorage as _, LogStorage as _, MetadataStorage as _};
 use tokio::time::Instant;
 use url::Url;
 

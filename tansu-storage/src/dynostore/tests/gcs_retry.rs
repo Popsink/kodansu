@@ -49,6 +49,8 @@ use std::{
 };
 
 use async_trait::async_trait;
+
+use crate::{GroupStorage as _, LogStorage as _, MetadataStorage as _};
 use bytes::Bytes;
 use futures::stream::{BoxStream, StreamExt as _};
 use object_store::{
@@ -63,7 +65,7 @@ use tansu_sans_io::{
 };
 
 use crate::{
-    Error, MemberRef, OffsetCommitRequest, Result, Storage as _, Topition, UpdateError,
+    Error, MemberRef, OffsetCommitRequest, Result, Topition, UpdateError,
     dynostore::{CoalesceTuning, DynoStore, is_immutable, tests::init_tracing},
     gcs::{limit::PutRateLimiter, retry::RetrySplit},
 };

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! [`Storage::admit`]: a batch takes its place in the write order before it is
+//! [`LogStorage::admit`]: a batch takes its place in the write order before it is
 //! durable, so a connection can read its next request without waiting for the
 //! window (#588).
 //!
@@ -34,6 +34,8 @@ use std::{
 };
 
 use async_trait::async_trait;
+
+use crate::{LogStorage as _, MetadataStorage as _};
 use bytes::Bytes;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -47,7 +49,7 @@ use tansu_sans_io::{
 use tokio::{sync::Semaphore, time::timeout};
 
 use crate::{
-    Error, Result, Storage, Topition,
+    Error, Result, Topition,
     dynostore::{DynoStore, tests::init_tracing},
 };
 

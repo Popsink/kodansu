@@ -1271,6 +1271,17 @@ fmt:
 # through `added_by_topic` / `added_by_transaction`, which build the response
 # the service used to. Only code went, so the ceiling rises.
 #
+#   refactor  +120 lines, Storage split into five domain traits  2814 -> 2814  2.6971 -> 2.6940
+#
+# Lot E's first refactoring (Popsink/data-plane#5884). `Storage` is now
+# `MetadataStorage + LogStorage + GroupStorage + TxnStorage + PrincipalStorage`
+# with a blanket impl, so every `G: Storage` and `Arc<dyn Storage>` reads as
+# before. `delegate.rs` hands its signatures over in one block per trait and
+# each expander emits one impl per block; `DynoStore` and `Null` implement the
+# five. Modules that call engine methods on a concrete type import the traits
+# they use. The new trait docs are doc comments, so the ratio falls and the
+# ceiling follows it.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1280,7 +1291,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6971" top="12":
+comments ceiling="2.6940" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

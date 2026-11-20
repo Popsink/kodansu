@@ -44,6 +44,8 @@
 
 use std::{num::NonZeroU32, sync::Arc, time::Duration};
 
+use tansu_storage::GroupStorage as _;
+
 use bytes::Bytes;
 use object_store::memory::InMemory;
 use tansu_broker::{
@@ -51,7 +53,7 @@ use tansu_broker::{
     coordinator::group::{Coordinator as _, administrator::Controller},
 };
 use tansu_sans_io::{Body, ErrorCode, join_group_request::JoinGroupRequestProtocol};
-use tansu_storage::{DynoStore, PutRateLimiter, Storage};
+use tansu_storage::{DynoStore, PutRateLimiter};
 use tokio::{task::JoinSet, time::Instant};
 
 const CLUSTER: &str = "tansu";

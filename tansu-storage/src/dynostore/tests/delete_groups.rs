@@ -13,10 +13,12 @@
 // limitations under the License.
 
 use object_store::memory::InMemory;
+
+use crate::GroupStorage as _;
 use tansu_sans_io::ErrorCode;
 
 use crate::{
-    GenerationDoc, Result, Storage,
+    GenerationDoc, Result,
     dynostore::{
         DynoStore,
         tests::{init_tracing, legacy_group_exists, seed_legacy_group},

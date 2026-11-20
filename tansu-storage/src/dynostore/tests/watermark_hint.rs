@@ -19,6 +19,8 @@
 
 use std::time::{Duration, SystemTime};
 
+use crate::{LogStorage as _, MetadataStorage as _};
+
 use bytes::Bytes;
 use object_store::memory::InMemory;
 use tansu_sans_io::{
@@ -26,7 +28,7 @@ use tansu_sans_io::{
     record::deflated, record::inflated,
 };
 
-use crate::{Error, Result, Storage, Topition};
+use crate::{Error, Result, Topition};
 
 use super::super::{CoalesceTuning, DynoStore, tests::init_tracing};
 

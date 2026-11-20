@@ -40,7 +40,10 @@ use uuid::Uuid;
 
 use crate::TxnOffsetCommitRequest;
 use crate::delegate::storage_methods;
-use crate::{Ack, AclBinding, AclFilter, AutoTopicCreate, BrokerRegistrationRequest};
+use crate::{
+    Ack, AclBinding, AclFilter, AutoTopicCreate, BrokerRegistrationRequest, GroupStorage,
+    LogStorage, MetadataStorage, PrincipalStorage, TxnStorage,
+};
 use crate::{AssignmentDoc, AssignmentOutcome, ConsumerGroupDoc, GenerationDoc, MemberDoc};
 use crate::{CommittedOffset, ContactStamps, NamedGroupDetail, OffsetCommitRequest, OffsetStage};
 use crate::{ListOffsetResponse, MetadataResponse, ProducerIdResponse, Result, Storage};
@@ -344,12 +347,14 @@ macro_rules! latency_body {
 /// Most are `introduce_latency` then forward; seven count something on the
 /// way past. All of them were written out by hand until #551.
 macro_rules! latency_delegation {
-    (
-        $(fn $name:ident(&$s:ident $(, $arg:ident : $ty:ty)* $(,)?) -> $ret:ty;)*
-        $(sync fn $sname:ident(&$ss:ident $(, $sarg:ident : $sty:ty)* $(,)?) -> $sret:ty;)*
-    ) => {
+    ($(
+        $trait:ident {
+            $(fn $name:ident(&$s:ident $(, $arg:ident : $ty:ty)* $(,)?) -> $ret:ty;)*
+            $(sync fn $sname:ident(&$ss:ident $(, $sarg:ident : $sty:ty)* $(,)?) -> $sret:ty;)*
+        }
+    )*) => {$(
         #[async_trait]
-        impl<G> Storage for LatencyIntroducingStorage<G>
+        impl<G> $trait for LatencyIntroducingStorage<G>
         where
             G: Storage + Clone,
         {
@@ -364,7 +369,7 @@ macro_rules! latency_delegation {
                 }
             )*
         }
-    };
+    )*};
 }
 
 storage_methods!(latency_delegation);

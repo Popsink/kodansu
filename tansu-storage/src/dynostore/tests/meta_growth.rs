@@ -25,7 +25,9 @@
 
 use object_store::memory::InMemory;
 
-use crate::{Error, Result, Storage, dynostore::DynoStore, dynostore::tests::init_tracing};
+use crate::TxnStorage as _;
+
+use crate::{Error, Result, dynostore::DynoStore, dynostore::tests::init_tracing};
 
 const CLUSTER: &str = "tansu";
 const NODE: i32 = 111;

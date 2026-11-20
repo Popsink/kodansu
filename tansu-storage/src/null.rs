@@ -42,11 +42,11 @@ use uuid::Uuid;
 use crate::{
     Ack, AclBinding, AclFilter, Acls, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
     BrokerRegistrationRequest, CommittedOffset, ConsumerGroupDoc, ContactStamps,
-    DEFAULT_FETCH_MAX_BYTES, Error, GenerationDoc, GroupDetailResponse, ListOffsetResponse,
-    MemberDoc, MetadataResponse, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
-    ProducerIdResponse, QuotaAlteration, QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas,
-    Result, ScramCredential, Storage, TopicId, Topition, TxnOffsetCommitRequest, UpdateError,
-    Version,
+    DEFAULT_FETCH_MAX_BYTES, Error, GenerationDoc, GroupDetailResponse, GroupStorage,
+    ListOffsetResponse, LogStorage, MemberDoc, MetadataResponse, MetadataStorage, NamedGroupDetail,
+    OffsetCommitRequest, OffsetStage, PrincipalStorage, ProducerIdResponse, QuotaAlteration,
+    QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas, Result, ScramCredential, TopicId,
+    Topition, TxnOffsetCommitRequest, TxnStorage, UpdateError, Version,
 };
 
 /// A stored document with the version identifying it, as the object store
@@ -139,7 +139,7 @@ fn undefined<T>() -> Result<T> {
 }
 
 #[async_trait::async_trait]
-impl Storage for Engine {
+impl MetadataStorage for Engine {
     #[tracing::instrument(skip_all)]
     async fn register_broker(&self, _broker_registration: BrokerRegistrationRequest) -> Result<()> {
         Ok(())
@@ -189,114 +189,12 @@ impl Storage for Engine {
         Ok(altered.resource_type(resource.resource_type))
     }
 
-    #[tracing::instrument(skip_all)]
-    async fn produce(
-        &self,
-        _transaction_id: Option<&str>,
-        _topition: &Topition,
-        _deflated: Batch,
-    ) -> Result<i64> {
-        Ok(6)
-    }
-
-    /// Nothing to wait for, so nothing to pipeline: the [`Ack`] is already
-    /// resolved, with the offset [`Self::produce`] answers.
-    #[tracing::instrument(skip_all)]
-    async fn admit(
-        &self,
-        transaction_id: Option<&str>,
-        topition: &Topition,
-        deflated: Batch,
-    ) -> Result<Ack> {
-        let produced = self.produce(transaction_id, topition, deflated).await;
-
-        Ok(Box::pin(std::future::ready(produced)))
-    }
-
-    #[tracing::instrument(skip_all)]
-    async fn fetch(
-        &self,
-        _topition: &Topition,
-        _offset: i64,
-        _min_bytes: u32,
-        _max_bytes: u32,
-        _isolation_level: IsolationLevel,
-        _max_wait: Duration,
-    ) -> Result<Vec<Batch>> {
-        Ok(Vec::new())
-    }
-
-    #[tracing::instrument(skip_all)]
-    async fn offset_stage(&self, _topition: &Topition) -> Result<OffsetStage> {
-        Ok(OffsetStage::default())
-    }
-
     /// The three below are stated rather than inherited: #551 removed their
     /// trait defaults, because a default is a method a wrapper can forget
     /// without the compiler noticing (#273). The engine that stores nothing
     /// takes the same answers the defaults gave, and now says so.
     fn auto_create_topic_config(&self) -> AutoTopicCreate {
         AutoTopicCreate::default()
-    }
-
-    fn fetch_max_bytes(&self) -> u32 {
-        DEFAULT_FETCH_MAX_BYTES
-    }
-
-    async fn offset_stage_at(
-        &self,
-        topition: &Topition,
-        _isolation: IsolationLevel,
-    ) -> Result<OffsetStage> {
-        self.offset_stage(topition).await
-    }
-
-    async fn offset_stage_refreshed(&self, topition: &Topition) -> Result<OffsetStage> {
-        self.offset_stage(topition).await
-    }
-
-    #[tracing::instrument(skip_all)]
-    async fn offset_commit(
-        &self,
-        _group: &str,
-        _retention: Option<Duration>,
-        offsets: &[(Topition, OffsetCommitRequest)],
-    ) -> Result<Vec<(Topition, ErrorCode)>> {
-        let accepted = |(at, _): &(Topition, OffsetCommitRequest)| (at.clone(), ErrorCode::None);
-        Ok(offsets.iter().map(accepted).collect())
-    }
-
-    #[tracing::instrument(skip_all)]
-    async fn committed_offset_topitions(
-        &self,
-        _group_id: &str,
-    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
-        Ok(BTreeMap::new())
-    }
-
-    #[tracing::instrument(skip_all)]
-    async fn offset_fetch(
-        &self,
-        _group_id: Option<&str>,
-        topics: &[Topition],
-        _require_stable: Option<bool>,
-    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
-        let at_zero = |at: &Topition| (at.clone(), CommittedOffset::new(0, None));
-        Ok(topics.iter().map(at_zero).collect())
-    }
-
-    #[tracing::instrument(skip_all)]
-    async fn list_offsets(
-        &self,
-        _isolation_level: IsolationLevel,
-        offsets: &[(Topition, ListOffset)],
-    ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
-        let start = ListOffsetResponse {
-            offset: Some(0),
-            ..ListOffsetResponse::default()
-        };
-        let listed = |(at, _): &(Topition, ListOffset)| (at.clone(), start);
-        Ok(offsets.iter().map(listed).collect())
     }
 
     #[tracing::instrument(skip_all)]
@@ -386,6 +284,139 @@ impl Storage for Engine {
         Ok(created.iter().map(describe).collect())
     }
 
+    #[tracing::instrument(skip_all)]
+    async fn maintain(&self, _now: SystemTime) -> Result<()> {
+        Ok(())
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn cluster_id(&self) -> Result<String> {
+        Ok(self.cluster.clone())
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn node(&self) -> Result<i32> {
+        Ok(self.node)
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn advertised_listener(&self) -> Result<Url> {
+        Ok(self.advertised_listener.clone())
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn ping(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl LogStorage for Engine {
+    #[tracing::instrument(skip_all)]
+    async fn produce(
+        &self,
+        _transaction_id: Option<&str>,
+        _topition: &Topition,
+        _deflated: Batch,
+    ) -> Result<i64> {
+        Ok(6)
+    }
+
+    /// Nothing to wait for, so nothing to pipeline: the [`Ack`] is already
+    /// resolved, with the offset [`Self::produce`] answers.
+    #[tracing::instrument(skip_all)]
+    async fn admit(
+        &self,
+        transaction_id: Option<&str>,
+        topition: &Topition,
+        deflated: Batch,
+    ) -> Result<Ack> {
+        let produced = self.produce(transaction_id, topition, deflated).await;
+
+        Ok(Box::pin(std::future::ready(produced)))
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn fetch(
+        &self,
+        _topition: &Topition,
+        _offset: i64,
+        _min_bytes: u32,
+        _max_bytes: u32,
+        _isolation_level: IsolationLevel,
+        _max_wait: Duration,
+    ) -> Result<Vec<Batch>> {
+        Ok(Vec::new())
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn offset_stage(&self, _topition: &Topition) -> Result<OffsetStage> {
+        Ok(OffsetStage::default())
+    }
+
+    fn fetch_max_bytes(&self) -> u32 {
+        DEFAULT_FETCH_MAX_BYTES
+    }
+
+    async fn offset_stage_at(
+        &self,
+        topition: &Topition,
+        _isolation: IsolationLevel,
+    ) -> Result<OffsetStage> {
+        self.offset_stage(topition).await
+    }
+
+    async fn offset_stage_refreshed(&self, topition: &Topition) -> Result<OffsetStage> {
+        self.offset_stage(topition).await
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn offset_commit(
+        &self,
+        _group: &str,
+        _retention: Option<Duration>,
+        offsets: &[(Topition, OffsetCommitRequest)],
+    ) -> Result<Vec<(Topition, ErrorCode)>> {
+        let accepted = |(at, _): &(Topition, OffsetCommitRequest)| (at.clone(), ErrorCode::None);
+        Ok(offsets.iter().map(accepted).collect())
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn committed_offset_topitions(
+        &self,
+        _group_id: &str,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
+        Ok(BTreeMap::new())
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn offset_fetch(
+        &self,
+        _group_id: Option<&str>,
+        topics: &[Topition],
+        _require_stable: Option<bool>,
+    ) -> Result<BTreeMap<Topition, CommittedOffset>> {
+        let at_zero = |at: &Topition| (at.clone(), CommittedOffset::new(0, None));
+        Ok(topics.iter().map(at_zero).collect())
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn list_offsets(
+        &self,
+        _isolation_level: IsolationLevel,
+        offsets: &[(Topition, ListOffset)],
+    ) -> Result<Vec<(Topition, ListOffsetResponse)>> {
+        let start = ListOffsetResponse {
+            offset: Some(0),
+            ..ListOffsetResponse::default()
+        };
+        let listed = |(at, _): &(Topition, ListOffset)| (at.clone(), start);
+        Ok(offsets.iter().map(listed).collect())
+    }
+}
+
+#[async_trait::async_trait]
+impl GroupStorage for Engine {
     #[tracing::instrument(skip_all)]
     async fn list_groups(&self, _states_filter: Option<&[String]>) -> Result<Vec<ListedGroup>> {
         Ok(Vec::new())
@@ -502,92 +533,6 @@ impl Storage for Engine {
                 .filter(|((group, _), _)| group == group_id)
                 .map(|((_, member_id), (member, _))| (member_id.clone(), member.last_contact_ms))
                 .collect()
-        })
-    }
-
-    /// In memory for the life of the process, like everything else this engine
-    /// keeps.
-    #[tracing::instrument(skip_all)]
-    async fn create_acls(&self, bindings: &[AclBinding]) -> Result<Vec<ErrorCode>> {
-        self.acls.lock().map_err(Into::into).map(|mut acls| {
-            for binding in bindings {
-                _ = acls.bindings.insert(binding.clone());
-            }
-
-            vec![ErrorCode::None; bindings.len()]
-        })
-    }
-
-    #[tracing::instrument(skip_all)]
-    async fn describe_acls(&self, filter: &AclFilter) -> Result<Vec<AclBinding>> {
-        self.acls
-            .lock()
-            .map_err(Into::into)
-            .map(|acls| acls.matching(filter).cloned().collect())
-    }
-
-    #[tracing::instrument(skip_all)]
-    async fn delete_acls(&self, filters: &[AclFilter]) -> Result<Vec<Vec<AclBinding>>> {
-        self.acls.lock().map_err(Into::into).map(|mut acls| {
-            filters
-                .iter()
-                .map(|filter| {
-                    let selected = acls.matching(filter).cloned().collect::<Vec<_>>();
-
-                    for binding in &selected {
-                        _ = acls.bindings.remove(binding);
-                    }
-
-                    selected
-                })
-                .collect()
-        })
-    }
-
-    #[tracing::instrument(skip_all)]
-    async fn alter_client_quotas(
-        &self,
-        alterations: &[QuotaAlteration],
-        validate_only: bool,
-    ) -> Result<Vec<ErrorCode>> {
-        self.quotas.lock().map_err(Into::into).map(|mut quotas| {
-            // Validated against a copy, so that `validate_only` and a refused
-            // key both leave the document as they found it.
-            let mut proposed = quotas.clone();
-
-            let outcomes = alterations
-                .iter()
-                .map(|alteration| match proposed.alter(alteration) {
-                    Ok(()) => ErrorCode::None,
-                    Err(_) => ErrorCode::InvalidConfig,
-                })
-                .collect::<Vec<_>>();
-
-            if !validate_only {
-                *quotas = proposed;
-            }
-
-            outcomes
-        })
-    }
-
-    #[tracing::instrument(skip_all)]
-    async fn describe_client_quotas(
-        &self,
-        components: &[QuotaFilterComponent],
-        strict: bool,
-    ) -> Result<Vec<(QuotaEntity, QuotaLimits)>> {
-        self.quotas
-            .lock()
-            .map_err(Into::into)
-            .map(|quotas| quotas.matching(components, strict))
-    }
-
-    #[tracing::instrument(skip_all)]
-    async fn client_quotas(&self) -> Result<Quotas> {
-        self.quotas.lock().map_err(Into::into).map(|quotas| {
-            let quotas: &Quotas = &quotas;
-            quotas.clone()
         })
     }
 
@@ -787,7 +732,10 @@ impl Storage for Engine {
                 (held - assignments.len()) as u64
             })
     }
+}
 
+#[async_trait::async_trait]
+impl TxnStorage for Engine {
     #[tracing::instrument(skip_all)]
     async fn init_producer(
         &self,
@@ -877,30 +825,94 @@ impl Storage for Engine {
     ) -> Result<ErrorCode> {
         Ok(ErrorCode::None)
     }
+}
 
+#[async_trait::async_trait]
+impl PrincipalStorage for Engine {
+    /// In memory for the life of the process, like everything else this engine
+    /// keeps.
     #[tracing::instrument(skip_all)]
-    async fn maintain(&self, _now: SystemTime) -> Result<()> {
-        Ok(())
+    async fn create_acls(&self, bindings: &[AclBinding]) -> Result<Vec<ErrorCode>> {
+        self.acls.lock().map_err(Into::into).map(|mut acls| {
+            for binding in bindings {
+                _ = acls.bindings.insert(binding.clone());
+            }
+
+            vec![ErrorCode::None; bindings.len()]
+        })
     }
 
     #[tracing::instrument(skip_all)]
-    async fn cluster_id(&self) -> Result<String> {
-        Ok(self.cluster.clone())
+    async fn describe_acls(&self, filter: &AclFilter) -> Result<Vec<AclBinding>> {
+        self.acls
+            .lock()
+            .map_err(Into::into)
+            .map(|acls| acls.matching(filter).cloned().collect())
     }
 
     #[tracing::instrument(skip_all)]
-    async fn node(&self) -> Result<i32> {
-        Ok(self.node)
+    async fn delete_acls(&self, filters: &[AclFilter]) -> Result<Vec<Vec<AclBinding>>> {
+        self.acls.lock().map_err(Into::into).map(|mut acls| {
+            filters
+                .iter()
+                .map(|filter| {
+                    let selected = acls.matching(filter).cloned().collect::<Vec<_>>();
+
+                    for binding in &selected {
+                        _ = acls.bindings.remove(binding);
+                    }
+
+                    selected
+                })
+                .collect()
+        })
     }
 
     #[tracing::instrument(skip_all)]
-    async fn advertised_listener(&self) -> Result<Url> {
-        Ok(self.advertised_listener.clone())
+    async fn alter_client_quotas(
+        &self,
+        alterations: &[QuotaAlteration],
+        validate_only: bool,
+    ) -> Result<Vec<ErrorCode>> {
+        self.quotas.lock().map_err(Into::into).map(|mut quotas| {
+            // Validated against a copy, so that `validate_only` and a refused
+            // key both leave the document as they found it.
+            let mut proposed = quotas.clone();
+
+            let outcomes = alterations
+                .iter()
+                .map(|alteration| match proposed.alter(alteration) {
+                    Ok(()) => ErrorCode::None,
+                    Err(_) => ErrorCode::InvalidConfig,
+                })
+                .collect::<Vec<_>>();
+
+            if !validate_only {
+                *quotas = proposed;
+            }
+
+            outcomes
+        })
     }
 
     #[tracing::instrument(skip_all)]
-    async fn ping(&self) -> Result<()> {
-        Ok(())
+    async fn describe_client_quotas(
+        &self,
+        components: &[QuotaFilterComponent],
+        strict: bool,
+    ) -> Result<Vec<(QuotaEntity, QuotaLimits)>> {
+        self.quotas
+            .lock()
+            .map_err(Into::into)
+            .map(|quotas| quotas.matching(components, strict))
+    }
+
+    #[tracing::instrument(skip_all)]
+    async fn client_quotas(&self) -> Result<Quotas> {
+        self.quotas.lock().map_err(Into::into).map(|quotas| {
+            let quotas: &Quotas = &quotas;
+            quotas.clone()
+        })
     }
 
     #[tracing::instrument(skip_all)]

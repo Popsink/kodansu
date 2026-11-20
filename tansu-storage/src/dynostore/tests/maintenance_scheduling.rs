@@ -46,6 +46,8 @@
 
 use std::time::{Duration, SystemTime};
 
+use crate::{LogStorage as _, MetadataStorage as _};
+
 use bytes::Bytes;
 use futures::TryStreamExt as _;
 use object_store::{ObjectStore as _, memory::InMemory, path::Path};
@@ -56,7 +58,7 @@ use tansu_sans_io::{
 };
 
 use crate::{
-    Error, Result, Storage as _, Topition,
+    Error, Result, Topition,
     dynostore::{CoalesceTuning, DynoStore, SegmentFooter, SubstreamEntry},
 };
 

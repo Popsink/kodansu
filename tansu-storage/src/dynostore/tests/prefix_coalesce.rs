@@ -18,6 +18,7 @@
 //! from ~`(topics × flushes)` to ~`(connectors × flushes)` — while each
 //! `(topic, partition)` sub-stream keeps its own independent offset sequence.
 
+use crate::{LogStorage as _, MetadataStorage as _, TxnStorage as _};
 use std::{
     collections::BTreeMap,
     fmt::{self, Debug, Display},
@@ -47,7 +48,7 @@ use tansu_sans_io::{
 };
 
 use crate::{
-    Error, Result, Storage, TopicId, Topition,
+    Error, Result, TopicId, Topition,
     dynostore::{
         CoalesceTuning, CompactRun, DynoStore, Era, PrefixLease, SegmentFooter, ServedEnd,
         Substream, SubstreamEntry, TxnProduceOffset, retention::maybe_expirable,
@@ -4263,7 +4264,7 @@ async fn tail_probe_defers_to_a_listing_when_the_floor_is_ahead() -> Result<(), 
     Ok(())
 }
 
-/// Truncate `tp` below `offset` via the `Storage::delete_records` API,
+/// Truncate `tp` below `offset` via the `MetadataStorage::delete_records` API,
 /// returning the reported low watermark (#176).
 async fn delete_before(store: &DynoStore, tp: &Topition, offset: i64) -> Result<i64> {
     let responses = store

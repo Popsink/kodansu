@@ -31,6 +31,8 @@ use std::{
 };
 
 use async_trait::async_trait;
+
+use crate::{LogStorage as _, MetadataStorage as _};
 use bytes::Bytes;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -48,7 +50,7 @@ use tokio::{
 };
 
 use crate::{
-    Ack, Error, Result, Storage, Topition,
+    Ack, Error, Result, Topition,
     dynostore::{CoalesceTuning, DynoStore, tests::init_tracing},
 };
 

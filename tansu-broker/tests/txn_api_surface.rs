@@ -14,7 +14,7 @@
 
 //! A transaction can be ended over the wire, not only through `Storage` (#441).
 //!
-//! `Storage::txn_end` has been implemented and tested since transactions
+//! `TxnStorage::txn_end` has been implemented and tested since transactions
 //! landed, and `tansu-broker/tests/txn.rs` exercises commit and abort
 //! thoroughly — by calling `sc.txn_end(..)` on the storage container. Every one
 //! of those tests passed while api key 26 had **no route**, so `ApiVersions`
@@ -431,7 +431,7 @@ async fn a_transaction_aborts_over_the_wire() -> Result<()> {
     Ok(())
 }
 
-/// A rejection is an answer. `Storage::txn_end` reports a fence as
+/// A rejection is an answer. `TxnStorage::txn_end` reports a fence as
 /// `Err(Error::Api(PRODUCER_FENCED))`, unlike its siblings which report a
 /// rejection as `Ok(ErrorCode)` — and an `Err` out of a service ends the
 /// connection with no response written. `PRODUCER_FENCED` is a code a

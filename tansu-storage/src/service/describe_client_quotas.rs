@@ -145,6 +145,8 @@ mod tests {
     use tansu_sans_io::describe_client_quotas_request::ComponentData;
 
     use super::*;
+
+    use crate::PrincipalStorage as _;
     use crate::{PRODUCER_BYTE_RATE, QuotaAlteration, QuotaOp, Result, dynostore::DynoStore};
 
     async fn storage() -> Result<DynoStore> {

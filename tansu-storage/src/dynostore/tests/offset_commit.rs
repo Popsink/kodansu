@@ -15,6 +15,8 @@
 //! How `OffsetCommit` reports a storage failure to the client (#275).
 
 use async_trait::async_trait;
+
+use crate::{LogStorage as _, MetadataStorage as _};
 use futures::stream::BoxStream;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -24,7 +26,7 @@ use std::fmt::{self, Debug, Display};
 use tansu_sans_io::{ErrorCode, create_topics_request::CreatableTopic};
 
 use crate::{
-    OffsetCommitRequest, Result, Storage, Topition,
+    OffsetCommitRequest, Result, Topition,
     dynostore::{DynoStore, tests::init_tracing},
 };
 

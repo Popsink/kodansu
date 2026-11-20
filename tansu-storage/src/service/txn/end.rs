@@ -22,7 +22,7 @@ use crate::{Error, Result, Storage, storage_error_code};
 /// returning [`EndTxnResponse`] — the commit and the abort of a transaction
 /// (#441).
 ///
-/// [`Storage::txn_end`] has been implemented and tested since transactions
+/// [`crate::TxnStorage::txn_end`] has been implemented and tested since transactions
 /// landed; what was missing was the service and the route, so `ApiVersions`
 /// advertised `InitProducerId`, `AddPartitionsToTxn`, `AddOffsetsToTxn` and
 /// `TxnOffsetCommit` but not api key 26. A transactional producer therefore
@@ -34,7 +34,7 @@ use crate::{Error, Result, Storage, storage_error_code};
 /// there was anything to fail on.
 ///
 /// Unlike its siblings this service **folds `Error::Api` into the response**
-/// rather than propagating it. [`Storage::txn_add_offsets`] and friends answer
+/// rather than propagating it. [`crate::TxnStorage::txn_add_offsets`] and friends answer
 /// a rejection as `Ok(ErrorCode)`; `txn_end` answers it as
 /// `Err(Error::Api(code))` — and an `Err` out of a service ends the connection
 /// with **no response written**. `PRODUCER_FENCED` is a code a transactional

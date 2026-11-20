@@ -39,7 +39,7 @@ use opentelemetry_sdk::metrics::{
 };
 use tansu_broker::{Result, coordinator::group::administrator::Controller};
 use tansu_sans_io::{ErrorCode, join_group_response::JoinGroupResponseMember};
-use tansu_storage::{GenerationDoc, MemberDoc, MemberRef, Storage as _};
+use tansu_storage::{GenerationDoc, MemberDoc, MemberRef};
 use tokio::time::timeout;
 use url::Url;
 use uuid::Uuid;

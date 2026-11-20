@@ -20,7 +20,7 @@
 //! routing prefix and a metric label — so an unrepresentable name breaks far
 //! from the client that chose it, and by then nothing points back.
 //!
-//! Applied at [`crate::Storage::create_topic`], which is the single creation
+//! Applied at [`crate::MetadataStorage::create_topic`], which is the single creation
 //! choke point (#225): `CreateTopics` and metadata auto-create both land there,
 //! and auto-create takes its name straight off the wire.
 

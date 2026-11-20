@@ -32,6 +32,8 @@ use std::{
 };
 
 use async_trait::async_trait;
+
+use crate::{LogStorage as _, MetadataStorage as _};
 use bytes::Bytes;
 use futures::{TryStreamExt as _, stream::BoxStream};
 use object_store::{
@@ -48,7 +50,7 @@ use tansu_sans_io::{
     record::{Record, deflated, inflated},
 };
 
-use crate::{Error, FetchService, Result, Storage as _, TopicId, Topition, dynostore::DynoStore};
+use crate::{Error, FetchService, Result, TopicId, Topition, dynostore::DynoStore};
 
 const CLUSTER: &str = "tansu";
 const NODE: i32 = 111;

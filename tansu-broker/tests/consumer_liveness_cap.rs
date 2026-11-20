@@ -41,6 +41,7 @@ use std::{
 };
 
 use object_store::{ObjectStore, memory::InMemory};
+
 use tansu_broker::{
     Result,
     coordinator::group::{
@@ -52,6 +53,7 @@ use tansu_sans_io::{
     consumer_group_heartbeat_request::TopicPartitions, create_topics_request::CreatableTopic,
 };
 use tansu_storage::{DynoStore, LatencyIntroducingStorage, PutRateLimiter, Storage};
+use tansu_storage::{GroupStorage as _, MetadataStorage as _};
 use tokio::{
     task::JoinSet,
     time::{Instant, sleep},

@@ -30,6 +30,8 @@
 
 use std::time::Duration;
 
+use crate::{LogStorage as _, MetadataStorage as _};
+
 use bytes::Bytes;
 use object_store::memory::InMemory;
 use tansu_sans_io::{
@@ -39,7 +41,7 @@ use tansu_sans_io::{
 };
 
 use crate::{
-    ListOffsetResponse, Result, Storage, TopicId, Topition,
+    ListOffsetResponse, Result, TopicId, Topition,
     dynostore::{
         CoalesceTuning, DynoStore, SEGMENT_FORMAT_VERSION_V4, Substream, tests::init_tracing,
     },

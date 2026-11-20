@@ -20,7 +20,7 @@ use tansu_sans_io::{
 };
 
 storage_service! {
-    /// Asks [`Storage::describe_config`](crate::Storage::describe_config) about
+    /// Asks [`MetadataStorage::describe_config`](crate::MetadataStorage::describe_config) about
     /// each resource in turn, in request order. A resource that does not exist
     /// comes back with its own error code; only a storage failure fails the
     /// whole request.

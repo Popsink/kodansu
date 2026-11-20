@@ -26,6 +26,8 @@ use std::{
 };
 
 use async_trait::async_trait;
+
+use crate::{LogStorage as _, MetadataStorage as _};
 use futures::stream::{BoxStream, StreamExt};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -39,7 +41,7 @@ use tansu_sans_io::{
 };
 
 use crate::{
-    Error, OffsetCommitRequest, Result, Storage, TopicId, Topition,
+    Error, OffsetCommitRequest, Result, TopicId, Topition,
     dynostore::{CoalesceTuning, DynoStore, Substream, tests::init_tracing},
 };
 

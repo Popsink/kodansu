@@ -879,7 +879,7 @@ pub const DEFAULT_FETCH_MAX_BYTES: u32 = 5 * 1024 * 1024;
 /// `retention.ms` to 7 days, so retention is enforced even when the client sends
 /// no topic config.
 ///
-/// Applied inside [`Storage::create_topic`] rather than in the `CreateTopics`
+/// Applied inside [`MetadataStorage::create_topic`] rather than in the `CreateTopics`
 /// service, so a topic's effective config cannot depend on which API created it
 /// (#225): the auto-create path builds its own `CreatableTopic` and used to bypass
 /// the injection entirely, storing no config at all.
@@ -1431,18 +1431,17 @@ impl From<TxnState> for String {
     }
 }
 
-/// A batch [admitted](Storage::admit) to storage, resolving to its base offset
+/// A batch [admitted](LogStorage::admit) to storage, resolving to its base offset
 /// once it is durable (#588).
 ///
 /// `'static` and owned, so whoever admitted the batch can go and admit the next
 /// one — from the same connection — while this one waits for its window.
 pub type Ack = Pin<Box<dyn Future<Output = Result<i64>> + Send + 'static>>;
 
-/// Storage
-///
-/// The Core storage abstraction. All storage engines implement this type.
+/// The cluster, its brokers and its topics: registration, metadata, topic
+/// lifecycle and configuration, and the engine's own housekeeping.
 #[async_trait]
-pub trait Storage: Debug + Send + Sync + 'static {
+pub trait MetadataStorage: Debug + Send + Sync + 'static {
     /// On startup a broker will register with storage.
     async fn register_broker(&self, broker_registration: BrokerRegistrationRequest) -> Result<()>;
 
@@ -1467,6 +1466,63 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// Query the brokers registered with this storage.
     async fn brokers(&self) -> Result<Vec<DescribeClusterBroker>>;
 
+    /// Query broker and topic metadata.
+    ///
+    /// `None` asks for every topic and `Some` for exactly the topics listed, so
+    /// an empty list answers with the brokers and no topic at all (#593). The
+    /// wire's v0 `[]`, which means every topic, is resolved to `None` before it
+    /// gets here.
+    async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse>;
+
+    /// The broker's auto-topic-creation policy.
+    ///
+    /// Had a default of [`AutoTopicCreate::default`] until #551, alongside
+    /// [`LogStorage::fetch_max_bytes`]. Both are read *through* the wrapper
+    /// stack, so a wrapper that inherits the default answers for a backend
+    /// that was configured otherwise — the #273 shape, and the one place it
+    /// would have cost most, because `fetch_max_bytes` is #547's
+    /// per-deployment clamp. Every wrapper forwarded both by hand and none had
+    /// to; now none can forget.
+    fn auto_create_topic_config(&self) -> AutoTopicCreate;
+
+    /// Query the configuration of a resource in this storage.
+    async fn describe_config(
+        &self,
+        name: &str,
+        resource: ConfigResource,
+        keys: Option<&[String]>,
+    ) -> Result<DescribeConfigsResult>;
+
+    /// Describe the topic partitions found in this storage.
+    async fn describe_topic_partitions(
+        &self,
+        topics: Option<&[TopicId]>,
+        partition_limit: i32,
+        cursor: Option<Topition>,
+    ) -> Result<Vec<DescribeTopicPartitionsResponseTopic>>;
+
+    /// Run periodic maintenance on this storage.
+    ///
+    /// This had a default body of `Ok(())`, for backends with nothing to do
+    /// periodically. Removed with `offset_stage_at`'s and for the same reason
+    /// (#273, #551): a defaulted method is one a wrapper can forget without
+    /// the compiler noticing. A backend with no maintenance writes the
+    /// `Ok(())`.
+    async fn maintain(&self, now: SystemTime) -> Result<()>;
+
+    async fn cluster_id(&self) -> Result<String>;
+
+    async fn node(&self) -> Result<i32>;
+
+    async fn advertised_listener(&self) -> Result<Url>;
+
+    async fn ping(&self) -> Result<()>;
+}
+
+/// The log: producing and fetching batches, the offsets that bound a
+/// partition, and the offsets consumers commit against it.
+#[async_trait]
+pub trait LogStorage: Debug + Send + Sync + 'static {
     /// Produce a deflated batch to this storage.
     async fn produce(
         &self,
@@ -1577,57 +1633,16 @@ pub trait Storage: Debug + Send + Sync + 'static {
         group_id: &str,
     ) -> Result<BTreeMap<Topition, CommittedOffset>>;
 
-    /// Query broker and topic metadata.
-    ///
-    /// `None` asks for every topic and `Some` for exactly the topics listed, so
-    /// an empty list answers with the brokers and no topic at all (#593). The
-    /// wire's v0 `[]`, which means every topic, is resolved to `None` before it
-    /// gets here.
-    async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse>;
-
-    /// The broker's auto-topic-creation policy.
-    ///
-    /// Had a default of [`AutoTopicCreate::default`] until #551, alongside
-    /// [`Self::fetch_max_bytes`] below. Both are read *through* the wrapper
-    /// stack, so a wrapper that inherits the default answers for a backend
-    /// that was configured otherwise — the #273 shape, and the one place it
-    /// would have cost most, because `fetch_max_bytes` is #547's
-    /// per-deployment clamp. Every wrapper forwarded both by hand and none had
-    /// to; now none can forget.
-    fn auto_create_topic_config(&self) -> AutoTopicCreate;
-
     /// Upper bound on one `Fetch` response; the request's `max_bytes` is
     /// clamped to it. A backend with no configured value answers
     /// [`DEFAULT_FETCH_MAX_BYTES`].
     fn fetch_max_bytes(&self) -> u32;
+}
 
-    async fn upsert_user_scram_credential(
-        &self,
-        user: &str,
-        mechanism: ScramMechanism,
-        credential: ScramCredential,
-    ) -> Result<()>;
-
-    async fn delete_user_scram_credential(
-        &self,
-        user: &str,
-        mechanism: ScramMechanism,
-    ) -> Result<()>;
-
-    async fn user_scram_credential(
-        &self,
-        user: &str,
-        mechanism: ScramMechanism,
-    ) -> Result<Option<ScramCredential>>;
-
-    /// Query the configuration of a resource in this storage.
-    async fn describe_config(
-        &self,
-        name: &str,
-        resource: ConfigResource,
-        keys: Option<&[String]>,
-    ) -> Result<DescribeConfigsResult>;
-
+/// Consumer groups: the classic protocol's members, generations and
+/// assignments, and the consumer protocol's group documents.
+#[async_trait]
+pub trait GroupStorage: Debug + Send + Sync + 'static {
     /// Query available groups optionally with a state filter.
     ///
     /// The filter is the wire field, with the wire's meaning: `None` is a
@@ -1654,14 +1669,6 @@ pub trait Storage: Debug + Send + Sync + 'static {
         group_ids: Option<&[String]>,
         include_authorized_operations: bool,
     ) -> Result<Vec<NamedGroupDetail>>;
-
-    /// Describe the topic partitions found in this storage.
-    async fn describe_topic_partitions(
-        &self,
-        topics: Option<&[TopicId]>,
-        partition_limit: i32,
-        cursor: Option<Topition>,
-    ) -> Result<Vec<DescribeTopicPartitionsResponseTopic>>;
 
     /// Write a member's own document, `members/{member_id}.json` (#359).
     ///
@@ -1832,6 +1839,83 @@ pub trait Storage: Debug + Send + Sync + 'static {
         stamps: &[(String, i64)],
     ) -> Result<()>;
 
+    /// Assert that the group layout this binary writes is the one the cluster
+    /// already holds, claiming it when the cluster holds none (#359).
+    ///
+    /// Absent means a cluster that has never run a binary that cares, so the
+    /// version is claimed with a create-only write — two replicas starting
+    /// together race on the key and the loser reads what the winner claimed.
+    /// A different version is a refusal to start: see [`GroupSchema`] for why
+    /// a converter would be all cost and no benefit, and why a mixed fleet is
+    /// the hazard worth a guard rail.
+    async fn assert_group_schema(&self) -> Result<()>;
+}
+
+/// Transactions and idempotent producers.
+#[async_trait]
+pub trait TxnStorage: Debug + Send + Sync + 'static {
+    /// Initialise a transactional or idempotent producer in this storage.
+    async fn init_producer(
+        &self,
+        transaction_id: Option<&str>,
+        transaction_timeout_ms: i32,
+        producer_id: Option<i64>,
+        producer_epoch: Option<i16>,
+    ) -> Result<ProducerIdResponse>;
+
+    /// Add offsets to a transaction for a producer.
+    async fn txn_add_offsets(
+        &self,
+        transaction_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+        group_id: &str,
+    ) -> Result<ErrorCode>;
+
+    /// Add partitions to a transaction.
+    async fn txn_add_partitions(
+        &self,
+        partitions: AddPartitionsToTxnRequest,
+    ) -> Result<AddPartitionsToTxnResponse>;
+
+    /// Commit an offset within a transaction.
+    async fn txn_offset_commit(
+        &self,
+        offsets: TxnOffsetCommitRequest,
+    ) -> Result<Vec<TxnOffsetCommitResponseTopic>>;
+
+    /// Commit or abort a running transaction.
+    async fn txn_end(
+        &self,
+        transaction_id: &str,
+        producer_id: i64,
+        producer_epoch: i16,
+        committed: bool,
+    ) -> Result<ErrorCode>;
+}
+
+/// Who may do what, and how much: SCRAM credentials, ACLs and client quotas.
+#[async_trait]
+pub trait PrincipalStorage: Debug + Send + Sync + 'static {
+    async fn upsert_user_scram_credential(
+        &self,
+        user: &str,
+        mechanism: ScramMechanism,
+        credential: ScramCredential,
+    ) -> Result<()>;
+
+    async fn delete_user_scram_credential(
+        &self,
+        user: &str,
+        mechanism: ScramMechanism,
+    ) -> Result<()>;
+
+    async fn user_scram_credential(
+        &self,
+        user: &str,
+        mechanism: ScramMechanism,
+    ) -> Result<Option<ScramCredential>>;
+
     /// Create each ACL, answering one error code per creation **in request
     /// order** (#363).
     ///
@@ -1882,73 +1966,21 @@ pub trait Storage: Debug + Send + Sync + 'static {
     /// keeps the hot path from being expressed as a describe that matches
     /// everything.
     async fn client_quotas(&self) -> Result<Quotas>;
+}
 
-    /// Assert that the group layout this binary writes is the one the cluster
-    /// already holds, claiming it when the cluster holds none (#359).
-    ///
-    /// Absent means a cluster that has never run a binary that cares, so the
-    /// version is claimed with a create-only write — two replicas starting
-    /// together race on the key and the loser reads what the winner claimed.
-    /// A different version is a refusal to start: see [`GroupSchema`] for why
-    /// a converter would be all cost and no benefit, and why a mixed fleet is
-    /// the hazard worth a guard rail.
-    async fn assert_group_schema(&self) -> Result<()>;
+/// Storage
+///
+/// The core storage abstraction, as the five domain traits it is made of
+/// (Popsink/data-plane#5884). Every engine implements all five, and so is a
+/// `Storage`; code that needs only one domain can ask for that trait alone.
+pub trait Storage:
+    MetadataStorage + LogStorage + GroupStorage + TxnStorage + PrincipalStorage
+{
+}
 
-    /// Initialise a transactional or idempotent producer in this storage.
-    async fn init_producer(
-        &self,
-        transaction_id: Option<&str>,
-        transaction_timeout_ms: i32,
-        producer_id: Option<i64>,
-        producer_epoch: Option<i16>,
-    ) -> Result<ProducerIdResponse>;
-
-    /// Add offsets to a transaction for a producer.
-    async fn txn_add_offsets(
-        &self,
-        transaction_id: &str,
-        producer_id: i64,
-        producer_epoch: i16,
-        group_id: &str,
-    ) -> Result<ErrorCode>;
-
-    /// Add partitions to a transaction.
-    async fn txn_add_partitions(
-        &self,
-        partitions: AddPartitionsToTxnRequest,
-    ) -> Result<AddPartitionsToTxnResponse>;
-
-    /// Commit an offset within a transaction.
-    async fn txn_offset_commit(
-        &self,
-        offsets: TxnOffsetCommitRequest,
-    ) -> Result<Vec<TxnOffsetCommitResponseTopic>>;
-
-    /// Commit or abort a running transaction.
-    async fn txn_end(
-        &self,
-        transaction_id: &str,
-        producer_id: i64,
-        producer_epoch: i16,
-        committed: bool,
-    ) -> Result<ErrorCode>;
-
-    /// Run periodic maintenance on this storage.
-    ///
-    /// This had a default body of `Ok(())`, for backends with nothing to do
-    /// periodically. Removed with `offset_stage_at`'s and for the same reason
-    /// (#273, #551): a defaulted method is one a wrapper can forget without
-    /// the compiler noticing. A backend with no maintenance writes the
-    /// `Ok(())`.
-    async fn maintain(&self, now: SystemTime) -> Result<()>;
-
-    async fn cluster_id(&self) -> Result<String>;
-
-    async fn node(&self) -> Result<i32>;
-
-    async fn advertised_listener(&self) -> Result<Url>;
-
-    async fn ping(&self) -> Result<()>;
+impl<T> Storage for T where
+    T: MetadataStorage + LogStorage + GroupStorage + TxnStorage + PrincipalStorage
+{
 }
 
 // The existence of this function makes the compiler catch if the Storage
@@ -1963,12 +1995,14 @@ fn _assert_trait_object(_s: &dyn Storage) {}
 /// parameterised by the type, because `#[async_trait]` has to be attached to a
 /// complete `impl` in a single expansion — see `delegate.rs`.
 macro_rules! arc_delegation {
-    (
-        $(fn $name:ident(&$s:ident $(, $arg:ident : $ty:ty)* $(,)?) -> $ret:ty;)*
-        $(sync fn $sname:ident(&$ss:ident $(, $sarg:ident : $sty:ty)* $(,)?) -> $sret:ty;)*
-    ) => {
+    ($(
+        $trait:ident {
+            $(fn $name:ident(&$s:ident $(, $arg:ident : $ty:ty)* $(,)?) -> $ret:ty;)*
+            $(sync fn $sname:ident(&$ss:ident $(, $sarg:ident : $sty:ty)* $(,)?) -> $sret:ty;)*
+        }
+    )*) => {$(
         #[async_trait]
-        impl<T> Storage for Arc<T>
+        impl<T> $trait for Arc<T>
         where
             T: Storage + ?Sized,
         {
@@ -1983,16 +2017,18 @@ macro_rules! arc_delegation {
                 }
             )*
         }
-    };
+    )*};
 }
 
 macro_rules! box_delegation {
-    (
-        $(fn $name:ident(&$s:ident $(, $arg:ident : $ty:ty)* $(,)?) -> $ret:ty;)*
-        $(sync fn $sname:ident(&$ss:ident $(, $sarg:ident : $sty:ty)* $(,)?) -> $sret:ty;)*
-    ) => {
+    ($(
+        $trait:ident {
+            $(fn $name:ident(&$s:ident $(, $arg:ident : $ty:ty)* $(,)?) -> $ret:ty;)*
+            $(sync fn $sname:ident(&$ss:ident $(, $sarg:ident : $sty:ty)* $(,)?) -> $sret:ty;)*
+        }
+    )*) => {$(
         #[async_trait]
-        impl<T> Storage for Box<T>
+        impl<T> $trait for Box<T>
         where
             T: Storage + ?Sized,
         {
@@ -2007,7 +2043,7 @@ macro_rules! box_delegation {
                 }
             )*
         }
-    };
+    )*};
 }
 
 storage_methods!(arc_delegation);

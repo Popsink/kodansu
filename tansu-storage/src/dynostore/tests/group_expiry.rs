@@ -18,6 +18,8 @@ use std::{
 };
 
 use async_trait::async_trait;
+
+use crate::{GroupStorage as _, LogStorage as _, MetadataStorage as _};
 use futures::{StreamExt as _, stream::BoxStream};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -26,7 +28,7 @@ use object_store::{
 use tansu_sans_io::{ErrorCode, create_topics_request::CreatableTopic};
 
 use crate::{
-    GenerationDoc, MemberDoc, OffsetCommitRequest, Result, Storage, Topition,
+    GenerationDoc, MemberDoc, OffsetCommitRequest, Result, Topition,
     dynostore::{
         DynoStore,
         tests::{init_tracing, legacy_group_exists, seed_legacy_group},

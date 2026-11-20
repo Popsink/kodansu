@@ -17,7 +17,7 @@
 use tansu_sans_io::{TxnOffsetCommitRequest, TxnOffsetCommitResponse};
 
 storage_service! {
-    /// Passes the commit to [`Storage::txn_offset_commit`](crate::Storage::txn_offset_commit),
+    /// Passes the commit to [`TxnStorage::txn_offset_commit`](crate::TxnStorage::txn_offset_commit),
     /// which holds the offsets until the transaction ends, and returns its
     /// per-partition results.
     OffsetCommitService: TxnOffsetCommitRequest => TxnOffsetCommitResponse,
