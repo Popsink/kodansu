@@ -1110,6 +1110,15 @@ fmt:
 # route and the same layer stack in the same order. Only code went, so the
 # ceiling rises.
 #
+#   defork  -229 lines, the broker's storage routes on one macro  2817 -> 2817  2.6612 -> 2.6670
+#
+# `tansu-broker/src/service/storage.rs` keeps all 29 route functions and their
+# signatures, `Acks` and the #440/#588 reasoning on it. Each route spelled out
+# the same map-error, map-state and frame-request layers around its service;
+# `storage_route!` spells them once and expands to the same stack, under the
+# same API key, with the same error conversion. `services` registers the same
+# routes in the same order. Only code went, so the ceiling rises.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1119,7 +1128,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6612" top="12":
+comments ceiling="2.6670" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
