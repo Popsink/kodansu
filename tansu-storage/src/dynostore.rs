@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Dynamic Object Storage engine (S3, memory, ...)
+//! The object-store engine, over S3, GCS or memory.
 //!
 //! This file holds the shapes and nothing else: [`DynoStore`] itself, the
 //! documents it reads and writes, the small types the engine passes between
@@ -46,64 +46,59 @@
 //! because anything outside this directory may call it — nothing can, the
 //! modules are private.
 
-use std::{
-    cmp::Reverse,
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque, btree_map::Entry},
-    fmt::{Debug, Display, Write as _},
-    num::NonZeroUsize,
-    str::FromStr,
-    sync::{
-        Arc, LazyLock, Mutex,
-        atomic::{self, AtomicU64},
-    },
-    time::SystemTime,
-};
+use std::cmp::Reverse;
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::fmt::{Debug, Display, Write as _};
+use std::num::NonZeroUsize;
+use std::str::FromStr as _;
+use std::sync::atomic::{self, AtomicU64};
+use std::sync::{Arc, LazyLock, Mutex};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use caches::{ClientCaches, PrefixCaches, PrefixLocks, TopicCaches};
 use config::{StoreIdentity, Tuning};
-use futures::{
-    StreamExt,
-    stream::{BoxStream, TryStreamExt},
-};
+use futures::StreamExt;
+use futures::stream::{BoxStream, TryStreamExt};
 use metadata::{Cache, key_class};
-use object_store::{
-    Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore, GetOptions, GetRange,
-    GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, ObjectStoreExt, PutMode,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, UpdateVersion, path::Path,
-};
-use opentelemetry::{
-    KeyValue,
-    metrics::{Counter, Gauge, Histogram},
-};
+use object_store::path::Path;
+use object_store::{Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore};
+use object_store::{GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta};
+use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions};
+use object_store::{PutPayload, PutResult, UpdateVersion};
+use opentelemetry::KeyValue;
+use opentelemetry::metrics::{Counter, Gauge, Histogram};
 use opticon::OptiCon;
-use rand::{prelude::*, rng};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use tansu_sans_io::{
-    BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch, EndTransactionMarker,
-    ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, OpType, ScramMechanism, TimestampType,
-    add_partitions_to_txn_response::{
-        AddPartitionsToTxnPartitionResult, AddPartitionsToTxnTopicResult,
-    },
-    create_topics_request::{CreatableTopic, CreatableTopicConfig},
-    delete_groups_response::DeletableGroupResult,
-    delete_records_request::DeleteRecordsTopic,
-    delete_records_response::{DeleteRecordsPartitionResult, DeleteRecordsTopicResult},
-    describe_cluster_response::DescribeClusterBroker,
-    describe_configs_response::{DescribeConfigsResourceResult, DescribeConfigsResult},
-    describe_topic_partitions_response::{
-        DescribeTopicPartitionsResponsePartition, DescribeTopicPartitionsResponseTopic,
-    },
-    incremental_alter_configs_request::{AlterConfigsResource, AlterableConfig},
-    incremental_alter_configs_response::AlterConfigsResourceResponse,
-    join_group_response::JoinGroupResponseMember,
-    list_groups_response::ListedGroup,
-    metadata_response::{MetadataResponseBroker, MetadataResponsePartition, MetadataResponseTopic},
-    record::{Record, deflated, inflated},
-    to_system_time,
-    txn_offset_commit_response::{TxnOffsetCommitResponsePartition, TxnOffsetCommitResponseTopic},
-};
+use rand::prelude::*;
+use rand::rng;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use tansu_sans_io::add_partitions_to_txn_response::AddPartitionsToTxnPartitionResult;
+use tansu_sans_io::add_partitions_to_txn_response::AddPartitionsToTxnTopicResult;
+use tansu_sans_io::create_topics_request::{CreatableTopic, CreatableTopicConfig};
+use tansu_sans_io::delete_groups_response::DeletableGroupResult;
+use tansu_sans_io::delete_records_request::DeleteRecordsTopic;
+use tansu_sans_io::delete_records_response::DeleteRecordsPartitionResult;
+use tansu_sans_io::delete_records_response::DeleteRecordsTopicResult;
+use tansu_sans_io::describe_cluster_response::DescribeClusterBroker;
+use tansu_sans_io::describe_configs_response::DescribeConfigsResourceResult;
+use tansu_sans_io::describe_configs_response::DescribeConfigsResult;
+use tansu_sans_io::describe_topic_partitions_response::DescribeTopicPartitionsResponsePartition;
+use tansu_sans_io::describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic;
+use tansu_sans_io::incremental_alter_configs_request::{AlterConfigsResource, AlterableConfig};
+use tansu_sans_io::incremental_alter_configs_response::AlterConfigsResourceResponse;
+use tansu_sans_io::join_group_response::JoinGroupResponseMember;
+use tansu_sans_io::list_groups_response::ListedGroup;
+use tansu_sans_io::metadata_response::MetadataResponseBroker;
+use tansu_sans_io::metadata_response::{MetadataResponsePartition, MetadataResponseTopic};
+use tansu_sans_io::record::{Record, deflated, inflated};
+use tansu_sans_io::txn_offset_commit_response::TxnOffsetCommitResponsePartition;
+use tansu_sans_io::txn_offset_commit_response::TxnOffsetCommitResponseTopic;
+use tansu_sans_io::{BatchAttribute, ConfigResource, ConfigSource, ConfigType, ControlBatch};
+use tansu_sans_io::{EndTransactionMarker, ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID};
+use tansu_sans_io::{OpType, ScramMechanism, TimestampType, to_system_time};
 use tokio::sync::{oneshot, watch};
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, instrument, warn};
@@ -1260,7 +1255,8 @@ struct Meta {
 
 impl OptiCon<Meta> {
     fn new(cluster: &str) -> Self {
-        Self::path(format!("clusters/{cluster}/meta.json"))
+        let location = format!("clusters/{cluster}/meta.json");
+        OptiCon::path(location)
     }
 }
 
@@ -1310,32 +1306,23 @@ impl Meta {
         producer_id: ProducerId,
         producer_epoch: ProducerEpoch,
     ) -> Result<BTreeMap<Topition, TxnProduceOffset>> {
-        let Some(txn) = self.transactions.get(transaction_id) else {
-            return Err(Error::Api(ErrorCode::TransactionalIdNotFound));
+        let refused = |code| Err(Error::Api(code));
+        let known = self.transactions.get(transaction_id);
+        let Some(txn) = known else {
+            return refused(ErrorCode::TransactionalIdNotFound);
+        };
+        if producer_id != txn.producer {
+            return refused(ErrorCode::UnknownProducerId);
+        }
+        let Some(detail) = txn.epochs.get(&producer_epoch) else {
+            return refused(ErrorCode::ProducerFenced);
         };
 
-        if txn.producer != producer_id {
-            return Err(Error::Api(ErrorCode::UnknownProducerId));
+        let mut ranges = BTreeMap::new();
+        for (topition, range) in produced_ranges(detail) {
+            assert_eq!(None, ranges.insert(topition, range));
         }
-
-        let Some(txn_detail) = txn.epochs.get(&producer_epoch) else {
-            return Err(Error::Api(ErrorCode::ProducerFenced));
-        };
-
-        let mut produced = BTreeMap::new();
-
-        for (topic, partitions) in txn_detail.produces.iter() {
-            for (partition, offset_range) in partitions.iter() {
-                let Some(offset_range) = offset_range else {
-                    continue;
-                };
-
-                let tp = Topition::new(topic.to_owned(), *partition);
-                assert_eq!(None, produced.insert(tp, *offset_range));
-            }
-        }
-
-        Ok(produced)
+        Ok(ranges)
     }
 
     fn overlapping_transactions(
@@ -1344,49 +1331,31 @@ impl Meta {
         producer_id: ProducerId,
         producer_epoch: ProducerEpoch,
     ) -> Result<Vec<TxnId>> {
-        let candidates = self.produced(transaction_id, producer_id, producer_epoch)?;
+        let ours = self.produced(transaction_id, producer_id, producer_epoch)?;
+        let clashes = |(topition, range): (Topition, TxnProduceOffset)| {
+            let claimed = ours.get(&topition);
+            claimed.is_some_and(|mine| range.offset_start < mine.offset_end)
+        };
 
-        let mut overlapping = Vec::new();
-
-        'candidates: for (candidate_id, txn) in self.transactions.iter() {
-            for (epoch, txn_detail) in txn.epochs.iter() {
-                if transaction_id == candidate_id
-                    && producer_id == txn.producer
-                    && producer_epoch == *epoch
-                {
-                    continue;
+        let mut clashing_txns = Vec::new();
+        for (candidate_id, txn) in &self.transactions {
+            let first = txn.epochs.iter().find_map(|(&epoch, detail)| {
+                let same = (candidate_id.as_str(), txn.producer, epoch);
+                if same == (transaction_id, producer_id, producer_epoch) {
+                    return None;
                 }
-
-                let Some(state) = txn_detail.state else {
-                    continue;
-                };
-
-                for (topic, partitions) in txn_detail.produces.iter() {
-                    for (partition, offset_range) in partitions.iter() {
-                        let Some(offset_range) = offset_range else {
-                            continue;
-                        };
-
-                        let tp = Topition::new(topic.to_owned(), *partition);
-
-                        if let Some(candidate) = candidates.get(&tp)
-                            && offset_range.offset_start < candidate.offset_end
-                        {
-                            overlapping.push(TxnId {
-                                transaction: candidate_id.to_owned(),
-                                producer_id: txn.producer,
-                                producer_epoch: *epoch,
-                                state,
-                            });
-
-                            continue 'candidates;
-                        }
-                    }
-                }
-            }
+                let state = detail.state?;
+                let clashing = produced_ranges(detail).any(clashes);
+                clashing.then(|| TxnId {
+                    transaction: candidate_id.clone(),
+                    producer_id: txn.producer,
+                    producer_epoch: epoch,
+                    state,
+                })
+            });
+            clashing_txns.extend(first);
         }
-
-        Ok(overlapping)
+        Ok(clashing_txns)
     }
 }
 
@@ -1424,22 +1393,23 @@ struct TxnDetail {
     offsets: BTreeMap<Group, BTreeMap<Topic, BTreeMap<Partition, TxnCommitOffset>>>,
 }
 
+/// Every topition `detail` produced to, with the offsets it produced there.
+fn produced_ranges(detail: &TxnDetail) -> impl Iterator<Item = (Topition, TxnProduceOffset)> + '_ {
+    detail.produces.iter().flat_map(|(topic, partitions)| {
+        partitions.iter().filter_map(move |(&partition, range)| {
+            let topition = Topition::new(topic.clone(), partition);
+            range.map(|range| (topition, range))
+        })
+    })
+}
+
 impl From<&TxnDetail> for BTreeMap<Topition, Offset> {
     fn from(value: &TxnDetail) -> Self {
-        let mut result = BTreeMap::new();
-
-        for (topic, partitions) in value.produces.iter() {
-            for (partition, offset_range) in partitions.iter() {
-                let Some(offset_range) = offset_range else {
-                    continue;
-                };
-
-                let tp = Topition::new(topic.to_owned(), *partition);
-                assert_eq!(None, result.insert(tp, offset_range.offset_start));
-            }
+        let mut starts = BTreeMap::new();
+        for (topition, range) in produced_ranges(value) {
+            assert_eq!(None, starts.insert(topition, range.offset_start));
         }
-
-        result
+        starts
     }
 }
 
@@ -1670,26 +1640,22 @@ struct CachedWatermark {
 }
 
 fn json_content_type() -> Attributes {
-    let mut attributes = Attributes::new();
-    _ = attributes.insert(
-        Attribute::ContentType,
-        AttributeValue::from(APPLICATION_JSON),
-    );
-    attributes
+    let json = AttributeValue::from(APPLICATION_JSON);
+    Attributes::from_iter([(Attribute::ContentType, json)])
 }
 
 impl DynoStore {
     pub fn new(cluster: &str, node: i32, object_store: impl ObjectStore) -> Self {
-        let cache = Arc::new(Cache::new(
-            Metron::new(object_store, cluster),
-            Duration::from_millis(5_000),
-        ));
+        let metered = Metron::new(object_store, cluster);
+        let cache = Arc::new(Cache::new(metered, Duration::from_secs(5)));
+        let meta = OptiCon::<Meta>::new(cluster);
+        let localhost = Url::parse("tcp://127.0.0.1/");
 
-        Self {
+        DynoStore {
             identity: StoreIdentity {
-                cluster: cluster.into(),
+                advertised_listener: localhost.unwrap(),
+                cluster: cluster.to_owned(),
                 node,
-                advertised_listener: Url::parse("tcp://127.0.0.1/").unwrap(),
 
                 // Per-process random component so two ReplicaSet pods are
                 // actually distinguishable (#126): `node` is always 111 and
@@ -1712,7 +1678,7 @@ impl DynoStore {
             topics: TopicCaches::default(),
             prefixes: PrefixCaches::default(),
             prefix_locks: PrefixLocks::default(),
-            meta: OptiCon::<Meta>::new(cluster),
+            meta,
             #[cfg(test)]
             metadata_etags: cache.clone(),
             object_store: cache,
