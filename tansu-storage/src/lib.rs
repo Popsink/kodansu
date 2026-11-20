@@ -13,11 +13,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-//! Tansu Storage Abstraction
+//! Where Kodansu keeps its data, behind one [`Storage`] trait.
 //!
-//! [`StorageContainer::builder`] selects a [`Storage`] from a URL scheme:
-//! `memory://` for tests and ephemeral use, or an object store —
-//! [S3](https://en.wikipedia.org/wiki/Amazon_S3) and Google Cloud Storage.
+//! [`StorageContainer::builder`] picks the engine from the storage URL's
+//! scheme: `memory://` for tests and anything ephemeral, `s3://` for
+//! [S3](https://en.wikipedia.org/wiki/Amazon_S3) or MinIO, and `gs://` for
+//! Google Cloud Storage.
 //!
 //! The PostgreSQL, libSQL and Turso backends this used to advertise were removed
 //! in #96; their examples went with this doc's rewrite (#279).
@@ -25,14 +26,16 @@
 //! ## Memory
 //!
 //! ```
-//! # use tansu_storage::{Error, StorageContainer};
-//! # use url::Url;
+//! use tansu_storage::{Error, StorageContainer};
+//! use url::Url;
+//!
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Error> {
-//! let storage = StorageContainer::builder()
+//! let listener = Url::parse("tcp://localhost:9092")?;
+//! let _storage = StorageContainer::builder()
 //!     .cluster_id("tansu")
 //!     .node_id(111)
-//!     .advertised_listener(Url::parse("tcp://localhost:9092")?)
+//!     .advertised_listener(listener)
 //!     .storage(Url::parse("memory://tansu/")?)
 //!     .build()
 //!     .await?;
@@ -43,14 +46,16 @@
 //! ## S3
 //!
 //! ```no_run
-//! # use tansu_storage::{Error, StorageContainer};
-//! # use url::Url;
+//! use tansu_storage::{Error, StorageContainer};
+//! use url::Url;
+//!
 //! # #[tokio::main]
 //! # async fn main() -> Result<(), Error> {
-//! let storage = StorageContainer::builder()
+//! let listener = Url::parse("tcp://localhost:9092")?;
+//! let _storage = StorageContainer::builder()
 //!     .cluster_id("tansu")
 //!     .node_id(111)
-//!     .advertised_listener(Url::parse("tcp://localhost:9092")?)
+//!     .advertised_listener(listener)
 //!     .storage(Url::parse("s3://tansu/")?)
 //!     .build()
 //!     .await?;
@@ -82,58 +87,54 @@ use object_store::aws::{AmazonS3Builder, S3ConditionalPut};
 #[cfg(feature = "dynostore")]
 use object_store::{BackoffConfig, RetryConfig};
 
-use opentelemetry::{
-    InstrumentationScope, global,
-    metrics::{Counter, Meter, UpDownCounter},
-};
-use opentelemetry_semantic_conventions::SCHEMA_URL;
+use std::array::TryFromSliceError;
+use std::collections::BTreeMap;
+use std::fmt::{self, Debug, Display, Formatter};
+use std::future::Future;
+use std::io;
+use std::marker::PhantomData;
+use std::num::{ParseIntError, TryFromIntError};
+use std::pin::Pin;
+use std::result;
+use std::str::FromStr;
+use std::sync::{Arc, LazyLock, PoisonError};
+use std::time::{Duration, SystemTime, SystemTimeError};
 
 use governor::InsufficientCapacity;
+use opentelemetry::metrics::{Counter, Meter, UpDownCounter};
+use opentelemetry::{InstrumentationScope, global};
+use opentelemetry_semantic_conventions::SCHEMA_URL;
 use serde::{Deserialize, Serialize};
-use std::{
-    array::TryFromSliceError,
-    collections::BTreeMap,
-    fmt::{self, Debug, Display, Formatter},
-    future::Future,
-    io,
-    marker::PhantomData,
-    num::{ParseIntError, TryFromIntError},
-    pin::Pin,
-    result,
-    str::FromStr,
-    sync::{Arc, LazyLock, PoisonError},
-    time::{Duration, SystemTime, SystemTimeError},
+use tansu_sans_io::add_partitions_to_txn_request::AddPartitionsToTxnRequest;
+use tansu_sans_io::add_partitions_to_txn_request::{
+    AddPartitionsToTxnTopic, AddPartitionsToTxnTransaction,
 };
-use tansu_sans_io::{
-    ConfigResource, ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID, ScramMechanism,
-    add_partitions_to_txn_request::{
-        AddPartitionsToTxnRequest, AddPartitionsToTxnTopic, AddPartitionsToTxnTransaction,
-    },
-    add_partitions_to_txn_response::{AddPartitionsToTxnResult, AddPartitionsToTxnTopicResult},
-    consumer_group_describe_response,
-    create_topics_request::{CreatableTopic, CreatableTopicConfig},
-    delete_groups_response::DeletableGroupResult,
-    delete_records_request::DeleteRecordsTopic,
-    delete_records_response::DeleteRecordsTopicResult,
-    delete_topics_request::DeleteTopicState,
-    describe_cluster_response::DescribeClusterBroker,
-    describe_configs_response::DescribeConfigsResult,
-    describe_groups_response,
-    describe_topic_partitions_request::{Cursor, TopicRequest},
-    describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic,
-    fetch_request::FetchTopic,
-    incremental_alter_configs_request::AlterConfigsResource,
-    incremental_alter_configs_response::AlterConfigsResourceResponse,
-    join_group_response::JoinGroupResponseMember,
-    list_groups_response::ListedGroup,
-    metadata_request::MetadataRequestTopic,
-    metadata_response::{MetadataResponseBroker, MetadataResponseTopic},
-    offset_commit_request::OffsetCommitRequestPartition,
-    record::deflated,
-    to_system_time, to_timestamp,
-    txn_offset_commit_request::TxnOffsetCommitRequestTopic,
-    txn_offset_commit_response::TxnOffsetCommitResponseTopic,
+use tansu_sans_io::add_partitions_to_txn_response::{
+    AddPartitionsToTxnResult, AddPartitionsToTxnTopicResult,
 };
+use tansu_sans_io::create_topics_request::{CreatableTopic, CreatableTopicConfig};
+use tansu_sans_io::delete_groups_response::DeletableGroupResult;
+use tansu_sans_io::delete_records_request::DeleteRecordsTopic;
+use tansu_sans_io::delete_records_response::DeleteRecordsTopicResult;
+use tansu_sans_io::delete_topics_request::DeleteTopicState;
+use tansu_sans_io::describe_cluster_response::DescribeClusterBroker;
+use tansu_sans_io::describe_configs_response::DescribeConfigsResult;
+use tansu_sans_io::describe_topic_partitions_request::{Cursor, TopicRequest};
+use tansu_sans_io::describe_topic_partitions_response::DescribeTopicPartitionsResponseTopic;
+use tansu_sans_io::fetch_request::FetchTopic;
+use tansu_sans_io::incremental_alter_configs_request::AlterConfigsResource;
+use tansu_sans_io::incremental_alter_configs_response::AlterConfigsResourceResponse;
+use tansu_sans_io::join_group_response::JoinGroupResponseMember;
+use tansu_sans_io::list_groups_response::ListedGroup;
+use tansu_sans_io::metadata_request::MetadataRequestTopic;
+use tansu_sans_io::metadata_response::{MetadataResponseBroker, MetadataResponseTopic};
+use tansu_sans_io::offset_commit_request::OffsetCommitRequestPartition;
+use tansu_sans_io::record::deflated;
+use tansu_sans_io::txn_offset_commit_request::TxnOffsetCommitRequestTopic;
+use tansu_sans_io::txn_offset_commit_response::TxnOffsetCommitResponseTopic;
+use tansu_sans_io::{ConfigResource, ErrorCode, IsolationLevel, ListOffset, NULL_TOPIC_ID};
+use tansu_sans_io::{ScramMechanism, consumer_group_describe_response, describe_groups_response};
+use tansu_sans_io::{to_system_time, to_timestamp};
 use tracing::debug;
 use tracing_subscriber::filter::ParseError;
 use url::Url;
@@ -985,38 +986,39 @@ pub enum GroupState {
 impl GroupState {
     pub fn protocol_type(&self) -> Option<String> {
         match self {
-            Self::Forming { protocol_type, .. } => protocol_type.clone(),
-            Self::Formed { protocol_type, .. } => Some(protocol_type.clone()),
+            GroupState::Formed { protocol_type, .. } => Some(String::clone(protocol_type)),
+            GroupState::Forming { protocol_type, .. } => Option::clone(protocol_type),
         }
     }
 
     pub fn protocol_name(&self) -> Option<String> {
         match self {
-            Self::Forming { protocol_name, .. } => protocol_name.clone(),
-            Self::Formed { protocol_name, .. } => Some(protocol_name.clone()),
+            GroupState::Formed { protocol_name, .. } => Some(String::clone(protocol_name)),
+            GroupState::Forming { protocol_name, .. } => Option::clone(protocol_name),
         }
     }
 
     pub fn leader(&self) -> Option<String> {
         match self {
-            Self::Forming { leader, .. } => leader.clone(),
-            Self::Formed { leader, .. } => Some(leader.clone()),
+            GroupState::Formed { leader, .. } => Some(String::clone(leader)),
+            GroupState::Forming { leader, .. } => Option::clone(leader),
         }
     }
 
     pub fn assignments(&self) -> BTreeMap<String, Bytes> {
-        match self {
-            Self::Forming { .. } => BTreeMap::new(),
-            Self::Formed { assignments, .. } => assignments.clone(),
-        }
+        let GroupState::Formed { assignments, .. } = self else {
+            return BTreeMap::new();
+        };
+        assignments.clone()
     }
 }
 
 impl Default for GroupState {
     fn default() -> Self {
-        Self::Forming {
+        let protocol_name = Some(String::new());
+        GroupState::Forming {
             protocol_type: None,
-            protocol_name: Some("".into()),
+            protocol_name,
             leader: None,
         }
     }
@@ -1039,16 +1041,17 @@ pub enum ConsumerGroupState {
 
 impl Display for ConsumerGroupState {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Unknown => f.write_str("Unknown"),
-            Self::PreparingRebalance => f.write_str("PreparingRebalance"),
-            Self::CompletingRebalance => f.write_str("CompletingRebalance"),
-            Self::Stable => f.write_str("Stable"),
-            Self::Dead => f.write_str("Dead"),
-            Self::Empty => f.write_str("Empty"),
-            Self::Assigning => f.write_str("Assigning"),
-            Self::Reconciling => f.write_str("Reconciling"),
-        }
+        let name = match self {
+            ConsumerGroupState::Unknown => "Unknown",
+            ConsumerGroupState::PreparingRebalance => "PreparingRebalance",
+            ConsumerGroupState::CompletingRebalance => "CompletingRebalance",
+            ConsumerGroupState::Stable => "Stable",
+            ConsumerGroupState::Dead => "Dead",
+            ConsumerGroupState::Empty => "Empty",
+            ConsumerGroupState::Assigning => "Assigning",
+            ConsumerGroupState::Reconciling => "Reconciling",
+        };
+        f.write_str(name)
     }
 }
 
@@ -1068,13 +1071,14 @@ pub struct GroupDetail {
 
 impl Default for GroupDetail {
     fn default() -> Self {
-        Self {
+        let inception = SystemTime::now();
+        GroupDetail {
             session_timeout_ms: 45_000,
             rebalance_timeout_ms: None,
-            members: BTreeMap::new(),
+            members: BTreeMap::default(),
             generation_id: -1,
             skip_assignment: Some(false),
-            inception: SystemTime::now(),
+            inception,
             state: GroupState::default(),
         }
     }
@@ -1201,17 +1205,37 @@ impl From<&NamedGroupDetail> for consumer_group_describe_response::DescribedGrou
             GroupDetailResponse::ErrorCode(error_code) => *error_code,
         };
 
+        let code: i16 = error_code.into();
+        let message = error_code.to_string();
         Self::default()
-            .error_code(error_code.into())
-            .error_message(Some(error_code.to_string()))
-            .group_id(name.into())
-            .group_state("Unknown".into())
+            .group_id(name.to_owned())
+            .error_code(code)
+            .error_message(Some(message))
+            .group_state(String::from("Unknown"))
             .group_epoch(-1)
             .assignment_epoch(-1)
-            .assignor_name("".into())
-            .members(Some([].into()))
+            .assignor_name(String::new())
+            .members(Some(Vec::new()))
             .authorized_operations(-1)
     }
+}
+
+/// A `DescribeGroups` answer for `name` in `state` with no members and no
+/// protocol: what the broker says about a group it holds no state for.
+fn memberless(
+    name: &str,
+    error_code: ErrorCode,
+    state: String,
+) -> describe_groups_response::DescribedGroup {
+    let code: i16 = error_code.into();
+    describe_groups_response::DescribedGroup::default()
+        .group_id(name.to_owned())
+        .error_code(code)
+        .group_state(state)
+        .protocol_type(String::new())
+        .protocol_data(String::new())
+        .members(Some(Vec::new()))
+        .authorized_operations(Some(-1))
 }
 
 impl From<&NamedGroupDetail> for describe_groups_response::DescribedGroup {
@@ -1276,26 +1300,12 @@ impl From<&NamedGroupDetail> for describe_groups_response::DescribedGroup {
             NamedGroupDetail {
                 name,
                 response: GroupDetailResponse::Dead,
-            } => Self::default()
-                .error_code(ErrorCode::None.into())
-                .group_id(name.clone())
-                .group_state(ConsumerGroupState::Dead.to_string())
-                .protocol_type("".into())
-                .protocol_data("".into())
-                .members(Some(vec![]))
-                .authorized_operations(Some(-1)),
+            } => memberless(name, ErrorCode::None, ConsumerGroupState::Dead.to_string()),
 
             NamedGroupDetail {
                 name,
                 response: GroupDetailResponse::ErrorCode(error_code),
-            } => Self::default()
-                .error_code((*error_code).into())
-                .group_id(name.clone())
-                .group_state("Unknown".into())
-                .protocol_type("".into())
-                .protocol_data("".into())
-                .members(Some(vec![]))
-                .authorized_operations(Some(-1)),
+            } => memberless(name, *error_code, String::from("Unknown")),
         }
     }
 }
@@ -1378,9 +1388,10 @@ impl TryFrom<AddPartitionsToTxnRequest> for TxnAddPartitionsRequest {
                 ..
             } => Ok(Self::VersionFourPlus { transactions }),
 
-            unexpected => Err(Error::UnexpectedAddPartitionsToTxnRequest(Box::new(
-                unexpected,
-            ))),
+            unexpected => {
+                let boxed = Box::new(unexpected);
+                Err(Error::UnexpectedAddPartitionsToTxnRequest(boxed))
+            }
         }
     }
 }
@@ -1396,10 +1407,10 @@ pub enum TxnAddPartitionsResponse {
 
 impl TxnAddPartitionsResponse {
     pub fn zero_to_three(&self) -> &[AddPartitionsToTxnTopicResult] {
-        match self {
-            Self::VersionZeroToThree(result) => result.as_slice(),
-            Self::VersionFourPlus(_) => &[][..],
-        }
+        let TxnAddPartitionsResponse::VersionZeroToThree(results) = self else {
+            return &[];
+        };
+        results
     }
 }
 
@@ -1428,10 +1439,7 @@ pub enum TxnState {
 
 impl TxnState {
     pub fn is_prepared(&self) -> bool {
-        match self {
-            Self::PrepareAbort | Self::PrepareCommit => true,
-            _otherwise => false,
-        }
+        matches!(self, TxnState::PrepareAbort | TxnState::PrepareCommit)
     }
 }
 
@@ -1439,14 +1447,15 @@ impl FromStr for TxnState {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "ABORTED" => Ok(TxnState::Aborted),
-            "BEGIN" => Ok(TxnState::Begin),
-            "COMMITTED" => Ok(TxnState::Committed),
-            "PREPARE_ABORT" => Ok(TxnState::PrepareAbort),
-            "PREPARE_COMMIT" => Ok(TxnState::PrepareCommit),
-            otherwise => Err(Error::UnknownTxnState(otherwise.to_owned())),
-        }
+        let state = match s {
+            "BEGIN" => TxnState::Begin,
+            "PREPARE_COMMIT" => TxnState::PrepareCommit,
+            "PREPARE_ABORT" => TxnState::PrepareAbort,
+            "COMMITTED" => TxnState::Committed,
+            "ABORTED" => TxnState::Aborted,
+            unknown => return Err(Error::UnknownTxnState(String::from(unknown))),
+        };
+        Ok(state)
     }
 }
 
@@ -1454,19 +1463,20 @@ impl TryFrom<String> for TxnState {
     type Error = Error;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::from_str(&value)
+        value.parse()
     }
 }
 
 impl From<TxnState> for String {
     fn from(value: TxnState) -> Self {
-        match value {
-            TxnState::Begin => "BEGIN".into(),
-            TxnState::PrepareCommit => "PREPARE_COMMIT".into(),
-            TxnState::PrepareAbort => "PREPARE_ABORT".into(),
-            TxnState::Committed => "COMMITTED".into(),
-            TxnState::Aborted => "ABORTED".into(),
-        }
+        let spelled = match value {
+            TxnState::Begin => "BEGIN",
+            TxnState::PrepareCommit => "PREPARE_COMMIT",
+            TxnState::PrepareAbort => "PREPARE_ABORT",
+            TxnState::Committed => "COMMITTED",
+            TxnState::Aborted => "ABORTED",
+        };
+        String::from(spelled)
     }
 }
 
