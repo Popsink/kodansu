@@ -1243,6 +1243,16 @@ fmt:
 # their names and assertions through `answered`, `produce`, `new_producer`
 # and `record`. Only code went, so the ceiling rises.
 #
+#   defork  +2 lines, the storage crate root's types rewritten  2814 -> 2814  2.6939 -> 2.6939
+#
+# `tansu-storage/src/lib.rs` keeps the `Storage` trait, every type, field,
+# impl and signature and every cited comment. The crate doc and its two
+# examples are reworded; the group-state accessors, `ConsumerGroupState`'s
+# names, `TxnState`'s spellings and the add-partitions request split answer
+# the same; the two member-less `DescribeGroups` answers share `memberless`.
+# The `StorageContainer` builder's backend arms come in a follow-up. Two
+# lines more code lower the ratio a hair, and the ceiling follows it.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
