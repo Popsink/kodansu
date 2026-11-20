@@ -1119,6 +1119,15 @@ fmt:
 # same API key, with the same error conversion. `services` registers the same
 # routes in the same order. Only code went, so the ceiling rises.
 #
+#   defork  -40 lines, the broker's run loop and builder rewritten  2817 -> 2817  2.6670 -> 2.6680
+#
+# `tansu-broker/src/broker.rs` keeps `Broker`, `Builder`, their fields and every
+# impl and signature, and every comment that cites an issue. The six typestate
+# setters share `retyped`, which moves the other fields across unchanged; the
+# plain setters assign one field. `main` waits on the same signals with the
+# same patience, `listen` binds, ticks, spawns and drains the same way, and
+# `bind` resolves the same address. Only code went, so the ceiling rises.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1128,7 +1137,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6670" top="12":
+comments ceiling="2.6680" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
