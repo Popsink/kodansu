@@ -1156,6 +1156,16 @@ fmt:
 # `kind_of_sequence`. The three edition labels inside the reserved-word list
 # went with the list's layout, so the ratio falls and the ceiling follows it.
 #
+#   defork  -68 lines, the protocol code generator rewritten  2817 -> 2817  2.6686 -> 2.6703
+#
+# `tansu-sans-io/build.rs` keeps every function signature and every `quote!`
+# template, which is the generated code itself; the generated `generate.rs` is
+# byte-identical before and after (diffed in `OUT_DIR`). The thirteen inline
+# path parses go through `module_of` and `path_in`, `read_value` strips the
+# same comments and still reports a malformed descriptor as `Io`, and `kind`,
+# `tag_kind`, the throttle arms and the field metadata choose the same types.
+# Only code went, so the ceiling rises.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1165,7 +1175,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6686" top="12":
+comments ceiling="2.6703" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

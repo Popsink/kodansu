@@ -12,20 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use convert_case::{Case, Casing};
+use std::collections::{BTreeMap, HashMap};
+use std::fmt::{self, Display};
+use std::io::{self, BufRead as _, BufReader};
+use std::path::Path;
+use std::{env, error, fs};
+
+use convert_case::{Case, Casing as _};
 use proc_macro2::TokenStream;
 use quote::{ToTokens, quote};
 use serde_json::Value;
-use std::{
-    collections::{BTreeMap, HashMap},
-    env, error,
-    fmt::{self, Display},
-    fs,
-    io::{self, BufRead, BufReader, Cursor, Seek, Write},
-    path::Path,
-};
 use syn::{Expr, Type};
-use tansu_model::{CommonStruct, Field, Listener, Message, MessageKind, wv::Wv};
+use tansu_model::wv::Wv;
+use tansu_model::{CommonStruct, Field, Listener, Message, MessageKind};
 
 #[derive(Debug)]
 #[allow(dead_code)]
@@ -44,43 +43,43 @@ enum Error {
 
 impl Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        f.write_fmt(format_args!("{self:?}"))
     }
 }
 
 impl From<glob::GlobError> for Error {
     fn from(value: glob::GlobError) -> Self {
-        Error::Glob(value)
+        Self::Glob(value)
     }
 }
 
 impl From<glob::PatternError> for Error {
     fn from(value: glob::PatternError) -> Self {
-        Error::Pattern(value)
+        Self::Pattern(value)
     }
 }
 
 impl From<syn::Error> for Error {
     fn from(value: syn::Error) -> Self {
-        Error::Syn(value)
+        Self::Syn(value)
     }
 }
 
 impl From<io::Error> for Error {
     fn from(value: io::Error) -> Self {
-        Error::Io(value)
+        Self::Io(value)
     }
 }
 
 impl From<serde_json::Error> for Error {
     fn from(value: serde_json::Error) -> Self {
-        Error::Json(value)
+        Self::Json(value)
     }
 }
 
 impl From<tansu_model::Error> for Error {
     fn from(value: tansu_model::Error) -> Self {
-        Error::KafkaModel(value)
+        Self::KafkaModel(value)
     }
 }
 
@@ -92,23 +91,44 @@ fn read_value<P>(filename: P) -> Result<Value>
 where
     P: AsRef<Path>,
 {
-    fs::File::open(filename)
-        .map(BufReader::new)
-        .and_then(|r| {
-            r.lines()
-                .try_fold(Cursor::new(Vec::new()), |mut acc, line| {
-                    if let Ok(mut line) = line {
-                        if let Some(position) = line.find("//") {
-                            line.truncate(position);
-                        }
-                        acc.write_all(line.as_bytes())?;
-                    }
-                    Ok(acc)
-                })
-        })
-        .and_then(|mut r| r.rewind().map(|()| r))
-        .and_then(|r| serde_json::from_reader(r).map_err(Into::into))
-        .map_err(Into::into)
+    let descriptor = fs::File::open(filename)?;
+    let mut stripped = Vec::new();
+    for line in BufReader::new(descriptor).lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let code = line
+            .find("//")
+            .map_or(line.as_str(), |comment| &line[..comment]);
+        stripped.extend_from_slice(code.as_bytes());
+    }
+    // A malformed descriptor surfaces as `Error::Io`, as it did when the
+    // parse ran inside the reader's chain, so a broken build reads the same
+    // (Popsink/data-plane#5880).
+    let parsed = serde_json::from_slice(&stripped).map_err(io::Error::from)?;
+    Ok(parsed)
+}
+
+/// The module a message or structure named `name` is generated into: its name
+/// in snake case.
+fn module_of(name: &Type) -> syn::Path {
+    let snake = spelled(name).to_case(Case::Snake);
+    syn::parse_str::<syn::Path>(&snake).unwrap_or_else(|_| panic!("module: {}", spelled(name)))
+}
+
+/// `name` in `module`, as a path from the crate root: `crate::{module}`, with
+/// `::{name}` after it when there is one.
+fn path_in(prefix: &str, module: &syn::Path, name: Option<&Type>) -> syn::Path {
+    let mut written = format!("{prefix}{}", spelled(module));
+    if let Some(name) = name {
+        written = format!("{written}::{}", spelled(name));
+    }
+    syn::parse_str::<syn::Path>(&written).unwrap_or_else(|_| panic!("path: {written}"))
+}
+
+/// How `tokens` reads as source.
+fn spelled<T: ToTokens>(tokens: &T) -> String {
+    tokens.to_token_stream().to_string()
 }
 
 fn kind(
@@ -135,34 +155,21 @@ fn kind(
             .is_mandatory(parent.map(|parent| parent.versions()))
     );
 
-    if f.tag().is_some() {
-        let t = f.kind().type_name();
-
-        if f.kind().is_sequence() {
-            quote! {
-                Option<Vec<#t>>
-            }
-        } else {
-            quote! {
-                Option<#t>
-            }
-        }
-    } else if f.kind().is_sequence() {
-        let t = f.kind().type_name();
-        quote! {
-            Option<Vec<#t>>
-        }
+    let t = f.kind().type_name();
+    let sequence = f.kind().is_sequence();
+    let element = if sequence {
+        quote! { Vec<#t> }
     } else {
-        let t = f.kind().type_name();
-        if f.nullable().is_none() && f.versions().is_mandatory(parent.map(Field::versions)) {
-            quote! {
-                #t
-            }
-        } else {
-            quote! {
-                Option<#t>
-            }
-        }
+        quote! { #t }
+    };
+    let bare = f.tag().is_none()
+        && !sequence
+        && f.nullable().is_none()
+        && f.versions().is_mandatory(parent.map(Field::versions));
+    if bare {
+        element
+    } else {
+        quote! { Option<#element> }
     }
 }
 
@@ -181,30 +188,18 @@ fn tag_kind(
         f.nullable().is_none(),
     );
 
-    if f.kind().is_sequence() {
-        let t = f.kind().type_name();
-        quote! {
-            Vec<#module::#t>
-        }
-    } else if f.kind().is_primitive() {
-        let t = f.kind().type_name();
-        quote! {
-            #t
-        }
-    } else {
-        let t = f.kind().type_name();
-        quote! {
-            #module::#t
-        }
+    let t = f.kind().type_name();
+    match (f.kind().is_sequence(), f.kind().is_primitive()) {
+        (true, _) => quote! { Vec<#module::#t> },
+        (false, true) => quote! { #t },
+        (false, false) => quote! { #module::#t },
     }
 }
 
 fn body_enum(messages: &[Message], include_tag: bool) -> TokenStream {
     let variants = messages.iter().map(|message| {
         let name = message.type_name();
-        let module =
-            syn::parse_str::<syn::Path>(&name.to_token_stream().to_string().to_case(Case::Snake))
-                .unwrap();
+        let module = module_of(&name);
 
         quote! {
             #name(#module::#name)
@@ -215,10 +210,7 @@ fn body_enum(messages: &[Message], include_tag: bool) -> TokenStream {
         let from_mezzanine = {
             let conversions = messages.iter().map(|message| {
                 let name = message.type_name();
-                let module = syn::parse_str::<syn::Path>(
-                    &name.to_token_stream().to_string().to_case(Case::Snake),
-                )
-                .unwrap();
+                let module = module_of(&name);
 
                 quote! {
                     mezzanine::Body::#name(inner) => {
@@ -262,10 +254,7 @@ fn body_enum(messages: &[Message], include_tag: bool) -> TokenStream {
         let from_tagged = {
             let conversions = messages.iter().map(|message| {
                 let name = message.type_name();
-                let module = syn::parse_str::<syn::Path>(
-                    &name.to_token_stream().to_string().to_case(Case::Snake),
-                )
-                .unwrap();
+                let module = module_of(&name);
 
                 quote! {
                     crate::Body::#name(inner) => {
@@ -315,35 +304,37 @@ fn body_enum(messages: &[Message], include_tag: bool) -> TokenStream {
 /// throttle is advisory on the wire, and a client that cannot be told still has
 /// its connection muted, which is what actually enforces the limit.
 fn throttle_time_ms(messages: &[Message]) -> TokenStream {
-    let arms = messages
+    let mut arms = Vec::new();
+    for message in messages
         .iter()
         .filter(|message| message.kind() == MessageKind::Response)
-        .filter_map(|message| {
-            let field = message
-                .fields()
-                .iter()
-                .find(|field| field.name() == "ThrottleTimeMs")?;
+    {
+        let carried = message
+            .fields()
+            .iter()
+            .find(|field| field.name() == "ThrottleTimeMs");
+        let Some(field) = carried else {
+            continue;
+        };
+        let name = message.type_name();
+        let ident = field.ident();
 
-            let name = message.type_name();
-            let ident = field.ident();
-
-            // The same test `kind` applies to decide the generated type: a
-            // field absent from the earliest versions of a response is
-            // `Option<i32>`, one present in all of them is a bare `i32`.
-            let assign = if field.nullable().is_none() && field.versions().is_mandatory(None) {
-                quote! { inner.#ident = throttle_time_ms; }
-            } else {
-                quote! { inner.#ident = Some(throttle_time_ms); }
-            };
-
-            Some(quote! {
-                Body::#name(mut inner) => {
-                    #assign
-                    Body::#name(inner)
-                }
-            })
-        })
-        .collect::<Vec<_>>();
+        // The same test `kind` applies to decide the generated type: a field
+        // absent from the earliest versions of a response is `Option<i32>`,
+        // one present in all of them is a bare `i32`.
+        let bare = field.nullable().is_none() && field.versions().is_mandatory(None);
+        let value = if bare {
+            quote! { throttle_time_ms }
+        } else {
+            quote! { Some(throttle_time_ms) }
+        };
+        arms.push(quote! {
+            Body::#name(mut inner) => {
+                inner.#ident = #value;
+                Body::#name(inner)
+            }
+        });
+    }
 
     quote! {
         impl Body {
@@ -367,28 +358,25 @@ fn visibility_field_kind(
     dependencies: &[Type],
     include_tag: bool,
 ) -> Vec<TokenStream> {
-    fields
+    let mut declared = Vec::new();
+    for field in fields
         .iter()
         .filter(|field| include_tag || field.tag().is_none())
-        .map(|field| {
-            let ident = field.ident();
-            let kind = kind(parent, module, field, dependencies);
-
-            field.about().map_or(
-                quote! {
-                    #visibility #ident: #kind
-                },
-                |about| {
-                    let about = about.replace("[", "\\[").replace("]", "\\]");
-
-                    quote! {
-                        #[doc = #about]
-                        #visibility #ident: #kind
-                    }
-                },
-            )
-        })
-        .collect()
+    {
+        let ident = field.ident();
+        let kind = kind(parent, module, field, dependencies);
+        let declaration = quote! { #visibility #ident: #kind };
+        let Some(about) = field.about() else {
+            declared.push(declaration);
+            continue;
+        };
+        let about = about.replace('[', "\\[").replace(']', "\\]");
+        declared.push(quote! {
+            #[doc = #about]
+            #declaration
+        });
+    }
+    declared
 }
 
 fn root_message_struct(message: &Message, include_tag: bool) -> TokenStream {
@@ -398,9 +386,7 @@ fn root_message_struct(message: &Message, include_tag: bool) -> TokenStream {
     let common_structs = message.common_structs();
     let message_name = message.name();
 
-    let module =
-        syn::parse_str::<syn::Path>(&name.to_token_stream().to_string().to_case(Case::Snake))
-            .unwrap();
+    let module = module_of(name);
 
     let tokens = message_struct(&module, None, name, fields, common_structs, include_tag);
 
@@ -512,7 +498,7 @@ fn message_struct(
                 let f = field.ident();
                 let k = tag_kind(
                     parent,
-                    &syn::parse_str::<syn::Path>(&format!("crate::mezzanine::{}",module.to_token_stream())).unwrap(),
+                    &path_in("crate::mezzanine::", module, None),
                     field,
                     &dependencies,
                 );
@@ -599,12 +585,7 @@ fn message_struct(
             })
             .collect::<Vec<_>>();
 
-        let mezzanine_name = syn::parse_str::<syn::Path>(&format!(
-            "crate::mezzanine::{}::{}",
-            module.to_token_stream(),
-            name.to_token_stream()
-        ))
-        .unwrap();
+        let mezzanine_name = path_in("crate::mezzanine::", module, Some(name));
 
         let from_mezzanine = (!fields.is_empty()).then(|| {
             quote! {
@@ -672,11 +653,7 @@ fn message_struct(
                 let f = field.ident();
                 let k = tag_kind(
                     parent,
-                    &syn::parse_str::<syn::Path>(&format!(
-                        "crate::mezzanine::{}",
-                        module.to_token_stream()
-                    ))
-                    .unwrap(),
+                    &path_in("crate::mezzanine::", module, None),
                     field,
                     &dependencies,
                 );
@@ -750,12 +727,7 @@ fn message_struct(
             })
             .collect();
 
-        let tagged_name = syn::parse_str::<syn::Path>(&format!(
-            "crate::{}::{}",
-            module.to_token_stream(),
-            name.to_token_stream()
-        ))
-        .unwrap();
+        let tagged_name = path_in("crate::", module, Some(name));
 
         let from_tagged = (!fields.is_empty()).then(|| {
             quote! {
@@ -882,12 +854,7 @@ fn common_struct(
             })
             .collect::<Vec<_>>();
 
-        let from = syn::parse_str::<syn::Path>(&format!(
-            "crate::mezzanine::{}::{}",
-            module.to_token_stream(),
-            name.to_token_stream()
-        ))
-        .unwrap();
+        let from = path_in("crate::mezzanine::", module, Some(name));
 
         let derived = if fields.iter().any(Field::has_float) {
             quote! {
@@ -938,11 +905,7 @@ fn common_struct(
                 let f = field.ident();
                 let k = tag_kind(
                     parent,
-                    &syn::parse_str::<syn::Path>(&format!(
-                        "crate::mezzanine::{}",
-                        module.to_token_stream()
-                    ))
-                    .unwrap(),
+                    &path_in("crate::mezzanine::", module, None),
                     field,
                     &[],
                 );
@@ -1013,12 +976,7 @@ fn common_struct(
             })
             .collect();
 
-        let from = syn::parse_str::<syn::Path>(&format!(
-            "crate::{}::{}",
-            module.to_token_stream(),
-            name.to_token_stream()
-        ))
-        .unwrap();
+        let from = path_in("crate::", module, Some(name));
 
         let derived = if fields.iter().any(Field::has_float) {
             quote! {
@@ -1072,15 +1030,10 @@ fn process(messages: &[Message], include_tag: bool) -> TokenStream {
             .map(|message| {
                 let name = message.type_name();
 
-                let module = syn::parse_str::<syn::Path>(
-                    &name.to_token_stream().to_string().to_case(Case::Snake),
-                )
-                .unwrap_or_else(|_| panic!("module: {}", &name.to_token_stream().to_string()));
+                let module = module_of(&name);
 
-                let as_name = syn::parse_str::<syn::Path>(
-                    &format!("As{}", name.to_token_stream()).to_case(Case::Snake),
-                )
-                .unwrap();
+                let accessor = format!("As{}", spelled(&name)).to_case(Case::Snake);
+                let as_name = syn::parse_str::<syn::Path>(&accessor).unwrap();
 
                 quote! {
                     pub fn #as_name(self) -> Option<#module::#name> {
@@ -1250,16 +1203,14 @@ fn process(messages: &[Message], include_tag: bool) -> TokenStream {
 }
 
 fn all(pattern: &str) -> Result<Vec<Message>> {
-    glob::glob(pattern).map_err(Into::into).and_then(|paths| {
-        paths
-            .map(|path| {
-                path.map_err(Into::into)
-                    .inspect(|path| println!("cargo::rerun-if-changed={}", path.display()))
-                    .and_then(read_value)
-                    .and_then(|v| Message::try_from(&Wv::from(&v)).map_err(Into::into))
-            })
-            .collect::<Result<Vec<_>>>()
-    })
+    let mut messages = Vec::new();
+    for found in glob::glob(pattern)? {
+        let path = found?;
+        println!("cargo::rerun-if-changed={}", path.display());
+        let descriptor = read_value(path)?;
+        messages.push(Message::try_from(&Wv::from(&descriptor))?);
+    }
+    Ok(messages)
 }
 
 fn each_field_meta(
@@ -1273,24 +1224,16 @@ fn each_field_meta(
     let tag = OptionWrapper::from(field.tag());
     let tagged = OptionWrapper::from(field.tagged());
 
-    let children = field.fields().as_ref().map_or_else(
-        || {
-            common_structs.as_ref().map_or(Vec::new(), |m| {
-                m.get(&field.kind().type_name()).map_or(Vec::new(), |cs| {
-                    cs.fields()
-                        .iter()
-                        .map(|f| each_field_meta(f, common_structs))
-                        .collect()
-                })
-            })
-        },
-        |fields| {
-            fields
-                .iter()
-                .map(|f| each_field_meta(f, common_structs))
-                .collect()
-        },
-    );
+    let shared = || {
+        let structures = common_structs.as_ref()?;
+        let named = structures.get(&field.kind().type_name())?;
+        Some(named.fields().as_slice())
+    };
+    let nested = field.fields().or_else(shared).unwrap_or_default();
+    let children: Vec<TokenStream> = nested
+        .iter()
+        .map(|nested| each_field_meta(nested, common_structs))
+        .collect();
 
     quote! {
         (#name,
@@ -1311,16 +1254,14 @@ fn each_message_meta(message: &Message) -> TokenStream {
     let version = message.version();
     let message_kind = message.kind();
 
-    let common_structs = message
-        .common_structs()
-        .as_ref()
-        .map(|v| v.iter().map(|cs| (cs.type_name(), cs)))
-        .map(HashMap::from_iter);
-
-    let children = message
-        .fields()
-        .iter()
-        .map(|f| each_field_meta(f, &common_structs));
+    let common_structs = message.common_structs().map(|declared| {
+        let named = declared
+            .iter()
+            .map(|structure| (structure.type_name(), structure));
+        named.collect::<HashMap<_, _>>()
+    });
+    let fields = message.fields().iter();
+    let children = fields.map(|field| each_field_meta(field, &common_structs));
 
     quote! {
         (#name,
@@ -1335,9 +1276,8 @@ fn each_message_meta(message: &Message) -> TokenStream {
 }
 
 fn message_meta(messages: &[Message]) -> TokenStream {
-    let len = messages.len();
-
     let meta = messages.iter().map(each_message_meta);
+    let len = messages.len();
 
     quote! {
         pub static MESSAGE_META : [(&str, &tansu_model::MessageMeta); #len] = [#(#meta, )*];
@@ -1345,43 +1285,37 @@ fn message_meta(messages: &[Message]) -> TokenStream {
 }
 
 pub fn main() {
-    let files = "message/[A-Z]*Re[qs]*.json";
+    let messages = all("message/[A-Z]*Re[qs]*.json").unwrap_or_else(|e| panic!("all: {e:?}"));
 
-    let messages = all(files).unwrap_or_else(|e| panic!("all: {e:?}"));
-
-    let broker_api_keys = messages
+    let on_broker = |message: &&Message| {
+        let listeners = message.listeners().unwrap_or_default();
+        listeners.contains(&Listener::Broker)
+    };
+    let broker_api_keys: Vec<i16> = messages
         .iter()
-        .filter(|m| {
-            m.listeners()
-                .is_some_and(|listeners| listeners.contains(&Listener::Broker))
-        })
-        .map(|m| m.api_key())
-        .collect::<Vec<_>>();
-
-    let broker_messages = messages
+        .filter(on_broker)
+        .map(Message::api_key)
+        .collect();
+    let broker_messages: Vec<Message> = messages
         .into_iter()
-        .filter(|message| {
-            broker_api_keys.contains(&message.api_key()) && !message.fields().is_empty()
-        })
-        .collect::<Vec<_>>();
+        .filter(|message| broker_api_keys.contains(&message.api_key()))
+        .filter(|message| !message.fields().is_empty())
+        .collect();
 
     let tagged = process(&broker_messages, true);
     let untagged = process(&broker_messages, false);
-
     let message_meta = message_meta(&broker_messages);
-
-    let out_dir = env::var_os("OUT_DIR").unwrap();
-    let dest_path = Path::new(&out_dir).join("generate.rs");
-
-    let q = quote! {
+    let generated = quote! {
         #tagged
         #untagged
         #message_meta
     };
 
-    let r = syn::parse_file(&q.to_string()).unwrap_or_else(|_| panic!("{}", q.to_string()));
-
-    fs::write(&dest_path, prettyplease::unparse(&r)).unwrap();
+    let source = generated.to_string();
+    let file = syn::parse_file(&source).unwrap_or_else(|_| panic!("{source}"));
+    let out_dir = env::var_os("OUT_DIR").unwrap();
+    let destination = Path::new(&out_dir).join("generate.rs");
+    fs::write(&destination, prettyplease::unparse(&file)).unwrap();
 
     println!("cargo::rerun-if-changed=build.rs");
 }
@@ -1390,20 +1324,17 @@ struct OptionWrapper<T>(Option<T>);
 
 impl<T> From<Option<T>> for OptionWrapper<T> {
     fn from(value: Option<T>) -> Self {
-        Self(value)
+        OptionWrapper(value)
     }
 }
 
 impl<T: ToTokens> ToTokens for OptionWrapper<T> {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-        if let Some(ref v) = self.0 {
-            tokens.extend(quote! {
-                Some(#v)
-            });
-        } else {
-            tokens.extend(quote! {
-                None
-            });
-        }
+        let OptionWrapper(wrapped) = self;
+        let written = match wrapped {
+            Some(value) => quote! { Some(#value) },
+            None => quote! { None },
+        };
+        tokens.extend(written);
     }
 }
