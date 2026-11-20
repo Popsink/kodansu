@@ -1253,6 +1253,15 @@ fmt:
 # The `StorageContainer` builder's backend arms come in a follow-up. Two
 # lines more code lower the ratio a hair, and the ceiling follows it.
 #
+#   defork  -45 lines, the storage container's backends on two helpers  2814 -> 2814  2.6939 -> 2.6950
+#
+# `StorageContainer`'s `build` keeps one arm per backend. The S3, GCS and
+# Azure arms each built the same `DynoStore` over their object store, probed
+# it, sealed it and put the same batcher in front of it; `engine` and
+# `served` do that once, in the same order, and `memory://` takes `engine`
+# alone as it took the chain alone. The progress bar and `METER` read the
+# same. Only code went, so the ceiling rises.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1262,7 +1271,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6939" top="12":
+comments ceiling="2.6950" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

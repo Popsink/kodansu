@@ -2548,6 +2548,36 @@ fn coalesce_tuning(storage: &Url) -> CoalesceTuning {
 }
 
 impl Builder<i32, String, Url, Url> {
+    /// An object-store engine over `object_store`, with this builder's
+    /// identity and the knobs its storage URL carries.
+    #[cfg(feature = "dynostore")]
+    fn engine(&self, object_store: impl object_store::ObjectStore) -> DynoStore {
+        let engine = DynoStore::new(self.cluster_id.as_str(), self.node_id, object_store);
+        engine
+            .advertised_listener(self.advertised_listener.clone())
+            .auto_create(auto_topic_create(&self.storage))
+            .topic_defaults(self.topic_defaults.clone())
+            .coalesce_tuning(coalesce_tuning(&self.storage))
+            .message_max_bytes(message_max_bytes(&self.storage))
+    }
+
+    /// `engine` probed for conditional puts, sealed to its prefix shape, and
+    /// behind a produce batcher with the URL's minimum size and delay.
+    #[cfg(feature = "dynostore")]
+    async fn served(
+        &self,
+        engine: DynoStore,
+        minimum_size: Option<usize>,
+        maximum_delay: Option<Duration>,
+    ) -> Result<Arc<dyn Storage>> {
+        let probed = engine.conditional_put_probed(&self.storage).await?;
+        let sealed = probed.sealed_prefix_shape().await?;
+        let batched = batch::ProduceRequestBatcher::new(sealed)
+            .with_minimum_size(minimum_size)
+            .with_maximum_delay(maximum_delay);
+        Ok(Arc::new(batched))
+    }
+
     pub async fn build(self) -> Result<Arc<dyn Storage>> {
         // Routed through [`Backend`] rather than matching `scheme()` here, so
         // that a backend added to one builder cannot be missing from the other
@@ -2555,8 +2585,6 @@ impl Builder<i32, String, Url, Url> {
         let storage = match Backend::try_from_url(&self.storage)? {
             #[cfg(feature = "dynostore")]
             Backend::S3 => {
-                use crate::batch::ProduceRequestBatcher;
-
                 let bucket_name = self.storage.host_str().unwrap_or("tansu");
 
                 let minimum_size = batch_minimum_size(&self.storage);
@@ -2568,7 +2596,7 @@ impl Builder<i32, String, Url, Url> {
                 // per-key compaction pass (#175). Off by default; flipped only
                 debug!(?minimum_size, ?maximum_delay);
 
-                AmazonS3Builder::from_env()
+                let engine = AmazonS3Builder::from_env()
                     .with_bucket_name(bucket_name)
                     .with_conditional_put(S3ConditionalPut::ETagMatch)
                     // S3 enforces a per-prefix request-rate limit (~3,500
@@ -2594,25 +2622,9 @@ impl Builder<i32, String, Url, Url> {
                         retry_timeout: Duration::from_secs(300),
                     })
                     .build()
-                    .map(|object_store| {
-                        DynoStore::new(self.cluster_id.as_str(), self.node_id, object_store)
-                            .advertised_listener(self.advertised_listener.clone())
-                            .auto_create(auto_topic_create(&self.storage))
-                            .topic_defaults(self.topic_defaults.clone())
-                            .coalesce_tuning(coalesce_tuning(&self.storage))
-                            .message_max_bytes(message_max_bytes(&self.storage))
-                    })
-                    .map_err(Error::from)?
-                    .conditional_put_probed(&self.storage)
-                    .await?
-                    .sealed_prefix_shape()
-                    .await
-                    .map(|storage| {
-                        ProduceRequestBatcher::new(storage)
-                            .with_minimum_size(minimum_size)
-                            .with_maximum_delay(maximum_delay)
-                    })
-                    .map(|storage| Arc::new(storage) as Arc<dyn Storage>)
+                    .map(|object_store| self.engine(object_store))
+                    .map_err(Error::from)?;
+                self.served(engine, minimum_size, maximum_delay).await
             }
 
             #[cfg(feature = "dynostore")]
@@ -2621,13 +2633,8 @@ impl Builder<i32, String, Url, Url> {
 
                 use object_store::gcp::GoogleCloudStorageBuilder;
 
-                use crate::{
-                    batch::ProduceRequestBatcher,
-                    gcs::{
-                        limit::PutRateLimiter,
-                        retry::{BUCKET_RAMP_RETRY, OBJECT_CAP_RETRY, RetrySplit},
-                    },
-                };
+                use crate::gcs::limit::PutRateLimiter;
+                use crate::gcs::retry::{BUCKET_RAMP_RETRY, OBJECT_CAP_RETRY, RetrySplit};
 
                 let bucket_name = self.storage.host_str().unwrap_or("tansu");
 
@@ -2655,7 +2662,7 @@ impl Builder<i32, String, Url, Url> {
                         .build()
                 };
 
-                client(BUCKET_RAMP_RETRY)
+                let engine = client(BUCKET_RAMP_RETRY)
                     .and_then(|bucket_ramp| {
                         client(OBJECT_CAP_RETRY)
                             .map(|object_cap| RetrySplit::new(bucket_ramp, object_cap))
@@ -2669,25 +2676,9 @@ impl Builder<i32, String, Url, Url> {
                             // (#518).
                             .with_delete_concurrency(delete_concurrency(&self.storage))
                     })
-                    .map(|object_store| {
-                        DynoStore::new(self.cluster_id.as_str(), self.node_id, object_store)
-                            .advertised_listener(self.advertised_listener.clone())
-                            .auto_create(auto_topic_create(&self.storage))
-                            .topic_defaults(self.topic_defaults.clone())
-                            .coalesce_tuning(coalesce_tuning(&self.storage))
-                            .message_max_bytes(message_max_bytes(&self.storage))
-                    })
-                    .map_err(Error::from)?
-                    .conditional_put_probed(&self.storage)
-                    .await?
-                    .sealed_prefix_shape()
-                    .await
-                    .map(|storage| {
-                        ProduceRequestBatcher::new(storage)
-                            .with_minimum_size(minimum_size)
-                            .with_maximum_delay(maximum_delay)
-                    })
-                    .map(|storage| Arc::new(storage) as Arc<dyn Storage>)
+                    .map(|object_store| self.engine(object_store))
+                    .map_err(Error::from)?;
+                self.served(engine, minimum_size, maximum_delay).await
             }
 
             // Azure Data Lake Storage Gen2, hierarchical namespace on (#418).
@@ -2720,7 +2711,7 @@ impl Builder<i32, String, Url, Url> {
             Backend::Azure => {
                 use object_store::azure::MicrosoftAzureBuilder;
 
-                use crate::{azure::suffix::SuffixRange, batch::ProduceRequestBatcher};
+                use crate::azure::suffix::SuffixRange;
 
                 let minimum_size = batch_minimum_size(&self.storage);
                 let maximum_delay = batch_maximum_delay(&self.storage);
@@ -2734,7 +2725,7 @@ impl Builder<i32, String, Url, Url> {
                 // workload identity federation (`AZURE_FEDERATED_TOKEN_FILE`).
                 // The last is the AKS path, and the direct analogue of IRSA in
                 // the serverless roadmap (#364).
-                MicrosoftAzureBuilder::from_env()
+                let engine = MicrosoftAzureBuilder::from_env()
                     .with_url(self.storage.as_str())
                     // Azure throttles at the *account* and storage-partition
                     // level (`503 ServerBusy`, `500 OperationTimedOut`), not per
@@ -2769,46 +2760,22 @@ impl Builder<i32, String, Url, Url> {
                     // built on.
                     .build()
                     .map(SuffixRange::new)
-                    .map(|object_store| {
-                        DynoStore::new(self.cluster_id.as_str(), self.node_id, object_store)
-                            .advertised_listener(self.advertised_listener.clone())
-                            .auto_create(auto_topic_create(&self.storage))
-                            .topic_defaults(self.topic_defaults.clone())
-                            .coalesce_tuning(coalesce_tuning(&self.storage))
-                            .message_max_bytes(message_max_bytes(&self.storage))
-                    })
-                    .map_err(Error::from)?
-                    .conditional_put_probed(&self.storage)
-                    .await?
-                    .sealed_prefix_shape()
-                    .await
-                    .map(|storage| {
-                        ProduceRequestBatcher::new(storage)
-                            .with_minimum_size(minimum_size)
-                            .with_maximum_delay(maximum_delay)
-                    })
-                    .map(|storage| Arc::new(storage) as Arc<dyn Storage>)
+                    .map(|object_store| self.engine(object_store))
+                    .map_err(Error::from)?;
+                self.served(engine, minimum_size, maximum_delay).await
             }
 
             #[cfg(feature = "dynostore")]
             Backend::Memory => {
-                DynoStore::new(self.cluster_id.as_str(), self.node_id, InMemory::new())
-                    .advertised_listener(self.advertised_listener.clone())
-                    .auto_create(auto_topic_create(&self.storage))
-                    .topic_defaults(self.topic_defaults.clone())
-                    .coalesce_tuning(coalesce_tuning(&self.storage))
-                    .message_max_bytes(message_max_bytes(&self.storage))
-                    .sealed_prefix_shape()
-                    .await
-                    .map(|storage| Arc::new(storage) as Arc<dyn Storage>)
+                let sealed = self.engine(InMemory::new()).sealed_prefix_shape().await?;
+                Ok(Arc::new(sealed) as Arc<dyn Storage>)
             }
 
-            Backend::Null => Ok(null::Engine::new(
-                self.cluster_id.clone(),
-                self.node_id,
-                self.advertised_listener.clone(),
-            ))
-            .map(|storage| Arc::new(storage) as Arc<dyn Storage>),
+            Backend::Null => {
+                let listener = self.advertised_listener.clone();
+                let engine = null::Engine::new(self.cluster_id.clone(), self.node_id, listener);
+                Ok(Arc::new(engine) as Arc<dyn Storage>)
+            }
 
             // `file:///path/to/copy` is the offline audit's, and only the
             // audit's: a deployment already past the damage cannot be measured
@@ -2824,39 +2791,29 @@ impl Builder<i32, String, Url, Url> {
             }
         }?;
 
-        let pb = if self.silent {
-            None
-        } else {
-            let pb = ProgressBar::new(1);
-            pb.set_style(
-                ProgressStyle::with_template("[{elapsed}] {bar:40.cyan/blue} {msg}")
-                    .unwrap()
-                    .progress_chars("##-"),
-            );
-
-            pb.set_message("connecting to storage");
-
-            Some(pb)
-        };
+        let progress = (!self.silent).then(|| {
+            let style = ProgressStyle::with_template("[{elapsed}] {bar:40.cyan/blue} {msg}");
+            let connecting = ProgressBar::new(1);
+            connecting.set_style(style.unwrap().progress_chars("##-"));
+            connecting.set_message("connecting to storage");
+            connecting
+        });
 
         storage.ping().await?;
 
-        if let Some(pb) = pb {
-            pb.inc(1);
-            pb.finish_with_message(format!("{} connected to storage", Emoji("✅", ""),));
+        if let Some(connected) = progress {
+            connected.inc(1);
+            let done = Emoji("✅", "");
+            connected.finish_with_message(format!("{done} connected to storage"));
         }
-
         Ok(storage)
     }
 }
 
 pub(crate) static METER: LazyLock<Meter> = LazyLock::new(|| {
-    global::meter_with_scope(
-        InstrumentationScope::builder(env!("CARGO_PKG_NAME"))
-            .with_version(env!("CARGO_PKG_VERSION"))
-            .with_schema_url(SCHEMA_URL)
-            .build(),
-    )
+    let scope = InstrumentationScope::builder(env!("CARGO_PKG_NAME"));
+    let scope = scope.with_version(env!("CARGO_PKG_VERSION"));
+    global::meter_with_scope(scope.with_schema_url(SCHEMA_URL).build())
 });
 
 /// Requests parked in a long poll: waiting on a clock, not on this replica
