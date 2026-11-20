@@ -44,6 +44,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::{
@@ -57,7 +58,8 @@ use tansu_sans_io::{
     fetch_request::{FetchPartition, FetchTopic},
     record::{Record, deflated, inflated},
 };
-use tansu_storage::{DynoStore, FetchService, Storage, Topition};
+use tansu_storage::{DynoStore, FetchService, Topition};
+use tansu_storage::{LogStorage as _, MetadataStorage as _};
 use tokio::time::sleep;
 
 use crate::common::{Error, cluster_id, init_tracing};

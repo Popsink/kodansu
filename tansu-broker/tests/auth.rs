@@ -36,7 +36,7 @@ use tansu_sans_io::{SaslAuthenticateRequest, SaslAuthenticateResponse};
 use tansu_sans_io::{SaslHandshakeRequest, SaslHandshakeResponse, ScramMechanism};
 use tansu_service::FrameRouteService;
 use tansu_service::{BytesFrameLayer, BytesFrameService};
-use tansu_storage::{ScramCredential, Storage};
+use tansu_storage::ScramCredential;
 
 use crate::common::{init_tracing, storage_container};
 

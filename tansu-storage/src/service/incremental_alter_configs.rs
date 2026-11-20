@@ -20,7 +20,7 @@ use tansu_sans_io::{IncrementalAlterConfigsRequest, IncrementalAlterConfigsRespo
 use crate::Storage;
 use crate::{Error, Result};
 
-/// Hands each resource of the request to [`Storage::incremental_alter_resource`],
+/// Hands each resource of the request to [`crate::MetadataStorage::incremental_alter_resource`],
 /// answering with what the engine reports for each, in request order.
 /// ```
 /// use rama::layer::MapStateLayer;

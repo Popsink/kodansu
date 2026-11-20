@@ -20,6 +20,8 @@
 //! connection is reachable by anyone who can reach the port.
 
 use async_trait::async_trait;
+
+use crate::{LogStorage as _, MetadataStorage as _, TxnStorage as _};
 use futures::stream::BoxStream;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -33,7 +35,7 @@ use tansu_sans_io::{
 };
 
 use crate::{
-    Error, Result, Storage,
+    Error, Result,
     dynostore::{DynoStore, TopicMetadata, tests::init_tracing},
 };
 

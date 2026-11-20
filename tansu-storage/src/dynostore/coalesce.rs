@@ -216,7 +216,7 @@ impl DynoStore {
     /// idempotent sequence and schema were already validated by `produce`.
     ///
     /// Returns once the batch is in the buffer, which is what
-    /// [`Storage::admit`] promises (#588): buffer order is offset order, so a
+    /// [`LogStorage::admit`] promises (#588): buffer order is offset order, so a
     /// batch buffered after this call returns takes a later offset. A batch
     /// that fills the buffer closes the window and hands it to the prefix's
     /// flush queue (#590) rather than flushing it here, so the next batch

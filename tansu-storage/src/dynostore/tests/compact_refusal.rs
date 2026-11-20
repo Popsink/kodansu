@@ -26,13 +26,15 @@ use std::{
 };
 
 use object_store::{ObjectStoreExt as _, memory::InMemory, path::Path};
+
+use crate::MetadataStorage as _;
 use tansu_sans_io::{
     create_topics_request::{CreatableTopic, CreatableTopicConfig},
     record::{Record, deflated, inflated},
 };
 
 use crate::{
-    Result, Storage as _, Topition,
+    Result, Topition,
     dynostore::{
         CoalesceTuning, CompactRun, DynoStore, Substream,
         compaction::TilingBreak,

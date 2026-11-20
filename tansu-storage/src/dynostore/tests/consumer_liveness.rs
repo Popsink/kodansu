@@ -16,10 +16,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::GroupStorage as _;
+
 use object_store::memory::InMemory;
 
 use crate::{
-    ConsumerGroupDoc, Result, Storage,
+    ConsumerGroupDoc, Result,
     dynostore::{DynoStore, tests::init_tracing},
 };
 

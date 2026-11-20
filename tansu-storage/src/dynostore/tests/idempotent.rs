@@ -28,6 +28,8 @@
 //! by the checkpoint window. These tests pin both halves of that contract.
 
 use bytes::Bytes;
+
+use crate::{LogStorage as _, MetadataStorage as _, TxnStorage as _};
 use object_store::memory::InMemory;
 use tansu_sans_io::AddPartitionsToTxnRequest;
 use tansu_sans_io::{
@@ -36,7 +38,7 @@ use tansu_sans_io::{
 };
 
 use crate::{
-    Error, Result, Storage, Topition,
+    Error, Result, Topition,
     dynostore::{CoalesceTuning, CompactRun, DynoStore, Substream, tests::init_tracing},
 };
 

@@ -39,6 +39,8 @@
 //! upgrade rather than from nothing.
 
 use async_trait::async_trait;
+
+use crate::{LogStorage as _, MetadataStorage as _};
 use bytes::Bytes;
 use futures::stream::BoxStream;
 use object_store::{
@@ -56,7 +58,7 @@ use std::{
 use tansu_sans_io::{ErrorCode, create_topics_request::CreatableTopic};
 
 use crate::{
-    Error, OffsetCommitRequest, Result, Storage as _, TopicId, Topition,
+    Error, OffsetCommitRequest, Result, TopicId, Topition,
     dynostore::{DynoStore, tests::init_tracing},
 };
 

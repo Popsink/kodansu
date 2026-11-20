@@ -17,7 +17,7 @@
 use tansu_sans_io::{DescribeClusterRequest, DescribeClusterResponse};
 
 storage_service! {
-    /// Lists the brokers [`Storage::brokers`](crate::Storage::brokers) knows,
+    /// Lists the brokers [`MetadataStorage::brokers`](crate::MetadataStorage::brokers) knows,
     /// names the first as controller (`-1` if there is none) and echoes back
     /// the endpoint type the client asked about. Authorized operations are
     /// never computed, so they go back as Kafka's "not requested" sentinel,

@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use async_trait::async_trait;
+
+use crate::MetadataStorage as _;
 use futures::{StreamExt, stream::BoxStream};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -30,7 +32,7 @@ use tansu_sans_io::{ErrorCode, create_topics_request::CreatableTopic};
 use uuid::Uuid;
 
 use crate::{
-    Error, Result, Storage, TopicId,
+    Error, Result, TopicId,
     dynostore::{DynoStore, TopicMetadata, tests::init_tracing},
 };
 

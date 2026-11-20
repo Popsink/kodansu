@@ -15,6 +15,8 @@
 //! `DescribeGroups` over many groups (#240).
 
 use async_trait::async_trait;
+
+use crate::GroupStorage as _;
 use futures::stream::BoxStream;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -32,7 +34,7 @@ use tansu_sans_io::ErrorCode;
 use tokio::time::sleep;
 
 use crate::{
-    Error, GroupDetailResponse, Result, Storage,
+    Error, GroupDetailResponse, Result,
     dynostore::{DynoStore, tests::init_tracing},
 };
 

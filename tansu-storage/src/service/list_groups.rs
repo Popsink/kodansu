@@ -21,7 +21,7 @@ use super::handler::UNTHROTTLED;
 use crate::authorized;
 
 storage_service! {
-    /// Lists the groups [`Storage::list_groups`](crate::Storage::list_groups)
+    /// Lists the groups [`GroupStorage::list_groups`](crate::GroupStorage::list_groups)
     /// returns for the state filter, keeps those matching the type filter, and
     /// drops any the principal may not `Describe`.
     ///

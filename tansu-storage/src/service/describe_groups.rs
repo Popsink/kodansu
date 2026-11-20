@@ -18,7 +18,7 @@ use tansu_sans_io::describe_groups_response::DescribedGroup;
 use tansu_sans_io::{DescribeGroupsRequest, DescribeGroupsResponse};
 
 storage_service! {
-    /// Converts what [`Storage::describe_groups`](crate::Storage::describe_groups)
+    /// Converts what [`GroupStorage::describe_groups`](crate::GroupStorage::describe_groups)
     /// reports into the wire shape, one entry per requested group. A group
     /// nobody created is `Dead`, not an error (#445).
     ///

@@ -175,7 +175,7 @@ mod start_after {
 /// surviving records and serves them as though they were the ones asked for.
 ///
 /// Through `FetchService`, because that is where the check belongs and where it
-/// is: `Storage::fetch` answering an empty read for a position past the end is
+/// is: `LogStorage::fetch` answering an empty read for a position past the end is
 /// correct at its own level, and the storage-level tests above still assert it.
 mod out_of_range {
     use std::{sync::Arc, time::Duration};

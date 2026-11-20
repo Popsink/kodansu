@@ -146,11 +146,12 @@ use crate::{
     AclBinding, AclFilter, Acls, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
     BrokerRegistrationRequest, CommittedOffset, ConsumerGroupDoc, ConsumerGroupState,
     CorruptRegion, DivergentBatch, Error, GROUP_SCHEMA_VERSION, GenerationDoc, GroupDetail,
-    GroupMember, GroupSchema, GroupState, ListOffsetResponse, METER, MemberDoc, MetadataResponse,
-    NamedGroupDetail, OffsetCommitRequest, OffsetStage, ProducerIdResponse, QuotaAlteration,
-    QuotaEntity, QuotaFilterComponent, QuotaLimits, Quotas, Result, ScramCredential, Storage,
-    TopicDefaults, TopicId, Topition, TxnOffsetCommitRequest, TxnState, UpdateError, Version,
-    added_by_topic, storage_error_code, validation,
+    GroupMember, GroupSchema, GroupState, GroupStorage, ListOffsetResponse, LogStorage, METER,
+    MemberDoc, MetadataResponse, MetadataStorage, NamedGroupDetail, OffsetCommitRequest,
+    OffsetStage, PrincipalStorage, ProducerIdResponse, QuotaAlteration, QuotaEntity,
+    QuotaFilterComponent, QuotaLimits, Quotas, Result, ScramCredential, TopicDefaults, TopicId,
+    Topition, TxnOffsetCommitRequest, TxnState, TxnStorage, UpdateError, Version, added_by_topic,
+    storage_error_code, validation,
 };
 
 const APPLICATION_JSON: &str = "application/json";

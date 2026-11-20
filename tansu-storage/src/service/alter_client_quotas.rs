@@ -224,6 +224,8 @@ mod tests {
     use tansu_sans_io::alter_client_quotas_request::OpData;
 
     use super::*;
+
+    use crate::PrincipalStorage as _;
     use crate::{PRODUCER_BYTE_RATE, Quotas, Result, dynostore::DynoStore};
 
     fn storage() -> DynoStore {

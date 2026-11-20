@@ -25,6 +25,8 @@ use std::{
 };
 
 use async_trait::async_trait;
+
+use crate::{GroupStorage as _, LogStorage as _, MetadataStorage as _, PrincipalStorage as _};
 use bytes::Bytes;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
@@ -41,8 +43,7 @@ use tansu_sans_io::{acl, resource};
 use crate::{
     AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, ConsumerGroupState, Error,
     GROUP_SCHEMA_VERSION, GenerationDoc, GroupDetail, GroupDetailResponse, GroupSchema, MemberDoc,
-    MemberRef, NamedGroupDetail, OffsetCommitRequest, Result, Storage, Topition, UpdateError,
-    WILDCARD_HOST,
+    MemberRef, NamedGroupDetail, OffsetCommitRequest, Result, Topition, UpdateError, WILDCARD_HOST,
     dynostore::{
         DynoStore,
         tests::{init_tracing, legacy_group_exists, seed_legacy_group},

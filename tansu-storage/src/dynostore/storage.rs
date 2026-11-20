@@ -21,7 +21,7 @@ use super::*;
 use crate::ContactStamps;
 
 #[async_trait]
-impl Storage for DynoStore {
+impl MetadataStorage for DynoStore {
     async fn register_broker(&self, _broker_registration: BrokerRegistrationRequest) -> Result<()> {
         // Idempotent, concurrency-safe backfill of any legacy monolithic topic
         // metadata into per-topic objects on first boot of this version.
@@ -37,10 +37,6 @@ impl Storage for DynoStore {
 
     fn auto_create_topic_config(&self) -> AutoTopicCreate {
         self.tuning.auto_create
-    }
-
-    fn fetch_max_bytes(&self) -> u32 {
-        self.tuning.fetch_max_bytes
     }
 
     async fn incremental_alter_resource(
@@ -195,6 +191,278 @@ impl Storage for DynoStore {
                 .port(port)
                 .rack(rack),
         ])
+    }
+
+    async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
+        self.metadata_response(topics).await
+    }
+
+    async fn describe_config(
+        &self,
+        name: &str,
+        resource: ConfigResource,
+        _keys: Option<&[String]>,
+    ) -> Result<DescribeConfigsResult> {
+        match resource {
+            // Deliberately the authoritative per-topic read, not the
+            // index-served `described_topic_metadata` (#387): `topic_is_compacted`
+            // reads through here to derive a routing prefix for a pre-#236 topic,
+            // and that derivation is pinned create-only and permanently. A stale
+            // `cleanup.policy` would route a topic's new records to a prefix its
+            // existing segments are not under — unreachable data, not a stale
+            // answer. Admin-rate plus a memoized derivation, so the request it
+            // costs is not part of the plane #387 removed.
+            ConfigResource::Topic => match self.topic_metadata(&TopicId::Name(name.into())).await {
+                Ok(Some(topic_metadata)) => {
+                    let error_code = ErrorCode::None;
+
+                    Ok(DescribeConfigsResult::default()
+                        .error_code(error_code.into())
+                        .error_message(Some(error_code.to_string()))
+                        .resource_type(i8::from(resource))
+                        .resource_name(name.into())
+                        .configs(topic_metadata.topic.configs.map(|configs| {
+                            configs
+                                .iter()
+                                .map(|config| {
+                                    DescribeConfigsResourceResult::default()
+                                        .name(config.name.clone())
+                                        .value(config.value.clone())
+                                        .read_only(false)
+                                        .is_default(None)
+                                        .config_source(Some(ConfigSource::DefaultConfig.into()))
+                                        .is_sensitive(false)
+                                        .synonyms(Some([].into()))
+                                        .config_type(Some(ConfigType::String.into()))
+                                        .documentation(Some("".into()))
+                                })
+                                .collect()
+                        })))
+                }
+
+                // A topic that does not exist is said not to exist (#579). An
+                // empty `ok` made `DescribeConfigs` an existence check that
+                // always answered yes, so tooling that probes a topic this way —
+                // rather than through `Metadata`, which does not auto-create —
+                // saw every name it asked about as a real topic with no config.
+                //
+                // `topic_is_compacted` reads through this arm on a produce or
+                // fetch whose memo has expired, and reads only `configs`: an
+                // absent topic has no `cleanup.policy` either way, so the code
+                // change does not move a routing verdict.
+                Ok(None) => Ok(DescribeConfigsResult::default()
+                    .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                    .error_message(Some(ErrorCode::UnknownTopicOrPartition.to_string()))
+                    .resource_type(i8::from(resource))
+                    .resource_name(name.into())
+                    .configs(Some(vec![]))),
+
+                // Not an admin-only path: `topic_is_compacted` calls this, and
+                // it runs on produce and fetch via `routed_prefix_of` whenever
+                // the memo misses (first use of a topic in a process, or TTL
+                // expiry). So any transient object-store error while reading
+                // topic metadata reached this arm, and transient storage errors
+                // are routine.
+                //
+                // Propagate rather than panic, and rather than guessing a
+                // routing verdict: `topic_is_compacted` already has a `?`, and
+                // the storage error then classifies retriable (#275) instead of
+                // taking the request task down (#276). Answering "not
+                // compacted" on a failed read would be the other option, but
+                // routing is pinned create-only (#236) and a wrong pin is
+                // permanent — not a guess worth making on a blip.
+                Err(err) => Err(err),
+            },
+
+            _ => Ok(DescribeConfigsResult::default()
+                .error_code(ErrorCode::None.into())
+                .error_message(Some(ErrorCode::None.to_string()))
+                .resource_type(i8::from(resource))
+                .resource_name(name.into())
+                .configs(Some(vec![]))),
+        }
+    }
+
+    async fn describe_topic_partitions(
+        &self,
+        topics: Option<&[TopicId]>,
+        partition_limit: i32,
+        cursor: Option<Topition>,
+    ) -> Result<Vec<DescribeTopicPartitionsResponseTopic>> {
+        let _ = (partition_limit, cursor);
+
+        let mut responses =
+            Vec::with_capacity(topics.map(|topics| topics.len()).unwrap_or_default());
+
+        // One refresh, then every topic below is described from the index (#387).
+        self.refresh_index_for_described_reads("describe_topic_partitions")
+            .await;
+
+        for topic in topics.unwrap_or_default() {
+            match self
+                .described_topic_metadata(topic, "describe_topic_partitions")
+                .await
+                .inspect_err(|error| error!(?error))
+            {
+                Ok(Some(topic_metadata)) => responses.push(
+                    DescribeTopicPartitionsResponseTopic::default()
+                        .error_code(ErrorCode::None.into())
+                        .name(Some(topic_metadata.topic.name))
+                        .topic_id(topic_metadata.id.into_bytes())
+                        .is_internal(false)
+                        .partitions(Some(
+                            (0..topic_metadata.topic.num_partitions)
+                                .map(|partition_index| {
+                                    DescribeTopicPartitionsResponsePartition::default()
+                                        .error_code(ErrorCode::None.into())
+                                        .partition_index(partition_index)
+                                        .leader_id(self.identity.node)
+                                        .leader_epoch(0)
+                                        .replica_nodes(Some(vec![
+                                            self.identity.node;
+                                            topic_metadata.topic.replication_factor
+                                                as usize
+                                        ]))
+                                        .isr_nodes(Some(vec![
+                                            self.identity.node;
+                                            topic_metadata.topic.replication_factor
+                                                as usize
+                                        ]))
+                                        .eligible_leader_replicas(Some(vec![]))
+                                        .last_known_elr(Some(vec![]))
+                                        .offline_replicas(Some(vec![]))
+                                })
+                                .collect(),
+                        ))
+                        .topic_authorized_operations(-2147483648),
+                ),
+
+                Ok(None) => responses.push(
+                    DescribeTopicPartitionsResponseTopic::default()
+                        .error_code(ErrorCode::UnknownTopicOrPartition.into())
+                        .name(match topic {
+                            TopicId::Name(name) => Some(name.into()),
+                            TopicId::Id(_) => None,
+                        })
+                        .topic_id(match topic {
+                            TopicId::Name(_) => NULL_TOPIC_ID,
+                            TopicId::Id(id) => id.into_bytes(),
+                        })
+                        .is_internal(false)
+                        .partitions(Some([].into()))
+                        .topic_authorized_operations(-2147483648),
+                ),
+
+                Err(_) => responses.push(
+                    DescribeTopicPartitionsResponseTopic::default()
+                        .error_code(ErrorCode::UnknownServerError.into())
+                        .name(match topic {
+                            TopicId::Name(name) => Some(name.into()),
+                            TopicId::Id(_) => None,
+                        })
+                        .topic_id(match topic {
+                            TopicId::Name(_) => NULL_TOPIC_ID,
+                            TopicId::Id(id) => id.into_bytes(),
+                        })
+                        .is_internal(false)
+                        .partitions(Some([].into()))
+                        .topic_authorized_operations(-2147483648),
+                ),
+            }
+        }
+
+        Ok(responses)
+    }
+
+    async fn maintain(&self, now: SystemTime) -> Result<()> {
+        let now_ms = i64::try_from(
+            now.duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(i64::MAX);
+
+        // Claim this tick's prefix-segment maintenance work-set once (#126),
+        // stateless and coordinator-free: N maintainer replicas partition the
+        // prefixes by first-arrival on the per-prefix lease + a recency stamp,
+        // so retention and compaction of a prefix run under one claim (one
+        // discovery LIST, not one per pass per replica). `None` when prefix
+        // coalescing is off = today's every-prefix behaviour.
+        let owned = self.claim_maintenance_prefixes(now_ms).await?;
+        let owned = Some(&owned);
+
+        // Retention and segment compaction per prefix, interleaved and
+        // concurrent (#140) — not two whole sequential passes, where a delete
+        // backlog consumed the bounded run (#131) before compaction ever ran.
+        // The per-partition legacy `records/` pass that used to run first went
+        // with that layout (#179).
+        let (deleted_segments, compacted_segments) =
+            self.maintain_prefix_segments(now_ms, owned).await?;
+        let (expired_groups, reclaimed_members) = self.expire_groups(now).await?;
+
+        // Converge the per-topic caches of topics another replica deleted (#283).
+        // Not `?`: this is memory hygiene, and a failed topic listing must not
+        // cost the pass its retention and compaction — the next tick retries.
+        let evicted_topics = self
+            .evict_deleted_topic_caches()
+            .await
+            .inspect_err(|err| warn!(?err, "could not evict deleted-topic caches"))
+            .unwrap_or_default();
+
+        // Per-cache occupancy (#554), on the same tick and for the same reason as
+        // the topic-cache gauges above: the resident-memory work (#476, #543)
+        // keeps landing on these maps and could not name which one.
+        //
+        // Kept here as well as on the index walk that records it everywhere
+        // (#573): a tick whose topic listing failed still has to report what this
+        // process holds, and that listing is the one thing above that is
+        // deliberately not `?`.
+        self.record_cache_occupancy();
+
+        // Measurement only (#283): a failure here must not cost this replica its
+        // retention and compaction, which is why it is not `?`.
+        let meta = self
+            .measure_meta()
+            .await
+            .inspect_err(|err| debug!(?err, "could not measure meta.json"))
+            .ok();
+
+        debug!(
+            deleted_segments,
+            compacted_segments,
+            expired_groups,
+            reclaimed_members,
+            evicted_topics,
+            ?meta
+        );
+
+        Ok(())
+    }
+
+    async fn cluster_id(&self) -> Result<String> {
+        Ok(self.identity.cluster.clone())
+    }
+
+    async fn node(&self) -> Result<i32> {
+        Ok(self.identity.node)
+    }
+
+    async fn advertised_listener(&self) -> Result<Url> {
+        Ok(self.identity.advertised_listener.clone())
+    }
+
+    #[instrument(skip_all)]
+    async fn ping(&self) -> Result<()> {
+        // Verify connectivity by listing objects at the root
+        let _ = self.scan(Scan::Ping, &Path::from("/")).next().await;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl LogStorage for DynoStore {
+    fn fetch_max_bytes(&self) -> u32 {
+        self.tuning.fetch_max_bytes
     }
 
     async fn produce(
@@ -986,188 +1254,10 @@ impl Storage for DynoStore {
 
         Ok(responses)
     }
+}
 
-    async fn metadata(&self, topics: Option<&[TopicId]>) -> Result<MetadataResponse> {
-        self.metadata_response(topics).await
-    }
-
-    async fn describe_config(
-        &self,
-        name: &str,
-        resource: ConfigResource,
-        _keys: Option<&[String]>,
-    ) -> Result<DescribeConfigsResult> {
-        match resource {
-            // Deliberately the authoritative per-topic read, not the
-            // index-served `described_topic_metadata` (#387): `topic_is_compacted`
-            // reads through here to derive a routing prefix for a pre-#236 topic,
-            // and that derivation is pinned create-only and permanently. A stale
-            // `cleanup.policy` would route a topic's new records to a prefix its
-            // existing segments are not under — unreachable data, not a stale
-            // answer. Admin-rate plus a memoized derivation, so the request it
-            // costs is not part of the plane #387 removed.
-            ConfigResource::Topic => match self.topic_metadata(&TopicId::Name(name.into())).await {
-                Ok(Some(topic_metadata)) => {
-                    let error_code = ErrorCode::None;
-
-                    Ok(DescribeConfigsResult::default()
-                        .error_code(error_code.into())
-                        .error_message(Some(error_code.to_string()))
-                        .resource_type(i8::from(resource))
-                        .resource_name(name.into())
-                        .configs(topic_metadata.topic.configs.map(|configs| {
-                            configs
-                                .iter()
-                                .map(|config| {
-                                    DescribeConfigsResourceResult::default()
-                                        .name(config.name.clone())
-                                        .value(config.value.clone())
-                                        .read_only(false)
-                                        .is_default(None)
-                                        .config_source(Some(ConfigSource::DefaultConfig.into()))
-                                        .is_sensitive(false)
-                                        .synonyms(Some([].into()))
-                                        .config_type(Some(ConfigType::String.into()))
-                                        .documentation(Some("".into()))
-                                })
-                                .collect()
-                        })))
-                }
-
-                // A topic that does not exist is said not to exist (#579). An
-                // empty `ok` made `DescribeConfigs` an existence check that
-                // always answered yes, so tooling that probes a topic this way —
-                // rather than through `Metadata`, which does not auto-create —
-                // saw every name it asked about as a real topic with no config.
-                //
-                // `topic_is_compacted` reads through this arm on a produce or
-                // fetch whose memo has expired, and reads only `configs`: an
-                // absent topic has no `cleanup.policy` either way, so the code
-                // change does not move a routing verdict.
-                Ok(None) => Ok(DescribeConfigsResult::default()
-                    .error_code(ErrorCode::UnknownTopicOrPartition.into())
-                    .error_message(Some(ErrorCode::UnknownTopicOrPartition.to_string()))
-                    .resource_type(i8::from(resource))
-                    .resource_name(name.into())
-                    .configs(Some(vec![]))),
-
-                // Not an admin-only path: `topic_is_compacted` calls this, and
-                // it runs on produce and fetch via `routed_prefix_of` whenever
-                // the memo misses (first use of a topic in a process, or TTL
-                // expiry). So any transient object-store error while reading
-                // topic metadata reached this arm, and transient storage errors
-                // are routine.
-                //
-                // Propagate rather than panic, and rather than guessing a
-                // routing verdict: `topic_is_compacted` already has a `?`, and
-                // the storage error then classifies retriable (#275) instead of
-                // taking the request task down (#276). Answering "not
-                // compacted" on a failed read would be the other option, but
-                // routing is pinned create-only (#236) and a wrong pin is
-                // permanent — not a guess worth making on a blip.
-                Err(err) => Err(err),
-            },
-
-            _ => Ok(DescribeConfigsResult::default()
-                .error_code(ErrorCode::None.into())
-                .error_message(Some(ErrorCode::None.to_string()))
-                .resource_type(i8::from(resource))
-                .resource_name(name.into())
-                .configs(Some(vec![]))),
-        }
-    }
-
-    async fn describe_topic_partitions(
-        &self,
-        topics: Option<&[TopicId]>,
-        partition_limit: i32,
-        cursor: Option<Topition>,
-    ) -> Result<Vec<DescribeTopicPartitionsResponseTopic>> {
-        let _ = (partition_limit, cursor);
-
-        let mut responses =
-            Vec::with_capacity(topics.map(|topics| topics.len()).unwrap_or_default());
-
-        // One refresh, then every topic below is described from the index (#387).
-        self.refresh_index_for_described_reads("describe_topic_partitions")
-            .await;
-
-        for topic in topics.unwrap_or_default() {
-            match self
-                .described_topic_metadata(topic, "describe_topic_partitions")
-                .await
-                .inspect_err(|error| error!(?error))
-            {
-                Ok(Some(topic_metadata)) => responses.push(
-                    DescribeTopicPartitionsResponseTopic::default()
-                        .error_code(ErrorCode::None.into())
-                        .name(Some(topic_metadata.topic.name))
-                        .topic_id(topic_metadata.id.into_bytes())
-                        .is_internal(false)
-                        .partitions(Some(
-                            (0..topic_metadata.topic.num_partitions)
-                                .map(|partition_index| {
-                                    DescribeTopicPartitionsResponsePartition::default()
-                                        .error_code(ErrorCode::None.into())
-                                        .partition_index(partition_index)
-                                        .leader_id(self.identity.node)
-                                        .leader_epoch(0)
-                                        .replica_nodes(Some(vec![
-                                            self.identity.node;
-                                            topic_metadata.topic.replication_factor
-                                                as usize
-                                        ]))
-                                        .isr_nodes(Some(vec![
-                                            self.identity.node;
-                                            topic_metadata.topic.replication_factor
-                                                as usize
-                                        ]))
-                                        .eligible_leader_replicas(Some(vec![]))
-                                        .last_known_elr(Some(vec![]))
-                                        .offline_replicas(Some(vec![]))
-                                })
-                                .collect(),
-                        ))
-                        .topic_authorized_operations(-2147483648),
-                ),
-
-                Ok(None) => responses.push(
-                    DescribeTopicPartitionsResponseTopic::default()
-                        .error_code(ErrorCode::UnknownTopicOrPartition.into())
-                        .name(match topic {
-                            TopicId::Name(name) => Some(name.into()),
-                            TopicId::Id(_) => None,
-                        })
-                        .topic_id(match topic {
-                            TopicId::Name(_) => NULL_TOPIC_ID,
-                            TopicId::Id(id) => id.into_bytes(),
-                        })
-                        .is_internal(false)
-                        .partitions(Some([].into()))
-                        .topic_authorized_operations(-2147483648),
-                ),
-
-                Err(_) => responses.push(
-                    DescribeTopicPartitionsResponseTopic::default()
-                        .error_code(ErrorCode::UnknownServerError.into())
-                        .name(match topic {
-                            TopicId::Name(name) => Some(name.into()),
-                            TopicId::Id(_) => None,
-                        })
-                        .topic_id(match topic {
-                            TopicId::Name(_) => NULL_TOPIC_ID,
-                            TopicId::Id(id) => id.into_bytes(),
-                        })
-                        .is_internal(false)
-                        .partitions(Some([].into()))
-                        .topic_authorized_operations(-2147483648),
-                ),
-            }
-        }
-
-        Ok(responses)
-    }
-
+#[async_trait]
+impl GroupStorage for DynoStore {
     /// Every group in the cluster, optionally filtered by state.
     ///
     /// A group is whatever owns something under the consumer root: a `{group}/`
@@ -1861,114 +1951,6 @@ impl Storage for DynoStore {
         Ok(deleted.len() as u64)
     }
 
-    async fn create_acls(&self, bindings: &[AclBinding]) -> Result<Vec<ErrorCode>> {
-        // Every creation reports `None`: a rule that is already there is not a
-        // failure. `kafka-acls.sh` is run from configuration management, so
-        // re-applying the same file must not start reporting errors on the
-        // second run.
-        let outcome = vec![ErrorCode::None; bindings.len()];
-
-        if bindings.is_empty() {
-            return Ok(outcome);
-        }
-
-        self.update_acls(|acls| {
-            for binding in bindings {
-                _ = acls.bindings.insert(binding.clone());
-            }
-        })
-        .await
-        .map(|()| outcome)
-    }
-
-    async fn describe_acls(&self, filter: &AclFilter) -> Result<Vec<AclBinding>> {
-        self.read_acls()
-            .await
-            .map(|(acls, _)| acls.matching(filter).cloned().collect())
-    }
-
-    async fn delete_acls(&self, filters: &[AclFilter]) -> Result<Vec<Vec<AclBinding>>> {
-        if filters.is_empty() {
-            return Ok(vec![]);
-        }
-
-        // Decided inside the CAS, not before it: a filter evaluated against a
-        // snapshot that then lost the race would report deleting rules another
-        // writer had already removed, or miss ones it had just added.
-        let mut deleted = vec![];
-
-        self.update_acls(|acls| {
-            deleted = filters
-                .iter()
-                .map(|filter| {
-                    let selected = acls.matching(filter).cloned().collect::<Vec<_>>();
-
-                    for binding in &selected {
-                        _ = acls.bindings.remove(binding);
-                    }
-
-                    selected
-                })
-                .collect();
-        })
-        .await
-        .map(|()| deleted)
-    }
-
-    async fn alter_client_quotas(
-        &self,
-        alterations: &[QuotaAlteration],
-        validate_only: bool,
-    ) -> Result<Vec<ErrorCode>> {
-        // Validated against the current document before anything is written,
-        // so that a request naming a key this broker does not enforce is
-        // refused whole rather than half-applied — and so `validate_only` is
-        // the same check without the write, rather than a second
-        // implementation of it that can drift from the first.
-        let mut proposed = self.read_quotas().await.map(|(quotas, _)| quotas)?;
-
-        let outcomes = alterations
-            .iter()
-            .map(|alteration| match proposed.alter(alteration) {
-                Ok(()) => ErrorCode::None,
-
-                Err(error) => {
-                    warn!(?alteration, %error, "refusing a quota alteration");
-                    ErrorCode::InvalidConfig
-                }
-            })
-            .collect::<Vec<_>>();
-
-        if !validate_only && outcomes.contains(&ErrorCode::None) {
-            self.update_quotas(|quotas| {
-                for alteration in alterations {
-                    // Re-applied against whatever document won the CAS, and the
-                    // refusals above stay refused: a key this broker cannot
-                    // enforce does not become enforceable by another writer
-                    // having landed first.
-                    _ = quotas.alter(alteration);
-                }
-            })
-            .await?;
-        }
-
-        Ok(outcomes)
-    }
-
-    async fn describe_client_quotas(
-        &self,
-        components: &[QuotaFilterComponent],
-        strict: bool,
-    ) -> Result<Vec<(QuotaEntity, QuotaLimits)>> {
-        self.read_quotas()
-            .await
-            .map(|(quotas, _)| quotas.matching(components, strict))
-    }
-
-    async fn client_quotas(&self) -> Result<Quotas> {
-        self.read_quotas().await.map(|(quotas, _)| quotas)
-    }
-
     async fn assert_group_schema(&self) -> Result<()> {
         let location = Path::from(format!(
             "clusters/{}/schema/groups.json",
@@ -2054,7 +2036,10 @@ impl Storage for DynoStore {
             Err(error) => Err(error),
         }
     }
+}
 
+#[async_trait]
+impl TxnStorage for DynoStore {
     async fn init_producer(
         &self,
         transaction_id: Option<&str>,
@@ -2176,82 +2161,116 @@ impl Storage for DynoStore {
         self.end_txn(transaction_id, producer_id, producer_epoch, committed)
             .await
     }
+}
 
-    async fn maintain(&self, now: SystemTime) -> Result<()> {
-        let now_ms = i64::try_from(
-            now.duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
-        )
-        .unwrap_or(i64::MAX);
+#[async_trait]
+impl PrincipalStorage for DynoStore {
+    async fn create_acls(&self, bindings: &[AclBinding]) -> Result<Vec<ErrorCode>> {
+        // Every creation reports `None`: a rule that is already there is not a
+        // failure. `kafka-acls.sh` is run from configuration management, so
+        // re-applying the same file must not start reporting errors on the
+        // second run.
+        let outcome = vec![ErrorCode::None; bindings.len()];
 
-        // Claim this tick's prefix-segment maintenance work-set once (#126),
-        // stateless and coordinator-free: N maintainer replicas partition the
-        // prefixes by first-arrival on the per-prefix lease + a recency stamp,
-        // so retention and compaction of a prefix run under one claim (one
-        // discovery LIST, not one per pass per replica). `None` when prefix
-        // coalescing is off = today's every-prefix behaviour.
-        let owned = self.claim_maintenance_prefixes(now_ms).await?;
-        let owned = Some(&owned);
+        if bindings.is_empty() {
+            return Ok(outcome);
+        }
 
-        // Retention and segment compaction per prefix, interleaved and
-        // concurrent (#140) — not two whole sequential passes, where a delete
-        // backlog consumed the bounded run (#131) before compaction ever ran.
-        // The per-partition legacy `records/` pass that used to run first went
-        // with that layout (#179).
-        let (deleted_segments, compacted_segments) =
-            self.maintain_prefix_segments(now_ms, owned).await?;
-        let (expired_groups, reclaimed_members) = self.expire_groups(now).await?;
+        self.update_acls(|acls| {
+            for binding in bindings {
+                _ = acls.bindings.insert(binding.clone());
+            }
+        })
+        .await
+        .map(|()| outcome)
+    }
 
-        // Converge the per-topic caches of topics another replica deleted (#283).
-        // Not `?`: this is memory hygiene, and a failed topic listing must not
-        // cost the pass its retention and compaction — the next tick retries.
-        let evicted_topics = self
-            .evict_deleted_topic_caches()
+    async fn describe_acls(&self, filter: &AclFilter) -> Result<Vec<AclBinding>> {
+        self.read_acls()
             .await
-            .inspect_err(|err| warn!(?err, "could not evict deleted-topic caches"))
-            .unwrap_or_default();
+            .map(|(acls, _)| acls.matching(filter).cloned().collect())
+    }
 
-        // Per-cache occupancy (#554), on the same tick and for the same reason as
-        // the topic-cache gauges above: the resident-memory work (#476, #543)
-        // keeps landing on these maps and could not name which one.
-        //
-        // Kept here as well as on the index walk that records it everywhere
-        // (#573): a tick whose topic listing failed still has to report what this
-        // process holds, and that listing is the one thing above that is
-        // deliberately not `?`.
-        self.record_cache_occupancy();
+    async fn delete_acls(&self, filters: &[AclFilter]) -> Result<Vec<Vec<AclBinding>>> {
+        if filters.is_empty() {
+            return Ok(vec![]);
+        }
 
-        // Measurement only (#283): a failure here must not cost this replica its
-        // retention and compaction, which is why it is not `?`.
-        let meta = self
-            .measure_meta()
+        // Decided inside the CAS, not before it: a filter evaluated against a
+        // snapshot that then lost the race would report deleting rules another
+        // writer had already removed, or miss ones it had just added.
+        let mut deleted = vec![];
+
+        self.update_acls(|acls| {
+            deleted = filters
+                .iter()
+                .map(|filter| {
+                    let selected = acls.matching(filter).cloned().collect::<Vec<_>>();
+
+                    for binding in &selected {
+                        _ = acls.bindings.remove(binding);
+                    }
+
+                    selected
+                })
+                .collect();
+        })
+        .await
+        .map(|()| deleted)
+    }
+
+    async fn alter_client_quotas(
+        &self,
+        alterations: &[QuotaAlteration],
+        validate_only: bool,
+    ) -> Result<Vec<ErrorCode>> {
+        // Validated against the current document before anything is written,
+        // so that a request naming a key this broker does not enforce is
+        // refused whole rather than half-applied — and so `validate_only` is
+        // the same check without the write, rather than a second
+        // implementation of it that can drift from the first.
+        let mut proposed = self.read_quotas().await.map(|(quotas, _)| quotas)?;
+
+        let outcomes = alterations
+            .iter()
+            .map(|alteration| match proposed.alter(alteration) {
+                Ok(()) => ErrorCode::None,
+
+                Err(error) => {
+                    warn!(?alteration, %error, "refusing a quota alteration");
+                    ErrorCode::InvalidConfig
+                }
+            })
+            .collect::<Vec<_>>();
+
+        if !validate_only && outcomes.contains(&ErrorCode::None) {
+            self.update_quotas(|quotas| {
+                for alteration in alterations {
+                    // Re-applied against whatever document won the CAS, and the
+                    // refusals above stay refused: a key this broker cannot
+                    // enforce does not become enforceable by another writer
+                    // having landed first.
+                    _ = quotas.alter(alteration);
+                }
+            })
+            .await?;
+        }
+
+        Ok(outcomes)
+    }
+
+    async fn describe_client_quotas(
+        &self,
+        components: &[QuotaFilterComponent],
+        strict: bool,
+    ) -> Result<Vec<(QuotaEntity, QuotaLimits)>> {
+        self.read_quotas()
             .await
-            .inspect_err(|err| debug!(?err, "could not measure meta.json"))
-            .ok();
-
-        debug!(
-            deleted_segments,
-            compacted_segments,
-            expired_groups,
-            reclaimed_members,
-            evicted_topics,
-            ?meta
-        );
-
-        Ok(())
+            .map(|(quotas, _)| quotas.matching(components, strict))
     }
 
-    async fn cluster_id(&self) -> Result<String> {
-        Ok(self.identity.cluster.clone())
-    }
-
-    async fn node(&self) -> Result<i32> {
-        Ok(self.identity.node)
-    }
-
-    async fn advertised_listener(&self) -> Result<Url> {
-        Ok(self.identity.advertised_listener.clone())
+    async fn client_quotas(&self) -> Result<Quotas> {
+        self.read_quotas().await.map(|(quotas, _)| quotas)
     }
 
     /// Deleting a credential nobody has is not a failure.
@@ -2328,13 +2347,6 @@ impl Storage for DynoStore {
                 .await,
         )
         .map(|found| found.map(|(credential, _version)| credential))
-    }
-
-    #[instrument(skip_all)]
-    async fn ping(&self) -> Result<()> {
-        // Verify connectivity by listing objects at the root
-        let _ = self.scan(Scan::Ping, &Path::from("/")).next().await;
-        Ok(())
     }
 }
 

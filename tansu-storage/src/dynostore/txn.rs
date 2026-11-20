@@ -47,7 +47,7 @@ impl DynoStore {
 
         Ok(responses)
     }
-    /// The body of [`Storage::txn_end`]: fence the producer, then write the
+    /// The body of [`TxnStorage::txn_end`]: fence the producer, then write the
     /// commit or abort marker into every partition the transaction added.
     pub(super) async fn end_txn(
         &self,
@@ -300,7 +300,7 @@ impl DynoStore {
         Ok(ErrorCode::None)
     }
 
-    /// The body of [`Storage::init_producer`]: allocate or bump a producer
+    /// The body of [`TxnStorage::init_producer`]: allocate or bump a producer
     /// epoch, rolling back any transaction the previous epoch left open.
     pub(super) async fn init_producer_id(
         &self,
@@ -514,7 +514,7 @@ impl DynoStore {
         }
     }
 
-    /// The body of [`Storage::txn_add_partitions`], over both shapes of the
+    /// The body of [`TxnStorage::txn_add_partitions`], over both shapes of the
     /// request: the below-v4 one that names a single transaction and the v4+
     /// one that batches several.
     pub(super) async fn add_txn_partitions(

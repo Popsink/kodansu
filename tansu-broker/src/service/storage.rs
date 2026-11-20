@@ -538,7 +538,7 @@ where
 
 /// `EndTxn` (api key 26): commit or abort a transaction.
 ///
-/// Absent until #441. [`Storage::txn_end`] was implemented and tested, but with
+/// Absent until #441. [`TxnStorage::txn_end`] was implemented and tested, but with
 /// no route the API was not advertised — so `commit_transaction` and
 /// `abort_transaction` both failed `_UNSUPPORTED_FEATURE` on a client that the
 /// *other* four transaction APIs had already let write records. The route is

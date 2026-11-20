@@ -26,6 +26,8 @@
 
 use std::time::Duration;
 
+use crate::{LogStorage as _, MetadataStorage as _};
+
 use bytes::Bytes;
 use object_store::memory::InMemory;
 use rama::{Context, Service as _};
@@ -37,7 +39,7 @@ use tansu_sans_io::{
 };
 
 use crate::{
-    Result, Storage as _, Topition,
+    Result, Topition,
     dynostore::{CoalesceTuning, DynoStore, tests::init_tracing},
     service::FetchService,
 };

@@ -44,10 +44,11 @@ use crate::delegate::storage_methods;
 use crate::{
     Ack, AclBinding, AclFilter, AssignmentDoc, AssignmentOutcome, AutoTopicCreate,
     BrokerRegistrationRequest, CommittedOffset, ConsumerGroupDoc, ContactStamps, Error,
-    GenerationDoc, ListOffsetResponse, METER, MemberDoc, MetadataResponse, NamedGroupDetail,
-    OffsetCommitRequest, OffsetStage, ProducerIdResponse, QuotaAlteration, QuotaEntity,
-    QuotaFilterComponent, QuotaLimits, Quotas, Result, ScramCredential, Storage, TopicId, Topition,
-    TxnOffsetCommitRequest, UpdateError, Version,
+    GenerationDoc, GroupStorage, ListOffsetResponse, LogStorage, METER, MemberDoc,
+    MetadataResponse, MetadataStorage, NamedGroupDetail, OffsetCommitRequest, OffsetStage,
+    PrincipalStorage, ProducerIdResponse, QuotaAlteration, QuotaEntity, QuotaFilterComponent,
+    QuotaLimits, Quotas, Result, ScramCredential, Storage, TopicId, Topition,
+    TxnOffsetCommitRequest, TxnStorage, UpdateError, Version,
 };
 
 /// A counter called `name`.
@@ -413,12 +414,14 @@ macro_rules! batcher_body {
 /// Fifty-one of the fifty-three are `self.storage.m(args).await`, written out
 /// by hand until #551.
 macro_rules! batcher_delegation {
-    (
-        $(fn $name:ident(&$s:ident $(, $arg:ident : $ty:ty)* $(,)?) -> $ret:ty;)*
-        $(sync fn $sname:ident(&$ss:ident $(, $sarg:ident : $sty:ty)* $(,)?) -> $sret:ty;)*
-    ) => {
+    ($(
+        $trait:ident {
+            $(fn $name:ident(&$s:ident $(, $arg:ident : $ty:ty)* $(,)?) -> $ret:ty;)*
+            $(sync fn $sname:ident(&$ss:ident $(, $sarg:ident : $sty:ty)* $(,)?) -> $sret:ty;)*
+        }
+    )*) => {$(
         #[async_trait]
-        impl<G> Storage for ProduceRequestBatcher<G>
+        impl<G> $trait for ProduceRequestBatcher<G>
         where
             G: Storage + Clone,
         {
@@ -433,7 +436,7 @@ macro_rules! batcher_delegation {
                 }
             )*
         }
-    };
+    )*};
 }
 
 storage_methods!(batcher_delegation);
@@ -552,13 +555,15 @@ mod tests {
     }
 
     macro_rules! recorder_delegation {
-        (
-            $(fn $name:ident(&$s:ident $(, $arg:ident : $ty:ty)* $(,)?) -> $ret:ty;)*
-            $(sync fn $sname:ident(&$ss:ident $(, $sarg:ident : $sty:ty)* $(,)?) -> $sret:ty;)*
-        ) => {
+        ($(
+            $trait:ident {
+                $(fn $name:ident(&$s:ident $(, $arg:ident : $ty:ty)* $(,)?) -> $ret:ty;)*
+                $(sync fn $sname:ident(&$ss:ident $(, $sarg:ident : $sty:ty)* $(,)?) -> $sret:ty;)*
+            }
+        )*) => {$(
             #[async_trait]
             #[allow(unused_variables)]
-            impl Storage for FlightRecorder {
+            impl $trait for FlightRecorder {
                 $(
                     async fn $name(&$s $(, $arg: $ty)*) -> $ret {
                         recorder_body!($s, $name, ($($arg),*))
@@ -570,7 +575,7 @@ mod tests {
                     }
                 )*
             }
-        };
+        )*};
     }
 
     storage_methods!(recorder_delegation);

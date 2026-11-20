@@ -17,7 +17,7 @@
 use tansu_sans_io::{AddPartitionsToTxnRequest, AddPartitionsToTxnResponse};
 
 storage_service! {
-    /// Enlists the partitions through [`Storage::txn_add_partitions`](crate::Storage::txn_add_partitions).
+    /// Enlists the partitions through [`TxnStorage::txn_add_partitions`](crate::TxnStorage::txn_add_partitions).
     ///
     /// Version 4 reshaped the API: a client up to v3 sends one transaction and
     /// reads results by topic, a later one may batch several transactions and

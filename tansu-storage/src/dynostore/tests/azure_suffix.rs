@@ -34,6 +34,8 @@
 
 use std::time::Duration;
 
+use crate::{LogStorage as _, MetadataStorage as _};
+
 use bytes::Bytes;
 use object_store::memory::InMemory;
 use tansu_sans_io::{
@@ -43,7 +45,7 @@ use tansu_sans_io::{
 };
 
 use crate::{
-    Error, Result, Storage as _, Topition,
+    Error, Result, Topition,
     azure::suffix::{
         SuffixRange,
         reject::{Requests, SuffixRejecting},

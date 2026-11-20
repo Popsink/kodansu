@@ -17,7 +17,7 @@
 // it; with the module gone it belongs to the file.
 #![cfg(feature = "dynostore")]
 
-//! What `Storage::metadata` answers for no list, an empty list, and topics
+//! What `MetadataStorage::metadata` answers for no list, an empty list, and topics
 //! asked for by name and by id, known and unknown: always the one broker,
 //! and the topics as asked.
 

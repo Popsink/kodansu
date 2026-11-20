@@ -17,7 +17,7 @@
 use tansu_sans_io::{DeleteRecordsRequest, DeleteRecordsResponse};
 
 storage_service! {
-    /// Hands the requested topics to [`Storage::delete_records`](crate::Storage::delete_records)
+    /// Hands the requested topics to [`MetadataStorage::delete_records`](crate::MetadataStorage::delete_records)
     /// and returns its per-partition results as they are.
     DeleteRecordsService: DeleteRecordsRequest => DeleteRecordsResponse,
     |ctx, req| {

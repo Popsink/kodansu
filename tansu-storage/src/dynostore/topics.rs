@@ -248,7 +248,7 @@ impl DynoStore {
     }
 
     /// Best-effort warm-up of the topic index at boot, run from
-    /// [`Storage::register_broker`] which completes *before* the broker binds
+    /// [`MetadataStorage::register_broker`] which completes *before* the broker binds
     /// its listener. Without it, the first list-all metadata request pays the
     /// full cold build — LIST the `topic-metadata/` prefix and GET every object
     /// — which at 15k topics is several seconds and can exceed a Kafka client's
@@ -559,7 +559,7 @@ impl DynoStore {
 
         Ok(compacted)
     }
-    /// The body of [`Storage::metadata`]: the brokers, and one
+    /// The body of [`MetadataStorage::metadata`]: the brokers, and one
     /// [`MetadataResponseTopic`] per topic the request names or, when it names
     /// none, per topic the index holds.
     pub(super) async fn metadata_response(
@@ -883,7 +883,7 @@ impl DynoStore {
         })
     }
 
-    /// The body of [`Storage::delete_topic`]: the topic's data before its
+    /// The body of [`MetadataStorage::delete_topic`]: the topic's data before its
     /// metadata (#251), because the metadata object is the only handle on the
     /// data and losing it first strands every segment behind it.
     pub(super) async fn delete_topic_objects(&self, topic: &TopicId) -> Result<ErrorCode> {
@@ -1113,7 +1113,7 @@ impl DynoStore {
         }
     }
 
-    /// The body of [`Storage::create_topic`]: validation, the routing pin the
+    /// The body of [`MetadataStorage::create_topic`]: validation, the routing pin the
     /// topic's prefix is resolved through ever after (#236/#242), and the
     /// create-only PUTs that make it visible to the other replicas.
     pub(super) async fn create_topic_objects(

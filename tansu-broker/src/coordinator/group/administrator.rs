@@ -1753,7 +1753,7 @@ where
     /// by the generation (#427). `member_id` itself is never in the answer.
     ///
     /// **One LIST, and no document reads.** That is the whole reason
-    /// [`Storage::list_group_member_stamps`] exists: electing an admitter needs
+    /// [`GroupStorage::list_group_member_stamps`] exists: electing an admitter needs
     /// ids and how recently each was written, and the listing carries both.
     /// Only the member that goes on to admit reads anything, and only the
     /// documents it is admitting.
@@ -4575,6 +4575,7 @@ mod tests {
         create_topics_request::CreatableTopic,
         offset_commit_request::{OffsetCommitRequestPartition, OffsetCommitRequestTopic},
     };
+    use tansu_storage::{GroupStorage as _, LogStorage as _, MetadataStorage as _};
     use tansu_storage::{LatencyIntroducingStorage, StorageContainer};
     use tokio::task::JoinSet;
     use tokio::time::{advance, timeout};

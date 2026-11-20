@@ -539,7 +539,9 @@ mod tests {
     use tracing::subscriber::DefaultGuard;
 
     use super::*;
+
     use crate::Error;
+    use crate::LogStorage as _;
     use crate::dynostore::DynoStore;
     use crate::service::init_producer_id::InitProducerIdService;
 

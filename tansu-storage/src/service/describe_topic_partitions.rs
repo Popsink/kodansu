@@ -20,7 +20,7 @@ use crate::TopicId;
 
 storage_service! {
     /// Passes the requested topics, the partition limit and the cursor to
-    /// [`Storage::describe_topic_partitions`](crate::Storage::describe_topic_partitions).
+    /// [`MetadataStorage::describe_topic_partitions`](crate::MetadataStorage::describe_topic_partitions).
     /// No topics means all of them. Every page fits in one response, so there
     /// is never a next cursor.
     ///

@@ -22,7 +22,7 @@
 //! exist. Two audit runs four minutes apart agreed on only 50% of their new
 //! holes, and 170 of them "healed", which a real hole cannot do.
 //!
-//! `Storage::fetch` is the same call the broker serves `Fetch` with, and it
+//! `LogStorage::fetch` is the same call the broker serves `Fetch` with, and it
 //! resolves against a *freshly refreshed* index each time, so it answers the
 //! question the audit cannot while the bucket moves.
 //!
@@ -32,7 +32,7 @@
 use std::env;
 
 use tansu_sans_io::IsolationLevel;
-use tansu_storage::{Storage, StorageContainer, Topition};
+use tansu_storage::{StorageContainer, Topition};
 use url::Url;
 
 #[derive(serde::Deserialize)]

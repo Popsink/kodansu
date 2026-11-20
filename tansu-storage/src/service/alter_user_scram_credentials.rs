@@ -123,7 +123,7 @@ mod tests {
     use tansu_sans_io::{AlterUserScramCredentialsRequest, ErrorCode, ScramMechanism};
 
     use super::AlterUserScramCredentialsService;
-    use crate::{Error, Storage as _, StorageContainer};
+    use crate::{Error, StorageContainer};
 
     #[tokio::test]
     async fn an_upsert_stores_the_derived_keys_and_a_deletion_removes_them() -> Result<(), Error> {

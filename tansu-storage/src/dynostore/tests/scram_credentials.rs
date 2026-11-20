@@ -25,12 +25,14 @@
 //! authenticate to.
 
 use bytes::Bytes;
+
+use crate::PrincipalStorage as _;
 use object_store::memory::InMemory;
 
 use tansu_sans_io::ScramMechanism;
 
 use crate::{
-    Result, ScramCredential, Storage,
+    Result, ScramCredential,
     dynostore::{DynoStore, tests::init_tracing},
 };
 

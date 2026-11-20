@@ -38,6 +38,8 @@
 //! churn loop returns to where it started however many times it runs.
 
 use bytes::Bytes;
+
+use crate::{LogStorage as _, MetadataStorage as _};
 use object_store::memory::InMemory;
 use tansu_sans_io::{
     ConfigResource, ListOffset,
@@ -51,7 +53,7 @@ use tansu_sans_io::{
 use uuid::Uuid;
 
 use crate::{
-    Error, Result, Storage, TopicId, Topition,
+    Error, Result, TopicId, Topition,
     dynostore::{DynoStore, tests::init_tracing},
 };
 
