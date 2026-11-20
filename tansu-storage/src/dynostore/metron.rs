@@ -145,14 +145,13 @@ pub(crate) fn is_timeout(error: &object_store::Error) -> bool {
 /// `NotFound` whose source happens to mention a timeout is still `not_found`. They
 /// are guards on the fallthrough rather than a pre-match for the same reason.
 pub(crate) fn object_store_error_name(error: &object_store::Error) -> &'static str {
+    use object_store::Error::{AlreadyExists, NotFound, NotModified, Precondition};
+
     match error {
-        object_store::Error::Precondition { .. } => "pre_condition",
-
-        object_store::Error::AlreadyExists { .. } => "already_exists",
-
-        object_store::Error::NotModified { .. } => "not_modified",
-
-        object_store::Error::NotFound { .. } => "not_found",
+        Precondition { .. } => "pre_condition",
+        AlreadyExists { .. } => "already_exists",
+        NotModified { .. } => "not_modified",
+        NotFound { .. } => "not_found",
 
         // Both shapes under one label: S3's `503 SlowDown` and GCS's `429
         // rateLimitExceeded` are the same event and no backend emits both, so
@@ -163,8 +162,8 @@ pub(crate) fn object_store_error_name(error: &object_store::Error) -> &'static s
 
         timed_out if is_timeout(timed_out) => "timeout",
 
-        otherwise => {
-            debug!(?otherwise);
+        unnamed => {
+            debug!(otherwise = ?unnamed);
             "otherwise"
         }
     }
@@ -200,8 +199,30 @@ pub(crate) struct Metron<O> {
 
 impl<O> Display for Metron<O> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Metron").finish()
+        f.write_str("Metron")
     }
+}
+
+/// Milliseconds since `started`, `0` when the clock went backwards.
+fn elapsed_ms(started: SystemTime) -> u64 {
+    let took = started.elapsed();
+    took.map_or(0, |took| took.as_millis() as u64)
+}
+
+/// The labels of a failed request: its `reason`, the `class` of what it
+/// addressed, then the request's own `labels`.
+fn failure_labels(
+    error: &object_store::Error,
+    class: &'static str,
+    labels: impl IntoIterator<Item = KeyValue>,
+) -> Vec<KeyValue> {
+    let reason = object_store_error_name(error);
+    let mut failure = vec![
+        KeyValue::new("reason", reason),
+        KeyValue::new("class", class),
+    ];
+    failure.extend(labels);
+    failure
 }
 
 impl<O> Metron<O>
@@ -209,27 +230,54 @@ where
     O: ObjectStore,
 {
     pub(crate) fn new(object_store: O, cluster: &str) -> Self {
-        Self {
-            cluster: cluster.into(),
-            // Labelled by `class` as well as `method` (#409). The error counter
-            // below has carried the key class since #203 and this had not, so
-            // "the brokers are slow" — a 350 ms `get_opts` mean against the
-            // maintainers' 24 ms on the same bucket — could not be narrowed to
-            // "slow reading *what*". One label, and it separates a request
-            // waiting on the wire from a plane with a pathological caller:
-            // `list_with_delimiter` averages 4.5 s at 0.3 req/s on that fleet.
-            request_duration: METER
-                .u64_histogram("tansu_object_store_request_duration")
-                .with_unit("ms")
-                .with_description("The object store request latencies in milliseconds")
-                .build(),
-            request_error: METER
-                .u64_counter("tansu_object_store_request_error")
-                .with_description("The object store request errors")
-                .build(),
+        // Labelled by `class` as well as `method` (#409). The error counter
+        // below has carried the key class since #203 and this had not, so
+        // "the brokers are slow" — a 350 ms `get_opts` mean against the
+        // maintainers' 24 ms on the same bucket — could not be narrowed to
+        // "slow reading *what*". One label, and it separates a request
+        // waiting on the wire from a plane with a pathological caller:
+        // `list_with_delimiter` averages 4.5 s at 0.3 req/s on that fleet.
+        let latency = METER.u64_histogram("tansu_object_store_request_duration");
+        let latency = latency.with_unit("ms");
+        let latency =
+            latency.with_description("The object store request latencies in milliseconds");
+        let failures = METER.u64_counter("tansu_object_store_request_error");
+        let failures = failures.with_description("The object store request errors");
 
+        Metron {
+            request_duration: latency.build(),
+            request_error: failures.build(),
+            cluster: cluster.to_owned(),
             object_store,
         }
+    }
+
+    /// The labels every metered request carries, in this order: the method,
+    /// the cluster, and the class of what it addresses.
+    fn labels(&self, method: &'static str, class: &'static str) -> Vec<KeyValue> {
+        let cluster = self.cluster.clone();
+        vec![
+            KeyValue::new("method", method),
+            KeyValue::new("cluster", cluster),
+            KeyValue::new("class", class),
+        ]
+    }
+
+    /// Meter the `outcome` of a request begun at `started`: its latency when it
+    /// succeeded, otherwise one failure counted against `failed_class`.
+    fn observe<T>(
+        &self,
+        outcome: &Result<T, object_store::Error>,
+        started: SystemTime,
+        labels: Vec<KeyValue>,
+        failed_class: &'static str,
+    ) {
+        let Err(error) = outcome else {
+            self.request_duration.record(elapsed_ms(started), &labels);
+            return;
+        };
+        let failure = failure_labels(error, failed_class, labels);
+        self.request_error.add(1, &failure);
     }
 
     /// Make a listing stream visible to the request metrics (#165).
@@ -260,49 +308,30 @@ where
         /// Keys per `ListObjectsV2` response, i.e. per metered LIST request.
         const LIST_PAGE_KEYS: u64 = 1_000;
 
-        let attributes = vec![
-            KeyValue::new("method", method),
-            KeyValue::new("cluster", self.cluster.clone()),
-            KeyValue::new("class", class),
-        ];
-        let request_duration = self.request_duration.clone();
-        let request_error = self.request_error.clone();
+        let labels = self.labels(method, class);
+        let (latency, failures) = (self.request_duration.clone(), self.request_error.clone());
+        latency.record(0, &labels);
 
-        request_duration.record(0, attributes.as_ref());
-
-        let mut yielded = 0u64;
-        let mut page_started = SystemTime::now();
-
-        Box::pin(inner.inspect(move |result| match result {
-            Ok(_) => {
-                yielded += 1;
-
-                if yielded.is_multiple_of(LIST_PAGE_KEYS) {
-                    request_duration.record(
-                        page_started
-                            .elapsed()
-                            .map_or(0, |elapsed| elapsed.as_millis() as u64),
-                        attributes.as_ref(),
-                    );
-                    page_started = SystemTime::now();
+        let mut seen = 0u64;
+        let mut page_began = SystemTime::now();
+        let metered = inner.inspect(move |item| {
+            let Err(error) = item else {
+                seen += 1;
+                if seen.is_multiple_of(LIST_PAGE_KEYS) {
+                    latency.record(elapsed_ms(page_began), &labels);
+                    page_began = SystemTime::now();
                 }
-            }
-
-            Err(err) => {
-                debug!(?err, method);
-
-                let mut additional = vec![
-                    KeyValue::new("reason", object_store_error_name(err)),
-                    KeyValue::new("class", "prefix"),
-                ];
-                additional.extend(attributes.iter().cloned());
-                request_error.add(1, &additional[..]);
-            }
-        }))
+                return;
+            };
+            debug!(err = ?error, method);
+            let failure = failure_labels(error, "prefix", labels.iter().cloned());
+            failures.add(1, &failure);
+        });
+        Box::pin(metered)
     }
 }
 
-#[async_trait]
+#[async_trait::async_trait]
 impl<O> ObjectStore for Metron<O>
 where
     O: ObjectStore,
@@ -313,38 +342,20 @@ where
         payload: PutPayload,
         opts: PutOptions,
     ) -> Result<PutResult, object_store::Error> {
-        debug!(%location, ?opts);
+        debug!(location = %location, opts = ?opts);
+        let class = key_class(location);
+        let (started, labels) = (SystemTime::now(), self.labels("put_opts", class));
 
-        let execute_start = SystemTime::now();
-        let mut attributes = vec![
-            KeyValue::new("method", "put_opts"),
-            KeyValue::new("cluster", self.cluster.clone()),
-            KeyValue::new("class", key_class(location)),
-        ];
-
-        self.object_store
+        let outcome = self
+            .object_store
             .put_opts(location, payload, opts.clone())
-            .await
-            .inspect(|put_result| {
-                debug!(%location, etag = ?put_result.e_tag, version = ?put_result.version);
-
-                self.request_duration.record(
-                    execute_start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    attributes.as_ref(),
-                )
-            })
-            .inspect_err(|err| {
-                debug!(%location, opts = ?opts, err = ?err);
-
-                let mut additional = vec![
-                    KeyValue::new("reason", object_store_error_name(err)),
-                    KeyValue::new("class", key_class(location)),
-                ];
-                additional.append(&mut attributes);
-                self.request_error.add(1, &additional[..]);
-            })
+            .await;
+        match &outcome {
+            Ok(put) => debug!(location = %location, etag = ?put.e_tag, version = ?put.version),
+            Err(err) => debug!(location = %location, opts = ?opts, err = ?err),
+        }
+        self.observe(&outcome, started, labels, class);
+        outcome
     }
 
     async fn put_multipart_opts(
@@ -352,34 +363,13 @@ where
         location: &Path,
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
-        debug!(%location, ?opts);
+        debug!(location = %location, opts = ?opts);
+        let class = key_class(location);
+        let (started, labels) = (SystemTime::now(), self.labels("put_multipart_opts", class));
 
-        let execute_start = SystemTime::now();
-        let mut attributes = vec![
-            KeyValue::new("method", "put_multipart_opts"),
-            KeyValue::new("cluster", self.cluster.clone()),
-            KeyValue::new("class", key_class(location)),
-        ];
-
-        self.object_store
-            .put_multipart_opts(location, opts)
-            .await
-            .inspect(|_put_result| {
-                self.request_duration.record(
-                    execute_start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    attributes.as_ref(),
-                )
-            })
-            .inspect_err(|err| {
-                let mut additional = vec![
-                    KeyValue::new("reason", object_store_error_name(err)),
-                    KeyValue::new("class", key_class(location)),
-                ];
-                additional.append(&mut attributes);
-                self.request_error.add(1, &additional[..]);
-            })
+        let outcome = self.object_store.put_multipart_opts(location, opts).await;
+        self.observe(&outcome, started, labels, class);
+        outcome
     }
 
     // `debug`, and without `ret` (#428): see the note on `Cache::get_opts`,
@@ -391,90 +381,55 @@ where
         location: &Path,
         options: GetOptions,
     ) -> Result<GetResult, object_store::Error> {
-        debug!(?options);
+        debug!(options = ?options);
+        let class = key_class(location);
+        let (started, labels) = (SystemTime::now(), self.labels("get_opts", class));
 
-        let execute_start = SystemTime::now();
-        let mut attributes = vec![
-            KeyValue::new("method", "get_opts"),
-            KeyValue::new("cluster", self.cluster.clone()),
-            KeyValue::new("class", key_class(location)),
-        ];
-
-        self.object_store
-            .get_opts(location, options.clone())
-            .await
-            .inspect(|get_result| {
-                debug!(meta = ?get_result.meta);
-
-                self.request_duration.record(
-                    execute_start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    attributes.as_ref(),
-                )
-            })
-            .inspect_err(|err| {
-                debug!(?err);
-
-                let mut additional = vec![
-                    KeyValue::new("reason", object_store_error_name(err)),
-                    KeyValue::new("class", key_class(location)),
-                ];
-                additional.append(&mut attributes);
-                self.request_error.add(1, &additional[..]);
-            })
+        let outcome = self.object_store.get_opts(location, options.clone()).await;
+        match &outcome {
+            Ok(got) => debug!(meta = ?got.meta),
+            Err(err) => debug!(err = ?err),
+        }
+        self.observe(&outcome, started, labels, class);
+        outcome
     }
 
     fn delete_stream(
         &self,
         locations: BoxStream<'static, Result<Path, object_store::Error>>,
     ) -> BoxStream<'static, Result<Path, object_store::Error>> {
-        debug!("delete_stream");
+        tracing::debug!("delete_stream");
+        let method = KeyValue::new("method", "delete_stream");
+        let labels = [method, KeyValue::new("cluster", self.cluster.clone())];
+        let (latency, failures) = (self.request_duration.clone(), self.request_error.clone());
 
-        let cluster = self.cluster.clone();
-        let request_duration = self.request_duration.clone();
-        let request_error = self.request_error.clone();
-
-        let inner = self.object_store.delete_stream(locations);
-
-        Box::pin(inner.inspect(move |result| {
-            let attributes = vec![
-                KeyValue::new("method", "delete_stream"),
-                KeyValue::new("cluster", cluster.clone()),
-            ];
-
-            if let Err(err) = result {
-                // The stream yields the key only on success, so a failed delete
-                // is classed from the error when it carries a path — the
-                // `DeleteObjects` per-key failures do.
-                let class = match err {
-                    object_store::Error::NotFound { path, .. } => key_class(&Path::from(&path[..])),
-                    _ => "other",
-                };
-
-                let mut additional = vec![
-                    KeyValue::new("reason", object_store_error_name(err)),
-                    KeyValue::new("class", class),
-                ];
-                additional.extend(attributes);
-                request_error.add(1, &additional[..]);
+        let deleted = self.object_store.delete_stream(locations);
+        let metered = deleted.inspect(move |item| {
+            let Err(error) = item else {
+                latency.record(0, &labels);
+                return;
+            };
+            // The stream yields the key only on success, so a failed delete
+            // is classed from the error when it carries a path — the
+            // `DeleteObjects` per-key failures do.
+            let class = if let object_store::Error::NotFound { path, .. } = error {
+                key_class(&Path::from(path.as_str()))
             } else {
-                request_duration.record(0, attributes.as_ref());
-            }
-        }))
+                "other"
+            };
+            failures.add(1, &failure_labels(error, class, labels.clone()));
+        });
+        Box::pin(metered)
     }
 
     fn list(
         &self,
         prefix: Option<&Path>,
     ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
-        debug!(?prefix);
-
-        self.instrument_listing(
-            "list",
-            prefix.map_or("other", key_class),
-            self.object_store.list(prefix),
-        )
+        debug!(prefix = ?prefix);
+        let listing = self.object_store.list(prefix);
+        let class = prefix.map_or("other", key_class);
+        self.instrument_listing("list", class, listing)
     }
 
     // Forward `list_with_offset` (S3 `start-after`) so a tail-offset scan reads
@@ -484,58 +439,31 @@ where
         prefix: Option<&Path>,
         offset: &Path,
     ) -> BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
-        debug!(?prefix, ?offset);
-
-        self.instrument_listing(
-            "list_with_offset",
-            prefix.map_or("other", key_class),
-            self.object_store.list_with_offset(prefix, offset),
-        )
+        debug!(prefix = ?prefix, offset = ?offset);
+        let listing = self.object_store.list_with_offset(prefix, offset);
+        let class = prefix.map_or("other", key_class);
+        self.instrument_listing("list_with_offset", class, listing)
     }
 
     async fn list_with_delimiter(
         &self,
         prefix: Option<&Path>,
     ) -> Result<ListResult, object_store::Error> {
-        debug!(?prefix);
+        debug!(prefix = ?prefix);
+        let started = SystemTime::now();
+        let mut labels = self.labels("list_with_delimiter", prefix.map_or("other", key_class));
+        labels.extend(prefix.map(|under| KeyValue::new("prefix", under.to_string())));
 
-        let execute_start = SystemTime::now();
-        let mut attributes = vec![
-            KeyValue::new("method", "list_with_delimiter"),
-            KeyValue::new("cluster", self.cluster.clone()),
-            KeyValue::new("class", prefix.map_or("other", key_class)),
-        ];
-
-        if let Some(prefix) = prefix {
-            attributes.push(KeyValue::new("prefix", prefix.to_string()));
+        let outcome = self.object_store.list_with_delimiter(prefix).await;
+        match &outcome {
+            Ok(_) => debug!(prefix = ?prefix),
+            Err(err) => debug!(prefix = ?prefix, err = ?err),
         }
-
-        self.object_store
-            .list_with_delimiter(prefix)
-            .await
-            .inspect(|_list_result| {
-                debug!(?prefix);
-
-                self.request_duration.record(
-                    execute_start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    attributes.as_ref(),
-                )
-            })
-            .inspect_err(|err| {
-                debug!(?prefix, err = ?err);
-
-                // A listing addresses a prefix, not a key: the same stand-in the
-                // cache metrics use, so `sum by (class)` covers every series
-                // rather than leaving listings in an unlabelled bucket.
-                let mut additional = vec![
-                    KeyValue::new("reason", object_store_error_name(err)),
-                    KeyValue::new("class", "prefix"),
-                ];
-                additional.append(&mut attributes);
-                self.request_error.add(1, &additional[..]);
-            })
+        // A listing addresses a prefix, not a key: the same stand-in the cache
+        // metrics use, so `sum by (class)` covers every series rather than
+        // leaving listings in an unlabelled bucket.
+        self.observe(&outcome, started, labels, "prefix");
+        outcome
     }
 
     async fn copy_opts(
@@ -544,38 +472,16 @@ where
         to: &Path,
         opts: CopyOptions,
     ) -> Result<(), object_store::Error> {
-        debug!(%from, %to, ?opts);
+        debug!(from = %from, to = %to, opts = ?opts);
+        let (started, labels) = (SystemTime::now(), self.labels("copy_opts", key_class(to)));
 
-        let execute_start = SystemTime::now();
-        let mut attributes = vec![
-            KeyValue::new("method", "copy_opts"),
-            KeyValue::new("cluster", self.cluster.clone()),
-            KeyValue::new("class", key_class(to)),
-        ];
-
-        self.object_store
-            .copy_opts(from, to, opts)
-            .await
-            .inspect(|_| {
-                debug!(%from, %to);
-
-                self.request_duration.record(
-                    execute_start
-                        .elapsed()
-                        .map_or(0, |duration| duration.as_millis() as u64),
-                    attributes.as_ref(),
-                )
-            })
-            .inspect_err(|err| {
-                debug!(%from, %to, err = ?err);
-
-                let mut additional = vec![
-                    KeyValue::new("reason", object_store_error_name(err)),
-                    KeyValue::new("class", key_class(from)),
-                ];
-                additional.append(&mut attributes);
-                self.request_error.add(1, &additional[..]);
-            })
+        let outcome = self.object_store.copy_opts(from, to, opts).await;
+        match &outcome {
+            Ok(()) => debug!(from = %from, to = %to),
+            Err(err) => debug!(from = %from, to = %to, err = ?err),
+        }
+        self.observe(&outcome, started, labels, key_class(from));
+        outcome
     }
 }
 

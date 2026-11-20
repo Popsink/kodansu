@@ -1071,6 +1071,15 @@ fmt:
 # `callback` looks up the same SCRAM credential and satisfies the same stored
 # password. Only code went, so the ceiling rises.
 #
+#   defork  -78 lines, the object-store metering decorator rewritten  2834 -> 2834  2.6731 -> 2.6752
+#
+# `tansu-storage/src/dynostore/metron.rs` keeps `Metron`, its fields, and
+# every impl and signature. The five metered requests share `observe`, which
+# records the same latency on success and counts the same failure on error,
+# with the same `reason`, `class`, `method`, `cluster` and `prefix` labels in
+# the same order. `object_store_error_name` answers the same names. No comment
+# changed, only code went, so the ceiling rises.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1080,7 +1089,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6731" top="12":
+comments ceiling="2.6752" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
