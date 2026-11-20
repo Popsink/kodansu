@@ -1090,6 +1090,17 @@ fmt:
 # that paraphrased the protocol guide became those helpers' doc comments,
 # so the ratio falls and the ceiling follows it down.
 #
+#   defork  -73 lines, the client crate root rewritten  2819 -> 2817  2.6611 -> 2.6611
+#
+# `tansu-client/src/lib.rs` keeps `Error`, `Connection`, `ConnectionManager`,
+# `Builder`, every layer and service, their fields, and every impl and
+# signature. The two connection services share `checkout`, which times the
+# same pool wait, and the metric statics share `millis`, `counter` and `gauge`,
+# with the same names, units and descriptions. `bootstrap` negotiates the same
+# versions, and a connection is still discarded on recycle while dirty. The
+# two-line comment inside `bootstrap` became part of its doc comment, and the
+# ratio stays under the ceiling the frame rewrite set.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
