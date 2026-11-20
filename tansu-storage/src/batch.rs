@@ -491,13 +491,18 @@ fn combine(batches: Vec<deflated::Batch>) -> Result<Option<deflated::Batch>> {
 mod tests {
 
     use bytes::Bytes;
-    use tansu_sans_io::{
-        BatchAttribute,
-        record::{Record, deflated, inflated},
-    };
-    use tokio::{task::yield_now, time::advance};
+    use tansu_sans_io::BatchAttribute;
+    use tansu_sans_io::record::{Record, deflated, inflated};
+    use tokio::task::yield_now;
+    use tokio::time::advance;
 
     use super::*;
+
+    const A: Bytes = Bytes::from_static(b"a");
+    const B: Bytes = Bytes::from_static(b"b");
+    const C: Bytes = Bytes::from_static(b"c");
+    const D: Bytes = Bytes::from_static(b"d");
+    const E: Bytes = Bytes::from_static(b"e");
 
     #[derive(Clone, Debug, Default)]
     struct FlightRecorder {
@@ -506,29 +511,20 @@ mod tests {
 
     impl FlightRecorder {
         fn new() -> Self {
-            Self {
-                produced: Arc::new(Mutex::new(BTreeMap::new())),
-            }
+            let produced = Arc::default();
+            FlightRecorder { produced }
         }
 
         fn produced(&self, topition: &Topition) -> Result<Option<Vec<inflated::Batch>>> {
-            self.produced
-                .as_ref()
-                .lock()
-                .map_err(Into::into)
-                .and_then(|produced| {
-                    produced
-                        .get(topition)
-                        .map(|produced| {
-                            produced
-                                .iter()
-                                .map(|deflated| {
-                                    inflated::Batch::try_from(deflated).map_err(Into::into)
-                                })
-                                .collect::<Result<Vec<_>>>()
-                        })
-                        .transpose()
-                })
+            let held = self.produced.lock()?;
+            let Some(batches) = held.get(topition) else {
+                return Ok(None);
+            };
+            let mut inflated = Vec::with_capacity(batches.len());
+            for batch in batches {
+                inflated.push(inflated::Batch::try_from(batch)?);
+            }
+            Ok(Some(inflated))
         }
     }
 
@@ -587,188 +583,76 @@ mod tests {
         base_offset: i64,
         records: &[Bytes],
     ) -> Result<deflated::Batch> {
-        let base_sequence = 0;
+        let values = [records.to_vec()];
+        let mut split = into_batches(
+            attributes,
+            producer_id,
+            producer_epoch,
+            base_offset,
+            &values,
+        )?;
+        Ok(split.remove(0))
+    }
 
-        let mut inflated = inflated::Batch::builder()
-            .attributes(attributes)
-            .producer_id(producer_id)
-            .producer_epoch(producer_epoch)
-            .base_offset(base_offset)
-            .last_offset_delta(records.len() as i32 - 1)
-            .base_sequence(base_sequence);
+    /// Each of `groups` produced through a batcher with a one-second window,
+    /// from its own task, before five seconds pass: the offset each was
+    /// answered with, and the batches that reached storage.
+    async fn produced_in_window(groups: &[&[Bytes]]) -> Result<(Vec<i64>, Vec<inflated::Batch>)> {
+        let recorder = FlightRecorder::new();
+        let window = Some(Duration::from_secs(1));
+        let storage = ProduceRequestBatcher::new(recorder.clone()).with_maximum_delay(window);
+        let abc0 = Topition::new("abc", 0);
+        let attributes: i16 = BatchAttribute::default().into();
 
-        for (offset_delta, value) in records.iter().enumerate() {
-            inflated = inflated.record(
-                Record::builder()
-                    .value(value.clone().into())
-                    .offset_delta(offset_delta as i32),
-            );
+        let mut produces = Vec::new();
+        for group in groups {
+            let batch = into_batch(attributes, 54345, 32123, 0, group)?;
+            let (storage, abc0) = (storage.clone(), abc0.clone());
+            produces.push(tokio::spawn(async move {
+                storage.produce(None, &abc0, batch).await
+            }));
         }
 
-        inflated
-            .build()
-            .and_then(TryInto::try_into)
-            .inspect(|deflated| debug!(?deflated))
-            .map_err(Into::into)
+        advance(Duration::from_secs(5)).await;
+        yield_now().await;
+
+        let mut offsets = Vec::new();
+        for produce in produces {
+            let offset = produce.await.expect("join_handle")?;
+            debug!(produce_response = ?offset);
+            offsets.push(offset);
+        }
+        let sent = recorder.produced(&abc0)?.unwrap_or_default();
+        Ok((offsets, sent))
+    }
+
+    /// The values of `batch`'s records, in order.
+    fn values(batch: &inflated::Batch) -> Vec<Option<Bytes>> {
+        batch.records.iter().map(Record::value).collect()
     }
 
     #[tokio::test(start_paused = true)]
     async fn single_produce_in_window() -> Result<()> {
-        const MINIMUM_DELAY: Duration = Duration::from_secs(1);
-        const ADVANCE_DELAY: Duration = Duration::from_secs(5);
-
-        let recorder = FlightRecorder::new();
-        let storage =
-            ProduceRequestBatcher::new(recorder.clone()).with_maximum_delay(Some(MINIMUM_DELAY));
-
-        let producer_id = 54345;
-        let producer_epoch = 32123;
-        let base_offset = 0;
-        let attributes: i16 = BatchAttribute::default().into();
-
-        let transaction_id = None;
-        let abc0 = Topition::new("abc", 0);
-
-        const A: Bytes = Bytes::from_static(b"a");
-        const B: Bytes = Bytes::from_static(b"b");
-        const C: Bytes = Bytes::from_static(b"c");
-
-        let batch_a = {
-            let storage = storage.clone();
-            let abc0 = abc0.clone();
-
-            tokio::spawn(async move {
-                storage
-                    .produce(
-                        transaction_id,
-                        &abc0,
-                        into_batch(
-                            attributes,
-                            producer_id,
-                            producer_epoch,
-                            base_offset,
-                            &[A, B, C],
-                        )?,
-                    )
-                    .await
-            })
-        };
-
-        advance(ADVANCE_DELAY).await;
-        yield_now().await;
-
-        let response_a = batch_a
-            .await
-            .expect("join_handle")
-            .inspect(|produce_response| debug!(?produce_response))?;
-        assert_eq!(0, response_a);
-
-        let sent = recorder.produced(&abc0)?.unwrap();
+        let (offsets, sent) = produced_in_window(&[&[A, B, C]]).await?;
+        assert_eq!(vec![0], offsets);
         assert_eq!(1, sent.len());
-        assert_eq!(3, sent[0].records.len());
-        assert_eq!(Some(A), sent[0].records[0].value());
-        assert_eq!(Some(B), sent[0].records[1].value());
-        assert_eq!(Some(C), sent[0].records[2].value());
-
+        assert_eq!(vec![Some(A), Some(B), Some(C)], values(&sent[0]));
         Ok(())
     }
 
     #[tokio::test(start_paused = true)]
     async fn two_produces_in_window() -> Result<()> {
-        const MINIMUM_DELAY: Duration = Duration::from_secs(1);
-        const ADVANCE_DELAY: Duration = Duration::from_secs(5);
-
-        let recorder = FlightRecorder::new();
-        let storage =
-            ProduceRequestBatcher::new(recorder.clone()).with_maximum_delay(Some(MINIMUM_DELAY));
-
-        let producer_id = 54345;
-        let producer_epoch = 32123;
-        let base_offset = 0;
-        let attributes: i16 = BatchAttribute::default().into();
-
-        let transaction_id = None;
-        let abc0 = Topition::new("abc", 0);
-
-        const A: Bytes = Bytes::from_static(b"a");
-        const B: Bytes = Bytes::from_static(b"b");
-        const C: Bytes = Bytes::from_static(b"c");
-
-        let batch_a = {
-            let storage = storage.clone();
-            let abc0 = abc0.clone();
-
-            tokio::spawn(async move {
-                storage
-                    .produce(
-                        transaction_id,
-                        &abc0,
-                        into_batch(
-                            attributes,
-                            producer_id,
-                            producer_epoch,
-                            base_offset,
-                            &[A, B, C],
-                        )?,
-                    )
-                    .await
-            })
-        };
-
-        const D: Bytes = Bytes::from_static(b"d");
-        const E: Bytes = Bytes::from_static(b"e");
-
-        let batch_b = {
-            let storage = storage.clone();
-            let abc0 = abc0.clone();
-
-            tokio::spawn(async move {
-                storage
-                    .produce(
-                        transaction_id,
-                        &abc0,
-                        into_batch(
-                            attributes,
-                            producer_id,
-                            producer_epoch,
-                            base_offset,
-                            &[D, E],
-                        )?,
-                    )
-                    .await
-            })
-        };
-
-        advance(ADVANCE_DELAY).await;
-        yield_now().await;
-
-        let response_a = batch_a
-            .await
-            .expect("join_handle")
-            .inspect(|produce_response| debug!(?produce_response))?;
-        assert_eq!(0, response_a);
-
-        let response_b = batch_b
-            .await
-            .expect("join_handle")
-            .inspect(|produce_response| debug!(?produce_response))?;
-        assert_eq!(0, response_b);
-
-        let sent = recorder.produced(&abc0)?.unwrap();
+        let (offsets, sent) = produced_in_window(&[&[A, B, C], &[D, E]]).await?;
+        assert_eq!(vec![0, 0], offsets);
         assert_eq!(1, sent.len());
-        assert_eq!(5, sent[0].records.len());
-        assert_eq!(Some(A), sent[0].records[0].value());
-        assert_eq!(Some(B), sent[0].records[1].value());
-        assert_eq!(Some(C), sent[0].records[2].value());
-        assert_eq!(Some(D), sent[0].records[3].value());
-        assert_eq!(Some(E), sent[0].records[4].value());
-
+        let expected = vec![Some(A), Some(B), Some(C), Some(D), Some(E)];
+        assert_eq!(expected, values(&sent[0]));
         Ok(())
     }
 
     #[test]
     fn combine_empty() -> Result<()> {
-        assert_eq!(None, combine(vec![])?);
+        assert_eq!(None, combine(Vec::new())?);
         Ok(())
     }
 
@@ -779,146 +663,72 @@ mod tests {
         base_offset: i64,
         batches: &[Vec<Bytes>],
     ) -> Result<Vec<deflated::Batch>> {
-        let mut split = vec![];
+        let mut split = Vec::with_capacity(batches.len());
         let mut base_sequence = 0;
-
-        for batch in batches {
-            let mut inflated = inflated::Batch::builder()
+        for values in batches {
+            let builder = inflated::Batch::builder()
                 .attributes(attributes)
                 .producer_id(producer_id)
                 .producer_epoch(producer_epoch)
                 .base_offset(base_offset)
-                .last_offset_delta(batch.len() as i32 - 1)
+                .last_offset_delta(values.len() as i32 - 1)
                 .base_sequence(base_sequence);
-
-            for (offset_delta, value) in batch.iter().enumerate() {
-                inflated = inflated.record(
-                    Record::builder()
-                        .value(value.clone().into())
-                        .offset_delta(offset_delta as i32),
-                );
-            }
-
-            split.push(
-                inflated
-                    .build()
-                    .and_then(TryInto::try_into)
-                    .inspect(|deflated| debug!(?deflated))?,
-            );
-
-            base_sequence += batch.len() as i32;
+            let records = values.iter().enumerate().map(|(offset_delta, value)| {
+                let record = Record::builder().value(value.clone().into());
+                record.offset_delta(offset_delta as i32)
+            });
+            let built = records
+                .fold(builder, |builder, record| builder.record(record))
+                .build()?;
+            let deflated: deflated::Batch = built.try_into()?;
+            debug!(deflated = ?deflated);
+            split.push(deflated);
+            base_sequence += values.len() as i32;
         }
-
         Ok(split)
     }
 
-    // A table of split/combine cases, each with its own assertion: the branch
-    // count #555's nursery gate sees is the size of the table.
-    #[allow(clippy::cognitive_complexity)]
     #[test]
     fn combine_batches() -> Result<()> {
+        let one = |value: &'static [u8]| Bytes::from_static(value);
         let batches = [
-            vec![
-                Bytes::from_static(b"a"),
-                Bytes::from_static(b"b"),
-                Bytes::from_static(b"c"),
-            ],
-            vec![Bytes::from_static(b"f"), Bytes::from_static(b"g")],
-            vec![Bytes::from_static(b"i")],
-            vec![Bytes::from_static(b"j")],
-            vec![Bytes::from_static(b"k")],
-            vec![
-                Bytes::from_static(b"p"),
-                Bytes::from_static(b"q"),
-                Bytes::from_static(b"r"),
-                Bytes::from_static(b"s"),
-            ],
+            vec![one(b"a"), one(b"b"), one(b"c")],
+            vec![one(b"f"), one(b"g")],
+            vec![one(b"i")],
+            vec![one(b"j")],
+            vec![one(b"k")],
+            vec![one(b"p"), one(b"q"), one(b"r"), one(b"s")],
         ];
-
-        let producer_id = 54345;
-        let producer_epoch = 32123;
-        let base_offset = 0;
+        let (producer_id, producer_epoch, base_offset) = (54345, 32123, 0);
         let attributes: i16 = BatchAttribute::default().into();
-        let base_sequence: i32 = 0;
 
-        let combined = inflated::Batch::try_from(
-            into_batches(
-                attributes,
-                producer_id,
-                producer_epoch,
-                base_offset,
-                &batches[..],
-            )
-            .and_then(combine)?
-            .expect("a batch"),
+        let split = into_batches(
+            attributes,
+            producer_id,
+            producer_epoch,
+            base_offset,
+            &batches,
         )?;
+        let combined = inflated::Batch::try_from(combine(split)?.expect("a batch"))?;
 
-        assert_eq!(combined.producer_id, producer_id);
-        assert_eq!(combined.producer_epoch, producer_epoch);
-        assert_eq!(combined.base_sequence, base_sequence);
-        assert_eq!(combined.base_offset, base_offset);
-        assert_eq!(combined.attributes, attributes);
+        let header = (
+            combined.producer_id,
+            combined.producer_epoch,
+            combined.base_sequence,
+            combined.base_offset,
+            combined.attributes,
+        );
+        assert_eq!(
+            (producer_id, producer_epoch, 0, base_offset, attributes),
+            header
+        );
 
-        let index = 0;
-        assert_eq!(None, combined.records[index].key);
-        assert_eq!(Some(batches[0][0].clone()), combined.records[index].value);
-        assert_eq!(index, combined.records[index].offset_delta as usize);
-
-        let index = 1;
-        assert_eq!(None, combined.records[index].key);
-        assert_eq!(Some(batches[0][1].clone()), combined.records[index].value);
-        assert_eq!(index, combined.records[index].offset_delta as usize);
-
-        let index = 2;
-        assert_eq!(None, combined.records[index].key);
-        assert_eq!(Some(batches[0][2].clone()), combined.records[index].value);
-        assert_eq!(index, combined.records[index].offset_delta as usize);
-
-        let index = 3;
-        assert_eq!(None, combined.records[index].key);
-        assert_eq!(Some(batches[1][0].clone()), combined.records[index].value);
-        assert_eq!(index, combined.records[index].offset_delta as usize);
-
-        let index = 4;
-        assert_eq!(None, combined.records[index].key);
-        assert_eq!(Some(batches[1][1].clone()), combined.records[index].value);
-        assert_eq!(index, combined.records[index].offset_delta as usize);
-
-        let index = 5;
-        assert_eq!(None, combined.records[index].key);
-        assert_eq!(Some(batches[2][0].clone()), combined.records[index].value);
-        assert_eq!(index, combined.records[index].offset_delta as usize);
-
-        let index = 6;
-        assert_eq!(None, combined.records[index].key);
-        assert_eq!(Some(batches[3][0].clone()), combined.records[index].value);
-        assert_eq!(index, combined.records[index].offset_delta as usize);
-
-        let index = 7;
-        assert_eq!(None, combined.records[index].key);
-        assert_eq!(Some(batches[4][0].clone()), combined.records[index].value);
-        assert_eq!(index, combined.records[index].offset_delta as usize);
-
-        let index = 8;
-        assert_eq!(None, combined.records[index].key);
-        assert_eq!(Some(batches[5][0].clone()), combined.records[index].value);
-        assert_eq!(index, combined.records[index].offset_delta as usize);
-
-        let index = 9;
-        assert_eq!(None, combined.records[index].key);
-        assert_eq!(Some(batches[5][1].clone()), combined.records[index].value);
-        assert_eq!(index, combined.records[index].offset_delta as usize);
-
-        let index = 10;
-        assert_eq!(None, combined.records[index].key);
-        assert_eq!(Some(batches[5][2].clone()), combined.records[index].value);
-        assert_eq!(index, combined.records[index].offset_delta as usize);
-
-        let index = 11;
-        assert_eq!(None, combined.records[index].key);
-        assert_eq!(Some(batches[5][3].clone()), combined.records[index].value);
-        assert_eq!(index, combined.records[index].offset_delta as usize);
-
+        for (index, value) in batches.iter().flatten().enumerate() {
+            let record = &combined.records[index];
+            assert_eq!(None, record.key, "{index}");
+            assert_eq!(Some(value.clone()), record.value, "{index}");
+            assert_eq!(index, record.offset_delta as usize);
+        }
         Ok(())
     }
 }

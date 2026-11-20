@@ -1224,6 +1224,15 @@ fmt:
 # metric statics share `counter`. The tests come in a follow-up. The ceiling
 # follows the ratio.
 #
+#   defork  -170 lines, the produce batcher's tests rewritten  2814 -> 2814  2.6825 -> 2.6864
+#
+# `tansu-storage/src/batch.rs`'s tests keep their names and assertions. The
+# two window tests share `produced_in_window`, which spawns the same produces
+# in the same order before the same paused-time advance; `into_batch` is one
+# `into_batches`; `combine_batches` walks its table instead of spelling twelve
+# index blocks, so it no longer needs the #555 complexity allow. The #551
+# recorder macros are untouched. Only code went, so the ceiling rises.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1233,7 +1242,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6825" top="12":
+comments ceiling="2.6864" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
