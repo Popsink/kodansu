@@ -1282,6 +1282,21 @@ fmt:
 # they use. The new trait docs are doc comments, so the ratio falls and the
 # ceiling follows it.
 #
+#   bench  +209 lines, the storage hot path benched  2814 -> 2814  2.6940 -> 2.6899
+#
+# `tansu-storage/benches/hot_path.rs` (#750), lot E's before/after benchmark:
+# produce, fetch and metadata through the public services over `memory://`.
+# A bench is tracked Rust like any other, so it is counted; it has no `//`, so
+# the ratio falls. #750 left the ceiling where it was, and this entry lowers it.
+#
+#   defork  -8 lines, the object-store version conversions rewritten  2814 -> 2814  2.6899 -> 2.6901
+#
+# `os.rs`, the last file of lot E (Popsink/data-plane#5884): the four `From`
+# impls between `Version` and `object_store`'s types destructure instead of
+# copying field by field, exhaustively where both sides are two fields, so a
+# third field is a compile error rather than a silent drop. Only code went, so
+# the ceiling rises.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1291,7 +1306,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6940" top="12":
+comments ceiling="2.6902" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

@@ -18,10 +18,8 @@ use crate::Version;
 
 impl From<Version> for UpdateVersion {
     fn from(value: Version) -> Self {
-        Self {
-            e_tag: value.e_tag,
-            version: value.version,
-        }
+        let Version { e_tag, version } = value;
+        Self { e_tag, version }
     }
 }
 
@@ -63,27 +61,21 @@ impl From<Version> for UpdateVersion {
 /// and GCS object versioning likewise (`docs/gcs.md`).
 impl From<ObjectMeta> for Version {
     fn from(value: ObjectMeta) -> Self {
-        Self {
-            e_tag: value.e_tag,
-            version: value.version,
-        }
+        let ObjectMeta { e_tag, version, .. } = value;
+        Self { e_tag, version }
     }
 }
 
 impl From<UpdateVersion> for Version {
     fn from(value: UpdateVersion) -> Self {
-        Self {
-            e_tag: value.e_tag,
-            version: value.version,
-        }
+        let UpdateVersion { e_tag, version } = value;
+        Self { e_tag, version }
     }
 }
 
 impl From<PutResult> for Version {
     fn from(value: PutResult) -> Self {
-        Self {
-            e_tag: value.e_tag,
-            version: value.version,
-        }
+        let PutResult { e_tag, version, .. } = value;
+        Self { e_tag, version }
     }
 }
