@@ -60,3 +60,7 @@ pretty_assertions.workspace = true
 tempfile.workspace = true
 time.workspace = true
 tracing-subscriber.workspace = true
+
+[[bench]]
+name = "hot_path"
+harness = false
