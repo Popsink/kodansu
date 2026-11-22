@@ -73,3 +73,7 @@ diagnostics = []
 [[bench]]
 name = "decode_bench"
 harness = false
+
+[[bench]]
+name = "record_bench"
+harness = false

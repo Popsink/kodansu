@@ -12,97 +12,76 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-//! Kafka Record
+//! Kafka records, and the batches that carry them.
 //!
-//! Constructing a [`Record`] using a builder:
+//! A [`Record`] is put together with its [`Builder`], headers included:
 //!
 //! ```
 //! use bytes::Bytes;
 //! use tansu_sans_io::record::{Header, Record};
 //!
+//! let header = |key, value| {
+//!     Header::builder()
+//!         .key(Bytes::from_static(key))
+//!         .value(Bytes::from_static(value))
+//! };
+//!
 //! let record = Record::builder()
 //!     .key(Some(Bytes::from_static(b"message")))
 //!     .value(Some(Bytes::from_static(b"hello world!")))
-//!     .header(
-//!         Header::builder()
-//!             .key(Bytes::from_static(b"format"))
-//!             .value(Bytes::from_static(b"text")),
-//!     )
-//!     .header(
-//!         Header::builder()
-//!             .key(Bytes::from_static(b"importance"))
-//!             .value(Bytes::from_static(b"high")),
-//!     );
+//!     .header(header(b"format", b"text"))
+//!     .header(header(b"importance", b"high"))
+//!     .build()?;
 //!
+//! assert_eq!(2, record.headers.len());
+//! # Ok::<(), tansu_sans_io::Error>(())
 //! ```
 //!
-//! An [`inflated`] Kafka record batch must be [`deflated`] before it can be sent using [`Compression`](super::Compression) with a [`ProduceRequest`](super::ProduceRequest):
+//! A batch exists in two forms. An [`inflated`] batch holds its records
+//! decoded; a [`deflated`] batch holds them encoded, and compressed by the
+//! batch's [`Compression`](super::Compression). A [`ProduceRequest`](super::ProduceRequest)
+//! sends the deflated form:
 //!
 //! ```
-//! # use tansu_sans_io::Error;
-//! # pub fn main() -> Result<(), Error> {
-//! #
 //! use bytes::Bytes;
-//! use tansu_sans_io::{
-//!     ApiKey as _, BatchAttribute, Compression, Frame, Header, ProduceRequest,
-//!     produce_request::{PartitionProduceData, TopicProduceData},
-//!     record::{self, deflated, inflated},
-//! };
+//! use tansu_sans_io::produce_request::{PartitionProduceData, TopicProduceData};
+//! use tansu_sans_io::record::{Record, deflated, inflated};
+//! use tansu_sans_io::{ApiKey as _, BatchAttribute, Compression, Frame, Header, ProduceRequest};
 //!
+//! let lz4 = BatchAttribute::default().compression(Compression::Lz4);
 //! let batch = inflated::Batch::builder()
-//!     .attributes(
-//!         BatchAttribute::default()
-//!             .compression(Compression::Lz4)
-//!             .into(),
-//!     )
-//!     .record(record::Record::builder().value(Bytes::from_static(b"hello world!").into()))
+//!     .attributes(lz4.into())
+//!     .record(Record::builder().value(Some(Bytes::from_static(b"hello world!"))))
 //!     .build()
 //!     .and_then(deflated::Batch::try_from)?;
 //!
-//! let produce_request = ProduceRequest::default()
-//!     .topic_data(Some(
-//!         [TopicProduceData::default()
-//!             .name("test".into())
-//!             .partition_data(Some(
-//!                 [PartitionProduceData::default()
-//!                     .index(0)
-//!                     .records(Some(deflated::Frame {
-//!                         batches: vec![batch],
-//!                     }))]
-//!                 .into(),
-//!             ))]
-//!         .into(),
-//!     ))
-//!     .into();
+//! let partition = PartitionProduceData::default()
+//!     .index(0)
+//!     .records(Some(deflated::Frame { batches: vec![batch] }));
+//! let topic = TopicProduceData::default()
+//!     .name(String::from("test"))
+//!     .partition_data(Some(vec![partition]));
+//! let produce = ProduceRequest::default().topic_data(Some(vec![topic]));
 //!
-//! let correlation_id = 12321;
-//!
-//! let request = Frame::request(
-//!     Header::Request {
-//!         api_key: ProduceRequest::KEY,
-//!         api_version: 6,
-//!         correlation_id,
-//!         client_id: Some("tansu".into()),
-//!     },
-//!     produce_request,
-//! )?;
-//! # Ok(())
-//! # }
+//! let header = Header::Request {
+//!     api_key: ProduceRequest::KEY,
+//!     api_version: 6,
+//!     correlation_id: 12321,
+//!     client_id: Some(String::from("tansu")),
+//! };
+//! let _encoded = Frame::request(header, produce.into())?;
+//! # Ok::<(), tansu_sans_io::Error>(())
 //! ```
 //!
-//! A [`deflated`] Kafka record batch from a [`FetchRequest`](super::FetchRequest) must be [`inflated`] before it can be used:
+//! A [`FetchResponse`](super::FetchResponse) answers with the deflated form,
+//! which is inflated before its records can be read:
 //!
 //! ```
-//! # use tansu_sans_io::Error;
-//! # pub fn main() -> Result<(), Error> {
-//! #
 //! use bytes::Bytes;
 //! use tansu_sans_io::{ApiKey as _, FetchResponse, Frame, record::inflated};
 //!
-//! let api_key = FetchResponse::KEY;
-//! let api_version = 16;
-//!
-//! let v = vec![
+//! // A v16 fetch response: one topic, one partition, one batch of one record.
+//! let wire = [
 //!     0, 0, 0, 186, 0, 0, 0, 8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 28, 205, 172, 195, 142, 19,
 //!     71, 71, 182, 128, 13, 18, 65, 142, 210, 222, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
 //!     0, 0, 0, 0, 0, 0, 0, 1, 255, 255, 255, 255, 255, 255, 255, 255, 1, 0, 0, 0, 0, 74, 0, 0, 0,
@@ -113,39 +92,22 @@
 //!     13, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0,
 //! ];
 //!
-//! let fetch_response = Frame::response_from_bytes(&v[..], api_key, api_version)
-//!     .and_then(|message_frame| FetchResponse::try_from(message_frame.body))?;
+//! let frame = Frame::response_from_bytes(&wire[..], FetchResponse::KEY, 16)?;
+//! let response = FetchResponse::try_from(frame.body)?;
 //!
-//! // first batch, from the first partition of the first topic
-//! // in the response:
-//!
-//! let deflated = fetch_response
-//!     .responses
-//!     .as_ref()
-//!     .and_then(|topics| topics.first())
-//!     .and_then(|topic| topic.partitions.as_ref())
-//!     .and_then(|partitions| partitions.first())
-//!     .and_then(|partition| partition.records.as_ref())
-//!     .map(|record_frame| record_frame.batches.as_slice())
-//!     .and_then(|batches| batches.first())
-//!     .expect("deflated batch");
-//!
-//! // we just have raw record data at this point:
+//! let topics = response.responses.unwrap_or_default();
+//! let partitions = topics.into_iter().flat_map(|topic| topic.partitions.unwrap_or_default());
+//! let deflated = partitions
+//!     .flat_map(|partition| partition.records)
+//!     .flat_map(|frame| frame.batches)
+//!     .next()
+//!     .expect("one batch");
 //! assert_eq!(12, deflated.record_data.len());
 //!
-//! // inflate the batch:
-//! let inflated = inflated::Batch::try_from(deflated)?;
-//!
-//! // first record in the inflated batch:
-//! assert_eq!(
-//!     Some(Bytes::from_static(b"poiuy")),
-//!     inflated
-//!         .records
-//!         .first()
-//!         .and_then(|first| first.value.clone())
-//! );
-//! # Ok(())
-//! # }
+//! let inflated = inflated::Batch::try_from(&deflated)?;
+//! let first = inflated.records.first().and_then(|record| record.value());
+//! assert_eq!(Some(Bytes::from_static(b"poiuy")), first);
+//! # Ok::<(), tansu_sans_io::Error>(())
 //! ```
 pub(crate) mod codec;
 pub mod deflated;
@@ -199,33 +161,39 @@ pub struct Record {
 
 impl ByteSize for Record {
     fn size_in_bytes(&self) -> Result<usize> {
-        let size = VarInt::from(self.length).size_in_bytes()?
-            + 1
-            + LongVarInt::from(self.timestamp_delta).size_in_bytes()?
-            + VarInt::from(self.offset_delta).size_in_bytes()?
-            + Octets(self.key.clone()).size_in_bytes()?
-            + Octets(self.value.clone()).size_in_bytes()?
-            + VarIntSequence(self.headers.clone()).size_in_bytes()?;
+        let Self {
+            length,
+            timestamp_delta,
+            offset_delta,
+            key,
+            value,
+            headers,
+            ..
+        } = self;
 
-        Ok(size)
+        let mut total = size_of::<u8>();
+        total += VarInt::from(*length).size_in_bytes()?;
+        total += LongVarInt::from(*timestamp_delta).size_in_bytes()?;
+        total += VarInt::from(*offset_delta).size_in_bytes()?;
+        for octets in [key, value] {
+            total += Octets(octets.clone()).size_in_bytes()?;
+        }
+        Ok(total + VarIntSequence(headers.clone()).size_in_bytes()?)
     }
 }
 
 impl Encode for &[Record] {
     #[instrument(skip_all)]
     fn encode(&self) -> Result<Bytes> {
-        let mut encoded = self
-            .iter()
-            .map(ByteSize::size_in_bytes)
-            .collect::<Result<Vec<_>>>()
-            .map(|sizes| sizes.iter().sum::<usize>())
-            .inspect(|with_capacity| debug!(records = self.len(), with_capacity))
-            .map(BytesMut::with_capacity)?;
+        let with_capacity = self.iter().try_fold(0, |total, record| {
+            Ok::<_, crate::Error>(total + record.size_in_bytes()?)
+        })?;
+        debug!(records = self.len(), with_capacity);
 
-        for record in self.iter() {
-            encoded.extend_from_slice(&record.encode()?[..]);
+        let mut encoded = BytesMut::with_capacity(with_capacity);
+        for record in *self {
+            encoded.extend_from_slice(&record.encode()?);
         }
-
         Ok(encoded.freeze())
     }
 }
@@ -233,20 +201,28 @@ impl Encode for &[Record] {
 impl Encode for Record {
     #[instrument(skip_all)]
     fn encode(&self) -> Result<Bytes> {
-        let mut encoded = self
-            .size_in_bytes()
-            .inspect(|with_capacity| debug!(with_capacity))
-            .map(BytesMut::with_capacity)?;
+        let with_capacity = self.size_in_bytes()?;
+        debug!(with_capacity);
 
-        let length = VarInt::from(self.length);
-        encoded.put(length.encode()?);
-        encoded.put_u8(self.attributes);
-        encoded.put(LongVarInt::from(self.timestamp_delta).encode()?);
-        encoded.put(VarInt::from(self.offset_delta).encode()?);
-        encoded.put(Octets(self.key.clone()).encode()?);
-        encoded.put(Octets(self.value.clone()).encode()?);
-        encoded.put(VarIntSequence(self.headers.clone()).encode()?);
+        let Self {
+            length,
+            attributes,
+            timestamp_delta,
+            offset_delta,
+            key,
+            value,
+            headers,
+        } = self;
 
+        let mut encoded = BytesMut::with_capacity(with_capacity);
+        encoded.put(VarInt::from(*length).encode()?);
+        encoded.put_u8(*attributes);
+        encoded.put(LongVarInt::from(*timestamp_delta).encode()?);
+        encoded.put(VarInt::from(*offset_delta).encode()?);
+        for octets in [key, value] {
+            encoded.put(Octets(octets.clone()).encode()?);
+        }
+        encoded.put(VarIntSequence(headers.clone()).encode()?);
         Ok(encoded.freeze())
     }
 }
@@ -256,22 +232,14 @@ impl Decode for Record {
     fn decode(encoded: &mut Bytes) -> Result<Self> {
         debug!(encoded = ?encoded[..]);
 
-        let length = VarInt::decode(encoded).map(Into::into)?;
-        let attributes = encoded.get_u8();
-        let timestamp_delta = LongVarInt::decode(encoded).map(Into::into)?;
-        let offset_delta = VarInt::decode(encoded).map(Into::into)?;
-        let key = Octets::decode(encoded).map(Into::into)?;
-        let value = Octets::decode(encoded).map(Into::into)?;
-        let headers = VarIntSequence::decode(encoded).map(Into::into)?;
-
         Ok(Self {
-            length,
-            attributes,
-            timestamp_delta,
-            offset_delta,
-            key,
-            value,
-            headers,
+            length: VarInt::decode(encoded)?.into(),
+            attributes: encoded.get_u8(),
+            timestamp_delta: LongVarInt::decode(encoded)?.into(),
+            offset_delta: VarInt::decode(encoded)?.into(),
+            key: Octets::decode(encoded)?.into(),
+            value: Octets::decode(encoded)?.into(),
+            headers: VarIntSequence::decode(encoded)?.into(),
         })
     }
 }
@@ -279,15 +247,15 @@ impl Decode for Record {
 impl Record {
     #[must_use]
     pub fn builder() -> Builder {
-        Builder::default()
+        Default::default()
     }
 
     pub fn key(&self) -> Option<Bytes> {
-        self.key.clone()
+        self.key.as_ref().cloned()
     }
 
     pub fn value(&self) -> Option<Bytes> {
-        self.value.clone()
+        self.value.as_ref().cloned()
     }
 }
 
@@ -295,29 +263,47 @@ impl TryFrom<Builder> for Record {
     type Error = crate::Error;
 
     fn try_from(builder: Builder) -> Result<Self, Self::Error> {
+        let length = i32::try_from(builder.size_in_bytes()?)?;
+        let Builder {
+            attributes,
+            timestamp_delta,
+            offset_delta,
+            key,
+            value,
+            headers,
+        } = builder;
+
         Ok(Self {
-            length: builder
-                .size_in_bytes()
-                .and_then(|sz| i32::try_from(sz).map_err(Into::into))?,
-            attributes: builder.attributes,
-            timestamp_delta: *builder.timestamp_delta,
-            offset_delta: *builder.offset_delta,
-            key: builder.key.into(),
-            value: builder.value.into(),
-            headers: builder.headers.0.into_iter().map(Into::into).collect(),
+            length,
+            attributes,
+            timestamp_delta: timestamp_delta.into(),
+            offset_delta: offset_delta.into(),
+            key: key.into(),
+            value: value.into(),
+            headers: headers.into_iter().map(Header::from).collect(),
         })
     }
 }
 
 impl From<Record> for Builder {
     fn from(value: Record) -> Self {
+        let Record {
+            attributes,
+            timestamp_delta,
+            offset_delta,
+            key,
+            value,
+            headers,
+            ..
+        } = value;
+
         Self {
-            attributes: value.attributes,
-            timestamp_delta: value.timestamp_delta.into(),
-            offset_delta: value.offset_delta.into(),
-            key: value.key.into(),
-            value: value.value.into(),
-            headers: value.headers.into_iter().map(Into::into).collect(),
+            attributes,
+            timestamp_delta: LongVarInt::from(timestamp_delta),
+            offset_delta: VarInt::from(offset_delta),
+            key: Octets::from(key),
+            value: Octets::from(value),
+            headers: headers.into_iter().map(header::Builder::from).collect(),
         }
     }
 }
@@ -337,33 +323,42 @@ impl Serialize for Builder {
     where
         S: Serializer,
     {
-        serializer.serialize_seq(None).and_then(|mut s| {
-            self.size_in_bytes()
-                .map_err(|e| ser::Error::custom(e.to_string()))
-                .map(|size| {
-                    VarInt::try_from(size)
-                        .map_err(|e| ser::Error::custom(e.to_string()))
-                        .and_then(|v| s.serialize_element(&v))
-                })
-                .and(s.serialize_element(&self.attributes))
-                .and(s.serialize_element(&self.timestamp_delta))
-                .and(s.serialize_element(&self.offset_delta))
-                .and(s.serialize_element(&self.key))
-                .and(s.serialize_element(&self.value))
-                .and(s.serialize_element(&self.headers))
-                .and(s.end())
-        })
+        let custom = |error: crate::Error| ser::Error::custom(error.to_string());
+        let mut seq = serializer.serialize_seq(None)?;
+
+        let size = self.size_in_bytes().map_err(custom);
+        if let Ok(size) = size {
+            _ = VarInt::try_from(size)
+                .map_err(custom)
+                .and_then(|length| seq.serialize_element(&length));
+        }
+
+        let attributes = seq.serialize_element(&self.attributes);
+        let timestamp_delta = seq.serialize_element(&self.timestamp_delta);
+        let offset_delta = seq.serialize_element(&self.offset_delta);
+        let key = seq.serialize_element(&self.key);
+        let value = seq.serialize_element(&self.value);
+        let headers = seq.serialize_element(&self.headers);
+
+        size.and(attributes)
+            .and(timestamp_delta)
+            .and(offset_delta)
+            .and(key)
+            .and(value)
+            .and(headers)
+            .and(seq.end())
     }
 }
 
 impl ByteSize for Builder {
     fn size_in_bytes(&self) -> Result<usize> {
-        Ok(size_of::<u8>()
-            + self.timestamp_delta.size_in_bytes()?
-            + self.offset_delta.size_in_bytes()?
-            + self.key.size_in_bytes()?
-            + self.value.size_in_bytes()?
-            + self.headers.size_in_bytes()?)
+        let mut total = size_of::<u8>();
+        total += self.timestamp_delta.size_in_bytes()?;
+        total += self.offset_delta.size_in_bytes()?;
+        for octets in [&self.key, &self.value] {
+            total += octets.size_in_bytes()?;
+        }
+        Ok(total + self.headers.size_in_bytes()?)
     }
 }
 
@@ -375,193 +370,153 @@ impl Builder {
 
     #[must_use]
     pub fn timestamp_delta(self, timestamp_delta: i64) -> Self {
+        let timestamp_delta = LongVarInt::from(timestamp_delta);
         Self {
-            timestamp_delta: timestamp_delta.into(),
+            timestamp_delta,
             ..self
         }
     }
 
     #[must_use]
     pub fn offset_delta(self, offset_delta: i32) -> Self {
+        let offset_delta = VarInt::from(offset_delta);
         Self {
-            offset_delta: offset_delta.into(),
+            offset_delta,
             ..self
         }
     }
 
     #[must_use]
     pub fn key(self, key: Option<Bytes>) -> Self {
-        Self {
-            key: key.into(),
-            ..self
-        }
+        let key = Octets::from(key);
+        Self { key, ..self }
     }
 
     #[must_use]
     pub fn value(self, value: Option<Bytes>) -> Self {
-        Self {
-            value: value.into(),
-            ..self
-        }
+        let value = Octets::from(value);
+        Self { value, ..self }
     }
 
     #[must_use]
     pub fn header(mut self, header: header::Builder) -> Self {
-        self.headers.0.extend(vec![header]);
+        self.headers.0.push(header);
         self
     }
 
     pub fn build(self) -> Result<Record> {
-        Record::try_from(self)
+        self.try_into()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::{Error, Result, ser::RecordBatchEncoder};
-    use codec::Sequence;
-    use tracing::subscriber::DefaultGuard;
-    use tracing_subscriber::EnvFilter;
+    use bytes::{Bytes, BytesMut};
 
-    fn init_tracing() -> Result<DefaultGuard> {
-        use std::{fs::File, sync::Arc, thread};
+    use super::{Octets, Record, codec::Sequence};
+    use crate::{ByteSize as _, Decode as _, Encode as _, Error, Result, ser::RecordBatchEncoder};
 
-        Ok(tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_level(true)
-                .with_line_number(true)
-                .with_thread_names(false)
-                .with_env_filter(EnvFilter::from_default_env().add_directive(
-                    format!("{}=debug", env!("CARGO_PKG_NAME").replace("-", "_")).parse()?,
-                ))
-                .with_writer(
-                    thread::current()
-                        .name()
-                        .ok_or(Error::Message(String::from("unnamed thread")))
-                        .and_then(|name| {
-                            File::create(format!("../logs/{}/{name}.log", env!("CARGO_PKG_NAME"),))
-                                .map_err(Into::into)
-                        })
-                        .map(Arc::new)?,
-                )
-                .finish(),
-        ))
+    /// A record carrying only the value `def`, on the wire: length 9, no
+    /// attributes, both deltas 0, a null key, a three-byte value, no headers.
+    const DEF: [u8; 10] = [18, 0, 0, 0, 1, 6, 100, 101, 102, 0];
+
+    /// Logs this test at `debug` for this crate, on top of `RUST_LOG`, into
+    /// `../logs/<package>/<thread>.log`: one file per test.
+    fn init_tracing() -> Result<tracing::subscriber::DefaultGuard> {
+        let directive = format!("{}=debug", env!("CARGO_CRATE_NAME")).parse()?;
+        let filter = tracing_subscriber::EnvFilter::from_default_env().add_directive(directive);
+
+        let unnamed = || Error::Message(String::from("unnamed thread"));
+        let current = std::thread::current();
+        let test = current.name().ok_or_else(unnamed)?;
+        let log = std::fs::File::create(format!("../logs/{}/{test}.log", env!("CARGO_PKG_NAME")))?;
+
+        let subscriber = tracing_subscriber::fmt().with_level(true);
+        let subscriber = subscriber.with_line_number(true).with_thread_names(false);
+        let subscriber = subscriber.with_env_filter(filter);
+        let subscriber = subscriber.with_writer(std::sync::Arc::new(log));
+        Ok(tracing::subscriber::set_default(subscriber.finish()))
+    }
+
+    fn def() -> super::Builder {
+        Record::builder().value(Some(Bytes::from_static(b"def")))
+    }
+
+    /// What `value` serializes to through the record batch encoder.
+    fn serialized(value: impl serde::Serialize) -> Result<Bytes> {
+        let mut encoder = RecordBatchEncoder::new(BytesMut::new());
+        value.serialize(&mut encoder)?;
+        Ok(Bytes::from(encoder))
     }
 
     #[test]
-    fn bytes_size() -> Result<()> {
+    fn octets_are_prefixed_by_their_length() -> Result<()> {
         let _guard = init_tracing()?;
-
         assert_eq!(4, Octets::from(Some(vec![100, 101, 102])).size_in_bytes()?);
         Ok(())
     }
 
     #[test]
-    fn record_size() -> Result<()> {
+    fn a_builder_sizes_the_record_without_its_length() -> Result<()> {
         let _guard = init_tracing()?;
-
-        assert_eq!(
-            9,
-            Record::builder()
-                .value(Some(Bytes::from(vec![100, 101, 102])))
-                .size_in_bytes()?
-        );
+        assert_eq!(9, def().size_in_bytes()?);
         Ok(())
     }
 
     #[test]
-    fn serialize_record_builder() -> Result<()> {
+    fn a_built_record_carries_the_builder_size_as_its_length() -> Result<()> {
         let _guard = init_tracing()?;
-
-        let rb = Record::builder().value(Some(Bytes::from(vec![100, 101, 102])));
-
-        let mut e = RecordBatchEncoder::new(BytesMut::new());
-        rb.serialize(&mut e)?;
-
-        let encoded = Bytes::from(e);
-
-        assert_eq!(&[18, 0, 0, 0, 1, 6, 100, 101, 102, 0], &encoded[..]);
+        assert_eq!(9, Record::try_from(def())?.length);
         Ok(())
     }
 
     #[test]
-    fn encode_record_builder() -> Result<()> {
+    fn a_builder_serializes_as_the_record_does() -> Result<()> {
         let _guard = init_tracing()?;
-
-        let rb = Record::builder()
-            .value(Some(Bytes::from_static(b"def")))
-            .build()?;
-
-        let encoded = rb.encode()?;
-        assert_eq!(
-            Bytes::from(vec![18, 0, 0, 0, 1, 6, 100, 101, 102, 0]),
-            encoded
-        );
-
+        assert_eq!(&DEF[..], &serialized(def())?[..]);
         Ok(())
     }
 
     #[test]
-    fn decode_record_builder() -> Result<()> {
+    fn a_record_encodes_and_decodes_through_the_wire_bytes() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let mut encoded = Bytes::from(vec![18, 0, 0, 0, 1, 6, 100, 101, 102, 0]);
-        let actual = Record::decode(&mut encoded)?;
+        let record = def().build()?;
+        assert_eq!(Bytes::from_static(&DEF), record.encode()?);
 
-        let expected = Record::builder()
-            .value(Some(Bytes::from_static(b"def")))
-            .build()?;
-
-        assert_eq!(expected, actual);
-
+        let mut encoded = Bytes::from_static(&DEF);
+        assert_eq!(record, Record::decode(&mut encoded)?);
+        assert!(encoded.is_empty());
         Ok(())
     }
 
     #[test]
-    fn try_from_record_builder() -> Result<()> {
+    fn a_sequence_of_builders_is_prefixed_by_its_count() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let record =
-            Record::try_from(Record::builder().value(Some(Bytes::from(vec![100, 101, 102]))))?;
-        assert_eq!(9, record.length);
-        Ok(())
-    }
-
-    #[test]
-    fn sequence_of_record_builder() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let rb = Record::builder().value(Some(Bytes::from(vec![100, 101, 102])));
-        let records = Sequence::from(vec![rb.clone()]);
+        let records = Sequence::from(vec![def()]);
         assert_eq!(14, records.size_in_bytes()?);
 
-        let mut e = RecordBatchEncoder::new(BytesMut::new());
-        records.serialize(&mut e)?;
-
-        let encoded = Bytes::from(e);
-
-        assert_eq!(
-            &[0, 0, 0, 1, 18, 0, 0, 0, 1, 6, 100, 101, 102, 0],
-            &encoded[..]
-        );
-
+        let mut expected = vec![0, 0, 0, 1];
+        expected.extend_from_slice(&DEF);
+        assert_eq!(&expected[..], &serialized(records)?[..]);
         Ok(())
     }
 
+    /// The checksum a batch header and the [`DEF`] record give under
+    /// CRC-32C, the algorithm a v2 batch is checked with.
     #[test]
-    fn crc_check() -> Result<()> {
+    fn a_batch_checksum_is_crc32c() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let mut digester = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
-
-        digester.update(&[
+        let header = [
             0, 0, 0, 0, 0, 0, 0, 0, 1, 141, 116, 152, 137, 53, 0, 0, 1, 141, 116, 152, 137, 53, 0,
-            0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 18, 0, 0, 0, 1, 6, 100, 101, 102, 0,
-        ]);
-
-        assert_eq!(1_126_819_645, digester.finalize());
-
+            0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1,
+        ];
+        let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
+        digest.update(&header);
+        digest.update(&DEF);
+        assert_eq!(1_126_819_645, digest.finalize());
         Ok(())
     }
 }
