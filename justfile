@@ -1297,6 +1297,14 @@ fmt:
 # third field is a compile error rather than a silent drop. Only code went, so
 # the ceiling rises.
 #
+#   defork  +44 lines, the record rewritten, and a record-batch bench  2814 -> 2814  2.6902 -> 2.6888
+#
+# Lot F's first file (Popsink/data-plane#5885): `record.rs`'s bodies, tests and
+# module docs. `benches/record_bench.rs` comes with it, because `decode_bench`
+# never inflates a batch and so never reaches a record: it deflates and inflates
+# a hundred records, uncompressed and LZ4. The bench has no `//`, so the ratio
+# falls and the ceiling follows it.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1306,7 +1314,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6902" top="12":
+comments ceiling="2.6889" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
