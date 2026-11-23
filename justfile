@@ -1322,6 +1322,14 @@ fmt:
 # #320) stay where they were. Comment went faster than code, so the ratio falls
 # and the ceiling follows it.
 #
+#   defork  -193 lines, the deflated batch's tests rewritten  2802 -> 2800  2.6803 -> 2.6824
+#
+# `record/deflated.rs`'s tests (Popsink/data-plane#5885). The gzip, zstd and
+# LZ4 tests were one round trip written three times; they share `round_trip`
+# over the same wire bytes, now constants. The LZ4 descriptor test keeps its
+# #253 reasoning as a doc comment. More code went than comment, so the ceiling
+# rises.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1331,7 +1339,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6804" top="12":
+comments ceiling="2.6825" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
