@@ -2,7 +2,8 @@
 
 The runbook for acceptance items 1–3 of Popsink/data-plane#6179 (DEV-485):
 a broker deployed from the chart on GKE with Workload Identity alone, a
-sustained load test, and the offset-commit bound. **None of it has been run.**
+sustained load test, and the offset-commit bound. **Only step 1 has been run**
+(results under it).
 It needs a GCP project, a bucket and a GKE cluster, which this repository's CI
 does not hold and, by decision (`docs/testing.md`, 2026-09-03), will not hold
 on a schedule. Everything that can be measured without them is measured in the
@@ -54,6 +55,25 @@ tansu audit --storage-engine gs://<bucket>/ --cluster-id <one of the suite's clu
 
 **Pass**: both runs complete and agree (#758 is what gives the audit the
 broker's retry budgets on GCS).
+
+**Run on 2026-11-23**, against `gs://kodansu-dev485-validation/` (sandbox
+project, europe-west1, created with the operator docs' command; its `describe |
+jq` check returned exactly the expected values). The build was `main` with
+#758, #760 and this branch merged, run from a workstation and authenticated as
+a user (`authorized_user` ADC). Results:
+
+- 757 of 758 passed. About 2,200 objects were written, with no `MissingVersion`
+  and no `429`.
+- The one failure was `produce_fan_out::partitions_are_written_at_once`, a
+  wall-clock bound calibrated for `memory://`: eight partitions must finish
+  inside two lingers (500 ms). Over GCS from a workstation they took 520–600 ms
+  across four runs, which is one linger plus ~300 ms of round trips. A serial
+  write would be at least 2 s, so this is latency and not a regression. That
+  bound cannot hold against a remote store.
+- `tansu audit`, two passes on each of three of the suite's clusters: the passes
+  were identical, 0 unreadable, no records lost.
+
+Not yet run: steps 2–4.
 
 ## 2. Acceptance 1 — deployed from the chart with Workload Identity only
 
