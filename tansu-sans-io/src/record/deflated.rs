@@ -691,45 +691,39 @@ impl<'de> Deserialize<'de> for Batch {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+    use serde::Deserialize as _;
+    use tracing::debug;
 
+    use super::Batch;
     use crate::{
-        BatchAttribute, ControlBatch, EndTransactionMarker, de::BatchDecoder, record::inflated,
+        BatchAttribute, Compression, ControlBatch, EndTransactionMarker, Error, Result,
+        de::BatchDecoder,
+        record::{Record, inflated},
     };
-
-    use super::*;
-
-    use tracing::subscriber::DefaultGuard;
 
     #[cfg(miri)]
     fn init_tracing() -> Result<()> {
         Ok(())
     }
 
+    /// Logs this test at `debug`, active spans included, into
+    /// `../logs/<package>/<thread>.log`: one file per test.
     #[cfg(not(miri))]
-    fn init_tracing() -> Result<DefaultGuard> {
-        use std::{fs::File, sync::Arc, thread};
-
+    fn init_tracing() -> Result<tracing::subscriber::DefaultGuard> {
         use tracing_subscriber::fmt::format::FmtSpan;
 
-        Ok(tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_level(true)
-                .with_line_number(true)
-                .with_thread_names(false)
-                .with_max_level(tracing::Level::DEBUG)
-                .with_span_events(FmtSpan::ACTIVE)
-                .with_writer(
-                    thread::current()
-                        .name()
-                        .ok_or(Error::Message(String::from("unnamed thread")))
-                        .and_then(|name| {
-                            File::create(format!("../logs/{}/{name}.log", env!("CARGO_PKG_NAME")))
-                                .map_err(Into::into)
-                        })
-                        .map(Arc::new)?,
-                )
-                .finish(),
-        ))
+        let unnamed = || Error::Message(String::from("unnamed thread"));
+        let current = std::thread::current();
+        let test = current.name().ok_or_else(unnamed)?;
+        let log = std::fs::File::create(format!("../logs/{}/{test}.log", env!("CARGO_PKG_NAME")))?;
+
+        let subscriber = tracing_subscriber::fmt().with_level(true);
+        let subscriber = subscriber.with_line_number(true).with_thread_names(false);
+        let subscriber = subscriber.with_max_level(tracing::Level::DEBUG);
+        let subscriber = subscriber.with_span_events(FmtSpan::ACTIVE);
+        let subscriber = subscriber.with_writer(std::sync::Arc::new(log));
+        Ok(tracing::subscriber::set_default(subscriber.finish()))
     }
 
     const LOREM: &[u8] = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do \
@@ -740,521 +734,334 @@ mod tests {
     pariatur. Excepteur sint occaecat cupidatat non proident, sunt in \
     culpa qui officia deserunt mollit anim id est laborum.";
 
-    #[test]
-    fn decode_gzip() -> Result<()> {
-        let _guard = init_tracing()?;
+    /// Batches of one [`LOREM`] record, one per codec, in their wire bytes.
+    const GZIP: [u8; 360] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 89, 0, 0, 0, 0, 2, 198, 48, 56, 83, 0, 1, 0, 0, 0, 0, 0,
+        0, 1, 145, 183, 231, 239, 158, 0, 0, 1, 145, 183, 231, 239, 158, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 1, 31, 139, 8, 0, 0, 0, 0, 0, 0, 19,
+        53, 144, 205, 81, 67, 49, 12, 132, 31, 23, 104, 99, 11, 200, 188, 42, 224, 198, 149, 2,
+        132, 172, 4, 205, 248, 47, 182, 148, 73, 9, 169, 153, 19, 50, 15, 110, 150, 37, 173, 118,
+        191, 199, 203, 182, 109, 79, 223, 207, 239, 109, 72, 129, 246, 233, 5, 169, 229, 54, 48,
+        213, 64, 69, 236, 4, 110, 117, 10, 155, 152, 15, 80, 210, 174, 147, 181, 94, 32, 89, 163,
+        57, 37, 197, 2, 68, 125, 150, 150, 96, 82, 122, 44, 107, 101, 77, 154, 188, 26, 220, 144,
+        233, 51, 228, 33, 118, 72, 11, 10, 93, 42, 129, 178, 94, 157, 118, 124, 24, 164, 106, 9,
+        109, 20, 93, 143, 91, 148, 84, 78, 184, 186, 78, 212, 54, 109, 120, 130, 220, 101, 176, 26,
+        153, 182, 10, 207, 153, 10, 183, 67, 121, 13, 233, 212, 117, 233, 87, 82, 123, 12, 67, 40,
+        140, 151, 240, 212, 142, 0, 113, 202, 118, 188, 46, 73, 114, 19, 232, 240, 112, 114, 100,
+        213, 138, 33, 125, 200, 151, 212, 36, 35, 130, 199, 199, 173, 101, 239, 113, 78, 194, 78,
+        36, 133, 204, 41, 96, 205, 249, 159, 80, 4, 114, 156, 253, 162, 100, 168, 203, 16, 58, 141,
+        40, 124, 236, 120, 187, 179, 116, 19, 95, 24, 131, 65, 99, 38, 225, 152, 99, 239, 154, 200,
+        214, 70, 164, 232, 163, 105, 146, 186, 40, 46, 82, 113, 148, 61, 119, 90, 185, 209, 206,
+        103, 101, 37, 36, 153, 50, 86, 183, 180, 188, 108, 208, 2, 164, 129, 99, 254, 113, 245,
+        178, 111, 63, 143, 62, 223, 101, 198, 1, 0, 0, 0, 0, 0,
+    ];
+    const ZSTD: [u8; 362] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 91, 0, 0, 0, 0, 2, 200, 21, 172, 244, 0, 4, 0, 0, 0, 0, 0,
+        0, 1, 145, 183, 250, 201, 221, 0, 0, 1, 145, 183, 250, 201, 221, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 1, 40, 181, 47, 253, 0, 88, 13, 9, 0,
+        70, 217, 64, 36, 160, 37, 73, 7, 255, 255, 255, 255, 143, 174, 211, 102, 147, 114, 239,
+        182, 165, 188, 148, 244, 91, 75, 123, 39, 146, 211, 241, 3, 167, 201, 64, 245, 234, 24, 45,
+        9, 56, 0, 53, 0, 53, 0, 197, 44, 90, 146, 147, 15, 123, 209, 29, 99, 44, 57, 147, 242, 238,
+        145, 18, 167, 14, 240, 197, 53, 216, 71, 250, 57, 169, 162, 68, 227, 112, 178, 27, 29, 160,
+        77, 21, 159, 138, 174, 28, 169, 201, 116, 94, 99, 116, 4, 0, 36, 40, 40, 138, 34, 0, 130,
+        229, 38, 220, 115, 204, 62, 221, 154, 126, 195, 84, 41, 89, 187, 99, 225, 7, 114, 194, 37,
+        137, 48, 157, 53, 61, 15, 29, 152, 186, 25, 81, 115, 187, 41, 169, 154, 155, 139, 5, 74,
+        168, 60, 188, 84, 203, 12, 101, 106, 116, 141, 206, 64, 149, 40, 177, 142, 234, 180, 74,
+        73, 43, 214, 13, 89, 104, 186, 46, 229, 163, 78, 201, 197, 23, 35, 106, 44, 60, 89, 14, 81,
+        123, 241, 200, 196, 124, 192, 232, 24, 213, 94, 163, 68, 175, 49, 171, 233, 41, 160, 4,
+        172, 60, 28, 57, 99, 110, 52, 5, 193, 100, 114, 201, 107, 110, 85, 124, 41, 103, 138, 150,
+        200, 201, 164, 245, 241, 66, 225, 250, 60, 180, 78, 201, 97, 153, 58, 64, 51, 249, 161, 83,
+        59, 43, 22, 22, 249, 201, 81, 172, 225, 26, 227, 138, 246, 84, 148, 198, 227, 145, 24, 80,
+        66, 8, 0, 220, 218, 44, 15, 30, 45, 186, 100, 95, 73, 49, 124, 17, 109, 0, 43, 70, 43, 93,
+        140, 227, 122, 67, 136, 2, 0, 0, 0,
+    ];
+    const LZ4: [u8; 508] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 237, 0, 0, 0, 0, 2, 43, 216, 167, 237, 0, 3, 0, 0, 0, 0,
+        0, 0, 1, 145, 184, 77, 37, 242, 0, 0, 1, 145, 184, 77, 37, 242, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 1, 4, 34, 77, 24, 96, 64, 130, 173,
+        1, 0, 0, 242, 95, 136, 7, 0, 0, 0, 1, 250, 6, 76, 111, 114, 101, 109, 32, 105, 112, 115,
+        117, 109, 32, 100, 111, 108, 111, 114, 32, 115, 105, 116, 32, 97, 109, 101, 116, 44, 32,
+        99, 111, 110, 115, 101, 99, 116, 101, 116, 117, 114, 32, 97, 100, 105, 112, 105, 115, 99,
+        105, 110, 103, 32, 101, 108, 105, 116, 44, 32, 115, 101, 100, 32, 100, 111, 32, 101, 105,
+        117, 115, 109, 111, 100, 32, 116, 101, 109, 112, 111, 114, 32, 105, 110, 99, 105, 100, 105,
+        100, 117, 110, 116, 32, 117, 116, 32, 108, 97, 98, 111, 114, 101, 32, 101, 116, 91, 0, 240,
+        14, 101, 32, 109, 97, 103, 110, 97, 32, 97, 108, 105, 113, 117, 97, 46, 32, 85, 116, 32,
+        101, 110, 105, 109, 32, 97, 100, 32, 109, 105, 9, 0, 242, 26, 118, 101, 110, 105, 97, 109,
+        44, 32, 113, 117, 105, 115, 32, 110, 111, 115, 116, 114, 117, 100, 32, 101, 120, 101, 114,
+        99, 105, 116, 97, 116, 105, 111, 110, 32, 117, 108, 108, 97, 109, 99, 111, 90, 0, 0, 37, 0,
+        98, 105, 115, 105, 32, 117, 116, 83, 0, 242, 1, 105, 112, 32, 101, 120, 32, 101, 97, 32,
+        99, 111, 109, 109, 111, 100, 111, 193, 0, 112, 113, 117, 97, 116, 46, 32, 68, 83, 0, 162,
+        97, 117, 116, 101, 32, 105, 114, 117, 114, 101, 145, 0, 240, 2, 32, 105, 110, 32, 114, 101,
+        112, 114, 101, 104, 101, 110, 100, 101, 114, 105, 116, 17, 0, 176, 118, 111, 108, 117, 112,
+        116, 97, 116, 101, 32, 118, 234, 0, 164, 32, 101, 115, 115, 101, 32, 99, 105, 108, 108, 34,
+        1, 208, 101, 32, 101, 117, 32, 102, 117, 103, 105, 97, 116, 32, 110, 145, 0, 240, 4, 32,
+        112, 97, 114, 105, 97, 116, 117, 114, 46, 32, 69, 120, 99, 101, 112, 116, 101, 117, 71, 1,
+        240, 4, 110, 116, 32, 111, 99, 99, 97, 101, 99, 97, 116, 32, 99, 117, 112, 105, 100, 97,
+        116, 50, 0, 160, 111, 110, 32, 112, 114, 111, 105, 100, 101, 110, 70, 1, 0, 42, 1, 128,
+        105, 110, 32, 99, 117, 108, 112, 97, 248, 0, 224, 32, 111, 102, 102, 105, 99, 105, 97, 32,
+        100, 101, 115, 101, 114, 30, 0, 64, 109, 111, 108, 108, 147, 1, 0, 33, 1, 240, 1, 105, 100,
+        32, 101, 115, 116, 32, 108, 97, 98, 111, 114, 117, 109, 46, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    const SNAPPY: [u8; 489] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 218, 0, 0, 0, 0, 2, 228, 189, 111, 249, 0, 2, 0, 0, 0, 0,
+        0, 0, 1, 145, 184, 92, 90, 192, 0, 0, 1, 145, 184, 92, 90, 192, 255, 255, 255, 255, 255,
+        255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 1, 198, 3, 240, 111, 136, 7, 0, 0, 0,
+        1, 250, 6, 76, 111, 114, 101, 109, 32, 105, 112, 115, 117, 109, 32, 100, 111, 108, 111,
+        114, 32, 115, 105, 116, 32, 97, 109, 101, 116, 44, 32, 99, 111, 110, 115, 101, 99, 116,
+        101, 116, 117, 114, 32, 97, 100, 105, 112, 105, 115, 99, 105, 110, 103, 32, 101, 108, 105,
+        116, 44, 32, 115, 101, 100, 32, 100, 111, 32, 101, 105, 117, 115, 109, 111, 100, 32, 116,
+        101, 109, 112, 111, 114, 32, 105, 110, 99, 105, 100, 105, 100, 117, 110, 116, 32, 117, 116,
+        32, 108, 97, 98, 111, 114, 101, 32, 101, 116, 32, 100, 1, 91, 112, 101, 32, 109, 97, 103,
+        110, 97, 32, 97, 108, 105, 113, 117, 97, 46, 32, 85, 116, 32, 101, 110, 105, 109, 32, 97,
+        100, 32, 109, 105, 1, 9, 160, 118, 101, 110, 105, 97, 109, 44, 32, 113, 117, 105, 115, 32,
+        110, 111, 115, 116, 114, 117, 100, 32, 101, 120, 101, 114, 99, 105, 116, 97, 116, 105, 111,
+        110, 32, 117, 108, 108, 97, 109, 99, 111, 9, 90, 1, 37, 8, 105, 115, 105, 1, 106, 5, 83,
+        60, 105, 112, 32, 101, 120, 32, 101, 97, 32, 99, 111, 109, 109, 111, 100, 111, 9, 193, 24,
+        113, 117, 97, 116, 46, 32, 68, 1, 83, 36, 97, 117, 116, 101, 32, 105, 114, 117, 114, 101,
+        13, 236, 60, 105, 110, 32, 114, 101, 112, 114, 101, 104, 101, 110, 100, 101, 114, 105, 116,
+        1, 17, 40, 118, 111, 108, 117, 112, 116, 97, 116, 101, 32, 118, 1, 234, 36, 32, 101, 115,
+        115, 101, 32, 99, 105, 108, 108, 49, 34, 232, 101, 32, 101, 117, 32, 102, 117, 103, 105,
+        97, 116, 32, 110, 117, 108, 108, 97, 32, 112, 97, 114, 105, 97, 116, 117, 114, 46, 32, 69,
+        120, 99, 101, 112, 116, 101, 117, 114, 32, 115, 105, 110, 116, 32, 111, 99, 99, 97, 101,
+        99, 97, 116, 32, 99, 117, 112, 105, 100, 97, 116, 1, 50, 60, 111, 110, 32, 112, 114, 111,
+        105, 100, 101, 110, 116, 44, 32, 115, 117, 110, 5, 117, 88, 99, 117, 108, 112, 97, 32, 113,
+        117, 105, 32, 111, 102, 102, 105, 99, 105, 97, 32, 100, 101, 115, 101, 114, 1, 30, 12, 109,
+        111, 108, 108, 33, 147, 33, 33, 60, 105, 100, 32, 101, 115, 116, 32, 108, 97, 98, 111, 114,
+        117, 109, 46, 0, 0, 0, 0,
+    ];
 
-        let encoded = &[
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 89, 0, 0, 0, 0, 2, 198, 48, 56, 83, 0, 1, 0, 0, 0, 0,
-            0, 0, 1, 145, 183, 231, 239, 158, 0, 0, 1, 145, 183, 231, 239, 158, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 1, 31, 139, 8, 0, 0, 0, 0,
-            0, 0, 19, 53, 144, 205, 81, 67, 49, 12, 132, 31, 23, 104, 99, 11, 200, 188, 42, 224,
-            198, 149, 2, 132, 172, 4, 205, 248, 47, 182, 148, 73, 9, 169, 153, 19, 50, 15, 110,
-            150, 37, 173, 118, 191, 199, 203, 182, 109, 79, 223, 207, 239, 109, 72, 129, 246, 233,
-            5, 169, 229, 54, 48, 213, 64, 69, 236, 4, 110, 117, 10, 155, 152, 15, 80, 210, 174,
-            147, 181, 94, 32, 89, 163, 57, 37, 197, 2, 68, 125, 150, 150, 96, 82, 122, 44, 107,
-            101, 77, 154, 188, 26, 220, 144, 233, 51, 228, 33, 118, 72, 11, 10, 93, 42, 129, 178,
-            94, 157, 118, 124, 24, 164, 106, 9, 109, 20, 93, 143, 91, 148, 84, 78, 184, 186, 78,
-            212, 54, 109, 120, 130, 220, 101, 176, 26, 153, 182, 10, 207, 153, 10, 183, 67, 121,
-            13, 233, 212, 117, 233, 87, 82, 123, 12, 67, 40, 140, 151, 240, 212, 142, 0, 113, 202,
-            118, 188, 46, 73, 114, 19, 232, 240, 112, 114, 100, 213, 138, 33, 125, 200, 151, 212,
-            36, 35, 130, 199, 199, 173, 101, 239, 113, 78, 194, 78, 36, 133, 204, 41, 96, 205, 249,
-            159, 80, 4, 114, 156, 253, 162, 100, 168, 203, 16, 58, 141, 40, 124, 236, 120, 187,
-            179, 116, 19, 95, 24, 131, 65, 99, 38, 225, 152, 99, 239, 154, 200, 214, 70, 164, 232,
-            163, 105, 146, 186, 40, 46, 82, 113, 148, 61, 119, 90, 185, 209, 206, 103, 101, 37, 36,
-            153, 50, 86, 183, 180, 188, 108, 208, 2, 164, 129, 99, 254, 113, 245, 178, 111, 63,
-            143, 62, 223, 101, 198, 1, 0, 0, 0, 0, 0,
-        ];
+    /// The one record every captured batch carries: `LOREM`, unkeyed.
+    fn lorem() -> Vec<Record> {
+        vec![Record {
+            length: 452,
+            attributes: 0,
+            timestamp_delta: 0,
+            offset_delta: 0,
+            key: None,
+            value: Some(Bytes::from_static(LOREM)),
+            headers: Vec::new(),
+        }]
+    }
 
-        let decoder = BatchDecoder::new(Bytes::from_static(encoded));
-        let decoded = Batch::deserialize(decoder)?;
+    fn decoded(encoded: &'static [u8]) -> Result<Batch> {
+        Batch::deserialize(BatchDecoder::new(Bytes::from_static(encoded)))
+    }
 
-        assert_eq!(
-            Compression::Gzip,
-            Compression::try_from(decoded.attributes)?
-        );
+    /// A captured batch decodes as `compression`, inflates to [`lorem`], and
+    /// deflates back with the same header and records.
+    fn round_trip(encoded: &'static [u8], compression: Compression) -> Result<()> {
+        let batch = decoded(encoded)?;
+        assert_eq!(compression, Compression::try_from(batch.attributes)?);
 
-        let mut inflated = crate::record::inflated::Batch::try_from(decoded.clone())
-            .inspect(|inflated| debug!(?inflated))?;
-
+        let mut inflated = inflated::Batch::try_from(batch.clone())?;
+        debug!(?inflated);
         assert_eq!(
             Compression::None,
             Compression::try_from(inflated.attributes)?
         );
+        assert_eq!(lorem(), inflated.records);
 
-        assert_eq!(
-            vec![Record {
-                length: 452,
-                attributes: 0,
-                timestamp_delta: 0,
-                offset_delta: 0,
-                key: None,
-                value: Some(Bytes::from_static(LOREM)),
-                headers: [].into()
-            }],
-            inflated.records
-        );
-
-        inflated.attributes = BatchAttribute::try_from(inflated.attributes)
-            .map(|attribute| attribute.compression(Compression::Gzip).into())?;
-
+        let attribute = BatchAttribute::try_from(inflated.attributes)?;
+        inflated.attributes = attribute.compression(compression).into();
         let deflated = Batch::try_from(inflated)?;
-        assert_eq!(decoded.base_offset, deflated.base_offset);
-        assert_eq!(
-            decoded.partition_leader_epoch,
-            deflated.partition_leader_epoch
-        );
-        assert_eq!(decoded.magic, deflated.magic);
-        assert_eq!(decoded.attributes, deflated.attributes);
-        assert_eq!(decoded.last_offset_delta, deflated.last_offset_delta);
-        assert_eq!(decoded.base_timestamp, deflated.base_timestamp);
 
-        let records: Vec<Record> = deflated.try_into()?;
-
-        assert_eq!(
-            vec![Record {
-                length: 452,
-                attributes: 0,
-                timestamp_delta: 0,
-                offset_delta: 0,
-                key: None,
-                value: Some(Bytes::from_static(LOREM)),
-                headers: [].into()
-            }],
-            records
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn decode_zstd() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let encoded = &[
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 91, 0, 0, 0, 0, 2, 200, 21, 172, 244, 0, 4, 0, 0, 0,
-            0, 0, 0, 1, 145, 183, 250, 201, 221, 0, 0, 1, 145, 183, 250, 201, 221, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 1, 40, 181, 47, 253, 0,
-            88, 13, 9, 0, 70, 217, 64, 36, 160, 37, 73, 7, 255, 255, 255, 255, 143, 174, 211, 102,
-            147, 114, 239, 182, 165, 188, 148, 244, 91, 75, 123, 39, 146, 211, 241, 3, 167, 201,
-            64, 245, 234, 24, 45, 9, 56, 0, 53, 0, 53, 0, 197, 44, 90, 146, 147, 15, 123, 209, 29,
-            99, 44, 57, 147, 242, 238, 145, 18, 167, 14, 240, 197, 53, 216, 71, 250, 57, 169, 162,
-            68, 227, 112, 178, 27, 29, 160, 77, 21, 159, 138, 174, 28, 169, 201, 116, 94, 99, 116,
-            4, 0, 36, 40, 40, 138, 34, 0, 130, 229, 38, 220, 115, 204, 62, 221, 154, 126, 195, 84,
-            41, 89, 187, 99, 225, 7, 114, 194, 37, 137, 48, 157, 53, 61, 15, 29, 152, 186, 25, 81,
-            115, 187, 41, 169, 154, 155, 139, 5, 74, 168, 60, 188, 84, 203, 12, 101, 106, 116, 141,
-            206, 64, 149, 40, 177, 142, 234, 180, 74, 73, 43, 214, 13, 89, 104, 186, 46, 229, 163,
-            78, 201, 197, 23, 35, 106, 44, 60, 89, 14, 81, 123, 241, 200, 196, 124, 192, 232, 24,
-            213, 94, 163, 68, 175, 49, 171, 233, 41, 160, 4, 172, 60, 28, 57, 99, 110, 52, 5, 193,
-            100, 114, 201, 107, 110, 85, 124, 41, 103, 138, 150, 200, 201, 164, 245, 241, 66, 225,
-            250, 60, 180, 78, 201, 97, 153, 58, 64, 51, 249, 161, 83, 59, 43, 22, 22, 249, 201, 81,
-            172, 225, 26, 227, 138, 246, 84, 148, 198, 227, 145, 24, 80, 66, 8, 0, 220, 218, 44,
-            15, 30, 45, 186, 100, 95, 73, 49, 124, 17, 109, 0, 43, 70, 43, 93, 140, 227, 122, 67,
-            136, 2, 0, 0, 0,
-        ];
-
-        let decoder = BatchDecoder::new(Bytes::from_static(encoded));
-        let decoded = Batch::deserialize(decoder)?;
-
-        assert_eq!(
-            Compression::Zstd,
-            Compression::try_from(decoded.attributes)?
-        );
-
-        let mut inflated = crate::record::inflated::Batch::try_from(decoded.clone())?;
-
-        assert_eq!(
-            Compression::None,
-            Compression::try_from(inflated.attributes)?
-        );
-
-        assert_eq!(
-            vec![Record {
-                length: 452,
-                attributes: 0,
-                timestamp_delta: 0,
-                offset_delta: 0,
-                key: None,
-                value: Some(Bytes::from_static(LOREM)),
-                headers: [].into()
-            }],
-            inflated.records
-        );
-
-        inflated.attributes = BatchAttribute::try_from(inflated.attributes)
-            .map(|attribute| attribute.compression(Compression::Zstd).into())?;
-
-        let deflated = Batch::try_from(inflated)?;
-        assert_eq!(decoded.base_offset, deflated.base_offset);
-        assert_eq!(
-            decoded.partition_leader_epoch,
-            deflated.partition_leader_epoch
-        );
-        assert_eq!(decoded.magic, deflated.magic);
-        assert_eq!(decoded.attributes, deflated.attributes);
-        assert_eq!(decoded.last_offset_delta, deflated.last_offset_delta);
-        assert_eq!(decoded.base_timestamp, deflated.base_timestamp);
-
-        let records: Vec<Record> = deflated.try_into()?;
-
-        assert_eq!(
-            vec![Record {
-                length: 452,
-                attributes: 0,
-                timestamp_delta: 0,
-                offset_delta: 0,
-                key: None,
-                value: Some(Bytes::from_static(LOREM)),
-                headers: [].into()
-            }],
-            records
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn decode_lz4() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let encoded = &[
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 237, 0, 0, 0, 0, 2, 43, 216, 167, 237, 0, 3, 0, 0, 0,
-            0, 0, 0, 1, 145, 184, 77, 37, 242, 0, 0, 1, 145, 184, 77, 37, 242, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 1, 4, 34, 77, 24, 96, 64,
-            130, 173, 1, 0, 0, 242, 95, 136, 7, 0, 0, 0, 1, 250, 6, 76, 111, 114, 101, 109, 32,
-            105, 112, 115, 117, 109, 32, 100, 111, 108, 111, 114, 32, 115, 105, 116, 32, 97, 109,
-            101, 116, 44, 32, 99, 111, 110, 115, 101, 99, 116, 101, 116, 117, 114, 32, 97, 100,
-            105, 112, 105, 115, 99, 105, 110, 103, 32, 101, 108, 105, 116, 44, 32, 115, 101, 100,
-            32, 100, 111, 32, 101, 105, 117, 115, 109, 111, 100, 32, 116, 101, 109, 112, 111, 114,
-            32, 105, 110, 99, 105, 100, 105, 100, 117, 110, 116, 32, 117, 116, 32, 108, 97, 98,
-            111, 114, 101, 32, 101, 116, 91, 0, 240, 14, 101, 32, 109, 97, 103, 110, 97, 32, 97,
-            108, 105, 113, 117, 97, 46, 32, 85, 116, 32, 101, 110, 105, 109, 32, 97, 100, 32, 109,
-            105, 9, 0, 242, 26, 118, 101, 110, 105, 97, 109, 44, 32, 113, 117, 105, 115, 32, 110,
-            111, 115, 116, 114, 117, 100, 32, 101, 120, 101, 114, 99, 105, 116, 97, 116, 105, 111,
-            110, 32, 117, 108, 108, 97, 109, 99, 111, 90, 0, 0, 37, 0, 98, 105, 115, 105, 32, 117,
-            116, 83, 0, 242, 1, 105, 112, 32, 101, 120, 32, 101, 97, 32, 99, 111, 109, 109, 111,
-            100, 111, 193, 0, 112, 113, 117, 97, 116, 46, 32, 68, 83, 0, 162, 97, 117, 116, 101,
-            32, 105, 114, 117, 114, 101, 145, 0, 240, 2, 32, 105, 110, 32, 114, 101, 112, 114, 101,
-            104, 101, 110, 100, 101, 114, 105, 116, 17, 0, 176, 118, 111, 108, 117, 112, 116, 97,
-            116, 101, 32, 118, 234, 0, 164, 32, 101, 115, 115, 101, 32, 99, 105, 108, 108, 34, 1,
-            208, 101, 32, 101, 117, 32, 102, 117, 103, 105, 97, 116, 32, 110, 145, 0, 240, 4, 32,
-            112, 97, 114, 105, 97, 116, 117, 114, 46, 32, 69, 120, 99, 101, 112, 116, 101, 117, 71,
-            1, 240, 4, 110, 116, 32, 111, 99, 99, 97, 101, 99, 97, 116, 32, 99, 117, 112, 105, 100,
-            97, 116, 50, 0, 160, 111, 110, 32, 112, 114, 111, 105, 100, 101, 110, 70, 1, 0, 42, 1,
-            128, 105, 110, 32, 99, 117, 108, 112, 97, 248, 0, 224, 32, 111, 102, 102, 105, 99, 105,
-            97, 32, 100, 101, 115, 101, 114, 30, 0, 64, 109, 111, 108, 108, 147, 1, 0, 33, 1, 240,
-            1, 105, 100, 32, 101, 115, 116, 32, 108, 97, 98, 111, 114, 117, 109, 46, 0, 0, 0, 0, 0,
-            0, 0, 0,
-        ];
-
-        let decoder = BatchDecoder::new(Bytes::from_static(encoded));
-        let decoded = Batch::deserialize(decoder)?;
-        assert_eq!(Compression::Lz4, Compression::try_from(decoded.attributes)?);
-
-        let mut inflated = crate::record::inflated::Batch::try_from(decoded.clone())?;
-
-        assert_eq!(
-            Compression::None,
-            Compression::try_from(inflated.attributes)?
-        );
-
-        assert_eq!(
-            vec![Record {
-                length: 452,
-                attributes: 0,
-                timestamp_delta: 0,
-                offset_delta: 0,
-                key: None,
-                value: Some(Bytes::from_static(LOREM)),
-                headers: [].into()
-            }],
-            inflated.records
-        );
-
-        inflated.attributes = BatchAttribute::try_from(inflated.attributes)
-            .map(|attribute| attribute.compression(Compression::Lz4).into())?;
-
-        let deflated = Batch::try_from(inflated)?;
-        assert_eq!(decoded.base_offset, deflated.base_offset);
-        assert_eq!(
-            decoded.partition_leader_epoch,
-            deflated.partition_leader_epoch
-        );
-        assert_eq!(decoded.magic, deflated.magic);
-        assert_eq!(decoded.attributes, deflated.attributes);
-        assert_eq!(decoded.last_offset_delta, deflated.last_offset_delta);
-        assert_eq!(decoded.base_timestamp, deflated.base_timestamp);
-
-        let records: Vec<Record> = deflated.try_into()?;
-
-        assert_eq!(
-            vec![Record {
-                length: 452,
-                attributes: 0,
-                timestamp_delta: 0,
-                offset_delta: 0,
-                key: None,
-                value: Some(Bytes::from_static(LOREM)),
-                headers: [].into()
-            }],
-            records
-        );
-
-        Ok(())
-    }
-
-    #[test]
-    fn lz4_frame_sets_block_independence() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        // Kafka's Java client (KafkaLZ4BlockInputStream) mandates
-        // BD.blockIndependence and throws "Dependent block stream is
-        // unsupported" otherwise (issue #253). Assert on the raw frame
-        // descriptor rather than round-tripping through our own decoder:
-        // lz4::Decoder accepts both block modes, so a round-trip would pass
-        // even when the frame is unreadable by every Kafka Java client.
-        let deflated: Batch = inflated::Batch::builder()
-            .record(Record::builder().value(Bytes::from_static(LOREM).into()))
-            .attributes(
-                BatchAttribute::default()
-                    .compression(Compression::Lz4)
-                    .into(),
+        let header = |batch: &Batch| {
+            (
+                batch.base_offset,
+                batch.partition_leader_epoch,
+                batch.magic,
+                batch.attributes,
+                batch.last_offset_delta,
+                batch.base_timestamp,
             )
-            .build()
-            .and_then(TryInto::try_into)?;
-
-        let frame = &deflated.record_data[..];
-
-        // LZ4 frame magic number 0x184D2204, little endian.
-        assert_eq!([0x04, 0x22, 0x4D, 0x18], frame[..4]);
-
-        // FLG is the byte following the magic; bit 5 is B.Indep.
-        let flg = frame[4];
-        assert_eq!(
-            0b0010_0000,
-            flg & 0b0010_0000,
-            "FLG {flg:#010b} does not set block independence"
-        );
-
+        };
+        assert_eq!(header(&batch), header(&deflated));
+        assert_eq!(lorem(), Vec::<Record>::try_from(deflated)?);
         Ok(())
     }
 
     #[test]
-    fn decode_snappy() -> Result<()> {
+    fn gzip_round_trips() -> Result<()> {
+        let _guard = init_tracing()?;
+        round_trip(&GZIP, Compression::Gzip)
+    }
+
+    #[test]
+    fn zstd_round_trips() -> Result<()> {
+        let _guard = init_tracing()?;
+        round_trip(&ZSTD, Compression::Zstd)
+    }
+
+    #[test]
+    fn lz4_round_trips() -> Result<()> {
+        let _guard = init_tracing()?;
+        round_trip(&LZ4, Compression::Lz4)
+    }
+
+    /// Snappy is read, never written, so the captured batch only inflates.
+    #[test]
+    fn snappy_inflates() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let encoded = &[
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 218, 0, 0, 0, 0, 2, 228, 189, 111, 249, 0, 2, 0, 0, 0,
-            0, 0, 0, 1, 145, 184, 92, 90, 192, 0, 0, 1, 145, 184, 92, 90, 192, 255, 255, 255, 255,
-            255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 1, 198, 3, 240, 111, 136, 7,
-            0, 0, 0, 1, 250, 6, 76, 111, 114, 101, 109, 32, 105, 112, 115, 117, 109, 32, 100, 111,
-            108, 111, 114, 32, 115, 105, 116, 32, 97, 109, 101, 116, 44, 32, 99, 111, 110, 115,
-            101, 99, 116, 101, 116, 117, 114, 32, 97, 100, 105, 112, 105, 115, 99, 105, 110, 103,
-            32, 101, 108, 105, 116, 44, 32, 115, 101, 100, 32, 100, 111, 32, 101, 105, 117, 115,
-            109, 111, 100, 32, 116, 101, 109, 112, 111, 114, 32, 105, 110, 99, 105, 100, 105, 100,
-            117, 110, 116, 32, 117, 116, 32, 108, 97, 98, 111, 114, 101, 32, 101, 116, 32, 100, 1,
-            91, 112, 101, 32, 109, 97, 103, 110, 97, 32, 97, 108, 105, 113, 117, 97, 46, 32, 85,
-            116, 32, 101, 110, 105, 109, 32, 97, 100, 32, 109, 105, 1, 9, 160, 118, 101, 110, 105,
-            97, 109, 44, 32, 113, 117, 105, 115, 32, 110, 111, 115, 116, 114, 117, 100, 32, 101,
-            120, 101, 114, 99, 105, 116, 97, 116, 105, 111, 110, 32, 117, 108, 108, 97, 109, 99,
-            111, 9, 90, 1, 37, 8, 105, 115, 105, 1, 106, 5, 83, 60, 105, 112, 32, 101, 120, 32,
-            101, 97, 32, 99, 111, 109, 109, 111, 100, 111, 9, 193, 24, 113, 117, 97, 116, 46, 32,
-            68, 1, 83, 36, 97, 117, 116, 101, 32, 105, 114, 117, 114, 101, 13, 236, 60, 105, 110,
-            32, 114, 101, 112, 114, 101, 104, 101, 110, 100, 101, 114, 105, 116, 1, 17, 40, 118,
-            111, 108, 117, 112, 116, 97, 116, 101, 32, 118, 1, 234, 36, 32, 101, 115, 115, 101, 32,
-            99, 105, 108, 108, 49, 34, 232, 101, 32, 101, 117, 32, 102, 117, 103, 105, 97, 116, 32,
-            110, 117, 108, 108, 97, 32, 112, 97, 114, 105, 97, 116, 117, 114, 46, 32, 69, 120, 99,
-            101, 112, 116, 101, 117, 114, 32, 115, 105, 110, 116, 32, 111, 99, 99, 97, 101, 99, 97,
-            116, 32, 99, 117, 112, 105, 100, 97, 116, 1, 50, 60, 111, 110, 32, 112, 114, 111, 105,
-            100, 101, 110, 116, 44, 32, 115, 117, 110, 5, 117, 88, 99, 117, 108, 112, 97, 32, 113,
-            117, 105, 32, 111, 102, 102, 105, 99, 105, 97, 32, 100, 101, 115, 101, 114, 1, 30, 12,
-            109, 111, 108, 108, 33, 147, 33, 33, 60, 105, 100, 32, 101, 115, 116, 32, 108, 97, 98,
-            111, 114, 117, 109, 46, 0, 0, 0, 0,
-        ];
-
-        let decoder = BatchDecoder::new(Bytes::from_static(encoded));
-        let decoded = Batch::deserialize(decoder)?;
+        let batch = decoded(&SNAPPY)?;
         assert_eq!(
             Compression::Snappy,
-            Compression::try_from(decoded.attributes)?
+            Compression::try_from(batch.attributes)?
         );
+        assert_eq!(lorem(), Vec::<Record>::try_from(batch)?);
+        Ok(())
+    }
 
-        let records: Vec<Record> = decoded.try_into()?;
+    /// The frame descriptor itself, not a round trip: `lz4::Decoder` reads
+    /// both block modes, so only the FLG byte shows what a Kafka Java client
+    /// will refuse (#253).
+    #[test]
+    fn an_lz4_frame_declares_independent_blocks() -> Result<()> {
+        let _guard = init_tracing()?;
 
-        assert_eq!(
-            vec![Record {
-                length: 452,
-                attributes: 0,
-                timestamp_delta: 0,
-                offset_delta: 0,
-                key: None,
-                value: Some(Bytes::from_static(LOREM)),
-                headers: [].into()
-            }],
-            records
-        );
+        let lz4 = BatchAttribute::default().compression(Compression::Lz4);
+        let deflated = inflated::Batch::builder()
+            .attributes(lz4.into())
+            .record(Record::builder().value(Some(Bytes::from_static(LOREM))))
+            .build()
+            .and_then(Batch::try_from)?;
 
+        let (magic, flg) = (&deflated.record_data[..4], deflated.record_data[4]);
+        assert_eq!([0x04, 0x22, 0x4D, 0x18], magic);
+        assert_ne!(0, flg & 1 << 5, "FLG {flg:#010b} has dependent blocks");
+        assert!(!deflated.has_dependent_lz4_blocks());
         Ok(())
     }
 
     #[test]
-    pub fn is_transactional() -> Result<()> {
+    fn the_transactional_bit_is_read_from_the_attributes() -> Result<()> {
         let _guard = init_tracing()?;
 
         let batch = Batch {
-            base_offset: 0,
             batch_length: 68,
-            partition_leader_epoch: 0,
             magic: 2,
-            crc: 3650210183,
+            crc: 3_650_210_183,
             attributes: 16,
-            last_offset_delta: 0,
-            base_timestamp: 1729509915759,
-            max_timestamp: 1729509915759,
+            base_timestamp: 1_729_509_915_759,
+            max_timestamp: 1_729_509_915_759,
             producer_id: 5,
-            producer_epoch: 0,
-            base_sequence: 0,
             record_count: 1,
             record_data: Bytes::from_static(b"$\0\0\0\x08\0\0\0\0\x10test0-ok\0"),
+            ..Batch::default()
         };
-
-        assert!(batch.is_transactional());
-
+        assert_eq!(
+            (true, false),
+            (batch.is_transactional(), batch.is_control())
+        );
         Ok(())
     }
 
+    /// A commit marker as a producer's transaction ends: transactional and
+    /// control, one record keyed by the control batch, valued by the marker.
     #[test]
-    pub fn is_transactional_control() -> Result<()> {
-        use crate::record::inflated;
-
+    fn a_commit_marker_inflates_to_its_control_record() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let deflated = Batch {
+        let marker = Batch {
             base_offset: 1,
             batch_length: 66,
-            partition_leader_epoch: 0,
             magic: 2,
-            crc: 820655041,
+            crc: 820_655_041,
             attributes: 48,
-            last_offset_delta: 0,
-            base_timestamp: 1729509916024,
-            max_timestamp: 1729509916024,
+            base_timestamp: 1_729_509_916_024,
+            max_timestamp: 1_729_509_916_024,
             producer_id: 5,
-            producer_epoch: 0,
             base_sequence: -1,
             record_count: 1,
             record_data: Bytes::from_static(b" \0\0\0\x08\0\0\0\x01\x0c\0\0\0\0\0\0\0"),
+            ..Batch::default()
         };
-
-        assert!(deflated.is_transactional());
-        assert!(deflated.is_control());
-
-        let inflated = inflated::Batch::try_from(deflated)?;
-
-        assert_eq!(1, inflated.records.len());
         assert_eq!(
-            Some(Bytes::from_static(b"\0\0\0\x01")),
-            inflated.records[0].key
+            (true, true),
+            (marker.is_transactional(), marker.is_control())
         );
 
-        let control_batch = ControlBatch::try_from(inflated.records[0].clone().key().unwrap())?;
-        assert_eq!(0, control_batch.version);
-        assert!(control_batch.is_commit());
-        assert!(!control_batch.is_abort());
+        let inflated = inflated::Batch::try_from(marker)?;
+        let [record] = <[Record; 1]>::try_from(inflated.records).expect("one record");
 
-        assert_eq!(
-            Some(Bytes::from_static(b"\0\0\0\0\0\0")),
-            inflated.records[0].value
-        );
+        let key = record.key().expect("keyed");
+        assert_eq!(Bytes::from_static(b"\0\0\0\x01"), key);
+        let control = ControlBatch::try_from(key)?;
+        assert_eq!(0, control.version);
+        assert_eq!((true, false), (control.is_commit(), control.is_abort()));
 
-        let txn_marker =
-            EndTransactionMarker::try_from(inflated.records[0].clone().value.unwrap())?;
-        assert_eq!(0, txn_marker.version);
-        assert_eq!(0, txn_marker.coordinator_epoch);
-
+        let value = record.value().expect("valued");
+        assert_eq!(Bytes::from_static(b"\0\0\0\0\0\0"), value);
+        let end = EndTransactionMarker::try_from(value)?;
+        assert_eq!((0, 0), (end.version, end.coordinator_epoch));
         Ok(())
     }
 
-    #[test]
-    fn deflate() -> Result<()> {
-        let key = Bytes::from_static(b"Lorem ipsum dolor sit amet");
-        let value = Bytes::from_static(b"consectetur adipiscing elit");
+    const KEY: &[u8] = b"Lorem ipsum dolor sit amet";
+    const VALUE: &[u8] = b"consectetur adipiscing elit";
 
-        let producer_id = 54345;
-        let producer_epoch = 32123;
-        let base_sequence = 78987;
-        let base_offset = 9876789;
-        let attributes: i16 = BatchAttribute::default().transaction(true).into();
-
-        let batch: Batch = inflated::Batch::builder()
-            .record(
-                Record::builder()
-                    .key(key.clone().into())
-                    .value(value.clone().into()),
-            )
-            .attributes(attributes)
-            .producer_id(producer_id)
-            .producer_epoch(producer_epoch)
-            .base_offset(base_offset)
-            .base_sequence(base_sequence)
+    /// One keyed record, deflated, from a transactional producer whose every
+    /// identifying field is distinct.
+    fn transactional() -> Result<Batch> {
+        let record = Record::builder()
+            .key(Some(Bytes::from_static(KEY)))
+            .value(Some(Bytes::from_static(VALUE)));
+        inflated::Batch::builder()
+            .record(record)
+            .attributes(BatchAttribute::default().transaction(true).into())
+            .producer_id(54_345)
+            .producer_epoch(32_123)
+            .base_offset(9_876_789)
+            .base_sequence(78_987)
             .build()
-            .and_then(TryInto::try_into)
-            .inspect(|deflated| debug!(?deflated))?;
+            .and_then(Batch::try_from)
+    }
 
-        assert_eq!(base_sequence, batch.base_sequence);
-        assert_eq!(producer_id, batch.producer_id);
-        assert_eq!(producer_epoch, batch.producer_epoch);
-        assert_eq!(attributes, batch.attributes);
+    /// The producer's fields, the attributes and the base offset.
+    fn identity(batch: &Batch) -> (i64, i16, i32, i64, i16) {
+        (
+            batch.producer_id,
+            batch.producer_epoch,
+            batch.base_sequence,
+            batch.base_offset,
+            batch.attributes,
+        )
+    }
+
+    #[test]
+    fn deflating_keeps_the_producer_fields() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let batch = transactional()?;
+        debug!(?batch);
+        let attributes = BatchAttribute::default().transaction(true).into();
+        assert_eq!(
+            (54_345, 32_123, 78_987, 9_876_789, attributes),
+            identity(&batch)
+        );
         assert_eq!(1, batch.record_count);
-        assert_eq!(base_offset, batch.base_offset);
-
         Ok(())
     }
 
     #[test]
-    fn encode_decode() -> Result<()> {
-        let key = Bytes::from_static(b"Lorem ipsum dolor sit amet");
-        let value = Bytes::from_static(b"consectetur adipiscing elit");
+    fn a_batch_survives_its_wire_bytes() -> Result<()> {
+        let _guard = init_tracing()?;
 
-        let producer_id = 54345;
-        let producer_epoch = 32123;
-        let base_sequence = 78987;
-        let base_offset = 9876789;
-        let attributes: i16 = BatchAttribute::default().transaction(true).into();
+        let batch = transactional()?;
+        let expected = identity(&batch);
 
-        let batch: Batch = inflated::Batch::builder()
-            .record(
-                Record::builder()
-                    .key(key.clone().into())
-                    .value(value.clone().into()),
-            )
-            .attributes(attributes)
-            .producer_id(producer_id)
-            .producer_epoch(producer_epoch)
-            .base_offset(base_offset)
-            .base_sequence(base_sequence)
-            .build()
-            .and_then(TryInto::try_into)
-            .inspect(|deflated| debug!(?deflated))?;
+        let decoded = Batch::try_from(Bytes::from(batch))?;
+        assert_eq!(expected, identity(&decoded));
 
-        let expected = batch.batch_length as usize;
-
-        let encoded = Bytes::from(batch);
-
-        let deflated = Batch::try_from(encoded)?;
-
-        assert_eq!(deflated.producer_id, producer_id);
-        assert_eq!(deflated.producer_epoch, producer_epoch);
-        assert_eq!(deflated.base_sequence, base_sequence);
-        assert_eq!(deflated.base_offset, base_offset);
-        assert_eq!(deflated.attributes, attributes);
-
-        let inflated = inflated::Batch::try_from(deflated)?;
-        assert_eq!(1, inflated.records.len());
-
-        assert_eq!(Some(key), inflated.records[0].key);
-        assert_eq!(Some(value), inflated.records[0].value);
-
+        let inflated = inflated::Batch::try_from(decoded)?;
+        let [record] = <[Record; 1]>::try_from(inflated.records).expect("one record");
+        assert_eq!(
+            (
+                Some(Bytes::from_static(KEY)),
+                Some(Bytes::from_static(VALUE))
+            ),
+            (record.key, record.value)
+        );
         Ok(())
     }
 }
