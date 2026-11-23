@@ -140,10 +140,13 @@ async fn a_merged_segment_does_not_skip_a_peers_segments() -> Result<()> {
         .get(PREFIX)
         .and_then(PrefixIndex::resolved_max)
         .expect("the merged segment is indexed");
-    assert_eq!(6, merged, "the merge wins the first free name");
+    assert_eq!(
+        7, merged,
+        "the merge wins the name behind its claim on the first free one (DEV-662)"
+    );
 
     assert_eq!(
-        BTreeSet::from([2, 3, 4, 5, 6]),
+        BTreeSet::from([2, 3, 4, 5, 7]),
         indexed(&maintainer)?,
         "every live segment is indexed, without waiting for the reconcile"
     );
@@ -154,7 +157,7 @@ async fn a_merged_segment_does_not_skip_a_peers_segments() -> Result<()> {
         .map(|segment| (segment.seq, segment.served_from))
         .collect();
     assert_eq!(
-        vec![(6, 0), (2, 100), (3, 150), (4, 200), (5, 250)],
+        vec![(7, 0), (2, 100), (3, 150), (4, 200), (5, 250)],
         served,
         "the fenced view tiles [0, 300) with no hole where the peer's segments are"
     );

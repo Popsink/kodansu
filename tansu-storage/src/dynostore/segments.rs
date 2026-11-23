@@ -17,10 +17,18 @@
 
 use super::*;
 
+/// A compaction claim this process won (DEV-662): its name, and the footer to
+/// index it under once the merged segment behind it is decided.
+struct CompactionClaim {
+    seq: u64,
+    footer: SegmentFooter,
+}
+
 impl SegmentCreateRole {
     pub(super) fn as_str(self) -> &'static str {
         match self {
             Self::Compaction => "compaction",
+            Self::CompactionClaim => "compaction_claim",
         }
     }
 }
@@ -664,30 +672,31 @@ impl DynoStore {
     /// (#57). The create is the authority: on a lost sequence, fold and retry
     /// the next free one. There is no lease to re-validate since #177 — the
     /// leaseless arbiter (#86) makes the create-only CAS itself the arbiter, so
-    /// a loser is never a fenced writer, only a slower one.
-    ///
-    /// The conflict protocol is the leaseless flush's, and deliberately so
-    /// (#286): [`Self::resolve_segment_create`] for the ambiguous PUT, a
-    /// jittered [`cas_conflict_backoff`] so N contenders do not resync in
-    /// lockstep, and fold-before-claim off the in-memory index (#91) instead of
-    /// a fresh `tail_next_seq` LIST per attempt.
+    /// a loser is never a fenced writer, only a slower one. The ambiguous PUT
+    /// is resolved as the leaseless flush resolves it (#286), through
+    /// [`Self::resolve_segment_create`].
     ///
     /// **Staged, then copied (DEV-662).** A create-only PUT is decided when its
-    /// body has finished uploading, so a merged segment that takes longer to
-    /// upload than producers take to claim the next sequence never wins: on the
-    /// DEV-662 GCS run a 16 MiB merge took ~0.5 s against a producer create every
-    /// ~70 ms, and all 64 attempts lost on every pass. So the payload is
-    /// uploaded once to [`Self::staging_location`], where nothing contends, and
-    /// each attempt is a server-side create-only copy of it to the candidate
-    /// name: the race is decided by a request whose size does not depend on the
-    /// payload, and a lost attempt re-uploads nothing.
+    /// body has finished uploading, so the payload is uploaded once to
+    /// [`Self::staging_location`], where nothing contends, and the merged
+    /// segment is a server-side create-only copy of it: a lost attempt
+    /// re-uploads nothing. A store without a create-only copy falls back to the
+    /// direct upload once and for good.
     ///
-    /// Everything readers see is unchanged: the merged object is created
-    /// create-only at the tail of `segments/` exactly as before, with the same
-    /// bytes, the same footer and the same nonce, so seq order, the single
-    /// listing, the overlap tie-break and the ambiguous-create adoption (#89,
-    /// #401) all hold as they did. A store without a create-only copy falls back
-    /// to the direct upload once and for good.
+    /// **Claimed, then created (DEV-662).** Staging was not enough on the real
+    /// bucket: a prefix took a producer segment every ~80 ms, one attempt —
+    /// re-reading the tail, then the copy — took ~230 ms, and every attempt of
+    /// every pass found its name taken. So the compactor first wins a
+    /// [`Self::claim_tail`], an empty segment as cheap to create as a
+    /// producer's, and only then creates the merged segment at the name right
+    /// behind it. Producers that fold the claim wait for that segment
+    /// ([`Self::yield_to_compaction_claim`]) rather than take its name, so the
+    /// merged create no longer needs the tail to hold still for a round trip.
+    ///
+    /// Everything readers see is unchanged but for the empty claim: the merged
+    /// object is created create-only at the tail of `segments/` with the same
+    /// bytes, footer and nonce as before, so seq order, the single listing, the
+    /// overlap tie-break and the ambiguous-create adoption (#89, #401) all hold.
     pub(super) async fn assign_and_create_segment(
         &self,
         prefix: &str,
@@ -839,7 +848,8 @@ impl DynoStore {
         (uploaded, true)
     }
 
-    /// The conflict loop of [`Self::assign_and_create_segment`].
+    /// The conflict loop of [`Self::assign_and_create_segment`]: win a claim at
+    /// the tail, then create the merged segment right behind it.
     async fn claim_segment_sequence(
         &self,
         prefix: &str,
@@ -855,9 +865,9 @@ impl DynoStore {
         let payload_len = payload.content_length() as u64;
 
         // Conflict accounting for the exhaustion terminal and for #130: how often
-        // this role loses the shared tail-sequence race, and how many payload
-        // bytes that costs in re-uploads.
-        let (mut conflicts, mut rewritten) = (0u64, 0u64);
+        // the claim loses the tail to a producer, how often a producer took the
+        // name behind a won claim anyway, and how many payload bytes that cost.
+        let (mut claim_conflicts, mut conflicts, mut rewritten) = (0u64, 0u64, 0u64);
 
         // #77's invariant is that a sequence name freed by retention or
         // compaction is never reused, and it needs a floor observed *after* the
@@ -882,8 +892,20 @@ impl DynoStore {
         // produce path: the leaseless flush derives every candidate from
         // `tail_next_seq_folded`, which has folded the floor all along. #116's
         // saving lives there and is untouched.
+        //
+        // The index the pass just refreshed is folded in too (DEV-662): the
+        // hint is this process's last create, a whole merge behind producers.
         let mut candidate = match self.cached_seq(prefix)? {
-            Some(seq) => seq.max(self.read_seq_floor(prefix).await?),
+            Some(seq) => {
+                let listed = self
+                    .prefixes
+                    .index()?
+                    .get(prefix)
+                    .and_then(PrefixIndex::resolved_max)
+                    .map_or(0, |max| max + 1);
+
+                seq.max(listed).max(self.read_seq_floor(prefix).await?)
+            }
 
             // Already folded: `tail_next_seq` reads the floor live, after its
             // listing.
@@ -891,24 +913,57 @@ impl DynoStore {
         };
 
         for attempt in 0..MAX_ATTEMPTS {
+            // DEV-662: no backoff between claims. A lost claim proves who holds
+            // `candidate`, so folding that one footer is the resync (#401), and
+            // the compaction lease means there is one compactor per prefix — no
+            // herd to de-synchronise. Every millisecond spent here is a window
+            // a producer fills. Only the first loss refreshes: it is the one
+            // that finds out how far behind the starting candidate was, which a
+            // fold per name would walk one round trip at a time.
+            let Some(claim) = self.claim_tail(prefix, candidate).await? else {
+                claim_conflicts += 1;
+
+                debug!(candidate, attempt, prefix, "compaction claim lost, folding");
+
+                if claim_conflicts == 1 || !self.fold_segment_footer(prefix, candidate).await {
+                    self.refresh_prefix_index_forced(prefix).await?;
+                }
+                candidate = self.tail_next_seq_folded(prefix).await?;
+                continue;
+            };
+
+            let won = claim.seq + 1;
+
             let (put_result, uploaded) = self
-                .create_segment_at(&self.segment_location(prefix, candidate), payload, staged)
+                .create_segment_at(&self.segment_location(prefix, won), payload, staged)
                 .await;
 
-            match self
-                .resolve_segment_create(prefix, candidate, nonce, put_result)
-                .await
-            {
+            let outcome = self
+                .resolve_segment_create(prefix, won, nonce, put_result)
+                .await;
+
+            // Folded and indexed only now, after the copy, so nothing delays it:
+            // `fold_below_won` may list, and producers are yielding meanwhile.
+            self.fold_below_won(prefix, claim.seq).await;
+            self.index_insert(prefix, claim.seq, claim.footer, Self::now_ms())?;
+
+            match outcome {
                 SegmentCreate::Won => {
                     SEGMENT_CREATES.add(1, &attributes);
-                    self.set_seq(prefix, candidate + 1)?;
-                    self.fold_below_won(prefix, candidate).await;
-                    return Ok(candidate);
+                    self.set_seq(prefix, won + 1)?;
+                    debug!(
+                        prefix,
+                        claim = claim.seq,
+                        won,
+                        attempt,
+                        "merged segment landed"
+                    );
+                    return Ok(won);
                 }
 
                 SegmentCreate::Lost { .. } => {
-                    // Every loss costs a re-upload of the whole payload into the
-                    // same key prefix (#130).
+                    // A producer that did not yield: one older than DEV-662, or
+                    // one whose yield budget had run out.
                     conflicts += 1;
                     SEGMENT_CREATE_CONFLICTS.add(1, &attributes);
                     if uploaded {
@@ -916,13 +971,11 @@ impl DynoStore {
                         SEGMENT_CREATE_BYTES_REWRITTEN.add(payload_len, &attributes);
                     }
 
-                    debug!(candidate, attempt, prefix, "segment seq taken, resyncing");
+                    debug!(won, attempt, prefix, "claimed successor taken, reclaiming");
 
-                    sleep(cas_conflict_backoff(attempt)).await;
-
-                    // Fold-before-claim off the index the forced refresh just
-                    // listed, rather than a second full LIST (#91).
-                    self.refresh_prefix_index_forced(prefix).await?;
+                    if !self.fold_segment_footer(prefix, won).await {
+                        self.refresh_prefix_index_forced(prefix).await?;
+                    }
                     candidate = self.tail_next_seq_folded(prefix).await?;
                 }
 
@@ -934,6 +987,7 @@ impl DynoStore {
             prefix,
             candidate,
             role = role.as_str(),
+            claim_conflicts,
             conflicts,
             payload_len,
             bytes_rewritten = rewritten,
@@ -941,6 +995,162 @@ impl DynoStore {
         );
         // Retriable: contention exhaustion, not a permanent fault (#6/#129).
         Err(Error::Api(ErrorCode::KafkaStorageError))
+    }
+
+    /// Create a compaction claim at `candidate` (DEV-662): a segment with no
+    /// entries, stamped [`Self::COMPACTION_CLAIM_EPOCH`]. `None` when a producer
+    /// holds the name.
+    ///
+    /// The claim is what lets a merged segment win a tail that moves faster
+    /// than one compaction attempt. It is a few dozen bytes, so it races
+    /// producers on the same terms they race each other; and once it is the
+    /// tail, a producer that folds it waits for the segment behind it
+    /// ([`Self::yield_to_compaction_claim`]) instead of taking that name.
+    ///
+    /// Nothing about names changes: the claim and the merged segment are both
+    /// created create-only at the tail, the merged one at a name whose
+    /// predecessor exists, so the contiguity the tail probe proves from (#112)
+    /// holds, the incremental cursor misses nothing, and a freed name is still
+    /// never reused (#77). For a reader the claim is an empty segment — no
+    /// sub-stream, so no offsets — that the next merge retires like any other.
+    /// Its own nonce makes an ambiguous create adoptable as any segment's is
+    /// (#89, #401).
+    async fn claim_tail(&self, prefix: &str, candidate: u64) -> Result<Option<CompactionClaim>> {
+        let attributes = [KeyValue::new(
+            "role",
+            SegmentCreateRole::CompactionClaim.as_str(),
+        )];
+
+        let nonce = rng().random::<u64>();
+        let (payload, footer) = self.encode_segment_indexed(
+            &[],
+            Self::COMPACTION_CLAIM_EPOCH,
+            nonce,
+            self.tuning.segment_format_version,
+        )?;
+
+        let result = self
+            .object_store
+            .put_opts(
+                &self.segment_location(prefix, candidate),
+                payload,
+                PutOptions {
+                    mode: PutMode::Create,
+                    attributes: Attributes::new(),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        match self
+            .resolve_segment_create(prefix, candidate, nonce, result)
+            .await
+        {
+            SegmentCreate::Won => {
+                SEGMENT_CREATES.add(1, &attributes);
+                self.set_seq(prefix, candidate + 1)?;
+                Ok(Some(CompactionClaim {
+                    seq: candidate,
+                    footer,
+                }))
+            }
+
+            SegmentCreate::Lost { .. } => {
+                SEGMENT_CREATE_CONFLICTS.add(1, &attributes);
+                Ok(None)
+            }
+
+            SegmentCreate::Failed(error) => Err(error),
+        }
+    }
+
+    /// The claim a segment from [`Self::assign_and_create_segment`] was created
+    /// behind (DEV-662): always the name right below it, which is what lets the
+    /// caller retire the claim with the run it merged.
+    pub(super) fn claim_of(created: u64) -> u64 {
+        created.saturating_sub(1)
+    }
+
+    /// Whether `footer` is a compaction claim (DEV-662).
+    fn is_compaction_claim(footer: &SegmentFooter) -> bool {
+        footer.entries.is_empty() && footer.writer_epoch == Self::COMPACTION_CLAIM_EPOCH
+    }
+
+    /// Whether the segment just below `candidate` is a compaction claim still
+    /// waiting for its merged segment (DEV-662), as this process's index has it.
+    ///
+    /// Aged by the claim's append time as the store reports it, so a claim
+    /// whose compactor died is ignored once [`Self::COMPACTION_CLAIM_TTL`] has
+    /// passed for every replica; the caller's own budget bounds what clock skew
+    /// can add to that.
+    fn compaction_claim_below(&self, prefix: &str, candidate: u64) -> Result<bool> {
+        let Some(below) = candidate.checked_sub(1) else {
+            return Ok(false);
+        };
+
+        let index = self.prefixes.index()?;
+
+        Ok(index
+            .get(prefix)
+            .and_then(|entry| entry.segments.get(&below))
+            .is_some_and(|cached| {
+                Self::is_compaction_claim(&cached.footer)
+                    && Self::now_ms().saturating_sub(cached.last_modified_ms)
+                        < Self::COMPACTION_CLAIM_TTL.as_millis() as i64
+            }))
+    }
+
+    /// Hold a leaseless flush off the name behind a compaction claim until the
+    /// merged segment lands there (DEV-662), returning the candidate to claim.
+    ///
+    /// Without this a merged segment never lands under sustained produce: on
+    /// the DEV-662 GCS run a prefix took a producer segment every ~80 ms and a
+    /// compaction attempt took ~230 ms, and all 64 attempts of every pass lost.
+    /// The claim is decided by a request as small as a producer's, and this is
+    /// what makes winning it enough.
+    ///
+    /// The wait is a hint, never part of the arbiter: the create-only CAS still
+    /// decides every name, so a producer that does not wait — a binary older
+    /// than DEV-662, one past its budget, one that never folded the claim —
+    /// costs the compactor a reclaim and nothing else. `yielded` is the flush's
+    /// running total, bounded by [`Self::COMPACTION_CLAIM_TTL`] whatever the
+    /// claims and the clocks say.
+    pub(super) async fn yield_to_compaction_claim(
+        &self,
+        prefix: &str,
+        mut candidate: u64,
+        yielded: &mut Duration,
+    ) -> Result<u64> {
+        if !self.compaction_claim_below(prefix, candidate)? {
+            return Ok(candidate);
+        }
+
+        let outcome = loop {
+            if *yielded >= Self::COMPACTION_CLAIM_TTL {
+                break "expired";
+            }
+
+            sleep(Self::COMPACTION_CLAIM_POLL).await;
+            *yielded += Self::COMPACTION_CLAIM_POLL;
+
+            self.refresh_prefix_index_forced(prefix).await?;
+            candidate = self.tail_next_seq_folded(prefix).await?;
+
+            if !self.compaction_claim_below(prefix, candidate)? {
+                break "released";
+            }
+        };
+
+        FLUSH_COMPACTION_YIELDS.add(1, &[KeyValue::new("outcome", outcome)]);
+        debug!(
+            prefix,
+            candidate,
+            ?yielded,
+            outcome,
+            "yielded to a compaction claim"
+        );
+
+        Ok(candidate)
     }
 
     /// Fold every segment between the index cursor and `won` into the prefix

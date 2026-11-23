@@ -532,6 +532,7 @@ impl DynoStore {
         let mut put_elapsed = Duration::ZERO;
         let mut put_bytes = 0u64;
         let mut backoff_elapsed = Duration::ZERO;
+        let mut yielded = Duration::ZERO;
 
         for attempt in 0..MAX_ATTEMPTS {
             // Two departures from a plain `elapsed >= budget` (#192):
@@ -590,6 +591,16 @@ impl DynoStore {
             // Derive the candidate from the index the forced refresh just folded
             // — no second LIST per attempt (#91).
             let candidate = match self.tail_next_seq_folded(prefix).await {
+                Ok(seq) => seq,
+                Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
+            };
+
+            // The name behind a compaction claim belongs to the merged segment
+            // (DEV-662): taking it is what kept compaction from ever landing.
+            let candidate = match self
+                .yield_to_compaction_claim(prefix, candidate, &mut yielded)
+                .await
+            {
                 Ok(seq) => seq,
                 Err(error) => return Self::fail_prefix_flush(buffer, error, prefix),
             };

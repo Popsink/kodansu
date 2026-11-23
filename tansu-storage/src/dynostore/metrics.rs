@@ -561,6 +561,18 @@ pub(super) static SEGMENT_CREATE_BYTES_REWRITTEN: LazyLock<Counter<u64>> = LazyL
         .build()
 });
 
+/// Leaseless flushes that waited on a compaction claim at the tail (DEV-662),
+/// by `outcome`: `released` when the merged segment landed behind it, `expired`
+/// when the flush's wait budget ran out first. A steady `expired` rate is a
+/// compactor that claims and then does not create, and it costs produce
+/// latency.
+pub(super) static FLUSH_COMPACTION_YIELDS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_flush_compaction_yields")
+        .with_description("leaseless flushes that waited on a compaction claim, by outcome")
+        .build()
+});
+
 /// Create-CAS rounds a leaseless flush lost to another writer of the same
 /// prefix (#157) — `AlreadyExists`, or an ambiguous PUT resolved to a peer's
 /// footer. A rate here is normal multi-writer arbitration; a rate approaching

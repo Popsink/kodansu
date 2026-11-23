@@ -747,7 +747,16 @@ impl DynoStore {
         // superseded no merged seq is written (`new_seq == None`) and deleting
         // the run *can* lower the listing max — freeing a run name for reuse
         // without the floor.
-        _ = self.retire_segments(prefix, &run).await?;
+        //
+        // The merged segment's claim goes with the run (DEV-662): left behind,
+        // every merge would add a segment, and a prefix could never drain below
+        // two.
+        let retired: Vec<u64> = run
+            .iter()
+            .copied()
+            .chain(new_seq.map(Self::claim_of))
+            .collect();
+        _ = self.retire_segments(prefix, &retired).await?;
 
         SEGMENT_COMPACTIONS.add(run.len() as u64, &[]);
         debug!(
@@ -1297,6 +1306,7 @@ impl DynoStore {
         // tie-break makes the rewrite win during the write→delete window,
         // exactly as for a #66 merge. `index_insert` keeps the original append
         // time so `compact,delete` retention is not reset by the rewrite.
+        let mut claims = Vec::with_capacity(dirty.len());
         for seq in &dirty {
             let Some(substreams) = outputs.remove(seq) else {
                 continue;
@@ -1315,11 +1325,12 @@ impl DynoStore {
                 .assign_and_create_segment(prefix, payload, nonce, SegmentCreateRole::Compaction)
                 .await?;
             self.index_insert(prefix, new_seq, footer, last_modified)?;
+            claims.push(Self::claim_of(new_seq));
         }
 
-        // Retire the rewritten seqs: floor before delete, then prune (#77) — see
-        // [`Self::retire_segments`].
-        let retired: Vec<u64> = dirty.iter().copied().collect();
+        // Retire the rewritten seqs and their claims (DEV-662): floor before
+        // delete, then prune (#77) — see [`Self::retire_segments`].
+        let retired: Vec<u64> = dirty.iter().copied().chain(claims).collect();
         _ = self.retire_segments(prefix, &retired).await?;
 
         SEGMENT_RECORDS_COMPACTED.add(removed_total, &[]);
