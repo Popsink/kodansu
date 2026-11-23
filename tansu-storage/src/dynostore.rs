@@ -110,6 +110,7 @@ use uuid::Uuid;
 mod caches;
 mod coalesce;
 mod codec;
+mod commits;
 mod compaction;
 mod config;
 mod fetch;

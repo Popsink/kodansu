@@ -69,7 +69,7 @@ const PARTITIONS: i32 = 3;
 /// same list twice. It is the same reasoning `topic_churn` gives for reading the
 /// group's own inventory: this file sits outside the crate and cannot, which
 /// makes it the independent copy.
-const CACHES: [&str; 19] = [
+const CACHES: [&str; 20] = [
     "topic_metas",
     "topic_ids",
     "routing_prefixes",
@@ -89,6 +89,7 @@ const CACHES: [&str; 19] = [
     "segment_reads",
     "producers",
     "group_offsets",
+    "group_commits",
 ];
 
 /// The meter every instrument in the process reports through, plus the sink the

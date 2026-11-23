@@ -1015,14 +1015,9 @@ impl LogStorage for DynoStore {
         } else {
             match self.group_offsets(group_id)? {
                 Some(offsets) => {
-                    offsets
-                        .with_mut(&self.object_store, |group| {
-                            for (topition, commit) in &committable {
-                                group.insert(topition, commit.clone());
-                            }
-
-                            Ok(())
-                        })
+                    self.clients
+                        .group_commits(group_id)?
+                        .commit(&committable, &offsets, &self.object_store)
                         .await
                 }
 

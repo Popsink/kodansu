@@ -49,7 +49,7 @@ use object_store::path::Path;
 use super::{
     CachedWatermark, DynoStore, GroupOffsets, HeldLease, OffsetHint, OptiCon, PrefixIndex,
     ProducerDetail, ProducerId, RetiredPrefixCache, SegmentReadTrace, ServedEnd, Topic, TopicIndex,
-    TopicMetadata, TopicRouting, Watermark,
+    TopicMetadata, TopicRouting, Watermark, commits::GroupCommits,
 };
 use crate::{Error, METER, Result, Topition};
 
@@ -1171,6 +1171,11 @@ pub(super) struct ClientCaches {
     /// conditional GET a commit pays is served from a memoized etag rather than a
     /// body read on every commit.
     group_offsets: LockedMap<String, OptiCon<GroupOffsets>>,
+
+    /// Per-group queue that folds concurrent commits into one write of
+    /// `offsets.json`, so a large group is not paced commit by commit on GCS.
+    /// See [`GroupCommits`].
+    group_commits: LockedMap<String, Arc<GroupCommits>>,
 }
 
 impl ClientCaches {
@@ -1204,7 +1209,13 @@ impl ClientCaches {
         })
     }
 
-    /// Drop a deleted group's `offsets.json` handle.
+    /// The commit queue of a group, allocating one on first use.
+    pub(super) fn group_commits(&self, group_id: &str) -> Result<Arc<GroupCommits>> {
+        self.group_commits
+            .write(|commits| commits.entry(group_id.to_owned()).or_default().clone())
+    }
+
+    /// Drop a deleted group's `offsets.json` handle and its commit queue.
     ///
     /// Not for correctness: a retained handle would self-heal a stale etag
     /// against a re-created group — the conditional PUT fails its precondition
@@ -1214,6 +1225,9 @@ impl ClientCaches {
         self.group_offsets.try_write(|offsets| {
             _ = offsets.remove(group_id);
         });
+        self.group_commits.try_write(|commits| {
+            _ = commits.remove(group_id);
+        });
     }
 
     /// Record what each map holds (#554).
@@ -1221,6 +1235,7 @@ impl ClientCaches {
         for (cache, entries) in [
             ("producers", self.producers.len()),
             ("group_offsets", self.group_offsets.len()),
+            ("group_commits", self.group_commits.len()),
         ] {
             CACHE_ENTRIES.record(entries as u64, &[KeyValue::new("cache", cache)]);
         }
