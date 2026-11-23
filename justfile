@@ -1339,6 +1339,15 @@ fmt:
 # `// Heartbeat` banners went with the arms they introduced, so the ratio falls
 # and the ceiling follows it.
 #
+#   defork  +95 lines, the protocol encoder rewritten, and an encode bench  2790 -> 2790  2.6758 -> 2.6743
+#
+# `ser.rs`'s `Encoder` (Popsink/data-plane#5885); `RecordBatchEncoder` follows
+# separately. Length prefixes go through `length`, infallible writes through
+# `put`, a nested field's lookup through `nested`, and record batches through
+# `records`, which keeps the #312 reasoning. `benches/encode_bench.rs` comes
+# with it: nothing measured encoding before, and every response is encoded.
+# The bench has no `//`, so the ratio falls and the ceiling follows it.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1348,7 +1357,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6759" top="12":
+comments ceiling="2.6744" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would

@@ -54,9 +54,9 @@ enum Container {
 
 impl Container {
     fn name(&self) -> String {
-        match self {
-            Self::Struct { name, .. } => (*name).to_string(),
+        match *self {
             Self::StructVariant { name, variant, .. } => format!("{name}::{variant}"),
+            Self::Struct { name, .. } => String::from(name),
         }
     }
 }
@@ -73,10 +73,10 @@ impl From<&'static [(&'static str, &'static FieldMeta)]> for FieldLookup {
 impl FieldLookup {
     #[must_use]
     pub(crate) fn field(&self, name: &str) -> Option<&'static FieldMeta> {
-        self.0
+        let Self(fields) = self;
+        fields
             .iter()
-            .find(|(found, _)| name == *found)
-            .map(|(_, meta)| *meta)
+            .find_map(|&(found, meta)| (found == name).then_some(meta))
     }
 }
 
@@ -91,10 +91,11 @@ struct Meta {
 
 impl Default for Meta {
     fn default() -> Self {
+        let parse = VecDeque::with_capacity(PARSE_DEPTH);
         Self {
-            message: Default::default(),
-            field: Default::default(),
-            parse: VecDeque::with_capacity(PARSE_DEPTH),
+            message: None,
+            field: None,
+            parse,
         }
     }
 }
@@ -118,154 +119,176 @@ impl From<Encoder> for BytesMut {
 
 impl From<Encoder> for Bytes {
     fn from(encoder: Encoder) -> Self {
-        BytesMut::from(encoder).freeze()
+        encoder.working.freeze()
     }
 }
 
 impl fmt::Debug for Encoder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct(stringify!(Self)).finish()
+        f.debug_struct("Self").finish()
     }
 }
 
 impl Encoder {
     pub(crate) fn request(working: BytesMut) -> Self {
-        Self {
-            working,
-            containers: VecDeque::with_capacity(PARSE_DEPTH),
-            kind: Some(Kind::Request),
-            field: None,
-            api_key: None,
-            api_version: None,
-            meta: Meta::default(),
-        }
+        Self::with(working, Some(Kind::Request), None, None, Meta::default())
     }
 
     pub(crate) fn response(working: BytesMut, api_key: i16, api_version: i16) -> Self {
-        Self {
-            working,
-            containers: VecDeque::with_capacity(PARSE_DEPTH),
-            kind: Some(Kind::Response),
-            field: None,
-            api_key: Some(api_key),
-            api_version: Some(api_version),
-            meta: RootMessageMeta::messages()
-                .responses()
-                .get(&api_key)
-                .map_or_else(Meta::default, |meta| {
-                    let mut parse = VecDeque::with_capacity(PARSE_DEPTH);
-                    parse.push_front(meta.fields.into());
-
-                    Meta {
-                        message: Some(*meta),
-                        parse,
-                        ..Default::default()
-                    }
-                }),
-        }
+        let responses = RootMessageMeta::messages().responses();
+        let meta = responses
+            .get(&api_key)
+            .map_or_else(Meta::default, |&message| {
+                let mut meta = Meta {
+                    message: Some(message),
+                    ..Meta::default()
+                };
+                meta.parse.push_front(message.fields.into());
+                meta
+            });
+        let kind = Some(Kind::Response);
+        Self::with(working, kind, Some(api_key), Some(api_version), meta)
     }
 
     pub fn new(working: BytesMut) -> Self {
+        Self::with(working, None, None, None, Meta::default())
+    }
+
+    fn with(
+        working: BytesMut,
+        kind: Option<Kind>,
+        api_key: Option<i16>,
+        api_version: Option<i16>,
+        meta: Meta,
+    ) -> Self {
+        let containers = VecDeque::with_capacity(PARSE_DEPTH);
         Self {
             working,
-            containers: VecDeque::with_capacity(PARSE_DEPTH),
-            kind: None,
+            containers,
             field: None,
-            api_key: None,
-            api_version: None,
-            meta: Meta::default(),
+            kind,
+            api_key,
+            api_version,
+            meta,
         }
     }
 
     #[instrument(skip(self))]
     fn field_meta(&self, name: &str) -> Option<&'static FieldMeta> {
-        debug!(
-            parse_front = ?self.meta.parse.front().and_then(|front| front.field(name)),
-            meta = ?self.meta.message.and_then(|mm| mm.field(name))
-        );
-
-        self.meta
+        let parsing = self
+            .meta
             .parse
             .front()
-            .and_then(|front| front.field(name))
-            .or(self.meta.message.and_then(|mm| mm.field(name)))
+            .and_then(|lookup| lookup.field(name));
+        let message = self.meta.message.and_then(|message| message.field(name));
+        debug!(parse_front = ?parsing, meta = ?message);
+        parsing.or(message)
     }
 
     fn field_name(&self) -> String {
-        self.containers.iter().fold(
-            self.field.map_or_else(String::new, str::to_owned),
-            |acc, container| {
-                if acc.is_empty() {
-                    container.name()
-                } else {
-                    format!("{}.{acc}", container.name())
-                }
-            },
-        )
+        let mut path = self.field.map(str::to_owned).unwrap_or_default();
+        for container in &self.containers {
+            path = if path.is_empty() {
+                container.name()
+            } else {
+                format!("{}.{path}", container.name())
+            };
+        }
+        path
     }
 
     fn unsigned_varint(&mut self, mut v: u32) -> Result<()> {
-        const CONTINUATION: u8 = 0b1000_0000;
-
-        while v >= u32::from(CONTINUATION) {
-            self.working.put_u8(v as u8 | CONTINUATION);
+        loop {
+            let low = (v & 0x7f) as u8;
             v >>= 7;
+            if v == 0 {
+                self.working.put_u8(low);
+                return Ok(());
+            }
+            self.working.put_u8(low | 0x80);
         }
+    }
 
-        self.working.put_u8(v as u8);
+    /// `len` as a length prefix: an unsigned varint of `len + 1` when the
+    /// message is flexible, otherwise through `fixed` at its own width.
+    fn length<T>(&mut self, len: usize, fixed: fn(&mut Self, T) -> Result<()>) -> Result<()>
+    where
+        T: TryFrom<usize>,
+        Error: From<T::Error>,
+    {
+        if self.is_flexible() {
+            self.unsigned_varint(u32::try_from(len + 1)?)
+        } else {
+            fixed(self, T::try_from(len)?)
+        }
+    }
+
+    /// Writes with `write`, which cannot fail.
+    fn put(&mut self, write: impl FnOnce(&mut BytesMut)) -> Result<()> {
+        write(&mut self.working);
         Ok(())
     }
 
+    /// `value`, with `lookup` resolving the fields it holds.
+    fn nested<T>(&mut self, lookup: FieldLookup, value: &T) -> Result<()>
+    where
+        T: Serialize + ?Sized,
+    {
+        self.meta.parse.push_front(lookup);
+        let outcome = value.serialize(&mut *self);
+        _ = self.meta.parse.pop_front();
+        outcome
+    }
+
     fn in_header(&self) -> bool {
-        matches!(
-            self.containers.front(),
-            Some(Container::StructVariant {
-                name: "HeaderMezzanine",
-                ..
-            })
-        )
+        let front = self.containers.front();
+        matches!(front, Some(Container::StructVariant { name, .. }) if *name == "HeaderMezzanine")
+    }
+
+    /// The request header's `client_id`, which is a non-compact string at
+    /// every version.
+    fn is_client_id(&self) -> bool {
+        self.field == Some("client_id")
     }
 
     #[must_use]
     fn is_flexible(&self) -> bool {
         debug!(
-            "api_key: {:?}, api_version: {:?}, in_header: {}, is_client_id: {}",
-            self.api_key,
-            self.api_version,
-            self.in_header(),
-            self.field.is_some_and(|field| field == "client_id")
+            api_key = self.api_key,
+            api_version = self.api_version,
+            in_header = self.in_header(),
+            is_client_id = self.is_client_id(),
         );
 
-        if self.in_header()
-            && ((self.kind.is_some_and(|kind| kind == Kind::Request)
-                && self.field.is_some_and(|field| field == "client_id"))
-                || (self.kind.is_some_and(|kind| kind == Kind::Response)
-                    && self.api_key.is_some_and(|api_key| api_key == 18)))
-        {
-            false
-        } else {
-            self.meta.message.is_some_and(|meta| {
-                self.api_version
-                    .is_some_and(|api_version| meta.is_flexible(api_version))
-            })
+        let fixed_in_header = match self.kind {
+            Some(Kind::Request) => self.is_client_id(),
+            Some(Kind::Response) => self.api_key == Some(18),
+            None => false,
+        };
+
+        if self.in_header() && fixed_in_header {
+            return false;
+        }
+
+        match (self.meta.message, self.api_version) {
+            (Some(message), Some(api_version)) => message.is_flexible(api_version),
+            _ => false,
         }
     }
 
     fn is_nullable(&self) -> bool {
-        self.api_version.is_some_and(|api_version| {
-            self.meta
-                .field
-                .is_some_and(|field| field.is_nullable(api_version))
-        })
+        match (self.meta.field, self.api_version) {
+            (Some(field), Some(api_version)) => field.is_nullable(api_version),
+            _ => false,
+        }
     }
 
     #[must_use]
     fn is_valid(&self) -> bool {
-        self.api_version.is_some_and(|api_version| {
-            self.meta
-                .field
-                .is_some_and(|field| field.version.within(api_version))
-        })
+        match (self.meta.field, self.api_version) {
+            (Some(field), Some(api_version)) => field.version.within(api_version),
+            _ => false,
+        }
     }
 
     #[must_use]
@@ -277,18 +300,86 @@ impl Encoder {
 
     #[must_use]
     fn is_structure(&self) -> bool {
-        self.meta.field.is_some_and(|field| field.is_structure())
+        self.meta.field.is_some_and(FieldMeta::is_structure)
     }
 
     #[must_use]
     fn is_string(&self) -> bool {
-        self.in_header() && self.field.is_some_and(|field| field == "client_id")
-            || self.meta.field.is_some_and(|field| field.kind.is_string())
+        let header = self.in_header() && self.is_client_id();
+        header || self.meta.field.is_some_and(|field| field.kind.is_string())
     }
 
     #[must_use]
     fn is_records(&self) -> bool {
         self.meta.field.is_some_and(|field| field.kind.is_records())
+    }
+
+    /// The header's `client_id` in a request.
+    fn is_request_client_id(&self) -> bool {
+        self.in_header() && self.kind == Some(Kind::Request) && self.is_client_id()
+    }
+
+    /// Writes `value`'s record batches behind their length, which is only
+    /// known once they are written.
+    fn records<T>(&mut self, value: &T) -> Result<()>
+    where
+        T: Serialize + ?Sized,
+    {
+        debug!(
+            working_capacity = self.working.capacity(),
+            working_len = self.working.len()
+        );
+
+        // `split_off` past `len` borrows from spare capacity, and panics
+        // outright if the offset runs past `capacity`. So the buffer's
+        // size — computed once by `size_in_bytes()` in
+        // `Frame::response`, never grown — was load-bearing for memory
+        // safety and not merely for efficiency, and an under-count by as
+        // little as three bytes took down a `tokio-rt-worker` instead of
+        // reallocating (#312, observed twice in 12 hours on a
+        // `FetchResponse`).
+        //
+        // Reserve the length prefix rather than trust the estimate. This
+        // makes a wrong estimate cost what a wrong estimate should cost
+        // anywhere else: a reallocation.
+        self.working.reserve(size_of::<u32>());
+
+        let after_length = self.working.len() + size_of::<u32>();
+        let spare = self.working.split_off(after_length);
+        debug!(
+            records_capacity = spare.capacity(),
+            records_len = spare.len()
+        );
+
+        let mut batches = RecordBatchEncoder::new(spare);
+        value.serialize(&mut batches)?;
+        let records = BytesMut::from(batches);
+
+        debug!(
+            working_capacity = self.working.capacity(),
+            working_len = self.working.len(),
+            records_capacity = records.capacity(),
+            records_len = records.len(),
+        );
+
+        let length = u32::try_from(records.len())?;
+        if self.is_flexible() {
+            let compact = UnsignedVarInt(length + 1).encode()?;
+            self.working.put(compact);
+        } else {
+            self.working.put_u32(length);
+        }
+        debug!(
+            working_capacity = self.working.capacity(),
+            working_len = self.working.len(),
+        );
+
+        self.working.unsplit(records);
+        debug!(
+            working_capacity = self.working.capacity(),
+            working_len = self.working.len(),
+        );
+        Ok(())
     }
 }
 
@@ -306,99 +397,80 @@ impl Serializer for &mut Encoder {
 
     #[instrument(skip(self))]
     fn serialize_bool(self, v: bool) -> Result<Self::Ok, Self::Error> {
-        self.working.put_u8(u8::from(v));
-        Ok(())
+        self.put(|working| working.put_u8(u8::from(v)))
     }
 
     #[instrument(skip(self))]
     fn serialize_i8(self, v: i8) -> Result<Self::Ok, Self::Error> {
-        self.working.put_i8(v);
-        Ok(())
+        self.put(|working| working.put_i8(v))
     }
 
     #[instrument(skip(self))]
     fn serialize_i16(self, v: i16) -> Result<Self::Ok, Self::Error> {
-        match (self.containers.front(), self.field) {
-            (
-                Some(Container::StructVariant {
-                    name: "HeaderMezzanine",
-                    variant: "Request",
-                    ..
-                }),
-                Some("api_key"),
-            ) => {
-                _ = self.api_key.replace(v);
+        let request_header = matches!(
+            self.containers.front(),
+            Some(Container::StructVariant {
+                name: "HeaderMezzanine",
+                variant: "Request",
+                ..
+            })
+        );
 
-                if let Some(meta) = RootMessageMeta::messages().requests().get(&v) {
-                    self.meta.message = Some(*meta);
-                    self.meta.parse.push_front(meta.fields.into());
+        if request_header {
+            match self.field {
+                Some("api_key") => {
+                    self.api_key = Some(v);
+                    if let Some(&message) = RootMessageMeta::messages().requests().get(&v) {
+                        self.meta.message = Some(message);
+                        self.meta.parse.push_front(message.fields.into());
+                    }
                 }
+                Some("api_version") => self.api_version = Some(v),
+                _ => {}
             }
-
-            (
-                Some(Container::StructVariant {
-                    name: "HeaderMezzanine",
-                    variant: "Request",
-                    ..
-                }),
-                Some("api_version"),
-            ) => {
-                _ = self.api_version.replace(v);
-            }
-
-            _ => (),
         }
 
-        self.working.put_i16(v);
-        Ok(())
+        self.put(|working| working.put_i16(v))
     }
 
     #[instrument(skip(self))]
     fn serialize_i32(self, v: i32) -> Result<Self::Ok, Self::Error> {
-        self.working.put_i32(v);
-        Ok(())
+        self.put(|working| working.put_i32(v))
     }
 
     #[instrument(skip(self))]
     fn serialize_i64(self, v: i64) -> Result<Self::Ok, Self::Error> {
-        self.working.put_i64(v);
-        Ok(())
+        self.put(|working| working.put_i64(v))
     }
 
     #[instrument(skip(self))]
     fn serialize_u8(self, v: u8) -> Result<Self::Ok, Self::Error> {
-        self.working.put_u8(v);
-        Ok(())
+        self.put(|working| working.put_u8(v))
     }
 
     #[instrument(skip(self))]
     fn serialize_u16(self, v: u16) -> Result<Self::Ok, Self::Error> {
-        self.working.put_u16(v);
-        Ok(())
+        self.put(|working| working.put_u16(v))
     }
 
     #[instrument(skip(self))]
     fn serialize_u32(self, v: u32) -> Result<Self::Ok, Self::Error> {
-        self.working.put_u32(v);
-        Ok(())
+        self.put(|working| working.put_u32(v))
     }
 
     #[instrument(skip(self))]
     fn serialize_u64(self, v: u64) -> Result<Self::Ok, Self::Error> {
-        self.working.put_u64(v);
-        Ok(())
+        self.put(|working| working.put_u64(v))
     }
 
     #[instrument(skip(self))]
     fn serialize_f32(self, v: f32) -> Result<Self::Ok, Self::Error> {
-        self.working.put_f32(v);
-        Ok(())
+        self.put(|working| working.put_f32(v))
     }
 
     #[instrument(skip(self))]
     fn serialize_f64(self, v: f64) -> Result<Self::Ok, Self::Error> {
-        self.working.put_f64(v);
-        Ok(())
+        self.put(|working| working.put_f64(v))
     }
 
     #[instrument(skip(self))]
@@ -408,60 +480,26 @@ impl Serializer for &mut Encoder {
 
     #[instrument(skip(self))]
     fn serialize_str(self, v: &str) -> Result<Self::Ok, Self::Error> {
-        if self.in_header()
-            && self.kind.is_some_and(|kind| kind == Kind::Request)
-            && self.field.is_some_and(|field| field == "client_id")
-        {
-            v.len()
-                .try_into()
-                .map_err(Into::into)
-                .and_then(|len| self.serialize_i16(len))?;
-
-            self.working.put_slice(v.as_bytes());
+        if self.is_request_client_id() {
+            self.serialize_i16(i16::try_from(v.len())?)?;
         } else if self.is_valid() {
-            if self.is_flexible() {
-                (v.len() + 1)
-                    .try_into()
-                    .map_err(Into::into)
-                    .and_then(|len| self.unsigned_varint(len))?;
-            } else {
-                v.len()
-                    .try_into()
-                    .map_err(Into::into)
-                    .and_then(|len| self.serialize_i16(len))?;
-            }
-
-            self.working.put_slice(v.as_bytes());
+            self.length(v.len(), |encoder, len: i16| encoder.serialize_i16(len))?;
+        } else {
+            return Ok(());
         }
-
-        Ok(())
+        self.put(|working| working.put_slice(v.as_bytes()))
     }
 
     #[instrument(skip(self))]
     fn serialize_bytes(self, v: &[u8]) -> Result<Self::Ok, Self::Error> {
-        debug!(
-            ?v,
-            is_valid = self.is_valid(),
-            is_flexible = self.is_flexible()
-        );
+        let is_valid = self.is_valid();
+        debug!(?v, is_valid, is_flexible = self.is_flexible());
 
-        if self.is_valid() {
-            if self.is_flexible() {
-                (v.len() + 1)
-                    .try_into()
-                    .map_err(Into::into)
-                    .and_then(|len| self.unsigned_varint(len))?;
-            } else {
-                v.len()
-                    .try_into()
-                    .map_err(Into::into)
-                    .and_then(|len| self.serialize_u32(len))?;
-            }
-
-            self.working.put_slice(v);
+        if !is_valid {
+            return Ok(());
         }
-
-        Ok(())
+        self.length(v.len(), |encoder, len: u32| encoder.serialize_u32(len))?;
+        self.put(|working| working.put_slice(v))
     }
 
     #[instrument(skip(self))]
@@ -475,19 +513,19 @@ impl Serializer for &mut Encoder {
             is_flexible = self.is_flexible(),
         );
 
-        if self.in_header()
-            && self.kind.is_some_and(|kind| kind == Kind::Request)
-            && self.field.is_some_and(|field| field == "client_id")
-        {
+        let is_valid = self.is_valid();
+        if self.is_request_client_id() {
             self.serialize_i16(-1)
-        } else if self.is_valid() && self.is_records() {
-            if self.is_flexible() {
+        } else if is_valid && self.is_records() {
+            let flexible = self.is_flexible();
+            if flexible {
                 self.unsigned_varint(1)
             } else {
                 self.serialize_i32(0)
             }
-        } else if self.is_valid() && self.is_nullable() {
-            if self.is_structure() && !self.is_sequence() {
+        } else if is_valid && self.is_nullable() {
+            let presence = self.is_structure() && !self.is_sequence();
+            if presence {
                 self.serialize_i8(-1)
             } else if self.is_flexible() {
                 self.unsigned_varint(0)
@@ -498,7 +536,7 @@ impl Serializer for &mut Encoder {
             } else {
                 Ok(())
             }
-        } else if self.is_valid() {
+        } else if is_valid {
             // Valid at this version and not nullable: there is no encoding for
             // "absent". Writing nothing would not shorten the message, it would
             // shift every following field left, and the peer would read the
@@ -521,77 +559,17 @@ impl Serializer for &mut Encoder {
         T: Serialize,
         T: ?Sized,
     {
+        let is_tag_buffer = self.field == Some("tag_buffer");
         debug!(
-            is_tag_buffer = self.field.is_some_and(|field| field == "tag_buffer"),
+            is_tag_buffer,
             is_flexible = self.is_flexible(),
             is_records = self.is_records(),
         );
 
-        if self.field.is_some_and(|field| field == "tag_buffer") && !self.is_flexible() {
+        if is_tag_buffer && !self.is_flexible() {
             Ok(())
         } else if self.is_records() {
-            debug!(
-                working_capacity = self.working.capacity(),
-                working_len = self.working.len()
-            );
-
-            let records = {
-                // `split_off` past `len` borrows from spare capacity, and panics
-                // outright if the offset runs past `capacity`. So the buffer's
-                // size — computed once by `size_in_bytes()` in
-                // `Frame::response`, never grown — was load-bearing for memory
-                // safety and not merely for efficiency, and an under-count by as
-                // little as three bytes took down a `tokio-rt-worker` instead of
-                // reallocating (#312, observed twice in 12 hours on a
-                // `FetchResponse`).
-                //
-                // Reserve the length prefix rather than trust the estimate. This
-                // makes a wrong estimate cost what a wrong estimate should cost
-                // anywhere else: a reallocation.
-                self.working.reserve(size_of::<u32>());
-
-                let records = self
-                    .working
-                    .split_off(self.working.len() + size_of::<u32>());
-                debug!(
-                    records_capacity = records.capacity(),
-                    records_len = records.len(),
-                );
-
-                let mut e = RecordBatchEncoder::new(records);
-                value.serialize(&mut e)?;
-                BytesMut::from(e)
-            };
-
-            debug!(
-                working_capacity = self.working.capacity(),
-                working_len = self.working.len(),
-                records_capacity = records.capacity(),
-                records_len = records.len(),
-            );
-
-            let length = u32::try_from(records.len())?;
-
-            if self.is_flexible() {
-                let encoded = UnsignedVarInt(length + 1).encode()?;
-                self.working.put(encoded);
-            } else {
-                self.working.put_u32(length);
-            }
-
-            debug!(
-                working_capacity = self.working.capacity(),
-                working_len = self.working.len(),
-            );
-
-            self.working.unsplit(records);
-
-            debug!(
-                working_capacity = self.working.capacity(),
-                working_len = self.working.len(),
-            );
-
-            Ok(())
+            self.records(value)
         } else {
             // The presence byte of a nullable structure: the `1` that pairs
             // with the `-1` `serialize_none` writes, and that the decoder
@@ -622,9 +600,8 @@ impl Serializer for &mut Encoder {
         variant_index: u32,
         variant: &'static str,
     ) -> Result<Self::Ok, Self::Error> {
-        Err(Error::UnexpectedType(format!(
-            "{name}:{variant_index}:{variant}"
-        )))
+        let unit = format!("{name}:{variant_index}:{variant}");
+        Err(Error::UnexpectedType(unit))
     }
 
     #[instrument(skip(self, value), fields(value = type_name::<T>()))]
@@ -657,21 +634,9 @@ impl Serializer for &mut Encoder {
 
     #[instrument(skip(self))]
     fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq, Self::Error> {
-        if self.is_valid()
-            && let Some(len) = len
-        {
-            if self.is_flexible() {
-                (len + 1)
-                    .try_into()
-                    .map_err(Into::into)
-                    .and_then(|l| self.unsigned_varint(l))?;
-            } else {
-                len.try_into()
-                    .map_err(Into::into)
-                    .and_then(|l| self.serialize_i32(l))?;
-            }
+        if let Some(len) = len.filter(|_| self.is_valid()) {
+            self.length(len, |encoder, len: i32| encoder.serialize_i32(len))?;
         }
-
         Ok(self)
     }
 
@@ -712,12 +677,10 @@ impl Serializer for &mut Encoder {
         len: usize,
     ) -> Result<Self::SerializeStruct, Self::Error> {
         self.containers.push_front(Container::Struct { name, len });
-
-        if let Some(fm) = self.field_meta(name) {
-            self.meta.field = Some(fm);
-            self.meta.parse.push_front(fm.fields.into());
+        if let Some(field) = self.field_meta(name) {
+            self.meta.field = Some(field);
+            self.meta.parse.push_front(field.fields.into());
         }
-
         Ok(self)
     }
 
@@ -729,13 +692,13 @@ impl Serializer for &mut Encoder {
         variant: &'static str,
         len: usize,
     ) -> Result<Self::SerializeStructVariant, Self::Error> {
-        self.containers.push_front(Container::StructVariant {
+        let container = Container::StructVariant {
             name,
             variant_index,
             variant,
             len,
-        });
-
+        };
+        self.containers.push_front(container);
         Ok(self)
     }
 }
@@ -751,7 +714,8 @@ impl SerializeSeq for &mut Encoder {
         T: Serialize,
         T: ?Sized,
     {
-        value.serialize(&mut **self)
+        let encoder: &mut Encoder = self;
+        value.serialize(encoder)
     }
 
     fn end(self) -> Result<Self::Ok, Self::Error> {
@@ -770,7 +734,8 @@ impl SerializeTuple for &mut Encoder {
         T: Serialize,
         T: ?Sized,
     {
-        value.serialize(&mut **self)
+        let encoder: &mut Encoder = self;
+        value.serialize(encoder)
     }
 
     fn end(self) -> Result<Self::Ok, Self::Error> {
@@ -789,11 +754,11 @@ impl SerializeTupleStruct for &mut Encoder {
         T: Serialize,
         T: ?Sized,
     {
-        Err(Error::UnexpectedType(type_name_of_val(value).into()))
+        Err(unexpected(value))
     }
 
     fn end(self) -> Result<Self::Ok, Self::Error> {
-        Err(Error::UnexpectedType(format!("{self:?}")))
+        Err(self.refused())
     }
 }
 
@@ -808,11 +773,11 @@ impl SerializeTupleVariant for &mut Encoder {
         T: Serialize,
         T: ?Sized,
     {
-        Err(Error::UnexpectedType(type_name_of_val(value).into()))
+        Err(unexpected(value))
     }
 
     fn end(self) -> Result<Self::Ok, Self::Error> {
-        Err(Error::UnexpectedType(format!("{self:?}")))
+        Err(self.refused())
     }
 }
 
@@ -827,7 +792,7 @@ impl SerializeMap for &mut Encoder {
         T: Serialize,
         T: ?Sized,
     {
-        Err(Error::UnexpectedType(type_name_of_val(key).into()))
+        Err(unexpected(key))
     }
 
     #[instrument(skip(self, value), fields(value = type_name::<T>()))]
@@ -836,11 +801,11 @@ impl SerializeMap for &mut Encoder {
         T: Serialize,
         T: ?Sized,
     {
-        Err(Error::UnexpectedType(type_name_of_val(value).into()))
+        Err(unexpected(value))
     }
 
     fn end(self) -> Result<Self::Ok, Self::Error> {
-        Err(Error::UnexpectedType(format!("{self:?}")))
+        Err(self.refused())
     }
 }
 
@@ -854,30 +819,22 @@ impl SerializeStruct for &mut Encoder {
         T: Serialize,
         T: ?Sized,
     {
-        _ = self.field.replace(key);
+        self.field = Some(key);
 
-        if let Some(fm) = self.field_meta(key) {
-            debug!(field = self.field_name(), meta = ?fm, is_valid = self.is_valid());
-
-            _ = self.meta.field.replace(fm);
-            self.meta.parse.push_front(fm.fields.into());
-            let outcome = if self.is_valid() {
-                value.serialize(&mut **self)
-            } else {
-                Ok(())
-            };
-            _ = self.meta.parse.pop_front();
-            _ = self.meta.field.take();
-            outcome
-        } else {
+        let Some(field) = self.field_meta(key) else {
             debug!(field = self.field_name());
+            return self.unlisted(value);
+        };
 
-            _ = self.meta.field.take();
-            self.meta.parse.push_front(FieldLookup::default());
-            let outcome = value.serialize(&mut **self);
-            _ = self.meta.parse.pop_front();
-            outcome
-        }
+        debug!(field = self.field_name(), meta = ?field, is_valid = self.is_valid());
+        self.meta.field = Some(field);
+        let outcome = if self.is_valid() {
+            self.nested(field.fields.into(), value)
+        } else {
+            Ok(())
+        };
+        self.meta.field = None;
+        outcome
     }
 
     fn end(self) -> Result<Self::Ok, Self::Error> {
@@ -896,40 +853,55 @@ impl SerializeStructVariant for &mut Encoder {
         T: Serialize,
         T: ?Sized,
     {
-        _ = self.field.replace(key);
+        self.field = Some(key);
 
-        if let Some(fm) = self.field_meta(key) {
-            if self
-                .api_version
-                .is_some_and(|api_version| fm.version.within(api_version))
-            {
-                debug!(field_name = self.field_name(), meta = ?fm);
+        let Some(field) = self.field_meta(key) else {
+            return self.unlisted(value);
+        };
 
-                _ = self.meta.field.replace(fm);
-                self.meta.parse.push_front(fm.fields.into());
-                let outcome = value.serialize(&mut **self);
-                _ = self.meta.parse.pop_front();
-                _ = self.meta.field.take();
-                outcome
-            } else {
-                debug!(
-                    field_name = self.field_name(),
-                    api_version = self.api_version
-                );
-                Ok(())
-            }
-        } else {
-            _ = self.meta.field.take();
-            self.meta.parse.push_front(FieldLookup::default());
-            let outcome = value.serialize(&mut **self);
-            _ = self.meta.parse.pop_front();
-            outcome
+        let within = self
+            .api_version
+            .is_some_and(|version| field.version.within(version));
+        if !within {
+            debug!(
+                field_name = self.field_name(),
+                api_version = self.api_version
+            );
+            return Ok(());
         }
+
+        debug!(field_name = self.field_name(), meta = ?field);
+        self.meta.field = Some(field);
+        let outcome = self.nested(field.fields.into(), value);
+        self.meta.field = None;
+        outcome
     }
 
     fn end(self) -> Result<Self::Ok, Self::Error> {
         _ = self.containers.pop_front();
         Ok(())
+    }
+}
+
+/// What a serializer answers for a type it has no encoding for.
+fn unexpected<T: ?Sized>(value: &T) -> Error {
+    Error::UnexpectedType(type_name_of_val(value).into())
+}
+
+impl Encoder {
+    /// A shape the Kafka protocol has no place for, named as the encoder.
+    fn refused(&self) -> Error {
+        Error::UnexpectedType(format!("{self:?}"))
+    }
+
+    /// `value` for a field the metadata does not list: no field metadata, and
+    /// no fields of its own to look up.
+    fn unlisted<T>(&mut self, value: &T) -> Result<()>
+    where
+        T: Serialize + ?Sized,
+    {
+        self.meta.field = None;
+        self.nested(FieldLookup::default(), value)
     }
 }
 

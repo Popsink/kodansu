@@ -77,3 +77,7 @@ harness = false
 [[bench]]
 name = "record_bench"
 harness = false
+
+[[bench]]
+name = "encode_bench"
+harness = false
