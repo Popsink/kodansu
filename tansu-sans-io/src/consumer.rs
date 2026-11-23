@@ -27,8 +27,8 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument};
 
 use crate::{
-    Body, Decoder, Encoder, Error, ErrorCode, HeartbeatRequest, HeartbeatResponse,
-    JoinGroupRequest, JoinGroupResponse, MetadataResponse, SyncGroupRequest, SyncGroupResponse,
+    Body, Decoder, Encoder, Error, ErrorCode, HeartbeatRequest, JoinGroupRequest,
+    JoinGroupResponse, MetadataResponse, SyncGroupRequest,
     join_group_request::JoinGroupRequestProtocol, join_group_response::JoinGroupResponseMember,
     sync_group_request::SyncGroupRequestAssignment,
 };
@@ -77,13 +77,16 @@ impl FromStr for Assignor {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            Self::COOPERATIVE_STICKY => Ok(Self::CooperativeSticky),
-            Self::RANGE => Ok(Self::Range),
-            Self::ROUND_ROBIN => Ok(Self::RoundRobin),
-            Self::UNIFORM => Ok(Self::Uniform),
-            otherwise => Err(Error::UnknownAssignor(otherwise.into())),
-        }
+        let known = [
+            Self::CooperativeSticky,
+            Self::Range,
+            Self::RoundRobin,
+            Self::Uniform,
+        ];
+        known
+            .into_iter()
+            .find(|assignor| assignor.as_ref() == s)
+            .ok_or_else(|| Error::UnknownAssignor(s.to_owned()))
     }
 }
 
@@ -93,12 +96,13 @@ impl ConsumerAssignor for Assignor {
         members: &[JoinGroupResponseMember],
         metadata: &MetadataResponse,
     ) -> Result<Vec<SyncGroupRequestAssignment>, Error> {
-        match self {
-            Self::CooperativeSticky => CooperativeStickyAssignor.assign(members, metadata),
-            Self::Range => RangeAssignor.assign(members, metadata),
-            Self::RoundRobin => RoundRobinAssignor.assign(members, metadata),
-            Self::Uniform => UniformAssignor.assign(members, metadata),
-        }
+        let assignor: &dyn ConsumerAssignor = match self {
+            Self::CooperativeSticky => &CooperativeStickyAssignor,
+            Self::Range => &RangeAssignor,
+            Self::RoundRobin => &RoundRobinAssignor,
+            Self::Uniform => &UniformAssignor,
+        };
+        assignor.assign(members, metadata)
     }
 }
 
@@ -133,15 +137,14 @@ impl fmt::Display for MemberMetadata {
 }
 
 impl MemberMetadata {
-    pub fn version(self, version: i16) -> Self {
-        Self { version, ..self }
+    pub fn version(mut self, version: i16) -> Self {
+        self.version = version;
+        self
     }
 
-    pub fn subscription(self, subscription: ConsumerProtocolSubscription) -> Self {
-        Self {
-            subscription,
-            ..self
-        }
+    pub fn subscription(mut self, subscription: ConsumerProtocolSubscription) -> Self {
+        self.subscription = subscription;
+        self
     }
 }
 
@@ -149,9 +152,7 @@ impl TryFrom<Bytes> for MemberMetadata {
     type Error = Error;
 
     fn try_from(value: Bytes) -> Result<Self, Self::Error> {
-        let mut reader = value.reader();
-        let mut decoder = Decoder::new(&mut reader);
-        Self::deserialize(&mut decoder)
+        decoded(value)
     }
 }
 
@@ -159,10 +160,29 @@ impl TryFrom<&MemberMetadata> for Bytes {
     type Error = Error;
 
     fn try_from(value: &MemberMetadata) -> Result<Self, Self::Error> {
-        let mut encoder = Encoder::new(BytesMut::new());
-
-        value.serialize(&mut encoder).and(Ok(Bytes::from(encoder)))
+        encoded(value)
     }
+}
+
+/// `T` read from the protocol's own encoding of it in `bytes`.
+fn decoded<T>(bytes: Bytes) -> Result<T, Error>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    T::deserialize(&mut Decoder::new(&mut bytes.reader()))
+}
+
+/// `value` in the protocol's own encoding.
+fn encoded(value: &impl Serialize) -> Result<Bytes, Error> {
+    let mut encoder = Encoder::new(BytesMut::new());
+    value.serialize(&mut encoder)?;
+    Ok(Bytes::from(encoder))
+}
+
+/// `items`, displayed and separated by commas.
+fn listed<T: fmt::Display>(items: &[T]) -> String {
+    let shown: Vec<String> = items.iter().map(T::to_string).collect();
+    shown.join(", ")
 }
 
 #[derive(Clone, Default, Deserialize, Eq, Hash, Debug, Ord, PartialEq, PartialOrd, Serialize)]
@@ -176,20 +196,8 @@ pub struct ConsumerProtocolSubscription {
 
 impl fmt::Display for ConsumerProtocolSubscription {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "owned: {}",
-            self.owned_partitions
-                .as_deref()
-                .map(|partitions| {
-                    partitions
-                        .iter()
-                        .map(|partition| partition.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
-                .unwrap_or_default()
-        )
+        let owned = self.owned_partitions.as_deref().map(listed);
+        write!(f, "owned: {}", owned.unwrap_or_default())
     }
 }
 
@@ -199,33 +207,32 @@ impl ConsumerProtocolSubscription {
     pub const V2: i16 = 2;
     pub const V3: i16 = 3;
 
-    pub fn topics(self, topics: impl IntoIterator<Item = String>) -> Self {
-        Self {
-            topics: topics.into_iter().collect(),
-            ..self
-        }
+    pub fn topics(mut self, topics: impl IntoIterator<Item = String>) -> Self {
+        self.topics = Vec::from_iter(topics);
+        self
     }
 
-    pub fn user_data(self, user_data: Option<Bytes>) -> Self {
-        Self { user_data, ..self }
+    pub fn user_data(mut self, user_data: Option<Bytes>) -> Self {
+        self.user_data = user_data;
+        self
     }
 
-    pub fn owned_partitions(self, owned_partitions: impl Iterator<Item = TopicPartition>) -> Self {
-        Self {
-            owned_partitions: Some(owned_partitions.collect()),
-            ..self
-        }
+    pub fn owned_partitions(
+        mut self,
+        owned_partitions: impl Iterator<Item = TopicPartition>,
+    ) -> Self {
+        self.owned_partitions = Some(Vec::from_iter(owned_partitions));
+        self
     }
 
-    pub fn generation_id(self, generation_id: Option<i32>) -> Self {
-        Self {
-            generation_id,
-            ..self
-        }
+    pub fn generation_id(mut self, generation_id: Option<i32>) -> Self {
+        self.generation_id = generation_id;
+        self
     }
 
-    pub fn rack_id(self, rack_id: Option<String>) -> Self {
-        Self { rack_id, ..self }
+    pub fn rack_id(mut self, rack_id: Option<String>) -> Self {
+        self.rack_id = rack_id;
+        self
     }
 }
 
@@ -241,41 +248,29 @@ where
     P: IntoIterator<Item = i32>,
 {
     fn from(value: (T, P)) -> TopicPartition {
-        let topic = value.0.into();
-        let partitions = value.1.into_iter().collect();
-
-        Self { topic, partitions }
+        let (topic, partitions) = value;
+        Self {
+            topic: topic.into(),
+            partitions: Vec::from_iter(partitions),
+        }
     }
 }
 
 impl fmt::Display for TopicPartition {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}: [{}]",
-            self.topic,
-            self.partitions
-                .iter()
-                .map(|partition| partition.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
+        write!(f, "{}: [{}]", self.topic, listed(&self.partitions))
     }
 }
 
 impl TopicPartition {
-    pub fn topic(self, topic: impl Into<String>) -> Self {
-        Self {
-            topic: topic.into(),
-            ..self
-        }
+    pub fn topic(mut self, topic: impl Into<String>) -> Self {
+        self.topic = topic.into();
+        self
     }
 
-    pub fn partitions(self, partitions: impl Iterator<Item = i32>) -> Self {
-        Self {
-            partitions: partitions.collect(),
-            ..self
-        }
+    pub fn partitions(mut self, partitions: impl Iterator<Item = i32>) -> Self {
+        self.partitions = Vec::from_iter(partitions);
+        self
     }
 }
 
@@ -289,17 +284,19 @@ pub struct MemberAssignment {
 
 impl fmt::Display for MemberAssignment {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.assignment.to_string().as_str())
+        fmt::Display::fmt(&self.assignment, f)
     }
 }
 
 impl MemberAssignment {
-    pub fn version(self, version: i16) -> Self {
-        Self { version, ..self }
+    pub fn version(mut self, version: i16) -> Self {
+        self.version = version;
+        self
     }
 
-    pub fn assignment(self, assignment: ConsumerProtocolAssignment) -> Self {
-        Self { assignment, ..self }
+    pub fn assignment(mut self, assignment: ConsumerProtocolAssignment) -> Self {
+        self.assignment = assignment;
+        self
     }
 }
 
@@ -307,9 +304,7 @@ impl TryFrom<Bytes> for MemberAssignment {
     type Error = Error;
 
     fn try_from(value: Bytes) -> Result<Self, Self::Error> {
-        let mut reader = value.reader();
-        let mut codec = Decoder::new(&mut reader);
-        Self::deserialize(&mut codec)
+        decoded(value)
     }
 }
 
@@ -317,9 +312,7 @@ impl TryFrom<&MemberAssignment> for Bytes {
     type Error = Error;
 
     fn try_from(value: &MemberAssignment) -> Result<Self, Self::Error> {
-        let mut encoder = Encoder::new(BytesMut::new());
-
-        value.serialize(&mut encoder).and(Ok(Bytes::from(encoder)))
+        encoded(value)
     }
 }
 
@@ -331,14 +324,7 @@ pub struct ConsumerProtocolAssignment {
 
 impl fmt::Display for ConsumerProtocolAssignment {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(
-            self.assigned_partitions
-                .iter()
-                .map(|assigned| assigned.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-                .as_str(),
-        )
+        f.write_str(&listed(&self.assigned_partitions))
     }
 }
 
@@ -347,17 +333,16 @@ impl ConsumerProtocolAssignment {
         self,
         assigned_partitions: impl IntoIterator<Item = impl Into<TopicPartition>>,
     ) -> Self {
+        let assigned = assigned_partitions.into_iter().map(Into::into);
         Self {
-            assigned_partitions: assigned_partitions.into_iter().map(|p| p.into()).collect(),
+            assigned_partitions: assigned.collect(),
             ..self
         }
     }
 
     pub fn user_data(self, user_data: impl IntoIterator<Item = Bytes>) -> Self {
-        Self {
-            user_data: user_data.into_iter().next(),
-            ..self
-        }
+        let user_data = user_data.into_iter().next();
+        Self { user_data, ..self }
     }
 }
 
@@ -374,8 +359,9 @@ pub struct Builder<M, T> {
 
 impl Builder<PhantomData<MetadataResponse>, PhantomData<Vec<String>>> {
     fn new(group_id: impl Into<String>) -> Self {
+        let group_id = group_id.into();
         Self {
-            group_id: group_id.into(),
+            group_id,
             topics: PhantomData,
             metadata: PhantomData,
             on_assignment: None,
@@ -390,49 +376,59 @@ impl<M, T> Builder<M, T> {
         self,
         topics: impl IntoIterator<Item = impl Into<String>>,
     ) -> Builder<M, Vec<String>> {
+        let Self {
+            group_id,
+            metadata,
+            on_assignment,
+            rebalance_timeout,
+            session_timeout,
+            ..
+        } = self;
+
         Builder {
-            group_id: self.group_id,
+            group_id,
             topics: topics.into_iter().map(Into::into).collect(),
-            metadata: self.metadata,
-            on_assignment: self.on_assignment,
-            rebalance_timeout: self.rebalance_timeout,
-            session_timeout: self.session_timeout,
+            metadata,
+            on_assignment,
+            rebalance_timeout,
+            session_timeout,
         }
     }
 
     pub fn metadata(self, metadata: MetadataResponse) -> Builder<MetadataResponse, T> {
-        Builder {
-            group_id: self.group_id,
-            topics: self.topics,
-            metadata,
-            on_assignment: self.on_assignment,
-            rebalance_timeout: self.rebalance_timeout,
-            session_timeout: self.session_timeout,
-        }
-    }
-
-    pub fn rebalance_timeout(self, rebalance_timeout: Option<Duration>) -> Self {
-        Self {
+        let Self {
+            group_id,
+            topics,
+            on_assignment,
             rebalance_timeout,
-            ..self
+            session_timeout,
+            ..
+        } = self;
+
+        Builder {
+            group_id,
+            topics,
+            metadata,
+            on_assignment,
+            rebalance_timeout,
+            session_timeout,
         }
     }
 
-    pub fn session_timeout(self, session_timeout: Option<Duration>) -> Self {
-        Self {
-            session_timeout,
-            ..self
-        }
+    pub fn rebalance_timeout(mut self, rebalance_timeout: Option<Duration>) -> Self {
+        self.rebalance_timeout = rebalance_timeout;
+        self
+    }
+
+    pub fn session_timeout(mut self, session_timeout: Option<Duration>) -> Self {
+        self.session_timeout = session_timeout;
+        self
     }
 
     pub fn on_assignment(self, on_assignment: Option<Arc<DynConsumerAssignment>>) -> Builder<M, T> {
-        Builder {
-            group_id: self.group_id,
-            topics: self.topics,
-            metadata: self.metadata,
+        Self {
             on_assignment,
-            rebalance_timeout: self.rebalance_timeout,
-            session_timeout: self.session_timeout,
+            ..self
         }
     }
 }
@@ -442,23 +438,23 @@ impl Builder<MetadataResponse, Vec<String>> {
     const SESSION_TIMEOUT_MS_DEFAULT: u64 = 10_000;
 
     pub fn build(self) -> GroupConsumer {
+        let rebalance = Duration::from_millis(Self::REBALANCE_TIMEOUT_MS_DEFAULT);
+        let session = Duration::from_millis(Self::SESSION_TIMEOUT_MS_DEFAULT);
+        let outsider = MemberState::Outsider {
+            generation_id: None,
+            member_id: None,
+            member_assignment: None,
+        };
+
         GroupConsumer {
             group_id: self.group_id,
             topics: self.topics,
-            rebalance_timeout: self
-                .rebalance_timeout
-                .unwrap_or_else(|| Duration::from_millis(Self::REBALANCE_TIMEOUT_MS_DEFAULT)),
-            session_timeout: self
-                .session_timeout
-                .unwrap_or_else(|| Duration::from_millis(Self::SESSION_TIMEOUT_MS_DEFAULT)),
-            member_state: MemberState::Outsider {
-                generation_id: None,
-                member_id: None,
-                member_assignment: None,
-            },
-            on_assignment: self.on_assignment,
+            rebalance_timeout: self.rebalance_timeout.unwrap_or(rebalance),
+            session_timeout: self.session_timeout.unwrap_or(session),
+            member_state: outsider,
             metadata: self.metadata,
-            errors: Default::default(),
+            on_assignment: self.on_assignment,
+            errors: Arc::new(Mutex::new(BTreeMap::new())),
         }
     }
 }
@@ -497,32 +493,31 @@ impl MemberState {
 
     fn generation_id(&self) -> Option<i32> {
         match self {
-            MemberState::Outsider { generation_id, .. } => *generation_id,
-            MemberState::Follower { generation_id, .. } => Some(*generation_id),
-            MemberState::Leader { generation_id, .. } => Some(*generation_id),
+            Self::Outsider { generation_id, .. } => *generation_id,
+            Self::Follower { generation_id, .. } | Self::Leader { generation_id, .. } => {
+                Some(*generation_id)
+            }
         }
     }
 
     fn member_id(&self) -> Option<&str> {
         match self {
-            MemberState::Outsider { member_id, .. } => member_id.as_deref(),
-            MemberState::Follower { member_id, .. } => Some(member_id.as_str()),
-            MemberState::Leader { member_id, .. } => Some(member_id.as_str()),
+            Self::Outsider { member_id, .. } => member_id.as_deref(),
+            Self::Follower { member_id, .. } | Self::Leader { member_id, .. } => Some(member_id),
         }
     }
 
     fn member_assignment(&self) -> Option<&MemberAssignment> {
-        match self {
-            MemberState::Outsider {
-                member_assignment, ..
-            } => member_assignment.as_ref(),
-            MemberState::Follower {
-                member_assignment, ..
-            } => member_assignment.as_ref(),
-            MemberState::Leader {
-                member_assignment, ..
-            } => member_assignment.as_ref(),
+        let (Self::Outsider {
+            member_assignment, ..
         }
+        | Self::Follower {
+            member_assignment, ..
+        }
+        | Self::Leader {
+            member_assignment, ..
+        }) = self;
+        member_assignment.as_ref()
     }
 }
 
@@ -577,11 +572,14 @@ impl GroupConsumer {
     }
 
     pub fn errors(&self) -> Result<BTreeMap<ErrorCode, u64>, Error> {
-        self.errors
-            .lock()
-            .map(|errors| errors.clone())
-            .map_err(Into::into)
+        let errors = self.errors.lock()?;
+        Ok(errors.clone())
     }
+}
+
+/// Whether a response's `error_code` is `expected`.
+fn is(error_code: i16, expected: ErrorCode) -> bool {
+    error_code == i16::from(expected)
 }
 
 impl GroupConsumer {
@@ -598,35 +596,24 @@ impl GroupConsumer {
         generation_id: Option<i32>,
         member_assignment: Option<&MemberAssignment>,
     ) -> Result<JoinGroupRequestProtocol, Error> {
-        Bytes::try_from(
-            &MemberMetadata::default()
-                .version(
-                    member_assignment
-                        .as_ref()
-                        .map_or(ConsumerProtocolSubscription::V3, |member_assignment| {
-                            member_assignment.version
-                        }),
-                )
-                .subscription(
-                    ConsumerProtocolSubscription::default()
-                        .topics(self.topics.clone())
-                        .owned_partitions(
-                            member_assignment
-                                .as_ref()
-                                .map(|member_assignment| {
-                                    member_assignment.assignment.assigned_partitions.clone()
-                                })
-                                .unwrap_or_default()
-                                .into_iter(),
-                        )
-                        .generation_id(generation_id.or(Some(-1))),
-                ),
-        )
-        .map(|metadata| {
-            JoinGroupRequestProtocol::default()
-                .name(assignor.as_ref().into())
-                .metadata(metadata)
-        })
+        let version = member_assignment.map_or(ConsumerProtocolSubscription::V3, |assigned| {
+            assigned.version
+        });
+        let owned = member_assignment
+            .map(|assigned| assigned.assignment.assigned_partitions.clone())
+            .unwrap_or_default();
+
+        let subscription = ConsumerProtocolSubscription::default()
+            .topics(self.topics.clone())
+            .owned_partitions(owned.into_iter())
+            .generation_id(Some(generation_id.unwrap_or(-1)));
+        let metadata = MemberMetadata::default()
+            .version(version)
+            .subscription(subscription);
+
+        Ok(JoinGroupRequestProtocol::default()
+            .name(String::from(assignor.as_ref()))
+            .metadata(Bytes::try_from(&metadata)?))
     }
 
     fn join_protocols(
@@ -634,10 +621,9 @@ impl GroupConsumer {
         generation_id: Option<i32>,
         member_assignment: Option<&MemberAssignment>,
     ) -> Result<Vec<JoinGroupRequestProtocol>, Error> {
-        Self::ASSIGNORS
-            .iter()
-            .map(|assignor| self.join_protocol(assignor, generation_id, member_assignment))
-            .collect::<Result<Vec<_>, Error>>()
+        let protocol =
+            |assignor: &Assignor| self.join_protocol(assignor, generation_id, member_assignment);
+        Self::ASSIGNORS.iter().map(protocol).collect()
     }
 
     fn join_request(
@@ -647,367 +633,268 @@ impl GroupConsumer {
         member_assignment: Option<MemberAssignment>,
         reason: &str,
     ) -> Result<JoinGroupRequest, Error> {
-        self.join_protocols(generation_id, member_assignment.as_ref())
-            .map(Some)
-            .map(|protocols| {
-                JoinGroupRequest::default()
-                    .group_id(self.group_id.clone())
-                    .protocol_type(CONSUMER.into())
-                    .rebalance_timeout_ms(Some(self.rebalance_timeout.as_millis() as i32))
-                    .session_timeout_ms(self.session_timeout.as_millis() as i32)
-                    .member_id(member_id.to_owned().unwrap_or_default())
-                    .reason(Some(reason.into()))
-                    .protocols(protocols)
-            })
+        let protocols = self.join_protocols(generation_id, member_assignment.as_ref())?;
+        let rebalance_timeout_ms = self.rebalance_timeout.as_millis() as i32;
+
+        Ok(JoinGroupRequest::default()
+            .group_id(self.group_id.clone())
+            .protocol_type(String::from(CONSUMER))
+            .rebalance_timeout_ms(Some(rebalance_timeout_ms))
+            .session_timeout_ms(self.session_timeout.as_millis() as i32)
+            .member_id(member_id.unwrap_or_default())
+            .reason(Some(String::from(reason)))
+            .protocols(Some(protocols)))
+    }
+
+    /// One more response with `error_code`.
+    fn count(&self, error_code: ErrorCode) -> Result<(), Error> {
+        let mut errors = self.errors.lock()?;
+        *errors.entry(error_code).or_default() += 1;
+        Ok(())
+    }
+
+    /// Back outside the group with what it still knows, asking to join.
+    fn rejoin(
+        &mut self,
+        generation_id: Option<i32>,
+        member_id: Option<String>,
+        member_assignment: Option<MemberAssignment>,
+        reason: &str,
+    ) -> Result<Body, Error> {
+        self.member_state = MemberState::Outsider {
+            generation_id,
+            member_id: member_id.clone(),
+            member_assignment: member_assignment.clone(),
+        };
+        let request = self.join_request(generation_id, member_id, member_assignment, reason)?;
+        Ok(request.into())
+    }
+
+    fn heartbeat(&self, generation_id: i32, member_id: String) -> Body {
+        HeartbeatRequest::default()
+            .group_id(self.group_id.clone())
+            .generation_id(generation_id)
+            .member_id(member_id)
+            .into()
+    }
+
+    /// The leader's sync: each member's assignment, by the protocol the
+    /// coordinator chose, or [`RangeAssignor`] when it is not one of ours.
+    fn lead(&mut self, join: JoinGroupResponse) -> Result<Body, Error> {
+        let JoinGroupResponse {
+            generation_id,
+            protocol_type,
+            protocol_name,
+            leader,
+            member_id,
+            members,
+            ..
+        } = join;
+
+        self.member_state = MemberState::Leader {
+            generation_id,
+            member_id,
+            member_assignment: None,
+        };
+        debug!(?self.member_state);
+
+        let chosen = protocol_name.as_deref().map(str::parse::<Assignor>);
+        let assignor: Box<dyn ConsumerAssignor> = match chosen {
+            Some(Ok(assignor)) => Box::new(assignor),
+            _ => Box::new(RangeAssignor),
+        };
+        let assignments =
+            assignor.assign(members.as_deref().unwrap_or_default(), &self.metadata)?;
+        for assignment in &assignments {
+            let decoded = MemberAssignment::try_from(assignment.assignment.clone()).ok();
+            debug!(member_id = assignment.member_id, assignment = ?decoded);
+        }
+
+        Ok(SyncGroupRequest::default()
+            .generation_id(generation_id)
+            .group_id(self.group_id.clone())
+            .member_id(leader)
+            .assignments(Some(assignments))
+            .protocol_name(protocol_name)
+            .protocol_type(protocol_type)
+            .into())
+    }
+
+    /// A follower's sync, which carries no assignments.
+    fn follow(&mut self, join: JoinGroupResponse) -> Body {
+        let JoinGroupResponse {
+            generation_id,
+            protocol_type,
+            protocol_name,
+            member_id,
+            ..
+        } = join;
+
+        self.member_state = MemberState::Follower {
+            generation_id,
+            member_id: member_id.clone(),
+            member_assignment: None,
+        };
+        debug!(?self.member_state);
+
+        SyncGroupRequest::default()
+            .generation_id(generation_id)
+            .group_id(self.group_id.clone())
+            .member_id(member_id)
+            .assignments(Some(Vec::new()))
+            .protocol_name(protocol_name)
+            .protocol_type(protocol_type)
+            .into()
+    }
+
+    /// The assignment the coordinator synced, handed to `on_assignment`.
+    fn assigned(&mut self, assignment: Bytes) -> Result<Body, Error> {
+        let (Some(generation_id), Some(member_id)) =
+            (self.generation_id(), self.member_id().map(str::to_owned))
+        else {
+            unreachable!("only a leader or a follower is synced")
+        };
+        assert!(!assignment.is_empty(), "member: {member_id}");
+
+        let decoded = MemberAssignment::try_from(assignment)?;
+        debug!(%decoded);
+        if let MemberState::Leader {
+            member_assignment, ..
+        }
+        | MemberState::Follower {
+            member_assignment, ..
+        } = &mut self.member_state
+        {
+            *member_assignment = Some(decoded.clone());
+        }
+
+        if let Some(on_assignment) = self.on_assignment.as_ref() {
+            on_assignment(self.group_id.clone(), decoded)
+        }
+        Ok(self.heartbeat(generation_id, member_id))
     }
 
     #[instrument(skip(self, input), fields(group_id = self.group_id, member_state = ?self.member_state), ret)]
     pub fn next_action(&mut self, input: Option<Body>) -> Result<Body, Error> {
-        match (&mut self.member_state, input) {
-            // initial
-            //
+        use MemberState::{Follower, Leader, Outsider};
+
+        match (self.member_state.clone(), input) {
             (
-                MemberState::Outsider {
+                Outsider {
                     generation_id,
                     member_id,
                     member_assignment,
                 },
                 None,
-            ) => {
-                let generation_id = *generation_id;
-                let member_id = member_id.clone();
-                let member_assignment = member_assignment.clone();
+            ) => self.rejoin(generation_id, member_id, member_assignment, "join"),
 
-                self.join_request(generation_id, member_id, member_assignment, "join")
-                    .map(Into::into)
-            }
-
-            // Join
-            //
             (
-                MemberState::Outsider {
+                Outsider {
                     generation_id,
                     member_id,
                     member_assignment,
                 },
-                Some(Body::JoinGroupResponse(JoinGroupResponse { error_code, .. })),
-            ) if i16::from(ErrorCode::NotCoordinator) == error_code => {
-                self.errors
-                    .lock()
-                    .map(|mut errors| *errors.entry(ErrorCode::NotCoordinator).or_default() += 1)?;
-
-                let generation_id = *generation_id;
-                let member_id = member_id.clone();
-                let member_assignment = member_assignment.clone();
-
-                self.join_request(generation_id, member_id, member_assignment, "join")
-                    .map(Into::into)
+                Some(Body::JoinGroupResponse(join)),
+            ) if is(join.error_code, ErrorCode::NotCoordinator) => {
+                self.count(ErrorCode::NotCoordinator)?;
+                self.rejoin(generation_id, member_id, member_assignment, "join")
             }
 
             (
-                MemberState::Outsider {
-                    generation_id,
-                    member_id,
-                    member_assignment,
+                Outsider {
+                    member_assignment, ..
                 },
-                Some(Body::JoinGroupResponse(JoinGroupResponse {
-                    error_code,
-                    generation_id: current_generation_id,
-                    member_id: required_member_id,
-                    ..
-                })),
-            ) if error_code == i16::from(ErrorCode::MemberIdRequired) => {
-                self.errors.lock().map(|mut errors| {
-                    *errors.entry(ErrorCode::MemberIdRequired).or_default() += 1
-                })?;
+                Some(Body::JoinGroupResponse(join)),
+            ) if is(join.error_code, ErrorCode::MemberIdRequired) => {
+                self.count(ErrorCode::MemberIdRequired)?;
+                let (generation_id, member_id) = (Some(join.generation_id), Some(join.member_id));
+                let reason = "join member id required";
+                self.rejoin(generation_id, member_id, member_assignment, reason)
+            }
 
-                _ = generation_id.replace(current_generation_id);
-                _ = member_id.replace(required_member_id);
+            (Outsider { .. }, Some(Body::JoinGroupResponse(join)))
+                if is(join.error_code, ErrorCode::None) && join.leader == join.member_id =>
+            {
+                self.count(ErrorCode::None)?;
+                self.lead(join)
+            }
 
-                let generation_id = *generation_id;
-                let member_id = member_id.clone();
-                let member_assignment = member_assignment.clone();
+            (Outsider { .. }, Some(Body::JoinGroupResponse(join)))
+                if is(join.error_code, ErrorCode::None) =>
+            {
+                self.count(ErrorCode::None)?;
+                Ok(self.follow(join))
+            }
 
-                self.join_request(
-                    generation_id,
-                    member_id,
-                    member_assignment,
-                    "join member id required",
-                )
-                .map(Into::into)
+            (Leader { .. } | Follower { .. }, Some(Body::SyncGroupResponse(sync)))
+                if is(sync.error_code, ErrorCode::None) =>
+            {
+                self.count(ErrorCode::None)?;
+                self.assigned(sync.assignment)
             }
 
             (
-                MemberState::Outsider { .. },
-                Some(Body::JoinGroupResponse(JoinGroupResponse {
-                    error_code,
-                    generation_id,
-                    protocol_type,
-                    protocol_name,
-                    leader,
-                    member_id,
-                    members,
-                    ..
-                })),
-            ) if error_code == i16::from(ErrorCode::None) && leader == member_id => {
-                self.errors
-                    .lock()
-                    .map(|mut errors| *errors.entry(ErrorCode::None).or_default() += 1)?;
-
-                self.member_state = MemberState::Leader {
-                    generation_id,
-                    member_id,
-                    member_assignment: None,
-                };
-
-                debug!(?self.member_state);
-
-                protocol_name
-                    .as_deref()
-                    .and_then(|name| name.parse::<Assignor>().ok())
-                    .map_or_else(
-                        || Box::new(RangeAssignor) as Box<dyn ConsumerAssignor>,
-                        |assignor| Box::new(assignor) as Box<dyn ConsumerAssignor>,
-                    )
-                    .assign(members.as_deref().unwrap_or_default(), &self.metadata)
-                    .inspect(|assignments| {
-                        for assignment in assignments {
-                            debug!(
-                                member_id = assignment.member_id,
-                                assignment =
-                                    ?MemberAssignment::try_from(assignment.assignment.clone()).ok()
-                            );
-                        }
-                    })
-                    .map(Some)
-                    .map(|assignments| {
-                        SyncGroupRequest::default()
-                            .generation_id(generation_id)
-                            .group_id(self.group_id.clone())
-                            .member_id(leader)
-                            .assignments(assignments)
-                            .protocol_name(protocol_name)
-                            .protocol_type(protocol_type)
-                    })
-                    .map(Into::into)
-            }
-
-            (
-                MemberState::Outsider { .. },
-                Some(Body::JoinGroupResponse(JoinGroupResponse {
-                    error_code,
-                    generation_id,
-                    protocol_type,
-                    protocol_name,
-                    member_id,
-                    ..
-                })),
-            ) if i16::from(ErrorCode::None) == error_code => {
-                self.errors
-                    .lock()
-                    .map(|mut errors| *errors.entry(ErrorCode::None).or_default() += 1)?;
-
-                self.member_state = MemberState::Follower {
-                    generation_id,
-                    member_id: member_id.clone(),
-                    member_assignment: None,
-                };
-
-                debug!(?self.member_state);
-
-                Ok(SyncGroupRequest::default()
-                    .generation_id(generation_id)
-                    .group_id(self.group_id.clone())
-                    .member_id(member_id)
-                    .assignments(Some([].into()))
-                    .protocol_name(protocol_name)
-                    .protocol_type(protocol_type)
-                    .into())
-            }
-
-            // Sync
-            //
-            (
-                MemberState::Leader {
-                    member_assignment,
-                    generation_id,
-                    member_id,
-                }
-                | MemberState::Follower {
-                    member_assignment,
-                    generation_id,
-                    member_id,
-                },
-                Some(Body::SyncGroupResponse(SyncGroupResponse {
-                    error_code,
-                    assignment,
-                    ..
-                })),
-            ) if i16::from(ErrorCode::None) == error_code => {
-                self.errors
-                    .lock()
-                    .map(|mut errors| *errors.entry(ErrorCode::None).or_default() += 1)?;
-
-                assert!(!assignment.is_empty(), "member: {member_id}");
-
-                let ma = MemberAssignment::try_from(assignment).inspect(|ma| debug!(%ma))?;
-                _ = member_assignment.replace(ma.clone());
-
-                if let Some(on_assignment) = self.on_assignment.as_ref() {
-                    on_assignment(self.group_id.clone(), ma)
-                }
-
-                Ok(HeartbeatRequest::default()
-                    .group_id(self.group_id.clone())
-                    .generation_id(*generation_id)
-                    .member_id(member_id.clone())
-                    .into())
-            }
-
-            (
-                MemberState::Leader {
-                    generation_id,
+                Leader {
                     member_id,
                     member_assignment,
                     ..
                 }
-                | MemberState::Follower {
-                    generation_id,
+                | Follower {
                     member_id,
                     member_assignment,
                     ..
                 },
-                Some(Body::SyncGroupResponse(SyncGroupResponse {
-                    error_code,
-                    assignment,
-                    ..
-                })),
-            ) if error_code == i16::from(ErrorCode::RebalanceInProgress) => {
-                self.errors.lock().map(|mut errors| {
-                    *errors.entry(ErrorCode::RebalanceInProgress).or_default() += 1
-                })?;
-
-                assert!(assignment.is_empty());
-
-                let generation_id = None;
-                let member_id = Some(member_id.to_owned());
-                let member_assignment = member_assignment.to_owned();
-
-                self.member_state = MemberState::Outsider {
-                    generation_id,
-                    member_id: member_id.clone(),
-                    member_assignment: member_assignment.clone(),
-                };
-
-                self.join_request(
-                    generation_id,
-                    member_id,
-                    member_assignment,
-                    "join after sync with rebalance",
-                )
-                .map(Into::into)
+                Some(Body::SyncGroupResponse(sync)),
+            ) if is(sync.error_code, ErrorCode::RebalanceInProgress) => {
+                self.count(ErrorCode::RebalanceInProgress)?;
+                assert!(sync.assignment.is_empty());
+                let reason = "join after sync with rebalance";
+                self.rejoin(None, Some(member_id), member_assignment, reason)
             }
 
-            // Heartbeat
-            //
-            (
-                MemberState::Leader {
-                    generation_id,
-                    member_id,
-                    ..
-                }
-                | MemberState::Follower {
-                    generation_id,
-                    member_id,
-                    ..
-                },
-                Some(Body::HeartbeatResponse(HeartbeatResponse { error_code, .. })),
-            ) if error_code == i16::from(ErrorCode::UnknownMemberId) => {
-                self.errors.lock().map(|mut errors| {
-                    *errors.entry(ErrorCode::UnknownMemberId).or_default() += 1
-                })?;
-
-                let generation_id = None;
-                let member_id = None;
-                let member_assignment = None;
-
-                self.member_state = MemberState::Outsider {
-                    generation_id,
-                    member_id: member_id.clone(),
-                    member_assignment: member_assignment.clone(),
-                };
-
-                self.join_request(
-                    generation_id,
-                    member_id,
-                    member_assignment,
-                    "join after unknown member id",
-                )
-                .map(Into::into)
+            (Leader { .. } | Follower { .. }, Some(Body::HeartbeatResponse(heartbeat)))
+                if is(heartbeat.error_code, ErrorCode::UnknownMemberId) =>
+            {
+                self.count(ErrorCode::UnknownMemberId)?;
+                self.rejoin(None, None, None, "join after unknown member id")
             }
 
             (
-                MemberState::Leader {
+                Leader {
                     generation_id,
                     member_id,
                     member_assignment,
                 }
-                | MemberState::Follower {
+                | Follower {
                     generation_id,
                     member_id,
                     member_assignment,
                 },
-                Some(Body::HeartbeatResponse(HeartbeatResponse { error_code, .. })),
-            ) if error_code == i16::from(ErrorCode::RebalanceInProgress) => {
-                self.errors.lock().map(|mut errors| {
-                    *errors.entry(ErrorCode::RebalanceInProgress).or_default() += 1
-                })?;
-
-                let generation_id = Some(generation_id.to_owned());
-                let member_id = Some(member_id.to_owned());
-                let member_assignment = member_assignment.to_owned();
-
-                self.member_state = MemberState::Outsider {
-                    generation_id,
-                    member_id: member_id.clone(),
-                    member_assignment: member_assignment.clone(),
-                };
-
-                self.join_request(
-                    generation_id,
-                    member_id,
-                    member_assignment,
-                    "join after rebalance",
-                )
-                .map(Into::into)
+                Some(Body::HeartbeatResponse(heartbeat)),
+            ) if is(heartbeat.error_code, ErrorCode::RebalanceInProgress) => {
+                self.count(ErrorCode::RebalanceInProgress)?;
+                let (generation_id, member_id) = (Some(generation_id), Some(member_id));
+                let reason = "join after rebalance";
+                self.rejoin(generation_id, member_id, member_assignment, reason)
             }
 
             (
-                MemberState::Leader {
+                Leader {
                     generation_id,
                     member_id,
                     ..
                 }
-                | MemberState::Follower {
+                | Follower {
                     generation_id,
                     member_id,
                     ..
                 },
-                Some(Body::HeartbeatResponse(HeartbeatResponse { error_code, .. })),
-            ) if error_code == i16::from(ErrorCode::None) => {
-                self.errors
-                    .lock()
-                    .map(|mut errors| *errors.entry(ErrorCode::None).or_default() += 1)?;
-
-                Ok(HeartbeatRequest::default()
-                    .group_id(self.group_id.clone())
-                    .generation_id(*generation_id)
-                    .member_id(member_id.clone())
-                    .into())
+                Some(Body::HeartbeatResponse(heartbeat)),
+            ) if is(heartbeat.error_code, ErrorCode::None) => {
+                self.count(ErrorCode::None)?;
+                Ok(self.heartbeat(generation_id, member_id))
             }
 
-            // Fall through
-            //
             (state, input) => todo!("state: {state:?}, input: {input:?}"),
         }
     }

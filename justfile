@@ -1330,6 +1330,15 @@ fmt:
 # #253 reasoning as a doc comment. More code went than comment, so the ceiling
 # rises.
 #
+#   defork  -113 lines, the group consumer rewritten  2800 -> 2790  2.6824 -> 2.6758
+#
+# `consumer.rs` (Popsink/data-plane#5885). `next_action` counted a response's
+# error code and rebuilt a join request in nine arms; `count` and `rejoin` now
+# do it once each, and the leader's and follower's sync and the synced
+# assignment are their own functions. Its `// Join`, `// Sync` and
+# `// Heartbeat` banners went with the arms they introduced, so the ratio falls
+# and the ceiling follows it.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1339,7 +1348,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6825" top="12":
+comments ceiling="2.6759" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
