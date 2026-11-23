@@ -194,6 +194,18 @@ pub(super) struct Tuning {
     /// rejects the produce and a rejected produce costs a connector restart
     /// downstream. Overridable via `flush_max_elapsed`.
     pub(super) flush_max_elapsed: Duration,
+
+    /// The spacing the object store imposes between two writes of one object
+    /// name, or `None` where it imposes none. One second on `gs://`, GCS's
+    /// per-object cap and what [`crate::PutRateLimiter`] paces at; `None` on
+    /// `s3://` and `memory://`.
+    ///
+    /// The limiter knows this and the engine above it did not, so a conflict
+    /// paid for it twice: the loser re-read, then sat out the pacing with an
+    /// etag that other replicas were moving under it. Knowing the spacing, a
+    /// writer that lost can wait first and re-read after (DEV-663,
+    /// `commits.rs`).
+    pub(super) object_write_interval: Option<Duration>,
 }
 
 impl Tuning {
@@ -275,6 +287,7 @@ impl Tuning {
             prefix_compact_seen_keys: DynoStore::PREFIX_COMPACT_SEEN_KEYS,
             maintenance_recency: DynoStore::MAINTENANCE_RECENCY,
             flush_max_elapsed: DynoStore::FLUSH_MAX_ELAPSED,
+            object_write_interval: None,
         }
     }
 }

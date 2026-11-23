@@ -1735,6 +1735,18 @@ impl DynoStore {
         self
     }
 
+    /// The spacing the object store imposes between two writes of one object
+    /// name: what `gs://` paces every key at, one second, and nothing elsewhere.
+    ///
+    /// Read by the offset-commit queue, which waits it out *before* re-reading
+    /// after a conflict with another replica rather than after (DEV-663). A
+    /// store built over [`crate::PutRateLimiter`] without this set still works:
+    /// it pays the pacing between its re-read and its write, as it always did.
+    pub fn object_write_interval(mut self, object_write_interval: Option<Duration>) -> Self {
+        self.tuning.object_write_interval = object_write_interval;
+        self
+    }
+
     /// Override the coalescing (#50) / producer-checkpoint (#48) flush
     /// thresholds (#54). Each `None` in `tuning` leaves that trigger at its
     /// current value (the compile-time default), so an all-default `tuning` is a

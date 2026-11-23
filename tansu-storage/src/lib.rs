@@ -2624,7 +2624,10 @@ impl Builder<i32, String, Url, Url> {
                 warn_deprecated_layout_flags(&self.storage);
 
                 let engine = gcs::object_store(bucket_name, delete_concurrency(&self.storage))
-                    .map(|object_store| self.engine(object_store))
+                    .map(|object_store| {
+                        self.engine(object_store)
+                            .object_write_interval(Some(gcs::OBJECT_WRITE_INTERVAL))
+                    })
                     .map_err(Error::from)?;
                 self.served(engine, minimum_size, maximum_delay).await
             }
