@@ -455,7 +455,9 @@ pub(super) static SEGMENT_COMPACT_RUNS: LazyLock<Counter<u64>> = LazyLock::new(|
 });
 
 /// Why a prefix's drain stopped, by `reason` (#399): `drained`, `runs`,
-/// `retries`, `error`.
+/// `retries`, `error`, and `slice` when it handed its slot to the next prefix
+/// after its share of merges (DEV-662) — the steady state of a prefix under
+/// sustained produce.
 ///
 /// "Does a drain that starts on a 15 000-segment prefix finish it?" was
 /// unanswerable: the drain logged nothing on the way out, so a prefix that

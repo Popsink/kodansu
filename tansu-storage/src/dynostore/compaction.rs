@@ -1498,10 +1498,20 @@ impl DynoStore {
         /// above and the broker's maintenance run timeout (#131).
         const MAX_RETRIES_PER_PREFIX: usize = 1_024;
 
+        /// Merges one call makes before handing its slot to the next prefix
+        /// (DEV-662). A prefix under sustained produce never reports `Drained`:
+        /// each run merges what arrived during the last one. Once merges
+        /// started landing on the GCS bucket, the first four prefixes kept all
+        /// of the sweep's slots for the whole tick and the other three were
+        /// never compacted. Sliced, [`Self::sweep_backlogged_prefixes`] comes
+        /// back to every backlogged prefix, largest first.
+        const MAX_MERGES_PER_SLICE: usize = 32;
+
         self.sweep_staged(prefix).await;
 
         let mut compacted = 0;
         let mut retries = 0usize;
+        let mut merges = 0usize;
         let mut reason = "runs";
 
         for _ in 0..MAX_RUNS_PER_PREFIX {
@@ -1516,7 +1526,14 @@ impl DynoStore {
             );
 
             match outcome {
-                Ok(CompactRun::Merged(n)) => compacted += n,
+                Ok(CompactRun::Merged(n)) => {
+                    compacted += n;
+                    merges += 1;
+                    if merges >= MAX_MERGES_PER_SLICE {
+                        reason = "slice";
+                        break;
+                    }
+                }
 
                 Ok(CompactRun::Drained) => {
                     reason = "drained";
