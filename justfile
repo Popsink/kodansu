@@ -1348,6 +1348,13 @@ fmt:
 # with it: nothing measured encoding before, and every response is encoded.
 # The bench has no `//`, so the ratio falls and the ceiling follows it.
 #
+#   defork  -2 lines, the record batch encoder rewritten  2790 -> 2790  2.6743 -> 2.6745
+#
+# `ser.rs`'s `RecordBatchEncoder`, its other half (Popsink/data-plane#5885).
+# Writes go through its own `put`; refusals through `unexpected` and
+# `unnamed`. Nearly every line it keeps from upstream is a trait method's
+# signature. A little code went and no comment, so the ceiling rises.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1357,7 +1364,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6744" top="12":
+comments ceiling="2.6746" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
