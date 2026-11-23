@@ -90,6 +90,9 @@ pub(super) fn key_class(path: &Path) -> &'static str {
         "segment"
     } else if path.ends_with(".batch") || path.contains("/records/") || path.ends_with("/records") {
         "records"
+    } else if path.ends_with(".staged") || path.contains("/staging/") || path.ends_with("/staging")
+    {
+        "staging"
     } else if path.ends_with("/meta.json") {
         "meta"
     } else if path.ends_with("/watermark.json") {
@@ -779,6 +782,11 @@ mod tests {
             ),
             ("clusters/c/prefixes/p/seq-floor.json", "seq_floor"),
             ("clusters/c/prefixes/p/era.json", "era"),
+            (
+                "clusters/c/prefixes/p/staging/00000000000000ff.staged",
+                "staging",
+            ),
+            ("clusters/c/prefixes/p/staging/", "staging"),
             // The directory forms, so a listing is attributable too (#409).
             ("clusters/c/prefixes/p/segments/", "segment"),
             (

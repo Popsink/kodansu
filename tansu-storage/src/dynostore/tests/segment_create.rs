@@ -37,9 +37,9 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use object_store::{
-    CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    ObjectStoreExt as _, PutMode, PutMultipartOptions, PutOptions, PutPayload, PutResult,
-    memory::InMemory, path::Path,
+    CopyMode, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
+    ObjectStore, ObjectStoreExt as _, PutMode, PutMultipartOptions, PutOptions, PutPayload,
+    PutResult, memory::InMemory, path::Path,
 };
 use tansu_sans_io::record::{Record, deflated, inflated};
 
@@ -53,7 +53,7 @@ const NODE: i32 = 111;
 const PREFIX: &str = "connector-a";
 
 /// Serves everything normally, but makes the first `ambiguous` segment creates
-/// **land and then fail**: the payload is written to the inner store and a
+/// — a direct PUT or the copy of a staged payload — **land and then fail**: the payload is written to the inner store and a
 /// transport-shaped error is returned anyway. That is exactly the case #89
 /// exists for — the object is durable, the writer does not know it.
 ///
@@ -96,6 +96,12 @@ impl Display for AmbiguousSegmentCreates {
 
 fn is_segment_create(location: &Path, options: &PutOptions) -> bool {
     options.mode == PutMode::Create && location.as_ref().ends_with(".seg")
+}
+
+/// A merged segment's create is a copy of its staged payload (DEV-662), so the
+/// same faults are injected there.
+fn is_segment_copy(to: &Path, options: &CopyOptions) -> bool {
+    options.mode == CopyMode::Create && to.as_ref().ends_with(".seg")
 }
 
 #[async_trait]
@@ -171,7 +177,25 @@ impl ObjectStore for AmbiguousSegmentCreates {
         to: &Path,
         options: CopyOptions,
     ) -> Result<(), object_store::Error> {
-        self.inner.copy_opts(from, to, options).await
+        if !is_segment_copy(to, &options) {
+            return self.inner.copy_opts(from, to, options).await;
+        }
+
+        _ = self.attempts.fetch_add(1, Ordering::SeqCst);
+
+        let ambiguous = self
+            .remaining
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok();
+
+        let outcome = self.inner.copy_opts(from, to, options).await;
+
+        match (ambiguous, outcome) {
+            (true, Ok(())) => Err(Self::lost_response()),
+            (_, outcome) => outcome,
+        }
     }
 }
 
@@ -262,6 +286,11 @@ impl ObjectStore for FailedSegmentCreates {
         to: &Path,
         options: CopyOptions,
     ) -> Result<(), object_store::Error> {
+        if is_segment_copy(to, &options) {
+            _ = self.attempts.fetch_add(1, Ordering::SeqCst);
+            return Err(AmbiguousSegmentCreates::lost_response());
+        }
+
         self.inner.copy_opts(from, to, options).await
     }
 }
@@ -565,6 +594,131 @@ async fn a_peers_raise_is_respected_even_when_this_process_certified_an_older_fl
         5, seq,
         "a create must respect a peer's raise, not this process's certification"
     );
+
+    Ok(())
+}
+
+/// A store with no create-only copy, as an `s3://` bucket is without
+/// `aws_copy_if_not_exists` (DEV-662).
+struct NoCreateCopy {
+    inner: InMemory,
+}
+
+impl Debug for NoCreateCopy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NoCreateCopy").finish()
+    }
+}
+
+impl Display for NoCreateCopy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("NoCreateCopy").finish()
+    }
+}
+
+#[async_trait]
+impl ObjectStore for NoCreateCopy {
+    async fn put_opts(
+        &self,
+        location: &Path,
+        payload: PutPayload,
+        options: PutOptions,
+    ) -> Result<PutResult, object_store::Error> {
+        self.inner.put_opts(location, payload, options).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Path,
+        options: PutMultipartOptions,
+    ) -> Result<Box<dyn MultipartUpload>, object_store::Error> {
+        self.inner.put_multipart_opts(location, options).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Path,
+        options: GetOptions,
+    ) -> Result<GetResult, object_store::Error> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, Result<Path, object_store::Error>>,
+    ) -> futures::stream::BoxStream<'static, Result<Path, object_store::Error>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Path>,
+    ) -> futures::stream::BoxStream<'static, Result<ObjectMeta, object_store::Error>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Path>,
+    ) -> Result<ListResult, object_store::Error> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Path,
+        to: &Path,
+        options: CopyOptions,
+    ) -> Result<(), object_store::Error> {
+        if options.mode == CopyMode::Create {
+            return Err(object_store::Error::NotSupported {
+                source: "S3 does not support copy-if-not-exists".into(),
+            });
+        }
+
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// Without a create-only copy a merged segment is uploaded at the tail as it
+/// was before DEV-662, the staged payload is not left behind, and the store is
+/// not asked again: the second create stages nothing.
+#[tokio::test]
+async fn a_store_without_a_create_only_copy_falls_back_to_the_direct_upload() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let storage = DynoStore::new(
+        CLUSTER,
+        NODE,
+        NoCreateCopy {
+            inner: bucket.clone(),
+        },
+    );
+
+    for nonce in 0..2u64 {
+        assert_eq!(
+            nonce,
+            storage
+                .assign_and_create_segment(
+                    PREFIX,
+                    merged(&storage, nonce)?,
+                    nonce,
+                    SegmentCreateRole::Compaction,
+                )
+                .await?
+        );
+
+        assert!(
+            bucket
+                .head(&storage.staging_location(PREFIX, nonce))
+                .await
+                .is_err(),
+            "the staged payload of create {nonce} is gone"
+        );
+    }
+
+    assert!(storage.staged_create_unsupported.load(Ordering::Relaxed));
 
     Ok(())
 }

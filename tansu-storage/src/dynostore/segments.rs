@@ -93,6 +93,29 @@ impl DynoStore {
         ))
     }
 
+    /// Where a merged segment's payload waits to be copied to its sequence name
+    /// (DEV-662) — see [`Self::assign_and_create_segment`].
+    ///
+    /// Outside [`Self::segment_prefix`], so no incremental listing, reconcile,
+    /// fetch or `tansu audit` walk ever meets it, and the external readers'
+    /// contract (`docs/virtual-topics-format.md`) is untouched. Named by the
+    /// merge's nonce, so two compactors — a lease holder and a stale one — never
+    /// write the same staging object.
+    pub(super) fn staging_location(&self, prefix: &str, nonce: u64) -> Path {
+        Path::from(format!(
+            "clusters/{}/prefixes/{}/staging/{:016x}.staged",
+            self.identity.cluster, prefix, nonce,
+        ))
+    }
+
+    /// The listing prefix of [`Self::staging_location`].
+    pub(super) fn staging_prefix(&self, prefix: &str) -> Path {
+        Path::from(format!(
+            "clusters/{}/prefixes/{}/staging/",
+            self.identity.cluster, prefix,
+        ))
+    }
+
     /// The cached next segment sequence for `prefix`, if known to this process.
     pub(super) fn cached_seq(&self, prefix: &str) -> Result<Option<u64>> {
         self.prefixes.seq(prefix)
@@ -567,12 +590,12 @@ impl DynoStore {
     /// Compaction used to treat every ambiguous PUT as a plain error, so a
     /// merged segment that had actually landed was retried as a failure and its
     /// whole payload re-uploaded — the #130 write amplification.
-    pub(super) async fn resolve_segment_create(
+    pub(super) async fn resolve_segment_create<T: Debug>(
         &self,
         prefix: &str,
         candidate: u64,
         nonce: u64,
-        result: Result<PutResult, object_store::Error>,
+        result: Result<T, object_store::Error>,
     ) -> SegmentCreate {
         let error = match result {
             Ok(outcome) => {
@@ -648,10 +671,180 @@ impl DynoStore {
     /// jittered [`cas_conflict_backoff`] so N contenders do not resync in
     /// lockstep, and fold-before-claim off the in-memory index (#91) instead of
     /// a fresh `tail_next_seq` LIST per attempt.
+    ///
+    /// **Staged, then copied (DEV-662).** A create-only PUT is decided when its
+    /// body has finished uploading, so a merged segment that takes longer to
+    /// upload than producers take to claim the next sequence never wins: on the
+    /// DEV-662 GCS run a 16 MiB merge took ~0.5 s against a producer create every
+    /// ~70 ms, and all 64 attempts lost on every pass. So the payload is
+    /// uploaded once to [`Self::staging_location`], where nothing contends, and
+    /// each attempt is a server-side create-only copy of it to the candidate
+    /// name: the race is decided by a request whose size does not depend on the
+    /// payload, and a lost attempt re-uploads nothing.
+    ///
+    /// Everything readers see is unchanged: the merged object is created
+    /// create-only at the tail of `segments/` exactly as before, with the same
+    /// bytes, the same footer and the same nonce, so seq order, the single
+    /// listing, the overlap tie-break and the ambiguous-create adoption (#89,
+    /// #401) all hold as they did. A store without a create-only copy falls back
+    /// to the direct upload once and for good.
     pub(super) async fn assign_and_create_segment(
         &self,
         prefix: &str,
         payload: PutPayload,
+        nonce: u64,
+        role: SegmentCreateRole,
+    ) -> Result<u64> {
+        let mut staged = self.stage_segment(prefix, &payload, nonce).await?;
+
+        let created = self
+            .claim_segment_sequence(prefix, &payload, &mut staged, nonce, role)
+            .await;
+
+        if let Some(staged) = staged {
+            self.discard_staged(&staged).await;
+        }
+
+        created
+    }
+
+    /// Upload `payload` to its staging object, or `None` when this store has
+    /// shown it cannot copy create-only.
+    async fn stage_segment(
+        &self,
+        prefix: &str,
+        payload: &PutPayload,
+        nonce: u64,
+    ) -> Result<Option<Path>> {
+        if self
+            .staged_create_unsupported
+            .load(atomic::Ordering::Relaxed)
+        {
+            return Ok(None);
+        }
+
+        let location = self.staging_location(prefix, nonce);
+
+        _ = self
+            .object_store
+            .put_opts(&location, payload.clone(), PutOptions::default())
+            .await?;
+
+        Ok(Some(location))
+    }
+
+    /// Delete a staging object, logging rather than failing: the merged segment
+    /// is already decided either way, and [`Self::sweep_staged`] collects what
+    /// this misses.
+    async fn discard_staged(&self, staged: &Path) {
+        if let Err(error) = self.object_store.delete(staged).await {
+            warn!(?error, %staged, "discarding a staged segment");
+        }
+    }
+
+    /// Delete staging objects under `prefix` that outlived any merge that could
+    /// still be copying them (DEV-662): a compactor that crashed, or whose pass
+    /// was cancelled, between staging a payload and discarding it.
+    ///
+    /// An hour is far above a merge's whole conflict loop, so the sweep cannot
+    /// pull a payload from under a live copy — the copy would fail and the merge
+    /// retry on the next pass, which is the cost of being wrong, not a lost
+    /// write. One LIST per drained prefix per maintenance tick, off the read
+    /// path.
+    pub(super) async fn sweep_staged(&self, prefix: &str) {
+        const ORPHANED_AFTER: Duration = Duration::from_secs(60 * 60);
+
+        let Some(cutoff) = SystemTime::now()
+            .checked_sub(ORPHANED_AFTER)
+            .and_then(|cutoff| cutoff.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .and_then(|cutoff| i64::try_from(cutoff.as_millis()).ok())
+        else {
+            return;
+        };
+
+        let orphans = match self
+            .object_store
+            .list(Some(&self.staging_prefix(prefix)))
+            .try_filter(|meta| std::future::ready(meta.last_modified.timestamp_millis() < cutoff))
+            .map_ok(|meta| meta.location)
+            .try_collect::<Vec<_>>()
+            .await
+        {
+            Ok(orphans) => orphans,
+            Err(error) => {
+                warn!(?error, prefix, "listing staged segments");
+                return;
+            }
+        };
+
+        for orphan in orphans {
+            debug!(prefix, %orphan, "sweeping an orphaned staged segment");
+            self.discard_staged(&orphan).await;
+        }
+    }
+
+    /// One create-only attempt at `location`: a copy of `staged` when there is
+    /// one, the direct upload of `payload` otherwise. Returns whether the
+    /// payload went over the wire, which is what a lost attempt costs (#130).
+    async fn create_segment_at(
+        &self,
+        location: &Path,
+        payload: &PutPayload,
+        staged: &mut Option<Path>,
+    ) -> (Result<(), object_store::Error>, bool) {
+        if let Some(from) = staged.as_ref() {
+            match self
+                .object_store
+                .copy_opts(
+                    from,
+                    location,
+                    CopyOptions {
+                        mode: CopyMode::Create,
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Err(object_store::Error::NotSupported { source }) => {
+                    warn!(
+                        %source,
+                        "no create-only copy on this store: merged segments upload at the tail"
+                    );
+                    self.staged_create_unsupported
+                        .store(true, atomic::Ordering::Relaxed);
+
+                    if let Some(from) = staged.take() {
+                        self.discard_staged(&from).await;
+                    }
+                }
+
+                copied => return (copied, false),
+            }
+        }
+
+        let uploaded = self
+            .object_store
+            .put_opts(
+                location,
+                payload.clone(),
+                PutOptions {
+                    mode: PutMode::Create,
+                    attributes: Attributes::new(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map(|_| ());
+
+        (uploaded, true)
+    }
+
+    /// The conflict loop of [`Self::assign_and_create_segment`].
+    async fn claim_segment_sequence(
+        &self,
+        prefix: &str,
+        payload: &PutPayload,
+        staged: &mut Option<Path>,
         nonce: u64,
         role: SegmentCreateRole,
     ) -> Result<u64> {
@@ -664,7 +857,7 @@ impl DynoStore {
         // Conflict accounting for the exhaustion terminal and for #130: how often
         // this role loses the shared tail-sequence race, and how many payload
         // bytes that costs in re-uploads.
-        let mut conflicts = 0u64;
+        let (mut conflicts, mut rewritten) = (0u64, 0u64);
 
         // #77's invariant is that a sequence name freed by retention or
         // compaction is never reused, and it needs a floor observed *after* the
@@ -698,17 +891,8 @@ impl DynoStore {
         };
 
         for attempt in 0..MAX_ATTEMPTS {
-            let put_result = self
-                .object_store
-                .put_opts(
-                    &self.segment_location(prefix, candidate),
-                    payload.clone(),
-                    PutOptions {
-                        mode: PutMode::Create,
-                        attributes: Attributes::new(),
-                        ..Default::default()
-                    },
-                )
+            let (put_result, uploaded) = self
+                .create_segment_at(&self.segment_location(prefix, candidate), payload, staged)
                 .await;
 
             match self
@@ -727,7 +911,10 @@ impl DynoStore {
                     // same key prefix (#130).
                     conflicts += 1;
                     SEGMENT_CREATE_CONFLICTS.add(1, &attributes);
-                    SEGMENT_CREATE_BYTES_REWRITTEN.add(payload_len, &attributes);
+                    if uploaded {
+                        rewritten += payload_len;
+                        SEGMENT_CREATE_BYTES_REWRITTEN.add(payload_len, &attributes);
+                    }
 
                     debug!(candidate, attempt, prefix, "segment seq taken, resyncing");
 
@@ -749,7 +936,7 @@ impl DynoStore {
             role = role.as_str(),
             conflicts,
             payload_len,
-            bytes_rewritten = conflicts * payload_len,
+            bytes_rewritten = rewritten,
             "segment sequence assignment exhausted retries"
         );
         // Retriable: contention exhaustion, not a permanent fault (#6/#129).

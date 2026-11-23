@@ -1487,6 +1487,8 @@ impl DynoStore {
         /// above and the broker's maintenance run timeout (#131).
         const MAX_RETRIES_PER_PREFIX: usize = 1_024;
 
+        self.sweep_staged(prefix).await;
+
         let mut compacted = 0;
         let mut retries = 0usize;
         let mut reason = "runs";
