@@ -858,8 +858,15 @@ impl DynoStore {
         nonce: u64,
         role: SegmentCreateRole,
     ) -> Result<u64> {
-        /// Bounds the conflict-resync loop; far above any real contention.
+        /// Bounds the merged creates behind won claims; far above any real
+        /// contention, since producers yield those names.
         const MAX_ATTEMPTS: usize = 64;
+
+        /// Bounds the claim rounds lost to producers (DEV-662). A claim round
+        /// is one PUT of a few dozen bytes, so the budget is sized in time:
+        /// ~13 s at the bucket's ~50 ms, against the 64 rounds a hot prefix
+        /// outlasted there.
+        const MAX_CLAIM_ROUNDS: u64 = 256;
 
         let attributes = [KeyValue::new("role", role.as_str())];
         let payload_len = payload.content_length() as u64;
@@ -912,26 +919,37 @@ impl DynoStore {
             None => self.tail_next_seq(prefix).await?,
         };
 
-        for attempt in 0..MAX_ATTEMPTS {
-            // DEV-662: no backoff between claims. A lost claim proves who holds
-            // `candidate`, so folding that one footer is the resync (#401), and
-            // the compaction lease means there is one compactor per prefix — no
-            // herd to de-synchronise. Every millisecond spent here is a window
-            // a producer fills. Only the first loss refreshes: it is the one
-            // that finds out how far behind the starting candidate was, which a
-            // fold per name would walk one round trip at a time.
+        let mut attempt = 0;
+
+        while attempt < MAX_ATTEMPTS && claim_conflicts < MAX_CLAIM_ROUNDS {
+            // DEV-662: a lost claim proves `candidate` is held, so the next
+            // round claims the name after it with nothing read in between — no
+            // backoff, no footer fold. The compaction lease means there is one
+            // compactor per prefix, so there is no herd to de-synchronise, and a
+            // round is then one small PUT, shorter than the gap between two
+            // producer creates on a hot prefix. On the bucket, a fold per round
+            // (#401) made a round as long as that gap: a claim that started
+            // behind never caught up, and exhausted its 64 rounds on every hot
+            // prefix. Only the first loss refreshes, to find out how far behind
+            // the starting candidate was.
             let Some(claim) = self.claim_tail(prefix, candidate).await? else {
                 claim_conflicts += 1;
 
-                debug!(candidate, attempt, prefix, "compaction claim lost, folding");
+                debug!(
+                    candidate,
+                    round = claim_conflicts,
+                    prefix,
+                    "compaction claim lost"
+                );
 
-                if claim_conflicts == 1 || !self.fold_segment_footer(prefix, candidate).await {
+                if claim_conflicts == 1 {
                     self.refresh_prefix_index_forced(prefix).await?;
                 }
-                candidate = self.tail_next_seq_folded(prefix).await?;
+                candidate = (candidate + 1).max(self.tail_next_seq_folded(prefix).await?);
                 continue;
             };
 
+            attempt += 1;
             let won = claim.seq + 1;
 
             let (put_result, uploaded) = self
