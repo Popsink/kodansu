@@ -162,6 +162,12 @@ three replicas and 48 members, which still meet each other in the CAS.
 Measured in `tansu-storage/tests/offset_commit_cap.rs` over the same
 `InMemory` model, so it says nothing about request latency or a real `429`.
 
+**Observed against a bucket** on 2026-11-23 (Standard, europe-west1, soft
+delete 0; from a workstation, not in-region; the real `gs` arm through
+`StorageContainer::builder`; three rounds each): 16 members committing at once
+took **54–57 s, p50 ~33 s, before; ~2.0 s after**. 128 members took 2.1 s.
+No commit failed and no `429` was logged in either run.
+
 Two things bounded the original problem honestly and are worth keeping in mind
 for the next one: it was per group, not fleet-wide (different groups write
 different objects), and the limiter is a **local delay**, so the cost was paid
