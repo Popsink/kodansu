@@ -13,7 +13,11 @@
 // limitations under the License.
 //
 //! Deflated (compressed) Kafka Records
-use std::{fmt::Formatter, io::Write, result};
+use std::{
+    fmt::Formatter,
+    io::{Read, Write},
+    result,
+};
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use flate2::write::GzEncoder;
@@ -40,12 +44,10 @@ impl TryFrom<crate::record::inflated::Frame> for Frame {
     type Error = Error;
 
     fn try_from(inflated: crate::record::inflated::Frame) -> Result<Self, Self::Error> {
-        inflated
-            .batches
-            .into_iter()
-            .map(Batch::try_from)
-            .collect::<Result<Vec<_>>>()
-            .map(|batches| Self { batches })
+        let batches = inflated.batches.into_iter().map(Batch::try_from);
+        Ok(Self {
+            batches: batches.collect::<Result<_>>()?,
+        })
     }
 }
 
@@ -70,25 +72,40 @@ pub struct Batch {
 
 impl From<Batch> for Bytes {
     fn from(value: Batch) -> Self {
-        let mut encoded =
-            BytesMut::with_capacity(value.batch_length as usize + size_of_val(&value.base_offset));
+        let Batch {
+            base_offset,
+            batch_length,
+            partition_leader_epoch,
+            magic,
+            crc,
+            attributes,
+            last_offset_delta,
+            base_timestamp,
+            max_timestamp,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            record_count,
+            record_data,
+        } = value;
 
-        encoded.put_i64(value.base_offset);
-        encoded.put_i32(value.batch_length);
-        encoded.put_i32(value.partition_leader_epoch);
-        encoded.put_i8(value.magic);
-        encoded.put_u32(value.crc);
-        encoded.put_i16(value.attributes);
-        encoded.put_i32(value.last_offset_delta);
-        encoded.put_i64(value.base_timestamp);
-        encoded.put_i64(value.max_timestamp);
-        encoded.put_i64(value.producer_id);
-        encoded.put_i16(value.producer_epoch);
-        encoded.put_i32(value.base_sequence);
-        encoded.put_u32(value.record_count);
-        encoded.put(value.record_data);
-
-        Bytes::from(encoded)
+        let framed = batch_length as usize + size_of::<i64>();
+        let mut encoded = BytesMut::with_capacity(framed);
+        encoded.put_i64(base_offset);
+        encoded.put_i32(batch_length);
+        encoded.put_i32(partition_leader_epoch);
+        encoded.put_i8(magic);
+        encoded.put_u32(crc);
+        encoded.put_i16(attributes);
+        encoded.put_i32(last_offset_delta);
+        encoded.put_i64(base_timestamp);
+        encoded.put_i64(max_timestamp);
+        encoded.put_i64(producer_id);
+        encoded.put_i16(producer_epoch);
+        encoded.put_i32(base_sequence);
+        encoded.put_u32(record_count);
+        encoded.put(record_data);
+        encoded.freeze()
     }
 }
 
@@ -122,61 +139,29 @@ impl TryFrom<Bytes> for Batch {
         if magic != Self::MAGIC_RECORD_BATCH_V2 {
             debug!(base_offset, batch_length, magic, "pre-v2 message set");
 
-            return Ok(Batch {
+            return Ok(Self {
                 base_offset,
                 batch_length,
                 magic,
-                ..Default::default()
+                ..Self::default()
             });
         }
 
         let crc = encoded.try_get_u32()?;
-
         debug!(base_offset, batch_length);
 
-        let crc_data_size = usize::try_from(batch_length)
-            .map_err(Into::into)
-            .and_then(|batch_length| {
-                batch_length
-                    .checked_sub(size_of_val(&partition_leader_epoch))
-                    .ok_or(Error::Overflow)
-                    .inspect_err(|err| {
-                        debug!(
-                            batch_length,
-                            size_of_val = size_of_val(&partition_leader_epoch),
-                            ?err
-                        )
-                    })
-            })
-            .and_then(|batch_length| {
-                batch_length
-                    .checked_sub(size_of_val(&magic))
-                    .ok_or(Error::Overflow)
-                    .inspect_err(|err| {
-                        debug!(batch_length, size_of_val = size_of_val(&magic), ?err)
-                    })
-            })
-            .and_then(|batch_length| {
-                batch_length
-                    .checked_sub(size_of_val(&crc))
-                    .ok_or(Error::Overflow)
-                    .inspect_err(|err| debug!(batch_length, size_of_val = size_of_val(&crc), ?err))
-            })?;
-
+        let ahead_of_crc = size_of_val(&partition_leader_epoch) + size_of_val(&magic);
+        let unchecked = ahead_of_crc + size_of_val(&crc);
+        let crc_data_size = usize::try_from(batch_length)?
+            .checked_sub(unchecked)
+            .ok_or(Error::Overflow)
+            .inspect_err(|err| debug!(batch_length, unchecked, ?err))?;
         debug!(crc_data_size, encoded = encoded.len(), crc);
 
-        if crc_data_size > encoded.len() {
-            return Err(Error::Overflow);
-        }
-
-        let crc_data = &encoded[..crc_data_size];
-
-        let computed = {
-            let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
-            digest.update(crc_data);
-
-            digest.finalize() as u32
-        };
+        let crc_data = encoded.get(..crc_data_size).ok_or(Error::Overflow)?;
+        let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
+        digest.update(crc_data);
+        let computed = digest.finalize() as u32;
 
         // Log a mismatch, do not refuse the batch. This decoder is shared by
         // the two directions and only one of them can afford to reject:
@@ -212,24 +197,16 @@ impl TryFrom<Bytes> for Batch {
         let base_sequence = encoded.try_get_i32()?;
         let record_count = encoded.try_get_u32()?;
 
-        let record_data_size =
-            usize::try_from(batch_length)
-                .map_err(Into::into)
-                .and_then(|batch_length| {
-                    batch_length
-                        .checked_sub(FIXED_BATCH_LENGTH)
-                        .ok_or(Error::Overflow)
-                })?;
-
+        let record_data_size = usize::try_from(batch_length)?
+            .checked_sub(FIXED_BATCH_LENGTH)
+            .ok_or(Error::Overflow)?;
         debug!(record_data_size, encoded = encoded.len(), computed);
 
-        if record_data_size > encoded.len() {
-            return Err(Error::Overflow);
-        }
+        let record_data = (record_data_size <= encoded.len())
+            .then(|| encoded.slice(..record_data_size))
+            .ok_or(Error::Overflow)?;
 
-        let record_data = encoded.slice(..record_data_size);
-
-        let batch = Batch {
+        Ok(Self {
             base_offset,
             batch_length,
             partition_leader_epoch,
@@ -244,9 +221,7 @@ impl TryFrom<Bytes> for Batch {
             base_sequence,
             record_count,
             record_data,
-        };
-
-        Ok(batch)
+        })
     }
 }
 
@@ -300,15 +275,15 @@ impl Batch {
     }
 
     pub fn is_transactional(&self) -> bool {
-        self.attributes & Self::TRANSACTIONAL_BITMASK == Self::TRANSACTIONAL_BITMASK
+        (self.attributes & Self::TRANSACTIONAL_BITMASK) != 0
     }
 
     pub fn is_control(&self) -> bool {
-        self.attributes & Self::CONTROL_BITMASK == Self::CONTROL_BITMASK
+        (self.attributes & Self::CONTROL_BITMASK) != 0
     }
 
     pub fn is_idempotent(&self) -> bool {
-        self.producer_id != -1 && self.base_sequence != -1
+        ![self.producer_id, i64::from(self.base_sequence)].contains(&-1)
     }
 
     /// The CRC-32C that this batch's own fields imply.
@@ -387,147 +362,153 @@ impl TryFrom<&CrcData> for Bytes {
     type Error = Error;
 
     fn try_from(value: &CrcData) -> result::Result<Self, Self::Error> {
-        let mut encoded = value.size_in_bytes().map(BytesMut::with_capacity)?;
-        encoded.put_i16(value.attributes);
-        encoded.put_i32(value.last_offset_delta);
-        encoded.put_i64(value.base_timestamp);
-        encoded.put_i64(value.max_timestamp);
-        encoded.put_i64(value.producer_id);
-        encoded.put_i16(value.producer_epoch);
-        encoded.put_i32(value.base_sequence);
-        encoded.put_u32(value.record_count);
-        encoded.put(&value.record_data[..]);
+        let CrcData {
+            attributes,
+            last_offset_delta,
+            base_timestamp,
+            max_timestamp,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            record_count,
+            record_data,
+        } = value;
 
-        Ok(Bytes::from(encoded))
+        let mut encoded = BytesMut::with_capacity(value.size_in_bytes()?);
+        encoded.put_i16(*attributes);
+        encoded.put_i32(*last_offset_delta);
+        encoded.put_i64(*base_timestamp);
+        encoded.put_i64(*max_timestamp);
+        encoded.put_i64(*producer_id);
+        encoded.put_i16(*producer_epoch);
+        encoded.put_i32(*base_sequence);
+        encoded.put_u32(*record_count);
+        encoded.extend_from_slice(record_data);
+        Ok(encoded.freeze())
     }
 }
 
 impl ByteSize for CrcData {
     fn size_in_bytes(&self) -> Result<usize> {
-        Ok(size_of_val(&self.attributes)
-            + size_of_val(&self.last_offset_delta)
-            + size_of_val(&self.base_timestamp)
-            + size_of_val(&self.max_timestamp)
-            + size_of_val(&self.producer_id)
-            + size_of_val(&self.producer_epoch)
-            + size_of_val(&self.base_sequence)
-            + size_of_val(&self.record_count)
-            + self.record_data.len())
+        let fixed = 2 * size_of::<i16>() + 2 * size_of::<i32>() + 3 * size_of::<i64>();
+        Ok(fixed + size_of::<u32>() + self.record_data.len())
     }
 }
 
 impl From<&Batch> for CrcData {
     fn from(batch: &Batch) -> Self {
+        let Batch {
+            attributes,
+            last_offset_delta,
+            base_timestamp,
+            max_timestamp,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            record_count,
+            record_data,
+            ..
+        } = batch;
+
         Self {
-            attributes: batch.attributes,
-            last_offset_delta: batch.last_offset_delta,
-            base_timestamp: batch.base_timestamp,
-            max_timestamp: batch.max_timestamp,
-            producer_id: batch.producer_id,
-            producer_epoch: batch.producer_epoch,
-            base_sequence: batch.base_sequence,
-            record_count: batch.record_count,
-            record_data: batch.record_data.clone(),
+            attributes: *attributes,
+            last_offset_delta: *last_offset_delta,
+            base_timestamp: *base_timestamp,
+            max_timestamp: *max_timestamp,
+            producer_id: *producer_id,
+            producer_epoch: *producer_epoch,
+            base_sequence: *base_sequence,
+            record_count: *record_count,
+            record_data: Bytes::clone(record_data),
         }
     }
 }
 
 impl CrcData {
     fn into_batch(self, base_offset: i64, partition_leader_epoch: i32, magic: i8) -> Result<Batch> {
-        let crc = self
-            .crc()
-            .inspect(|crc| debug!(?self, base_offset, partition_leader_epoch, magic, crc))?;
+        let crc = self.crc()?;
+        debug!(?self, base_offset, partition_leader_epoch, magic, crc);
+        let batch_length = i32::try_from(self.record_data.len() + FIXED_BATCH_LENGTH)?;
+
+        let Self {
+            attributes,
+            last_offset_delta,
+            base_timestamp,
+            max_timestamp,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            record_count,
+            record_data,
+        } = self;
 
         Ok(Batch {
             base_offset,
-            batch_length: i32::try_from(FIXED_BATCH_LENGTH + self.record_data.len())?,
+            batch_length,
             partition_leader_epoch,
             magic,
             crc,
-            attributes: self.attributes,
-            last_offset_delta: self.last_offset_delta,
-            base_timestamp: self.base_timestamp,
-            max_timestamp: self.max_timestamp,
-            producer_id: self.producer_id,
-            producer_epoch: self.producer_epoch,
-            base_sequence: self.base_sequence,
-            record_count: self.record_count,
-            record_data: self.record_data,
+            attributes,
+            last_offset_delta,
+            base_timestamp,
+            max_timestamp,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            record_count,
+            record_data,
         })
     }
 
     fn crc(&self) -> Result<u32> {
-        let encoded = Bytes::try_from(self)?;
-        debug!(encoded = ?&encoded[..]);
+        let checked = Bytes::try_from(self)?;
+        debug!(encoded = ?&checked[..]);
 
         let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
-        digest.update(&encoded[..]);
-
+        digest.update(&checked);
         Ok(digest.finalize() as u32)
     }
 }
 
 fn into_record_data(records: &[Record], compression: Compression) -> Result<Bytes> {
-    let sizing = records
-        .iter()
-        .map(|record| record.size_in_bytes())
-        .collect::<Result<Vec<_>>>()
-        .map(|sizes| sizes.iter().sum::<usize>())?;
-
+    let sizing = records.iter().try_fold(0, |total, record| {
+        Ok::<_, Error>(total + record.size_in_bytes()?)
+    })?;
     debug!(sizing);
+
+    let sized_for = |uncompressed: &Bytes| BytesMut::with_capacity(uncompressed.len()).writer();
 
     match compression {
         Compression::None => records.encode(),
 
         Compression::Gzip => {
             let uncompressed = records.encode()?;
-
-            let mut gz = GzEncoder::new(
-                BytesMut::with_capacity(uncompressed.len()).writer(),
-                flate2::Compression::default(),
-            );
-
-            gz.write_all(&uncompressed)?;
-
-            gz.finish()
-                .map(|w| w.into_inner())
-                .map(Bytes::from)
-                .map_err(Into::into)
+            let mut gzip = GzEncoder::new(sized_for(&uncompressed), flate2::Compression::default());
+            gzip.write_all(&uncompressed)?;
+            Ok(gzip.finish()?.into_inner().freeze())
         }
 
         Compression::Lz4 => {
             let uncompressed = records.encode()?;
-
             // Kafka's Java client requires BD.blockIndependence and rejects a
             // linked-block frame ("Dependent block stream is unsupported") —
             // the lz4 crate's default block mode (#253).
             let mut lz4 = lz4::EncoderBuilder::new()
                 .block_mode(lz4::BlockMode::Independent)
-                .build(BytesMut::with_capacity(uncompressed.len()).writer())?;
-
-            lz4.write_all(&uncompressed[..])?;
-
-            let (w, _) = lz4.finish();
-            Ok(Bytes::from(w.into_inner()))
+                .build(sized_for(&uncompressed))?;
+            lz4.write_all(&uncompressed)?;
+            let (written, _) = lz4.finish();
+            Ok(written.into_inner().freeze())
         }
 
         Compression::Zstd => {
             let uncompressed = records.encode()?;
-
-            let mut zstd = zstd::stream::write::Encoder::new(
-                BytesMut::with_capacity(uncompressed.len()).writer(),
-                0,
-            )?;
-
-            zstd.write_all(&uncompressed[..])?;
-
-            zstd.finish()
-                .map(|w| w.into_inner())
-                .map(Bytes::from)
-                .map_err(Into::into)
+            let mut zstd = zstd::stream::write::Encoder::new(sized_for(&uncompressed), 0)?;
+            zstd.write_all(&uncompressed)?;
+            Ok(zstd.finish()?.into_inner().freeze())
         }
 
-        unexpected => Err(Error::UnexpectedType(format!("{unexpected:?}",))),
+        unsupported => Err(Error::UnexpectedType(format!("{unsupported:?}"))),
     }
 }
 
@@ -535,7 +516,11 @@ impl TryFrom<crate::record::inflated::Batch> for Batch {
     type Error = Error;
 
     fn try_from(batch: crate::record::inflated::Batch) -> std::result::Result<Self, Self::Error> {
-        CrcData {
+        let record_count = u32::try_from(batch.records.len())?;
+        let compression = batch.compression()?;
+        let record_data = into_record_data(&batch.records, compression)?;
+
+        let crc_data = CrcData {
             attributes: batch.attributes,
             last_offset_delta: batch.last_offset_delta,
             base_timestamp: batch.base_timestamp,
@@ -543,20 +528,20 @@ impl TryFrom<crate::record::inflated::Batch> for Batch {
             producer_id: batch.producer_id,
             producer_epoch: batch.producer_epoch,
             base_sequence: batch.base_sequence,
-            record_count: u32::try_from(batch.records.len())?,
-            record_data: into_record_data(&batch.records[..], batch.compression()?)?,
-        }
-        .into_batch(batch.base_offset, batch.partition_leader_epoch, batch.magic)
+            record_count,
+            record_data,
+        };
+        crc_data.into_batch(batch.base_offset, batch.partition_leader_epoch, batch.magic)
     }
 }
 
 impl Batch {
     pub fn max_offset(&self) -> i64 {
-        self.base_offset + i64::from(self.last_offset_delta)
+        i64::from(self.last_offset_delta) + self.base_offset
     }
 
     fn compression(&self) -> Result<Compression> {
-        Compression::try_from(self.attributes)
+        self.attributes.try_into()
     }
 
     /// Whether this batch carries an LZ4 frame with **dependent (linked) blocks**,
@@ -608,43 +593,39 @@ impl Batch {
 /// (`Seq` implements no `size_hint()`).
 const RECORD_PREALLOC_LIMIT: usize = 8 * 1024;
 
+/// `count` records deserialized from `inflated`, reserving no more than
+/// [`RECORD_PREALLOC_LIMIT`] up front.
+fn deserialized(count: usize, mut inflated: Box<dyn Read>) -> Result<Vec<Record>> {
+    let mut decoder = Decoder::new(&mut inflated);
+    let mut records = Vec::with_capacity(count.min(RECORD_PREALLOC_LIMIT));
+    for _ in 0..count {
+        records.push(Record::deserialize(&mut decoder)?);
+    }
+    Ok(records)
+}
+
 impl TryFrom<Batch> for Vec<Record> {
     type Error = Error;
 
     #[instrument(skip_all)]
     fn try_from(mut batch: Batch) -> Result<Self, Self::Error> {
         let record_count = usize::try_from(batch.record_count)?;
-        let prealloc = record_count.min(RECORD_PREALLOC_LIMIT);
-
         debug!(?record_count);
         debug!(?batch.record_data);
 
-        if batch
-            .compression()
-            .is_ok_and(|compression| compression == Compression::None)
-        {
-            let mut records = Vec::with_capacity(prealloc);
-
-            for _ in 0..record_count {
-                let record = Record::decode(&mut batch.record_data)?;
-                records.push(record);
+        match batch.compression() {
+            Ok(Compression::None) => {
+                let mut records = Vec::with_capacity(record_count.min(RECORD_PREALLOC_LIMIT));
+                for _ in 0..record_count {
+                    records.push(Record::decode(&mut batch.record_data)?);
+                }
+                Ok(records)
             }
 
-            Ok(records)
-        } else {
-            let mut reader = batch
-                .compression()
-                .and_then(|compression| compression.inflator(batch.record_data.reader()))?;
-
-            let mut decoder = Decoder::new(&mut reader);
-            let mut records = Vec::with_capacity(prealloc);
-
-            for _ in 0..record_count {
-                let record = Record::deserialize(&mut decoder)?;
-                records.push(record);
-            }
-
-            Ok(records)
+            compression => deserialized(
+                record_count,
+                compression?.inflator(batch.record_data.reader())?,
+            ),
         }
     }
 }
@@ -654,49 +635,30 @@ impl TryFrom<&Batch> for Vec<Record> {
 
     fn try_from(batch: &Batch) -> Result<Self, Self::Error> {
         let record_count = usize::try_from(batch.record_count)?;
-        let prealloc = record_count.min(RECORD_PREALLOC_LIMIT);
-
         debug!(?record_count);
         debug!(?batch.record_data);
 
-        let mut reader = batch
-            .compression()
-            .and_then(|compression| compression.inflator(batch.record_data.clone().reader()))?;
-
-        let mut decoder = Decoder::new(&mut reader);
-        let mut records = Vec::with_capacity(prealloc);
-
-        for _ in 0..record_count {
-            let record = Record::deserialize(&mut decoder)?;
-            records.push(record);
-        }
-
-        Ok(records)
+        let compression = batch.compression()?;
+        deserialized(
+            record_count,
+            compression.inflator(batch.record_data.clone().reader())?,
+        )
     }
 }
 
-const FIXED_BATCH_LENGTH: usize =
-    // partition leader epoch
-    size_of::<i32>()
-    // magic
+/// The v2 batch header after `base_offset` and `batch_length`, which is what
+/// `batch_length` counts beyond the records: the partition leader epoch,
+/// magic, CRC, attributes, last offset delta, base and max timestamps, the
+/// producer's id, epoch and base sequence, and the record count.
+const FIXED_BATCH_LENGTH: usize = size_of::<i32>()
     + size_of::<i8>()
-    // CRC
     + size_of::<u32>()
-    // attributes
     + size_of::<i16>()
-    // last_offset_delta
     + size_of::<i32>()
-    // base timestamp
+    + 2 * size_of::<i64>()
     + size_of::<i64>()
-    // max timestamp
-    + size_of::<i64>()
-    // producer id
-    + size_of::<i64>()
-    // producer epoch
     + size_of::<i16>()
-    // base sequence
     + size_of::<i32>()
-    // record count
     + size_of::<u32>();
 
 impl<'de> Deserialize<'de> for Batch {
@@ -704,13 +666,13 @@ impl<'de> Deserialize<'de> for Batch {
     where
         D: Deserializer<'de>,
     {
-        struct V;
+        struct Bytewise;
 
-        impl<'de> Visitor<'de> for V {
+        impl Visitor<'_> for Bytewise {
             type Value = Batch;
 
             fn expecting(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str(stringify!(Batch))
+                formatter.write_str("Batch")
             }
 
             fn visit_byte_buf<E>(self, v: Vec<u8>) -> result::Result<Self::Value, E>
@@ -718,11 +680,12 @@ impl<'de> Deserialize<'de> for Batch {
                 E: de::Error,
             {
                 debug!(v = ?v[..]);
-                Batch::try_from(Bytes::from(v)).map_err(|err| de::Error::custom(err.to_string()))
+                let encoded = Bytes::from(v);
+                Batch::try_from(encoded).map_err(|err| E::custom(err.to_string()))
             }
         }
 
-        deserializer.deserialize_byte_buf(V)
+        deserializer.deserialize_byte_buf(Bytewise)
     }
 }
 
