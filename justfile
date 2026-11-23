@@ -1305,6 +1305,15 @@ fmt:
 # a hundred records, uncompressed and LZ4. The bench has no `//`, so the ratio
 # falls and the ceiling follows it.
 #
+#   defork  -98 lines, the inflated batch rewritten  2814 -> 2813  2.6888 -> 2.6903
+#
+# `record/inflated.rs` (Popsink/data-plane#5885). The two conversions from a
+# deflated batch share `inflate`, and keep their difference: the owned one
+# validates the attributes and clears the compression, the borrowed one copies
+# them. The batch builder's size is the same 45 fixed bytes, without the
+# narration on the CRC's width; compaction counts superseded records in one
+# pass. More code went than comment, so the ceiling rises.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1314,7 +1323,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6889" top="12":
+comments ceiling="2.6904" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
