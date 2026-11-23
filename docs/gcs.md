@@ -50,6 +50,13 @@ retention and compaction are implemented by delete, and the read path lists.
 Project-level `Owner` does grant this, but a dedicated bucket-scoped binding is
 the right shape.
 
+**Workload Identity *Federation* does not work.** `object_store` 0.14.1 parses
+`service_account` and `authorized_user` credential files and nothing else
+(`src/gcp/credential.rs`, `ApplicationDefaultCredentials`), so an
+`external_account` file — GitHub OIDC through `google-github-actions/auth`, AWS
+or Azure to GCP — fails to authenticate. GKE Workload Identity is a different
+mechanism and works: it goes through the metadata server.
+
 **Requester-pays buckets do not work.** `object_store` never sends
 `userProject`, so every request to one is rejected. There is no error message
 that says so.
@@ -57,18 +64,17 @@ that says so.
 ## Bucket configuration is part of the contract
 
 The layout is create-only and immutable, and retention is implemented by delete.
-So these settings are not preferences:
+So the bucket's settings are not preferences: soft delete retention `0`,
+versioning off, no retention policy or bucket lock, Autoclass off, no lifecycle
+rules, requester pays off, and `roles/storage.objectAdmin` for the identity.
 
-| Setting | Required | Why |
-|---|---|---|
-| **Soft delete** | **retention `0`** | On by default, at 7 days, and billed |
-| Object versioning | off | Every deleted segment would be retained as a noncurrent version |
-| Retention policy / bucket lock | off | Would refuse the deletes retention and compaction depend on |
-| Autoclass | off | Nearline/Coldline carry early-delete minimums; segments live minutes |
-| Lifecycle class transitions | off | Same reason |
-| Lifecycle deletion rules | off | Retention is the broker's, and a rule that races it deletes live data |
-| Uniform bucket-level access | on (recommended) | Nothing here sets an object ACL |
-| Location | single region, near the brokers | Every request is on the hot path |
+**The operator-facing list is in the deployment docs**, not here: the Helm chart
+reference on docs.popsink.com, *Broker storage (Kodansu)* → *Google Cloud
+Storage* → *Bucket settings* (source: `Popsink/docs`,
+`deployment/reference/helm-values.mdx`). It has the `gcloud` commands to create
+a bucket that meets the contract, to check an existing one, and to fix one in
+place. Change a requirement there. This page keeps only the reasoning an engine
+change might need.
 
 **Soft delete is the one that costs money quietly.** Google enabled it on all
 new and existing buckets in March 2024 with a seven-day default, and it has been
@@ -337,6 +343,14 @@ per-request:
   off — the largest single avoidable cost on this backend;
 - **delete concurrency**, which is throughput rather than money, but it is what
   decides whether retention keeps up — `?delete_concurrency=`, default 16.
+
+## Validating against a real bucket
+
+[docs/gcs-validation.md](gcs-validation.md) is the runbook: the storage suite
+on a bucket, a chart deploy with Workload Identity only, the sustained load
+test, and the offset-commit bound, each with the number it has to produce. It
+has not been run. Its results belong on this page, replacing the *assumed*
+claims above.
 
 ## Running it locally
 
