@@ -21,7 +21,7 @@ on:
   workflow_dispatch:
     inputs:
       storage-url:
-        description: 'Storage URL to test (bucket must exist and be writable)'
+        description: 'Storage URL to test, s3:// or gs:// (bucket must exist and be writable)'
         required: false
         default: 's3://tansu/'
 
@@ -120,6 +120,11 @@ jobs:
       AWS_ACCESS_KEY_ID: ${{ secrets.STORAGE_TEST_AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.STORAGE_TEST_AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: ${{ vars.STORAGE_TEST_AWS_DEFAULT_REGION }}
+      # A `gs://` dispatch (docs/gcs-validation.md, step 1). A key and not
+      # Workload Identity Federation: `object_store` reads no `external_account`
+      # credential, so `google-github-actions/auth` cannot feed it. Unset like
+      # the AWS pair, for the same 2026-09-03 decision.
+      GOOGLE_SERVICE_ACCOUNT_KEY: ${{ secrets.STORAGE_TEST_GCP_SERVICE_ACCOUNT_KEY }}
     steps:
       - run: sudo mkdir /mnt/build
       - run: sudo chmod a+rwxt /mnt/build
@@ -135,10 +140,14 @@ jobs:
       - name: Are storage credentials configured?
         id: credentials
         run: |
-          if [ -n "${AWS_ACCESS_KEY_ID}" ]; then
+          case "${TANSU_TEST_STORAGE_URL}" in
+            gs://*) credential="${GOOGLE_SERVICE_ACCOUNT_KEY}" name=STORAGE_TEST_GCP_SERVICE_ACCOUNT_KEY ;;
+            *) credential="${AWS_ACCESS_KEY_ID}" name='STORAGE_TEST_AWS_*' ;;
+          esac
+          if [ -n "${credential}" ]; then
             echo 'configured=true' >>"${GITHUB_OUTPUT}"
           else
-            echo 'no STORAGE_TEST_AWS_* secrets: skipping the real-store run'
+            echo "no ${name} secret for ${TANSU_TEST_STORAGE_URL}: skipping the real-store run"
           fi
       - if: steps.credentials.outputs.configured == 'true'
         run: just test-storage "${TANSU_TEST_STORAGE_URL}"
