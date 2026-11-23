@@ -2,8 +2,10 @@
 
 The runbook for acceptance items 1–3 of Popsink/data-plane#6179 (DEV-485):
 a broker deployed from the chart on GKE with Workload Identity alone, a
-sustained load test, and the offset-commit bound. **Only step 1 has been run**
-(results under it).
+sustained load test, and the offset-commit bound. **All four steps were run
+once, on 2026-11-23, on the sandbox GKE cluster** (results under each step).
+Steps 1 and 2 pass; step 3 passes on produce and fails on compaction; step 4
+fails. The failures are DEV-662, DEV-663 and DEV-664.
 It needs a GCP project, a bucket and a GKE cluster, which this repository's CI
 does not hold and, by decision (`docs/testing.md`, 2026-09-03), will not hold
 on a schedule. Everything that can be measured without them is measured in the
@@ -73,7 +75,6 @@ a user (`authorized_user` ADC). Results:
 - `tansu audit`, two passes on each of three of the suite's clusters: the passes
   were identical, 0 unreadable, no records lost.
 
-Not yet run: steps 2–4.
 
 ## 2. Acceptance 1 — deployed from the chart with Workload Identity only
 
@@ -108,6 +109,22 @@ No `serviceAccount.annotations`, no `extraEnvVars*`, no `extraEgress`.
 Then repeat once with `networkPolicy.allowExternalEgress: false` and an
 `extraEgress` rule for `storage.googleapis.com`'s ranges, to confirm the
 metadata rule is what Workload Identity was using.
+
+**Run on 2026-11-23: pass.** The broker (3 replicas plus the maintainer) and
+Kotatsu were rendered from Popsink/data-plane#6574 and applied as-is. The
+data-plane backend Deployment cannot be switched off, so only the `tansu/*`
+and `kotatsu/*` templates went in. Results:
+
+- The metadata server, queried from inside a broker pod, answered with the
+  GSA, and the token request returned `200`.
+- With `allowExternalEgress: false` and an `extraEgress` rule allowing only
+  port 443, the token request still returned `200`. Without the chart's
+  metadata rule (`metadataServerEgress: false`), the metadata server was
+  unreachable. So that rule is what Workload Identity uses.
+- An idempotent `acks=all` round trip worked, and the group's offset was
+  committed.
+- Kotatsu, on `KOTATSU_STORAGE_PROVIDER=gcs` with the same identity, listed
+  the topics and read the records.
 
 ## 3. Acceptance 2 — sustained load
 
@@ -150,6 +167,34 @@ at a time, as `docs/storage-tuning.md` prescribes. Record GCS class A
 operations per second against produce p99. The GCS-specific defaults that
 acceptance item 2 asks to document come from this sweep and from nothing else.
 
+**Run on 2026-11-23, scaled to the sandbox cluster: produce passes,
+compaction fails.**
+
+- **Shape.** 7 producers (6 topics × 16 partitions at 2 000 × 500 B
+  records/s, plus `load-commit` with 64 partitions at 500/s), 3 groups × 16
+  members on librdkafka auto-commit, 3 broker replicas plus the maintainer, 46
+  minutes. The bucket was not ramped, since the load is far below its cold
+  write limit.
+- **Produce.** Mean window latency was ~450 ms and the worst window max 6.5 s,
+  out of ~545 five-second windows per producer. No producer restarted. This is
+  well inside the 30 s bound. kafka-producer-perf-test 4.1 has no
+  `--reporting-interval`, so p99 comes only from the end-of-run line, which a
+  stopped run never prints; the worst window max is the bound to quote.
+- **Compaction never landed.** Every pass ended in `segment sequence
+  assignment exhausted retries … role="compaction" conflicts=64`, and prefixes
+  reached 30 000 – 38 000 segments. The cause is that the 16 MiB merged create
+  loses the tail-sequence race to producer creates arriving every ~70 ms.
+  Setting `prefix_compact_target_bytes=1m` did not fix it: compaction won ~1 %
+  of attempts and the count kept growing. **DEV-662.**
+- **Kotatsu (pin 0.12.1).** 92 of 113 probe requests on topic endpoints
+  returned 504 at its 30 s timeout. They kept doing so after the producers
+  stopped, because of the segment backlog. **DEV-664.**
+
+Add a Kotatsu probe to every run of this step: four loops requesting
+`/api/clusters/{c}/topics`, `…/topics/{t}`, `…/topics/{t}/messages`,
+`…/groups/{g}` every 5 s, recording code and `time_total`. Pass when they
+return 200 within 30 s throughout.
+
 ## 4. Acceptance 3 — offset commits of a large group
 
 Measured locally over the `gs` arm's limiter (`tansu-storage/tests/offset_commit_cap.rs`):
@@ -172,6 +217,20 @@ with 64 members in the group, spread over the 3 replicas. **Pass**: the
 client's `commit-latency-max`) stays under 10 s, and no commit fails with a
 timeout. Record the measured bound in `docs/gcs.md` either way. Acceptance
 accepts "the limit is documented with a measured bound".
+
+**Run on 2026-11-23: fail.** The group had 64 members, committing
+synchronously every 1 s from one pod of `confluent-kafka` consumers, spread
+over the 3 replicas, on a build including #760. Results:
+
+- Commit p50 stayed ~2 s.
+- p99 per one-minute window was a median of 29 s and a max of 80 s, over 52
+  windows.
+- 381 commits failed with `ILLEGAL_GENERATION`.
+- The broker logged `OptiCon with_mut contending on a hot object` on every
+  group's `offsets.json`, up to 105 retries.
+
+#760 removed the contention within a replica. Across replicas, the three still
+fight over the one object GCS updates about once per second. **DEV-663.**
 
 ## What to file if a step fails
 
