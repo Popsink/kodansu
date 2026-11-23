@@ -720,6 +720,28 @@ fn an_adls_gen2_url_builds_an_audit() -> Result<(), Error> {
     Ok(())
 }
 
+/// A `gs://` audit is built on the broker's GCS stack, not on a bare client.
+///
+/// It used to be `GoogleCloudStorageBuilder::from_env()` with `object_store`'s
+/// default retry, so a sweep over a cold bucket met the ramp's `429`s (#519)
+/// with neither of the budgets the broker reads that bucket with. Both now come
+/// from [`crate::gcs::object_store`]; the outermost decorator's `Debug` is what
+/// survives the `Arc<dyn ObjectStore>`, as for the Azure case above. Building
+/// needs no credentials: with no `GOOGLE_*` variable `object_store` falls back
+/// to the metadata server, and only on the first request.
+#[test]
+fn a_gcs_url_builds_an_audit_on_the_brokers_stack() -> Result<(), Error> {
+    let audit = Audit::try_from_url(&Url::parse("gs://tansu/")?, CLUSTER)?;
+
+    let store = format!("{audit:?}");
+    assert!(
+        store.contains("object_store: PutRateLimiter"),
+        "gs:// must build the broker's decorated store, got {store}"
+    );
+
+    Ok(())
+}
+
 /// #531: a URL the broker refuses is refused identically by the audit.
 ///
 /// The two builders share [`crate::Backend`] now, so this is a property of one

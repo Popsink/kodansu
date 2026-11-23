@@ -2616,13 +2616,6 @@ impl Builder<i32, String, Url, Url> {
 
             #[cfg(feature = "dynostore")]
             Backend::Google => {
-                use std::num::NonZeroU32;
-
-                use object_store::gcp::GoogleCloudStorageBuilder;
-
-                use crate::gcs::limit::PutRateLimiter;
-                use crate::gcs::retry::{BUCKET_RAMP_RETRY, OBJECT_CAP_RETRY, RetrySplit};
-
                 let bucket_name = self.storage.host_str().unwrap_or("tansu");
 
                 let minimum_size = batch_minimum_size(&self.storage);
@@ -2630,39 +2623,7 @@ impl Builder<i32, String, Url, Url> {
 
                 warn_deprecated_layout_flags(&self.storage);
 
-                // Two clients on one bucket, because GCS has two rate limits and
-                // one retry budget cannot be right for both (#519). The bucket
-                // ramps and answers a retryable `429 rateLimitExceeded` above
-                // the guideline, which is `503 SlowDown` in a different colour
-                // and wants the `s3` arm's patience; a single *object name*
-                // caps at ~1 write/s, and waiting inside `object_store` for
-                // that is #13's 30-second produce. `RetrySplit` picks per
-                // request — see `gcs/retry.rs` for the table and for what the
-                // second client costs.
-                //
-                // Everything else about the two is identical, so the closure
-                // holds the whole configuration and the budget is the argument.
-                let client = |retry| {
-                    GoogleCloudStorageBuilder::from_env()
-                        .with_bucket_name(bucket_name)
-                        .with_retry(retry)
-                        .build()
-                };
-
-                let engine = client(BUCKET_RAMP_RETRY)
-                    .and_then(|bucket_ramp| {
-                        client(OBJECT_CAP_RETRY)
-                            .map(|object_cap| RetrySplit::new(bucket_ramp, object_cap))
-                    })
-                    .map(|object_store| {
-                        PutRateLimiter::new(object_store, Duration::from_mins(5))
-                            .with_rate_per_second(NonZeroU32::new(1))
-                            .with_jitter(Some(Duration::from_millis(50)))
-                            // GCS has no bulk delete, so the delete fan-out is
-                            // this decorator's and not `object_store`'s ten
-                            // (#518).
-                            .with_delete_concurrency(delete_concurrency(&self.storage))
-                    })
+                let engine = gcs::object_store(bucket_name, delete_concurrency(&self.storage))
                     .map(|object_store| self.engine(object_store))
                     .map_err(Error::from)?;
                 self.served(engine, minimum_size, maximum_delay).await
