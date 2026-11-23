@@ -66,7 +66,6 @@ use object_store::{
     GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt,
     aws::{AmazonS3Builder, S3ConditionalPut},
     azure::MicrosoftAzureBuilder,
-    gcp::GoogleCloudStorageBuilder,
     local::LocalFileSystem,
     memory::InMemory,
     path::Path,
@@ -329,11 +328,15 @@ impl Audit {
                     .build()?,
             ),
 
-            Backend::Google => Arc::new(
-                GoogleCloudStorageBuilder::from_env()
-                    .with_bucket_name(bucket)
-                    .build()?,
-            ),
+            // The broker's own stack: the audit only lists and reads, so
+            // what it takes from it is the bucket-ramp retry budget on every GET
+            // and LIST — a full sweep is exactly the burst a cold bucket answers
+            // with `429` (#519) — and a construction that cannot drift from the
+            // broker's.
+            Backend::Google => Arc::new(crate::gcs::object_store(
+                bucket,
+                crate::delete_concurrency(url),
+            )?),
 
             // `with_url` rather than a bucket taken from `host_str()`, mirroring
             // the `abfss` arm of `StorageContainer::builder`: the container is
@@ -349,9 +352,9 @@ impl Audit {
             // reads as a corrupt bucket rather than as an unsupported backend.
             //
             // No retry budget, unlike the broker's arm, and for the same reason
-            // the `s3` and `gs` arms above take none: this is a read-only sweep
-            // someone runs and watches, not a broker that has to ride out a
-            // throttle unattended.
+            // the `s3` arm above takes none: this is a read-only sweep someone
+            // runs and watches, not a broker that has to ride out a throttle
+            // unattended.
             Backend::Azure => Arc::new(SuffixRange::new(
                 MicrosoftAzureBuilder::from_env()
                     .with_url(url.as_str())
