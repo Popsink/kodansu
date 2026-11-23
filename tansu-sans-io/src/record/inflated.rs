@@ -35,12 +35,10 @@ impl TryFrom<deflated::Frame> for Frame {
     type Error = Error;
 
     fn try_from(deflated: deflated::Frame) -> Result<Self, Self::Error> {
-        deflated
-            .batches
-            .into_iter()
-            .map(Batch::try_from)
-            .collect::<Result<Vec<_>>>()
-            .map(|batches| Self { batches })
+        let batches = deflated.batches.into_iter().map(Batch::try_from);
+        Ok(Self {
+            batches: batches.collect::<Result<_>>()?,
+        })
     }
 }
 
@@ -48,16 +46,10 @@ impl TryFrom<&deflated::Frame> for Frame {
     type Error = Error;
 
     fn try_from(deflated: &deflated::Frame) -> Result<Self, Self::Error> {
-        deflated
-            .batches
-            .iter()
-            .try_fold(Vec::new(), |mut acc, batch| {
-                Batch::try_from(batch).map(|inflated| {
-                    acc.push(inflated);
-                    acc
-                })
-            })
-            .map(|batches| Self { batches })
+        let batches = deflated.batches.iter().map(Batch::try_from);
+        Ok(Self {
+            batches: batches.collect::<Result<_>>()?,
+        })
     }
 }
 
@@ -85,29 +77,46 @@ const MAGIC: i8 = 2;
 
 impl Default for Batch {
     fn default() -> Self {
-        let base_timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as i64)
-            .unwrap_or_default();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH);
+        let base_timestamp = now.map_or(0, |elapsed| elapsed.as_millis() as i64);
+        let create_time = BatchAttribute::default()
+            .compression(Compression::None)
+            .timestamp(TimestampType::CreateTime);
 
         Self {
             base_offset: 0,
-            batch_length: Default::default(),
+            batch_length: 0,
             partition_leader_epoch: -1,
             magic: MAGIC,
-            crc: Default::default(),
-            attributes: BatchAttribute::default()
-                .compression(Compression::None)
-                .timestamp(TimestampType::CreateTime)
-                .into(),
-            last_offset_delta: Default::default(),
+            crc: 0,
+            attributes: create_time.into(),
+            last_offset_delta: 0,
             base_timestamp,
             max_timestamp: base_timestamp,
             producer_id: -1,
             producer_epoch: -1,
             base_sequence: -1,
-            records: Default::default(),
+            records: Vec::new(),
         }
+    }
+}
+
+/// The header of a deflated batch with `attributes`, around `records`.
+fn inflate(deflated: &deflated::Batch, attributes: i16, records: Vec<Record>) -> Batch {
+    Batch {
+        base_offset: deflated.base_offset,
+        batch_length: deflated.batch_length,
+        partition_leader_epoch: deflated.partition_leader_epoch,
+        magic: deflated.magic,
+        crc: deflated.crc,
+        attributes,
+        last_offset_delta: deflated.last_offset_delta,
+        base_timestamp: deflated.base_timestamp,
+        max_timestamp: deflated.max_timestamp,
+        producer_id: deflated.producer_id,
+        producer_epoch: deflated.producer_epoch,
+        base_sequence: deflated.base_sequence,
+        records,
     }
 }
 
@@ -115,37 +124,13 @@ impl TryFrom<deflated::Batch> for Batch {
     type Error = Error;
 
     fn try_from(value: deflated::Batch) -> Result<Self, Self::Error> {
-        let base_offset = value.base_offset;
-        let batch_length = value.batch_length;
-        let partition_leader_epoch = value.partition_leader_epoch;
-        let magic = value.magic;
-        let crc = value.crc;
-        let attributes =
-            BatchAttribute::try_from(value.attributes).inspect(|attribute| debug!(?attribute))?;
-        let last_offset_delta = value.last_offset_delta;
-        let base_timestamp = value.base_timestamp;
-        let max_timestamp = value.max_timestamp;
-        let producer_id = value.producer_id;
-        let producer_epoch = value.producer_epoch;
-        let base_sequence = value.base_sequence;
+        let attribute = BatchAttribute::try_from(value.attributes)?;
+        debug!(?attribute);
+        let uncompressed = attribute.compression(Compression::None).into();
 
-        let records: Vec<Record> = value.try_into()?;
-
-        Ok(Self {
-            base_offset,
-            batch_length,
-            partition_leader_epoch,
-            magic,
-            crc,
-            attributes: attributes.compression(Compression::None).into(),
-            last_offset_delta,
-            base_timestamp,
-            max_timestamp,
-            producer_id,
-            producer_epoch,
-            base_sequence,
-            records,
-        })
+        let mut batch = inflate(&value, uncompressed, Vec::new());
+        batch.records = Vec::<Record>::try_from(value)?;
+        Ok(batch)
     }
 }
 
@@ -153,36 +138,8 @@ impl TryFrom<&deflated::Batch> for Batch {
     type Error = Error;
 
     fn try_from(value: &deflated::Batch) -> Result<Self, Self::Error> {
-        let base_offset = value.base_offset;
-        let batch_length = value.batch_length;
-        let partition_leader_epoch = value.partition_leader_epoch;
-        let magic = value.magic;
-        let crc = value.crc;
-        let attributes = value.attributes;
-        let last_offset_delta = value.last_offset_delta;
-        let base_timestamp = value.base_timestamp;
-        let max_timestamp = value.max_timestamp;
-        let producer_id = value.producer_id;
-        let producer_epoch = value.producer_epoch;
-        let base_sequence = value.base_sequence;
-
-        let records: Vec<Record> = value.try_into()?;
-
-        Ok(Self {
-            base_offset,
-            batch_length,
-            partition_leader_epoch,
-            magic,
-            crc,
-            attributes,
-            last_offset_delta,
-            base_timestamp,
-            max_timestamp,
-            producer_id,
-            producer_epoch,
-            base_sequence,
-            records,
-        })
+        let records = Vec::<Record>::try_from(value)?;
+        Ok(inflate(value, value.attributes, records))
     }
 }
 
@@ -194,90 +151,86 @@ pub struct Compaction {
 
 impl Batch {
     pub fn compression(&self) -> Result<Compression> {
-        Compression::try_from(self.attributes)
+        self.attributes.try_into()
     }
 
     #[must_use]
     pub fn builder() -> Builder {
-        Builder::default()
+        Default::default()
     }
 
     pub fn into_builder(self) -> Builder {
-        self.into()
+        Builder::from(self)
     }
 
     pub fn max_offset(&self) -> i64 {
-        self.base_offset + i64::from(self.last_offset_delta)
+        i64::from(self.last_offset_delta) + self.base_offset
     }
 
     pub fn keys(&self) -> BTreeSet<Bytes> {
-        self.records
-            .iter()
-            .fold(BTreeSet::new(), |mut acc, record| {
-                if let Some(key) = record.key() {
-                    _ = acc.insert(key);
-                }
-
-                acc
-            })
+        self.records.iter().filter_map(Record::key).collect()
     }
 
     pub fn compact(mut self, head: &BTreeSet<Bytes>) -> Result<Compaction> {
-        let mut last_delta_offset_for_key = BTreeMap::new();
+        let mut latest = BTreeMap::new();
         let mut records = 0;
 
-        for record in self.records.iter() {
-            if let Some(key) = record.key() {
-                if head.contains(&key) {
-                    records += 1;
-                    continue;
-                }
-
-                if last_delta_offset_for_key
-                    .insert(key, record.offset_delta)
-                    .is_some()
-                {
-                    records += 1;
-                }
-            }
+        for (key, offset_delta) in self
+            .records
+            .iter()
+            .filter_map(|record| record.key().map(|key| (key, record.offset_delta)))
+        {
+            let superseded = head.contains(&key) || latest.insert(key, offset_delta).is_some();
+            records += usize::from(superseded);
         }
-
         debug!(?records);
 
-        if records > 0 {
-            let delta_offsets_to_retain: BTreeSet<i32> =
-                last_delta_offset_for_key.into_values().collect();
-            debug!(?delta_offsets_to_retain);
-
-            self.records
-                .retain(|record| delta_offsets_to_retain.contains(&record.offset_delta));
-
-            self.into_builder()
-                .build()
-                .map(|batch| Compaction { batch, records })
-        } else {
-            Ok(Compaction {
+        if records == 0 {
+            return Ok(Compaction {
                 batch: self,
                 records,
-            })
+            });
         }
+
+        let retained: BTreeSet<i32> = latest.into_values().collect();
+        debug!(?retained);
+        self.records
+            .retain(|record| retained.contains(&record.offset_delta));
+
+        let batch = self.into_builder().build()?;
+        Ok(Compaction { batch, records })
     }
 }
 
 impl From<Batch> for Builder {
     fn from(value: Batch) -> Self {
+        let Batch {
+            base_offset,
+            partition_leader_epoch,
+            magic,
+            attributes,
+            last_offset_delta,
+            base_timestamp,
+            max_timestamp,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            records,
+            ..
+        } = value;
+
         Self {
-            base_offset: value.base_offset,
-            partition_leader_epoch: value.partition_leader_epoch,
-            magic: value.magic,
-            attributes: value.attributes,
-            last_offset_delta: value.last_offset_delta,
-            base_timestamp: value.base_timestamp,
-            max_timestamp: value.max_timestamp,
-            producer_id: value.producer_id,
-            producer_epoch: value.producer_epoch,
-            base_sequence: value.base_sequence,
-            records: value.records.into_iter().map(Into::into).collect(),
+            base_offset,
+            partition_leader_epoch,
+            magic,
+            attributes,
+            last_offset_delta,
+            base_timestamp,
+            max_timestamp,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            records: records.into_iter().map(super::Builder::from).collect(),
         }
     }
 }
@@ -299,12 +252,12 @@ pub struct Builder {
 
 impl Default for Builder {
     fn default() -> Self {
-        let base_timestamp = to_timestamp(&SystemTime::now()).unwrap_or_default();
+        let base_timestamp = to_timestamp(&SystemTime::now()).unwrap_or(0);
 
         Self {
             base_offset: 0,
             partition_leader_epoch: -1,
-            magic: 2,
+            magic: MAGIC,
             attributes: 0,
             last_offset_delta: 0,
             base_timestamp,
@@ -312,319 +265,268 @@ impl Default for Builder {
             producer_id: -1,
             producer_epoch: 0,
             base_sequence: 0,
-            records: Sequence::default(),
+            records: Sequence(Vec::new()),
         }
     }
 }
 
 impl ByteSize for Builder {
     fn size_in_bytes(&self) -> Result<usize> {
-        Ok(size_of_val(&self.partition_leader_epoch)
-            + size_of_val(&self.magic)
-            // size of crc is u32
+        let fixed = size_of::<i32>()
+            + size_of::<i8>()
             + size_of::<u32>()
-            + size_of_val(&self.attributes)
-            + size_of_val(&self.last_offset_delta)
-            + size_of_val(&self.base_timestamp)
-            + size_of_val(&self.max_timestamp)
-            + size_of_val(&self.producer_id)
-            + size_of_val(&self.producer_epoch)
-            + size_of_val(&self.base_sequence)
-            + self.records.size_in_bytes()?)
+            + size_of::<i16>()
+            + size_of::<i32>()
+            + 3 * size_of::<i64>()
+            + size_of::<i16>()
+            + size_of::<i32>();
+        Ok(fixed + self.records.size_in_bytes()?)
     }
 }
 
 impl Builder {
     #[must_use]
-    pub fn base_offset(self, base_offset: i64) -> Self {
-        Self {
-            base_offset,
-            ..self
-        }
+    pub fn base_offset(mut self, base_offset: i64) -> Self {
+        self.base_offset = base_offset;
+        self
     }
 
     #[must_use]
-    pub fn partition_leader_epoch(self, partition_leader_epoch: i32) -> Self {
-        Self {
-            partition_leader_epoch,
-            ..self
-        }
+    pub fn partition_leader_epoch(mut self, partition_leader_epoch: i32) -> Self {
+        self.partition_leader_epoch = partition_leader_epoch;
+        self
     }
 
     #[must_use]
-    pub fn magic(self, magic: i8) -> Self {
-        Self { magic, ..self }
+    pub fn magic(mut self, magic: i8) -> Self {
+        self.magic = magic;
+        self
     }
 
     #[must_use]
-    pub fn attributes(self, attributes: i16) -> Self {
-        Self { attributes, ..self }
+    pub fn attributes(mut self, attributes: i16) -> Self {
+        self.attributes = attributes;
+        self
     }
 
     #[must_use]
-    pub fn last_offset_delta(self, last_offset_delta: i32) -> Self {
-        Self {
-            last_offset_delta,
-            ..self
-        }
+    pub fn last_offset_delta(mut self, last_offset_delta: i32) -> Self {
+        self.last_offset_delta = last_offset_delta;
+        self
     }
 
     #[must_use]
-    pub fn base_timestamp(self, base_timestamp: i64) -> Self {
-        Self {
-            base_timestamp,
-            ..self
-        }
+    pub fn base_timestamp(mut self, base_timestamp: i64) -> Self {
+        self.base_timestamp = base_timestamp;
+        self
     }
 
     #[must_use]
-    pub fn max_timestamp(self, max_timestamp: i64) -> Self {
-        Self {
-            max_timestamp,
-            ..self
-        }
+    pub fn max_timestamp(mut self, max_timestamp: i64) -> Self {
+        self.max_timestamp = max_timestamp;
+        self
     }
 
     #[must_use]
-    pub fn producer_id(self, producer_id: i64) -> Self {
-        Self {
-            producer_id,
-            ..self
-        }
+    pub fn producer_id(mut self, producer_id: i64) -> Self {
+        self.producer_id = producer_id;
+        self
     }
 
     #[must_use]
-    pub fn producer_epoch(self, producer_epoch: i16) -> Self {
-        Self {
-            producer_epoch,
-            ..self
-        }
+    pub fn producer_epoch(mut self, producer_epoch: i16) -> Self {
+        self.producer_epoch = producer_epoch;
+        self
     }
 
     #[must_use]
-    pub fn base_sequence(self, base_sequence: i32) -> Self {
-        Self {
-            base_sequence,
-            ..self
-        }
+    pub fn base_sequence(mut self, base_sequence: i32) -> Self {
+        self.base_sequence = base_sequence;
+        self
     }
 
     #[must_use]
     pub fn record(mut self, record: super::Builder) -> Self {
-        self.records.extend(vec![record]);
+        self.records.0.push(record);
         self
     }
 
+    /// The CRC-32C of everything after the checksum, from `attributes` on.
     fn crc(&self) -> Result<u32> {
-        let mut encoder = RecordBatchEncoder::new(BytesMut::with_capacity(self.size_in_bytes()?));
-        self.attributes.serialize(&mut encoder)?;
-        self.last_offset_delta.serialize(&mut encoder)?;
-        self.base_timestamp.serialize(&mut encoder)?;
-        self.max_timestamp.serialize(&mut encoder)?;
-        self.producer_id.serialize(&mut encoder)?;
-        self.producer_epoch.serialize(&mut encoder)?;
-        self.base_sequence.serialize(&mut encoder)?;
-        self.records.serialize(&mut encoder)?;
-
-        let encoded = Bytes::from(encoder);
+        let mut checked = RecordBatchEncoder::new(BytesMut::with_capacity(self.size_in_bytes()?));
+        self.attributes.serialize(&mut checked)?;
+        self.last_offset_delta.serialize(&mut checked)?;
+        self.base_timestamp.serialize(&mut checked)?;
+        self.max_timestamp.serialize(&mut checked)?;
+        self.producer_id.serialize(&mut checked)?;
+        self.producer_epoch.serialize(&mut checked)?;
+        self.base_sequence.serialize(&mut checked)?;
+        self.records.serialize(&mut checked)?;
 
         let mut digest = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32Iscsi);
-        digest.update(&encoded[..]);
-
+        digest.update(&Bytes::from(checked));
         Ok(digest.finalize() as u32)
     }
 
     pub fn build(self) -> Result<Batch> {
-        let batch_length = self
-            .size_in_bytes()
-            .and_then(|size| i32::try_from(size).map_err(Into::into))?;
-
+        let batch_length = i32::try_from(self.size_in_bytes()?)?;
         let crc = self.crc()?;
 
-        let records = self
-            .records
-            .0
-            .into_iter()
-            .try_fold(Vec::new(), |mut acc, record| {
-                Record::try_from(record).map(|record| {
-                    acc.push(record);
-                    acc
-                })
-            })?;
+        let Self {
+            base_offset,
+            partition_leader_epoch,
+            magic,
+            attributes,
+            last_offset_delta,
+            base_timestamp,
+            max_timestamp,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            records,
+        } = self;
 
         Ok(Batch {
-            base_offset: self.base_offset,
+            base_offset,
             batch_length,
-            partition_leader_epoch: self.partition_leader_epoch,
-            magic: self.magic,
+            partition_leader_epoch,
+            magic,
             crc,
-            attributes: self.attributes,
-            last_offset_delta: self.last_offset_delta,
-            base_timestamp: self.base_timestamp,
-            max_timestamp: self.max_timestamp,
-            producer_id: self.producer_id,
-            producer_epoch: self.producer_epoch,
-            base_sequence: self.base_sequence,
-            records,
+            attributes,
+            last_offset_delta,
+            base_timestamp,
+            max_timestamp,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            records: records
+                .into_iter()
+                .map(Record::try_from)
+                .collect::<Result<_>>()?,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use tracing::subscriber::DefaultGuard;
-    use tracing_subscriber::EnvFilter;
+    use std::collections::BTreeSet;
 
-    use super::*;
-    use crate::{Result, de::BatchDecoder};
+    use bytes::Bytes;
+    use serde::Deserialize as _;
 
-    fn init_tracing() -> Result<DefaultGuard> {
-        use std::{fs::File, sync::Arc, thread};
+    use super::Batch;
+    use crate::{Error, Result, de::BatchDecoder, record::Record};
 
-        Ok(tracing::subscriber::set_default(
-            tracing_subscriber::fmt()
-                .with_level(true)
-                .with_line_number(true)
-                .with_thread_names(false)
-                .with_env_filter(EnvFilter::from_default_env().add_directive(
-                    format!("{}=debug", env!("CARGO_PKG_NAME").replace("-", "_")).parse()?,
-                ))
-                .with_writer(
-                    thread::current()
-                        .name()
-                        .ok_or(Error::Message(String::from("unnamed thread")))
-                        .and_then(|name| {
-                            File::create(format!("../logs/{}/{name}.log", env!("CARGO_PKG_NAME"),))
-                                .map_err(Into::into)
-                        })
-                        .map(Arc::new)?,
-                )
-                .finish(),
-        ))
+    /// [`def`] on the wire: a 59-byte batch from producer 1 at sequence 1,
+    /// whose one record carries the value `def`.
+    const DEF: [u8; 71] = [
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 59, 255, 255, 255, 255, 2, 67, 41, 231, 61, 0, 0, 0, 0, 0,
+        0, 0, 0, 1, 141, 116, 152, 137, 53, 0, 0, 1, 141, 116, 152, 137, 53, 0, 0, 0, 0, 0, 0, 0,
+        1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 18, 0, 0, 0, 1, 6, 100, 101, 102, 0,
+    ];
+
+    /// Logs this test at `debug` for this crate, on top of `RUST_LOG`, into
+    /// `../logs/<package>/<thread>.log`: one file per test.
+    fn init_tracing() -> Result<tracing::subscriber::DefaultGuard> {
+        let directive = format!("{}=debug", env!("CARGO_CRATE_NAME")).parse()?;
+        let filter = tracing_subscriber::EnvFilter::from_default_env().add_directive(directive);
+
+        let unnamed = || Error::Message(String::from("unnamed thread"));
+        let current = std::thread::current();
+        let test = current.name().ok_or_else(unnamed)?;
+        let log = std::fs::File::create(format!("../logs/{}/{test}.log", env!("CARGO_PKG_NAME")))?;
+
+        let subscriber = tracing_subscriber::fmt().with_level(true);
+        let subscriber = subscriber.with_line_number(true).with_thread_names(false);
+        let subscriber = subscriber.with_env_filter(filter);
+        let subscriber = subscriber.with_writer(std::sync::Arc::new(log));
+        Ok(tracing::subscriber::set_default(subscriber.finish()))
+    }
+
+    /// A batch of one record with the value `def`, at a fixed time, from
+    /// producer 1 at sequence 1.
+    fn def() -> Result<Batch> {
+        const AT: i64 = 1_707_058_170_165;
+        let record = Record::builder().value(Some(Bytes::from_static(b"def")));
+        Batch::builder()
+            .base_timestamp(AT)
+            .max_timestamp(AT)
+            .producer_id(1)
+            .base_sequence(1)
+            .record(record)
+            .build()
+    }
+
+    /// A record at `offset_delta`, keyed by `key` when there is one.
+    fn keyed(offset_delta: i32, key: Option<&'static str>) -> crate::record::Builder {
+        Record::builder()
+            .offset_delta(offset_delta)
+            .key(key.map(Bytes::from))
+            .value(Some(Bytes::from(format!("v{offset_delta}"))))
     }
 
     #[test]
-    fn batch() -> Result<()> {
+    fn a_built_batch_carries_its_length_and_checksum() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let decoded = Batch::builder()
-            .base_offset(0)
-            .partition_leader_epoch(-1)
-            .magic(2)
-            .attributes(0)
-            .last_offset_delta(0)
-            .base_timestamp(1_707_058_170_165)
-            .max_timestamp(1_707_058_170_165)
-            .producer_id(1)
-            .producer_epoch(0)
-            .base_sequence(1)
-            .record(Record::builder().value(Some(Bytes::from_static(&[100, 101, 102]))))
-            .build()?;
-
-        assert_eq!(decoded.batch_length, 59);
-        assert_eq!(decoded.crc, 1_126_819_645);
-
+        let batch = def()?;
+        assert_eq!((59, 1_126_819_645), (batch.batch_length, batch.crc));
         Ok(())
     }
 
     #[test]
-    fn batch_decode() -> Result<()> {
+    fn the_wire_bytes_decode_to_the_built_batch() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let encoded = vec![
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 59, 255, 255, 255, 255, 2, 67, 41, 231, 61, 0, 0, 0,
-            0, 0, 0, 0, 0, 1, 141, 116, 152, 137, 53, 0, 0, 1, 141, 116, 152, 137, 53, 0, 0, 0, 0,
-            0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 18, 0, 0, 0, 1, 6, 100, 101, 102, 0,
+        let decoded = Batch::deserialize(BatchDecoder::new(Bytes::from_static(&DEF)))?;
+        assert_eq!(def()?, decoded);
+        Ok(())
+    }
+
+    #[test]
+    fn every_record_added_is_built() -> Result<()> {
+        let _guard = init_tracing()?;
+
+        let keys = [
+            "k1", "k2", "k1", "k1", "k3", "k2", "k4", "k5", "k5", "k2", "k6",
         ];
-
-        let decoded = Batch::builder()
-            .base_offset(0)
-            .partition_leader_epoch(-1)
-            .magic(2)
-            .attributes(0)
-            .last_offset_delta(0)
-            .base_timestamp(1_707_058_170_165)
-            .max_timestamp(1_707_058_170_165)
-            .producer_id(1)
-            .producer_epoch(0)
-            .base_sequence(1)
-            .record(Record::builder().value(Some(Bytes::from(vec![100, 101, 102]))))
-            .build()?;
-
-        let decoder = BatchDecoder::new(Bytes::copy_from_slice(&encoded[..]));
-        let actual = Batch::deserialize(decoder)?;
-
-        assert_eq!(decoded, actual);
-
+        let builder = (0..)
+            .zip(keys)
+            .fold(Batch::builder(), |builder, (delta, key)| {
+                builder.record(keyed(delta, Some(key)))
+            });
+        assert_eq!(keys.len(), builder.build()?.records.len());
         Ok(())
     }
 
+    /// Compaction keeps the latest record of each key the head does not
+    /// already hold, drops keyless records, and counts what it superseded.
     #[test]
-    fn batch_encode() -> Result<()> {
+    fn compaction_keeps_the_latest_record_per_key() -> Result<()> {
         let _guard = init_tracing()?;
 
-        let encoded = Bytes::from_static(&[
-            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 59, 255, 255, 255, 255, 2, 67, 41, 231, 61, 0, 0, 0,
-            0, 0, 0, 0, 0, 1, 141, 116, 152, 137, 53, 0, 0, 1, 141, 116, 152, 137, 53, 0, 0, 0, 0,
-            0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 18, 0, 0, 0, 1, 6, 100, 101, 102, 0,
-        ]);
-
-        let decoded = Batch::builder()
-            .base_offset(0)
-            .partition_leader_epoch(-1)
-            .magic(2)
-            .attributes(0)
-            .last_offset_delta(0)
-            .base_timestamp(1_707_058_170_165)
-            .max_timestamp(1_707_058_170_165)
-            .producer_id(1)
-            .producer_epoch(0)
-            .base_sequence(1)
-            .record(Record::builder().value(Some(Bytes::from(vec![100, 101, 102]))))
+        let batch = [Some("k1"), Some("k2"), Some("k1"), Some("k3"), None]
+            .into_iter()
+            .zip(0..)
+            .fold(Batch::builder(), |builder, (key, delta)| {
+                builder.record(keyed(delta, key))
+            })
             .build()?;
+        assert_eq!(
+            BTreeSet::from(["k1", "k2", "k3"].map(Bytes::from)),
+            batch.keys()
+        );
 
-        let decoder = BatchDecoder::new(encoded);
-        let actual = Batch::deserialize(decoder)?;
+        let head = BTreeSet::from([Bytes::from_static(b"k3")]);
+        let compaction = batch.compact(&head)?;
 
-        assert_eq!(decoded, actual);
-
-        Ok(())
-    }
-
-    #[test]
-    fn build_batch_records() -> Result<()> {
-        let _guard = init_tracing()?;
-
-        let keys: Vec<_> = (0..=6).map(|i| format!("k{i}")).map(Bytes::from).collect();
-        let values: Vec<_> = (0..=11).map(|i| format!("v{i}")).map(Bytes::from).collect();
-
-        let mut builder = Batch::builder();
-        let indexes = [
-            (1, 1),
-            (2, 2),
-            (1, 3),
-            (1, 4),
-            (3, 5),
-            (2, 6),
-            (4, 7),
-            (5, 8),
-            (5, 9),
-            (2, 10),
-            (6, 11),
-        ];
-
-        for (offset_delta, (key_index, value_index)) in indexes.into_iter().enumerate() {
-            builder = builder.record(
-                Record::builder()
-                    .offset_delta(i32::try_from(offset_delta)?)
-                    .key(Some(keys[key_index].clone()))
-                    .value(Some(values[value_index].clone())),
-            );
-        }
-
-        let batch = builder.build()?;
-        assert_eq!(indexes.len(), batch.records.len());
-
+        let deltas: Vec<_> = compaction
+            .batch
+            .records
+            .iter()
+            .map(|r| r.offset_delta)
+            .collect();
+        assert_eq!((2, vec![1, 2]), (compaction.records, deltas));
         Ok(())
     }
 }
