@@ -32,17 +32,68 @@
 //! any size costs two writes — the one already in flight and the one that
 //! carries the rest.
 //!
-//! Replicas do not coordinate: two replicas committing for one group still meet
-//! in the CAS, as before, so the fleet's bound is one write per replica per
-//! turn rather than one per commit.
+//! Replicas do not coordinate, and on `gs://` that was the rest of the problem
+//! (DEV-663). Sixty-four members committing every second through three
+//! replicas measured p99 35 s here and 29–80 s on a real bucket, with up to 105
+//! retries for one write. Each replica's turn met the others' in the CAS, and
+//! the loser paid twice: [`OptiCon::with_mut`] re-read the object *then* sat out
+//! a second of [`crate::PutRateLimiter`] pacing, so the etag it carried was a
+//! second old when it reached the bucket — long enough for another replica to
+//! have moved it. On a hot object that is a loop, not a retry.
+//!
+//! So on a store that paces writes of one object (`object_write_interval`,
+//! [`super::config::Tuning`]), the turn owns its retry:
+//!
+//! - **a loser waits, then re-reads.** The pacing is sat out before the re-read,
+//!   so the etag a retry presents is milliseconds old rather than a second;
+//! - **a retry carries what arrived meanwhile.** Commits queued on this replica
+//!   while the turn waited are folded into its next attempt instead of waiting
+//!   for a turn of their own behind it;
+//! - **a contended replica backs off.** Each conflict lengthens the spacing
+//!   between this replica's writes of the group by one interval, up to
+//!   [`MAX_SPACING`] intervals, and each write that lands at the first attempt
+//!   shortens it by a quarter of one. Replicas that keep meeting spread their
+//!   turns out until they stop meeting — `n` replicas settle near `n` intervals
+//!   apart, the object's one write per interval shared between them — and a
+//!   loser, retrying after one interval, goes ahead of a winner spaced further
+//!   out;
+//! - **a contended replica re-reads before its turn.** The etag it holds is
+//!   from its own last write, which other replicas have since moved: presenting
+//!   it would lose for nothing, and cost an interval.
+//!
+//! The alternatives were weighed in DEV-663. Routing a group's commits to one
+//! replica is group forwarding, which #360 removed because it made replicas
+//! non-interchangeable (peer DNS, an internal listener, pod identity); sharding
+//! `offsets.json` per writer gives back the reads #406 and #415 traded away and
+//! needs a cross-shard order a stateless fleet does not have. This keeps one
+//! object and stateless replicas, and bounds the cost of a hot group at about
+//! one write per interval per replica rather than removing it.
+//!
+//! On `s3://` and `memory://` there is no spacing: a loser re-reads and retries
+//! at once, as [`OptiCon::with_mut`] did, and still carries what arrived.
 
-use std::sync::Mutex;
+use std::{sync::Mutex, time::Duration};
 
 use object_store::ObjectStore;
-use tokio::sync::oneshot::{self, error::TryRecvError};
+use tokio::{
+    sync::oneshot::{self, error::TryRecvError},
+    time::Instant,
+};
+use tracing::warn;
 
 use super::{GroupOffsets, OptiCon};
 use crate::{OffsetCommitRequest, Result, Topition};
+
+/// The longest spacing a contended replica keeps between its writes of one
+/// group, in object write intervals: four seconds on `gs://`, so a commit that
+/// arrives just after its replica's turn waits at most about that plus the
+/// write. Four replicas share the object's write rate without meeting; more
+/// than that meet more often, and each meeting costs a loser one interval.
+const MAX_SPACING: u32 = 4;
+
+/// Retries of one turn past which the group is logged as contended, as
+/// [`OptiCon::with_mut`] logs a hot object.
+const RETRY_WARN_THRESHOLD: u32 = 8;
 
 /// One commit waiting for a turn: what it writes, and who it answers.
 #[derive(Debug)]
@@ -51,21 +102,67 @@ struct Pending {
     done: oneshot::Sender<Result<()>>,
 }
 
+/// How this replica spaces its writes of one group's `offsets.json`.
+#[derive(Debug, Default)]
+struct Pacing {
+    /// The spacing between this replica's writes of the group: one interval
+    /// while uncontended, up to [`MAX_SPACING`] intervals while other replicas
+    /// keep winning the object first.
+    spacing: Duration,
+
+    /// When this replica last wrote the group.
+    written_at: Option<Instant>,
+}
+
+impl Pacing {
+    /// When this replica may next write the group.
+    fn next_write(&self, interval: Duration) -> Option<Instant> {
+        self.written_at
+            .map(|written_at| written_at + self.spacing.max(interval))
+    }
+
+    /// Whether other replicas have been writing the group: then the etag this
+    /// replica holds from its own last write is almost surely stale, and a
+    /// write presenting it would lose for nothing.
+    fn contended(&self, interval: Duration) -> bool {
+        self.spacing > interval
+    }
+
+    /// Record a conflict: lengthen the spacing now, not when the write lands,
+    /// so the next turn is spaced out even while this one is still retrying.
+    fn conflicted(&mut self, interval: Duration) {
+        self.spacing = (self.spacing.max(interval) + interval).min(interval * MAX_SPACING);
+    }
+
+    /// Record a write that landed, after `retries` conflicts: a clean one
+    /// shortens the spacing by a quarter interval.
+    fn written(&mut self, interval: Duration, retries: u32) {
+        if retries == 0 {
+            self.spacing = self.spacing.saturating_sub(interval / 4).max(interval);
+        }
+        self.written_at = Some(Instant::now());
+    }
+}
+
 /// The commit queue of one group, on this replica.
 #[derive(Debug, Default)]
 pub(super) struct GroupCommits {
     pending: Mutex<Vec<Pending>>,
 
-    /// Held for the length of a write. A `tokio` mutex because it is held
-    /// across the write's `await`, and because it is fair: a commit waiting for
-    /// the turn gets it in arrival order.
-    turn: tokio::sync::Mutex<()>,
+    /// Held for the length of a write, and what it holds is the group's pacing,
+    /// which only a writer reads. A `tokio` mutex because it is held across the
+    /// write's `await`, and because it is fair: a commit waiting for the turn
+    /// gets it in arrival order.
+    turn: tokio::sync::Mutex<Pacing>,
 }
 
 impl GroupCommits {
     /// Commit `offsets` to the group's `offsets.json`, together with whatever
     /// else is pending for the group when this commit's turn comes — or answer
     /// with the outcome of the write that already carried it.
+    ///
+    /// `interval` is the store's spacing between two writes of one object, if
+    /// it has one; see the module documentation for what the turn does with it.
     ///
     /// Safe to cancel. A commit whose writer is dropped mid-write gets a closed
     /// channel instead of an outcome and queues itself again; applying an
@@ -75,6 +172,7 @@ impl GroupCommits {
         offsets: &[(Topition, OffsetCommitRequest)],
         group: &OptiCon<GroupOffsets>,
         object_store: &impl ObjectStore,
+        interval: Option<Duration>,
     ) -> Result<()> {
         loop {
             let (done, mut outcome) = oneshot::channel();
@@ -83,7 +181,7 @@ impl GroupCommits {
                 done,
             });
 
-            let _turn = self.turn.lock().await;
+            let mut pacing = self.turn.lock().await;
 
             match outcome.try_recv() {
                 Ok(written) => return written,
@@ -91,16 +189,9 @@ impl GroupCommits {
                 Err(TryRecvError::Empty) => (),
             }
 
-            let carried = std::mem::take(&mut *self.pending.lock()?);
-
-            let written = group
-                .with_mut(object_store, |stored| {
-                    for (topition, commit) in carried.iter().flat_map(|pending| &pending.offsets) {
-                        stored.insert(topition, commit.clone());
-                    }
-
-                    Ok(())
-                })
+            let mut carried = vec![];
+            let written = self
+                .write(&mut carried, &mut pacing, group, object_store, interval)
                 .await;
 
             for pending in carried {
@@ -110,6 +201,64 @@ impl GroupCommits {
             if let Ok(written) = outcome.try_recv() {
                 return written;
             }
+        }
+    }
+
+    /// One turn: write everything pending into `carried`, retrying on conflict
+    /// until it lands or fails, and folding in what arrives while it waits.
+    async fn write(
+        &self,
+        carried: &mut Vec<Pending>,
+        pacing: &mut Pacing,
+        group: &OptiCon<GroupOffsets>,
+        object_store: &impl ObjectStore,
+        interval: Option<Duration>,
+    ) -> Result<()> {
+        if let Some(interval) = interval {
+            if let Some(next_write) = pacing.next_write(interval) {
+                tokio::time::sleep_until(next_write).await;
+            }
+
+            if pacing.contended(interval) {
+                group.reload(object_store).await?;
+            }
+        }
+
+        let mut retries = 0;
+        loop {
+            carried.append(&mut *self.pending.lock()?);
+
+            let attempt = group
+                .try_mut(object_store, |stored| {
+                    for (topition, commit) in carried.iter().flat_map(|pending| &pending.offsets) {
+                        stored.insert(topition, commit.clone());
+                    }
+
+                    Ok(())
+                })
+                .await?;
+
+            if let Some(written) = attempt {
+                if let Some(interval) = interval {
+                    pacing.written(interval, retries);
+                }
+                return written;
+            }
+
+            retries += 1;
+            if retries >= RETRY_WARN_THRESHOLD {
+                warn!(
+                    retries,
+                    carried = carried.len(),
+                    "offset commits contending"
+                );
+            }
+
+            if let Some(interval) = interval {
+                pacing.conflicted(interval);
+                tokio::time::sleep(interval).await;
+            }
+            group.reload(object_store).await?;
         }
     }
 }
@@ -130,6 +279,31 @@ mod tests {
         )]
     }
 
+    /// Conflicts space a replica's writes out to [`MAX_SPACING`] intervals and
+    /// no further; clean writes bring it back to one interval and no closer.
+    #[test]
+    fn spacing_grows_with_conflicts_and_shrinks_with_clean_writes() {
+        let interval = Duration::from_secs(1);
+        let mut pacing = Pacing::default();
+        assert!(!pacing.contended(interval));
+
+        for _ in 0..10 {
+            pacing.conflicted(interval);
+        }
+        pacing.written(interval, 10);
+        assert_eq!(interval * MAX_SPACING, pacing.spacing);
+        assert!(pacing.contended(interval));
+
+        pacing.written(interval, 0);
+        assert_eq!(interval * MAX_SPACING - interval / 4, pacing.spacing);
+
+        for _ in 0..20 {
+            pacing.written(interval, 0);
+        }
+        assert_eq!(interval, pacing.spacing);
+        assert!(!pacing.contended(interval));
+    }
+
     /// A commit carried by a writer that is dropped mid-write is not lost: the
     /// batch went with the writer, and the commit's closed channel sends it
     /// round again.
@@ -146,13 +320,15 @@ mod tests {
         let group = OptiCon::<GroupOffsets>::path(Path::from("g/offsets.json"));
         let commits = Arc::new(GroupCommits::default());
 
-        commits.commit(&commit(0, 1), &group, &*store).await?;
+        commits.commit(&commit(0, 1), &group, &*store, None).await?;
 
         let spawn = |partition| {
             let (commits, group, store) = (commits.clone(), group.clone(), store.clone());
-            tokio::spawn(
-                async move { commits.commit(&commit(partition, 1), &group, &*store).await },
-            )
+            tokio::spawn(async move {
+                commits
+                    .commit(&commit(partition, 1), &group, &*store, None)
+                    .await
+            })
         };
         let pause = || tokio::time::sleep(Duration::from_millis(200));
 

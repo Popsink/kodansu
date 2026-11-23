@@ -1017,7 +1017,12 @@ impl LogStorage for DynoStore {
                 Some(offsets) => {
                     self.clients
                         .group_commits(group_id)?
-                        .commit(&committable, &offsets, &self.object_store)
+                        .commit(
+                            &committable,
+                            &offsets,
+                            &self.object_store,
+                            self.tuning.object_write_interval,
+                        )
                         .await
                 }
 

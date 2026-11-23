@@ -162,6 +162,27 @@ three replicas and 48 members, which still meet each other in the CAS.
 Measured in `tansu-storage/tests/offset_commit_cap.rs` over the same
 `InMemory` model, so it says nothing about request latency or a real `429`.
 
+**Observed against a bucket** on 2026-11-23 (Standard, europe-west1, soft
+delete 0; from a workstation, not in-region; the real `gs` arm through
+`StorageContainer::builder`; three rounds each): 16 members committing at once
+took **54–57 s, p50 ~33 s, before; ~2.0 s after**. 128 members took 2.1 s.
+No commit failed and no `429` was logged in either run.
+
+**Across replicas, sustained (DEV-663).** One burst was not the case that
+broke: the DEV-485 sandbox run, 64 members committing synchronously every
+second through three replicas, measured commit p99 29–80 s and up to 105
+retries for one write. Each replica's turn met the others' in the CAS, and a
+loser re-read the object *then* waited out a second of local pacing, so it
+reached the bucket with an etag another replica had already moved. A writer
+on `gs://` now knows the per-object spacing: it waits before it re-reads, a
+retry carries the commits that arrived meanwhile, and each conflict spaces
+that replica's writes of the group one interval further apart (up to four),
+so three replicas settle about three seconds apart and share the object's one
+write per second. Same `InMemory` model, 30 s sustained: **p99 35 s before,
+~3 s after**, no commit lost. The model's limiters are per replica, so it
+does not reproduce the bucket refusing a fleet's second write in a second;
+the sandbox rerun is what settles that.
+
 Two things bounded the original problem honestly and are worth keeping in mind
 for the next one: it was per group, not fleet-wide (different groups write
 different objects), and the limiter is a **local delay**, so the cost was paid

@@ -61,14 +61,20 @@ fn gcs_shaped<O>(inner: O) -> PutRateLimiter<O> {
 }
 
 /// `replicas` brokers over one bucket, each with its own limiter as each
-/// process has, and a topic with a partition per member.
+/// process has and told its spacing as `StorageContainer`'s `gs` arm tells it,
+/// and a topic with a partition per member.
 async fn fleet(
     bucket: &Arc<InMemory>,
     replicas: usize,
     members: i32,
 ) -> tansu_storage::Result<Vec<Arc<DynoStore>>> {
     let fleet = (0..replicas)
-        .map(|_| Arc::new(DynoStore::new(CLUSTER, NODE, gcs_shaped(bucket.clone()))))
+        .map(|_| {
+            Arc::new(
+                DynoStore::new(CLUSTER, NODE, gcs_shaped(bucket.clone()))
+                    .object_write_interval(Some(Duration::from_secs(1))),
+            )
+        })
         .collect::<Vec<_>>();
 
     _ = fleet[0]
@@ -182,5 +188,116 @@ async fn a_burst_costs_two_writes_whatever_its_size() -> tansu_storage::Result<(
 async fn three_replicas_meet_in_the_cas_once_each() -> tansu_storage::Result<()> {
     let slowest = measured(3, 48).await?;
     assert!(slowest < REQUEST_TIMEOUT / 2, "{slowest:?}");
+    Ok(())
+}
+
+/// The acceptance bound of DEV-663: a synchronous commit answered within this,
+/// at the 99th percentile, from a large group committing every second through
+/// several replicas.
+const SUSTAINED_P99: Duration = Duration::from_secs(10);
+
+/// What a member's `commitSync` loop does: commit its own partition, wait a
+/// second, commit the next offset, for `lasting`. Member `m` goes through
+/// replica `m % replicas`, as a Service spreads connections. Returns every
+/// commit's latency and each member's last committed offset.
+async fn sustained(
+    fleet: &[Arc<DynoStore>],
+    members: i32,
+    lasting: Duration,
+) -> tansu_storage::Result<(Vec<Duration>, Vec<i64>)> {
+    let mut committing = JoinSet::new();
+    let until = Instant::now() + lasting;
+
+    for partition in 0..members {
+        let replica = fleet[partition as usize % fleet.len()].clone();
+
+        _ = committing.spawn(async move {
+            let topition = Topition::new(TOPIC, partition);
+            let mut latencies = vec![];
+            let mut offset = 0;
+
+            while Instant::now() < until {
+                offset += 1;
+                let started = Instant::now();
+                let committed = replica
+                    .offset_commit(
+                        GROUP,
+                        None,
+                        &[(
+                            topition.clone(),
+                            OffsetCommitRequest::default().offset(offset),
+                        )],
+                    )
+                    .await?;
+                latencies.push(started.elapsed());
+
+                assert_eq!(vec![(topition.clone(), ErrorCode::None)], committed);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+
+            Ok::<_, tansu_storage::Error>((partition, latencies, offset))
+        });
+    }
+
+    let mut latencies = vec![];
+    let mut last = vec![0; members as usize];
+    while let Some(member) = committing.join_next().await {
+        let (partition, member, offset) = member.expect("member")?;
+        latencies.extend(member);
+        last[partition as usize] = offset;
+    }
+    latencies.sort();
+    Ok((latencies, last))
+}
+
+/// DEV-663: a large group committing synchronously every second through three
+/// replicas. One burst (above) does not catch it: the replicas' turns collide
+/// on every write, and each loser re-read, waited out its own pacing and met
+/// the next winner. 35 s at p99 here before the fix; 29–80 s on a real bucket.
+///
+/// What this model leaves out is the bucket's own cap: each replica's limiter
+/// is local, so three replicas could land three writes a second on one object
+/// here, which GCS answers `429`. A shared limiter over the bucket was tried as
+/// that cap and dropped: `governor` does not serve its waiters in order, so a
+/// put could starve behind the others for tens of seconds, which measured the
+/// limiter rather than the bucket.
+///
+/// Read back through a replica that served none of it, for the reason
+/// [`measured`] gives.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_group_committing_every_second_through_three_replicas() -> tansu_storage::Result<()>
+{
+    const MEMBERS: i32 = 64;
+
+    let bucket = Arc::new(InMemory::new());
+    let fleet = fleet(&bucket, 3, MEMBERS).await?;
+    let (latencies, last) = sustained(&fleet, MEMBERS, Duration::from_secs(30)).await?;
+
+    let percentile = |p: usize| latencies[(latencies.len() * p / 100).min(latencies.len() - 1)];
+    let (p50, p99, max) = (
+        percentile(50),
+        percentile(99),
+        latencies[latencies.len() - 1],
+    );
+    println!(
+        "commits={} p50={p50:?} p99={p99:?} max={max:?}",
+        latencies.len()
+    );
+
+    let topitions = (0..MEMBERS)
+        .map(|partition| Topition::new(TOPIC, partition))
+        .collect::<Vec<_>>();
+    let fetched = DynoStore::new(CLUSTER, NODE, bucket)
+        .offset_fetch(Some(GROUP), &topitions, Some(false))
+        .await?;
+    for (topition, offset) in topitions.iter().zip(last) {
+        assert_eq!(
+            Some(offset),
+            fetched.get(topition).map(|c| c.offset),
+            "{topition:?}"
+        );
+    }
+
+    assert!(p99 < SUSTAINED_P99, "p50={p50:?} p99={p99:?} max={max:?}");
     Ok(())
 }

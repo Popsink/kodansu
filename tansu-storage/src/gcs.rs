@@ -28,6 +28,13 @@ use object_store::gcp::{GoogleCloudStorage, GoogleCloudStorageBuilder};
 use limit::PutRateLimiter;
 use retry::{BUCKET_RAMP_RETRY, OBJECT_CAP_RETRY, RetrySplit};
 
+/// The spacing [`object_store`] paces writes of one object name at: GCS's
+/// documented ~1 write/s per object, the `1` per second below. The engine is told it too
+/// ([`crate::dynostore::DynoStore::object_write_interval`]), so a writer that
+/// lost a conditional update waits it out before re-reading, not after
+/// (DEV-663).
+pub(crate) const OBJECT_WRITE_INTERVAL: Duration = Duration::from_secs(1);
+
 /// The object store a `gs://` URL names: the one stack both the broker and
 /// `tansu audit` build, so the two cannot drift apart.
 ///

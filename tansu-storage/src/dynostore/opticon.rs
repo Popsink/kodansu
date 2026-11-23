@@ -269,46 +269,77 @@ where
         loop {
             count("with_mut_loop");
 
-            let (outcome, dv) = {
-                let held = self.data_version.lock()?;
-                let mut dv = held.clone().unwrap_or_default();
-                let outcome = f(&mut dv.data);
-                (outcome, dv)
-            };
-
-            let payload = encoded(&dv.data)?;
-            let options = self.put_options(PutMode::from(&dv));
-            let put = object_store.put_opts(&self.path, payload, options).await;
-            noted(METHOD, &put);
-            match put {
-                Ok(written) => {
-                    RETRIES.record(retries, &[]);
-                    let version = Some(UpdateVersion {
-                        e_tag: written.e_tag,
-                        version: written.version,
-                    });
-                    let data = dv.data;
-                    let stored = self
-                        .guard()
-                        .map(|mut held| held.replace(DataVersion { data, version }));
-                    return stored.and(outcome);
-                }
-
-                Err(
-                    object_store::Error::Precondition { .. }
-                    | object_store::Error::AlreadyExists { .. },
-                ) => {
-                    retries += 1;
-                    if retries >= RETRY_WARN_THRESHOLD {
-                        let why = "OptiCon with_mut contending on a hot object (per-object update-rate cap?)";
-                        warn!(path = %self.path, retries = retries, "{why}");
-                    }
-                    self.get(object_store).await?;
-                }
-
-                Err(err) => return Err(err.into()),
+            if let Some(outcome) = self.try_mut(object_store, &f).await? {
+                RETRIES.record(retries, &[]);
+                return outcome;
             }
+
+            retries += 1;
+            if retries >= RETRY_WARN_THRESHOLD {
+                let why =
+                    "OptiCon with_mut contending on a hot object (per-object update-rate cap?)";
+                warn!(path = %self.path, retries = retries, "{why}");
+            }
+            self.reload(object_store).await?;
         }
+    }
+
+    /// One conditional write of `f` applied to the cached value: `Some` with
+    /// `f`'s outcome when it landed, `None` when another writer moved the object
+    /// first.
+    ///
+    /// The cache is left as it was on a conflict, and nothing is re-read: when to
+    /// re-read is the caller's choice, which is the point of this being separate
+    /// from [`Self::with_mut`]. A caller paced by a per-object write cap wants the
+    /// re-read *after* the pacing, not before it (DEV-663, `commits.rs`).
+    #[instrument(skip_all, fields(path = %self.path))]
+    pub(super) async fn try_mut<E, F>(
+        &self,
+        object_store: &impl ObjectStore,
+        f: F,
+    ) -> Result<Option<Result<E>>>
+    where
+        E: Debug,
+        F: Fn(&mut D) -> Result<E>,
+    {
+        const METHOD: &str = "with_mut";
+
+        let (outcome, dv) = {
+            let held = self.data_version.lock()?;
+            let mut dv = held.clone().unwrap_or_default();
+            let outcome = f(&mut dv.data);
+            (outcome, dv)
+        };
+
+        let payload = encoded(&dv.data)?;
+        let options = self.put_options(PutMode::from(&dv));
+        let put = object_store.put_opts(&self.path, payload, options).await;
+        noted(METHOD, &put);
+        match put {
+            Ok(written) => {
+                let version = Some(UpdateVersion {
+                    e_tag: written.e_tag,
+                    version: written.version,
+                });
+                let data = dv.data;
+                _ = self.guard()?.replace(DataVersion { data, version });
+                Ok(Some(outcome))
+            }
+
+            Err(
+                object_store::Error::Precondition { .. }
+                | object_store::Error::AlreadyExists { .. },
+            ) => Ok(None),
+
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// Replace the cached value with the object as stored, unconditionally: the
+    /// re-read after a conflict, which must not be answered from an etag memo
+    /// that still holds the version that just lost.
+    pub(super) async fn reload(&self, object_store: &impl ObjectStore) -> Result<()> {
+        self.get(object_store).await
     }
 
     /// Create the backing object iff it does not already exist
