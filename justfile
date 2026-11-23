@@ -1314,6 +1314,14 @@ fmt:
 # narration on the CRC's width; compaction counts superseded records in one
 # pass. More code went than comment, so the ceiling rises.
 #
+#   defork  -37 lines, the deflated batch's bodies rewritten  2813 -> 2802  2.6903 -> 2.6803
+#
+# `record/deflated.rs`'s production half (Popsink/data-plane#5885); its tests
+# follow separately. `FIXED_BATCH_LENGTH` lists its fields in a doc comment
+# instead of eleven `//` lines, one per field; the cited decisions (#253, #271,
+# #320) stay where they were. Comment went faster than code, so the ratio falls
+# and the ceiling follows it.
+#
 # The number lives here and nowhere else, unlike `coverage-ci`'s floor, which
 # `pr.yml` passes in: a second copy of a threshold this tight would mean `just
 # comments` on a laptop passing while CI fails.
@@ -1323,7 +1331,7 @@ fmt:
 # tracked, so neither can be counted.
 
 # Non-doc comment density per file and repo-wide, failing over ceiling%.
-comments ceiling="2.6904" top="12":
+comments ceiling="2.6804" top="12":
     #!/usr/bin/env bash
     set -euo pipefail
     # One awk over the whole list, deliberately not `| xargs awk`: xargs would
