@@ -139,6 +139,23 @@ every group pays on every backend.
 It also pays on S3, where the same per-member CAS was not a wall but a bill:
 #406 put consumer-group PUTs at 67% of the PUT spend.
 
+**The same wall, on `offsets.json`.** A group's committed offsets are one
+object (#406, #415), and every `OffsetCommit` was its own CAS of it. A large
+group's members auto-commit on the same interval, so their commits raced on
+that one key exactly as admissions had raced on `generation.json`:
+**sixteen members committing at once took 65.7 s, p50 39 s**, and three
+replicas serving 48 members took 147 s. That is past a client's 30 s
+`request.timeout.ms`: `commitSync` fails, and auto-commit falls behind with
+no bound.
+
+Fixed the same way, by batching. Within a replica one write of a group's
+offsets is in flight at a time, and the commits that arrive meanwhile are
+written together by the next one (`dynostore/commits.rs`). A burst of any
+size costs two writes: **~2.1 s for 16 members or for 128**, and 6.2 s for
+three replicas and 48 members, which still meet each other in the CAS.
+Measured in `tansu-storage/tests/offset_commit_cap.rs` over the same
+`InMemory` model, so it says nothing about request latency or a real `429`.
+
 Two things bounded the original problem honestly and are worth keeping in mind
 for the next one: it was per group, not fleet-wide (different groups write
 different objects), and the limiter is a **local delay**, so the cost was paid
