@@ -3597,7 +3597,8 @@ async fn documented_layout_decodes_a_segment_this_build_writes() -> Result<(), E
 }
 
 /// An `ObjectStore` that records the order in which segment objects are created
-/// and `segments/` prefixes listed, and fails every delete of keys under one
+/// — by a PUT, or by the copy of a staged merge (DEV-662) — and `segments/`
+/// prefixes listed, and fails every delete of keys under one
 /// chosen prefix — enough to observe the per-prefix maintenance driver's ordering
 /// and error isolation (#140). Everything else delegates to the inner store.
 #[derive(Clone)]
@@ -3723,6 +3724,9 @@ where
         to: &Path,
         opts: CopyOptions,
     ) -> Result<(), object_store::Error> {
+        if seg_seq_of(to).is_some() {
+            self.note(to);
+        }
         self.inner.copy_opts(from, to, opts).await
     }
 }

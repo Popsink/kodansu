@@ -26,6 +26,7 @@ mod compact_refusal;
 mod compact_segments;
 mod compacted_region_reads;
 mod compaction_cursor;
+mod compaction_race;
 mod conditional_put_probe;
 mod consumer_liveness;
 mod corrupt_region;

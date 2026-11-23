@@ -52,7 +52,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::{Debug, Display, Write as _};
 use std::num::NonZeroUsize;
 use std::str::FromStr as _;
-use std::sync::atomic::{self, AtomicU64};
+use std::sync::atomic::{self, AtomicBool, AtomicU64};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
@@ -64,7 +64,7 @@ use futures::StreamExt;
 use futures::stream::{BoxStream, TryStreamExt};
 use metadata::{Cache, key_class};
 use object_store::path::Path;
-use object_store::{Attribute, AttributeValue, Attributes, CopyOptions, DynObjectStore};
+use object_store::{Attribute, AttributeValue, Attributes, CopyMode, CopyOptions, DynObjectStore};
 use object_store::{GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta};
 use object_store::{ObjectStore, ObjectStoreExt, PutMode, PutMultipartOptions, PutOptions};
 use object_store::{PutPayload, PutResult, UpdateVersion};
@@ -226,6 +226,12 @@ pub struct DynoStore {
     prefix_flush_queues: Arc<Mutex<BTreeMap<String, PrefixFlushQueue>>>,
 
     object_store: Arc<DynObjectStore>,
+
+    /// Set once the store refuses a create-only copy (DEV-662): an `s3://`
+    /// bucket without `aws_copy_if_not_exists` has none. From then on a merged
+    /// segment is uploaded straight to its claimed name, as before, instead of
+    /// being staged and copied — see [`DynoStore::assign_and_create_segment`].
+    staged_create_unsupported: Arc<AtomicBool>,
 
     /// The same cache as `object_store`, typed, so a test can expire its etag
     /// memo instead of sleeping through the window (#167).
@@ -1686,6 +1692,7 @@ impl DynoStore {
             #[cfg(test)]
             metadata_etags: cache.clone(),
             object_store: cache,
+            staged_create_unsupported: Arc::new(AtomicBool::new(false)),
         }
     }
 
