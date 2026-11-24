@@ -190,6 +190,9 @@ async fn a_cold_build_racing_a_merge_serves_every_offset_once() -> Result<()> {
         prefix_compact_min_segments: Some(2),
         prefix_compact_keep_hot: Some(1),
         prefix_compact_target_bytes: Some(1 << 20),
+        // One merge to race the build, inside the reader's GET: a sweep that
+        // waits on produce would outlast the fetch it is racing (DEV-683).
+        maintenance_pass_budget: Some(Duration::ZERO),
         ..Default::default()
     });
 

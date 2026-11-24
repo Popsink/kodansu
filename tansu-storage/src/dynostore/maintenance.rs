@@ -66,9 +66,13 @@ impl DynoStore {
     /// with a per-process seed so N replicas sweep in independent orders, and for
     /// each prefix:
     ///
-    /// - **recency skip** — if the compaction lease shows it was maintained
-    ///   within `maintenance_recency`, a peer (or this replica) just did it, so
-    ///   skip without a `segments/` LIST or any work;
+    /// - **recency skip** — if the compaction lease shows *another* maintainer
+    ///   maintained it within `maintenance_recency`, that peer has it, so skip
+    ///   without a `segments/` LIST or any work. A lease this replica holds is
+    ///   never skipped (DEV-683): the window exists to keep peers off a prefix,
+    ///   and a prefix worked to the end of the last pass has its lease renewed
+    ///   — re-stamped — moments before this tick, so skipping our own made a
+    ///   lone maintainer claim only what its last pass had *not* worked;
     /// - **claim** — otherwise acquire the lease (which stamps `maintained_at_ms`
     ///   and caches the held term, so the two passes' inner acquires are free).
     ///   A win adds the prefix to the returned set; a fenced/lost claim means a
@@ -125,6 +129,7 @@ impl DynoStore {
         for prefix in prefixes {
             if recency_ms > 0
                 && let Some(lease) = self.read_compaction_lease(&prefix).await?
+                && lease.holder != self.identity.writer_id
                 && now_ms.saturating_sub(lease.maintained_at_ms) < recency_ms
             {
                 MAINTENANCE_PREFIXES.add(1, &[KeyValue::new("outcome", "recent")]);
@@ -176,6 +181,7 @@ impl DynoStore {
         owned: Option<&BTreeSet<String>>,
     ) -> Result<(u64, u64)> {
         let concurrency = self.tuning.prefix_maintenance_concurrency.max(1);
+        let deadline = tokio::time::Instant::now() + self.tuning.maintenance_pass_budget;
 
         let thresholds = self.segment_retention_thresholds(now_ms, owned).await?;
 
@@ -300,14 +306,14 @@ impl DynoStore {
         // (#399), instead of returning and idling out the rest of the interval.
         let (deleted, compacted) = outcomes;
         let swept = self
-            .sweep_backlogged_prefixes(&compactable, concurrency)
+            .sweep_backlogged_prefixes(&compactable, concurrency, deadline)
             .await;
 
         Ok((deleted, compacted + swept))
     }
 
     /// Drain the claimed prefixes that are *still* over the compaction trigger,
-    /// repeatedly, until the backlog stops shrinking (#399).
+    /// repeatedly, until `deadline` or until produce stops (#399, DEV-683).
     ///
     /// #140's acceptance was that the busiest prefixes converge toward
     /// `prefix_compact_min_segments` under sustained produce. Its four remedies
@@ -319,18 +325,41 @@ impl DynoStore {
     /// fires in a burst of 1–2 minutes per 10-minute window and then nothing:
     /// a 10–20 % duty cycle. They are not throughput-bound, they are unscheduled.
     ///
-    /// So the interval stops deciding how much work a tick does. The tick keeps
-    /// sweeping while there is a backlog it owns, and stops when a sweep merges
-    /// nothing — which means the prefix is waiting on produce, not on scheduling.
-    /// The outer bound stays where it was: the broker's bounded maintenance run
-    /// (#131) cancels a tick that overruns, and its in-flight guard stops a slow
-    /// tick from being joined by the next one.
+    /// So the interval stops deciding how much work a tick does: the tick keeps
+    /// sweeping while there is a backlog it owns. What ends it changed with
+    /// DEV-683, after merges started landing on a GCS bucket:
+    ///
+    /// - **A wall-clock deadline, not "a sweep merged nothing".** Under
+    ///   sustained produce every sweep merges something, so the pass outlived
+    ///   the interval, the broker skipped the next tick as still in flight, and
+    ///   the claim — which is what picks up a prefix the last pass did not hold —
+    ///   ran once every few intervals. The deadline is the pass budget, ~0.9× the
+    ///   interval, so the next tick always finds this pass finished. The broker's
+    ///   bounded run (#131) stays the outer bound for a pass that wedges.
+    /// - **The backlog is re-listed, not read from the cache.** A dedicated
+    ///   maintainer produces nothing, so its index only moves when compaction
+    ///   lists — and a prefix drained below the trigger was never listed again,
+    ///   so it dropped out of the pass while it regrew. Each round lists the
+    ///   prefixes still being watched (the incremental listing compaction itself
+    ///   uses) before choosing the backlog.
+    /// - **A round with nothing to merge waits for produce.** It used to end the
+    ///   pass, which left every prefix to grow unattended for the rest of the
+    ///   interval. A prefix stays watched while it is over the trigger or was
+    ///   produced to within the last two seconds, judged by its segments' append
+    ///   times rather than by whether a listing found something new: the round
+    ///   after a drain can list a hot prefix before its next segment lands.
+    ///   A backlogged prefix whose last drain merged nothing is not waited on
+    ///   either: its segments cannot form a run, and a listing will not change
+    ///   that, so it used to end the sweep and still does unless it is being
+    ///   produced to. Anything else is let go, so a quiet universe ends the pass
+    ///   at once and costs one listing per prefix per pass. Between rounds that merged
+    ///   nothing the sweep sleeps a sixty-fourth of the budget, at most a
+    ///   second, which bounds the listing rate on a prefix that is producing
+    ///   but not yet over the trigger.
     ///
     /// The claim is deliberately **not** re-taken between sweeps. It is already
-    /// held for these prefixes, re-reading every lease per sweep would be
-    /// O(prefixes) requests for nothing, and `maintenance_recency` (110 s in
-    /// production, against a 600 s interval) would skip this replica's own claim
-    /// back at it.
+    /// held for these prefixes, and re-reading every lease per sweep would be
+    /// O(prefixes) requests for nothing.
     ///
     /// Retention and the per-key pass are deliberately not repeated either. Both
     /// are once-per-tick work — retention is age-gated and the per-key pass GETs
@@ -340,47 +369,117 @@ impl DynoStore {
         &self,
         compactable: &BTreeSet<String>,
         concurrency: usize,
+        deadline: tokio::time::Instant,
     ) -> u64 {
-        /// Bounds the sweeps so one tick cannot become unbounded even if the
-        /// broker's run timeout were disabled. Each sweep that does nothing ends
-        /// the loop anyway, so this is a backstop, not a budget.
-        const MAX_SWEEPS: usize = 64;
+        /// How recently a prefix's newest segment must have been written for it
+        /// to count as produced to, and so stay in the sweep below the trigger
+        /// (DEV-683). Two seconds keeps any prefix producing more than one
+        /// segment every two seconds — 300 a 10-minute interval, about the 256
+        /// trigger — and lets a test that produced and then maintained finish
+        /// two seconds later.
+        const PRODUCING_WITHIN: Duration = Duration::from_secs(2);
 
+        let pause = (self.tuning.maintenance_pass_budget / 64).min(PRODUCING_WITHIN / 2);
+        let producing_within = PRODUCING_WITHIN.as_millis() as i64;
+
+        let mut watched = compactable.clone();
+        let mut stuck = BTreeSet::new();
         let mut compacted = 0;
 
-        for _ in 0..MAX_SWEEPS {
-            let backlogged = self.backlogged_prefixes(compactable);
-            if backlogged.is_empty() {
-                break;
-            }
-
-            let merged = futures::stream::iter(
-                backlogged
-                    .into_iter()
-                    .map(|prefix| async move { self.drain_compact_prefix(&prefix).await }),
-            )
+        while !watched.is_empty() && tokio::time::Instant::now() < deadline {
+            futures::stream::iter(watched.iter().cloned().map(|prefix| async move {
+                _ = self
+                    .refresh_prefix_index_forced(&prefix)
+                    .await
+                    .inspect_err(|err| warn!(?err, prefix, "listing a swept prefix"));
+            }))
             .buffer_unordered(concurrency)
-            .fold(0u64, |merged, n| async move { merged + n })
+            .collect::<()>()
             .await;
 
-            MAINTENANCE_SWEEPS.add(1, &[]);
+            let newest = self.newest_produced_ms(&watched);
+            let backlogged = self.backlogged_prefixes(&watched);
+            let now_ms = Self::now_ms();
+
+            watched.retain(|prefix| {
+                (backlogged.contains(prefix) && !stuck.contains(prefix))
+                    || newest
+                        .get(prefix)
+                        .is_some_and(|newest| now_ms.saturating_sub(*newest) < producing_within)
+            });
+
+            let merged = if backlogged.is_empty() {
+                0
+            } else {
+                MAINTENANCE_SWEEPS.add(1, &[]);
+                let drained: Vec<(String, u64)> =
+                    futures::stream::iter(backlogged.into_iter().map(|prefix| async move {
+                        let merged = self.drain_compact_prefix(&prefix).await;
+                        (prefix, merged)
+                    }))
+                    .buffer_unordered(concurrency)
+                    .collect()
+                    .await;
+
+                for (prefix, merged) in &drained {
+                    if *merged == 0 {
+                        _ = stuck.insert(prefix.clone());
+                    } else {
+                        _ = stuck.remove(prefix);
+                    }
+                }
+                drained.iter().map(|(_, merged)| merged).sum()
+            };
             compacted += merged;
 
-            // A sweep that merged nothing is a prefix waiting for produce, not
-            // for a tick. Sweeping again would re-list every backlogged prefix
-            // for the same answer.
-            if merged == 0 {
-                break;
+            if merged == 0 && !watched.is_empty() {
+                tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + pause)).await;
             }
         }
 
         compacted
     }
 
+    /// When each of `prefixes` was last produced to, as far as this process's
+    /// index knows: the newest append time among its most recent segments
+    /// (DEV-683).
+    ///
+    /// Compaction claims are left out, and a merged segment carries its
+    /// inputs' newest append time, so nothing this maintainer writes reads as
+    /// produce. Only the tail is looked at: produce lands there, and a prefix
+    /// holds tens of thousands of entries on the fleet.
+    fn newest_produced_ms(&self, prefixes: &BTreeSet<String>) -> BTreeMap<String, i64> {
+        /// Segments read back from the tail; a merge in flight puts one claim
+        /// and one merged segment there, so a handful is plenty.
+        const TAIL: usize = 16;
+
+        let Some(index) = self.prefixes.try_index() else {
+            return BTreeMap::new();
+        };
+
+        prefixes
+            .iter()
+            .filter_map(|prefix| {
+                index.get(prefix).and_then(|entry| {
+                    entry
+                        .segments
+                        .values()
+                        .rev()
+                        .filter(|cached| !Self::is_compaction_claim(&cached.footer))
+                        .take(TAIL)
+                        .map(|cached| cached.last_modified_ms)
+                        .max()
+                        .map(|newest| (prefix.clone(), newest))
+                })
+            })
+            .collect()
+    }
+
     /// The claimed prefixes whose cached live-segment count is still over the
     /// compaction trigger, largest first (#399).
     ///
-    /// Read from the in-memory index this process already holds — no request —
+    /// Read from the in-memory index this process already holds — no request,
+    /// so [`Self::sweep_backlogged_prefixes`] lists the prefixes first (DEV-683) —
     /// and gated on the same `min_segments` + `keep_hot` arithmetic
     /// `compact_prefix_segments` selects a run under, so a prefix that cannot
     /// yield a run is never swept for one.

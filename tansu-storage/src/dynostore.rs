@@ -797,6 +797,10 @@ pub struct CoalesceTuning {
     pub prefix_maintenance_concurrency: Option<usize>,
     /// Maintenance recency window (#126); set to ~0.9× `maintenance_interval`.
     pub maintenance_recency: Option<Duration>,
+    /// Wall clock one maintenance pass may spend sweeping its backlog
+    /// (DEV-683); set to ~0.9× `maintenance_interval`. See
+    /// [`DynoStore::MAINTENANCE_PASS_BUDGET`].
+    pub maintenance_pass_budget: Option<Duration>,
     /// Wall-clock budget for the leaseless flush's conflict-correction loop
     /// (#192). Hard-coded at 10s before that issue, which is too small to admit
     /// a useful number of attempts once one attempt costs seconds.
@@ -1951,6 +1955,13 @@ impl DynoStore {
     /// maintained ~once per interval. Override with `maintenance_recency` to
     /// match a non-default interval.
     const MAINTENANCE_RECENCY: Duration = Duration::from_secs(9 * 60);
+
+    /// Default wall clock a maintenance pass sweeps its backlog for (DEV-683):
+    /// ~0.9× the default `maintenance_interval`, so a pass yields before the
+    /// next tick and that tick re-claims the whole universe instead of being
+    /// skipped as still in flight. The broker sets it from its own interval
+    /// unless the storage URL names one.
+    const MAINTENANCE_PASS_BUDGET: Duration = Duration::from_secs(9 * 60);
 
     /// Default wall-clock budget for the leaseless flush loop (#157/#192).
     ///

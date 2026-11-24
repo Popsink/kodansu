@@ -190,6 +190,11 @@ pub(super) struct Tuning {
     /// works every prefix — the single-maintainer default behaviour).
     pub(super) maintenance_recency: Duration,
 
+    /// Wall clock one maintenance pass may spend on its backlog sweep
+    /// (DEV-683), measured from the start of the per-prefix work. `0` skips the
+    /// sweep, leaving the one drain per prefix the pass starts with.
+    pub(super) maintenance_pass_budget: Duration,
+
     /// Wall-clock budget for the leaseless prefix flush's conflict-correction
     /// loop (#157/#192). The loop yields to a competing writer rather than
     /// amplifying LIST+PUT against a contended prefix — but only once it has
@@ -232,6 +237,7 @@ impl Tuning {
             prefix_compact_seen_keys,
             prefix_maintenance_concurrency,
             maintenance_recency,
+            maintenance_pass_budget,
             flush_max_elapsed,
             watermark_hint_ttl,
             segment_format_version,
@@ -260,6 +266,7 @@ impl Tuning {
             prefix_compact_seen_keys,
             prefix_maintenance_concurrency,
             maintenance_recency,
+            maintenance_pass_budget,
             flush_max_elapsed,
             watermark_hint_ttl,
             segment_format_version,
@@ -292,6 +299,7 @@ impl Tuning {
             prefix_compact_seen_keys: DynoStore::PREFIX_COMPACT_SEEN_KEYS,
             prefix_maintenance_concurrency: DynoStore::PREFIX_MAINTENANCE_CONCURRENCY,
             maintenance_recency: DynoStore::MAINTENANCE_RECENCY,
+            maintenance_pass_budget: DynoStore::MAINTENANCE_PASS_BUDGET,
             flush_max_elapsed: DynoStore::FLUSH_MAX_ELAPSED,
             object_write_interval: None,
         }

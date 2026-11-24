@@ -409,7 +409,7 @@ async fn drain(
     let floor_before = counts.floor_put.load(Ordering::Relaxed);
     let started = Instant::now();
     let merged = maintainer
-        .sweep_backlogged_prefixes(&prefixes, concurrency)
+        .sweep_backlogged_prefixes(&prefixes, concurrency, started + Duration::from_mins(30))
         .await;
     let elapsed = started.elapsed();
     let after = counts.snapshot();
