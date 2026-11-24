@@ -98,6 +98,15 @@ fn is_segment_create(location: &Path, options: &PutOptions) -> bool {
     options.mode == PutMode::Create && location.as_ref().ends_with(".seg")
 }
 
+/// Whether `payload` is the empty claim a merged segment is created behind
+/// (DEV-662). The faults here are the merged segment's, so a claim goes through.
+fn is_claim(payload: &PutPayload) -> bool {
+    DynoStore::decode_segment_footer(&Bytes::from(payload.clone()))
+        .ok()
+        .flatten()
+        .is_some_and(|footer| footer.entries.is_empty())
+}
+
 /// A merged segment's create is a copy of its staged payload (DEV-662), so the
 /// same faults are injected there.
 fn is_segment_copy(to: &Path, options: &CopyOptions) -> bool {
@@ -112,7 +121,7 @@ impl ObjectStore for AmbiguousSegmentCreates {
         payload: PutPayload,
         options: PutOptions,
     ) -> Result<PutResult, object_store::Error> {
-        if !is_segment_create(location, &options) {
+        if !is_segment_create(location, &options) || is_claim(&payload) {
             return self.inner.put_opts(location, payload, options).await;
         }
 
@@ -235,7 +244,7 @@ impl ObjectStore for FailedSegmentCreates {
         payload: PutPayload,
         options: PutOptions,
     ) -> Result<PutResult, object_store::Error> {
-        if is_segment_create(location, &options) {
+        if is_segment_create(location, &options) && !is_claim(&payload) {
             _ = self.attempts.fetch_add(1, Ordering::SeqCst);
             return Err(AmbiguousSegmentCreates::lost_response());
         }
@@ -346,7 +355,10 @@ async fn an_ambiguous_create_that_landed_is_adopted_via_its_nonce() -> Result<()
         .assign_and_create_segment(PREFIX, payload, nonce, SegmentCreateRole::Compaction)
         .await?;
 
-    assert_eq!(0, seq, "the ambiguous create won sequence 0");
+    assert_eq!(
+        1, seq,
+        "the ambiguous create won sequence 1, behind its claim"
+    );
     assert_eq!(
         1,
         attempts.load(Ordering::SeqCst),
@@ -357,7 +369,7 @@ async fn an_ambiguous_create_that_landed_is_adopted_via_its_nonce() -> Result<()
     assert!(
         storage
             .object_store
-            .head(&storage.segment_location(PREFIX, 0))
+            .head(&storage.segment_location(PREFIX, 1))
             .await
             .is_ok()
     );
@@ -399,7 +411,10 @@ async fn an_ambiguous_create_lost_to_a_peer_claims_the_next_sequence() -> Result
         .assign_and_create_segment(PREFIX, payload, nonce, SegmentCreateRole::Compaction)
         .await?;
 
-    assert_eq!(1, seq, "the peer holds 0, so the resync claims 1");
+    assert_eq!(
+        2, seq,
+        "the peer holds 0, so the claim takes 1 and the merged segment 2"
+    );
 
     Ok(())
 }
@@ -458,10 +473,11 @@ async fn a_create_never_targets_a_sequence_at_or_below_the_persisted_floor() -> 
     let storage = DynoStore::new(CLUSTER, NODE, bucket.clone());
     let peer = DynoStore::new(CLUSTER, NODE, bucket.clone());
 
-    // This replica wins 0, 1, 2, so its hint sits at 3.
+    // This replica creates three merged segments, each behind its claim
+    // (DEV-662), so it holds 0..=5 and its hint sits at 6.
     for nonce in 0..3u64 {
         assert_eq!(
-            nonce,
+            2 * nonce + 1,
             storage
                 .assign_and_create_segment(
                     PREFIX,
@@ -472,12 +488,12 @@ async fn a_create_never_targets_a_sequence_at_or_below_the_persisted_floor() -> 
                 .await?
         );
     }
-    assert_eq!(Some(3), storage.cached_seq(PREFIX)?);
+    assert_eq!(Some(6), storage.cached_seq(PREFIX)?);
 
-    // A peer carries the prefix on to 5, which this replica never observes.
+    // A peer carries the prefix on to 11, which this replica never observes.
     for nonce in 3..6u64 {
         assert_eq!(
-            nonce,
+            2 * nonce + 1,
             peer.assign_and_create_segment(
                 PREFIX,
                 merged(&peer, nonce)?,
@@ -489,13 +505,14 @@ async fn a_create_never_targets_a_sequence_at_or_below_the_persisted_floor() -> 
     }
 
     // The peer then merges the whole run away: floor write-ahead of the delete,
-    // so 0..=5 are unoccupied names above which nothing may be created.
-    assert_eq!(6, peer.retire_segments(PREFIX, &[0, 1, 2, 3, 4, 5]).await?);
-    assert_eq!(6, storage.read_seq_floor(PREFIX).await?);
+    // so 0..=11 are unoccupied names above which nothing may be created.
+    let run = (0..12).collect::<Vec<u64>>();
+    assert_eq!(12, peer.retire_segments(PREFIX, &run).await?);
+    assert_eq!(12, storage.read_seq_floor(PREFIX).await?);
 
     // The hint is unmoved and now points *into* the freed range — the state the
     // fleet was in.
-    assert_eq!(Some(3), storage.cached_seq(PREFIX)?);
+    assert_eq!(Some(6), storage.cached_seq(PREFIX)?);
 
     let seq = storage
         .assign_and_create_segment(
@@ -507,7 +524,7 @@ async fn a_create_never_targets_a_sequence_at_or_below_the_persisted_floor() -> 
         .await?;
 
     assert_eq!(
-        6, seq,
+        13, seq,
         "a create must land above the floor, not reuse the freed name its hint names"
     );
 
@@ -515,10 +532,10 @@ async fn a_create_never_targets_a_sequence_at_or_below_the_persisted_floor() -> 
     // for it can alias onto a new object.
     assert!(
         bucket
-            .head(&storage.segment_location(PREFIX, 3))
+            .head(&storage.segment_location(PREFIX, 6))
             .await
             .is_err(),
-        "sequence 3 was freed and must stay free"
+        "sequence 6 was freed and must stay free"
     );
 
     Ok(())
@@ -555,7 +572,7 @@ async fn a_peers_raise_is_respected_even_when_this_process_certified_an_older_fl
             )
             .await?;
     }
-    assert_eq!(Some(3), storage.cached_seq(PREFIX)?);
+    assert_eq!(Some(6), storage.cached_seq(PREFIX)?);
 
     // Certify this process's view of the floor at its current value. Nothing
     // after this lists or prunes on this replica, so nothing invalidates it.
@@ -563,7 +580,7 @@ async fn a_peers_raise_is_respected_even_when_this_process_certified_an_older_fl
     assert_eq!(Some(0), storage.cached_certified_seq_floor(PREFIX)?);
 
     // The peer carries the prefix past this replica's hint and then retires the
-    // whole run, raising the floor to 5.
+    // whole run, raising the floor to 10.
     for nonce in 3..5u64 {
         _ = peer
             .assign_and_create_segment(
@@ -574,12 +591,13 @@ async fn a_peers_raise_is_respected_even_when_this_process_certified_an_older_fl
             )
             .await?;
     }
-    assert_eq!(5, peer.retire_segments(PREFIX, &[0, 1, 2, 3, 4]).await?);
+    let run = (0..10).collect::<Vec<u64>>();
+    assert_eq!(10, peer.retire_segments(PREFIX, &run).await?);
 
     // The stale certification survives the peer's raise — which is exactly why
     // the create cannot be built on it.
     assert_eq!(Some(0), storage.cached_certified_seq_floor(PREFIX)?);
-    assert_eq!(5, storage.read_seq_floor(PREFIX).await?);
+    assert_eq!(10, storage.read_seq_floor(PREFIX).await?);
 
     let seq = storage
         .assign_and_create_segment(
@@ -591,7 +609,7 @@ async fn a_peers_raise_is_respected_even_when_this_process_certified_an_older_fl
         .await?;
 
     assert_eq!(
-        5, seq,
+        11, seq,
         "a create must respect a peer's raise, not this process's certification"
     );
 
@@ -698,7 +716,7 @@ async fn a_store_without_a_create_only_copy_falls_back_to_the_direct_upload() ->
 
     for nonce in 0..2u64 {
         assert_eq!(
-            nonce,
+            2 * nonce + 1,
             storage
                 .assign_and_create_segment(
                     PREFIX,

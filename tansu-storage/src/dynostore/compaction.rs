@@ -747,7 +747,16 @@ impl DynoStore {
         // superseded no merged seq is written (`new_seq == None`) and deleting
         // the run *can* lower the listing max — freeing a run name for reuse
         // without the floor.
-        _ = self.retire_segments(prefix, &run).await?;
+        //
+        // The merged segment's claim goes with the run (DEV-662): left behind,
+        // every merge would add a segment, and a prefix could never drain below
+        // two.
+        let retired: Vec<u64> = run
+            .iter()
+            .copied()
+            .chain(new_seq.map(Self::claim_of))
+            .collect();
+        _ = self.retire_segments(prefix, &retired).await?;
 
         SEGMENT_COMPACTIONS.add(run.len() as u64, &[]);
         debug!(
@@ -1297,6 +1306,7 @@ impl DynoStore {
         // tie-break makes the rewrite win during the write→delete window,
         // exactly as for a #66 merge. `index_insert` keeps the original append
         // time so `compact,delete` retention is not reset by the rewrite.
+        let mut claims = Vec::with_capacity(dirty.len());
         for seq in &dirty {
             let Some(substreams) = outputs.remove(seq) else {
                 continue;
@@ -1315,11 +1325,12 @@ impl DynoStore {
                 .assign_and_create_segment(prefix, payload, nonce, SegmentCreateRole::Compaction)
                 .await?;
             self.index_insert(prefix, new_seq, footer, last_modified)?;
+            claims.push(Self::claim_of(new_seq));
         }
 
-        // Retire the rewritten seqs: floor before delete, then prune (#77) — see
-        // [`Self::retire_segments`].
-        let retired: Vec<u64> = dirty.iter().copied().collect();
+        // Retire the rewritten seqs and their claims (DEV-662): floor before
+        // delete, then prune (#77) — see [`Self::retire_segments`].
+        let retired: Vec<u64> = dirty.iter().copied().chain(claims).collect();
         _ = self.retire_segments(prefix, &retired).await?;
 
         SEGMENT_RECORDS_COMPACTED.add(removed_total, &[]);
@@ -1487,10 +1498,20 @@ impl DynoStore {
         /// above and the broker's maintenance run timeout (#131).
         const MAX_RETRIES_PER_PREFIX: usize = 1_024;
 
+        /// Merges one call makes before handing its slot to the next prefix
+        /// (DEV-662). A prefix under sustained produce never reports `Drained`:
+        /// each run merges what arrived during the last one. Once merges
+        /// started landing on the GCS bucket, the first four prefixes kept all
+        /// of the sweep's slots for the whole tick and the other three were
+        /// never compacted. Sliced, [`Self::sweep_backlogged_prefixes`] comes
+        /// back to every backlogged prefix, largest first.
+        const MAX_MERGES_PER_SLICE: usize = 32;
+
         self.sweep_staged(prefix).await;
 
         let mut compacted = 0;
         let mut retries = 0usize;
+        let mut merges = 0usize;
         let mut reason = "runs";
 
         for _ in 0..MAX_RUNS_PER_PREFIX {
@@ -1505,7 +1526,14 @@ impl DynoStore {
             );
 
             match outcome {
-                Ok(CompactRun::Merged(n)) => compacted += n,
+                Ok(CompactRun::Merged(n)) => {
+                    compacted += n;
+                    merges += 1;
+                    if merges >= MAX_MERGES_PER_SLICE {
+                        reason = "slice";
+                        break;
+                    }
+                }
 
                 Ok(CompactRun::Drained) => {
                     reason = "drained";

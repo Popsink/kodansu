@@ -736,6 +736,12 @@ enum SegmentCreateRole {
     /// a segment out of band: the produce path goes through the leaseless
     /// arbiter (#86), which resyncs on conflict and has no lease to fence.
     Compaction,
+
+    /// The zero-entry claim a compactor wins at the tail before its merged
+    /// segment (DEV-662): see [`DynoStore::assign_and_create_segment`]. Its
+    /// conflicts are the race compaction still runs against producers; the
+    /// merged segment's own, under `Compaction`, should be close to none.
+    CompactionClaim,
 }
 
 /// What a create-only segment PUT actually achieved, once an *ambiguous* result
@@ -1948,6 +1954,28 @@ impl DynoStore {
     /// restart the whole connector. Three attempts is enough to distinguish
     /// "losing a race" from "one slow PUT" while still bounding the work.
     const MIN_FLUSH_ATTEMPTS: usize = 3;
+
+    /// How long a compaction claim at the tail holds producers off its
+    /// successor (DEV-662), measured from the claim's append time, and the most
+    /// one flush waits on claims in all.
+    ///
+    /// The merged segment follows its claim by one server-side copy — ~90 ms on
+    /// the DEV-662 GCS bucket — or, on a store without a create-only copy, one
+    /// upload of the merged payload. Two seconds covers a 16 MiB upload with
+    /// room to spare, and bounds what a compactor that died between the two
+    /// creates costs: one produce stalled once, never a wedged prefix.
+    const COMPACTION_CLAIM_TTL: Duration = Duration::from_secs(2);
+
+    /// How often a flush yielding to a compaction claim looks for the merged
+    /// segment behind it: one tail probe per poll, so a quarter of a copy.
+    const COMPACTION_CLAIM_POLL: Duration = Duration::from_millis(25);
+
+    /// The `writer_epoch` of a compaction claim (DEV-662). No producer or
+    /// compactor stamps a negative epoch — the leaseless era starts at 1 and
+    /// every rewrite clamps at 0 — so a zero-entry segment carrying this is a
+    /// claim and nothing else, including the zero-entry rewrite the per-key
+    /// pass can leave.
+    const COMPACTION_CLAIM_EPOCH: i64 = -1;
 
     /// Default cap on the per-key pass's `seen` key set per partition (#175).
     /// Far above any real compacted topic here (connector config/status/offsets

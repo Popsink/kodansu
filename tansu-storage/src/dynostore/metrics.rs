@@ -455,7 +455,9 @@ pub(super) static SEGMENT_COMPACT_RUNS: LazyLock<Counter<u64>> = LazyLock::new(|
 });
 
 /// Why a prefix's drain stopped, by `reason` (#399): `drained`, `runs`,
-/// `retries`, `error`.
+/// `retries`, `error`, and `slice` when it handed its slot to the next prefix
+/// after its share of merges (DEV-662) — the steady state of a prefix under
+/// sustained produce.
 ///
 /// "Does a drain that starts on a 15 000-segment prefix finish it?" was
 /// unanswerable: the drain logged nothing on the way out, so a prefix that
@@ -558,6 +560,18 @@ pub(super) static SEGMENT_CREATE_BYTES_REWRITTEN: LazyLock<Counter<u64>> = LazyL
     METER
         .u64_counter("tansu_prefix_segment_create_bytes_rewritten")
         .with_description("payload bytes re-uploaded after losing a segment create-CAS")
+        .build()
+});
+
+/// Leaseless flushes that waited on a compaction claim at the tail (DEV-662),
+/// by `outcome`: `released` when the merged segment landed behind it, `expired`
+/// when the flush's wait budget ran out first. A steady `expired` rate is a
+/// compactor that claims and then does not create, and it costs produce
+/// latency.
+pub(super) static FLUSH_COMPACTION_YIELDS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("tansu_prefix_flush_compaction_yields")
+        .with_description("leaseless flushes that waited on a compaction claim, by outcome")
         .build()
 });
 

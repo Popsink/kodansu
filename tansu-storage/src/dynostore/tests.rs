@@ -25,6 +25,7 @@ mod azure_suffix;
 mod compact_refusal;
 mod compact_segments;
 mod compacted_region_reads;
+mod compaction_claim;
 mod compaction_cursor;
 mod compaction_race;
 mod conditional_put_probe;

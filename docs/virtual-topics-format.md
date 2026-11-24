@@ -202,6 +202,13 @@ them, but the writer regimes stamp it differently:
   version regardless of the versions of the segments it merged — so a v4 writer
   compacting v3 inputs emits v4, with the nil uuid on every name-keyed entry it
   carried forward.
+- **compaction claim (DEV-662):** before each merged segment, the compactor
+  creates a segment with **no entries** (`entry_count = 0`) and
+  `writer_epoch = -1` at the tail, and the merged segment at the sequence right
+  after it. A claim holds no offsets, so a reader decodes its footer and finds
+  nothing to serve; a later merge or retention deletes it like any segment.
+  Brokers recognise it by exactly that pair and briefly hold their own
+  creates off the next sequence. Nothing else writes a negative epoch.
 - **lease mode (#59) — historical, v1 segments only:** the epoch of the lease the
   writer held, `0` if none. No current writer emits v1; this is here to read
   segments written before `0.7.0-beta.25`.

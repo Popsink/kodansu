@@ -201,7 +201,8 @@ async fn ghost_originals_are_dropped_not_clipped_against_a_capped_merge() -> Res
     broker.refresh_prefix_index_forced(PREFIX).await?;
 
     let substream = Substream::Name(TOPIC.into());
-    let merged = ORIGINALS;
+    // Behind its claim, which took the first free name (DEV-662).
+    let merged = ORIGINALS + 1;
 
     let fenced = broker.valid_substream_segments(PREFIX, &substream, 0)?;
     assert_eq!(
