@@ -38,7 +38,8 @@ use bytes::Bytes;
 use futures::{StreamExt as _, TryStreamExt as _, stream::BoxStream};
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory, path::Path,
+    ObjectStoreExt as _, PutMultipartOptions, PutOptions, PutPayload, PutResult, memory::InMemory,
+    path::Path,
 };
 use tansu_sans_io::{
     create_topics_request::CreatableTopic,
@@ -80,6 +81,7 @@ struct Counts {
     delete: AtomicU64,
     getting: AtomicU64,
     most_getting: AtomicU64,
+    floor_put: AtomicU64,
 }
 
 impl Counts {
@@ -144,6 +146,9 @@ impl ObjectStore for Bucket {
         options: PutOptions,
     ) -> Result<PutResult, object_store::Error> {
         _ = self.counts.put.fetch_add(1, Ordering::Relaxed);
+        if location.filename() == Some("seq-floor.json") {
+            _ = self.counts.floor_put.fetch_add(1, Ordering::Relaxed);
+        }
         sleep(PUT + transfer(payload.content_length())).await;
         self.inner.put_opts(location, payload, options).await
     }
@@ -287,25 +292,84 @@ async fn backlog(bucket: &InMemory, prefixes: usize, backlog: usize) -> Result<(
     Ok(())
 }
 
+/// How many segments `prefix` holds, having checked its sequence floor
+/// against them: every name freed below the highest live one is under the
+/// floor, so none can be handed out again (#77), and the floor is no further
+/// ahead than the next name (DEV-675).
 async fn live(bucket: &InMemory, prefix: &str) -> Result<usize> {
-    Ok(bucket
+    let seqs: BTreeSet<u64> = bucket
         .list(Some(&Path::from(format!(
             "clusters/{CLUSTER}/prefixes/{prefix}/segments/"
         ))))
         .try_collect::<Vec<_>>()
         .await?
-        .len())
+        .iter()
+        .filter_map(|meta| meta.location.filename()?.get(..20)?.parse().ok())
+        .collect();
+
+    let floor = match bucket
+        .get(&Path::from(format!(
+            "clusters/{CLUSTER}/prefixes/{prefix}/seq-floor.json"
+        )))
+        .await
+    {
+        Ok(result) => {
+            serde_json::from_slice::<serde_json::Value>(&result.bytes().await?)?["next_seq_floor"]
+                .as_u64()
+                .unwrap_or_default()
+        }
+        Err(object_store::Error::NotFound { .. }) => 0,
+        Err(error) => return Err(error.into()),
+    };
+
+    let freed = seqs
+        .last()
+        .and_then(|max| (0..*max).rev().find(|seq| !seqs.contains(seq)));
+
+    assert!(
+        freed.is_none_or(|freed| freed < floor),
+        "{prefix}: {freed:?} was freed under a seq floor of {floor}"
+    );
+
+    // The tail is never merged (`keep_hot`), so the highest live name is the
+    // highest ever created: a floor past it + 1 would make writers skip names.
+    assert!(
+        seqs.last().is_none_or(|max| floor <= max + 1),
+        "{prefix}: seq floor {floor} is ahead of the tail {:?}",
+        seqs.last()
+    );
+
+    Ok(seqs.len())
 }
 
-/// What draining `prefixes` backlogs of `segments` each did: segments merged
-/// per second, and the most GETs that were ever in flight at once.
+/// What draining a backlog did.
+#[derive(Clone, Copy, Debug)]
+struct Drained {
+    /// Segments merged per second.
+    rate: f64,
+
+    /// Segments merged away, over every prefix.
+    merged: u64,
+
+    /// Writes of `seq-floor.json`, over every prefix.
+    floor_puts: u64,
+
+    /// The most GETs that were ever in flight at once.
+    most_getting: u64,
+
+    /// The most live segments any prefix was left with.
+    most_remaining: usize,
+}
+
+/// Drain `prefixes` backlogs of `segments` each, merging runs of `run`
+/// segments into a target of `run` segments plus `slack` bytes.
 async fn drain(
     prefixes: usize,
     segments: usize,
     concurrency: usize,
-    run: usize,
+    (run, slack): (usize, usize),
     paced: bool,
-) -> Result<(f64, u64)> {
+) -> Result<Drained> {
     let bucket = InMemory::new();
     backlog(&bucket, prefixes, segments).await?;
 
@@ -331,7 +395,7 @@ async fn drain(
     .coalesce_tuning(CoalesceTuning {
         prefix_compact_min_segments: Some(MIN_SEGMENTS),
         prefix_compact_keep_hot: Some(1),
-        prefix_compact_target_bytes: Some(run * SEGMENT_BYTES),
+        prefix_compact_target_bytes: Some(run * SEGMENT_BYTES + slack),
         ..Default::default()
     });
 
@@ -342,12 +406,14 @@ async fn drain(
 
     counts.most_getting.store(0, Ordering::Relaxed);
     let before = counts.snapshot();
+    let floor_before = counts.floor_put.load(Ordering::Relaxed);
     let started = Instant::now();
     let merged = maintainer
         .sweep_backlogged_prefixes(&prefixes, concurrency)
         .await;
     let elapsed = started.elapsed();
     let after = counts.snapshot();
+    let floor_puts = counts.floor_put.load(Ordering::Relaxed) - floor_before;
 
     let mut remaining = Vec::new();
     for prefix in &prefixes {
@@ -360,7 +426,8 @@ async fn drain(
 
     eprintln!(
         "paced={paced} concurrency={concurrency} run={run} merged={merged} elapsed={elapsed:?} rate={rate:.1}/s \
-         per ~run: get={:.1} put={:.1} copy={:.1} list={:.1} delete={:.1} remaining={remaining:?}",
+         floor_puts={floor_puts} per ~run: get={:.1} put={:.1} copy={:.1} list={:.1} delete={:.1} \
+         remaining={remaining:?}",
         per_run(0),
         per_run(1),
         per_run(2),
@@ -368,7 +435,13 @@ async fn drain(
         per_run(4),
     );
 
-    Ok((rate, counts.most_getting.load(Ordering::Relaxed)))
+    Ok(Drained {
+        rate,
+        merged,
+        floor_puts,
+        most_getting: counts.most_getting.load(Ordering::Relaxed),
+        most_remaining: remaining.into_iter().max().unwrap_or_default(),
+    })
 }
 
 /// A merge reads its run's segments concurrently: one GET at a time made the
@@ -377,12 +450,84 @@ async fn drain(
 async fn merge_reads_its_run_concurrently() -> Result<()> {
     let _guard = init_tracing()?;
 
-    let (rate, most_getting) = drain(1, 48, 1, 22, false).await?;
+    let drained = drain(1, 48, 1, (22, 0), false).await?;
 
-    assert!(rate > 0.0);
+    assert!(drained.rate > 0.0);
     assert!(
-        most_getting >= 8,
-        "{most_getting} GETs in flight at most, merging runs of 22 one prefix at a time"
+        drained.most_getting >= 8,
+        "{} GETs in flight at most, merging runs of 22 one prefix at a time",
+        drained.most_getting
+    );
+
+    Ok(())
+}
+
+/// A backlog pass moves the sequence floor a couple of times, not once per
+/// merge (DEV-675): `gs://` paces `seq-floor.json` at one write a second, so a
+/// write per merge capped every prefix at one merge a second.
+#[tokio::test]
+async fn seq_floor_moves_once_per_pass_not_per_merge() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    const BACKLOG: usize = 240;
+    const RUN: usize = 22;
+
+    let drained = drain(1, BACKLOG, 1, (RUN, 0), false).await?;
+    let merges = drained.merged / RUN as u64;
+
+    assert!(
+        merges >= 10,
+        "{merges} merges of {BACKLOG} segments in runs of {RUN}"
+    );
+    assert!(
+        drained.floor_puts <= 2,
+        "{} seq-floor.json writes for {merges} merges",
+        drained.floor_puts
+    );
+    assert!(
+        drained.most_remaining <= MIN_SEGMENTS,
+        "{} segments left, claims included",
+        drained.most_remaining
+    );
+
+    Ok(())
+}
+
+/// A merge's claim stays behind it until the floor covers it, and must never
+/// be selected into a run (DEV-675).
+///
+/// A target with room for a merged segment and an empty claim, but not for a
+/// merged segment and one more producer segment, is the shape that undid the
+/// naive version: every run was a merged segment and the claim behind it, two
+/// in, a merged segment and a new claim out, until the drain ran out of runs.
+/// On the bucket that was 30 191 segments "merged" out of 1 680.
+#[tokio::test]
+async fn claims_left_behind_are_never_merged() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    const BACKLOG: usize = 120;
+    const RUN: usize = 6;
+
+    // Bounded: the naive version does not fail, it spins until the drain's
+    // own bounds stop it, minutes later.
+    let drained = tokio::time::timeout(
+        Duration::from_secs(60),
+        drain(1, BACKLOG, 1, (RUN, SEGMENT_BYTES / 2), false),
+    )
+    .await
+    .expect("the drain re-merged claims without end")?;
+
+    assert!(
+        drained.merged <= BACKLOG as u64,
+        "{} segments merged out of a backlog of {BACKLOG}",
+        drained.merged
+    );
+    // Each merged segment is too big to take a neighbour, so it is all that
+    // is left: one per run, and no claim beside it.
+    assert!(
+        drained.most_remaining <= BACKLOG / RUN,
+        "{} segments left, claims included",
+        drained.most_remaining
     );
 
     Ok(())
@@ -390,16 +535,48 @@ async fn merge_reads_its_run_concurrently() -> Result<()> {
 
 /// Seven backlogged prefixes, the shape of the bucket validation, at the
 /// default concurrency, one slot per prefix, and twice the run length — then
-/// again with `gs://`'s one write per object per second, which every merge
-/// meets at its prefix's sequence floor.
+/// again with `gs://`'s one write per object per second. Before DEV-675 every
+/// merge met that pacing at its prefix's sequence floor, so a slot took ~1.2 s
+/// per merge paced against ~0.1 s unpaced.
 #[tokio::test]
 #[ignore = "a measurement, not a check, and untraced: its debug log outgrows the disk (DEV-662)"]
 async fn merge_throughput_against_bucket_latencies() -> Result<()> {
     for paced in [false, true] {
         for (concurrency, run) in [(4, 22), (8, 22), (4, 44)] {
-            _ = drain(7, 240, concurrency, run, paced).await?;
+            _ = drain(7, 240, concurrency, (run, 0), paced).await?;
         }
     }
+
+    Ok(())
+}
+
+/// One slot's merges are no longer floored at a second each under `gs://`'s
+/// pacing (DEV-675): paced, a backlog drains about as fast as unpaced.
+#[tokio::test]
+async fn paced_merges_are_not_floored_at_a_second() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    const BACKLOG: usize = 160;
+    const RUN: usize = 22;
+
+    let unpaced = drain(1, BACKLOG, 1, (RUN, 0), false).await?;
+    let paced = drain(1, BACKLOG, 1, (RUN, 0), true).await?;
+
+    let merges = paced.merged / RUN as u64;
+    let per_merge = paced.merged as f64 / paced.rate / merges as f64;
+
+    assert!(
+        per_merge < 0.6,
+        "{per_merge:.2}s per paced merge over {merges} merges, {:.1}/s unpaced against {:.1}/s paced",
+        unpaced.rate,
+        paced.rate
+    );
+    assert!(
+        paced.rate * 2.0 > unpaced.rate,
+        "{:.1}/s paced against {:.1}/s unpaced",
+        paced.rate,
+        unpaced.rate
+    );
 
     Ok(())
 }

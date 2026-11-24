@@ -4257,7 +4257,7 @@ async fn tail_probe_defers_to_a_listing_when_the_floor_is_ahead() -> Result<(), 
     assert_eq!(baseline, lists.load(Relaxed));
 
     // A drain elsewhere raised the floor past the tail: absence is no longer proof.
-    store.raise_seq_floor(PREFIX, 9).await?;
+    _ = store.raise_seq_floor(PREFIX, 9, 9).await?;
     store.refresh_prefix_index_forced(PREFIX).await?;
     assert_eq!(
         baseline + 1,

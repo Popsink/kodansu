@@ -1169,7 +1169,7 @@ async fn coalesced_latest_survives_peer_expiry_via_floor_certification() -> Resu
             Ok(())
         })
         .await?;
-    storage.raise_seq_floor(&prefix, 1_000).await?;
+    _ = storage.raise_seq_floor(&prefix, 1_000, 1_000).await?;
 
     // The floor rise invalidates the cached watermark: the next stale-hint
     // read re-GETs `watermark.json` once and reports the peer-acked high —
@@ -1372,7 +1372,7 @@ async fn segmentless_substream_stale_hint_latest_costs_no_per_partition_get() ->
             Ok(())
         })
         .await?;
-    storage.raise_seq_floor(&prefix, 1_000).await?;
+    _ = storage.raise_seq_floor(&prefix, 1_000, 1_000).await?;
     age(&storage);
     assert_eq!(
         100,

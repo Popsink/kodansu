@@ -30,9 +30,10 @@
 
 use std::{
     fmt::{self, Debug, Display},
+    num::NonZeroU32,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -52,7 +53,7 @@ use tansu_sans_io::{
 use tokio::time::{Instant, sleep};
 
 use crate::{
-    LogStorage as _, MetadataStorage as _, Result, Topition,
+    LogStorage as _, MetadataStorage as _, PutRateLimiter, Result, Topition,
     dynostore::{CoalesceTuning, CompactRun, DynoStore, tests::init_tracing},
 };
 
@@ -86,6 +87,7 @@ const TARGET_BYTES: usize = 64 << 10;
 #[derive(Clone)]
 struct RoundTrips {
     inner: InMemory,
+    floor_puts: Arc<AtomicU64>,
 }
 
 impl Debug for RoundTrips {
@@ -123,6 +125,9 @@ impl ObjectStore for RoundTrips {
         payload: PutPayload,
         options: PutOptions,
     ) -> Result<PutResult, object_store::Error> {
+        if location.filename() == Some("seq-floor.json") {
+            _ = self.floor_puts.fetch_add(1, Ordering::Relaxed);
+        }
         sleep(PUT).await;
         self.inner.put_opts(location, payload, options).await
     }
@@ -262,6 +267,7 @@ fn replica(bucket: &InMemory) -> DynoStore {
         NODE,
         RoundTrips {
             inner: bucket.clone(),
+            floor_puts: Arc::default(),
         },
     )
     .coalesce_tuning(CoalesceTuning {
@@ -281,6 +287,7 @@ async fn compaction_lands_against_bucket_latencies() -> Result<()> {
         NODE,
         RoundTrips {
             inner: bucket.clone(),
+            floor_puts: Arc::default(),
         },
     )
     .coalesce_tuning(CoalesceTuning {
@@ -344,6 +351,96 @@ async fn compaction_lands_against_bucket_latencies() -> Result<()> {
     assert!(
         merges >= 5,
         "{merges} merged segments landed in {RUN_FOR:?} of sustained produce"
+    );
+
+    let reader = replica(&bucket);
+    for (partition, acked) in (0..REPLICAS).zip(acked) {
+        assert_eq!(
+            acked * RECORDS as i64,
+            read_back(&reader, partition).await?,
+            "partition {partition} lost or duplicated records"
+        );
+    }
+
+    Ok(())
+}
+
+/// Records survive merges whose claims stay behind them until the floor
+/// covers them (DEV-675), with the maintainer paced as `gs://` paces it and
+/// draining through the maintenance path, claim sweep included.
+#[tokio::test]
+async fn drain_loses_nothing_while_claims_wait_for_the_floor() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let floor_puts = Arc::new(AtomicU64::new(0));
+
+    let maintainer = DynoStore::new(
+        CLUSTER,
+        NODE,
+        PutRateLimiter::new(
+            RoundTrips {
+                inner: bucket.clone(),
+                floor_puts: floor_puts.clone(),
+            },
+            Duration::from_mins(5),
+        )
+        .with_rate_per_second(NonZeroU32::new(1)),
+    )
+    .object_write_interval(Some(Duration::from_secs(1)))
+    .coalesce_tuning(CoalesceTuning {
+        prefix_compact_min_segments: Some(MIN_SEGMENTS),
+        prefix_compact_keep_hot: Some(1),
+        prefix_compact_target_bytes: Some(TARGET_BYTES),
+        ..Default::default()
+    });
+
+    _ = maintainer
+        .create_topic(
+            CreatableTopic::default()
+                .name(TOPIC.into())
+                .num_partitions(REPLICAS)
+                .replication_factor(1)
+                .assignments(Some([].into()))
+                .configs(Some([].into())),
+            false,
+        )
+        .await?;
+
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let producers = (0..REPLICAS)
+        .map(|partition| tokio::spawn(produce(replica(&bucket), partition, stop.clone())))
+        .collect::<Vec<_>>();
+
+    let started = Instant::now();
+    let mut merged = 0;
+
+    while started.elapsed() < RUN_FOR {
+        maintainer.refresh_prefix_index_forced(PREFIX).await?;
+
+        match maintainer.drain_compact_prefix(PREFIX).await {
+            0 => sleep(Duration::from_millis(50)).await,
+            n => merged += n,
+        }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+
+    let mut acked = Vec::new();
+    for producer in producers {
+        acked.push(producer.await.expect("a producer panicked")?);
+    }
+
+    eprintln!(
+        "acked={acked:?} merged={merged} floor_puts={} elapsed={:?}",
+        floor_puts.load(Ordering::Relaxed),
+        started.elapsed()
+    );
+
+    assert!(
+        merged >= 2 * MIN_SEGMENTS as u64,
+        "{merged} segments merged in {RUN_FOR:?} of sustained produce"
     );
 
     let reader = replica(&bucket);
