@@ -495,6 +495,9 @@ async fn a_hole_bounds_the_runs_instead_of_wedging_them() -> Result<()> {
         CompactRun::Drained,
     ));
 
+    // The last merge's claim waits for the floor (DEV-675); the drain's sweep
+    // of a drained prefix is what retires it.
+    assert_eq!(0, store.drain_compact_prefix(PREFIX).await);
     assert_eq!(2, segments(&bucket).await.len());
 
     // Both sides of the hole still read back whole, at their own offsets — one

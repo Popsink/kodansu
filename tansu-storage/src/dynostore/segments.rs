@@ -254,9 +254,23 @@ impl DynoStore {
     /// worker wrote concurrently — re-read and, if the value already covers our
     /// floor, we are done; otherwise retry. Returns an error on persistent
     /// contention so the caller aborts the delete rather than break the invariant.
-    pub(super) async fn raise_seq_floor(&self, prefix: &str, floor: u64) -> Result<()> {
+    ///
+    /// **Headroom (DEV-675).** When the floor has to move it is written as
+    /// `headroom`, not `floor`, whenever that is higher. Returns the floor now
+    /// persisted — the value read when no write was needed — so the caller knows
+    /// every name below it may go without another write. `headroom` must not
+    /// exceed the highest name ever created + 1: a floor up to there makes no
+    /// writer skip a name, so #77 and the tail probe's contiguity (#112) are
+    /// unchanged; only a floor *above* it would open a gap.
+    pub(super) async fn raise_seq_floor(
+        &self,
+        prefix: &str,
+        floor: u64,
+        headroom: u64,
+    ) -> Result<u64> {
         const MAX_ATTEMPTS: usize = 16;
         let location = self.seq_floor_location(prefix);
+        let target = floor.max(headroom);
 
         for _ in 0..MAX_ATTEMPTS {
             let (current, version) = match self.object_store.get(&location).await {
@@ -274,11 +288,11 @@ impl DynoStore {
             };
 
             if current >= floor {
-                return Ok(());
+                return Ok(current);
             }
 
             let payload = PutPayload::from(Bytes::from(serde_json::to_vec(&SeqFloor {
-                next_seq_floor: floor,
+                next_seq_floor: target,
             })?));
             let mode = match &version {
                 Some(version) => PutMode::Update(version.clone()),
@@ -313,7 +327,7 @@ impl DynoStore {
                     // forbids. Invalidating at the source closes the window without
                     // making anything depend on raise-then-prune ordering.
                     self.invalidate_certified_seq_floor(prefix)?;
-                    return Ok(());
+                    return Ok(target);
                 }
                 // Lost the CAS (create race or stale version) — re-read and retry.
                 Err(object_store::Error::AlreadyExists { .. })
@@ -1084,13 +1098,13 @@ impl DynoStore {
 
     /// The claim a segment from [`Self::assign_and_create_segment`] was created
     /// behind (DEV-662): always the name right below it, which is what lets the
-    /// caller retire the claim with the run it merged.
+    /// per-key pass retire its claims with the segments it rewrote.
     pub(super) fn claim_of(created: u64) -> u64 {
         created.saturating_sub(1)
     }
 
     /// Whether `footer` is a compaction claim (DEV-662).
-    fn is_compaction_claim(footer: &SegmentFooter) -> bool {
+    pub(super) fn is_compaction_claim(footer: &SegmentFooter) -> bool {
         footer.entries.is_empty() && footer.writer_epoch == Self::COMPACTION_CLAIM_EPOCH
     }
 
@@ -1324,19 +1338,113 @@ impl DynoStore {
     /// deleting anything — the caller retries on the next tick rather than break
     /// the invariant.
     ///
-    /// This is the only place segment objects are deleted (#286): expiry,
-    /// whole-segment compaction and per-key rewrite all retire through here, so
-    /// a fourth delete path cannot get the ordering wrong by omission.
+    /// This and [`Self::retire_compacted`] are the only places segment objects
+    /// are deleted (#286): expiry and the per-key rewrite retire through here,
+    /// whole-segment compaction through the other, and both raise the floor
+    /// before [`Self::delete_segments`], so no delete path can get the ordering
+    /// wrong by omission.
     pub(super) async fn retire_segments(&self, prefix: &str, seqs: &[u64]) -> Result<u64> {
-        /// Segment objects deleted per bulk request — matches the S3
-        /// `DeleteObjects` per-request key cap.
-        const RETIRE_DELETE_CHUNK: usize = 1_000;
-
         let Some(max_seq) = seqs.iter().copied().max() else {
             return Ok(0);
         };
 
-        self.raise_seq_floor(prefix, max_seq + 1).await?;
+        _ = self
+            .raise_seq_floor(prefix, max_seq + 1, max_seq + 1)
+            .await?;
+
+        self.delete_segments(prefix, seqs).await
+    }
+
+    /// Retire a merged run (DEV-675), and with it every settled compaction
+    /// claim the floor already covers — or, with `sweep`, every settled claim.
+    ///
+    /// [`Self::retire_segments`] raises the floor to the retired maximum + 1,
+    /// and a merge used to retire its own claim, which sits at the tail: so
+    /// every merge rewrote `seq-floor.json`, and `gs://` paces that object at
+    /// one write a second — at most one merge a second per prefix, whatever
+    /// the merge cost. Here, when the floor has to move it moves to the
+    /// index's resolved maximum + 1, every name this process has seen created,
+    /// so the merges that follow over older segments find it already above
+    /// their run and write nothing. The floor then moves about once per pass
+    /// through the backlog: when the oldest run reaches the segments created
+    /// since the last raise.
+    ///
+    /// A merge's claim is not retired with it any more; it stays until the
+    /// floor next covers it. Claims are never selected into a run
+    /// ([`Self::compact_prefix_segments`]), so leaving them behind cannot make
+    /// a merge that rewrites a claim and makes another, which is how the naive
+    /// version of this re-merged empty claims without end. A claim is *settled*
+    /// once something was created above it, or once it is older than
+    /// [`Self::COMPACTION_CLAIM_TTL`]: no producer yields to it
+    /// ([`Self::yield_to_compaction_claim`] only looks at the tail) and its
+    /// merged segment has landed or lost. The tail claim of a create still in
+    /// flight is never swept.
+    pub(super) async fn retire_compacted(
+        &self,
+        prefix: &str,
+        seqs: &[u64],
+        sweep: bool,
+    ) -> Result<u64> {
+        let (claims, resolved_max) = self.settled_claims(prefix)?;
+
+        let needed = seqs
+            .iter()
+            .chain(claims.iter().filter(|_| sweep))
+            .copied()
+            .max()
+            .map(|max| max + 1);
+
+        let floor = match needed {
+            Some(needed) => {
+                let headroom = resolved_max.map_or(needed, |max| needed.max(max + 1));
+                self.raise_seq_floor(prefix, needed, headroom).await?
+            }
+
+            None => return Ok(0),
+        };
+
+        let retired: Vec<u64> = seqs
+            .iter()
+            .copied()
+            .chain(claims.into_iter().filter(|claim| *claim < floor))
+            .collect();
+
+        self.delete_segments(prefix, &retired).await
+    }
+
+    /// The settled compaction claims in this process's index for `prefix` (see
+    /// [`Self::retire_compacted`]), with the index's resolved maximum.
+    pub(super) fn settled_claims(&self, prefix: &str) -> Result<(Vec<u64>, Option<u64>)> {
+        let index = self.prefixes.index()?;
+
+        let Some(entry) = index.get(prefix) else {
+            return Ok((Vec::new(), None));
+        };
+
+        let resolved_max = entry.resolved_max();
+        let now = Self::now_ms();
+
+        let claims = entry
+            .segments
+            .iter()
+            .filter(|(seq, cached)| {
+                Self::is_compaction_claim(&cached.footer)
+                    && (resolved_max.is_some_and(|max| **seq < max)
+                        || now.saturating_sub(cached.last_modified_ms)
+                            >= Self::COMPACTION_CLAIM_TTL.as_millis() as i64)
+            })
+            .map(|(seq, _)| *seq)
+            .collect();
+
+        Ok((claims, resolved_max))
+    }
+
+    /// Delete `seqs`' objects and prune them from the index, once the caller
+    /// has raised the floor past every one of them (#77).
+    async fn delete_segments(&self, prefix: &str, seqs: &[u64]) -> Result<u64> {
+        /// Segment objects deleted per bulk request — matches the S3
+        /// `DeleteObjects` per-request key cap.
+        const RETIRE_DELETE_CHUNK: usize = 1_000;
 
         let mut deleted: u64 = 0;
         let mut chunk: Vec<Path> = Vec::new();

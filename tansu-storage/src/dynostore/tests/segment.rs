@@ -717,7 +717,7 @@ async fn tail_next_seq_folded_derives_from_index_and_floor() -> Result<(), Error
 
     // A persisted floor above the folded max wins (a retention/compaction delete
     // freed those names, which must not be reused).
-    store.raise_seq_floor(prefix, 10).await?;
+    _ = store.raise_seq_floor(prefix, 10, 10).await?;
     assert_eq!(10, store.tail_next_seq_folded(prefix).await?);
 
     Ok(())

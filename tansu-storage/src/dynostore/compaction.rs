@@ -380,6 +380,13 @@ impl DynoStore {
 
         // Snapshot (seq, epoch, last_modified, region bytes) for every cached
         // segment, ascending by seq (== ascending offset for a sub-stream).
+        //
+        // Compaction claims are left out (DEV-675): they now outlive their
+        // merge until the floor covers them, and a run holding one — two
+        // segments in, a claim and a merged segment out — rewrote claims
+        // without end. A claim holds no offsets, so skipping it joins nothing
+        // that was not already contiguous, and it does not count towards the
+        // trigger: it is swept by `retire_compacted`, not merged.
         let mut segs: Vec<(u64, i64, i64, usize)> = {
             let index = self.prefixes.index()?;
             index
@@ -388,6 +395,7 @@ impl DynoStore {
                     entry
                         .segments
                         .iter()
+                        .filter(|(_, cached)| !Self::is_compaction_claim(&cached.footer))
                         .map(|(seq, cached)| {
                             let bytes: usize = cached
                                 .footer
@@ -742,21 +750,15 @@ impl DynoStore {
         };
 
         // Retire the run: floor before delete, then prune (#77) — see
-        // [`Self::retire_segments`]. Compaction usually adds a higher merged seq
+        // [`Self::retire_compacted`]. Compaction usually adds a higher merged seq
         // so the listing max is unchanged, but when every run segment is
         // superseded no merged seq is written (`new_seq == None`) and deleting
         // the run *can* lower the listing max — freeing a run name for reuse
         // without the floor.
         //
-        // The merged segment's claim goes with the run (DEV-662): left behind,
-        // every merge would add a segment, and a prefix could never drain below
-        // two.
-        let retired: Vec<u64> = run
-            .iter()
-            .copied()
-            .chain(new_seq.map(Self::claim_of))
-            .collect();
-        _ = self.retire_segments(prefix, &retired).await?;
+        // The merged segment's claim stays until the floor covers it (DEV-675):
+        // retiring it here moved the floor to the tail on every merge.
+        _ = self.retire_compacted(prefix, &run, false).await?;
 
         SEGMENT_COMPACTIONS.add(run.len() as u64, &[]);
         debug!(
@@ -1579,6 +1581,10 @@ impl DynoStore {
 
         PREFIX_DRAIN_STOPS.add(1, &[KeyValue::new("reason", reason)]);
 
+        if reason == "drained" {
+            self.sweep_compaction_claims(prefix).await;
+        }
+
         // Report what this replica has indexed for the prefix, so runaway `S` is
         // observable even if the drain can't keep up.
         //
@@ -1616,6 +1622,36 @@ impl DynoStore {
         }
 
         compacted
+    }
+
+    /// Retire the claims a drained prefix still carries (DEV-675), with one
+    /// floor write when any of them is above the floor.
+    ///
+    /// A merge leaves its claim behind until a later merge's floor raise covers
+    /// it, so the claims of the last stretch of a drain have no later merge to
+    /// do that. They hold no offsets and cost a reader nothing but a name in a
+    /// listing, but on a prefix that drains and goes quiet nothing else would
+    /// ever take them: retention ages them like any segment, and a topic with
+    /// no retention keeps them for good. Under the compaction lease, like every
+    /// other segment-mutating maintenance step (#115).
+    async fn sweep_compaction_claims(&self, prefix: &str) {
+        match self.settled_claims(prefix) {
+            Ok((claims, _)) if !claims.is_empty() => {}
+            Ok(_) => return,
+            Err(err) => {
+                error!(?err, prefix);
+                return;
+            }
+        }
+
+        if self.acquire_compaction_lease(prefix).await.is_err() {
+            return;
+        }
+
+        _ = self
+            .retire_compacted(prefix, &[], true)
+            .await
+            .inspect_err(|err| error!(?err, prefix, "sweeping compaction claims"));
     }
 
     /// Run the per-key pass over `prefix`, excluding any segment it proves
