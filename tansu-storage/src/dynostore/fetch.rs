@@ -93,20 +93,37 @@ impl DynoStore {
         prefix: &str,
         seqs: impl IntoIterator<Item = u64>,
     ) -> Result<Option<BTreeMap<u64, Bytes>>> {
+        /// GETs in flight per call. A merge reads its whole run before it
+        /// writes anything, so one at a time made a 22-segment run cost 22
+        /// round trips end to end — 1.8× a merge's wall time on a latency
+        /// model of the bucket (DEV-662). Every object is held until the merge
+        /// is written either way, so this adds requests in flight, not memory.
+        const FETCH_SEGMENT_CONCURRENCY: usize = 16;
+
         let mut objects: BTreeMap<u64, Bytes> = BTreeMap::new();
         let mut vanished: Vec<u64> = Vec::new();
 
-        for seq in seqs {
-            match self
+        let mut fetched = futures::stream::iter(seqs.into_iter().map(|seq| async move {
+            let fetched = match self
                 .object_store
                 .get(&self.segment_location(prefix, seq))
                 .await
             {
-                Ok(result) => {
-                    _ = objects.insert(seq, result.bytes().await.map_err(Error::from)?);
+                Ok(result) => result.bytes().await.map(Some),
+                Err(object_store::Error::NotFound { .. }) => Ok(None),
+                Err(err) => Err(err),
+            };
+            (seq, fetched)
+        }))
+        .buffer_unordered(FETCH_SEGMENT_CONCURRENCY);
+
+        while let Some((seq, fetched)) = fetched.next().await {
+            match fetched {
+                Ok(Some(bytes)) => {
+                    _ = objects.insert(seq, bytes);
                 }
 
-                Err(object_store::Error::NotFound { .. }) => {
+                Ok(None) => {
                     SEGMENT_VANISHED_BEFORE_READ.add(1, &[]);
                     SEGMENT_ABSENT.add(1, &[KeyValue::new("caller", "compaction")]);
                     debug!(

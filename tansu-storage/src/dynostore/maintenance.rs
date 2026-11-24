@@ -175,12 +175,7 @@ impl DynoStore {
         now_ms: i64,
         owned: Option<&BTreeSet<String>>,
     ) -> Result<(u64, u64)> {
-        /// Prefixes maintained concurrently per maintainer. Deliberately small:
-        /// each in-flight prefix can hold a merged payload of up to
-        /// `prefix_compact_target_bytes` (16 MiB) plus the segments being merged,
-        /// and a maintainer runs in a modest memory budget. Raises per-maintainer
-        /// drain throughput ~K× without more pods.
-        const PREFIX_MAINTENANCE_CONCURRENCY: usize = 4;
+        let concurrency = self.tuning.prefix_maintenance_concurrency.max(1);
 
         let thresholds = self.segment_retention_thresholds(now_ms, owned).await?;
 
@@ -295,7 +290,7 @@ impl DynoStore {
                 (deleted, compacted)
             }
         }))
-        .buffer_unordered(PREFIX_MAINTENANCE_CONCURRENCY)
+        .buffer_unordered(concurrency)
         .fold((0, 0), |(deleted, compacted), (d, c)| async move {
             (deleted + d, compacted + c)
         })
@@ -305,7 +300,7 @@ impl DynoStore {
         // (#399), instead of returning and idling out the rest of the interval.
         let (deleted, compacted) = outcomes;
         let swept = self
-            .sweep_backlogged_prefixes(&compactable, PREFIX_MAINTENANCE_CONCURRENCY)
+            .sweep_backlogged_prefixes(&compactable, concurrency)
             .await;
 
         Ok((deleted, compacted + swept))
