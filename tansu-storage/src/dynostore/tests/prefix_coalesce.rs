@@ -2805,16 +2805,21 @@ async fn prefix_index_cold_build_commits_incrementally() -> Result<(), Error> {
 }
 
 /// Stateless maintenance scheduling (#126): a maintainer that claims a prefix
-/// stamps the compaction lease's `maintained_at_ms`; within the recency window
-/// it (and any peer) skips the prefix, and past the window it is claimed again —
-/// no per-replica identity, no membership, coordinator-free.
+/// stamps the compaction lease's `maintained_at_ms`, and a peer skips it within
+/// the recency window — but the maintainer that holds it claims it again on its
+/// next tick, within the window or not (DEV-683). Skipping its own claim made a
+/// lone maintainer alternate between two halves of its prefixes.
 #[tokio::test]
-async fn maintenance_claim_recency_skips_then_reclaims() -> Result<(), Error> {
+async fn maintenance_claim_recency_keeps_its_own_and_skips_a_peers() -> Result<(), Error> {
     let bucket = InMemory::new();
-    let store = DynoStore::new(CLUSTER, NODE, bucket.clone()).coalesce_tuning(CoalesceTuning {
-        maintenance_recency: Some(Duration::from_secs(60)),
-        ..Default::default()
-    });
+    let scheduler = |bucket: InMemory| {
+        DynoStore::new(CLUSTER, NODE, bucket).coalesce_tuning(CoalesceTuning {
+            maintenance_recency: Some(Duration::from_secs(60)),
+            ..Default::default()
+        })
+    };
+    let store = scheduler(bucket.clone());
+    let peer = scheduler(bucket.clone());
     create_topic(&store, "org.env.conn.tab_a").await?;
 
     let t = now_ms();
@@ -2823,14 +2828,13 @@ async fn maintenance_claim_recency_skips_then_reclaims() -> Result<(), Error> {
 
     let again = store.claim_maintenance_prefixes(t).await?;
     assert!(
-        !again.contains(PREFIX),
-        "a prefix maintained within the recency window is skipped"
+        again.contains(PREFIX),
+        "the holder claims its own prefix again inside the recency window"
     );
 
-    let later = store.claim_maintenance_prefixes(t + 120_000).await?;
     assert!(
-        later.contains(PREFIX),
-        "past the recency window the prefix is claimed again"
+        !peer.claim_maintenance_prefixes(t).await?.contains(PREFIX),
+        "a peer skips a prefix maintained within the recency window"
     );
 
     Ok(())

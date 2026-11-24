@@ -508,7 +508,8 @@ prefix's topics).
 | `prefix_compact_keep_hot` | `16` | Newest segments never compacted (leaves the active tail alone). |
 | `prefix_maintenance_concurrency` | `4` | Prefixes one maintainer compacts at once. Merges of one prefix are serial (one compaction lease, one tail), so a maintainer merges this many prefixes' worth and a hot prefix without a slot waits for one. Each slot holds up to `prefix_compact_target_bytes` of inputs plus the merged payload. Raise it to the number of hot prefixes when the maintainer's memory allows. On `gs://` each merge rewrites its prefix's `seq-floor.json`, which GCS paces at one write per second, so one prefix lands about one merge per second and a maintainer merges about `min(this, hot prefixes) × segments per run` per second: on a latency model of the bucket, 7 hot prefixes with runs of 22 merged 72 segments/s at `4` and 145/s at `8` (DEV-662). |
 | `maintenance_interval` | `10m` | How often this replica runs retention + compaction. `never` disables it entirely — the setting for a serving broker fleet that leaves storage maintenance to a dedicated maintainer. Do not spell that as a very large duration: a period still schedules a pass on every replica at once when it comes round. Ticks are wall-clock aligned, so replicas share a schedule whatever time their pods started. Evicting idle coordinator group state is *not* on this clock and keeps running under `never`. |
-| `maintenance_recency` | `9m` | A prefix maintained (compacted/expired) within this window is skipped by other maintainer replicas. Set to ~0.9× your `maintenance_interval`; `0` disables (every maintainer works every prefix). |
+| `maintenance_recency` | `9m` | A prefix maintained (compacted/expired) within this window is skipped by other maintainer replicas. The replica that holds it claims it again (DEV-683). Set to ~0.9× your `maintenance_interval`; `0` disables (every maintainer works every prefix). |
+| `maintenance_pass_budget` | 0.9× `maintenance_interval` | Wall clock one maintenance pass keeps sweeping its claimed prefixes for (DEV-683). The pass keeps merging, and keeps re-listing the prefixes still being produced to, until the budget runs out or every claimed prefix is quiet. That way it ends before the next tick, and the next tick claims again instead of being skipped as still in flight. The broker sets it from `maintenance_interval`; name it only to override that. `0` leaves one drain per prefix per pass. |
 | `flush_max_elapsed` | `10s` | Wall-clock budget for a flush's create-CAS conflict-correction loop. When it runs out the flush yields to the competing writer and the produce is rejected *retriably*. It is a floor on attempts, not a hard deadline: the loop always makes at least 3 real attempts, and will not start an attempt it expects to overshoot. Raise it if you see `leaseless flush exhausted retries` with a small `attempts` and a large `put_ms` — that is a slow bucket, not contention. |
 | `watermark_hint_ttl` | `5s` | Freshness window of the in-memory high-watermark view (#500): the per-partition hint and the prefix index answer `ListOffsets` and the fetch path's end-of-log check without a listing while younger than this. Widen it to match the cadence of periodic watermark readers — a sink fleet whose lag diagnostic calls `endOffsets` every 30s stays entirely on the zero-request path with `watermark_hint_ttl=30s`. The price is cross-replica visibility: a batch produced on a *peer* replica can stay invisible to this replica's `ListOffsets(LATEST)` **and fetch** for up to the window (same-replica produce advances the hint immediately, and a single-replica deployment gives the window away for free). Staleness only ever *under*-reports the end — a consumer re-reads, never skips. Offset assignment does not depend on it for correctness: the create-CAS reconciles against the real tail on conflict. |
 
@@ -580,9 +581,12 @@ ReplicaSet). Each tick a maintainer enumerates the full prefix set, shuffles it
 with a per-process seed so replicas sweep in independent orders, and for each
 prefix:
 
-- if the per-prefix compaction lease shows it was maintained within
-  `maintenance_recency`, it is skipped (no `segments/` LIST, no work) — a peer
-  just did it;
+- if the per-prefix compaction lease shows *another* maintainer maintained it
+  within `maintenance_recency`, it is skipped (no `segments/` LIST, no work), because
+  that peer has it. A lease this maintainer holds is claimed again (DEV-683).
+  Otherwise a prefix worked until the end of the last pass, with its lease renewed
+  moments before this tick, would be skipped by its own holder. A lone maintainer
+  then alternates between two halves of its prefixes;
 - otherwise the maintainer claims the lease (recording the time), does the
   retention + compaction for that prefix under that one claim, and moves on.
 

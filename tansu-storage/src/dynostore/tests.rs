@@ -48,6 +48,7 @@ mod group_describe;
 mod group_documents;
 mod group_expiry;
 mod group_offsets;
+mod hot_prefix_scheduling;
 mod idempotent;
 mod index_reconcile;
 mod latency;

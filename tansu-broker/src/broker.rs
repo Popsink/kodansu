@@ -998,6 +998,7 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
 
 impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
     const MAINTENANCE_INTERVAL: &str = "maintenance_interval";
+    const MAINTENANCE_PASS_BUDGET: &str = "maintenance_pass_budget";
 
     pub fn node_id(self, node_id: i32) -> Builder<i32, C, I, A, S, L> {
         self.retyped(
@@ -1083,11 +1084,27 @@ impl<N, C, I, A, S, L> Builder<N, C, I, A, S, L> {
                 })
             });
 
-        let kept: Vec<(String, String)> = storage
+        let mut kept: Vec<(String, String)> = storage
             .query_pairs()
             .filter(|(key, _)| key != Self::MAINTENANCE_INTERVAL)
             .map(|(key, value)| (key.into_owned(), value.into_owned()))
             .collect();
+
+        // The storage engine sweeps its backlog for a pass budget and cannot see
+        // the interval, which is consumed above (DEV-683). 0.9× leaves the pass
+        // finished when the next tick fires, so that tick re-claims every prefix
+        // rather than being skipped as still in flight. A budget the URL names
+        // wins.
+        if let Maintenance::Every(period) = maintenance
+            && !kept
+                .iter()
+                .any(|(key, _)| key == Self::MAINTENANCE_PASS_BUDGET)
+        {
+            kept.push((
+                Self::MAINTENANCE_PASS_BUDGET.to_owned(),
+                format!("{}ms", (period * 9 / 10).as_millis()),
+            ));
+        }
         if kept.is_empty() {
             storage.set_query(None);
         } else {
@@ -1416,6 +1433,27 @@ mod tests {
             let built = PhantomBuilder::default().storage(Url::parse("s3://bucket/").unwrap());
 
             assert_eq!(built.maintenance, Maintenance::default());
+        }
+
+        // The engine cannot see the interval, so it is handed a pass budget just
+        // under it (DEV-683) — unless the URL already names one.
+        #[test]
+        fn the_interval_sets_the_pass_budget_unless_the_url_does() {
+            let built = PhantomBuilder::default()
+                .storage(Url::parse("s3://bucket/?maintenance_interval=2m").unwrap());
+            assert_eq!(
+                built.storage.as_str(),
+                "s3://bucket/?maintenance_pass_budget=108000ms"
+            );
+
+            let built = PhantomBuilder::default().storage(
+                Url::parse("s3://bucket/?maintenance_interval=2m&maintenance_pass_budget=30s")
+                    .unwrap(),
+            );
+            assert_eq!(
+                built.storage.as_str(),
+                "s3://bucket/?maintenance_pass_budget=30s"
+            );
         }
 
         // `Never` has to be inert for the whole life of the process, not merely

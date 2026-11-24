@@ -2462,6 +2462,14 @@ fn coalesce_tuning(storage: &Url) -> CoalesceTuning {
                     )
                     .ok();
             }
+            "maintenance_pass_budget" => {
+                tuning.maintenance_pass_budget = human_units::Duration::from_str(value)
+                    .map(|duration| duration.0)
+                    .inspect_err(
+                        |err| warn!(storage = %storage, key = "maintenance_pass_budget", value, ?err),
+                    )
+                    .ok();
+            }
             "flush_max_elapsed" => {
                 tuning.flush_max_elapsed = human_units::Duration::from_str(value)
                     .map(|duration| duration.0)

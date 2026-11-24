@@ -328,8 +328,8 @@ Produce, fetch and maintenance need no configuration to scale:
   re-derives its sub-stream bases and retries at the next sequence.
 - **Fetch** — any replica, from the immutable segments and their cached footers.
 - **Maintenance** (retention and compaction) — runs on every replica. Each tick a
-  replica enumerates prefixes in its own shuffled order and skips any prefix a peer
-  maintained within `maintenance_recency`, so N maintainers partition the work by
+  replica enumerates prefixes in its own shuffled order and skips any prefix *another*
+  maintainer maintained within `maintenance_recency`, so N maintainers partition the work by
   first arrival rather than duplicating it N×. Set `maintenance_recency` to ~0.9× your
   maintenance interval.
 
