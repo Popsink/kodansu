@@ -179,6 +179,9 @@ pub(super) struct Tuning {
     /// Kafka-style dirty map is the follow-up if a real workload hits this.
     pub(super) prefix_compact_seen_keys: usize,
 
+    /// Prefixes one maintainer maintains at once (DEV-662), at least one.
+    pub(super) prefix_maintenance_concurrency: usize,
+
     /// Recency window for stateless maintenance scheduling (#126): a prefix
     /// whose compaction lease was last acquired within this window is skipped by
     /// other maintainers (they neither LIST nor re-work it). Set to ~0.9× the
@@ -227,6 +230,7 @@ impl Tuning {
             prefix_compact_keep_hot,
             prefix_compact_region_bytes,
             prefix_compact_seen_keys,
+            prefix_maintenance_concurrency,
             maintenance_recency,
             flush_max_elapsed,
             watermark_hint_ttl,
@@ -254,6 +258,7 @@ impl Tuning {
             prefix_compact_keep_hot,
             prefix_compact_region_bytes,
             prefix_compact_seen_keys,
+            prefix_maintenance_concurrency,
             maintenance_recency,
             flush_max_elapsed,
             watermark_hint_ttl,
@@ -285,6 +290,7 @@ impl Tuning {
             prefix_compact_keep_hot: DynoStore::PREFIX_COMPACT_KEEP_HOT,
             prefix_compact_region_bytes: DynoStore::PREFIX_COMPACT_REGION_BYTES,
             prefix_compact_seen_keys: DynoStore::PREFIX_COMPACT_SEEN_KEYS,
+            prefix_maintenance_concurrency: DynoStore::PREFIX_MAINTENANCE_CONCURRENCY,
             maintenance_recency: DynoStore::MAINTENANCE_RECENCY,
             flush_max_elapsed: DynoStore::FLUSH_MAX_ELAPSED,
             object_write_interval: None,

@@ -2442,6 +2442,12 @@ fn coalesce_tuning(storage: &Url) -> CoalesceTuning {
                     .inspect_err(|err| warn!(storage = %storage, key = "prefix_compact_keep_hot", value, ?err))
                     .ok();
             }
+            "prefix_maintenance_concurrency" => {
+                tuning.prefix_maintenance_concurrency = value
+                    .parse()
+                    .inspect_err(|err| warn!(storage = %storage, key = "prefix_maintenance_concurrency", value, ?err))
+                    .ok();
+            }
             "prefix_compact_seen_keys" => {
                 tuning.prefix_compact_seen_keys = value
                     .parse()
@@ -3140,8 +3146,9 @@ mod tests {
     #[test]
     fn coalesce_tuning_parses_compaction_keys() -> Result<()> {
         let tuning = coalesce_tuning(&Url::parse(
-            "s3://tansu/?prefix_compact_min_segments=512&prefix_compact_target_bytes=128m&prefix_compact_keep_hot=32&prefix_compact_region_bytes=4m",
+            "s3://tansu/?prefix_compact_min_segments=512&prefix_compact_target_bytes=128m&prefix_compact_keep_hot=32&prefix_compact_region_bytes=4m&prefix_maintenance_concurrency=8",
         )?);
+        assert_eq!(Some(8), tuning.prefix_maintenance_concurrency);
         assert_eq!(Some(512), tuning.prefix_compact_min_segments);
         assert_eq!(Some(128 * 1024 * 1024), tuning.prefix_compact_target_bytes);
         assert_eq!(Some(32), tuning.prefix_compact_keep_hot);

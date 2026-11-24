@@ -52,8 +52,9 @@ const DEFAULT_JITTER: Duration = Duration::from_millis(0);
 ///
 /// - at a nominal 30 ms per `DELETE`, 16 in flight is ~530 deletes/s per
 ///   `delete_stream`;
-/// - a maintainer runs up to `PREFIX_MAINTENANCE_CONCURRENCY` (4) prefixes at
-///   once and each one deletes, so the per-replica ceiling is ~4× that;
+/// - a maintainer runs up to `prefix_maintenance_concurrency` (4 by default)
+///   prefixes at once and each one deletes, so the per-replica ceiling is that
+///   many times this;
 /// - a bucket starts at ~1,000 **object writes**/s and deletes count against
 ///   that budget, and it ramps by redistribution rather than instantly.
 ///

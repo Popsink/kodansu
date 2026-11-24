@@ -792,6 +792,9 @@ pub struct CoalesceTuning {
     pub prefix_compact_region_bytes: Option<usize>,
     /// Per-partition `seen` key-set cap for the per-key compaction pass (#175).
     pub prefix_compact_seen_keys: Option<usize>,
+    /// Prefixes one maintainer compacts at once (DEV-662). See
+    /// [`DynoStore::PREFIX_MAINTENANCE_CONCURRENCY`].
+    pub prefix_maintenance_concurrency: Option<usize>,
     /// Maintenance recency window (#126); set to ~0.9× `maintenance_interval`.
     pub maintenance_recency: Option<Duration>,
     /// Wall-clock budget for the leaseless flush's conflict-correction loop
@@ -1927,6 +1930,20 @@ impl DynoStore {
     /// losing repeatedly against a hot prefix has exhausted the claim budget and
     /// taken produce down with it.
     const PREFIX_COMPACT_KEEP_HOT: usize = 16;
+
+    /// Prefixes one maintainer maintains at once (#140), overridable as
+    /// `prefix_maintenance_concurrency` (DEV-662).
+    ///
+    /// Merges of one prefix are serial — one compaction lease, one tail — so a
+    /// maintainer's merge rate is this many prefixes times one prefix's rate,
+    /// and a hot prefix without a slot is not compacted at all while the
+    /// others hold them. On `gs://` one prefix's rate is itself capped near a
+    /// merge per second, by the pacing of the `seq-floor.json` write each
+    /// merge makes. Each slot holds up to `prefix_compact_target_bytes`
+    /// of inputs plus the merged payload, which is why the default stays
+    /// small: raise it to the number of hot prefixes when the maintainer's
+    /// memory allows.
+    const PREFIX_MAINTENANCE_CONCURRENCY: usize = 4;
 
     /// Default maintenance recency window (#126): ~0.9× the default
     /// `maintenance_interval` (10 min), so a prefix maintained by one replica is
