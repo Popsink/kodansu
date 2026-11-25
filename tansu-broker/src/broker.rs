@@ -20,7 +20,7 @@ use std::io;
 use std::marker::PhantomData;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::str::FromStr as _;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -84,37 +84,118 @@ static MAINTENANCE_DURATION: LazyLock<Histogram<u64>> = LazyLock::new(|| {
         .build()
 });
 
-/// Releases the maintenance in-flight flag on drop — on normal return, timeout
-/// cancellation, or panic unwind — so a run can never leave it stuck `true` and
-/// disable maintenance pod-wide until restart (#8, #131).
-struct InFlightGuard(Arc<AtomicBool>);
+/// Whether a maintenance pass is running on this replica, and whether a tick
+/// came while it was.
+///
+/// One run at a time (#8), but a tick that finds a run in flight is **owed**
+/// rather than dropped. It used to be skipped, and with the interval's
+/// `MissedTickBehavior::Skip` that cost a whole interval of compaction: on the
+/// GCS bucket a 10 min pass ended 4 s after the next tick, nothing merged for
+/// the next 10 min, and every hot prefix took ~3 600 more segments (DEV-662).
+/// An owed tick is run as soon as the pass ends, so an overrun costs the
+/// overrun. Ticks owed during one pass coalesce into one pass.
+#[derive(Clone, Debug, Default)]
+struct MaintenanceSlot(Arc<AtomicU8>);
 
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+impl MaintenanceSlot {
+    const IDLE: u8 = 0;
+    const RUNNING: u8 = 1;
+    const OWED: u8 = 2;
+
+    /// Move the slot on by `next`, returning the state it was in.
+    fn step(&self, next: impl Fn(u8) -> u8) -> u8 {
+        let mut state = self.0.load(Ordering::Acquire);
+
+        loop {
+            match self.0.compare_exchange_weak(
+                state,
+                next(state),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(was) => return was,
+                Err(now) => state = now,
+            }
+        }
+    }
+
+    /// Take the slot for a tick: `true` when the caller is to start a run,
+    /// `false` when one is running and now owes a pass.
+    fn claim(&self) -> bool {
+        self.step(|state| {
+            if state == Self::IDLE {
+                Self::RUNNING
+            } else {
+                Self::OWED
+            }
+        }) == Self::IDLE
+    }
+
+    /// End a pass: `true` when a tick came during it and the run is to go on
+    /// with another pass, `false` when the slot is free again.
+    fn release(&self) -> bool {
+        self.step(|state| {
+            if state == Self::OWED {
+                Self::RUNNING
+            } else {
+                Self::IDLE
+            }
+        }) == Self::OWED
+    }
+
+    #[cfg(test)]
+    fn is_idle(&self) -> bool {
+        self.0.load(Ordering::Acquire) == Self::IDLE
     }
 }
 
-/// Run a maintenance `pass` while holding the in-flight guard, bounded by
-/// `timeout`. On timeout the pass future is dropped (cancelled) and the guard is
-/// released as this returns, so a *hung* run — e.g. one wedged in S3
-/// `DeleteObjects` retry loops during a throttling storm — cannot hold the flag
-/// forever and disable compaction/retention pod-wide until the pod is restarted
-/// (#131). The overlap guard (#8) prevents *concurrent* runs; this is the escape
-/// hatch for a *stuck* one. Cancellation is safe: maintenance is idempotent and
-/// resumes on the next tick.
-async fn run_bounded_maintenance<F>(in_flight: Arc<AtomicBool>, timeout: Duration, pass: F)
+/// Frees the slot if a run ends other than by [`MaintenanceSlot::release`]:
+/// cancelled with its task, or unwinding from a panic, so a run can never
+/// leave it taken and disable maintenance pod-wide until restart (#8, #131).
+struct SlotGuard(Option<MaintenanceSlot>);
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        if let Some(slot) = self.0.take() {
+            slot.0.store(MaintenanceSlot::IDLE, Ordering::Release);
+        }
+    }
+}
+
+/// Run maintenance passes in the slot a tick claimed, each bounded by
+/// `timeout`, until no tick is owed, then free the slot.
+///
+/// On timeout a pass future is dropped (cancelled), so a *hung* pass — e.g.
+/// one wedged in S3 `DeleteObjects` retry loops during a throttling storm —
+/// cannot hold the slot forever and disable compaction and retention
+/// pod-wide until the pod is restarted (#131). The slot (#8) prevents
+/// *concurrent* runs; this is the escape hatch for a *stuck* one.
+/// Cancellation is safe: maintenance is idempotent and resumes on the next
+/// pass.
+async fn run_bounded_maintenance<F, P>(slot: MaintenanceSlot, timeout: Duration, mut pass: P)
 where
+    P: FnMut() -> F,
     F: Future<Output = ()>,
 {
-    let _guard = InFlightGuard(in_flight);
-    if time::timeout(timeout, pass).await.is_err() {
-        warn!(
-            ?timeout,
-            "maintenance run exceeded its time budget; cancelling so the next tick retries \
-             (a run wedged in S3 retries would otherwise disable maintenance until restart)"
-        );
+    let mut guard = SlotGuard(Some(slot.clone()));
+
+    loop {
+        if time::timeout(timeout, pass()).await.is_err() {
+            warn!(
+                ?timeout,
+                "maintenance run exceeded its time budget; cancelling so the next tick retries \
+                 (a run wedged in S3 retries would otherwise disable maintenance until restart)"
+            );
+        }
+
+        if !slot.release() {
+            break;
+        }
+
+        warn!("a maintenance tick came during the last pass; running the pass it owes now");
     }
+
+    guard.0 = None;
 }
 
 /// How long the drain waits for in-flight requests to answer before the
@@ -525,7 +606,7 @@ where
         // Guard against overlapping `maintain` runs: under S3 throttling a pass
         // can take longer than the interval, and spawning a second concurrent
         // run compounds the memory + S3 pressure (#8).
-        let maintenance_in_flight = Arc::new(AtomicBool::new(false));
+        let maintenance = MaintenanceSlot::default();
 
         let mut set = JoinSet::new();
         let m = MultiProgress::new();
@@ -580,24 +661,26 @@ where
                 }
 
                 _ = maintenance_tick(interval.as_mut()) => {
-                    // Skip this tick if the previous maintenance run is still in
-                    // flight, rather than spawning a second concurrent run (#8).
-                    if maintenance_in_flight
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_err()
-                    {
-                        warn!("skipping maintenance tick: previous run still in flight");
+                    // A tick that finds a run in flight is owed to it rather than
+                    // spawning a second concurrent run (#8): see `MaintenanceSlot`.
+                    if !maintenance.claim() {
+                        warn!(
+                            "maintenance tick came while the previous run is in flight; \
+                             it runs when that one ends"
+                        );
                     } else {
                         let maintained = self.storage.clone();
-                        let in_flight = Arc::clone(&maintenance_in_flight);
+                        let slot = maintenance.clone();
 
                         let spawned = set.spawn(async move {
                             let span = tracing::debug_span!("maintenance");
 
-                            // Bounded so a hung run releases the guard and the next
+                            // Bounded so a hung run frees the slot and the next
                             // tick can retry, rather than wedging maintenance
                             // pod-wide until restart (#131).
-                            run_bounded_maintenance(in_flight, maintenance_run_timeout, async move {
+                            run_bounded_maintenance(slot, maintenance_run_timeout, || {
+                                let maintained = maintained.clone();
+                                async move {
                                 let started = Instant::now();
 
                                 // A failure here is not cosmetic: it means this
@@ -632,6 +715,7 @@ where
                                 // how that reads next to the sweep counter (#399).
                                 MAINTENANCE_DURATION
                                     .record(started.elapsed().as_millis() as u64, &[]);
+                                }
                             }).instrument(span).await
                         });
 
@@ -1338,38 +1422,98 @@ mod tests {
     use std::future::pending;
 
     // A run that never completes (modelling a pass wedged in S3 retry loops)
-    // must be cancelled at the timeout and release the in-flight guard, so the
-    // next tick can retry — not stay `true` and disable maintenance pod-wide
-    // until restart (#131). Paused time makes `timeout` fire in virtual time.
+    // must be cancelled at the timeout and free the slot, so the next tick can
+    // retry — not stay taken and disable maintenance pod-wide until restart
+    // (#131). Paused time makes `timeout` fire in virtual time.
     #[tokio::test(start_paused = true)]
-    async fn bounded_maintenance_cancels_a_hung_pass_and_releases_the_guard() {
-        let in_flight = Arc::new(AtomicBool::new(true));
+    async fn bounded_maintenance_cancels_a_hung_pass_and_frees_the_slot() {
+        let slot = MaintenanceSlot::default();
+        assert!(slot.claim());
 
-        run_bounded_maintenance(in_flight.clone(), Duration::from_secs(60), pending::<()>()).await;
+        run_bounded_maintenance(slot.clone(), Duration::from_secs(60), pending::<()>).await;
 
         assert!(
-            !in_flight.load(Ordering::Acquire),
-            "guard must be released after a timed-out run"
+            slot.is_idle(),
+            "the slot must be free after a timed-out run"
         );
     }
 
-    // The normal path: the pass runs to completion and the guard is released.
+    // The normal path: the pass runs to completion and the slot is freed.
     #[tokio::test]
-    async fn bounded_maintenance_runs_the_pass_and_releases_the_guard() {
-        let in_flight = Arc::new(AtomicBool::new(true));
-        let ran = Arc::new(AtomicBool::new(false));
+    async fn bounded_maintenance_runs_the_pass_and_frees_the_slot() {
+        let slot = MaintenanceSlot::default();
+        assert!(slot.claim());
+        let passes = Arc::new(AtomicU8::new(0));
 
-        let ran_in_pass = ran.clone();
-        run_bounded_maintenance(in_flight.clone(), Duration::from_secs(60), async move {
-            ran_in_pass.store(true, Ordering::Release);
+        let counted = passes.clone();
+        run_bounded_maintenance(slot.clone(), Duration::from_secs(60), || {
+            _ = counted.fetch_add(1, Ordering::AcqRel);
+            std::future::ready(())
         })
         .await;
 
-        assert!(ran.load(Ordering::Acquire), "the pass must have run");
-        assert!(
-            !in_flight.load(Ordering::Acquire),
-            "guard must be released after the run completes"
+        assert_eq!(
+            1,
+            passes.load(Ordering::Acquire),
+            "the pass must have run once"
         );
+        assert!(
+            slot.is_idle(),
+            "the slot must be free after the run completes"
+        );
+    }
+
+    /// A tick during a pass is run when the pass ends, not skipped
+    /// (DEV-662): skipping it lost a whole interval of compaction on the GCS
+    /// bucket. Two ticks during one pass owe one pass, not two.
+    #[tokio::test]
+    async fn a_tick_during_a_pass_is_run_when_it_ends() {
+        let slot = MaintenanceSlot::default();
+        assert!(slot.claim());
+        let passes = Arc::new(AtomicU8::new(0));
+
+        let (ticking, counted) = (slot.clone(), passes.clone());
+        run_bounded_maintenance(slot.clone(), Duration::from_secs(60), || {
+            if counted.fetch_add(1, Ordering::AcqRel) == 0 {
+                assert!(!ticking.claim(), "a run is in flight");
+                assert!(!ticking.claim(), "a run is in flight");
+            } else {
+                assert!(!ticking.is_idle(), "the owed pass holds the slot");
+            }
+            std::future::ready(())
+        })
+        .await;
+
+        assert_eq!(2, passes.load(Ordering::Acquire));
+        assert!(slot.is_idle());
+        assert!(slot.claim(), "a tick after the run starts one");
+    }
+
+    /// A run whose task is dropped mid-pass, as at shutdown, or that panics,
+    /// frees the slot (#8, #131).
+    #[tokio::test]
+    async fn a_run_that_dies_frees_the_slot() {
+        let slot = MaintenanceSlot::default();
+        assert!(slot.claim());
+
+        let task = tokio::spawn(run_bounded_maintenance(
+            slot.clone(),
+            Duration::from_secs(60),
+            || -> std::future::Ready<()> { panic!("a pass panicked") },
+        ));
+        assert!(task.await.is_err_and(|err| err.is_panic()));
+        assert!(slot.is_idle(), "a panicked run frees the slot");
+
+        assert!(slot.claim());
+        let task = tokio::spawn(run_bounded_maintenance(
+            slot.clone(),
+            Duration::from_secs(60),
+            pending::<()>,
+        ));
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.is_err_and(|err| err.is_cancelled()));
+        assert!(slot.is_idle(), "a cancelled run frees the slot");
     }
 
     mod maintenance_schedule {
