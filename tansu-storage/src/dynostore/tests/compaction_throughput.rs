@@ -23,11 +23,11 @@
 //! of the store.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fmt::{self, Debug, Display},
     num::NonZeroU32,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -82,9 +82,30 @@ struct Counts {
     getting: AtomicU64,
     most_getting: AtomicU64,
     floor_put: AtomicU64,
+    writes: Mutex<BTreeMap<Path, u64>>,
 }
 
 impl Counts {
+    /// Count a PUT or a copy landing on `location`.
+    fn wrote(&self, location: &Path) {
+        if let Ok(mut writes) = self.writes.lock() {
+            *writes.entry(location.clone()).or_default() += 1;
+        }
+    }
+
+    /// The most writes any one object name took since the last call.
+    fn take_most_writes(&self) -> u64 {
+        self.writes
+            .lock()
+            .map(|mut writes| {
+                std::mem::take(&mut *writes)
+                    .into_values()
+                    .max()
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default()
+    }
+
     fn snapshot(&self) -> [u64; 5] {
         [
             self.get.load(Ordering::Relaxed),
@@ -146,6 +167,7 @@ impl ObjectStore for Bucket {
         options: PutOptions,
     ) -> Result<PutResult, object_store::Error> {
         _ = self.counts.put.fetch_add(1, Ordering::Relaxed);
+        self.counts.wrote(location);
         if location.filename() == Some("seq-floor.json") {
             _ = self.counts.floor_put.fetch_add(1, Ordering::Relaxed);
         }
@@ -234,6 +256,7 @@ impl ObjectStore for Bucket {
         options: CopyOptions,
     ) -> Result<(), object_store::Error> {
         _ = self.counts.copy.fetch_add(1, Ordering::Relaxed);
+        self.counts.wrote(to);
         sleep(COPY).await;
         self.inner.copy_opts(from, to, options).await
     }
@@ -357,6 +380,10 @@ struct Drained {
     /// The most GETs that were ever in flight at once.
     most_getting: u64,
 
+    /// The most writes any one object name took during the drain: `gs://`
+    /// paces each name at one write a second.
+    most_writes: u64,
+
     /// The most live segments any prefix was left with.
     most_remaining: usize,
 }
@@ -407,6 +434,7 @@ async fn drain(
     counts.most_getting.store(0, Ordering::Relaxed);
     let before = counts.snapshot();
     let floor_before = counts.floor_put.load(Ordering::Relaxed);
+    _ = counts.take_most_writes();
     let started = Instant::now();
     let merged = maintainer
         .sweep_backlogged_prefixes(&prefixes, concurrency, started + Duration::from_mins(30))
@@ -414,6 +442,7 @@ async fn drain(
     let elapsed = started.elapsed();
     let after = counts.snapshot();
     let floor_puts = counts.floor_put.load(Ordering::Relaxed) - floor_before;
+    let most_writes = counts.take_most_writes();
 
     let mut remaining = Vec::new();
     for prefix in &prefixes {
@@ -440,6 +469,7 @@ async fn drain(
         merged,
         floor_puts,
         most_getting: counts.most_getting.load(Ordering::Relaxed),
+        most_writes,
         most_remaining: remaining.into_iter().max().unwrap_or_default(),
     })
 }
@@ -552,6 +582,11 @@ async fn merge_throughput_against_bucket_latencies() -> Result<()> {
 
 /// One slot's merges are no longer floored at a second each under `gs://`'s
 /// pacing (DEV-675): paced, a backlog drains about as fast as unpaced.
+///
+/// A merge is floored when it writes one object name every merge, so that is
+/// checked by count, whatever the runner's speed. The time bound is the floor
+/// itself: a floored merge takes a second at least. It used to be 0.6 s,
+/// against ~0.45 s on a workstation and 0.61 s on a CI runner (#768).
 #[tokio::test]
 async fn paced_merges_are_not_floored_at_a_second() -> Result<()> {
     let _guard = init_tracing()?;
@@ -566,7 +601,12 @@ async fn paced_merges_are_not_floored_at_a_second() -> Result<()> {
     let per_merge = paced.merged as f64 / paced.rate / merges as f64;
 
     assert!(
-        per_merge < 0.6,
+        paced.most_writes * 2 <= merges,
+        "one object written {} times over {merges} paced merges",
+        paced.most_writes
+    );
+    assert!(
+        per_merge < 1.0,
         "{per_merge:.2}s per paced merge over {merges} merges, {:.1}/s unpaced against {:.1}/s paced",
         unpaced.rate,
         paced.rate
