@@ -200,6 +200,54 @@ impl RunUnion {
         spans.insert(at, (from, to));
     }
 
+    /// The union of `spans` with this union's intervals for the sub-streams
+    /// `spans` hold, and only those.
+    pub(super) fn joined(&self, spans: &[(SubstreamKey, i64, i64)]) -> Self {
+        let mut trial = Self::default();
+
+        for (key, ..) in spans {
+            if trial.spans.contains_key(key) {
+                continue;
+            }
+
+            if let Some(held) = self.spans.get(key) {
+                _ = trial.spans.insert(key.clone(), held.clone());
+            }
+        }
+
+        for (key, from, to) in spans {
+            trial.insert(key.clone(), *from, *to);
+        }
+
+        trial
+    }
+
+    /// The union of `spans`.
+    pub(super) fn of(spans: &[(SubstreamKey, i64, i64)]) -> Self {
+        let mut union = Self::default();
+        for (key, from, to) in spans {
+            union.insert(key.clone(), *from, *to);
+        }
+        union
+    }
+
+    /// Whether folding `spans` in would leave every sub-stream one unbroken
+    /// interval, on a union that is one now.
+    pub(super) fn connects(&self, spans: &[(SubstreamKey, i64, i64)]) -> bool {
+        self.joined(spans).is_connected()
+    }
+
+    /// Whether any of `spans` shares an offset with the union; abutting does
+    /// not count.
+    pub(super) fn overlaps(&self, spans: &[(SubstreamKey, i64, i64)]) -> bool {
+        spans.iter().any(|(key, from, to)| {
+            self.spans.get(key).is_some_and(|held| {
+                held.iter()
+                    .any(|&(held_from, held_to)| held_from < *to && *from < held_to)
+            })
+        })
+    }
+
     /// Whether every sub-stream is one unbroken interval.
     pub(super) fn is_connected(&self) -> bool {
         self.spans.values().all(|spans| spans.len() <= 1)
@@ -356,7 +404,172 @@ fn retention_age_ms(cached: &CachedSegment) -> i64 {
     }
 }
 
+/// A segment's `[from, to)` offsets, one per footer entry.
+type OffsetSpans = Vec<(SubstreamKey, i64, i64)>;
+
+/// What bounds a run [`DynoStore::select_compaction_run`] builds.
+struct RunBounds<'a> {
+    target: usize,
+    skips: usize,
+    quarantined: &'a BTreeSet<u64>,
+    seams: &'a BTreeSet<u64>,
+    armed: bool,
+}
+
+/// Every offset `[from, to)` interval `entry`'s live segments hold for `key`,
+/// sorted and coalesced.
+fn served_spans(entry: &PrefixIndex, key: &SubstreamKey) -> Vec<(i64, i64)> {
+    let mut spans: Vec<(i64, i64)> = entry
+        .substream_entries(&key.0, key.1)
+        .map(|(_, _, e)| (e.base_offset, e.base_offset + e.record_count))
+        .collect();
+    spans.sort_unstable();
+
+    let mut coalesced: Vec<(i64, i64)> = Vec::with_capacity(spans.len());
+    for (from, to) in spans {
+        match coalesced.last_mut() {
+            Some(last) if from <= last.1 => last.1 = last.1.max(to),
+            _ => coalesced.push((from, to)),
+        }
+    }
+
+    coalesced
+}
+
+/// Whether one of the sorted, coalesced `spans` holds all of `range`.
+fn covers(spans: &[(i64, i64)], range: &Range<i64>) -> bool {
+    let at = spans.partition_point(|&(from, _)| from <= range.start);
+    at > 0 && spans[at - 1].1 >= range.end
+}
+
+impl RunBounds<'_> {
+    /// The positions in `segs` of the run seeded by `segs[0]`, as
+    /// [`DynoStore::select_compaction_run`] describes it.
+    fn walk(
+        &self,
+        entry: &PrefixIndex,
+        segs: &[(u64, i64, i64, usize)],
+        served: &mut BTreeMap<SubstreamKey, Vec<(i64, i64)>>,
+    ) -> Vec<usize> {
+        let mut union = RunUnion::default();
+        let mut stepped = RunUnion::default();
+        let mut coverage = RunCoverage::default();
+        let (mut bytes, mut skipped) = (0usize, 0usize);
+        let mut run: Vec<usize> = Vec::new();
+        let mut aside = Vec::new();
+
+        for (at, &(seq, _, _, size)) in segs.iter().enumerate() {
+            if self.quarantined.contains(&seq) || (!run.is_empty() && self.seams.contains(&seq)) {
+                break;
+            }
+
+            let Some(cached) = entry.segments.get(&seq) else {
+                break;
+            };
+            let entries = &cached.footer.entries;
+            let spans: OffsetSpans = entries
+                .iter()
+                .map(|e| {
+                    (
+                        (e.substream(), e.partition),
+                        e.base_offset,
+                        e.base_offset + e.record_count,
+                    )
+                })
+                .collect();
+
+            if stepped.overlaps(&spans) {
+                break;
+            }
+
+            let joined = union.joined(&spans);
+            let fits = size < self.target && (run.is_empty() || bytes + size <= self.target);
+
+            if joined.is_connected() {
+                if !fits || (self.armed && !coverage.extend(entries)) {
+                    break;
+                }
+
+                for (key, from, to) in spans {
+                    union.insert(key, from, to);
+                }
+                bytes += size;
+                run.push(at);
+                continue;
+            }
+
+            if self.armed || union.overlaps(&spans) {
+                break;
+            }
+
+            let hole = joined.gaps().into_iter().any(|(key, gaps)| {
+                let held = served
+                    .entry(key.clone())
+                    .or_insert_with(|| served_spans(entry, &key));
+                gaps.iter().any(|gap| !covers(held, gap))
+            });
+
+            if hole {
+                if fits {
+                    run.push(at);
+                }
+                return run;
+            }
+
+            if skipped >= self.skips {
+                break;
+            }
+
+            for (key, from, to) in &spans {
+                stepped.insert(key.clone(), *from, *to);
+            }
+            skipped += 1;
+            aside.push((at, spans, size));
+        }
+
+        self.fold_back(&mut run, &mut union, bytes, aside);
+        run.sort_unstable();
+        run
+    }
+
+    /// Join each stepped-over segment that the run has since grown up to,
+    /// where it still fits and overlaps no segment left stepped over: what a
+    /// sequence-contiguous run would have merged.
+    fn fold_back(
+        &self,
+        run: &mut Vec<usize>,
+        union: &mut RunUnion,
+        mut bytes: usize,
+        mut aside: Vec<(usize, OffsetSpans, usize)>,
+    ) {
+        while let Some(i) = (0..aside.len()).find(|&i| {
+            let (_, spans, size) = &aside[i];
+            *size < self.target
+                && bytes + size <= self.target
+                && union.connects(spans)
+                && !aside
+                    .iter()
+                    .enumerate()
+                    .any(|(j, (_, other, _))| j != i && RunUnion::of(other).overlaps(spans))
+        }) {
+            let (at, spans, size) = aside.swap_remove(i);
+            for (key, from, to) in spans {
+                union.insert(key, from, to);
+            }
+            bytes += size;
+            run.push(at);
+        }
+    }
+}
+
 impl DynoStore {
+    /// Segments one run may step over (DEV-692), see
+    /// [`Self::select_compaction_run`]. Under sustained produce a merged
+    /// segment lands among about a dozen producer segments, so a run of ~200
+    /// steps over ~17; this leaves room for slower merges without letting one
+    /// start walk the whole prefix.
+    const COMPACT_RUN_SKIPS: usize = 64;
+
     /// Compact a prefix's oldest segments into fewer, larger ones (#66) to bound
     /// the live segment count `S` (otherwise ≈ flush_rate × retention, unbounded)
     /// — keeping the footer index footprint and the per-fetch scan bounded.
@@ -422,12 +635,11 @@ impl DynoStore {
         let quarantined = self.quarantined_segments_of(prefix)?;
         let seams = self.compact_seams_of(prefix)?;
 
-        // The offset spans a run would cover, needed only once this prefix is
-        // known to have a hole in its tiling — a quarantined segment (#398) or a
-        // learned seam (#399) — see [`RunCoverage`]. Skipped entirely otherwise,
-        // because this clones a `Vec<SubstreamEntry>` per segment on a path that
-        // walks tens of thousands of them per drain; a prefix with neither is
-        // kept off a merged segment's offsets by `straddle_free_len` (#594).
+        // Offset coverage is checked only once this prefix is known to have a
+        // hole in its tiling — a quarantined segment (#398) or a learned seam
+        // (#399) — see [`RunCoverage`]. A prefix with neither is kept off a
+        // merged segment's offsets by the run's own union and by
+        // `straddle_free_len` (#594).
         //
         // The coverage guard is what makes the seam memo *sufficient* rather
         // than merely helpful. A seam is a sequence, but the tiling breaks in
@@ -444,22 +656,7 @@ impl DynoStore {
         // entries, so a batch-aligned overlap the fenced merge could heal reads
         // as over-full and bounds the run instead. On a damaged prefix that
         // trade is taken deliberately — a smaller run beats a wedged one.
-        let spans: BTreeMap<u64, Vec<SubstreamEntry>> =
-            if quarantined.is_empty() && seams.is_empty() {
-                BTreeMap::new()
-            } else {
-                let index = self.prefixes.index()?;
-                index
-                    .get(prefix)
-                    .map(|entry| {
-                        entry
-                            .segments
-                            .iter()
-                            .map(|(seq, cached)| (*seq, cached.footer.entries.clone()))
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            };
+        let armed = !quarantined.is_empty() || !seams.is_empty();
 
         // Only above the trigger, and never touch the hot (newest) tail.
         if segs.len() <= self.tuning.prefix_compact_min_segments {
@@ -472,89 +669,12 @@ impl DynoStore {
             return Ok(CompactRun::Drained);
         }
 
-        // Pick the OLDEST contiguous run of at least two segments to merge, up to
-        // the target size — but skip any *leading* segment already at/above the
-        // target (a prior merge, or a large folded-in backfill segment). Such a
-        // segment is effectively done: re-merging it just rewrites ~target_bytes
-        // to absorb one small neighbour (R=2 write amplification), and — worse —
-        // if the next segment overflowed the target the run would collapse to
-        // length one, `compact_prefix_segments` would return `Ok(0)`, and
-        // `policy_compact_segments` would treat the prefix as drained while small
-        // segments pile up behind the big one, so `S` grows unbounded until
-        // retention (#114). A segment at/above the target also *bounds* a run
-        // (never merged across), leaving it in place as its own segment. The
-        // merged epoch is taken from the fenced view below, not from this raw
-        // scan, so the segment epoch is ignored here.
-        let (run, max_last_modified): (Vec<u64>, i64) = {
-            let mut chosen: Vec<u64> = Vec::new();
-            let mut chosen_last_modified = i64::MIN;
-            let mut start = 0usize;
-
-            while start < eligible_end {
-                // A leading (or intervening) already-target-sized segment is a
-                // boundary: leave it alone and seed the run after it. So is a
-                // quarantined one (#398) — and it has to be a *boundary* rather
-                // than a filtered-out element, because the merged segment carries
-                // the base offset of its first region and concatenates the rest:
-                // merging across the hole would shift every following record's
-                // offset down into it, which is corruption where today there is
-                // only a stalled drain.
-                if segs[start].3 >= self.tuning.prefix_compact_target_bytes
-                    || quarantined.contains(&segs[start].0)
-                {
-                    start += 1;
-                    continue;
-                }
-
-                let mut bytes = 0usize;
-                let mut end = start;
-                let mut coverage = RunCoverage::default();
-                while end < eligible_end
-                    && segs[end].3 < self.tuning.prefix_compact_target_bytes
-                    && !quarantined.contains(&segs[end].0)
-                    // A seam (#399) ends the run *before* this segment but may
-                    // begin the next one with it: unlike a quarantined segment,
-                    // the segment itself is healthy — it is the offsets between
-                    // it and its predecessor that are gone, so the two sides
-                    // merge as their own runs and are never fused across it.
-                    && (end == start || !seams.contains(&segs[end].0))
-                    && (end == start || bytes + segs[end].3 <= self.tuning.prefix_compact_target_bytes)
-                    // A hole in the prefix's offset tiling ends the run here
-                    // (#398). Only ever consulted when something is quarantined,
-                    // where `spans` is populated; empty means "no hole to cross".
-                    && spans
-                        .get(&segs[end].0)
-                        .is_none_or(|entries| coverage.extend(entries))
-                {
-                    bytes += segs[end].3;
-                    end += 1;
-                }
-
-                if end - start >= 2 {
-                    let candidate: Vec<u64> =
-                        segs[start..end].iter().map(|(seq, ..)| *seq).collect();
-                    let take = self.straddle_free_len(prefix, &candidate)?;
-
-                    if take < 2 {
-                        start += 1;
-                        continue;
-                    }
-
-                    chosen = candidate[..take].to_vec();
-                    chosen_last_modified = segs[start..start + take]
-                        .iter()
-                        .map(|(_, _, last_modified, _)| *last_modified)
-                        .max()
-                        .unwrap_or(i64::MIN);
-                    break;
-                }
-
-                // A lone small segment wedged between large ones: advance past it.
-                start = end.max(start + 1);
-            }
-
-            (chosen, chosen_last_modified)
-        };
+        // Pick the OLDEST run of at least two segments to merge, up to the
+        // target size — see [`Self::select_compaction_run`] for what bounds a
+        // run, what it may step over, and #114's guard against a drain that
+        // looks finished while small segments pile up.
+        let (run, max_last_modified) =
+            self.select_compaction_run(prefix, &segs[..eligible_end], &quarantined, &seams, armed)?;
         if run.len() < 2 {
             return Ok(CompactRun::Drained);
         }
@@ -883,6 +1003,102 @@ impl DynoStore {
         } else {
             CompactRun::Drained
         }))
+    }
+
+    /// The run [`Self::compact_prefix_segments`] merges next, and its newest
+    /// append time: the oldest run of at least two segments of `segs` (the
+    /// eligible ones, ascending by sequence) whose bytes fit under the target,
+    /// or an empty run when there is none.
+    ///
+    /// **What bounds a run.** A quarantined segment (#398) and a learned seam
+    /// (#399) end it: merging across either would shift every following
+    /// record's offset into a hole. So does a segment holding offsets the run
+    /// already holds, or ones that would extend it but no longer fit the
+    /// target. A segment already at or above the target is never merged (#114):
+    /// re-merging it rewrites ~target bytes to absorb one small neighbour, and
+    /// if the next segment overflowed, a run of one would read as a drained
+    /// prefix while small segments pile up behind the big one. It cannot seed a
+    /// run either; selection moves past it.
+    ///
+    /// **What a run may step over** (DEV-692). Sequence order is not offset
+    /// order once compaction has run: a merged segment is created at the tail,
+    /// a fresh high sequence, holding the low offsets of the segments it
+    /// replaced. Under sustained produce one lands about every second, among
+    /// the producer segments created meanwhile, so a sequence-contiguous run
+    /// met one about every dozen segments, and `straddle_free_len` (#594) cut
+    /// it there: its offsets are not adjacent to the run's. Runs of ~200 small
+    /// segments came out as a median of 9 on the GCS bucket, a merge retired
+    /// fewer segments than producers created meanwhile, and the live count grew
+    /// without bound.
+    ///
+    /// So a segment whose offsets neither overlap the run's nor extend them is
+    /// stepped over and left where it is, and the run continues past it, as
+    /// long as live segments hold every offset between the two. A hole nothing
+    /// serves is met as before: the segment past it joins and ends the run, so
+    /// the merge refuses it at the tiling check and learns the seam (#461). A
+    /// stepped-over segment the run later grows up to is joined after all. The
+    /// run stays offset-contiguous: it joins a segment only if every
+    /// sub-stream it holds stays one unbroken interval, and never one that
+    /// overlaps a segment it stepped over. So no stepped-over segment lies
+    /// inside the run's offsets, nothing outside the run serves offsets the
+    /// merged segment straddles, and the merged segment, created above every
+    /// stepped-over one, shadows none of their offsets. At most
+    /// [`Self::COMPACT_RUN_SKIPS`] are stepped over per run, bounding the walk
+    /// from each start. On a prefix with a hole in its tiling (`armed`),
+    /// nothing is stepped over: [`RunCoverage`] alone decides, as before.
+    pub(super) fn select_compaction_run(
+        &self,
+        prefix: &str,
+        segs: &[(u64, i64, i64, usize)],
+        quarantined: &BTreeSet<u64>,
+        seams: &BTreeSet<u64>,
+        armed: bool,
+    ) -> Result<(Vec<u64>, i64)> {
+        let bounds = RunBounds {
+            target: self.tuning.prefix_compact_target_bytes,
+            skips: if armed { 0 } else { Self::COMPACT_RUN_SKIPS },
+            quarantined,
+            seams,
+            armed,
+        };
+        let mut served = BTreeMap::new();
+        let mut start = 0usize;
+
+        while start < segs.len() {
+            let (seq, ..) = segs[start];
+            if segs[start].3 >= bounds.target || quarantined.contains(&seq) {
+                start += 1;
+                continue;
+            }
+
+            let candidate = {
+                let index = self.prefixes.index()?;
+                let Some(entry) = index.get(prefix) else {
+                    return Ok((Vec::new(), i64::MIN));
+                };
+
+                bounds.walk(entry, &segs[start..], &mut served)
+            };
+
+            if candidate.len() >= 2 {
+                let candidate: Vec<usize> = candidate.into_iter().map(|at| start + at).collect();
+                let seqs: Vec<u64> = candidate.iter().map(|at| segs[*at].0).collect();
+                let take = self.straddle_free_len(prefix, &seqs)?;
+
+                if take >= 2 {
+                    let last_modified = candidate[..take]
+                        .iter()
+                        .map(|at| segs[*at].2)
+                        .max()
+                        .unwrap_or(i64::MIN);
+                    return Ok((seqs[..take].to_vec(), last_modified));
+                }
+            }
+
+            start += 1;
+        }
+
+        Ok((Vec::new(), i64::MIN))
     }
 
     /// How many of `run`'s leading segments selection may merge without
@@ -1818,5 +2034,42 @@ mod tiling_break_tests {
 
         union.insert(key(), 90, 400);
         assert!(union.is_connected());
+    }
+
+    fn other() -> super::SubstreamKey {
+        (super::Substream::Name("u".into()), 0)
+    }
+
+    /// A merged segment's low offsets land among a run's high ones (DEV-692):
+    /// selection steps over what neither overlaps nor extends the run.
+    #[test]
+    fn a_union_connects_what_extends_it_and_overlaps_only_shared_offsets() {
+        let mut union = RunUnion::default();
+        assert!(union.connects(&[(key(), 100, 150)]));
+        union.insert(key(), 100, 150);
+
+        assert!(union.connects(&[(key(), 150, 160)]));
+        assert!(union.connects(&[(key(), 90, 100)]));
+        assert!(union.connects(&[(key(), 120, 200)]));
+        assert!(union.connects(&[(other(), 0, 10)]));
+        assert!(!union.connects(&[(key(), 0, 50)]));
+        assert!(!union.connects(&[(key(), 150, 160), (other(), 0, 10), (key(), 170, 180)]));
+        assert!(union.connects(&[(key(), 160, 170), (key(), 150, 160)]));
+
+        assert!(!union.overlaps(&[(key(), 150, 160)]));
+        assert!(!union.overlaps(&[(key(), 0, 100)]));
+        assert!(!union.overlaps(&[(other(), 100, 150)]));
+        assert!(union.overlaps(&[(key(), 149, 151)]));
+        assert!(union.overlaps(&[(key(), 0, 500)]));
+    }
+
+    #[test]
+    fn covers_needs_one_span_holding_the_whole_range() {
+        let spans = [(0, 50), (60, 100)];
+        assert!(super::covers(&spans, &(10..50)));
+        assert!(super::covers(&spans, &(60..60)));
+        assert!(!super::covers(&spans, &(40..70)));
+        assert!(!super::covers(&spans, &(100..110)));
+        assert!(!super::covers(&[], &(0..1)));
     }
 }

@@ -350,6 +350,152 @@ async fn selection_still_meets_a_hole_nothing_serves() -> Result<()> {
     Ok(())
 }
 
+/// The run [`DynoStore::select_compaction_run`] picks over every eligible
+/// segment, `keep_hot` aside.
+fn selected(store: &DynoStore) -> Result<Vec<u64>> {
+    let segs: Vec<(u64, i64, i64, usize)> = {
+        let index = store.prefixes.index()?;
+        index
+            .get(PREFIX)
+            .map(|entry| {
+                entry
+                    .segments
+                    .iter()
+                    .map(|(seq, cached)| {
+                        let bytes = cached.footer.entries.iter().map(|e| e.byte_len as usize);
+                        (*seq, 0, 0, bytes.sum())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let eligible = &segs[..segs.len() - 1];
+    let none = BTreeSet::new();
+    Ok(store
+        .select_compaction_run(PREFIX, eligible, &none, &none, false)?
+        .0)
+}
+
+/// A merged segment lands among younger segments holding the low offsets of
+/// the ones it replaced (DEV-692): selection steps over it and merges `[0, 2]`
+/// around it, where it used to stop at it and leave a run of one.
+#[tokio::test]
+async fn selection_steps_over_a_merged_segment_among_younger_ones() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let store = new_store(&bucket);
+    create_topic(&store, &[]).await?;
+
+    put_segment(&store, &bucket, 0, 100, batch(50)?).await?;
+    put_segment(&store, &bucket, 1, 0, batch(50)?).await?;
+    put_segment(&store, &bucket, 2, 150, batch(50)?).await?;
+    put_segment(&store, &bucket, 3, 50, batch(50)?).await?;
+
+    assert!(matches!(
+        store.compact_prefix_segments(PREFIX).await?,
+        CompactRun::Merged(2),
+    ));
+    assert!(store.compact_seams_of(PREFIX)?.is_empty());
+
+    let served = served(&store, PREFIX)?;
+    assert_eq!(vec![(0, 50), (50, 100), (100, 200)], offsets(&served));
+    assert_eq!((1, 3), (served[0].0, served[1].0));
+
+    Ok(())
+}
+
+/// A segment stepped over is never overlapped by the run (DEV-692): `[0, 2]`
+/// would hold `[100, 120)` above segment 1, which holds it too, so the run is
+/// `[1, 2]`, the one a sequence-contiguous walk finds.
+#[tokio::test]
+async fn selection_never_joins_what_overlaps_a_stepped_over_segment() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let store = new_store(&bucket);
+    create_topic(&store, &[]).await?;
+
+    put_segment(&store, &bucket, 0, 0, batch(50)?).await?;
+    put_segment(&store, &bucket, 1, 100, batch(50)?).await?;
+    put_segment(&store, &bucket, 2, 50, batch(70)?).await?;
+    put_segment(&store, &bucket, 3, 150, batch(50)?).await?;
+    store.refresh_prefix_index_forced(PREFIX).await?;
+
+    assert_eq!(vec![1, 2], selected(&store)?);
+
+    Ok(())
+}
+
+/// Write segment `seq` out of band with one region per `(partition, base,
+/// records)`.
+async fn put_regions(
+    store: &DynoStore,
+    bucket: &InMemory,
+    seq: u64,
+    regions: &[(i32, i64, usize)],
+) -> Result<()> {
+    let regions = regions
+        .iter()
+        .map(|&(partition, base, records)| {
+            batch(records).map(|batch| (Topition::new(TOPIC, partition), base, vec![batch]))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let (payload, _footer) = store.encode_segment_v3(&regions, 1, seq)?;
+    let path = Path::from(format!(
+        "clusters/{CLUSTER}/prefixes/{PREFIX}/segments/{seq:0>20}.seg"
+    ));
+    _ = bucket.put(&path, payload).await?;
+
+    Ok(())
+}
+
+/// A segment holding offsets the run holds is never stepped over (DEV-692),
+/// even when another of its partitions is disjoint: the merged segment would
+/// shadow it. Segment 1 overlaps `[40, 50)` of partition 0 and sits above
+/// partition 1's, so the run is `[1, 2]`, never `[0, 2]`.
+#[tokio::test]
+async fn selection_never_steps_over_what_overlaps_the_run() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let store = new_store(&bucket);
+    create_topic(&store, &[]).await?;
+
+    put_regions(&store, &bucket, 0, &[(0, 0, 50), (1, 0, 50)]).await?;
+    put_regions(&store, &bucket, 1, &[(0, 40, 10), (1, 100, 50)]).await?;
+    put_regions(&store, &bucket, 2, &[(1, 50, 50)]).await?;
+    put_regions(&store, &bucket, 3, &[(1, 150, 50)]).await?;
+    store.refresh_prefix_index_forced(PREFIX).await?;
+
+    assert_eq!(vec![1, 2], selected(&store)?);
+
+    Ok(())
+}
+
+/// A stepped-over segment the run grows up to is merged after all: `[0, 1,
+/// 2]`, as before DEV-692, not `[0, 2]`.
+#[tokio::test]
+async fn selection_folds_back_what_the_run_grows_up_to() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let store = new_store(&bucket);
+    create_topic(&store, &[]).await?;
+
+    put_segment(&store, &bucket, 0, 0, batch(50)?).await?;
+    put_segment(&store, &bucket, 1, 100, batch(50)?).await?;
+    put_segment(&store, &bucket, 2, 50, batch(50)?).await?;
+    put_segment(&store, &bucket, 3, 150, batch(50)?).await?;
+    store.refresh_prefix_index_forced(PREFIX).await?;
+
+    assert_eq!(vec![0, 1, 2], selected(&store)?);
+
+    Ok(())
+}
+
 /// Key compaction does not open a gap in the tiling (#594), so a gap on a
 /// compacted topic is not one it made, and fusing across it would shift
 /// offsets exactly as on any other topic.
