@@ -28,6 +28,7 @@ mod compacted_region_reads;
 mod compaction_claim;
 mod compaction_cursor;
 mod compaction_race;
+mod compaction_run_size;
 mod compaction_throughput;
 mod conditional_put_probe;
 mod consumer_liveness;
