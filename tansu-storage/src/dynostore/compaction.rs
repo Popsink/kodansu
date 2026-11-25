@@ -562,6 +562,18 @@ impl RunBounds<'_> {
     }
 }
 
+/// A break in a run's tiling, as [`DynoStore::compact_prefix_segments`]
+/// classified it.
+#[derive(Debug)]
+struct RunBreak {
+    substream: Substream,
+    topic: String,
+    partition: i32,
+    seq: u64,
+    gap: (i64, i64),
+    class: TilingBreak,
+}
+
 impl DynoStore {
     /// Segments one run may step over (DEV-692), see
     /// [`Self::select_compaction_run`]. Under sustained produce a merged
@@ -746,7 +758,7 @@ impl DynoStore {
         let mut substreams: Vec<SubstreamWrite> = Vec::new();
         let mut merged_epoch = i64::MIN;
         let mut seams: BTreeSet<u64> = BTreeSet::new();
-        let mut worst: Option<TilingBreak> = None;
+        let mut found: Vec<RunBreak> = Vec::new();
 
         for (substream, topic, partition) in substream_keys {
             let in_run = self.decode_fenced_regions(prefix, &substream, partition, &objects)?;
@@ -797,8 +809,14 @@ impl DynoStore {
                         (expected, region_base),
                     )
                     .await;
-                class.log(prefix, &topic, partition, seq, (expected, region_base));
-                worst = worst.max(Some(class));
+                found.push(RunBreak {
+                    substream: substream.clone(),
+                    topic: topic.clone(),
+                    partition,
+                    seq,
+                    gap: (expected, region_base),
+                    class,
+                });
             }
 
             // The run is already refused; this sub-stream's batches would only
@@ -822,7 +840,29 @@ impl DynoStore {
             });
         }
 
-        if let Some(worst) = worst {
+        if found
+            .iter()
+            .any(|found| found.class == TilingBreak::Missing)
+            && self
+                .served_after_relisting(prefix, &run, &mut found)
+                .await?
+        {
+            SEGMENT_COMPACT_REFUSED.add(1, &[KeyValue::new("reason", "stale_index")]);
+            warn!(
+                prefix,
+                "offsets this replica's index had no segment for are served after relisting \
+                 the prefix: selecting again rather than refusing"
+            );
+            return Ok(CompactRun::Retry);
+        }
+
+        for found in &found {
+            found
+                .class
+                .log(prefix, &found.topic, found.partition, found.seq, found.gap);
+        }
+
+        if let Some(worst) = found.iter().map(|found| found.class).max() {
             SEGMENT_COMPACT_REFUSED.add(1, &[KeyValue::new("reason", worst.reason())]);
 
             // `Retry` when something was learned: the drain loop re-selects at
@@ -1003,6 +1043,51 @@ impl DynoStore {
         } else {
             CompactRun::Drained
         }))
+    }
+
+    /// Whether a [`TilingBreak::Missing`] among `breaks` was this replica's
+    /// index rather than the bucket: relist the whole prefix and classify each
+    /// missing break again, `true` when one of them is now served.
+    ///
+    /// A missing break is classified from the index alone, and the index can
+    /// lack segments the bucket holds. On the GCS bucket (DEV-692) a maintainer
+    /// that had run for an hour refused ~20 runs as `missing`, on every hot
+    /// prefix, and each refusal left a seam that turned step-over selection off
+    /// for that prefix. Every one of those ranges read back whole from a
+    /// consumer, and a restarted maintainer, whose first listing is the whole
+    /// prefix, met none in the hour after. A real hole survives the relisting
+    /// and is refused, logged and learned as before (#461, #399); a stale index
+    /// gets one listing and a fresh selection, and no seam. Breaks of other
+    /// classes do not depend on what the index lacks, and are left as they were.
+    async fn served_after_relisting(
+        &self,
+        prefix: &str,
+        run: &[u64],
+        breaks: &mut [RunBreak],
+    ) -> Result<bool> {
+        self.index_invalidate(prefix)?;
+        self.refresh_prefix_index_forced(prefix).await?;
+
+        let mut served = false;
+
+        for missing in breaks
+            .iter_mut()
+            .filter(|found| found.class == TilingBreak::Missing)
+        {
+            missing.class = self
+                .classify_tiling_break(
+                    prefix,
+                    &missing.substream,
+                    &Topition::new(missing.topic.as_str(), missing.partition),
+                    run,
+                    missing.gap,
+                )
+                .await;
+
+            served |= missing.class != TilingBreak::Missing;
+        }
+
+        Ok(served)
     }
 
     /// The run [`Self::compact_prefix_segments`] merges next, and its newest

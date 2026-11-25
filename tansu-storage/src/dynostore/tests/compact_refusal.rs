@@ -496,6 +496,45 @@ async fn selection_folds_back_what_the_run_grows_up_to() -> Result<()> {
     Ok(())
 }
 
+/// A gap this replica's index has no segment for, but the bucket does, is
+/// not a hole (DEV-692): the refusal relists the prefix, finds the segment,
+/// and selects again instead of logging `missing` and learning a seam.
+///
+/// Segment 1 lands after the store indexed 0, 2 and 3, below its listing
+/// cursor, the shape of a create that finished late. Its offsets read as a
+/// hole to the index, and the run `[0, 2]` was refused and seamed for good.
+#[tokio::test]
+async fn a_gap_the_index_lacks_is_relisted_before_it_is_refused() -> Result<()> {
+    let _guard = init_tracing()?;
+
+    let bucket = InMemory::new();
+    let store = new_store(&bucket);
+    create_topic(&store, &[]).await?;
+
+    put_segment(&store, &bucket, 0, 0, batch(50)?).await?;
+    put_segment(&store, &bucket, 2, 100, batch(50)?).await?;
+    put_segment(&store, &bucket, 3, 150, batch(50)?).await?;
+    store.refresh_prefix_index_forced(PREFIX).await?;
+
+    put_segment(&store, &bucket, 1, 50, batch(50)?).await?;
+
+    assert!(matches!(
+        store.compact_prefix_segments(PREFIX).await?,
+        CompactRun::Retry,
+    ));
+    assert!(store.compact_seams_of(PREFIX)?.is_empty());
+
+    assert!(matches!(
+        store.compact_prefix_segments(PREFIX).await?,
+        CompactRun::Merged(3),
+    ));
+
+    let served = served(&store, PREFIX)?;
+    assert_eq!(vec![(0, 150), (150, 200)], offsets(&served));
+
+    Ok(())
+}
+
 /// Key compaction does not open a gap in the tiling (#594), so a gap on a
 /// compacted topic is not one it made, and fusing across it would shift
 /// offsets exactly as on any other topic.
