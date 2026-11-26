@@ -32,7 +32,7 @@ jobs:
   # minio is the closest thing to S3 that needs no account, and it implements
   # conditional put with `If-None-Match` rather than emulating it.
   minio:
-    runs-on: ubuntu-latest-8-cores
+    runs-on: blacksmith-8vcpu-ubuntu-2604
     env:
       CARGO_BUILD_BUILD_DIR: /mnt/build
       NEXTEST_PROFILE: ci
@@ -41,7 +41,7 @@ jobs:
     steps:
       - run: sudo mkdir /mnt/build
       - run: sudo chmod a+rwxt /mnt/build
-      - uses: actions/checkout@v6
+      - uses: useblacksmith/checkout@v1
       - uses: extractions/setup-just@v3
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -72,7 +72,7 @@ jobs:
   # exit criterion, so leaving it to a manual run would mean the property the
   # autoscaling story rests on is guarded by nobody.
   group-scale:
-    runs-on: ubuntu-latest-8-cores
+    runs-on: blacksmith-8vcpu-ubuntu-2604
     env:
       CARGO_BUILD_BUILD_DIR: /mnt/build
       NEXTEST_PROFILE: ci
@@ -81,7 +81,7 @@ jobs:
     steps:
       - run: sudo mkdir /mnt/build
       - run: sudo chmod a+rwxt /mnt/build
-      - uses: actions/checkout@v6
+      - uses: useblacksmith/checkout@v1
       - uses: extractions/setup-just@v3
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
@@ -110,7 +110,7 @@ jobs:
   # read its permanently-skipped state as an oversight.
   object-store:
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest-8-cores
+    runs-on: blacksmith-8vcpu-ubuntu-2604
     env:
       CARGO_BUILD_BUILD_DIR: /mnt/build
       NEXTEST_PROFILE: ci
@@ -128,7 +128,7 @@ jobs:
     steps:
       - run: sudo mkdir /mnt/build
       - run: sudo chmod a+rwxt /mnt/build
-      - uses: actions/checkout@v6
+      - uses: useblacksmith/checkout@v1
       - uses: extractions/setup-just@v3
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
