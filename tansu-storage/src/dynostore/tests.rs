@@ -26,6 +26,7 @@ mod compact_refusal;
 mod compact_segments;
 mod compacted_region_reads;
 mod compaction_claim;
+mod compaction_claim_tail;
 mod compaction_cursor;
 mod compaction_race;
 mod compaction_run_size;

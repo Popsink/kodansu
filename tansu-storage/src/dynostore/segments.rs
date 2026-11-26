@@ -541,6 +541,32 @@ impl DynoStore {
         Ok(max.map_or(0, |m| m + 1).max(floor))
     }
 
+    /// The name after the last one taken beyond `taken`, which a lost create
+    /// proved occupied (DEV-692): a listing that starts after it, so it costs
+    /// what was created since rather than the whole prefix.
+    pub(super) async fn next_after_taken(&self, prefix: &str, taken: u64) -> Result<u64> {
+        let mut listing = self.scan_from(
+            Scan::SegmentIndex,
+            &self.segment_prefix(prefix),
+            &self.segment_location(prefix, taken),
+        );
+
+        let mut next = taken + 1;
+
+        while let Some(meta) = listing
+            .next()
+            .await
+            .transpose()
+            .inspect_err(|err| error!(?err, prefix, taken))?
+        {
+            if let Some(seq) = Self::segment_seq_of(&meta.location) {
+                next = next.max(seq + 1);
+            }
+        }
+
+        Ok(next)
+    }
+
     /// The next free segment sequence for `prefix`, derived from the *already
     /// force-folded* in-memory index instead of a fresh LIST (#91). The leaseless
     /// flush (`fold-before-claim`) calls [`Self::refresh_prefix_index_forced`]
@@ -936,16 +962,20 @@ impl DynoStore {
         let mut attempt = 0;
 
         while attempt < MAX_ATTEMPTS && claim_conflicts < MAX_CLAIM_ROUNDS {
-            // DEV-662: a lost claim proves `candidate` is held, so the next
-            // round claims the name after it with nothing read in between — no
-            // backoff, no footer fold. The compaction lease means there is one
-            // compactor per prefix, so there is no herd to de-synchronise, and a
-            // round is then one small PUT, shorter than the gap between two
-            // producer creates on a hot prefix. On the bucket, a fold per round
-            // (#401) made a round as long as that gap: a claim that started
-            // behind never caught up, and exhausted its 64 rounds on every hot
-            // prefix. Only the first loss refreshes, to find out how far behind
-            // the starting candidate was.
+            // A lost claim proves `candidate` is held, so the next round claims
+            // the name after the last one created since, read by a listing
+            // that starts at `candidate` — no backoff, no footer fold, and the
+            // compaction lease means there is no herd to de-synchronise (#764).
+            //
+            // Climbing one name per lost round assumed a round is shorter than
+            // the gap between two producer creates. On the DEV-692 bucket run
+            // it was not: ~93 ms a round against a name every ~83 ms, behind a
+            // forced refresh of 3.6 s that had left the claim ~40 names back.
+            // Every claim that lost its first round lost all 256, merges fell
+            // from 1 500 to 320 per 10 min, and one prefix grew to 16 912
+            // segments. A jump to the real tail leaves only the race for the
+            // next name, which a round wins as often as no producer creates
+            // during it.
             let Some(claim) = self.claim_tail(prefix, candidate).await? else {
                 claim_conflicts += 1;
 
@@ -956,10 +986,10 @@ impl DynoStore {
                     "compaction claim lost"
                 );
 
-                if claim_conflicts == 1 {
-                    self.refresh_prefix_index_forced(prefix).await?;
-                }
-                candidate = (candidate + 1).max(self.tail_next_seq_folded(prefix).await?);
+                candidate = self
+                    .next_after_taken(prefix, candidate)
+                    .await?
+                    .max(self.tail_next_seq_folded(prefix).await?);
                 continue;
             };
 
