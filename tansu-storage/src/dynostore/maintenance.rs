@@ -387,6 +387,14 @@ impl DynoStore {
         let mut compacted = 0;
 
         while !watched.is_empty() && tokio::time::Instant::now() < deadline {
+            // A prefix's newest segment is as old as the listing that found it,
+            // not as old as the slowest listing of the round. Judged after all
+            // of them, one prefix listing in 3 s aged every other prefix past
+            // `PRODUCING_WITHIN`: on the DEV-692 bucket `load-2` left the sweep
+            // under ~12 segments a second and grew to 4 480 before the next
+            // tick (#773 follow-up).
+            let listed_from_ms = Self::now_ms();
+
             futures::stream::iter(watched.iter().cloned().map(|prefix| async move {
                 _ = self
                     .refresh_prefix_index_forced(&prefix)
@@ -399,13 +407,12 @@ impl DynoStore {
 
             let newest = self.newest_produced_ms(&watched);
             let backlogged = self.backlogged_prefixes(&watched);
-            let now_ms = Self::now_ms();
 
             watched.retain(|prefix| {
                 (backlogged.contains(prefix) && !stuck.contains(prefix))
-                    || newest
-                        .get(prefix)
-                        .is_some_and(|newest| now_ms.saturating_sub(*newest) < producing_within)
+                    || newest.get(prefix).is_some_and(|newest| {
+                        listed_from_ms.saturating_sub(*newest) < producing_within
+                    })
             });
 
             let merged = if backlogged.is_empty() {
