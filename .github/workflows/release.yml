@@ -5,12 +5,12 @@ on:
       - "v*"
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-4vcpu-ubuntu-2604
     environment: release
     permissions:
       id-token: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: useblacksmith/checkout@v1
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
       - run: cargo publish --workspace
