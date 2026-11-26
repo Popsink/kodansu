@@ -74,6 +74,7 @@ mod segment_create;
 mod short_region;
 mod stale_out_of_range;
 mod substream_identity;
+mod sweep_watch;
 mod topic_churn;
 mod txn_overlap;
 mod vanished_footer;
